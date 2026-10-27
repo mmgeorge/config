@@ -9,7 +9,7 @@ use crate::control_tools::{
     control_tool_failure_json,
 };
 use crate::plan::{PlanDocument, render_plan};
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -21,7 +21,7 @@ use std::time::Instant;
 /// Owns ordered tool state independently of the provider socket.
 pub(super) struct RequestExecutor {
     workspace: String,
-    execution_mode: PermissionMode,
+    approval_mode: ApprovalMode,
     planning_feedback: bool,
     plan_document: Option<PlanDocument>,
     control_runtime: Option<Arc<ControlToolExecutor>>,
@@ -39,7 +39,7 @@ impl RequestExecutor {
     /// Creates isolated tool state for one provider connection.
     pub(super) fn new(
         workspace: String,
-        execution_mode: PermissionMode,
+        approval_mode: ApprovalMode,
         permission_coordinator: Arc<PermissionCoordinator>,
         event_sink: Option<BackendEventSink>,
         trace: Arc<TraceStore>,
@@ -47,7 +47,7 @@ impl RequestExecutor {
     ) -> Self {
         Self {
             workspace,
-            execution_mode,
+            approval_mode,
             planning_feedback: false,
             plan_document: None,
             control_runtime: None,
@@ -71,11 +71,11 @@ impl RequestExecutor {
     pub(super) fn reset(
         &mut self,
         workspace: String,
-        mode: PermissionMode,
+        mode: ApprovalMode,
         sink: Option<BackendEventSink>,
     ) {
         self.workspace = workspace;
-        self.execution_mode = mode;
+        self.approval_mode = mode;
         self.event_sink = sink;
         self.control_runtime = None;
         self.plan_document = None;
@@ -418,7 +418,7 @@ impl RequestExecutor {
         let resolution = self
             .permission_coordinator
             .authorize(
-                self.execution_mode,
+                self.approval_mode,
                 request,
                 Some(crate::backend::ProviderAddress {
                     owner: self.execution_owner.clone(),

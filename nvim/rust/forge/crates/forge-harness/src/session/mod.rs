@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 mod access;
 mod shell;
 mod timeout;
-pub use access::{AccessPolicy, DirectoryScope, WindowsSandbox};
+pub use access::{AccessPolicy, DirectoryScope, WindowsSandbox, WriteScope};
 pub use shell::CheckShell;
 pub(crate) use timeout::InputSchedule;
 pub use timeout::{InputDeadline, InputTimeout, ResolutionSource, TimeoutUnit};
@@ -17,26 +17,24 @@ use std::collections::BTreeMap;
 /// Defines the approval policy selected for one Harness session.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PermissionMode {
+pub enum ApprovalMode {
     #[default]
-    Read,
-    Write,
-    Yolo,
+    /// Apply rules and request a decision for remaining tool requests.
+    Ask,
+    /// Reject tool requests that still require a decision.
+    Deny,
+    /// Approve remaining tool requests once, preserving explicit denials.
+    Allow,
 }
 
-impl PermissionMode {
+impl ApprovalMode {
     /// Return the stable user-facing label for this approval policy.
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Read => "Read",
-            Self::Write => "Write",
-            Self::Yolo => "YOLO",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+            Self::Allow => "allow",
         }
-    }
-
-    /// Return whether this policy is eligible as the default for new execution tasks.
-    pub const fn is_write_default(self) -> bool {
-        !matches!(self, Self::Read)
     }
 }
 
@@ -163,13 +161,13 @@ pub struct HarnessSession {
     pub access: crate::session::AccessPolicy,
     #[serde(default)]
     pub shell: CheckShell,
-    pub execution_mode: PermissionMode,
+    pub approval_mode: ApprovalMode,
     #[serde(default)]
     pub current_task_id: Option<String>,
-    #[serde(default = "default_write_permission")]
-    pub default_write_permission: PermissionMode,
     #[serde(default)]
-    pub plan_permission: Option<PermissionMode>,
+    pub default_approval: ApprovalMode,
+    #[serde(default)]
+    pub plan_approval: Option<ApprovalMode>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub goal_id: Option<String>,
@@ -190,10 +188,10 @@ pub struct HarnessPreference {
     pub access: crate::session::AccessPolicy,
     #[serde(default)]
     pub shell: CheckShell,
-    #[serde(default = "default_write_permission")]
-    pub default_write_permission: PermissionMode,
     #[serde(default)]
-    pub plan_permission: Option<PermissionMode>,
+    pub default_approval: ApprovalMode,
+    #[serde(default)]
+    pub plan_approval: Option<ApprovalMode>,
     pub model: String,
     pub effort: String,
     #[serde(default)]
@@ -291,8 +289,4 @@ mod context_usage_test {
 
 fn auto_approve_revisions() -> bool {
     true
-}
-
-fn default_write_permission() -> PermissionMode {
-    PermissionMode::Write
 }

@@ -12,7 +12,7 @@ use crate::control_tools::{
     ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext,
     apply_invocation,
 };
-use crate::session::{ContextUsage, PermissionMode};
+use crate::session::{ApprovalMode, ContextUsage};
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -256,7 +256,7 @@ pub struct CodexJsonRpc {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
     workspace: String,
-    execution_mode: PermissionMode,
+    approval_mode: ApprovalMode,
     planning_feedback: bool,
     request_executor: Arc<tokio::sync::Mutex<RequestExecutor>>,
     control_executor: Option<Arc<ControlToolExecutor>>,
@@ -279,7 +279,7 @@ impl CodexJsonRpc {
     pub async fn connect(
         endpoint: &str,
         workspace: &str,
-        execution_mode: PermissionMode,
+        approval_mode: ApprovalMode,
         permission_coordinator: Arc<PermissionCoordinator>,
         event_sink: Option<BackendEventSink>,
         trace: Arc<TraceStore>,
@@ -292,11 +292,11 @@ impl CodexJsonRpc {
             socket,
             next_id: 1,
             workspace: workspace.to_owned(),
-            execution_mode,
+            approval_mode,
             planning_feedback: false,
             request_executor: Arc::new(tokio::sync::Mutex::new(RequestExecutor::new(
                 workspace.to_owned(),
-                execution_mode,
+                approval_mode,
                 permission_coordinator.clone(),
                 event_sink.clone(),
                 trace.clone(),
@@ -331,11 +331,11 @@ impl CodexJsonRpc {
     pub async fn set_request_context(
         &mut self,
         workspace: &str,
-        execution_mode: PermissionMode,
+        approval_mode: ApprovalMode,
         event_sink: Option<BackendEventSink>,
     ) {
         self.workspace = workspace.to_owned();
-        self.execution_mode = execution_mode;
+        self.approval_mode = approval_mode;
         self.event_sink = event_sink;
         self.requests_cancelled = false;
         self.control_executor = None;
@@ -343,7 +343,7 @@ impl CodexJsonRpc {
         self.mcp.call.clear();
         self.request_executor.lock().await.reset(
             workspace.to_owned(),
-            execution_mode,
+            approval_mode,
             self.event_sink.clone(),
         );
     }
@@ -528,7 +528,7 @@ impl CodexJsonRpc {
             };
             let mut independent = RequestExecutor::new(
                 self.workspace.clone(),
-                self.execution_mode,
+                self.approval_mode,
                 self.permission_coordinator.clone(),
                 self.event_sink.clone(),
                 self.trace.clone(),
@@ -2308,7 +2308,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             PermissionCoordinator::transient(&workspace)?,
             None,
             Arc::new(TraceStore::open(fixture.path())?),
@@ -2407,7 +2407,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Yolo,
+            ApprovalMode::Allow,
             coordinator.clone(),
             Some(sink),
             Arc::new(TraceStore::open(fixture.path())?),
@@ -2576,7 +2576,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             PermissionCoordinator::transient(&workspace)?,
             None,
             Arc::new(TraceStore::open(fixture.path())?),
@@ -3131,7 +3131,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             PermissionCoordinator::transient(&workspace)?,
             Some(sink),
             Arc::new(TraceStore::open(fixture.path())?),

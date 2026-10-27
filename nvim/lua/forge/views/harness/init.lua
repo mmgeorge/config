@@ -62,14 +62,17 @@ local function finish_start(state, result, start_error, error_detail, callback)
         end)
       end,
       on_close = function()
-        if not confirmed and callback and callback.on_error then
-          callback.on_error("Session selection cancelled")
+        if not confirmed then
+          state.initial_snapshot_pending = nil
+          controller.render()
+          if callback and callback.on_error then callback.on_error("Session selection cancelled") end
         end
       end,
     })
     return
   end
   if start_error then
+    state.initial_snapshot_pending = nil
     if callback and callback.on_error then
       callback.on_error(start_error)
     else
@@ -92,6 +95,7 @@ function M.open()
     end
     return
   end
+  state.initial_snapshot_pending = true
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
     layout.open("initial-pending-" .. tostring(vim.uv.hrtime()))
   layout.attach_auto_height(state.composer_buf, state.composer_win)
@@ -114,7 +118,7 @@ function M.backend_switch_available()
     and not state.configuring and not state.state_sync_pending
     and not state.configuration_debounce and not state.aborting_plan
     and not (state.status and state.status.kind == "finalizing")
-    and not state.pending_config and not state.pending_mode
+    and not state.pending_config
     and #(state.queue or {}) == 0 and #(state.pending_steer or {}) == 0
 end
 
@@ -142,7 +146,8 @@ function M.switch_backend(backend, destination)
   end
   local previous_backend = state.session.backend
   local previous_session_id = state.session.id
-  local previous_mode = state.session.execution_mode
+  local previous_mode = state.session.approval_mode
+  local previous_access = vim.deepcopy(state.session.access)
   if backend == previous_backend then return end
   local initialize_options = destination.kind == "new" and { new_session_name = "" }
     or { session_id = destination.session_id }
@@ -154,8 +159,8 @@ function M.switch_backend(backend, destination)
         open_mode = "current",
         on_ready = function()
           state.switching_backend = false
-          if destination.kind == "new" and previous_mode and previous_mode ~= "read" then
-            controller.set_mode(previous_mode)
+          if destination.kind == "new" then
+            controller.configure({ access = previous_access, approval_mode = previous_mode })
           end
           controller.render()
           local saved, save_error = backend_preference.save(backend)

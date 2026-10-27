@@ -35,7 +35,7 @@ local success, failure = xpcall(function()
       else callback({ patch = {} }) end
     end
     _G.state = require("forge.session").harness
-    state.session = { id = "gutter-selection", backend = "mock", model = "mock", execution_mode = "read" }
+    state.session = { id = "gutter-selection", backend = "mock", model = "mock", approval_mode = "ask" }
     state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
       require("forge.views.harness.layout").open("gutter-selection")
     _G.controller = require("forge.views.harness.controller")

@@ -4,7 +4,7 @@ use super::session::AcpSessionState;
 use super::transport::AcpTransport;
 use crate::backend::approval::PermissionCoordinator;
 use crate::backend::*;
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 use crate::settings::ResourceProfile;
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -28,7 +28,6 @@ pub(crate) struct AcpBackend {
 
 struct AcpSession {
     id: String,
-    native_ask: bool,
     transport: AcpTransport,
     state: Arc<AcpSessionState>,
     _control: ControlServer,
@@ -250,10 +249,8 @@ impl AcpBackend {
         if self.kind == BackendKind::Claude {
             parameter["_meta"] = json!({"claudeCode":{"emitRawSDKMessages":true,"options":{
                 "strictMcpConfig":true,"disallowedTools":["Agent","Task"]}}});
-            if request.execution_mode != PermissionMode::Yolo {
-                parameter["_meta"]["claudeCode"]["options"]["settings"] =
-                    json!({"permissions":{"ask":["*"]}});
-            }
+            parameter["_meta"]["claudeCode"]["options"]["settings"] =
+                json!({"permissions":{"ask":["*"]}});
             parameter["_meta"]["claudeCode"]["options"]["plugins"] = json!([
                 {"type":"local","path":profile.as_ref().expect("Claude profile").path()}
             ]);
@@ -290,7 +287,6 @@ impl AcpBackend {
         }
         let session = Arc::new(AcpSession {
             id,
-            native_ask: request.execution_mode != PermissionMode::Yolo,
             transport,
             state,
             _control: control,
@@ -368,12 +364,6 @@ impl AcpBackend {
         };
         let desired = if let Some(mode) = plan_mode {
             mode
-        } else if request.execution_mode == PermissionMode::Yolo {
-            if self.kind == BackendKind::Claude {
-                "bypassPermissions"
-            } else {
-                "yolo"
-            }
         } else {
             "default"
         };
@@ -600,10 +590,10 @@ impl Backend for AcpBackend {
                     mcp: true,
                     live_mcp_mutation: false,
                 },
-                execution_mode_list: vec![
-                    PermissionMode::Read,
-                    PermissionMode::Write,
-                    PermissionMode::Yolo,
+                approval_mode_list: vec![
+                    ApprovalMode::Ask,
+                    ApprovalMode::Deny,
+                    ApprovalMode::Allow,
                 ],
                 compaction: CompactionCapability {
                     lifecycle: claude,
@@ -765,23 +755,6 @@ impl Backend for AcpBackend {
             .permission
             .directories(Some(&self.settings_root), &request)?;
         let sink = skills.sink(sink);
-        if self.kind == BackendKind::Claude {
-            let existing = self
-                .session
-                .lock()
-                .await
-                .get(&request.runtime_key()?)
-                .cloned();
-            if let Some(existing) = existing
-                && existing.native_ask != (request.execution_mode != PermissionMode::Yolo)
-            {
-                ensure!(
-                    existing.state.active.read().await.is_none(),
-                    "Permission policy changes require active execution cleanup"
-                );
-                self.cleanup_execution(&request.runtime_key()?).await?;
-            }
-        }
         self.cancellation
             .lock()
             .await
@@ -1032,7 +1005,7 @@ fn catalog_request(request: &BackendRequest) -> BackendCatalogRequest {
         harness_session_id: request.harness_session_id.clone(),
         workspace: request.workspace.clone(),
         access: request.access.clone(),
-        execution_mode: request.execution_mode,
+        approval_mode: request.approval_mode,
         backend_session_id: request.backend_session_id.clone(),
     }
 }
@@ -1083,7 +1056,7 @@ mod test {
                 harness_session_id: "preparing".into(),
                 workspace: fixture.path().to_string_lossy().into_owned(),
                 access: kind.resolve_access(Default::default()),
-                execution_mode: PermissionMode::Read,
+                approval_mode: ApprovalMode::Ask,
                 backend_session_id: None,
             };
             let failed = backend.session(request, None, Some(&cancelled)).await;
@@ -1138,7 +1111,7 @@ mod test {
             harness_session_id: "session".into(),
             workspace: workspace.clone(),
             access: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
         };
         for kind in [BackendKind::Claude, BackendKind::Antigravity] {

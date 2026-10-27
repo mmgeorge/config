@@ -179,7 +179,7 @@ fn unavailable_command(payload: &Value, workspace: &Path) -> Option<String> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::session::{AccessPolicy, PermissionMode};
+    use crate::session::{AccessPolicy, ApprovalMode};
 
     #[test]
     fn resource_targets_include_wildcards_and_preserve_provider_restrictions_and_selection() {
@@ -235,7 +235,7 @@ mod test {
             harness_session_id: "session".into(),
             workspace: workspace.to_string_lossy().into_owned(),
             access: AccessPolicy::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
         };
         for (backend, target, provider_skill) in [
@@ -408,7 +408,7 @@ mod test {
             harness_session_id: "session".into(),
             workspace: workspace.to_string_lossy().into_owned(),
             access: AccessPolicy::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
         };
         let loaded =

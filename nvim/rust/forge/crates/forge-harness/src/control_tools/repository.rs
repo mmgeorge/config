@@ -20,7 +20,6 @@ use crate::permissions::document::PermissionDecision;
 use crate::permissions::matcher::{
     CompiledPermissionDocument, PermissionRequest, PermissionTarget,
 };
-use crate::session::PermissionMode;
 
 const MAX_REPLY_BYTES: usize = 256 * 1024;
 
@@ -30,7 +29,6 @@ pub struct RepositoryToolScope {
     interaction: String,
     workspace: PathBuf,
     policy: Arc<CompiledPermissionDocument>,
-    mode: PermissionMode,
     repository: Arc<RepositoryStore>,
     diff: Arc<DiffEngine>,
     active: AtomicBool,
@@ -69,7 +67,6 @@ impl RepositoryToolScope {
         interaction: String,
         workspace: PathBuf,
         policy: Arc<CompiledPermissionDocument>,
-        mode: PermissionMode,
         cancelled: Arc<AtomicBool>,
         repository: Arc<RepositoryStore>,
         diff: Arc<DiffEngine>,
@@ -90,7 +87,6 @@ impl RepositoryToolScope {
             interaction,
             workspace,
             policy,
-            mode,
             repository,
             diff,
             active: AtomicBool::new(true),
@@ -138,15 +134,12 @@ impl RepositoryToolScope {
         let path = absolute
             .to_str()
             .context("repository path cannot be represented by the active read policy")?;
-        let evaluation = self.policy.evaluate(
-            self.mode,
-            &PermissionRequest {
-                id: self.interaction.clone(),
-                provider: "harness-repository".into(),
-                reason: None,
-                target_list: vec![PermissionTarget::Read { path: path.into() }],
-            },
-        )?;
+        let evaluation = self.policy.evaluate(&PermissionRequest {
+            id: self.interaction.clone(),
+            provider: "harness-repository".into(),
+            reason: None,
+            target_list: vec![PermissionTarget::Read { path: path.into() }],
+        })?;
         ensure!(
             evaluation.decision == PermissionDecision::Allow,
             "active policy does not authorize repository path inspection"
@@ -168,21 +161,18 @@ impl RepositoryToolScope {
         );
         ensure!(
             self.policy
-                .evaluate(
-                    self.mode,
-                    &PermissionRequest {
-                        id: self.interaction.clone(),
-                        provider: "harness-repository".into(),
-                        reason: None,
-                        target_list: vec![PermissionTarget::Read {
-                            path: self
-                                .workspace
-                                .to_str()
-                                .context("workspace cannot be represented by read policy")?
-                                .into()
-                        }]
-                    }
-                )?
+                .evaluate(&PermissionRequest {
+                    id: self.interaction.clone(),
+                    provider: "harness-repository".into(),
+                    reason: None,
+                    target_list: vec![PermissionTarget::Read {
+                        path: self
+                            .workspace
+                            .to_str()
+                            .context("workspace cannot be represented by read policy")?
+                            .into()
+                    }]
+                })?
                 .decision
                 == PermissionDecision::Allow,
             "active policy does not authorize repository inspection"
@@ -503,7 +493,6 @@ mod tests {
             "interaction".into(),
             workspace,
             policy,
-            PermissionMode::Read,
             Arc::clone(&cancelled),
             repository,
             diff,
@@ -535,7 +524,6 @@ mod tests {
             "interaction".into(),
             workspace,
             policy,
-            PermissionMode::Read,
             Arc::new(AtomicBool::new(false)),
             repository,
             diff,
@@ -573,7 +561,6 @@ mod tests {
                 "interaction".into(),
                 workspace.join("other"),
                 Arc::clone(&policy),
-                PermissionMode::Read,
                 Arc::new(AtomicBool::new(false)),
                 Arc::clone(&repository),
                 Arc::clone(&diff)
@@ -585,7 +572,6 @@ mod tests {
             "interaction".into(),
             workspace,
             policy,
-            PermissionMode::Read,
             Arc::new(AtomicBool::new(false)),
             repository,
             diff,
@@ -658,7 +644,6 @@ mod tests {
             "interaction".into(),
             workspace,
             policy,
-            PermissionMode::Read,
             Arc::new(AtomicBool::new(false)),
             Arc::clone(&repository),
             Arc::clone(&diff),

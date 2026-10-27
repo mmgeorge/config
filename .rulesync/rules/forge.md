@@ -54,10 +54,9 @@ or alternate subprocesses. During plan execution, finish the active phase and
 let Harness Checking execute validation. Delegated agents without check tools
 rely on their parent's automatic completion gate after child work settles. Missing coverage
 requires the authorized check-configuration workflow rather than an unrecorded
-command. Check-editing permission is shown in the Harness winbar. `/checks setup on`
-or `/checks setup off` toggles it without sending a prompt. Use the `harness-checks`
-skill to configure checks through `check_definition_edit`. Each submission requires
-approval outside YOLO. Read-only source and package-metadata discovery are unaffected.
+command. Check-editing permission is shown in the Harness winbar. `/checks edit on`
+or `/checks edit off` toggles it without sending a prompt. Use the `harness-checks`
+skill to configure checks through `check_definition_edit`. Each submission follows Ask/Deny/Allow approval and cannot override write-off. Read-only source and package-metadata discovery are unaffected.
 
 The build commands below define the required artifact and flags. Harness agents
 must execute them as configured checks when working inside Harness.
@@ -205,13 +204,30 @@ Harness keeps Lua presentation state in `session.harness` and durable state in
 generic `application`, `domain`, or `ports` layers.
 
 Only the Harness transcript window owns the winbar. Clear the composer winbar.
-Start the transcript winbar with `Read` or `Write`, omit the redundant Harness
-title, trust-profile suffix, and CLI/provider label, then show the resolved
+Start the transcript winbar with one gray access/approval code matching other status
+labels. Append `dx` for Deny or `ax` for Allow to the filesystem abbreviation. Ask
+adds no approval suffix. Append `ce` after the approval suffix when check editing
+is enabled, using the same gray field. Do not render separate approval or check-editing fields. Separate every
+field with a small gray `·`, including after the optional red `YOLO` text that appears
+only for full reads, full writes, Allow, and sandbox off. Show enabled sandbox status
+immediately before the model. Keep lifecycle and planning/review text
+white. Prefix the model and thinking level with a gray outlined lightning glyph
+(`󱐌`) for Fast or a filled lightning glyph (`󱐋`) in the same neon red as YOLO for Ultrafast. Standard speed
+has no glyph. Keep the icon and model in one field without an intervening dot.
+Show one trailing `*` after thinking only when a model, thinking, or speed change
+must wait for existing work to stop. Idle and paused changes apply without a marker.
+Preserve the deferred classification across superseding changes, and clear the marker
+when all selected values are applied.
+Omit the redundant Harness title, trust-profile suffix, and CLI/provider label,
+then show the resolved
 runtime model rather than the configured `default` sentinel. `/config` shows
 the underlying CLI/provider.
 Resolve the Codex default through `model/list`, persist `provider_label` and
-`resolved_model` on the Harness session, and show an explicit resolving state
-until provider metadata arrives. Stream provider events into the transcript
+`resolved_model` on the Harness session. Before the initial snapshot, omit session
+policy and model fields rather than displaying guessed or retained values. Seed an
+unresolved default from the latest current-format session for the same workspace
+and backend, then refresh it asynchronously from the provider catalog. Show an
+explicit resolving state only without a cached resolution. Stream provider events into the transcript
 before the final response, but discard Codex `userMessage` lifecycle echoes
 because the broker already records each admitted user action.
 
@@ -229,12 +245,15 @@ active/latest tool while its exchange runs. Completed exchanges keep tool output
 collapsed until explicitly opened. Status updates preserve the user's cursor and
 viewport and use the same atomic commit boundary as other buffer changes.
 
-Map `Shift-Tab` in both normal and insert mode to toggle Read and Write approval
-handling through the durable task transition coordinator. Keep approval mode independent
-from `session.access`. `/config` owns sandbox enablement, workspace/full write scope,
-additional writable directories, and Windows backend selection. Apply access changes
+Map `Shift-Tab` in both normal and insert mode to toggle writes Off/Workspace
+through the durable task transition coordinator. Keep Ask/Deny/Allow independent
+from `session.access`. `/read full` and `/write full` toggle scopes. `/yolo` atomically
+selects full reads, full writes, Allow, and sandbox off. When already in that state,
+`/yolo` keeps full reads/writes, selects Ask, and enables sandboxing if the provider supports it.
+Resolve rapid toggles against the latest admitted selection. `/config` owns sandbox enablement,
+Off/Workspace/Full write scope, directory grants, and Windows backend selection. Apply access changes
 through interrupt/finalize/resume and display failures instead of leaving the UI working.
-Validate directories before persisting them. Never disable isolation when selecting YOLO.
+Validate directories before persisting them. Other permission commands preserve sandbox selection.
 
 Every `/plan` result must stop in a physical editable `PlanReview` file before
 execution. Accept only an explicit `plan_submit` result or a complete
@@ -527,6 +546,44 @@ warnings (it merges the two copies). `:LspRestart` (or reopening nvim) re-indexe
 clears them — there is nothing to fix in the code.
 
 ## Testing
+
+### Reproduce interaction bugs with mock integration tests
+
+Use unit tests for isolated module logic and mock integration tests for behavior
+that crosses the editor, transport, Rust host, and persistence boundaries. Before
+fixing an observable interaction regression, reproduce the reported sequence in
+a mock integration fixture and establish which assertion fails on the current
+code. A fixture setup failure does not establish reproduction of the product bug.
+
+- Create isolated temporary workspaces and sessions with the required saved plan,
+  artifact, or conversation state. Reuse existing host and provider helpers.
+- Keep the affected production modules connected. Mock the external provider
+  through `MockBackend` or a local protocol peer rather than replacing the
+  controller, renderer, or persistence behavior that the test must verify.
+- Use `nvim/tests/forge/support/mock_provider.lua` to hold the relevant response,
+  await receipt of its prompt, perform the interaction, and explicitly release
+  the response. Do not use arbitrary sleeps to arrange response timing. Await
+  concrete state changes with failure deadlines and cancel outstanding holds
+  during cleanup.
+- Exercise the actual mappings and user actions. Assert visible content and its
+  placement, cursor behavior, and saved state where relevant. For plan questions,
+  cover leaving and returning while pending, interactions on the answer, and
+  closing and reopening the plan. Preserve the observed failure as a regression
+  test before changing production behavior.
+- Register deterministic host fixtures in the `mock-integration` suite and run
+  the smallest relevant fixture with `lua-test-mock-integration` and its `files`
+  input. Keep ordinary module fixtures under `lua-test`.
+- Keep installed-provider and real-model fixtures in `live-integration`, selected
+  only through `lua-test-live-integration`. Do not run them as part of ordinary or
+  mock coverage. Run live cases rarely, for a specific provider boundary that
+  local tests cannot verify, with explicit authorization for external requests.
+- Report fixture setup failures, reproduced product failures, passing mock
+  coverage, and live-provider evidence separately. Do not claim live-provider
+  verification from a mock run or claim reproduction from an interrupted run.
+
+See [Building and testing Forge](../../nvim/contributing/forge/building-and-testing.md)
+for suite selection and response-control examples. Inside Harness, execute all
+verification through the saved checks described above.
 
 Run the load check:
 

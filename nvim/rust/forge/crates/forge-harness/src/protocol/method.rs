@@ -53,6 +53,8 @@ pub enum HarnessMethod {
     TraceSessionClear,
     #[serde(rename = "backend.models")]
     BackendModels,
+    #[serde(rename = "backend.mock_response")]
+    BackendMockResponse,
     #[serde(rename = "backend.capabilities")]
     BackendCapabilities,
     #[serde(rename = "backend.authenticate")]
@@ -95,10 +97,8 @@ pub enum HarnessMethod {
     PermissionsOpen,
     #[serde(rename = "permissions.save")]
     PermissionsSave,
-    #[serde(rename = "session.execution_mode")]
-    SessionPermissionMode,
-    #[serde(rename = "session.mode")]
-    SessionMode,
+    #[serde(rename = "session.permission")]
+    SessionPermission,
     #[serde(rename = "exchange.resume")]
     ExchangeResume,
     #[serde(rename = "prompt.submit")]

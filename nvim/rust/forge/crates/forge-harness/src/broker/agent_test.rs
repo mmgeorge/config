@@ -75,28 +75,28 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
     let mut root = broker.backend_request(BackendInput::from_text("parent secret"),PromptMode::Chat);
     root.model = "parent-model".into();
     root.effort = "high".into();
-    root.execution_mode = PermissionMode::Write;
+    root.approval_mode = ApprovalMode::Ask;
     let inherited = broker.agent_backend_factory.resolve(&root,BackendKind::Mock,
         &SpawnAgentRequest { profile:None,text:"task".into() }).await?;
     assert_eq!(inherited.model, "parent-model");
     assert_eq!(inherited.reasoning_effort, "high");
     save_child_profile(&broker,"review",AgentProfile { provider:"codex".into(),model:"default".into(),
-        reasoning_effort:"default".into(),service_tier:"default".into(),permission_mode:"read".into(),
+        reasoning_effort:"default".into(),service_tier:"default".into(),approval_mode:"ask".into(),
         instructions:"First instructions".into(),..Default::default() })?;
     let spawn = SpawnAgentRequest { profile:Some("review".into()),text:"task".into() };
     let selected = broker.agent_backend_factory.resolve(&root,BackendKind::Mock,&spawn).await?;
     assert_eq!(selected.provider,BackendKind::Codex);
     assert_eq!(selected.model,"fixture-model");
     assert_eq!(selected.reasoning_effort,"low");
-    assert_eq!(selected.execution_mode,PermissionMode::Read);
+    assert_eq!(selected.approval_mode,ApprovalMode::Ask);
     let mut child = crate::agent::Agent::pending(&root.harness_session_id,"review","task",1);
     child.selection = Some(selected);
     save_child_profile(&broker,"review",AgentProfile { instructions:"Changed instructions".into(),..Default::default() })?;
     root.model = "changed-parent-model".into();
-    root.execution_mode = PermissionMode::Yolo;
+    root.approval_mode = ApprovalMode::Allow;
     let request = broker.agent_backend_factory.request(&root,&child,"follow-up".into())?;
     assert_eq!(request.model,"fixture-model");
-    assert_eq!(request.execution_mode,PermissionMode::Read);
+    assert_eq!(request.approval_mode,ApprovalMode::Ask);
     assert!(matches!(request.input,BackendInput::Text {text, ..} if text.contains("First instructions")
         && !text.contains("Changed instructions") && !text.contains("parent secret")));
     assert!(request.backend_session_id.is_none());
@@ -107,9 +107,9 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
     save_child_profile(&broker,"review",AgentProfile { provider:"codex".into(),..Default::default() })?;
     assert!(broker.agent_backend_factory.resolve(&root,BackendKind::Mock,&spawn).await.is_err(),
         "a foreign provider must reject an inherited unavailable model");
-    root.execution_mode = PermissionMode::Read;
-    child.selection.as_mut().unwrap().execution_mode = PermissionMode::Yolo;
-    assert_eq!(broker.agent_backend_factory.request(&root,&child,"task".into())?.execution_mode,PermissionMode::Read);
+    root.approval_mode = ApprovalMode::Ask;
+    child.selection.as_mut().unwrap().approval_mode = ApprovalMode::Allow;
+    assert_eq!(broker.agent_backend_factory.request(&root,&child,"task".into())?.approval_mode,ApprovalMode::Ask);
     Ok(())
 }
 
@@ -121,7 +121,7 @@ fn admit_child_fixture(broker: &mut HarnessBroker, name: &str) -> Result<crate::
         operation:crate::agent::AgentOperation::Spawn(spawn.clone())};
     let selection = crate::agent::AgentSelection { profile: "worker".into(), instructions: String::new(), provider:crate::backend::BackendKind::Mock,
         model:"mock".into(),reasoning_effort:"low".into(),context_window:None,service_tier:Default::default(),
-        access:broker.session.access.clone(),execution_mode:broker.session.execution_mode};
+        access:broker.session.access.clone(),approval_mode:broker.session.approval_mode};
     let admission = broker.agent_coordinator.reserve_spawn(&request,&spawn,selection,&parent.id,100)?;
     parent.append_agent_task(&admission.task)?;
     broker.store.admit_agent_task(&admission.agent,&admission.task,&parent)?;
@@ -299,14 +299,14 @@ async fn child_tool_configuration_resumes_the_same_goal_exchange() -> Result<()>
     let mut broker = planning_question_broker(repository.path(),data.path(),false);
     broker.backend = broker.agent_backend_factory.build(crate::backend::BackendKind::Mock)?;
     // Mock write turns report progress and keep this goal active across configuration changes.
-    broker.session.execution_mode = PermissionMode::Write;
+    broker.session.approval_mode = ApprovalMode::Ask;
     let child = admit_child_fixture(&mut broker,"config-child")?;
     let goal = GoalRecord {id:"configuration-goal".into(),session_id:broker.session.id.clone(),
         objective:"Continue work".into(),state:GoalState::Active,continuation:Default::default(),native:false,
         created_at_ms:1,updated_at_ms:1};
     broker.store.save_goal(&goal)?;
     let mut task = crate::task::TaskRecord::new(broker.session.id.clone(),goal.objective.clone(),
-        crate::task::TaskKind::Goal,broker.session.execution_mode,1);
+        crate::task::TaskKind::Goal,broker.session.access.clone(), broker.session.approval_mode,1);
     task.goal_id = Some(goal.id.clone());
     task.begin(1)?;
     broker.store.save_task(&task)?;
@@ -371,7 +371,7 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
         let permission = broker.permission_coordinator.clone();
         let sink = sink.clone();
         waiters.push(tokio::spawn(async move {
-            permission.authorize_callback(PermissionMode::Read,true,PermissionRequest {id:"approval".into(),provider:"Codex".into(),
+            permission.authorize(ApprovalMode::Ask, PermissionRequest {id:"approval".into(),provider:"Codex".into(),
                 reason:None,target_list:vec![PermissionTarget::Command {command:"probe task".into(),shell:None}]},
                 Some(crate::backend::ProviderAddress {owner:Some(owner),thread_id:"durable-child-conversation".into(),turn_id:"child-turn".into()}),Some(&sink)).await
         }));
@@ -463,7 +463,7 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     let selection = crate::agent::AgentSelection { profile: "worker".into(), instructions: String::new(),
         provider:crate::backend::BackendKind::Mock,model:"mock-model".into(),reasoning_effort:"low".into(),
         context_window:None,service_tier:Default::default(),access:broker.session.access.clone(),
-        execution_mode:broker.session.execution_mode,
+        approval_mode:broker.session.approval_mode,
     };
     let mut admission = Vec::new();
     for name in ["first","sibling"] {
@@ -607,7 +607,7 @@ async fn cross_provider_children_resolve_profile_model_reasoning_and_service_tie
     assert_eq!(selection.context_window,None);
     assert_eq!(selection.service_tier,crate::backend::ServiceTier::Fast);
     assert_eq!(selection.access.sandbox,root.access.sandbox);
-    assert_eq!(selection.execution_mode,root.execution_mode);
+    assert_eq!(selection.approval_mode,root.approval_mode);
     Ok(())
 }
 
@@ -661,11 +661,11 @@ async fn rejected_followup_preserves_inbox_and_current_root_policy() -> Result<(
         operation:crate::agent::AgentOperation::Message {target:target.clone(),message:"Retain this information".into()},
     },None,&mut Vec::new()).await?;
     let mut agent = broker.agent_coordinator.resolve(&target)?;
-    agent.selection.as_mut().unwrap().execution_mode = PermissionMode::Yolo;
+    agent.selection.as_mut().unwrap().approval_mode = ApprovalMode::Allow;
     agent.selection.as_mut().unwrap().access.sandbox = false;
     let root = broker.backend_request(BackendInput::from_text(""),PromptMode::Chat);
     let request = broker.agent_backend_factory.request(&root,&agent,"NEXT".into())?;
-    assert_eq!(request.execution_mode,root.execution_mode);
+    assert_eq!(request.approval_mode,root.approval_mode);
     assert_eq!(request.access.sandbox,root.access.sandbox);
     assert_eq!(request.backend_session_id,agent.provider_thread_id);
     broker.handle_agent_request(crate::agent::AgentRequest {

@@ -1,4 +1,4 @@
-use crate::session::{HarnessSession, PermissionMode, ProviderForkState, SessionStore};
+use crate::session::{ApprovalMode, HarnessSession, ProviderForkState, SessionStore};
 use crate::storage::SqliteStore;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -73,16 +73,14 @@ pub fn prepare_new_session(
         shell: preference
             .as_ref()
             .map_or(source.shell, |value| value.shell),
-        execution_mode: PermissionMode::Write,
+        approval_mode: ApprovalMode::Ask,
         current_task_id: None,
-        default_write_permission: preference
+        default_approval: preference
             .as_ref()
-            .map_or(source.default_write_permission, |value| {
-                value.default_write_permission
-            }),
-        plan_permission: preference
+            .map_or(source.default_approval, |value| value.default_approval),
+        plan_approval: preference
             .as_ref()
-            .map_or(source.plan_permission, |value| value.plan_permission),
+            .map_or(source.plan_approval, |value| value.plan_approval),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
         goal_id: None,
@@ -101,7 +99,47 @@ pub fn prepare_new_session(
         &child.backend,
     )?;
     shared.desired.apply(&mut child, native_compact)?;
+    child.approval_mode = child.default_approval;
     shared.apply_provider_defaults(&mut child)?;
+    if child.model == "default" && child.resolved_model.is_none() {
+        child.resolved_model =
+            store.latest_resolved_default_model(&child.workspace, &child.backend)?;
+    }
     store.save_session(&child)?;
     Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_conversation_reuses_resolved_default_before_catalog_request() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut broker = crate::broker::HarnessBroker::initialize(
+            serde_json::from_value(serde_json::json!({
+                "workspace": fixture.path(),
+                "data_root": fixture.path().join("data"),
+                "client_id": "cached-default-test",
+                "backend": { "kind": "mock", "command": ["mock"] },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        broker.session.resolved_model = Some("confirmed-default".into());
+        broker.save_session().unwrap();
+        let created = prepare_new_session(
+            &fixture.path().join("data"),
+            "cached-default-test",
+            "mock",
+            false,
+            &broker.session.id,
+            &serde_json::json!({}),
+            1,
+        )
+        .unwrap();
+        assert_ne!(created.id, broker.session.id);
+        assert_eq!(created.model, "default");
+        assert_eq!(created.resolved_model.as_deref(), Some("confirmed-default"));
+    }
 }

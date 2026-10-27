@@ -1,12 +1,13 @@
 vim.loader.enable(false)
 local original_directory = vim.fn.getcwd()
+vim.opt.runtimepath:prepend(original_directory .. "/nvim")
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
 local original_stdpath = vim.fn.stdpath
-vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
+vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback)
   vim.schedule(function() callback({ ok = true, path = binary }) end)
   return function() end
@@ -55,6 +56,20 @@ local success, failure = xpcall(function()
   controller.reopen_question()
   assert(state.plan_question_open, "pending question could not reopen after rejection")
   assert(not (state.execution_notice or ""):find("Stopped", 1, true))
+  for _, change in ipairs({
+    { kind = "toggle_write_enabled" },
+    { kind = "set_approval", mode = "deny" },
+    { kind = "set_approval", mode = "allow" },
+  }) do
+    controller.task_transition({ action = "permission", change = change })
+    assert(vim.wait(10000, function() return not state.task_operation and not state.busy end, 10),
+      "permission change did not settle while a question waited")
+    local waiting = request("state.get")
+    assert(waiting.active_elicitation.elicitation.question_set.id == elicitation.question_set.id,
+      "permission change replaced the unanswered question")
+    assert(#waiting.active_elicitation.elicitation.answer == 0, "permission change answered the question")
+    assert(waiting.session.access.write_access == "off", "approval change restored writes")
+  end
 end, debug.traceback)
 if vim.g.forge_admission_inspect and success then
   print("harness_admission_host: passed, inspection ready")

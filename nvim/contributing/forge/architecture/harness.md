@@ -647,8 +647,8 @@ Other pickers retain their configured maximum height.
 
 `/config` groups all controls into Models, Compaction, Checks, Planning, Execute, Permissions,
 Tools, Display, Provider, and Debug. Main and Background model controls retain separate
-mutation owners. Planning owns the plan permission and revision Auto-approve controls.
-Execute labels the existing execution permission as Write or YOLO without a Defaults row.
+mutation owners. Planning owns the plan approval and revision Auto-approve controls.
+Execute exposes the Ask/Deny/Allow approval default without a Defaults row.
 The check-editing toggle uses the independent `checks.editing` control.
 Related values share rows, and the selected field replaces the permanent description
 column. Tools contains Timeouts and separate single-toggle rows for Subagents and LSP, Display owns Thoughts, and the final
@@ -663,7 +663,7 @@ Configuration pickers never depend on the serialized provider-turn request lane 
 Harness resolves and caches backend model metadata when the view activates, then `/model` refreshes
 the catalog when it opens so persisted model and effort selections remain current during provider work.
 Model, effort, service-tier, backend, and
-execution-mode selections continue through their normal mutation owners. Configuration changes
+access and approval selections continue through their normal mutation owners. Configuration changes
 that affect execution always use `task.transition`, including when Lua currently reports idle.
 The host determines whether execution needs collection, so a delayed busy snapshot cannot route
 a thinking or model change through the settled-session guard. Presentation-only status thoughts
@@ -857,21 +857,18 @@ change occurs, the broker finalizes partial timeline state and persists the inte
 cancelled. This split prevents the composer from presenting text that still exists in provider
 history while preserving the quick-regret workflow for a genuinely output-free turn.
 
-`turn.restart` uses that same out-of-band lane for an execution-mode change. Shift-Tab records the
-target mode in the Harness winbar, interrupts the active provider turn, persists the mode after
-both cancellation completion and restart acknowledgement arrive, then resumes the cancelled interaction on the retained provider
-conversation. The interrupted turn remains durable and the resumed provider work appends another
-`Turn` to the same `Exchange`, so one user action keeps one checkpoint and one rollback boundary.
-Codex exposes the submitted app-server thread for resumption, while Copilot exposes its retained
-SDK session. A restart failure preserves the partial transcript, keeps the selected execution mode,
-and notifies the user instead of silently replaying the original prompt.
+Policy changes use the durable `task.transition` lane. Shift-Tab submits a
+write-toggle intent, then the coordinator interrupts and collects active provider
+work before applying the new access policy. The winbar retains confirmed access
+and approval while that operation is pending. A resumed exchange retains its
+checkpoint and completed tool results. Codex resumes its app-server thread, and
+Copilot resumes its retained SDK session.
 
-All execution callbacks share mode-restart completion handling, including plan acceptance,
-planning clarification, goal continuation, compaction, child-agent requests, and resumed turns.
-The selected child timeline does not defer a session-wide mode change. A newer mode selection
-replaces the pending target while cancellation or mode application completes. The restart marker
-clears before resumed work begins, so another mode selection can interrupt that work immediately.
-Cleanup or mode-application failure stops the sequence and reports the error without resuming.
+Plan acceptance, planning clarification, goal continuation, compaction, and child
+execution retain their existing ownership boundaries. A newer policy intent can
+supersede a pending operation without applying its toggle twice. A validation or
+collection failure retains the last confirmed policy and reports the failure.
+Resumption failures preserve the policy that already committed.
 Interrupted exchanges without an active provider turn project a paused footer even while their
 retained exchange remains resumable. Host exit broadcasts a local stop event before failing pending
 requests. The controller clears transient busy, cancellation, and restart ownership, stops timers,
@@ -1052,8 +1049,8 @@ remain separate from provider conversation-token metrics, and stop changing once
 Codex discards resume-time usage before requesting compaction so stale counts cannot become
 the after reading. Usage notifications retain their provider thread address.
 Absent provider fields remain absent
-without a placeholder summary. Exchange headers
-retain compaction counts and active, failed, or unconfirmed counts while activity details are folded.
+without a placeholder summary. Compaction status and results remain in their timeline
+entries. Exchange headers omit compaction counts.
 
 Copilot's session subscription remains alive after prompt completion through `Backend::compaction_stream`.
 That subscription owns normalization across turns and SDK session rebinding. It delivers active
@@ -1124,8 +1121,8 @@ Tool time uses milliseconds below one second and rounded tenths of a second ther
 omitting a zero fractional digit. The outer duration remains whole seconds. The pass numerator
 counts successful completed calls only. Running, failed, interrupted, and cancelled calls remain
 in the denominator without counting as passed.
-Headers append nonzero failed-tool and distinct changed-file totals after usage.
-Failure counts include explicit provider failure flags and failed tool states.
+Headers append nonzero distinct changed-file totals after usage. The successful/total
+tool ratio accounts for unsuccessful calls without a separate failure count.
 Changed-file counts use successful provider file changes, normalize paths, and
 deduplicate repeated edits. Failed and unfinished edits do not increase the file total.
 
@@ -1164,19 +1161,19 @@ These durations measure Harness lifecycle observations rather than provider CPU 
 
 ## Permissions, sandboxing, and request deadlines
 
-Both initial interactive session creation and `session.new` initialize permissions
-to Write. Explicit and latest-session resumes retain the stored mode. Background
-generation and provider forks keep their existing Read initialization.
+Initial interactive sessions and `session.new` use full reads, workspace writes,
+and the configured approval default, which is Ask. Resumption retains both stored
+selections. Background generation disables writes explicitly. Provider forks copy
+the source session's access and approval.
 
 The Rust `PermissionStore` loads one validated Rulesync-shaped document from
 `stdpath("config")/forge/permissions.json`, compiles command and resource matchers once, and
 gives every surfaced provider request to one `PermissionCoordinator`. `allow` proceeds immediately,
 `deny` rejects immediately, and `ask` blocks the provider response on the Harness approval float.
-File writes requested by a root task in Read mode offer a switch to Write mode instead of
-a one-time file approval, including when the provider omits the path. Confirming uses the
-existing task permission transition to interrupt, collect, and resume the same task. It
-preserves configured directory access and permission rules. Staying in Read mode denies
-the request without persisting a rule. Child requests retain their own permission scope.
+Reported writes are rejected while writing is off, including requests without a
+path. Enabling writes requires an explicit `/write` or `/write full` command.
+Child requests retain the root's filesystem policy and a no-less-restrictive
+approval selection.
 Persistent approval choices atomically replace exact or broad JSON rules with allow or deny. The
 permission document remains outside provider write authority, including shell commands that name it.
 The command permission category displays as `shell` while retaining the Rulesync `bash` storage key.
@@ -1324,20 +1321,38 @@ and pauses its owning task without submitting an answer. Question freeform edito
 this binding. Shared picker actions explicitly opt into freeform input, override conflicting
 editor commands, and supply the corresponding footer.
 
-Read, Write, and YOLO select approval handling. Read asks before edits and untrusted
-commands, Write applies saved permission rules, and YOLO skips ordinary approval prompts. These
-settings do not select a filesystem scope or disable the sandbox. `/mode` and its direct
-commands change only approvals through the durable task transition coordinator.
+`HarnessSession` owns `AccessPolicy` and `ApprovalMode` independently. Approval
+is Ask, Deny, or Allow, defaulting to Ask. Read scope is Workspace or Full. Write
+scope is Off, Workspace, or Full. New interactive sessions use Full reads and
+Workspace writes. Additional readable/writable directories remain separate lists.
 
-`session.access` stores independent workspace/full read and write scopes, separate additional
-readable and writable directories, sandbox enablement, and the Windows sandbox backend.
-Read scope defaults to Full. Write scope defaults to Workspace. Workspace scope authorizes
-the execution workspace and its corresponding additional directories. Full scope removes
-that directory ceiling, but does not override explicit file denials or protected targets.
-Read approval mode still asks before writes, including writes inside an authorized directory.
-Out-of-scope reported file requests ask for approval even in YOLO mode. Specific saved file
-permission grants remain effective outside the scope, while wildcard allow rules do not
-override a Workspace ceiling.
+`PermissionChange` resolves `/read full`, `/write`, `/write full`, `/ask`, `/deny`,
+`/allow`, and `/yolo` once against authoritative candidate state. The existing task
+transition coordinator interrupts and collects active work, validates the candidate,
+persists both selections, and resumes only when the prior lifecycle requires it.
+`/yolo` selects Full reads, Full writes, Allow, and sandbox off in one operation.
+When those values are already selected, it keeps Full reads/writes, changes approval
+to Ask, and enables sandboxing only for providers that support it. Admission resolves
+this toggle against the latest pending permission selection, so rapid toggles compose
+before their superseded operations run.
+Lua submits intents and renders confirmed snapshots. Rust publishes the access
+filesystem abbreviation. Lua appends `dx` for Deny, `ax` for Allow, and nothing for Ask
+to form one gray winbar code. The independent policy values remain unchanged.
+The optional red YOLO prefix appears only for full reads/writes, Allow, and sandbox off,
+rendering `YOLO · rxwxax`. Enabled sandbox status precedes the model.
+Exchange headings and planning/review status text retain their own highlights.
+
+`CompiledPermissionDocument` evaluates saved rules without receiving approval mode.
+`DirectoryPolicy` evaluates canonical and supplied paths, retained directory grants,
+and filesystem scope. Write-off denies known and unknown-path writes even when a
+saved rule or directory grant allows them. Explicit denies and protected targets
+remain authoritative. Out-of-scope requests produce Ask unless a specific saved
+grant covers them. Wildcard allow rules do not remove the scope check.
+
+`PermissionCoordinator` resolves the final Ask decision with a popup under Ask,
+RejectOnce under Deny, or AllowOnce under Allow. Automatic decisions do not persist
+rules or directories. Forced ordinary provider callbacks use this same decision
+path. Proposal reviews, plan acceptance, and user questions keep their own lifecycle.
 
 `/config` exposes both scopes and directory lists for Copilot, Codex, and ACP, independently
 of sandbox support. Configuration saves global defaults through the existing settings store,
@@ -1357,8 +1372,9 @@ The broker publishes applied settings before resuming provider execution. That e
 the terminal catalog policy and completes the configuration picker while the task continues.
 
 `CodexSecurity` sends `sandbox` plus per-thread configuration to thread start, resume, and
-fork, and sends `sandboxPolicy` to every turn start. Read maps to native `untrusted`, Write
-to `on-request`, and YOLO to `never`. Workspace writes include the workspace and configured
+fork, and sends `sandboxPolicy` to every turn start. All approval selections use
+native `untrusted` routing so Harness receives ordinary decisions. Write-off selects
+native read-only isolation when sandboxing is enabled. Workspace writes include the workspace and configured
 directories. Full scope uses mounted filesystem roots while retaining OS isolation. Windows
 backend selection is independent of approvals. Background terminal thread resumes receive
 the same settings, so polling cannot restore an older policy.
@@ -1400,14 +1416,14 @@ the execution workspace also offer "Always allow writes in this workspace", whic
 an absolute workspace edit rule without enabling filesystem-wide writes or changing approval
 mode. When the directory and workspace coincide, this choice replaces the duplicate broad
 allow choice. External targets do not offer an unrelated workspace grant. Explicit denials,
-protected targets, and the Read-mode transition remain authoritative.
+protected targets, and write-off remain authoritative.
 
 These scopes authorize reported file operations, not every filesystem access performed by
 a provider, shell command, or MCP server. Copilot and ACP do not acquire an OS filesystem
 sandbox from these controls. Codex's native sandbox separately constrains writes, but Forge
 does not translate Read scope into native read isolation. A file callback without a path
-always asks for a one-request decision and explains that directory limits and protected paths
-cannot be verified. It never substitutes the workspace or offers a persistent directory grant.
+requires a one-request decision, resolved by Ask/Deny/Allow, because directory limits
+and protected paths cannot be verified. Unknown writes are rejected while writes are off. It never substitutes the workspace or offers a persistent directory grant.
 
 The global Rulesync config omits the `permissions` feature only for `codexcli`. Codex therefore
 cannot apply a generated exec-policy denial before Harness evaluates the request. Direct Codex CLI
@@ -1418,12 +1434,24 @@ their existing generated permission outputs.
 
 Only the transcript window owns the Harness winbar. The composer clears its window-local
 winbar so the split presents session identity once. The transcript winbar begins directly
-with the active execution mode and resolved runtime model. Its right side shows remaining
+with confirmed access and approval, followed by the resolved runtime model. Its right side shows remaining
 context followed by the sole command hint, `? help`, using the configured help binding.
-The composer displays no key hints. `/config` displays
+Every field separator uses the shared small gray `·` segment from `shared/keymaps`.
+Separators retain their own highlight independently of permission, lifecycle, and error text.
+The composer displays no key hints. Its bindings cover submission, queue editing,
+cancellation, write toggling, reasoning adjustment, and prompt history. Transcript
+navigation, help, and close bindings remain in the transcript so they do not replace
+native prompt editing keys. `/config` displays
 the underlying CLI provider.
-The winbar renders the configured service tier as `+` for fast or `++` for ultrafast,
-including before the model catalog loads. Configuration admission validates tier support.
+The winbar prefixes the model and thinking level with a gray outlined lightning glyph
+(`󱐌`, U+F140C) for Fast or a filled glyph (`󱐋`, U+F140B) in YOLO's neon red for Ultrafast,
+including before the model catalog loads. Standard has no glyph. The icon and gray
+model text share a field without an intervening separator. Model, thinking, and speed
+changes share one trailing `*` after thinking only when they interrupt existing work
+and any selected value still differs from the applied session. Configuration captures
+this distinction before the coordinator marks itself busy and retains it across
+superseding operations. Idle and paused changes show no marker. The marker clears
+once all values agree. Configuration admission validates tier support.
 The model picker and `/config` share `views/picker/field.lua` for field rendering.
 The active field uses arrows, while inactive fields retain equal-width padding.
 `/config` stores Logging preferences through the shared field picker.
@@ -1437,7 +1465,15 @@ the provider turn. Copilot publishes the same event when the root session report
 The broker persists this identity and forwards it directly to the winbar without waiting for
 turn completion or a model-picker catalog request. Runtime identity events have no turn
 address or transcript content, and child-agent model reports cannot replace the session model.
-Catalog lookups only fill an unresolved default and never overwrite an observed runtime model.
+Startup suppresses session fields and retained transcript rendering until the first
+snapshot applies. The snapshot publishes access and model identity together. Startup
+failure or dismissed session selection clears that pending state.
+For an unresolved `default`, broker initialization reads the latest resolved default
+from current-format sessions in the same workspace and backend before publishing the
+snapshot. The storage query selects only the model string. It does not load transcript
+history. Explicit model selections remain unchanged. The asynchronous catalog refresh
+updates a default session when its default model changes, persists the result, and emits
+`session_configured`. An unchanged catalog emits no redundant configuration event.
 
 `/rename <name>` routes directly to the broker's durable `session.rename` request rather
 than entering the model transcript. The broker retains rename metadata without displaying a
@@ -1656,8 +1692,12 @@ identity lookup, even when the child turn fails or is interrupted.
 
 ## Session and preference compatibility
 
-Session format 43 hides incompatible session records without deleting them. Preference format 40
-remains independent of session compatibility. Reopening retains child identities, completed
+Session format 51 hides incompatible session records without deleting them. Preference format 41
+remains independent of session compatibility. Portable settings layers, application snapshots,
+and replay receipts use their own exact versioned envelope in `settings.db`. Unversioned or
+incompatible records remain stored but do not participate in inheritance, replay, or forking.
+Current-format decoding failures remain errors. Provider model preferences, imported resources,
+and catalog bindings stay independent of that envelope. Reopening retains child identities, completed
 outcomes, and provider history, marks unfinished child tasks interrupted, and never replays them
 automatically. Root forking does not transfer live child execution ownership.
 
@@ -1666,7 +1706,7 @@ automatically. Root forking does not transfer live child execution ownership.
 - Add task-level diff annotations and feedback cycles now that stable task identity and shared
   diff rendering exist in the timeline.
 - Audit provider-local hooks and command policies that can still reject a tool under Harness
-  WRITE, because backend-native policy layers remain authoritative outside the Harness protocol.
+  Allow, because backend-native policy layers remain authoritative outside the Harness protocol.
 - Move the per-Neovim broker to a shared daemon only if cross-editor live control becomes
   valuable enough to justify process discovery and stronger lease coordination.
 - Add provider strategies only through the typed `Backend` contract. Do not scrape PTYs.
@@ -1704,7 +1744,7 @@ retains the conversation and current execution until a replacement task is submi
 Session listing and resumption compare existing workspace paths after filesystem resolution,
 so alternate separators do not hide a session from its worktree.
 `TaskRecord` identifies a conversation-scoped Plan, Execute, or Goal workflow, its saved
-permission, phase, lifecycle status, generation, and attempt identity. Plan and goal records
+access and approval selections, phase, lifecycle status, generation, and attempt identity. Plan and goal records
 retain their workflow-specific evidence. `current_task_id` selects the task independently of
 the conversation permission. The selected task owns the current plan through `TaskRecord.plan_id`.
 `HarnessSession` does not store a second plan selection. Pausing a task retains its plan association and hides planning
@@ -1724,9 +1764,10 @@ submitted plan in this conversation. Selection accepts the exact revision and tr
 Plan task into Execute. Terminal executions require an explicit fork. Forking a plan uses its
 latest saved design and reassesses the current repository without copying execution evidence.
 
-The default writable permission is Write and applies to new Goal tasks and accepted plans.
-The Plan permission defaults to Keep current. Both preferences live in `/config`.
-Explicit resume restores saved permission. Selecting Read pauses Execute and Goal tasks.
+The default approval is Ask and applies to new Goal tasks and accepted plans.
+The Plan approval defaults to Keep current. Both preferences live in `/config`.
+Explicit resume restores the task's saved access and approval. Workflow changes never
+enable writing or expand filesystem scope.
 Interrupting retains the selected task. The next ordinary message resumes a paused Plan,
 Execute, or Goal task with its saved context and the message as additional instructions.
 Control-triggered resumption records a lifecycle title on its exchange instead of a user
@@ -1750,7 +1791,18 @@ Settings received before a new task acquires its identity reject visibly without
 that task. The coordinator
 closes conflicting execution admission, collects the previous provider attempt, finishes
 checkpoint finalization, and applies the latest intent. Superseded intents cannot start a
-provider attempt. Ctrl-C submits a pause intent. Backend goal continuation stays inside the
+provider attempt. Permission admission resolves each toggle against the preceding pending
+permission selection, or the confirmed session when no selection is pending. The latest
+operation retains that cumulative selection without publishing it before application, so
+back-to-back access and approval commands preserve both changes even if an earlier operation
+is superseded. The cumulative selection includes sandbox enablement, so a pending
+`/yolo` cannot lose sandbox-off when another permission command supersedes it.
+Directory grants remain owned by the confirmed session.
+The shared coordinator also carries configuration and compaction operations, which do not
+create tasks. The winbar uses the operation's action to reserve task-control progress for
+workflow actions. Configuration keeps confirmed policy and the existing workflow visible
+without a task-submission label. Configuration failures retain their normal diagnostics.
+Ctrl-C submits a pause intent. Backend goal continuation stays inside the
 service-owned execution lifetime rather than relying on Lua to submit the next turn.
 The execution permit, rather than a contended broker mutex, identifies provider work that needs
 cleanup. Admitted execution waits up to ten seconds for transient broker ownership. Settled
@@ -1867,7 +1919,9 @@ for a state transition that the observer will discard.
 `checks.editing` persists `check_editing` in the session settings layer and updates
 shared live authority without acquiring provider execution admission. New conversations
 default to off. The broker snapshot supplies the permission for the Harness winbar.
-`/checks setup on` and `/checks setup off` send this control request without creating
+The winbar appends `ce` after the access and approval suffix in the same gray field,
+such as `rxwxce` or `rxwxaxce`, and omits it when editing is disabled.
+`/checks edit on` and `/checks edit off` send this control request without creating
 an exchange, interrupting active work, or issuing a model prompt.
 
 Configuration requests use ordinary chat, not a dedicated setup operation.
@@ -1878,8 +1932,8 @@ contract references the skill without repeating its body. Automatic planning
 prerequisites also reference it and retain the original plan request.
 Questions are optional and never authorize publication. Every `check_definition_edit` invocation
 reviews the exact configuration and managed helper changes through the shared
-approval coordinator in Read and Write modes, regardless of saved allow rules.
-YOLO skips this review. Review choices apply only to that submission and do not
+approval coordinator in Ask mode, regardless of saved allow rules.
+Deny rejects this review and Allow approves it once. Write-off still rejects the writes. Review choices apply only to that submission and do not
 create permission rules. Check tools read the
 shared permission at invocation and before publication, so revocation also applies to
 already-open tool scopes. Configuration still validates revisions, managed helpers,

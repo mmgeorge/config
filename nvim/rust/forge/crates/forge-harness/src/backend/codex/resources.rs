@@ -242,7 +242,7 @@ mod test {
             harness_session_id: "session".into(),
             workspace: root.path().to_string_lossy().into_owned(),
             access: Default::default(),
-            execution_mode: crate::session::PermissionMode::Read,
+            approval_mode: crate::session::ApprovalMode::Ask,
             backend_session_id: None,
         };
         let resources = CodexResources::new(root.path(), &request, vec!["unused".into()])?;
@@ -299,7 +299,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &request.workspace,
-            request.execution_mode,
+            request.approval_mode,
             crate::backend::approval::PermissionCoordinator::transient(&request.workspace)?,
             None,
             trace.clone(),

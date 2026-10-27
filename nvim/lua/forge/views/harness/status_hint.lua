@@ -171,10 +171,10 @@ function M.render(transcript, commands, width)
   local context = status and status.hint ~= vim.NIL and status.hint or nil
   if row and status and status.animated then
     local session = require("forge.session").harness.session or {}
-    local capture = require("forge.infra.highlights").harness_mode(session.execution_mode)
+    local capture = "ForgeTimelineStatus"
     local text = vim.api.nvim_buf_get_lines(target_buffer, row, row + 1, false)[1]
     animate(transcript, row, {
-      id = 1, sign_hl_group = capture,
+      id = 1, sign_hl_group = "ForgeTimelineStatusSpinner",
       end_row = row, end_col = #text, hl_group = capture, priority = 110,
     })
   end

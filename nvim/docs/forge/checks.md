@@ -9,21 +9,24 @@ for approval before saving.
 Saved results from an older check-history format remain on disk but are excluded from
 the current session history. Plans containing the older check configuration must be recreated.
 
-`/checks setup on` enables check-editing permission without sending a prompt.
-`/checks setup off` disables it without sending a prompt, including during active work.
+`/checks edit on` enables check-editing permission without sending a prompt.
+`/checks edit off` disables it without sending a prompt, including during active work.
 The permission starts off, applies to this Harness conversation, and survives reopening.
-The winbar shows `check editing on` while enabled. The same permission is
+The winbar appends gray `ce` to the permissions code while enabled, such as
+`rxwxce` or `rxwxaxce`. The same permission is
 available in `/config` under **Checks → Setup**, toggled with Space. Enabling
 permission does not run checks, send a prompt, or change which checks are enabled.
 Request configuration changes in ordinary chat, such as "Configure targeted checks
 for this repository." The `harness-checks` skill supplies discovery, schema, and
 scoped-runner guidance through the shared Rulesync skill catalog. Bare
-`/checks setup` and `/checks setup <check-id>` are not commands.
+`/checks edit` and `/checks edit <check-id>` are not commands.
 
-Every `check_definition_edit` submission opens an approval popup in Read and Write modes,
-even when saved rules allow the files. The popup shows the configuration and managed
-helper changes. Approve publishes that exact update, while rejection, cancellation,
-or timeout leaves the existing files unchanged. YOLO approves without a popup.
+`check_definition_edit` follows the selected approval mode after saved rules and
+filesystem access checks. Ask opens a popup for requests that require approval,
+Deny rejects them, and Allow approves them once without saving a grant. The popup
+shows the configuration and managed helper changes. Approve publishes that exact
+update, while rejection, cancellation, or timeout leaves the existing files unchanged.
+Write-off rejects publication in every approval mode.
 Setup questions are optional and do not authorize publication.
 
 Planning still configures missing or invalid checks before generating the plan.

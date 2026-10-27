@@ -18,7 +18,7 @@
 //! Do not add `--ignored` or `--include-ignored` to routine checks.
 
 use forge_harness::backend::{BackendCatalogRequest, BackendInput, BackendRequest, PromptMode};
-use forge_harness::session::PermissionMode;
+use forge_harness::session::ApprovalMode;
 use std::path::Path;
 
 #[path = "live_provider/catalog.rs"]
@@ -39,7 +39,7 @@ fn catalog_request(workspace: &Path, session_id: &str) -> BackendCatalogRequest 
         workspace: workspace.to_string_lossy().into_owned(),
         backend_session_id: None,
         access: Default::default(),
-        execution_mode: PermissionMode::Read,
+        approval_mode: ApprovalMode::Ask,
     }
 }
 
@@ -55,7 +55,7 @@ fn prompt_request(request: &BackendCatalogRequest) -> BackendRequest {
         context_window: None,
         service_tier: Default::default(),
         access: request.access.clone(),
-        execution_mode: request.execution_mode,
+        approval_mode: request.approval_mode,
         backend_session_id: request.backend_session_id.clone(),
         submission: None,
         recovered_input: Vec::new(),

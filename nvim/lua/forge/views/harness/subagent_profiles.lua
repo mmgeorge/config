@@ -10,7 +10,7 @@ local column_layout = { compact = true }
 local field_list = {
   { "name", "Name" }, { "description", "Purpose" },
   { "provider", "Provider" }, { "model", "Model" }, { "reasoning_effort", "Thinking" },
-  { "service_tier", "Speed" }, { "permission_mode", "Permissions" },
+  { "service_tier", "Speed" }, { "approval_mode", "Approval" },
   { "enabled", "Enable" }, { "default", "Default profile" }, { "instructions", "Instructions" },
 }
 
@@ -47,7 +47,7 @@ function Profiles.open(state, host, selected_name)
     local fields = {}
     local choices = {
       provider = {}, model = {}, reasoning_effort = {}, service_tier = {},
-      permission_mode = { "inherit", "read", "write", "yolo" },
+      approval_mode = { "inherit", "ask", "deny", "allow" },
       enabled = { "Yes", "No" }, default = { "No", "Yes" },
     }
     for _, field in ipairs(field_list) do

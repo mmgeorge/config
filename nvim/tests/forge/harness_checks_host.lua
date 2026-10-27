@@ -1,5 +1,6 @@
 vim.loader.enable(false)
 local root = vim.fs.normalize(vim.fn.getcwd())
+vim.opt.runtimepath:prepend(root .. "/nvim")
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
@@ -67,13 +68,18 @@ local succeeded, failure = xpcall(function()
   local controller = require("forge.views.harness.controller")
   assert(state.check_editing == false, "check editing must default off")
   local function toggle_editing(enabled)
-    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/checks setup " .. (enabled and "on" or "off") })
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/checks edit " .. (enabled and "on" or "off") })
     controller.submit()
     assert(vim.wait(3000, function() return state.check_editing == enabled end, 10), "editing toggle did not settle")
     local winbar = vim.wo[state.transcript_win].winbar
-    assert((winbar:find("check editing on", 1, true) ~= nil) == enabled,
-      "winbar must show check editing only when enabled")
-    assert(not winbar:find("check editing off", 1, true), "winbar must omit disabled check editing")
+    local text = vim.api.nvim_eval_statusline(winbar, { use_winbar = true, maxwidth = 240 }).str
+    local policy = state.access_abbreviation
+      .. (({ deny = "dx", allow = "ax" })[state.session.approval_mode] or "")
+      .. (enabled and "ce" or "")
+    assert(text:find(policy .. " · ", 1, true), "winbar lost its check-editing suffix: " .. text)
+    assert(winbar:find("%#ForgeStatusLabel#" .. policy .. "%*", 1, true), "check editing changed policy color")
+    assert(not text:find("check editing", 1, true), "winbar retained the separate check-editing field")
+    assert(not text:find("Task ", 1, true), "editing toggle appeared as task submission")
   end
   toggle_editing(true)
   toggle_editing(false)

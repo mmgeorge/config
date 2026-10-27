@@ -14,7 +14,7 @@ for _, key in ipairs({ "d", "c", "x", "p", "P", "q", "?", "<Tab>", "<CR>" }) do
   local mapping = vim.fn.maparg(key, "n", false, true)
   assert(mapping.buffer ~= 1, "composer shadowed ordinary editing key: " .. key)
 end
-for _, id in ipairs({ "submit", "queue", "cancel", "edit_queued", "next_queued", "toggle_mode", "history_previous", "history_next" }) do
+for _, id in ipairs({ "submit", "queue", "cancel", "edit_queued", "next_queued", "toggle_write", "history_previous", "history_next" }) do
   for _, key in ipairs(keymaps.view_keys_for("harness", id)) do
     assert(vim.fn.maparg(key, "n", false, true).buffer == 1, "missing composer control: " .. id)
   end

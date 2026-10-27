@@ -64,16 +64,16 @@ controller.attach()
 
 local workspace = vim.fn.getcwd()
 local entry_list = {
-  { id = "active", name = "Architecture review", workspace = workspace, backend = "mock", execution_mode = "read" },
-  { id = "streaming", name = "Streaming renderer", workspace = workspace, backend = "mock", execution_mode = "write" },
-  { id = "picker", name = "Picker polish", workspace = workspace, backend = "mock", execution_mode = "read" },
-  { id = "gamma", name = "Gamma migration", workspace = workspace, backend = "mock", execution_mode = "write" },
-  { id = "plans", name = "Plan review", workspace = workspace, backend = "mock", execution_mode = "read" },
-  { id = "agents", name = "Agent timeline", workspace = workspace, backend = "mock", execution_mode = "read" },
-  { id = "approvals", name = "Approval flow", workspace = workspace, backend = "mock", execution_mode = "write" },
-  { id = "rollback", name = "Rollback checks", workspace = workspace, backend = "mock", execution_mode = "read" },
-  { id = "unnamed", name = "", workspace = workspace, backend = "mock", execution_mode = "read" },
-  { id = "remote", name = "Remote repository", workspace = workspace .. "-remote", backend = "mock", execution_mode = "read" },
+  { id = "active", name = "Architecture review", workspace = workspace, backend = "mock", approval_mode = "ask" },
+  { id = "streaming", name = "Streaming renderer", workspace = workspace, backend = "mock", approval_mode = "ask" },
+  { id = "picker", name = "Picker polish", workspace = workspace, backend = "mock", approval_mode = "ask" },
+  { id = "gamma", name = "Gamma migration", workspace = workspace, backend = "mock", approval_mode = "ask" },
+  { id = "plans", name = "Plan review", workspace = workspace, backend = "mock", approval_mode = "ask" },
+  { id = "agents", name = "Agent timeline", workspace = workspace, backend = "mock", approval_mode = "ask" },
+  { id = "approvals", name = "Approval flow", workspace = workspace, backend = "mock", approval_mode = "ask" },
+  { id = "rollback", name = "Rollback checks", workspace = workspace, backend = "mock", approval_mode = "ask" },
+  { id = "unnamed", name = "", workspace = workspace, backend = "mock", approval_mode = "ask" },
+  { id = "remote", name = "Remote repository", workspace = workspace .. "-remote", backend = "mock", approval_mode = "ask" },
 }
 
 state.session = entry_list[1]

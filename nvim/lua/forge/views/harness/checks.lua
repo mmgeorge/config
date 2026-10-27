@@ -286,7 +286,7 @@ function Checks.open(state, host)
       page_list = {
         { id = "checks", title = "Project checks · " .. (load_error and "Unavailable" or catalog.configured and (present(catalog.snapshot) and "Configured" or "Configuration error") or "Unconfigured"),
           column_headers = { "Check", "Category", "Auto", "Directory" }, option_list = rows,
-          empty_text = "No checks configured. Enable /checks setup on, then request configuration in chat.",
+          empty_text = "No checks configured. Enable /checks edit on, then request configuration in chat.",
           footer = "↑↓ select  Space enable/disable  Tab field  ←→ value  [] pages  i details  q close",
           action_list = {
             { id = "toggle", key = "<Space>", callback = function() change("enabled", 1) end },

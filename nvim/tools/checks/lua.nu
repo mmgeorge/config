@@ -4,8 +4,8 @@ def main [suite: string, --full, --timeout: duration = 30sec] {
   cd $request.workspace
   let selected_suite = $request.inputs.suite? | default $suite
   let fixture = $request.inputs.fixture? | default ""
-  if $suite == "affected" and $selected_suite in ["extended" "benchmarks"] {
-    error make {msg: "Use lua-test-host or lua-benchmark for build-dependent coverage"}
+  if $suite == "affected" and $selected_suite in ["mock-integration" "live-integration" "extended" "benchmarks"] {
+    error make {msg: "Use lua-test-mock-integration, lua-test-live-integration, or lua-benchmark for build-dependent coverage"}
   }
   if $fixture != "" and ($selected_suite != "affected" or $full or $request.selection.kind == "all") {
     error make {msg: "Choose an exact fixture or a full suite, not both"}

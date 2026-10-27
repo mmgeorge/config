@@ -957,7 +957,7 @@ fn configured_checks(
     use crate::checks::{CheckScope, CheckTrigger};
 
     let message = match snapshot {
-        None => Some("Unconfigured · enable /checks setup on and request configuration in chat."),
+        None => Some("Unconfigured · enable /checks edit on and request configuration in chat."),
         Some(snapshot) if snapshot.config.definitions.is_empty() => {
             Some("No automated checks configured.")
         }

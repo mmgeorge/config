@@ -35,6 +35,10 @@ local finish_execution
 local resume_check_interrupted_prompt
 local render_status_hint
 local queue_only_commands = { ["/plan"] = true }
+local workflow_action = {
+  plan = true, execute = true, goal = true, fork = true, attach_plan = true,
+  resume = true, pause = true, clear = true, undo = true,
+}
 
 ---@param state table
 ---@param field string
@@ -203,77 +207,73 @@ end
 ---@return { text: string, group: string }[]
 local function status_text()
   local state = harness_state()
-  local active_session = state.session or {}
+  if state.initial_snapshot_pending or not state.session then return {} end
+  local active_session = state.session
   local current_task = task_control.current(state)
-  local pending_marker = state.busy and (not current_task or current_task.status == "running") and "*" or ""
-  local raw_mode = state.pending_mode or active_session.execution_mode or "read"
-  local mode = raw_mode:lower() == "yolo" and "YOLO" or (raw_mode:sub(1, 1):upper() .. raw_mode:sub(2))
-  if state.pending_mode then mode = mode .. pending_marker end
+  local approval = active_session.approval_mode or "ask"
+  local abbreviation = state.access_abbreviation or "rxw"
+  local policy_label = abbreviation .. (({ deny = "dx", allow = "ax" })[approval] or "")
+    .. (state.check_editing and "ce" or "")
+  local yolo = abbreviation == "rxwx" and approval == "allow"
+    and (active_session.access or {}).sandbox == false
   local configured_model = active_session.model or config.options.harness.model
   local model = active_session.resolved_model or (configured_model == "default" and "resolving model" or configured_model)
   local effort = selected_setting(state, "effort")
   local selected_model = selected_setting(state, "model")
-  if selected_model ~= configured_model then model = selected_model .. pending_marker end
-  if effort ~= (active_session.effort or config.options.harness.effort) then effort = effort .. pending_marker end
-  local busy = state.host_error and " • host stopped"
-    or state.execution_notice and " • stopped"
-    or state.cancel_requested and " • cancelling"
+  if selected_model ~= configured_model then model = selected_model end
+  local busy = state.host_error and "host stopped"
+    or state.execution_notice and "stopped"
+    or state.cancel_requested and "cancelling"
     or state.busy and ""
-    or (#state.queue > 0 and (" • queued " .. #state.queue) or "")
-  local goal = current_task and (" • " .. current_task.kind .. " · " .. current_task.phase
-    .. (current_task.status == "running" and "" or " · " .. current_task.status)) or nil
-  if state.task_operation and state.task_operation.state ~= "running" then
-    goal = " • Task " .. state.task_operation.state
-  end
-  if state.sync_error then goal = " • State unavailable: " .. state.sync_error end
-  if state.connection_error then goal = " • " .. state.connection_error end
+    or (#state.queue > 0 and ("queued " .. #state.queue) or "")
   local tier = selected_setting(state, "service_tier")
-  local tier_label = ({ fast = " +", ultrafast = " ++" })[tier] or ""
-  if tier ~= (active_session.service_tier or "default") and pending_marker ~= "" then
-    tier_label = (tier == "default" and " standard" or tier_label) .. "*"
+  local speed_icon = ({ fast = "󱐌", ultrafast = "󱐋" })[tier]
+  local deferred = state.configuration_completion and state.configuration_completion.deferred
+  if deferred == nil and state.task_operation and state.task_operation.action == "configure" then
+    deferred = state.task_operation.configuration_deferred
   end
-  local segment_list = {
-    {
-      text = mode,
-      group = require("forge.infra.highlights").harness_mode(raw_mode),
-    },
-    {
-      text = (" • %s %s%s"):format(model, effort, tier_label),
-      group = "ForgeStatusLabel",
-    },
-  }
+  local model_pending = deferred == true and (selected_model ~= configured_model
+    or effort ~= (active_session.effort or config.options.harness.effort)
+    or tier ~= (active_session.service_tier or "default"))
+  local model_text = ("%s %s%s"):format(model, effort, model_pending and "*" or "")
+  local segment_list = {}
+  local function append_status(text, group)
+    if not text or text == "" then return end
+    if #segment_list > 0 then segment_list[#segment_list + 1] = keymaps.winbar_separator end
+    segment_list[#segment_list + 1] = { text = text, group = group }
+  end
+  if yolo then append_status("YOLO", "ForgeHarnessYoloIndicator") end
+  append_status(policy_label, "ForgeStatusLabel")
   if (active_session.access or {}).sandbox ~= false then
-    segment_list[#segment_list + 1] = { text = " • sandbox", group = "ForgeStatusLabel" }
+    append_status("sandbox", "ForgeStatusLabel")
   end
-  if state.check_editing then
-    segment_list[#segment_list + 1] = {
-      text = " • check editing on",
-      group = "ForgeStatusLabel",
-    }
+  if speed_icon then
+    append_status(speed_icon, tier == "ultrafast" and "ForgeHarnessUltrafast" or "ForgeStatusLabel")
+    segment_list[#segment_list + 1] = { text = " " .. model_text, group = "ForgeStatusLabel" }
+  else
+    append_status(model_text, "ForgeStatusLabel")
   end
   local selected_run = selected_agent_run(state)
-  segment_list[#segment_list + 1] = {
-    text = selected_run and (" • " .. (selected_run.nickname or selected_run.definition)) or " • Main",
-    group = "ForgeStatusLabel",
-  }
-  if goal then
-    segment_list[#segment_list + 1] = { text = goal, group = "ForgeHarnessGoal" }
+  append_status(selected_run and (selected_run.nickname or selected_run.definition) or "Main", "ForgeStatusLabel")
+  if state.connection_error then
+    append_status(state.connection_error, "ForgeHarnessGoal")
+  elseif state.sync_error then
+    append_status("State unavailable: " .. state.sync_error, "ForgeHarnessGoal")
+  elseif state.task_operation and workflow_action[state.task_operation.action]
+    and state.task_operation.state ~= "running" then
+    append_status("Task " .. state.task_operation.state, "ForgeHarnessGoal")
+  elseif current_task then
+    append_status(current_task.kind, "ForgeHarnessGoal")
+    append_status(current_task.phase, "ForgeHarnessGoal")
+    if current_task.status ~= "running" then append_status(current_task.status, "ForgeHarnessGoal") end
   end
   local artifact_count = #(state.artifact or {})
   if artifact_count > 0 then
-    segment_list[#segment_list + 1] = {
-      text = (" • %d %s"):format(artifact_count, artifact_count == 1 and "artifact" or "artifacts"),
-      group = "ForgeStatusLabel",
-    }
+    append_status(("%d %s"):format(artifact_count, artifact_count == 1 and "artifact" or "artifacts"), "ForgeStatusLabel")
   end
-  if busy ~= "" then
-    segment_list[#segment_list + 1] = { text = busy, group = "ForgeStatusLabel" }
-  end
+  append_status(busy, "ForgeStatusLabel")
   if state.configuration_error then
-    segment_list[#segment_list + 1] = {
-      text = " • Settings rejected: " .. state.configuration_error:gsub("%s+", " "),
-      group = "ForgeHarnessToolFailure",
-    }
+    append_status("Settings rejected: " .. state.configuration_error:gsub("%s+", " "), "ForgeHarnessToolFailure")
   end
   return segment_list
 end
@@ -281,10 +281,11 @@ end
 function M.refresh_winbar()
   local state = harness_state()
   if not state.command_set then return end
-  tabline.set_session_name(state.timeline_tab, state.session and state.session.name)
-  local right_status = context_status.segment(state.session and state.session.context_usage) or {}
+  local active_session = not state.initial_snapshot_pending and state.session or nil
+  tabline.set_session_name(state.timeline_tab, active_session and active_session.name)
+  local right_status = context_status.segment(active_session and active_session.context_usage) or {}
   for _, hint in ipairs(keymaps.view_hint_entries("harness", state.command_set, state, "queue_edit")) do
-    if #right_status > 0 then right_status[#right_status + 1] = { text = " • ", group = "ForgeStatusHint" } end
+    if #right_status > 0 then right_status[#right_status + 1] = keymaps.winbar_separator end
     right_status[#right_status + 1] = { text = hint.key, group = "ForgeStatusHintKey" }
     right_status[#right_status + 1] = { text = " " .. hint.label, group = "ForgeStatusHint" }
   end
@@ -311,6 +312,7 @@ local function working_seconds()
 end
 
 render_status_hint = function(state)
+  if state.initial_snapshot_pending then return end
   if state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
     and vim.b[state.composer_buf].forge_queue_rows ~= nil then
     vim.api.nvim_buf_clear_namespace(state.composer_buf, queue_namespace, 0, -1)
@@ -337,6 +339,7 @@ end
 
 function M.render()
   local state = harness_state()
+  if state.initial_snapshot_pending then M.refresh_winbar() return end
   if not state.host_error then check_queue.publish(state, function() vim.schedule(M.drain) end) end
   render_status_hint(state)
   if state.host_error then M.refresh_winbar() return end
@@ -580,7 +583,6 @@ local function on_event(event, payload)
       { owner = tostring(client.host_generation()), category = "host", severity = payload.expected and "info" or "error",
         recovery = "reconnect", clear_when = "new host generation" })
     state.execution_notice = payload.message .. ". Reopen Harness to reconnect."
-    state.pending_mode = nil
     state.cancel_requested = false
     state.state_sync_pending, state.state_sync_again, state.state_sync_callback = nil, nil, nil
     state.configuring, state.configuration_debounce = false, false
@@ -743,8 +745,7 @@ local function on_event(event, payload)
       local provider_fork_state = state.session and state.session.provider_fork_state or {}
       notifications.error(provider_fork_state.message or "Provider fork preparation failed", "Harness fork")
     end
-  elseif event == "session_changed" or event == "session_configured" or event == "mode_changed"
-    or event == "execution_mode_changed"
+  elseif event == "session_changed" or event == "session_configured"
   then
     local next_session = payload.session or payload
     if event == "session_changed" and state.session and next_session.id ~= state.session.id then
@@ -763,7 +764,7 @@ local function on_event(event, payload)
       prompt_history.reset_navigation()
     end
     state.session = next_session
-    if payload.operation_id then state.pending_mode = nil end
+    if payload.access_abbreviation then state.access_abbreviation = payload.access_abbreviation end
     local configuration = state.configuration_completion
     if configuration and state.task_operation and payload.operation_id == state.task_operation.id then
       if state.task_config and type(state.task_config.lsp_tools) == "boolean" then state.lsp_tools = state.task_config.lsp_tools end
@@ -773,9 +774,6 @@ local function on_event(event, payload)
       state.configuration_completion = nil
       state.task_config = nil
       configuration.complete(true)
-    end
-    if (event == "execution_mode_changed" or event == "mode_changed") then
-      state.pending_mode = nil
     end
     M.refresh_winbar()
   elseif event == "agent_updated" then
@@ -810,15 +808,6 @@ function M.present_approval(reopen)
   end
   require("forge.views.harness.approval").open(request, {
     owner_label = owner_label,
-    switch_mode = function(mode, callback)
-      if harness_state() ~= state or state.host_error or not state.session
-        or not vim.iter(state.approval or {}):any(function(pending) return pending.id == request.id end) then
-        notifications.error("This permission request is no longer active", "Harness permission")
-        callback(false)
-        return
-      end
-      M.task_transition({ action = "permission", mode = mode }, nil, callback)
-    end,
     interrupt = function()
       if child_id then M.agent_action("interrupt", child_id)
       else M.task_transition({ action = "pause" }) end
@@ -1110,12 +1099,6 @@ function M.drain()
   if state.busy or state.prompt_submission or state.switching_backend or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
   if #(state.pending_steer or {}) > 0 then return end
   if state.status and state.status.kind == "finalizing" then return end
-  if state.pending_mode then
-    local pending_mode = state.pending_mode
-    state.pending_mode = nil
-    M.set_mode(pending_mode)
-    return
-  end
   if state.pending_config then
     local pending_config = state.pending_config
     local validate_selection = state.pending_config_validate == true
@@ -1772,25 +1755,23 @@ function M.submit()
     end)
     return
   end
-  if vim.tbl_contains({ "/read", "/write", "/yolo" }, text) then
+  local permission_change = {
+    ["/read full"] = { kind = "toggle_read_scope" },
+    ["/write"] = { kind = "toggle_write_enabled" },
+    ["/write full"] = { kind = "toggle_write_scope" },
+    ["/ask"] = { kind = "set_approval", mode = "ask" },
+    ["/deny"] = { kind = "set_approval", mode = "deny" },
+    ["/allow"] = { kind = "set_approval", mode = "allow" },
+    ["/yolo"] = { kind = "enable_yolo" },
+  }
+  if permission_change[text] then
     set_composer_text(state.composer_buf, "")
-    M.set_mode(text:sub(2))
+    M.task_transition({ action = "permission", change = permission_change[text] })
     return
   end
-  if text == "/mode" then
-    set_composer_text(state.composer_buf, "")
-    M.select_mode()
-    return
-  end
-  local execution_mode = text:match("^/mode%s+(%S+)$")
-  if execution_mode then
-    set_composer_text(state.composer_buf, "")
-    execution_mode = execution_mode:lower()
-    if not vim.tbl_contains({ "read", "write", "yolo" }, execution_mode) then
-      report_configuration_error("Unknown execution mode: " .. execution_mode)
-      return
-    end
-    M.set_mode(execution_mode)
+  local command = text:match("^(/%S+)")
+  if vim.tbl_contains({ "/read", "/write", "/mode", "/ask", "/deny", "/allow", "/yolo" }, command) then
+    report_configuration_error("Use /read full, /write, /write full, /ask, /deny, /allow, or /yolo")
     return
   end
   if text == "/effort" then
@@ -1813,7 +1794,7 @@ function M.submit()
     require("forge.views.harness.checks").open(state, picker_host(state))
     return
   end
-  local check_editing = text:match("^/checks setup%s+(%S+)$")
+  local check_editing = text:match("^/checks%s+edit%s+(%S+)$")
   if check_editing == "on" or check_editing == "off" then
     set_composer_text(state.composer_buf, "")
     local session_id = state.session.id
@@ -2520,44 +2501,8 @@ function M.task_transition(action, submitted_text, completed, method)
   M.refresh_winbar()
 end
 
-function M.set_mode(mode)
-  mode = mode:lower()
-  if not vim.tbl_contains({ "read", "write", "yolo" }, mode) then
-    report_configuration_error("Unknown permission: " .. mode)
-    return
-  end
-  M.task_transition({ action = "permission", mode = mode })
-end
-
-function M.toggle_mode()
-  local state = harness_state()
-  local current_mode = state.pending_mode
-    or (state.session and state.session.execution_mode) or "read"
-  M.set_mode(current_mode == "read" and "write" or "read")
-end
-
-function M.select_mode()
-  local state = harness_state()
-  local current_mode = state.pending_mode
-    or (state.session and state.session.execution_mode) or "read"
-  local detail_list = {
-    read = "Ask before edits and untrusted commands.",
-    write = "Apply saved approval rules within configured access.",
-    yolo = "Skip approval prompts within configured access.",
-  }
-  local option_list = vim.tbl_map(function(mode)
-    local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
-    if mode == current_mode then label = label .. " (current)" end
-    return {
-      label = label,
-      detail = detail_list[mode],
-      value = mode,
-      highlight_group = require("forge.infra.highlights").harness_mode(mode),
-      highlight_text = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2)),
-    }
-  end, { "read", "write", "yolo" })
-  open_choice_picker(state, "Select Mode", nil, option_list,
-    M.set_mode)
+function M.toggle_write()
+  M.task_transition({ action = "permission", change = { kind = "toggle_write_enabled" } })
 end
 
 ---@param next_config table
@@ -2565,6 +2510,14 @@ end
 ---@param completed? fun(applied: boolean)
 configure_now = function(next_config, validate_selection, completed)
   local state = harness_state()
+  local deferred
+  if state.configuration_completion then
+    deferred = state.configuration_completion.deferred
+  elseif state.task_operation and state.task_operation.action == "configure" then
+    deferred = state.task_operation.configuration_deferred == true
+  else
+    deferred = state.busy == true
+  end
   local request_config = vim.tbl_extend("force", state.task_config or {}, next_config, { validate = validate_selection == true })
   state.task_config = request_config
   state.configuring = true
@@ -2572,7 +2525,7 @@ configure_now = function(next_config, validate_selection, completed)
   state.configuration_error = nil
   if state.configuration_completion then state.configuration_completion.complete(false) end
   local finished = false
-  local configuration = { complete = function(applied)
+  local configuration = { deferred = deferred, complete = function(applied)
     if finished then return end
     finished = true
     if state.configuring_config == request_config then
@@ -2751,6 +2704,7 @@ function M.activate_snapshot(result)
   local state = harness_state()
   local previous_session = state.session and state.session.id
   if not snapshot.apply(state, result) then return end
+  state.initial_snapshot_pending = nil
   require("forge.views.harness.health").watch(state, function()
     if harness_state() == state then M.render() end
   end)
@@ -2781,7 +2735,7 @@ function M.command_set()
   command_set.register(set, "queue", M.queue_submit)
   command_set.register(set, "steer", M.steer_submit)
   command_set.register(set, "cancel", M.cancel_turn)
-  command_set.register(set, "toggle_mode", M.toggle_mode)
+  command_set.register(set, "toggle_write", M.toggle_write)
   command_set.register(set, "previous_prompt", function() M.jump_prompt(-1) end)
   command_set.register(set, "next_prompt", function() M.jump_prompt(1) end)
   command_set.register(set, "toggle_activity", M.toggle_activity)
@@ -2811,16 +2765,17 @@ function M.attach_transcript(buf)
   keymaps.setup_view_keymaps(buf, "harness", state.command_set)
 end
 
----Keep timeline navigation out of the editable prompt's command bindings.
+---Keep the editable prompt's bindings limited to input and tuning controls.
 ---@return ForgeViewCommandSet
 function M.composer_command_set()
   local set = M.command_set()
-  local timeline_controls = {
-    visual_line_with_gutter = true, previous_prompt = true, next_prompt = true,
-    toggle_activity = true, open_timeline = true,
+  local composer_controls = {
+    submit = true, queue = true, steer = true, cancel = true,
+    toggle_write = true, edit_queued = true, next_queued = true,
+    effort_down = true, effort_up = true,
   }
   for _, id in ipairs(vim.deepcopy(set.order)) do
-    if timeline_controls[id] then command_set.unregister(set, id) end
+    if not composer_controls[id] then command_set.unregister(set, id) end
   end
   command_set.register(set, "history_previous", prompt_history.previous)
   command_set.register(set, "history_next", prompt_history.next)

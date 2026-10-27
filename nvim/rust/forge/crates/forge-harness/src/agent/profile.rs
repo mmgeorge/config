@@ -35,7 +35,7 @@ pub struct AgentProfile {
     #[serde(default = "inherit")]
     pub service_tier: String,
     #[serde(default = "inherit")]
-    pub permission_mode: String,
+    pub approval_mode: String,
 }
 
 impl Default for AgentProfile {
@@ -48,7 +48,7 @@ impl Default for AgentProfile {
             model: inherit(),
             reasoning_effort: inherit(),
             service_tier: inherit(),
-            permission_mode: inherit(),
+            approval_mode: inherit(),
         }
     }
 }
@@ -120,10 +120,10 @@ impl AgentProfileDocument {
             );
             ensure!(
                 matches!(
-                    profile.permission_mode.as_str(),
-                    "inherit" | "read" | "write" | "yolo"
+                    profile.approval_mode.as_str(),
+                    "inherit" | "ask" | "deny" | "allow"
                 ),
-                "profile {name} has an unsupported permission_mode"
+                "profile {name} has an unsupported approval_mode"
             );
         }
         Ok(())
@@ -281,6 +281,18 @@ fn revision(bytes: Option<&[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_in_profiles_load_through_the_runtime_store() -> Result<()> {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../forge/subagents.json");
+        ensure!(path.is_file(), "checked-in subagent catalog is missing");
+        let store = AgentProfileStore::new(path);
+        let snapshot = store.snapshot()?;
+        ensure!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        store.resolve(None)?;
+        Ok(())
+    }
 
     #[test]
     fn large_profile_documents_round_trip_complete_instructions() -> Result<()> {

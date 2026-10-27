@@ -306,6 +306,7 @@ impl BrokerObserver {
             })
             .collect();
         Ok(BrokerSnapshot {
+            access_abbreviation: session.access.abbreviation().into(),
             subagent_tools: self.agent_coordinator.enabled(),
             lsp_tools: self.lsp.enabled(&source_session.id),
             status_thoughts,

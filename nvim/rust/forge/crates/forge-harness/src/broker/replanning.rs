@@ -71,8 +71,9 @@ impl HarnessBroker {
             document.overview = request.clone();
         }
         self.pause_task(false).await?;
-        if let Some(permission) = self.session.plan_permission {
-            self.select_execution_mode(json!({"mode":permission}))?;
+        if let Some(permission) = self.session.plan_approval {
+            self.configure_session(json!({"approval_mode":permission}))
+                .await?;
         }
         let now_ms = self.clock.now_ms();
         let plan_id = document.plan_id.clone();
@@ -110,7 +111,8 @@ impl HarnessBroker {
             self.session.id.clone(),
             plan.title.clone(),
             crate::task::TaskKind::Plan,
-            self.session.execution_mode,
+            self.session.access.clone(),
+            self.session.approval_mode,
             now_ms,
         );
         task.plan_id = Some(plan.id.clone());

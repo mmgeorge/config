@@ -1,7 +1,7 @@
 use forge_harness::backend::copilot::CopilotBackend;
 use forge_harness::backend::{Backend, BackendCatalogRequest, BackendLaunch, TextGeneration};
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
-use forge_harness::session::PermissionMode;
+use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
 use serde_json::{Value, json};
 use std::process::Command;
@@ -17,7 +17,7 @@ async fn isolated_commit_generation_uses_existing_login_without_starting_shared_
         harness_session_id: "copilot-isolated-commit".into(),
         workspace: temporary.path().to_string_lossy().into_owned(),
         access: Default::default(),
-        execution_mode: PermissionMode::Read,
+        approval_mode: ApprovalMode::Ask,
         backend_session_id: None,
     };
     let message = tokio::time::timeout(Duration::from_secs(120), backend.generate_text(
@@ -78,7 +78,7 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
         harness_session_id: "copilot-mcp-no-args-test".into(),
         workspace: workspace.to_string_lossy().into_owned(),
         access: Default::default(),
-        execution_mode: PermissionMode::Read,
+        approval_mode: ApprovalMode::Ask,
         backend_session_id: None,
     };
     let server = tokio::time::timeout(Duration::from_secs(40), backend.mcp_list(request.clone()))
@@ -153,7 +153,7 @@ async fn lists_native_copilot_skills_and_mcp_rows() {
         harness_session_id: "copilot-catalog".into(),
         workspace: temporary.path().to_string_lossy().into_owned(),
         access: Default::default(),
-        execution_mode: PermissionMode::Read,
+        approval_mode: ApprovalMode::Ask,
         backend_session_id: None,
     };
     let skill_list =

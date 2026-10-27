@@ -125,7 +125,7 @@ local succeeded,failure = xpcall(function()
   local profiles = request("agent.profiles.get")
   profiles.document.profiles["test-child"] = { enabled=true,description="Runtime verification child",instructions="",
     provider=child_backend == "mock" and "inherit" or child_backend,model=child_model or "inherit",
-    reasoning_effort="default",service_tier="default",permission_mode="inherit" }
+    reasoning_effort="default",service_tier="default",approval_mode="inherit" }
   request("agent.profiles.save",{expected_revision=profiles.revision,document=profiles.document})
   if vim.g.forge_agent_test_manual ~= false then
   local admitted = request("agent.start",{profile="test-child",text="Reply exactly " .. marker .. ". Do not use tools or access files."})

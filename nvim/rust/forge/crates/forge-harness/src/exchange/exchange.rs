@@ -86,8 +86,8 @@ pub struct Exchange {
     #[serde(default)]
     pub kind: ExchangeKind,
     #[serde(default)]
-    /// Interaction mode retained independently of later session mode changes.
-    pub mode: Option<crate::session::PermissionMode>,
+    /// Approval selection captured when this exchange starts.
+    pub approval_mode: Option<crate::session::ApprovalMode>,
     #[serde(default)]
     pub plan_id: Option<String>,
     #[serde(default)]
@@ -198,7 +198,7 @@ impl Exchange {
             prompt: delegation.task.clone(),
             lifecycle: None,
             kind: ExchangeKind::Chat,
-            mode: None,
+            approval_mode: None,
             plan_id: None,
             execution_id: None,
             execution_phase: None,
@@ -979,7 +979,7 @@ mod test {
             ordinal: 1,
             prompt: "inspect the repository".into(),
             kind: ExchangeKind::Chat,
-            mode: None,
+            approval_mode: None,
             plan_id: None,
             execution_id: None,
             execution_phase: None,

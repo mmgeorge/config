@@ -30,6 +30,9 @@ function M.transition(state, action, refresh, settled, admitted, method)
   action.operation_id = identity
   local previous = state.task_operation
   local operation = { id = identity, action = action.action, config = action.config, state = "submitting" }
+  if action.action == "configure" and state.configuration_completion then
+    operation.configuration_deferred = state.configuration_completion.deferred
+  end
   state.task_operation = operation
   state.execution_notice = nil
   state.execution_notice_operation = nil
@@ -164,7 +167,8 @@ local function inspect(host, task, transition)
   local options = {
     { label = task.kind .. " · " .. task.phase .. " · " .. task.status,
       detail = task.reason or "Task history retained", value = {} },
-    { label = "Permission: " .. task.permission,
+    { label = ("Read: %s · Write: %s · Approval: %s"):format(
+        task.access.read_access, task.access.write_access, task.approval_mode),
       detail = "Attempt " .. tostring(task.generation), value = {} },
   }
   if task.plan_id then

@@ -14,7 +14,6 @@ use crate::permissions::{
     document::PermissionDecision,
     matcher::{CompiledPermissionDocument, PermissionRequest, PermissionTarget},
 };
-use crate::session::PermissionMode;
 use forge_protocol::{message::SessionEvent, outbound::MessageSender};
 
 mod contract;
@@ -135,7 +134,6 @@ impl LspService {
         interaction: String,
         workspace: PathBuf,
         policy: Arc<CompiledPermissionDocument>,
-        mode: PermissionMode,
         cancelled: Arc<AtomicBool>,
     ) -> (Arc<LspScope>, LspLease) {
         let selection = self
@@ -152,7 +150,6 @@ impl LspService {
             interaction,
             workspace,
             policy,
-            mode,
             cancelled,
             active: AtomicBool::new(true),
             selection,
@@ -352,7 +349,6 @@ pub(crate) struct LspScope {
     interaction: String,
     workspace: PathBuf,
     policy: Arc<CompiledPermissionDocument>,
-    mode: PermissionMode,
     cancelled: Arc<AtomicBool>,
     active: AtomicBool,
     selection: Arc<Selection>,
@@ -402,15 +398,12 @@ impl LspScope {
             .context("path is not UTF-8")?
             .trim_start_matches("\\\\?\\")
             .replace('\\', "/");
-        let decision = self.policy.evaluate(
-            self.mode,
-            &PermissionRequest {
-                id: self.interaction.clone(),
-                provider: "harness-lsp".into(),
-                reason: None,
-                target_list: vec![PermissionTarget::Read { path }],
-            },
-        )?;
+        let decision = self.policy.evaluate(&PermissionRequest {
+            id: self.interaction.clone(),
+            provider: "harness-lsp".into(),
+            reason: None,
+            target_list: vec![PermissionTarget::Read { path }],
+        })?;
         ensure!(
             decision.decision == PermissionDecision::Allow,
             "access_denied: {}",
@@ -595,7 +588,6 @@ mod tests {
             "interaction".into(),
             directory.path().into(),
             policy,
-            PermissionMode::Read,
             Arc::new(AtomicBool::new(false)),
         );
         (directory, service, scope, lease, receiver)

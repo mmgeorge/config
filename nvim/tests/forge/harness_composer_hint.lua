@@ -13,9 +13,13 @@ local ok, failure = xpcall(function()
     keymaps.apply_view_winbar(0, "", "harness", commands, status, nil, context)
     return vim.api.nvim_eval_statusline(vim.wo.winbar, { use_winbar = true, maxwidth = 2000 }).str
   end
-  for _, status in ipairs({ "Read", string.rep("Read ", vim.api.nvim_win_get_width(0)) }) do
+  for _, status in ipairs({ "Read", string.rep("Read ", vim.api.nvim_win_get_width(0)),
+    { { text = "Read", group = "ForgeHarnessRead" } },
+    { { text = string.rep("Read ", vim.api.nvim_win_get_width(0)), group = "ForgeHarnessRead" } },
+  }) do
     local text = top_bar(status)
-    assert(text:find("75% left (200K) • ? help", 1, true), "context must precede help in wide and compact bars")
+    assert(text:find("75% left (200K) · ? help", 1, true), "context must precede help in wide and compact bars")
+    assert(vim.wo.winbar:find("%#ForgeStatusHint# · %*", 1, true), "context separator is not gray")
     assert(not text:find("submit", 1, true), "top bar contains additional command hints")
   end
   config.options.keymaps.harness.help = "<F1>"
@@ -45,8 +49,10 @@ local ok, failure = xpcall(function()
   assert(display(busy):find("<C-q> unqueue", 1, true), "editing must advertise moving the message back to the prompt")
   assert(display(busy):find("<M-t> next queued", 1, true), "queue editing must advertise forward navigation")
   local editing_hints = keymaps.view_hint_entries("harness", commands, busy, "queue_edit")
-  assert(#editing_hints == 3 and editing_hints[1].id == "queue")
-  assert(editing_hints[3].id == "next_queued" and editing_hints[3].key == "<M-t>")
+  local editing_hint_by_id = {}
+  for _, hint in ipairs(editing_hints) do editing_hint_by_id[hint.id] = hint end
+  assert(#editing_hints == 3 and editing_hint_by_id.queue.label == "unqueue")
+  assert(editing_hint_by_id.next_queued.key == "<M-t>")
   config.options.keymaps.harness.queue = "<F6>"
   assert(display(busy):find("<F6> unqueue", 1, true), "unqueue must use the configured queue binding")
   config.options.keymaps.harness.queue = original.queue

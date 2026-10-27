@@ -4,7 +4,7 @@ use crate::backend::submission::{Submission, SubmissionState, SubmissionStore, S
 use crate::backend::{
     Backend, BackendInput, BackendKind, BackendRequest, PromptMode, SteeringInput,
 };
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -78,7 +78,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
             context_window: None,
             service_tier: Default::default(),
             access: kind.resolve_access(Default::default()),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
             submission: None,
             recovered_input: Vec::new(),

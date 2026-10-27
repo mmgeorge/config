@@ -7,6 +7,9 @@ local config = require("forge.infra.config")
 local popup_window = require("forge.infra.popup_window")
 local command_specs = require("forge.shared.command_specs")
 
+---@type { text: string, group: string }
+M.winbar_separator = { text = " · ", group = "ForgeStatusHint" }
+
 ---@param key string
 ---@param bindings string[]
 ---@return boolean
@@ -190,6 +193,7 @@ end
 ---@param right_status? { text: string, group: string }[]
 function M.apply_view_winbar(win, title, group, command_set, status, context, right_status)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  local separator = ("%%#%s#%s%%*"):format(M.winbar_separator.group, M.winbar_separator.text)
   local title_text = tostring(title or "")
   local status_segments = type(status) == "table" and status or nil
   local status_text = status_segments and table.concat(vim.tbl_map(function(segment) return segment.text end, status_segments))
@@ -215,12 +219,12 @@ function M.apply_view_winbar(win, title, group, command_set, status, context, ri
       local rendered_left = title_text ~= "" and ("%%#ForgeStatusLabel#%s%%*"):format(left) or status_rendered
       local rendered_center = title_text ~= "" and status_rendered or ""
       local rendered_right = right_status_rendered
-      if rendered_right ~= "" and hint ~= "" then rendered_right = rendered_right .. " • " end
+      if rendered_right ~= "" and hint ~= "" then rendered_right = rendered_right .. separator end
       vim.wo[win].winbar = ("%s%%=%s%%=%s%%#ForgeStatusHint#%s%%*"):format(rendered_left, rendered_center, rendered_right, hint)
       return
     end
     local rendered_right = right_status_rendered
-    if rendered_right ~= "" and hint ~= "" then rendered_right = rendered_right .. " • " end
+    if rendered_right ~= "" and hint ~= "" then rendered_right = rendered_right .. separator end
     vim.wo[win].winbar = ("%%#ForgeStatusLabel#%s%%*%%=%%#ForgeStatusHint#%s%%*%%=%s%%#ForgeStatusHint#%s%%*")
       :format(left, center, rendered_right, hint)
     return
@@ -231,7 +235,7 @@ function M.apply_view_winbar(win, title, group, command_set, status, context, ri
     vim.api.nvim_win_get_width(win), { inline = true }) or ""
   local compact_content = right_status_rendered
   if help_hint ~= "" then
-    if compact_content ~= "" then compact_content = compact_content .. " • " end
+    if compact_content ~= "" then compact_content = compact_content .. separator end
     compact_content = compact_content .. ("%%#ForgeStatusHint#%s%%*"):format(help_hint)
   end
   local compact_right = compact_content ~= "" and ("%%=%s"):format(compact_content) or ""

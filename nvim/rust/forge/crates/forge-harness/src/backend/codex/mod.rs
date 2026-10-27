@@ -7,7 +7,7 @@ use crate::backend::{
     McpStatus, McpToolDefinition, PromptMode, SkillDefinition,
 };
 use crate::control_tools::ControlToolRegistry;
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -94,11 +94,7 @@ fn capability() -> BackendCapability {
         ultrafast_mode: true,
         permission_control: true,
         background_terminals: true,
-        execution_mode_list: vec![
-            PermissionMode::Read,
-            PermissionMode::Write,
-            PermissionMode::Yolo,
-        ],
+        approval_mode_list: vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow],
         agent: crate::agent::AgentCapability::default(),
         catalog: CatalogCapability {
             skill: true,
@@ -188,7 +184,7 @@ impl CodexBackend {
         let mut process = runtime
             .connect(
                 &request.workspace,
-                request.execution_mode,
+                request.approval_mode,
                 Arc::clone(&self.permission_coordinator),
                 event_sink,
                 Arc::clone(&self.trace),
@@ -224,7 +220,7 @@ impl CodexBackend {
             harness_session_id: request.harness_session_id.clone(),
             workspace: request.workspace.clone(),
             access: request.access.clone(),
-            execution_mode: request.execution_mode,
+            approval_mode: request.approval_mode,
             backend_session_id: request.backend_session_id.clone(),
         }
     }
@@ -395,7 +391,7 @@ impl CodexBackend {
                 .lock()
                 .await
                 .process
-                .set_request_context(&request.workspace, request.execution_mode, event_sink)
+                .set_request_context(&request.workspace, request.approval_mode, event_sink)
                 .await;
             return Ok(connection);
         }
@@ -416,7 +412,7 @@ impl CodexBackend {
     }
 
     fn apply_security(params: &mut Value, request: &BackendRequest) {
-        CodexSecurity::new(request.execution_mode, &request.access)
+        CodexSecurity::new(request.approval_mode, &request.access)
             .apply_turn(params, &request.workspace);
     }
 
@@ -426,7 +422,7 @@ impl CodexBackend {
     }
 
     fn secure_thread(mut params: Value, request: &BackendRequest) -> Value {
-        CodexSecurity::new(request.execution_mode, &request.access)
+        CodexSecurity::new(request.approval_mode, &request.access)
             .apply_thread(&mut params, &request.workspace);
         params["config"]["agents.enabled"] = json!(false);
         params
@@ -470,7 +466,7 @@ impl CodexBackend {
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: request.access.clone(),
-            execution_mode: request.execution_mode,
+            approval_mode: request.approval_mode,
             backend_session_id: request.backend_session_id.clone(),
             submission: None,
             recovered_input: Vec::new(),
@@ -2241,7 +2237,7 @@ mod test {
             harness_session_id: "checkpoint".into(),
             workspace: workspace.clone(),
             access: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
         });
         let gate = crate::checkpoint::ToolGate::new()?;
@@ -2251,7 +2247,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             PermissionCoordinator::transient(&workspace)?,
             None,
             Arc::new(TraceStore::open(fixture.path())?),
@@ -2364,7 +2360,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             permission,
             None,
             trace,
@@ -2376,7 +2372,7 @@ mod test {
             harness_session_id: "session".into(),
             workspace,
             access: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: Some("provider-thread".into()),
         };
         let result = CodexBackend::load_terminal_thread(
@@ -2403,7 +2399,7 @@ mod test {
             harness_session_id: "session".into(),
             workspace: workspace.clone(),
             access: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: Some("provider-thread".into()),
         };
         let resources = CodexResources::new(fixture.path(), &request, vec!["unused".into()])?;
@@ -2457,7 +2453,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             PermissionCoordinator::transient(&workspace)?,
             None,
             Arc::new(TraceStore::open(fixture.path())?),
@@ -2510,7 +2506,7 @@ mod test {
             harness_session_id: "session".into(),
             workspace: workspace.clone(),
             access: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: Some("provider-thread".into()),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2537,7 +2533,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             permission,
             None,
             trace,
@@ -2619,7 +2615,7 @@ mod test {
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: Some("source-thread".into()),
             submission: None,
             recovered_input: Vec::new(),
@@ -2684,7 +2680,7 @@ mod test {
         let process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             permission,
             None,
             trace.clone(),
@@ -2709,7 +2705,7 @@ mod test {
             context_window: None,
             service_tier: crate::backend::ServiceTier::Ultrafast,
             access: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
             submission: None,
             recovered_input: Vec::new(),
@@ -2987,7 +2983,7 @@ mod test {
             let process = CodexJsonRpc::connect(
                 &endpoint,
                 &workspace,
-                PermissionMode::Read,
+                ApprovalMode::Ask,
                 permission,
                 None,
                 trace,
@@ -3017,7 +3013,7 @@ mod test {
                 context_window: None,
                 service_tier,
                 access: Default::default(),
-                execution_mode: PermissionMode::Read,
+                approval_mode: ApprovalMode::Ask,
                 backend_session_id: resumed.then(|| "parent".into()),
                 submission: None,
                 recovered_input: Vec::new(),
@@ -3252,7 +3248,7 @@ mod test {
             let process = CodexJsonRpc::connect(
                 &endpoint,
                 &workspace,
-                PermissionMode::Read,
+                ApprovalMode::Ask,
                 permission,
                 None,
                 trace,
@@ -3281,7 +3277,7 @@ mod test {
                         context_window: None,
                         service_tier: crate::backend::ServiceTier::Standard,
                         access: Default::default(),
-                        execution_mode: PermissionMode::Read,
+                        approval_mode: ApprovalMode::Ask,
                         backend_session_id: Some("parent".into()),
                         submission: None,
                         recovered_input: Vec::new(),

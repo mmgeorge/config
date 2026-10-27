@@ -112,7 +112,7 @@ M.view_specs = {
     { id = "next_queued", label = "next queued", desc = "Move forward through queued prompts without changing their order", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state) if state.queue_edit then return "next queued" end end,
         queue_edit = function(state) if state.queue_edit then return "next queued" end end } },
-    { id = "toggle_mode", label = "mode", desc = "Toggle Read and Write mode", modes = { "n", "i" }, pinned = false },
+    { id = "toggle_write", label = "write", desc = "Toggle filesystem writing", modes = { "n", "i" }, pinned = false },
     { id = "previous_prompt", label = "previous", desc = "Jump to the previous user prompt", modes = "n", pinned = false },
     { id = "next_prompt", label = "next", desc = "Jump to the next user prompt", modes = "n", pinned = false },
     { id = "history_previous", label = "history-", desc = "Recall the previous submitted prompt", modes = { "n", "i" }, pinned = false },

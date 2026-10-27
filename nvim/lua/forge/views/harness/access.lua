@@ -5,7 +5,7 @@ local notifications = require("forge.infra.notifications")
 ---@class ForgeDirectoryPolicy
 ---@field sandbox boolean
 ---@field read_access "workspace"|"full"
----@field write_access "workspace"|"full"
+---@field write_access "off"|"workspace"|"full"
 ---@field readable_directory string[]
 ---@field writable_directory string[]
 ---@field windows_sandbox "elevated"|"unelevated"|"mxc"
@@ -93,7 +93,8 @@ function M.directories(state, host, apply, back, operation)
     picker.close(false)
     picker.open({ owner = "harness-" .. label .. "-directories", host = host,
       page_list = { { id = "directories", title = "Additional " .. label .. " directories",
-        subtitle = policy[scope] == "full" and "Already covered by full " .. operation .. " access" or "Allowed alongside the workspace · independent of sandbox",
+        subtitle = policy[scope] == "off" and "Retained grants are inactive while writing is off"
+          or policy[scope] == "full" and "Already covered by full " .. operation .. " access" or "Allowed alongside the workspace · independent of sandbox",
         option_list = options, footer = "Enter add/edit  d remove  q back" } },
       action_list = { { id = "remove", key = "d", callback = remove } },
       on_close = back,

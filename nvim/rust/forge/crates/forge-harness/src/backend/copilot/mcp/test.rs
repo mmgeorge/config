@@ -3,7 +3,7 @@ use crate::backend::copilot::CopilotBackend;
 use crate::backend::{
     Backend, BackendCatalogRequest, BackendInput, BackendRequest, McpStatus, PromptMode,
 };
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 use github_copilot_sdk::Client;
 use std::sync::{
     Arc, Mutex,
@@ -190,7 +190,7 @@ impl Fixture {
                 sandbox: false,
                 ..Default::default()
             },
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
         }
     }
@@ -213,7 +213,7 @@ impl Fixture {
                 sandbox: false,
                 ..Default::default()
             },
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
             submission: None,
             recovered_input: Vec::new(),

@@ -4,14 +4,6 @@
 
 local M = {}
 
----Return the shared highlight group for a Harness interaction mode.
----@param mode string?
----@return string
-function M.harness_mode(mode)
-  return ({ read = "ForgeHarnessRead", write = "ForgeHarnessWrite",
-    yolo = "ForgeHarnessYolo", plan = "ForgeHarnessPlan" })[(mode or "read"):lower()] or "ForgeHarnessRead"
-end
-
 function M.setup()
   local palette = require("theme.palette")
   local function get_bg(name)
@@ -80,9 +72,8 @@ function M.setup()
   vim.api.nvim_set_hl(0, "ForgeHarnessResponse", { fg = palette.white, bold = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessGoal", { fg = palette.green, bold = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessRead", { fg = palette.white, bold = true })
-  vim.api.nvim_set_hl(0, "ForgeHarnessWrite", { fg = palette.orange, bold = true })
-  vim.api.nvim_set_hl(0, "ForgeHarnessYolo", { fg = palette.purple, bold = true })
-  vim.api.nvim_set_hl(0, "ForgeHarnessPlan", { fg = palette.purple, bold = true })
+  vim.api.nvim_set_hl(0, "ForgeHarnessYoloIndicator", { fg = palette.red, bold = true })
+  vim.api.nvim_set_hl(0, "ForgeHarnessUltrafast", { link = "ForgeHarnessYoloIndicator" })
   vim.api.nvim_set_hl(0, "ForgeHarnessCommentary", { italic = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessCommand", { fg = palette.light_blue, bold = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessOption", { fg = palette.red })

@@ -2,7 +2,7 @@ use super::coordinator::*;
 use super::{AgentSelection, AgentSource};
 use crate::{
     backend::{BackendKind, ServiceTier},
-    session::PermissionMode,
+    session::ApprovalMode,
 };
 
 fn selection(provider: BackendKind) -> AgentSelection {
@@ -15,7 +15,7 @@ fn selection(provider: BackendKind) -> AgentSelection {
         context_window: None,
         service_tier: ServiceTier::Standard,
         access: Default::default(),
-        execution_mode: PermissionMode::Write,
+        approval_mode: ApprovalMode::Ask,
     }
 }
 

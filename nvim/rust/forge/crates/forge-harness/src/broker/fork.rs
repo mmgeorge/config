@@ -3,9 +3,7 @@ use crate::backend::{
     BackendCapability, BackendForkRequest, BackendForkResult, BackendInput, BackendRequest,
     BackendTimingRecord, PromptMode,
 };
-use crate::session::{
-    HarnessSession, PermissionMode, ProviderForkPoint, ProviderForkState, SessionStore,
-};
+use crate::session::{HarnessSession, ProviderForkPoint, ProviderForkState, SessionStore};
 use crate::storage::SqliteStore;
 use crate::timeline::{
     SessionEventKind, SessionEventRecord, TimelineEntry, TimelineProjection, TimelineProjector,
@@ -81,7 +79,7 @@ pub fn prepare_provider_fork(
         point: fork_point.clone(),
     };
     child.context_usage.clone_from(&source.context_usage);
-    child.execution_mode = PermissionMode::Read;
+    child.approval_mode = source.approval_mode;
 
     child.current_task_id = None;
     child.goal_id = None;
@@ -162,7 +160,7 @@ pub fn prepare_provider_fork(
             context_window: source.context_window,
             service_tier: source.service_tier,
             access: source.access,
-            execution_mode: PermissionMode::Read,
+            approval_mode: source.approval_mode,
             backend_session_id: fork_point.backend_session_id,
             submission: None,
             recovered_input: Vec::new(),

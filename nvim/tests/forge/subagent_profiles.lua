@@ -22,9 +22,9 @@ local catalog_by_provider = {
 local snapshot = { path = "global/forge/subagents.json", revision = "1", document = {
   default_profile = "worker", profiles = {
     worker = { enabled = true, description = "Implement", instructions = "Worker instructions", provider = "inherit",
-      model = "inherit", reasoning_effort = "inherit", service_tier = "inherit", permission_mode = "inherit" },
+      model = "inherit", reasoning_effort = "inherit", service_tier = "inherit", approval_mode = "inherit" },
     reviewer = { enabled = true, description = "Review", instructions = "Reviewer instructions", provider = "inherit",
-      model = "inherit", reasoning_effort = "inherit", service_tier = "inherit", permission_mode = "inherit" },
+      model = "inherit", reasoning_effort = "inherit", service_tier = "inherit", approval_mode = "inherit" },
   },
 } }
 snapshot.document.profiles.disabled = vim.tbl_extend("force", snapshot.document.profiles.reviewer, { enabled = false })

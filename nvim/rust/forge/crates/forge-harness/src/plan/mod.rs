@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use self::edit_trace::{PlanEditTrace, measure};
-use crate::session::{PermissionMode, continuation::ContinuationBudget};
+use crate::session::{ApprovalMode, continuation::ContinuationBudget};
 
 mod audit;
 mod comment_lint;
@@ -372,30 +372,30 @@ pub struct PlanAcceptance {
     pub overall_comment: Option<String>,
     #[serde(default)]
     pub saved_source_digest: Option<String>,
-    pub execution_mode_list: Vec<PermissionMode>,
+    pub approval_mode_list: Vec<ApprovalMode>,
     pub elicitation: PlanElicitation,
 }
 
 impl PlanAcceptance {
     /// Build acceptance questions from the execution modes exposed by the active backend.
-    pub fn new(review_digest: String, execution_mode_list: &[PermissionMode]) -> Result<Self> {
+    pub fn new(review_digest: String, approval_mode_list: &[ApprovalMode]) -> Result<Self> {
         anyhow::ensure!(
-            !execution_mode_list.is_empty(),
+            !approval_mode_list.is_empty(),
             "the active backend exposes no execution mode"
         );
         let mut question_list = Vec::new();
-        if !execution_mode_list.is_empty() {
+        if !approval_mode_list.is_empty() {
             question_list.push(PlanQuestion {
                 id: "acceptance-execution-mode".into(),
-                header: "Execution access".into(),
-                question: "What access should accepted-plan execution receive?".into(),
-                options: execution_mode_list
+                header: "Tool approval".into(),
+                question: "How should execution handle tool approval?".into(),
+                options: approval_mode_list
                     .iter()
                     .copied()
                     .map(|mode| PlanQuestionOption {
                         recommended: false,
-                        label: execution_mode_option_label(mode).into(),
-                        description: execution_mode_option_description(mode).into(),
+                        label: approval_mode_option_label(mode).into(),
+                        description: approval_mode_option_description(mode).into(),
                     })
                     .collect(),
                 allow_freeform: false,
@@ -410,21 +410,20 @@ impl PlanAcceptance {
             review_digest,
             overall_comment: None,
             saved_source_digest: None,
-            execution_mode_list: execution_mode_list.to_vec(),
+            approval_mode_list: approval_mode_list.to_vec(),
             elicitation: PlanElicitation::new(question_set),
         })
     }
 
     /// Resolve the selected execution boundary only after every acceptance question has an answer.
-    pub fn execution_mode(&self) -> Result<PermissionMode> {
-        if self.execution_mode_list.len() == 1 {
-            return Ok(self.execution_mode_list[0]);
+    pub fn approval_mode(&self) -> Result<ApprovalMode> {
+        if self.approval_mode_list.len() == 1 {
+            return Ok(self.approval_mode_list[0]);
         }
         match selected_option(&self.elicitation, "acceptance-execution-mode")? {
-            "Read" => Ok(PermissionMode::Read),
-            "Write (Recommended)" => Ok(PermissionMode::Write),
-
-            "YOLO" => Ok(PermissionMode::Yolo),
+            "ask" => Ok(ApprovalMode::Ask),
+            "deny" => Ok(ApprovalMode::Deny),
+            "allow" => Ok(ApprovalMode::Allow),
             option => anyhow::bail!("unsupported execution access choice {option:?}"),
         }
     }
@@ -444,21 +443,19 @@ fn selected_option<'a>(elicitation: &'a PlanElicitation, question_id: &str) -> R
     }
 }
 
-const fn execution_mode_option_label(mode: PermissionMode) -> &'static str {
+const fn approval_mode_option_label(mode: ApprovalMode) -> &'static str {
     match mode {
-        PermissionMode::Read => "Read",
-        PermissionMode::Write => "Write (Recommended)",
-
-        PermissionMode::Yolo => "YOLO",
+        ApprovalMode::Ask => "ask",
+        ApprovalMode::Deny => "deny",
+        ApprovalMode::Allow => "allow",
     }
 }
 
-const fn execution_mode_option_description(mode: PermissionMode) -> &'static str {
+const fn approval_mode_option_description(mode: ApprovalMode) -> &'static str {
     match mode {
-        PermissionMode::Read => "Ask before edits and untrusted commands.",
-        PermissionMode::Write => "Apply saved approval rules within configured access.",
-
-        PermissionMode::Yolo => "Run without interactive approval checks.",
+        ApprovalMode::Ask => "Apply saved rules and ask for remaining requests.",
+        ApprovalMode::Deny => "Reject requests that require approval.",
+        ApprovalMode::Allow => "Approve remaining requests once, preserving explicit denies.",
     }
 }
 
@@ -1542,11 +1539,8 @@ mod test {
         assert!(
             matches!(&fallback.answer[1].response, PlanQuestionResponse::Selected {option,..} if option == "First")
         );
-        let mut acceptance = PlanAcceptance::new(
-            "digest".into(),
-            &[PermissionMode::Read, PermissionMode::Write],
-        )
-        .unwrap();
+        let mut acceptance =
+            PlanAcceptance::new("digest".into(), &[ApprovalMode::Ask, ApprovalMode::Ask]).unwrap();
         assert_eq!(acceptance.overall_comment, None);
         acceptance
             .elicitation
@@ -2560,23 +2554,20 @@ mod test {
 
     #[test]
     fn acceptance_requires_execution_access_before_execution() {
-        let mut acceptance = PlanAcceptance::new(
-            "digest".into(),
-            &[PermissionMode::Write, PermissionMode::Read],
-        )
-        .unwrap();
+        let mut acceptance =
+            PlanAcceptance::new("digest".into(), &[ApprovalMode::Ask, ApprovalMode::Ask]).unwrap();
         assert_eq!(acceptance.elicitation.question_set.questions.len(), 1);
-        assert!(acceptance.execution_mode().is_err());
+        assert!(acceptance.approval_mode().is_err());
         acceptance
             .elicitation
             .answer(
                 "acceptance-execution-mode",
                 PlanQuestionResponse::Selected {
-                    option: "Write (Recommended)".into(),
+                    option: "ask".into(),
                     feedback: None,
                 },
             )
             .unwrap();
-        assert_eq!(acceptance.execution_mode().unwrap(), PermissionMode::Write);
+        assert_eq!(acceptance.approval_mode().unwrap(), ApprovalMode::Ask);
     }
 }

@@ -2,7 +2,7 @@ use super::*;
 use crate::agent::AgentCapability;
 use crate::goal::TurnEvidence;
 use crate::plan::{PlanQuestionAnswer, PlanQuestionSet, PlanQuestionWithdrawal};
-use crate::session::{ContextUsage, PermissionMode};
+use crate::session::{ApprovalMode, ContextUsage};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -94,7 +94,7 @@ pub struct BackendCapability {
     /// Exposes a provider-owned terminal inventory without running a model prompt.
     pub background_terminals: bool,
     #[serde(default)]
-    pub execution_mode_list: Vec<PermissionMode>,
+    pub approval_mode_list: Vec<ApprovalMode>,
     pub agent: AgentCapability,
     #[serde(default)]
     pub catalog: CatalogCapability,
@@ -139,7 +139,7 @@ pub struct BackendRequest {
     /// Carries the session tier through explicit and continuation turns.
     pub service_tier: ServiceTier,
     pub access: crate::session::AccessPolicy,
-    pub execution_mode: PermissionMode,
+    pub approval_mode: ApprovalMode,
     pub backend_session_id: Option<String>,
     #[serde(skip, default)]
     /// Durable acknowledgment capability attached before dispatch.
@@ -652,6 +652,11 @@ pub struct BackendModel {
 /// Requires session lifecycle ownership and provides explicit failures for optional operations.
 #[async_trait]
 pub trait Backend: Send + Sync {
+    /// Expose explicit response barriers only for the in-process mock provider.
+    fn mock_response_control(&self) -> Option<&super::mock_response::MockResponseControl> {
+        None
+    }
+
     /// Reports whether every local tool waits on the request's checkpoint barrier.
     fn checkpoint_tool_gate(&self) -> bool {
         false
@@ -877,6 +882,7 @@ pub fn build(
             acp::AcpBackend::new(kind, launch.command, permission_coordinator, settings_root)?,
         )),
         BackendKind::Mock => Ok(Box::new(MockBackend {
+            response_control: Default::default(),
             lsp_probe: launch
                 .command
                 .first()
@@ -918,6 +924,7 @@ pub fn build(
 }
 
 struct MockBackend {
+    response_control: super::mock_response::MockResponseControl,
     lsp_probe: bool,
     retained_control: Option<
         std::sync::Mutex<
@@ -935,6 +942,40 @@ struct MockBackend {
 }
 
 impl MockBackend {
+    async fn wait_for_response(
+        &self,
+        hold: Option<&super::mock_response::MockResponseLease<'_>>,
+        steering: &mut ActiveSteering,
+        steering_text: &mut Vec<String>,
+    ) -> Result<()> {
+        let ready = async {
+            if let Some(hold) = hold {
+                hold.released().await?;
+            } else if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::pin!(ready);
+        loop {
+            tokio::select! {
+                result = &mut ready => return result,
+                Some(command) = steering.receive() => {
+                    if let Some(submission) = &command.submission {
+                        let admitted = submission.sending(super::submission::SubmissionTarget::Untracked)
+                            .and_then(|()| submission.accepted("local mock steering admission".into()));
+                        if let Err(error) = admitted {
+                            command.complete(Err(error)).await;
+                            continue;
+                        }
+                    }
+                    steering_text.push(command.text.clone());
+                    command.complete(Ok(())).await;
+                }
+            }
+        }
+    }
+
     fn steering_lane(&self, session_id: &str) -> std::sync::Arc<steering::SteeringLane> {
         let mut lane = self
             .steering_by_session
@@ -952,11 +993,17 @@ impl MockBackend {
 
 #[async_trait]
 impl Backend for MockBackend {
+    fn mock_response_control(&self) -> Option<&super::mock_response::MockResponseControl> {
+        Some(&self.response_control)
+    }
+
     async fn shutdown(&self) -> Result<()> {
+        self.response_control.cancel_session(None);
         Ok(())
     }
 
-    async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+    async fn cancel_session(&self, session_id: &str) -> Result<()> {
+        self.response_control.cancel_session(Some(session_id));
         Ok(())
     }
 
@@ -975,7 +1022,8 @@ impl Backend for MockBackend {
         Ok(terminal::TerminalSnapshot::default())
     }
 
-    async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+    async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
+        self.response_control.cancel_session(Some(session_id));
         Ok(())
     }
     async fn generate_text(
@@ -1013,6 +1061,14 @@ impl Backend for MockBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
+        let steering = self.steering_lane(&request.runtime_key()?);
+        let mut active_steering = steering.activate(event_sink.clone())?;
+        let mut steering_text_list = Vec::new();
+        let response_hold = self.response_control.arrive(&request);
+        if let Some(hold) = response_hold.as_ref() {
+            self.wait_for_response(Some(hold), &mut active_steering, &mut steering_text_list)
+                .await?;
+        }
         if let Some(retained) = &self.retained_control
             && let Some(context) = &request.control_context
         {
@@ -1063,9 +1119,6 @@ impl Backend for MockBackend {
                 ..Default::default()
             });
         }
-        let steering = self.steering_lane(&request.runtime_key()?);
-        let mut active_steering = steering.activate(event_sink.clone())?;
-        let mut steering_text_list = Vec::new();
         if let Some(context) = request.control_context.as_ref()
             && context
                 .checks
@@ -1121,9 +1174,8 @@ impl Backend for MockBackend {
         }
         if let Some(permission) = &self.permission {
             let resolution = permission
-                .authorize_callback(
-                    request.execution_mode,
-                    true,
+                .authorize(
+                    request.approval_mode,
                     crate::permissions::matcher::PermissionRequest {
                         id: "mock-approval".into(),
                         provider: "Mock".into(),
@@ -1172,26 +1224,9 @@ impl Backend for MockBackend {
                 "changed before cancellation\n",
             )?;
         }
-        if let Some(delay) = self.delay {
-            let delay = tokio::time::sleep(delay);
-            tokio::pin!(delay);
-            loop {
-                tokio::select! {
-                    () = &mut delay => break,
-                    Some(command) = active_steering.receive() => {
-                        if let Some(submission) = &command.submission {
-                            let admitted = submission.sending(super::submission::SubmissionTarget::Untracked)
-                                .and_then(|()| submission.accepted("local mock steering admission".into()));
-                            if let Err(error) = admitted {
-                                command.complete(Err(error)).await;
-                                continue;
-                            }
-                        }
-                        steering_text_list.push(command.text.clone());
-                        command.complete(Ok(())).await;
-                    }
-                }
-            }
+        if response_hold.is_none() {
+            self.wait_for_response(None, &mut active_steering, &mut steering_text_list)
+                .await?;
         }
         if request.mode == PromptMode::Plan {
             if let Some(document) = request
@@ -1592,7 +1627,7 @@ impl Backend for MockBackend {
             question_withdrawal: None,
             control_error: None,
             evidence: TurnEvidence {
-                tool_called: request.execution_mode.is_write_default(),
+                tool_called: request.access.write_access != crate::session::WriteScope::Off,
                 structured_complete: execution_complete,
                 ..TurnEvidence::default()
             },
@@ -1725,11 +1760,7 @@ pub(crate) fn mock_capability() -> BackendCapability {
         ultrafast_mode: true,
         permission_control: true,
         background_terminals: true,
-        execution_mode_list: vec![
-            PermissionMode::Read,
-            PermissionMode::Write,
-            PermissionMode::Yolo,
-        ],
+        approval_mode_list: vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow],
         agent: AgentCapability::default(),
         catalog: CatalogCapability::default(),
     }
@@ -1773,10 +1804,10 @@ mod test {
         assert!(!prompt.contains("harness_plan_task_report"));
         assert!(!prompt.contains("harness_plan_edit"));
     }
+    use super::super::mock_response::MockResponseCommand;
     use super::{Backend, BackendRequest, MockBackend, PromptMode};
-    use crate::session::PermissionMode;
+    use crate::session::ApprovalMode;
     use std::sync::Arc;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn applies_steering_to_the_same_planning_turn() {
@@ -1793,7 +1824,7 @@ mod test {
                     harness_session_id: "harness-session".into(),
                     workspace: ".".into(),
                     access: Default::default(),
-                    execution_mode: PermissionMode::Read,
+                    approval_mode: ApprovalMode::Ask,
                     backend_session_id: None,
                 },
                 super::BackendInput::from_text("And be sure to modify Y"),
@@ -1806,15 +1837,27 @@ mod test {
             submission: Some(submission.clone()),
         };
         let backend = Arc::new(MockBackend {
+            response_control: Default::default(),
             lsp_probe: false,
             retained_control: None,
             permission: None,
-            delay: Some(Duration::from_millis(50)),
+            delay: None,
             emit_before_delay: false,
             write_before_delay: false,
             fork_delay: None,
             steering_by_session: Default::default(),
         });
+        let hold = backend
+            .response_control
+            .dispatch(
+                "harness-session",
+                MockResponseCommand::Hold {
+                    mode: Some(PromptMode::Plan),
+                },
+            )
+            .await
+            .unwrap();
+        let hold_id = hold["id"].as_str().unwrap().to_owned();
         let prompt_backend = Arc::clone(&backend);
         let prompt = tokio::spawn(async move {
             prompt_backend
@@ -1832,7 +1875,7 @@ mod test {
                         context_window: None,
                         service_tier: crate::backend::ServiceTier::Standard,
                         access: Default::default(),
-                        execution_mode: PermissionMode::Read,
+                        approval_mode: ApprovalMode::Ask,
                         backend_session_id: None,
                         submission: None,
                         recovered_input: Vec::new(),
@@ -1842,18 +1885,29 @@ mod test {
                 )
                 .await
         });
-        loop {
-            match backend
-                .steer_session("harness-session", input.clone())
-                .await
-            {
-                Ok(()) => break,
-                Err(error) if format!("{error:#}").contains("no active turn") => {
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => panic!("unexpected steering failure: {error:#}"),
-            }
-        }
+        backend
+            .response_control
+            .dispatch(
+                "harness-session",
+                MockResponseCommand::Wait {
+                    id: hold_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .steer_session("harness-session", input)
+            .await
+            .unwrap();
+        assert!(!prompt.is_finished(), "steering released the held response");
+        backend
+            .response_control
+            .dispatch(
+                "harness-session",
+                MockResponseCommand::Release { id: hold_id },
+            )
+            .await
+            .unwrap();
         let output = prompt.await.unwrap().unwrap();
         assert!(matches!(
             submission.record().unwrap().delivery,

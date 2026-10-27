@@ -6,11 +6,16 @@ assert(not source.accepts_prompt("/"))
 assert(source.accepts_prompt("/sessions anything /unrecognized"))
 assert(source.accepts_prompt("/plan arbitrary prompt"))
 assert(source.accepts_prompt("/plan"))
-assert(source.accepts_prompt("/checks setup on"))
-assert(source.accepts_prompt("/checks setup off"))
-assert(not source.accepts_prompt("/checks setup"))
-assert(not source.accepts_prompt("/checks setup unit"))
-assert(not source.accepts_prompt("/checks setup on extra"))
+assert(source.accepts_prompt("/checks edit on"))
+assert(source.accepts_prompt("/checks edit off"))
+assert(source.accepts_prompt("  /checks edit on  "))
+assert(source.accepts_prompt("/checks  edit\ton"))
+assert(source.accepts_prompt("/checks "))
+assert(not source.accepts_prompt("/checks setup on"))
+assert(not source.accepts_prompt("/checks setup off"))
+assert(not source.accepts_prompt("/checks edit"))
+assert(not source.accepts_prompt("/checks edit unit"))
+assert(not source.accepts_prompt("/checks edit on extra"))
 assert(source.accepts_prompt("Explain /sess"))
 assert(not source.queues_execution("/plan inspect screenshot.png"),
   "filename arguments must not override supported command routing")
@@ -24,8 +29,8 @@ notifications.warn = function(message) warnings[#warnings + 1] = message end
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 state.queue = {}
 for _, prompt in ipairs({ "/sess", "/spawn", "/unrecognized extra text", "/workspace/example",
-  "/workspace/", "/workspace.name/README", "/sessions-extra", "/checks setup",
-  "/checks setup unit", "/checks setup on extra" }) do
+  "/workspace/", "/workspace.name/README", "/sessions-extra", "/checks edit",
+  "/checks edit unit", "/checks edit on extra", "/checks setup on", "/checks setup off" }) do
   for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
     local warning_count = #warnings
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { prompt })
@@ -45,14 +50,14 @@ client.request_for = function(_, method, params, callback)
   callback({})
 end
 controller.refresh_winbar = function() end
-state.session = { id = "plan-mode", mode = "write", execution_mode = "write" }
+state.session = { id = "plan-mode", mode = "write", approval_mode = "ask" }
 state.transcript_win, state.composer_win = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_win()
 state.no_checkpoint = false
 state.busy = false
 for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "  /plan  " })
   submit()
-  assert(state.session.execution_mode == "write")
+  assert(state.session.approval_mode == "ask")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
   assert(#state.queue == 0)
 end

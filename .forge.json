@@ -153,7 +153,8 @@
           "nvim/tests/forge/plan_navigation_languages_host.lua",
           "nvim/tests/forge/sidecar_manual.lua",
           "nvim/tests/**/fixtures/**",
-          "nvim/tests/**/support/**"
+          "nvim/tests/**/support/**",
+          "nvim/tests/forge/plan_review_question_response_host.lua"
         ]
       },
       "action": {
@@ -191,7 +192,7 @@
         "input": true
       }
     },
-    "lua-test-host": {
+    "lua-test-live-integration": {
       "trigger": {
         "paths": [
           "nvim/lua/forge/**",
@@ -209,7 +210,7 @@
           "--no-config-file",
           "--stdin",
           "nvim/tools/checks/lua.nu",
-          "extended",
+          "live-integration",
           "--full",
           "--timeout",
           "120sec"
@@ -217,12 +218,51 @@
         "inputs": {
           "files": {
             "type": "array",
-            "description": "Repository paths",
+            "description": "Exact live integration fixture paths (omit for the whole suite)",
             "required": false,
             "source": "changed_files"
           }
         },
-        "label": "Run Lua host integration",
+        "label": "Run Lua live integration",
+        "category": "test",
+        "input": true,
+        "after": [
+          "rust-build"
+        ]
+      }
+    },
+    "lua-test-mock-integration": {
+      "trigger": {
+        "paths": [
+          "nvim/lua/forge/**",
+          "nvim/rust/forge/**",
+          "nvim/tests/forge/support/review_host.lua"
+        ],
+        "exclude": [
+          "**/target/**",
+          "**/node_modules/**"
+        ]
+      },
+      "action": {
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "mock-integration",
+          "--full",
+          "--timeout",
+          "120sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Exact mock integration fixture paths (omit for the whole suite)",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
+        "label": "Run Lua mock integration",
         "category": "test",
         "input": true,
         "after": [

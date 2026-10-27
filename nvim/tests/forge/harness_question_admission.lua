@@ -19,7 +19,7 @@ client.request_for = function(_, method, _, callback)
 end
 state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win =
   require("forge.views.harness.layout").open("admission")
-state.session = { id = "admission", backend = "mock", model = "mock", execution_mode = "read" }
+state.session = { id = "admission", backend = "mock", model = "mock", approval_mode = "ask" }
 state.active_elicitation = { owner = "interaction", exchange_id = "exchange",
   elicitation = { question_set = { id = "set", questions = {
     { id = "choice", question = "Choose?", options = {} },

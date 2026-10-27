@@ -39,7 +39,7 @@ local function snapshot(name)
       provider_label = "Mock CLI",
       resolved_model = "mock-model",
       effort = "low",
-      execution_mode = "read",
+      approval_mode = "ask",
       native_fork = false,
       native_compact = true,
     },

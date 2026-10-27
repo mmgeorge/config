@@ -23,8 +23,7 @@ local function option(entry, scope)
   if name == "" then name = "[unnamed]" end
   local current_session = session.harness.session or {}
   local label = current_session.id == entry.id and (name .. " (current)") or name
-  local mode = entry.execution_mode == "yolo" and "YOLO"
-    or ((entry.execution_mode or "read"):sub(1, 1):upper() .. (entry.execution_mode or "read"):sub(2))
+  local mode = entry.approval_mode or "ask"
   local columns = { datetime.relative_ms(entry.created_at_ms), label, entry.backend or "", mode }
   if scope == "all" then columns[#columns + 1] = entry.workspace or "" end
   return {

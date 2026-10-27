@@ -15,8 +15,8 @@ local session = require("forge.session")
 
 local command_list = {
   { label = "/checks", detail = "Manage project checks, scopes, and run history" },
-  { label = "/checks setup on", detail = "Enable check editing without sending a prompt" },
-  { label = "/checks setup off", detail = "Disable check editing without sending a prompt" },
+  { label = "/checks edit on", detail = "Enable check editing without sending a prompt" },
+  { label = "/checks edit off", detail = "Disable check editing without sending a prompt" },
   { label = "/config", detail = "Configure Harness settings" },
   { label = "/capabilities", detail = "Inspect supported and unsupported backend capabilities" },
   { label = "/log", detail = "Open the current session debug log" },
@@ -51,10 +51,13 @@ local command_list = {
   { label = "/goal pause", detail = "Pause automatic goal continuation" },
   { label = "/goal resume", detail = "Resume automatic goal continuation" },
   { label = "/goal clear", detail = "Clear the active goal" },
-  { label = "/read", detail = "Ask before edits and untrusted commands" },
-  { label = "/write", detail = "Apply saved approval rules" },
-  { label = "/yolo", detail = "Skip approval prompts" },
-  { label = "/mode", detail = "Select the approval mode" },
+  { label = "/read full", detail = "Toggle workspace/full read scope" },
+  { label = "/write", detail = "Toggle filesystem writing" },
+  { label = "/write full", detail = "Toggle workspace/full write scope" },
+  { label = "/ask", detail = "Ask for tool requests requiring approval" },
+  { label = "/deny", detail = "Reject tool requests requiring approval" },
+  { label = "/allow", detail = "Approve tool requests once, preserving saved denies" },
+  { label = "/yolo", detail = "Toggle YOLO and full-access Ask with supported sandboxing" },
   { label = "/clear", detail = "Start a new session" },
   { label = "/new", detail = "Start a new session in another tab" },
   { label = "/compact", detail = "Compact provider-owned context", capability = "native_compact" },
@@ -83,10 +86,11 @@ end
 ---@return boolean accepted
 ---@return string? failure
 function CommandSource.accepts_prompt(text)
-  if text:match("^%s*/checks%s+setup%s*$") or text:match("^%s*/checks%s+setup%s+") then
-    local setting = vim.trim(text):match("^/checks%s+setup%s+(%S+)$")
+  local trimmed = vim.trim(text)
+  if trimmed:match("^/checks%s+") then
+    local setting = trimmed:match("^/checks%s+edit%s+(%S+)$")
     if setting ~= "on" and setting ~= "off" then
-      return false, "Use /checks setup on or /checks setup off, then request check changes in chat."
+      return false, "Use /checks edit on or /checks edit off, then request check changes in chat."
     end
   end
   local token = command_token(text)
@@ -287,32 +291,16 @@ function CommandSource:get_completions(_, callback)
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end
-  local mode_start = prefix:match("^%s*/mode%s+()([^%s]*)$")
-  if mode_start then
-    local mode_list = {
-      { name = "read", detail = "Ask before edits and untrusted commands" },
-      { name = "write", detail = "Apply saved approval rules" },
-      { name = "yolo", detail = "Skip approval prompts" },
+  local scope_start = prefix:match("^%s*/read%s+()([^%s]*)$") or prefix:match("^%s*/write%s+()([^%s]*)$")
+  if scope_start then
+    items[1] = {
+      label = "full", filterText = "full", detail = "Toggle full filesystem scope",
+      kind = vim.lsp.protocol.CompletionItemKind.Value,
+      textEdit = { newText = "full", range = {
+        start = { line = row, character = scope_start - 1 },
+        ["end"] = { line = row, character = cursor_column },
+      } },
     }
-    for _, mode in ipairs(mode_list) do
-      items[#items + 1] = {
-        label = mode.name,
-        filterText = mode.name,
-        detail = mode.detail,
-        kind = vim.lsp.protocol.CompletionItemKind.Value,
-        textEdit = {
-          newText = mode.name,
-          range = {
-            start = { line = row, character = mode_start - 1 },
-            ["end"] = { line = row, character = cursor_column },
-          },
-        },
-      }
-    end
-    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
-    return
-  end
-  if prefix:match("^%s*/mode%s+") then
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end

@@ -909,7 +909,7 @@ mod test {
         use crate::backend::steering::SteeringLane;
         use crate::backend::{BackendInput, PromptMode};
         use crate::control_tools::{ControlTurnContext, lsp::LspService};
-        use crate::session::PermissionMode;
+        use crate::session::ApprovalMode;
         use crate::trace::TraceStore;
         use futures_util::{SinkExt, StreamExt};
         use std::sync::{Arc, atomic::AtomicBool};
@@ -941,7 +941,6 @@ mod test {
             "exchange".into(),
             directory.path().into(),
             policy,
-            PermissionMode::Read,
             Arc::new(AtomicBool::new(false)),
         );
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
@@ -1004,7 +1003,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             permission,
             Some(events.clone()),
             trace,
@@ -1023,7 +1022,7 @@ mod test {
             context_window: None,
             access: Default::default(),
             service_tier: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: Some("thread".into()),
             submission: None,
             recovered_input: Vec::new(),
@@ -1093,7 +1092,7 @@ mod test {
         use crate::backend::approval::PermissionCoordinator;
         use crate::backend::steering::SteeringLane;
         use crate::backend::{BackendInput, PromptMode};
-        use crate::session::PermissionMode;
+        use crate::session::ApprovalMode;
         use crate::trace::TraceStore;
         use futures_util::{SinkExt, StreamExt};
         use std::sync::Arc;
@@ -1139,7 +1138,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             permission,
             None,
             trace,
@@ -1157,7 +1156,7 @@ mod test {
             context_window: None,
             access: Default::default(),
             service_tier: crate::backend::ServiceTier::Standard,
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: Some("parent".into()),
             submission: None,
             recovered_input: Vec::new(),
@@ -1183,7 +1182,7 @@ mod test {
     async fn parent_restart_retains_child_progress_and_early_completion() -> Result<()> {
         use crate::backend::approval::PermissionCoordinator;
         use crate::backend::{BackendInput, PromptMode};
-        use crate::session::PermissionMode;
+        use crate::session::ApprovalMode;
         use crate::trace::TraceStore;
         use futures_util::{SinkExt, StreamExt};
         use std::sync::Arc;
@@ -1227,7 +1226,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             permission,
             None,
             trace,
@@ -1245,7 +1244,7 @@ mod test {
             access: Default::default(),
             context_window: None,
             service_tier: crate::backend::ServiceTier::Ultrafast,
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: Some("parent".into()),
             submission: None,
             recovered_input: Vec::new(),
@@ -1293,7 +1292,7 @@ mod test {
         use crate::backend::approval::PermissionCoordinator;
         use crate::backend::steering::SteeringLane;
         use crate::backend::{BackendInput, PromptMode};
-        use crate::session::PermissionMode;
+        use crate::session::ApprovalMode;
         use crate::trace::TraceStore;
         use futures_util::{SinkExt, StreamExt};
         use std::sync::Arc;
@@ -1379,7 +1378,7 @@ mod test {
             let mut process = CodexJsonRpc::connect(
                 &endpoint,
                 &workspace,
-                PermissionMode::Read,
+                ApprovalMode::Ask,
                 permission,
                 None,
                 trace,
@@ -1397,7 +1396,7 @@ mod test {
                 context_window: None,
                 service_tier: crate::backend::ServiceTier::Standard,
                 access: Default::default(),
-                execution_mode: PermissionMode::Read,
+                approval_mode: ApprovalMode::Ask,
                 backend_session_id: Some("parent".into()),
                 submission: None,
                 recovered_input: Vec::new(),

@@ -549,7 +549,7 @@ local function append_exchange_summary(result, interaction, options)
     agent_wait = agent_wait or blocker == "agent_wait"
   end
   local waiting_input = stopped_clock and (interaction.awaiting_input or type(interaction.elicitation) == "table")
-  local tool_count, passed_count, failed_count = 0, 0, 0
+  local tool_count, passed_count = 0, 0
   local changed_path = {}
   for _, turn in ipairs(interaction.turn or {}) do
     for _, tool_id in ipairs((turn.tool and turn.tool.order) or {}) do
@@ -557,7 +557,6 @@ local function append_exchange_summary(result, interaction, options)
       if tool then
         tool_count = tool_count + 1
         local status = tostring(tool.status or ""):lower()
-        if tool.failed == true or status == "failed" or status == "error" then failed_count = failed_count + 1 end
         if not tool_render.failed(tool) and (status == "completed" or status == "complete"
           or status == "success" or status == "succeeded") then
           passed_count = passed_count + 1
@@ -634,13 +633,10 @@ local function append_exchange_summary(result, interaction, options)
   end
   local usage = format_exchange_usage(interaction, metrics)
   if usage ~= "" then sections[#sections + 1] = usage end
-  local outcomes = {}
-  if failed_count > 0 then outcomes[#outcomes + 1] = ("%d failed"):format(failed_count) end
   local file_count = vim.tbl_count(changed_path)
   if file_count > 0 then
-    outcomes[#outcomes + 1] = ("%d %s changed"):format(file_count, file_count == 1 and "file" or "files")
+    sections[#sections + 1] = ("%d %s changed"):format(file_count, file_count == 1 and "file" or "files")
   end
-  if #outcomes > 0 then sections[#sections + 1] = table.concat(outcomes, " · ") end
   summary = table.concat(sections, " │ ")
   if type(interaction.finalization_error) == "string" then
     summary = summary .. " — " .. interaction.finalization_error:gsub("[\r\n]", " ")

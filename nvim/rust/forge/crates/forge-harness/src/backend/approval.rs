@@ -12,7 +12,7 @@ use crate::permissions::matcher::{
 };
 use crate::permissions::shell::{self, CommandAnalysisFailure, CommandHighlight, CommandShell};
 use crate::permissions::store::PermissionStore;
-use crate::session::{InputDeadline, InputTimeout, PermissionMode, ResolutionSource};
+use crate::session::{ApprovalMode, InputDeadline, InputTimeout, ResolutionSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,9 +58,6 @@ pub struct ApprovalRequestView {
     pub provider: String,
     pub reason: Option<String>,
     pub item_list: Vec<ApprovalItem>,
-    /// Requires a root task mode transition instead of a one-time file approval.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_mode: Option<PermissionMode>,
     /// Captures the original deadline independently of the active window.
     #[serde(default)]
     pub deadline: Option<InputDeadline>,
@@ -138,6 +135,19 @@ pub struct PermissionCoordinator {
 }
 
 impl PermissionCoordinator {
+    /// Report the captured write-off boundary for an active execution owner.
+    pub(crate) fn writes_disabled(
+        &self,
+        owner: Option<&crate::backend::ExecutionOwner>,
+    ) -> Result<bool> {
+        let policy = self
+            .directory_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))?;
+        Ok(owner
+            .and_then(|owner| policy.get(owner))
+            .is_some_and(|policy| policy.access.write_access == crate::session::WriteScope::Off))
+    }
     pub fn new(store: Arc<RwLock<PermissionStore>>) -> Self {
         Self {
             pending_map: Mutex::new(BTreeMap::new()),
@@ -202,7 +212,7 @@ impl PermissionCoordinator {
                     harness_session_id: request.harness_session_id.clone(),
                     workspace: request.workspace.clone(),
                     access: request.access.clone(),
-                    execution_mode: request.execution_mode,
+                    approval_mode: request.approval_mode,
                     backend_session_id: request.backend_session_id.clone(),
                 },
                 provider,
@@ -367,22 +377,10 @@ impl PermissionCoordinator {
         Ok(Arc::new(Self::new(Arc::new(RwLock::new(store)))))
     }
 
+    /// Evaluate file access and saved rules before resolving ordinary tool approval.
     pub async fn authorize(
         &self,
-        execution_mode: PermissionMode,
-        request: PermissionRequest,
-        address: Option<crate::backend::ProviderAddress>,
-        event_sink: Option<&BackendEventSink>,
-    ) -> Result<ApprovalResolution> {
-        self.authorize_callback(execution_mode, false, request, address, event_sink)
-            .await
-    }
-
-    /// Preserve mandatory provider prompts even when ordinary approval handling bypasses prompts.
-    pub async fn authorize_callback(
-        &self,
-        execution_mode: PermissionMode,
-        forced: bool,
+        approval_mode: ApprovalMode,
         mut request: PermissionRequest,
         address: Option<crate::backend::ProviderAddress>,
         event_sink: Option<&BackendEventSink>,
@@ -404,14 +402,17 @@ impl PermissionCoordinator {
                 .read()
                 .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?;
             if let Some(policy) = &directory_policy {
-                let mut evaluation =
-                    policy.evaluate(&store.compiled(), execution_mode, &mut request)?;
+                let mut evaluation = policy.evaluate(&store.compiled(), &mut request)?;
                 if protected_target(&request, &store) {
                     evaluation.decision = PermissionDecision::Deny;
                 }
                 Ok(evaluation)
             } else {
-                Ok(store.compiled().evaluate(execution_mode, &request)?)
+                let mut evaluation = store.compiled().evaluate(&request)?;
+                if protected_target(&request, &store) {
+                    evaluation.decision = PermissionDecision::Deny;
+                }
+                Ok(evaluation)
             }
         })();
         let mut evaluation = match evaluated {
@@ -434,7 +435,7 @@ impl PermissionCoordinator {
                 return Err(error);
             }
         };
-        if !forced && evaluation.decision != PermissionDecision::Deny {
+        if evaluation.decision != PermissionDecision::Deny {
             let scopes = self
                 .skill_by_owner
                 .lock()
@@ -479,9 +480,9 @@ impl PermissionCoordinator {
                         .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
                         .compiled();
                     let canonical = if let Some(policy) = &directory_policy {
-                        policy.evaluate(&compiled, execution_mode, &mut canonical)?
+                        policy.evaluate(&compiled, &mut canonical)?
                     } else {
-                        compiled.evaluate(PermissionMode::Write, &canonical)?
+                        compiled.evaluate(&canonical)?
                     };
                     if canonical.decision == PermissionDecision::Deny {
                         return Ok(ApprovalResolution::DenyOnce);
@@ -500,12 +501,13 @@ impl PermissionCoordinator {
             }
         }
         match evaluation.decision {
-            PermissionDecision::Allow if !forced => return Ok(ApprovalResolution::AllowOnce),
+            PermissionDecision::Allow => return Ok(ApprovalResolution::AllowOnce),
             PermissionDecision::Deny => return Ok(ApprovalResolution::DenyOnce),
-            PermissionDecision::Ask | PermissionDecision::Allow => {}
-        }
-        if forced && evaluation.pending_target_list.is_empty() {
-            evaluation.pending_target_list = request.target_list.clone();
+            PermissionDecision::Ask => match approval_mode {
+                ApprovalMode::Deny => return Ok(ApprovalResolution::DenyOnce),
+                ApprovalMode::Allow => return Ok(ApprovalResolution::AllowOnce),
+                ApprovalMode::Ask => {}
+            },
         }
         let execution_owner = address.as_ref().and_then(|address| address.owner.clone());
         if let Some(owner) = &execution_owner {
@@ -593,30 +595,6 @@ impl PermissionCoordinator {
                 }
             }
         }
-        if execution_mode == PermissionMode::Read
-            && execution_owner
-                .as_ref()
-                .is_none_or(crate::backend::ExecutionOwner::is_root)
-            && evaluation.pending_target_list.iter().any(|target| {
-                matches!(
-                    target,
-                    PermissionTarget::Write { .. }
-                        | PermissionTarget::UnknownFile {
-                            operation: DirectoryOperation::Write
-                        }
-                )
-            })
-        {
-            view.required_mode = Some(PermissionMode::Write);
-            for item in &mut view.item_list {
-                item.choice_list.retain(|choice| {
-                    matches!(
-                        choice.resolution,
-                        ApprovalResolution::DenyOnce | ApprovalResolution::Cancel
-                    )
-                });
-            }
-        }
         view.execution_owner = execution_owner;
         self.wait_for_approval(view, address, event_sink, directory_policy)
             .await
@@ -637,7 +615,6 @@ impl PermissionCoordinator {
             turn_id: None,
             provider: "Harness".into(),
             reason: None,
-            required_mode: None,
             deadline: None,
             resolution_source: ResolutionSource::User,
             item_list: vec![ApprovalItem {
@@ -1164,7 +1141,6 @@ fn approval_view(
         turn_id: None,
         provider: request.provider.clone(),
         reason: request.reason.clone(),
-        required_mode: None,
         item_list: evaluation
             .pending_target_list
             .iter()
@@ -1618,127 +1594,74 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 #[cfg(test)]
 mod test {
     #[tokio::test]
-    async fn read_mode_file_requests_require_a_mode_transition_without_granting_rules() {
-        for (mode, target, root, expected) in [
-            (
-                PermissionMode::Read,
-                PermissionTarget::UnknownFile {
-                    operation: DirectoryOperation::Write,
-                },
-                true,
-                true,
-            ),
-            (
-                PermissionMode::Read,
-                PermissionTarget::Write {
-                    path: "source.rs".into(),
-                },
-                true,
-                true,
-            ),
-            (
-                PermissionMode::Read,
-                PermissionTarget::UnknownFile {
-                    operation: DirectoryOperation::Read,
-                },
-                true,
-                false,
-            ),
-            (
-                PermissionMode::Write,
-                PermissionTarget::UnknownFile {
-                    operation: DirectoryOperation::Write,
-                },
-                true,
-                false,
-            ),
-            (
-                PermissionMode::Read,
-                PermissionTarget::UnknownFile {
-                    operation: DirectoryOperation::Write,
-                },
-                false,
-                false,
-            ),
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let coordinator = PermissionCoordinator::transient(directory.path()).unwrap();
-            let before = coordinator.store.read().unwrap().open().1;
-            let owner = if root {
-                crate::backend::ExecutionOwner::root("session")
-            } else {
-                crate::backend::ExecutionOwner {
-                    session_id: "session".into(),
-                    agent_id: "child".into(),
-                }
-            };
-            let (sink, mut stream) = crate::backend::events::channel();
-            let waiting_coordinator = coordinator.clone();
-            let waiting = tokio::spawn(async move {
-                waiting_coordinator
-                    .authorize(
-                        mode,
-                        PermissionRequest {
-                            id: "file-request".into(),
-                            provider: "test".into(),
-                            reason: None,
-                            target_list: vec![target],
-                        },
-                        Some(crate::backend::ProviderAddress {
-                            owner: Some(owner),
-                            thread_id: "thread".into(),
-                            turn_id: "turn".into(),
-                        }),
-                        Some(&sink),
-                    )
-                    .await
-                    .unwrap()
-            });
-            let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            let approval: ApprovalRequestView = serde_json::from_value(event.data).unwrap();
-            assert_eq!(
-                approval.required_mode,
-                expected.then_some(PermissionMode::Write)
-            );
-            if expected {
-                let error = coordinator
-                    .resolve(
-                        &approval.id,
-                        &[ApprovalAnswer {
-                            item_id: "0".into(),
-                            choice_id: "allow_once".into(),
-                        }],
-                        None,
-                    )
-                    .await
-                    .unwrap_err();
-                assert!(error.to_string().contains("unknown approval choice"));
-                assert_eq!(coordinator.pending_list().unwrap().len(), 1);
-                assert!(
-                    approval.item_list[0]
-                        .choice_list
-                        .iter()
-                        .all(|choice| choice.rule_list.is_empty() && choice.directory.is_none())
-                );
+    async fn approval_modes_resolve_rules_without_persisting_automatic_decisions() -> Result<()> {
+        for mode in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {
+            for decision in [
+                PermissionDecision::Ask,
+                PermissionDecision::Allow,
+                PermissionDecision::Deny,
+            ] {
+                let directory = tempfile::tempdir()?;
+                let coordinator = PermissionCoordinator::transient(directory.path())?;
+                coordinator.store().write().unwrap().set_rule_list(&[(
+                    CATEGORY_TOOL.into(),
+                    "sample".into(),
+                    decision,
+                )])?;
+                let before = coordinator.store.read().unwrap().open().1;
+                let (sink, mut stream) = crate::backend::events::channel();
+                let waiting_coordinator = coordinator.clone();
+                let waiting = tokio::spawn(async move {
+                    waiting_coordinator
+                        .authorize(
+                            mode,
+                            PermissionRequest {
+                                id: "decision".into(),
+                                provider: "test".into(),
+                                reason: None,
+                                target_list: vec![PermissionTarget::Tool {
+                                    target: "sample".into(),
+                                }],
+                            },
+                            None,
+                            Some(&sink),
+                        )
+                        .await
+                });
+                let expected = match (decision, mode) {
+                    (PermissionDecision::Deny, _)
+                    | (PermissionDecision::Ask, ApprovalMode::Deny) => ApprovalResolution::DenyOnce,
+                    (PermissionDecision::Allow, _)
+                    | (PermissionDecision::Ask, ApprovalMode::Allow) => {
+                        ApprovalResolution::AllowOnce
+                    }
+                    (PermissionDecision::Ask, ApprovalMode::Ask) => {
+                        let event =
+                            tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+                                .await?
+                                .context("approval stream closed")?
+                                .context("approval event missing")?;
+                        assert_eq!(event.kind, "approval_requested");
+                        let view: ApprovalRequestView = serde_json::from_value(event.data)?;
+                        coordinator
+                            .resolve(
+                                &view.id,
+                                &[ApprovalAnswer {
+                                    item_id: view.item_list[0].id.clone(),
+                                    choice_id: "allow_once".into(),
+                                }],
+                                None,
+                            )
+                            .await?;
+                        ApprovalResolution::AllowOnce
+                    }
+                };
+                assert_eq!(waiting.await??, expected);
+                assert!(coordinator.pending_list()?.is_empty());
+                assert_eq!(coordinator.store.read().unwrap().open().1, before);
             }
-            coordinator
-                .resolve(
-                    &approval.id,
-                    &[ApprovalAnswer {
-                        item_id: "0".into(),
-                        choice_id: "deny_once".into(),
-                    }],
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyOnce);
-            assert_eq!(coordinator.store.read().unwrap().open().1, before);
         }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1781,7 +1704,7 @@ mod test {
                 read_access: crate::session::DirectoryScope::Workspace,
                 ..Default::default()
             },
-            execution_mode: PermissionMode::Write,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
             submission: None,
             recovered_input: Vec::new(),
@@ -1825,12 +1748,7 @@ mod test {
         let waiting_address = address.clone();
         let waiter = tokio::spawn(async move {
             waiting_coordinator
-                .authorize(
-                    PermissionMode::Write,
-                    permission,
-                    waiting_address,
-                    Some(&sink),
-                )
+                .authorize(ApprovalMode::Ask, permission, waiting_address, Some(&sink))
                 .await
         });
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
@@ -1925,12 +1843,7 @@ mod test {
         );
         assert_eq!(
             coordinator
-                .authorize(
-                    PermissionMode::Write,
-                    original.clone(),
-                    address.clone(),
-                    None
-                )
+                .authorize(ApprovalMode::Ask, original.clone(), address.clone(), None)
                 .await?,
             ApprovalResolution::AllowOnce
         );
@@ -1945,48 +1858,22 @@ mod test {
                 .permission[CATEGORY_EDIT][&workspace_rule],
             PermissionDecision::Allow
         );
-        let (read_sink, mut read_stream) = crate::backend::events::channel();
-        let read_coordinator = coordinator.clone();
-        let read_address = address.clone();
-        let read_workspace = request.workspace.clone();
-        let read_waiter = tokio::spawn(async move {
-            read_coordinator
+        assert_eq!(
+            coordinator
                 .authorize(
-                    PermissionMode::Read,
+                    ApprovalMode::Ask,
                     permission_from_copilot(
-                        "read-mode-write".into(),
+                        "saved-write".into(),
                         "write",
                         json!({"path":workspace.join("another/file.txt")}),
-                        &read_workspace,
+                        &request.workspace
                     ),
-                    read_address,
-                    Some(&read_sink),
+                    address.clone(),
+                    None,
                 )
-                .await
-        });
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), read_stream.recv())
-            .await?
-            .unwrap()
-            .unwrap();
-        let read_approval: ApprovalRequestView = serde_json::from_value(event.data)?;
-        assert_eq!(read_approval.required_mode, Some(PermissionMode::Write));
-        assert!(
-            read_approval.item_list[0]
-                .choice_list
-                .iter()
-                .all(|choice| { choice.rule_list.is_empty() && choice.directory.is_none() })
+                .await?,
+            ApprovalResolution::AllowOnce
         );
-        coordinator
-            .resolve(
-                &read_approval.id,
-                &[ApprovalAnswer {
-                    item_id: "0".into(),
-                    choice_id: "deny_once".into(),
-                }],
-                None,
-            )
-            .await?;
-        assert_eq!(read_waiter.await??, ApprovalResolution::DenyOnce);
         let protected = Path::new(&request.workspace)
             .join("protected.txt")
             .display()
@@ -1999,7 +1886,7 @@ mod test {
         assert_eq!(
             coordinator
                 .authorize(
-                    PermissionMode::Write,
+                    ApprovalMode::Ask,
                     permission_from_copilot(
                         "protected".into(),
                         "write",
@@ -2017,7 +1904,7 @@ mod test {
         let _directories = coordinator.directories(Some(&settings_root), &request)?;
         assert_eq!(
             coordinator
-                .authorize(PermissionMode::Write, original, address.clone(), None)
+                .authorize(ApprovalMode::Ask, original, address.clone(), None)
                 .await?,
             ApprovalResolution::AllowOnce
         );
@@ -2033,7 +1920,7 @@ mod test {
                 .read()
                 .unwrap()
                 .compiled()
-                .evaluate(PermissionMode::Yolo, &missing)?
+                .evaluate(&missing)?
                 .decision,
             PermissionDecision::Ask
         );
@@ -2058,7 +1945,7 @@ mod test {
         );
         assert_eq!(
             coordinator
-                .authorize(PermissionMode::Yolo, denied, address, None)
+                .authorize(ApprovalMode::Allow, denied, address, None)
                 .await?,
             ApprovalResolution::DenyOnce
         );
@@ -2077,7 +1964,7 @@ mod test {
             turn_id: "turn".into(),
         });
         let failure = coordinator
-            .authorize(PermissionMode::Write, invalid, address, Some(&sink))
+            .authorize(ApprovalMode::Ask, invalid, address, Some(&sink))
             .await
             .unwrap_err();
         assert!(failure.to_string().contains("empty"));
@@ -2120,7 +2007,7 @@ mod test {
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: crate::session::AccessPolicy::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
             submission: None,
             recovered_input: Vec::new(),
@@ -2161,12 +2048,7 @@ mod test {
         ] {
             let granted = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                coordinator.authorize(
-                    PermissionMode::Read,
-                    operation(target),
-                    address.clone(),
-                    None,
-                ),
+                coordinator.authorize(ApprovalMode::Ask, operation(target), address.clone(), None),
             )
             .await??;
             assert_eq!(granted, ApprovalResolution::AllowOnce);
@@ -2186,7 +2068,7 @@ mod test {
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(20),
                 coordinator.authorize(
-                    PermissionMode::Read,
+                    ApprovalMode::Ask,
                     operation(target.clone()),
                     address.clone(),
                     None,
@@ -2212,7 +2094,7 @@ mod test {
         assert_eq!(
             coordinator
                 .authorize(
-                    PermissionMode::Read,
+                    ApprovalMode::Ask,
                     operation(command(format!("python '{script}'"))),
                     address.clone(),
                     None
@@ -2228,7 +2110,7 @@ mod test {
         assert_eq!(
             coordinator
                 .authorize(
-                    PermissionMode::Read,
+                    ApprovalMode::Ask,
                     operation(command(format!("Get-Content '{source}'"))),
                     address.clone(),
                     None
@@ -2249,7 +2131,7 @@ mod test {
         assert_eq!(
             coordinator
                 .authorize(
-                    PermissionMode::Read,
+                    ApprovalMode::Ask,
                     operation(PermissionTarget::Read {
                         path: alias.join("SKILL.md").display().to_string()
                     }),
@@ -2270,7 +2152,7 @@ mod test {
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
                 coordinator.authorize(
-                    PermissionMode::Read,
+                    ApprovalMode::Ask,
                     operation(PermissionTarget::Read {
                         path: source.clone()
                     }),
@@ -2301,7 +2183,7 @@ mod test {
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
                 coordinator.authorize(
-                    PermissionMode::Read,
+                    ApprovalMode::Ask,
                     operation(PermissionTarget::Read { path: source }),
                     address,
                     None
@@ -2323,12 +2205,8 @@ mod test {
         let store = PermissionStore::load(&path, directory.path()).unwrap();
         let coordinator = PermissionCoordinator::new(Arc::new(RwLock::new(store)));
         let (sink, mut stream) = crate::backend::events::channel();
-        for mode in [
-            PermissionMode::Read,
-            PermissionMode::Write,
-            PermissionMode::Yolo,
-        ] {
-            for forced in [false, true] {
+        for mode in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {
+            for _callback in 0..1 {
                 let request = PermissionRequest {
                     id: "parse-error".into(),
                     provider: "test".into(),
@@ -2340,7 +2218,7 @@ mod test {
                 };
                 let failure = tokio::time::timeout(
                     std::time::Duration::from_secs(1),
-                    coordinator.authorize_callback(mode, forced, request, None, Some(&sink)),
+                    coordinator.authorize(mode, request, None, Some(&sink)),
                 )
                 .await
                 .unwrap()
@@ -2422,7 +2300,7 @@ mod test {
             tasks.push(tokio::spawn(async move {
                 coordinator
                     .authorize(
-                        PermissionMode::Read,
+                        ApprovalMode::Ask,
                         PermissionRequest {
                             id: "same-id".into(),
                             provider: "test".into(),
@@ -2540,9 +2418,8 @@ mod test {
         let provider = coordinator.clone();
         let waiter = tokio::spawn(async move {
             provider
-                .authorize_callback(
-                    PermissionMode::Read,
-                    true,
+                .authorize(
+                    ApprovalMode::Ask,
                     PermissionRequest {
                         id: "abandoned".into(),
                         provider: "test".into(),
@@ -2581,9 +2458,8 @@ mod test {
             };
             waiter.push(tokio::spawn(async move {
                 coordinator
-                    .authorize_callback(
-                        PermissionMode::Read,
-                        true,
+                    .authorize(
+                        ApprovalMode::Ask,
                         PermissionRequest {
                             id: "same-provider-id".into(),
                             provider: "test".into(),
@@ -2650,7 +2526,7 @@ mod test {
         )
         .unwrap();
         crate::permissions::matcher::CompiledPermissionDocument::compile(document, ".")
-            .evaluate(PermissionMode::Write, request)
+            .evaluate(request)
             .unwrap()
     }
 
@@ -2783,7 +2659,7 @@ mod test {
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         let waiting_coordinator = Arc::clone(&coordinator);
         let waiting = tokio::spawn(async move {
-            waiting_coordinator.authorize(PermissionMode::Read, PermissionRequest {
+            waiting_coordinator.authorize(ApprovalMode::Ask, PermissionRequest {
                 id: "versions".into(), provider: "test".into(), reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: r#""C:/Program Files/PowerShell/7/pwsh.exe" -Command 'Get-Location; Get-ChildItem -Force; rustc --version; cargo --version; rustup show active-toolchain; rustc --version'"#.into(), shell: None
@@ -2998,7 +2874,7 @@ mod test {
             crate::permissions::document::parse_permission_document(&rules.to_string()).unwrap(),
             ".",
         );
-        let evaluation = compiled.evaluate(PermissionMode::Write, &request).unwrap();
+        let evaluation = compiled.evaluate(&request).unwrap();
         assert_eq!(evaluation.decision, PermissionDecision::Allow);
         assert!(evaluation.pending_target_list.is_empty());
     }
@@ -3110,49 +2986,35 @@ mod test {
     }
 
     #[tokio::test]
-    async fn mandatory_yolo_callback_retains_an_answerable_target() {
-        let directory = tempfile::tempdir().unwrap();
-        let coordinator = PermissionCoordinator::transient(directory.path()).unwrap();
+    async fn allow_callback_does_not_publish_or_persist_an_approval() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let coordinator = PermissionCoordinator::transient(directory.path())?;
+        let before = coordinator.store.read().unwrap().open().1;
         let (sink, mut stream) = crate::backend::events::channel();
-        let waiting_coordinator = coordinator.clone();
-        let waiting = tokio::spawn(async move {
-            waiting_coordinator
-                .authorize_callback(
-                    PermissionMode::Yolo,
-                    true,
-                    PermissionRequest {
-                        id: "mandatory-review".into(),
-                        provider: "test".into(),
-                        reason: None,
-                        target_list: vec![PermissionTarget::Write {
-                            path: "review.txt".into(),
-                        }],
-                    },
-                    None,
-                    Some(&sink),
-                )
-                .await
-                .unwrap()
-        });
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let approval: ApprovalRequestView = serde_json::from_value(event.data).unwrap();
-        assert_eq!(approval.item_list.len(), 1);
-        coordinator
-            .resolve(
-                &approval.id,
-                &[ApprovalAnswer {
-                    item_id: approval.item_list[0].id.clone(),
-                    choice_id: "deny_once".into(),
-                }],
+        let resolution = coordinator
+            .authorize(
+                ApprovalMode::Allow,
+                PermissionRequest {
+                    id: "callback".into(),
+                    provider: "test".into(),
+                    reason: None,
+                    target_list: vec![PermissionTarget::Write {
+                        path: "review.txt".into(),
+                    }],
+                },
                 None,
+                Some(&sink),
             )
-            .await
-            .unwrap();
-        assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyOnce);
+            .await?;
+        assert_eq!(resolution, ApprovalResolution::AllowOnce);
+        assert!(coordinator.pending_list()?.is_empty());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), stream.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(coordinator.store.read().unwrap().open().1, before);
+        Ok(())
     }
 
     #[tokio::test]
@@ -3168,7 +3030,7 @@ mod test {
         let waiting = tokio::spawn(async move {
             waiting_coordinator
                 .authorize(
-                    PermissionMode::Read,
+                    ApprovalMode::Ask,
                     PermissionRequest {
                         id: "cancel-versions".into(),
                         provider: "test".into(),
@@ -3227,12 +3089,7 @@ mod test {
         let waiting_coordinator = Arc::clone(&coordinator);
         let waiting = tokio::spawn(async move {
             waiting_coordinator
-                .authorize(
-                    PermissionMode::Read,
-                    request,
-                    None,
-                    Some(&waiting_event_sink),
-                )
+                .authorize(ApprovalMode::Ask, request, None, Some(&waiting_event_sink))
                 .await
                 .unwrap()
         });
@@ -3289,7 +3146,7 @@ mod test {
         let waiting = tokio::spawn(async move {
             waiting_coordinator
                 .authorize(
-                    PermissionMode::Write,
+                    ApprovalMode::Ask,
                     PermissionRequest {
                         id: "approval-deny".into(),
                         provider: "test".into(),
@@ -3336,7 +3193,7 @@ mod test {
         let waiting = tokio::spawn(async move {
             waiting_coordinator
                 .authorize(
-                    PermissionMode::Read,
+                    ApprovalMode::Ask,
                     PermissionRequest {
                         id: "approval-cancel".into(),
                         provider: "test".into(),
@@ -3462,7 +3319,7 @@ mod test {
                         .unwrap(),
                     ".",
                 );
-                let evaluation = compiled.evaluate(PermissionMode::Write, &request).unwrap();
+                let evaluation = compiled.evaluate(&request).unwrap();
                 if decision == "ask" {
                     let view = approval_view(&request, &evaluation);
                     assert_eq!(view.item_list.len(), 1);

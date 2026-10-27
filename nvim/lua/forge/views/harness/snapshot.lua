@@ -41,6 +41,7 @@ function HarnessSnapshot.apply(state, result)
   local previous_session_id = state.session and state.session.id or nil
   local previous_context_usage = state.session and state.session.context_usage or nil
   state.session = result.session
+  state.access_abbreviation = result.access_abbreviation
   if state.session and state.session.workspace then
     require("forge.lsp.startup").start(state.session.workspace)
   end

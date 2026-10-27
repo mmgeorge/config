@@ -1,7 +1,7 @@
 use forge_harness::backend::BackendLaunch;
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::permissions::store::PermissionStore;
-use forge_harness::session::PermissionMode;
+use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
 use serde_json::json;
 use std::process::Command;
@@ -65,8 +65,8 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
 async fn opens_validates_and_atomically_replaces_the_permission_document() {
     let (temporary, mut broker) = broker_fixture();
     assert_eq!(
-        broker.snapshot().unwrap().session.execution_mode,
-        PermissionMode::Write
+        broker.snapshot().unwrap().session.approval_mode,
+        ApprovalMode::Ask
     );
 
     let opened = broker
@@ -114,9 +114,9 @@ async fn opens_validates_and_atomically_replaces_the_permission_document() {
 async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
     let (_temporary, mut broker) = broker_fixture();
     for (command, expected) in [
-        ("/write", PermissionMode::Write),
-        ("/yolo", PermissionMode::Yolo),
-        ("/read", PermissionMode::Read),
+        ("/write", ApprovalMode::Ask),
+        ("/yolo", ApprovalMode::Allow),
+        ("/ask", ApprovalMode::Ask),
     ] {
         let response = broker
             .dispatch(Request {
@@ -126,7 +126,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
             })
             .await;
         assert!(response.response.error().is_none());
-        assert_eq!(broker.snapshot().unwrap().session.execution_mode, expected);
+        assert_eq!(broker.snapshot().unwrap().session.approval_mode, expected);
     }
 
     broker
@@ -147,7 +147,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         assert!(changed.response.error().is_none());
         let snapshot = broker.snapshot().unwrap();
         assert!(snapshot.session.current_task_id.is_none());
-        assert_eq!(snapshot.session.execution_mode, PermissionMode::Write);
+        assert_eq!(snapshot.session.approval_mode, ApprovalMode::Ask);
         assert!(snapshot.active_plan.is_none());
         assert!(snapshot.exchange.is_empty());
     }
@@ -160,8 +160,8 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         .await;
     assert!(planned.response.error().is_none());
     assert_eq!(
-        broker.snapshot().unwrap().session.execution_mode,
-        PermissionMode::Write
+        broker.snapshot().unwrap().session.approval_mode,
+        ApprovalMode::Ask
     );
     assert!(broker.snapshot().unwrap().session.current_task_id.is_some());
     let before = broker.snapshot().unwrap();
@@ -185,7 +185,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
             params: json!({
                 "plan_id": plan.id,
                 "digest": plan.review_digest.as_deref().unwrap(),
-                "execution_mode": "write"
+                "approval_mode": "ask"
             }),
         })
         .await;
@@ -195,8 +195,8 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         accepted.response.error()
     );
     assert_eq!(
-        broker.snapshot().unwrap().session.execution_mode,
-        PermissionMode::Write
+        broker.snapshot().unwrap().session.approval_mode,
+        ApprovalMode::Ask
     );
     assert!(broker.snapshot().unwrap().session.current_task_id.is_some());
 }

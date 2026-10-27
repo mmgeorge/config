@@ -200,7 +200,7 @@ fn bind_primary_action(
                     column: 0,
                 },
             },
-            capture: "ForgeHarnessPlan".into(),
+            capture: "ForgeTimelineStatus".into(),
             priority: 100,
         });
         let target = TargetId(format!("{id}:review-plan"));

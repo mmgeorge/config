@@ -143,8 +143,65 @@ paused clock instead of waiting for wall-clock deadlines.
 Inside Harness, select an ordinary fixture with
 `check_run({"check":"lua-test","inputs":{"fixture":"nvim/tests/forge/plan_check_selection.lua"}})`.
 Use `inputs:{"suite":"walkthrough"}` only when the whole feature requires coverage.
-Feature names do not need individual saved check definitions. Host integration
-and benchmarks retain their separate build-dependent checks.
+Feature names do not need individual saved check definitions. Editor integration
+uses two separate build-dependent checks:
+
+- `lua-test-mock-integration` runs local fixtures with `MockBackend`, simulated
+  provider processes, or local editor and Git state. It requires no authenticated
+  provider or model request.
+- `lua-test-live-integration` runs installed provider CLIs, including fixtures
+  that issue real model requests. Run it explicitly after checking credentials
+  and each fixture's prerequisites.
+
+Both accept `files` to select individual fixtures. For the plan-question
+regression, use
+`check_run({"check":"lua-test-mock-integration","inputs":{"files":["nvim/tests/forge/plan_review_question_response_host.lua"]}})`.
+Omitting `files` selects that integration suite. Ordinary `lua-test` and the
+runner's `all` selection exclude both integration suites and benchmarks.
+The registry rejects live fixtures submitted to the mock check. Use the live
+check explicitly for `harness_skill_reads_host.lua`, `harness_codex_activity.lua`,
+`harness_native_import_host.lua`, and `harness_provider_switch_host.lua`.
+Parameterized provider and platform fixtures remain separate from these suites.
+Benchmarks retain their own check.
+
+### Control mock response timing
+
+Use `nvim/tests/forge/support/mock_provider.lua` when an editor interaction must
+happen after a provider receives a prompt and before it responds. The helper
+controls the real host's `MockBackend` through `backend.mock_response`. Create
+the hold before submitting the prompt, then wait for its arrival before changing
+editor state. The selected session and optional prompt mode identify which next
+request stops. Omitting the mode selects that session's next prompt of any mode.
+
+This fragment assumes an initialized mock session and the existing Harness
+`state` and `controller` objects. It holds an ordinary chat response until the
+test explicitly releases it:
+
+```lua
+local mock = dofile("nvim/tests/forge/support/mock_provider.lua")
+local hold = mock.hold(state.session.id, "chat")
+vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Test response timing" })
+controller.submit()
+local pending = hold:wait()
+assert(pending.prompt == "Test response timing")
+-- Perform the cursor movement or other interaction being tested here.
+hold:release()
+```
+
+Use `"plan_question"` to hold a plan-annotation answer while allowing setup and
+other prompt modes to complete. `wait()` returns the held request's ID, session,
+mode, and full prompt. `release()` resumes only that arrived request and does
+not wait for its rendering to complete. After release, await the particular
+buffer or state observation under test. `cancel()` discards an unused hold or
+fails a response already waiting on it. Unknown IDs, early release, and IDs from
+another session fail explicitly. Released and cancelled IDs cannot be reused.
+
+The provider uses notifications rather than elapsed-time delays for these holds.
+Explicit holds replace any configured mock delay for the matching prompt.
+The helper's ten-second deadline detects a stuck test and stops waiting as soon
+as the operation responds. Cancellation, dropped prompt futures, and provider
+shutdown clear their holds and wake waiting operations. The `harness_host.lua`
+fixture exercises this helper through the real editor transport.
 
 From the repository root, run an isolated editor test directly in a fresh Neovim:
 

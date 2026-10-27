@@ -37,7 +37,7 @@ use crate::plan::{
 use crate::protocol::HarnessMethod;
 use crate::session::state_machine::{LifecycleAction, WorkflowActivity};
 use crate::session::{
-    ContextUsage, HarnessPreference, HarnessSession, ModelSetting, PermissionMode, PlanExecutor,
+    ApprovalMode, ContextUsage, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
     ProviderForkState, SessionStore,
 };
 use crate::storage::SqliteStore;
@@ -156,6 +156,8 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
 /// Represents the complete client-visible state for one active session.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
+    /// Confirmed access label computed by the authoritative filesystem policy.
+    pub access_abbreviation: String,
     pub subagent_tools: bool,
     pub lsp_tools: bool,
     pub status_thoughts: bool,
@@ -750,20 +752,16 @@ impl HarnessBroker {
                             shell: preference
                                 .as_ref()
                                 .map_or(Default::default(), |preference| preference.shell),
-                            execution_mode: if request.background.is_some() {
-                                PermissionMode::Read
-                            } else {
-                                PermissionMode::Write
-                            },
+                            approval_mode: preference
+                                .as_ref()
+                                .map_or(ApprovalMode::Ask, |value| value.default_approval),
                             current_task_id: None,
-                            default_write_permission: preference
+                            default_approval: preference
                                 .as_ref()
-                                .map_or(PermissionMode::Write, |value| {
-                                    value.default_write_permission
-                                }),
-                            plan_permission: preference
+                                .map_or(ApprovalMode::Ask, |value| value.default_approval),
+                            plan_approval: preference
                                 .as_ref()
-                                .and_then(|value| value.plan_permission),
+                                .and_then(|value| value.plan_approval),
                             created_at_ms: now_ms,
                             updated_at_ms: now_ms,
                             goal_id: None,
@@ -805,6 +803,14 @@ impl HarnessBroker {
             .apply(&mut session, backend_descriptor.capability.native_compact)?;
         if created_session && request.background.is_none() {
             shared.apply_provider_defaults(&mut session)?;
+            session.approval_mode = session.default_approval;
+        }
+        if request.background.is_some() {
+            session.access.write_access = crate::session::WriteScope::Off;
+        }
+        if session.model == "default" && session.resolved_model.is_none() {
+            session.resolved_model =
+                store.latest_resolved_default_model(&session.workspace, &session.backend)?;
         }
         permission_coordinator.configure_input_timeouts(
             &session.id,
@@ -995,7 +1001,7 @@ impl HarnessBroker {
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
             access: self.session.access.clone(),
-            execution_mode: self.session.execution_mode,
+            approval_mode: self.session.approval_mode,
             backend_session_id: self.session.backend_session_id.clone(),
         }
     }
@@ -1119,7 +1125,7 @@ impl HarnessBroker {
         self.session.effort = effort;
         self.session.context_window = None;
         self.session.service_tier = service_tier;
-        self.session.execution_mode = PermissionMode::Read;
+        self.session.access.write_access = crate::session::WriteScope::Off;
         self.session.auto_compaction = policy;
         self.checkpoint = None;
         self.event_sink = Some(sink);
@@ -1616,8 +1622,11 @@ impl HarnessBroker {
             }
             HarnessMethod::PermissionsOpen => self.observer.open_permission_document(),
             HarnessMethod::PermissionsSave => self.observer.save_permission_document(params),
-            HarnessMethod::SessionPermissionMode => self.select_execution_mode(params),
-            HarnessMethod::SessionMode => self.select_execution_mode(params),
+            HarnessMethod::SessionPermission => {
+                let mut action = params;
+                action["action"] = json!("permission");
+                self.transition_task(action).await
+            }
             HarnessMethod::HistoryRecord => self
                 .observer
                 .record_prompt_history(params, self.clock.now_ms()),
@@ -1879,7 +1888,8 @@ impl HarnessBroker {
             self.session.id.clone(),
             title,
             kind,
-            self.session.execution_mode,
+            self.session.access.clone(),
+            self.session.approval_mode,
             self.clock.now_ms(),
         );
         task.plan_id = plan_id;
@@ -1901,10 +1911,8 @@ impl HarnessBroker {
         if task.status == TaskStatus::Blocked && task.phase == "checks" && failure.is_none() {
             return Ok(());
         }
-        task.permission = self.session.execution_mode;
-        if task.permission.is_write_default() {
-            task.last_write_permission = task.permission;
-        }
+        task.approval_mode = self.session.approval_mode;
+        task.access = self.session.access.clone();
         if let Some(message) = failure {
             task.status = if self.turn_cancellation.requested.load(Ordering::Acquire) {
                 TaskStatus::Paused
@@ -2033,17 +2041,33 @@ impl HarnessBroker {
         command: String,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         use crate::task::TaskStatus;
-        let previous_permission = self.session.execution_mode;
-        let permission: PermissionMode = if command == "permission" {
-            serde_json::from_value(
+        let previous_permission = self.session.approval_mode;
+        let previous_access = self.session.access.abbreviation();
+        let mut access = self.session.access.clone();
+        let mut permission = self.session.approval_mode;
+        if command == "permission" {
+            let change: crate::task::PermissionChange = serde_json::from_value(
                 action
-                    .get("mode")
+                    .get("change")
                     .cloned()
-                    .context("permission is required")?,
-            )?
-        } else {
-            self.session.execution_mode
-        };
+                    .context("permission change is required")?,
+            )?;
+            if let Some(selection) = action.get("permission_selection") {
+                let selection: crate::task::PermissionSelection =
+                    serde_json::from_value(selection.clone())?;
+                access.sandbox = selection.sandbox;
+                access.read_access = selection.read_access;
+                access.write_access = selection.write_access;
+                permission = selection.approval_mode;
+            } else {
+                change.apply(
+                    &mut access,
+                    &mut permission,
+                    crate::backend::BackendKind::parse(&self.session.backend)?.supports_sandbox(),
+                );
+            }
+            access = access.validate()?;
+        }
         let task = self.current_task()?;
         let waiting = task
             .as_ref()
@@ -2095,7 +2119,10 @@ impl HarnessBroker {
                 Box::pin(self.compact_session(true)).await?;
             }
             _ => {
-                self.select_execution_mode(json!({"mode":permission}))?;
+                Box::pin(self.configure_session(
+                    json!({"access": access, "approval_mode": permission, "session_policy": true}),
+                ))
+                .await?;
             }
         }
         if command == "configure"
@@ -2122,8 +2149,8 @@ impl HarnessBroker {
             let mut effective = snapshot.desired;
             effective.access = Some(self.session.access.clone());
             effective.shell = Some(self.session.shell);
-            effective.default_write_permission = Some(self.session.default_write_permission);
-            effective.plan_permission = self.session.plan_permission;
+            effective.default_approval = Some(self.session.default_approval);
+            effective.plan_approval = self.session.plan_approval;
             effective.plan_compact = Some(self.session.plan_compact);
             effective.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions);
             effective.approval_timeout = Some(self.session.approval_timeout);
@@ -2142,7 +2169,7 @@ impl HarnessBroker {
                 turn_boundary: None,
                 kind: "configuration_applied".into(),
                 text: None,
-                data: json!({"session":self.session,"operation_id":self.active_operation_id,
+                data: json!({"session":self.session,"access_abbreviation":self.session.access.abbreviation(),"operation_id":self.active_operation_id,
                 "catalog":self.backend_catalog_request()}),
                 activity: None,
                 summary: None,
@@ -2156,16 +2183,14 @@ impl HarnessBroker {
             return Box::pin(self.resume_exchange(json!({"text":"Continue the interrupted request with the updated agent tools. Preserve completed actions and collect outstanding child results."}))).await;
         }
         let permission_notice = (command == "permission").then(|| format!(
-            "The user changed approval mode from {} to {}. Continue the interrupted work under the updated mode. \
-             Existing filesystem access and saved approval rules still apply. Preserve completed work. \
+            "The user changed filesystem access from {} to {} and approval mode from {} to {}. Continue the interrupted work under the updated policy. \
+             Saved approval rules still apply. Preserve completed work. \
              Before retrying an interrupted operation, inspect its recorded outcome and any affected files.",
-            previous_permission.label(), permission.label()
+            previous_access, self.session.access.abbreviation(), previous_permission.label(), permission.label()
         ));
         if let Some(mut task) = self.current_task()? {
-            task.permission = permission;
-            if permission.is_write_default() {
-                task.last_write_permission = permission;
-            }
+            task.approval_mode = self.session.approval_mode;
+            task.access = self.session.access.clone();
             if waiting {
                 task.status = TaskStatus::Waiting;
 
@@ -2256,7 +2281,7 @@ impl HarnessBroker {
         self.session.current_task_id = Some(task.id.clone());
 
         self.session.goal_id = task.goal_id.clone();
-        self.select_execution_mode(json!({"mode": task.permission}))?;
+        Box::pin(self.configure_session(json!({"access": task.access, "approval_mode": task.approval_mode, "session_policy": true}))).await?;
         task.begin(self.clock.now_ms())?;
         task.operation_id = self.active_operation_id.clone();
         self.store.save_task(&task)?;
@@ -2431,7 +2456,7 @@ impl HarnessBroker {
                     .and_then(|acceptance| acceptance.overall_comment.as_ref())
                     .map(|comment| json!(comment))
             });
-        self.accept_plan(json!({"plan_id":plan.id,"digest":digest,"execution_mode":self.session.default_write_permission,"saved_source_digest":saved_source,"comment":comment})).await
+        self.accept_plan(json!({"plan_id":plan.id,"digest":digest,"approval_mode":self.session.default_approval,"saved_source_digest":saved_source,"comment":comment})).await
     }
 
     async fn transition_attach_plan(
@@ -2463,12 +2488,13 @@ impl HarnessBroker {
         self.pause_task(false).await?;
         let permission = self
             .session
-            .plan_permission
-            .unwrap_or(self.session.execution_mode);
+            .plan_approval
+            .unwrap_or(self.session.approval_mode);
         let mut task = crate::task::TaskRecord::new(
             self.session.id.clone(),
             plan.title,
             TaskKind::Plan,
+            self.session.access.clone(),
             permission,
             self.clock.now_ms(),
         );
@@ -2507,25 +2533,6 @@ impl HarnessBroker {
             design.baseline_calls = fresh.baseline_calls;
         }
         self.start_plan(request.clone(), request, document).await
-    }
-
-    fn select_execution_mode(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let mode = serde_json::from_value::<PermissionMode>(
-            params.get("mode").cloned().context("mode is required")?,
-        )?;
-        anyhow::ensure!(
-            self.capability.execution_mode_list.contains(&mode),
-            "execution mode {} is unavailable for this backend",
-            mode.label()
-        );
-        self.session.execution_mode = mode;
-
-        self.save_session()?;
-        let session = serde_json::to_value(&self.session)?;
-        Ok((
-            session.clone(),
-            vec![self.event("execution_mode_changed", session)?],
-        ))
     }
 
     async fn resume_exchange(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -3122,7 +3129,6 @@ impl HarnessBroker {
                     admission.task.id.clone(),
                     PathBuf::from(&self.session.workspace),
                     policy,
-                    request.execution_mode,
                     Arc::new(AtomicBool::new(false)),
                 );
                 let mut context =
@@ -3620,11 +3626,11 @@ impl HarnessBroker {
         model_list: &[crate::backend::BackendModel],
     ) -> Result<Vec<SessionEvent>> {
         if self.session.model == "default"
-            && self.session.resolved_model.is_none()
             && let Some(model) = model_list
                 .iter()
                 .find(|model| model.is_default)
                 .or_else(|| model_list.first())
+            && self.session.resolved_model.as_deref() != Some(model.id.as_str())
         {
             self.session.resolved_model = Some(model.id.clone());
             self.save_session()?;
@@ -3751,15 +3757,33 @@ impl HarnessBroker {
         if text.trim() == "/plan" {
             return self.observer.list_replanning_choices();
         }
-        if text == "/read" {
-            return self.select_execution_mode(json!({ "mode": "read" }));
+        let change = match text.as_str() {
+            "/read full" => Some(crate::task::PermissionChange::ToggleReadScope),
+            "/write" => Some(crate::task::PermissionChange::ToggleWriteEnabled),
+            "/write full" => Some(crate::task::PermissionChange::ToggleWriteScope),
+            "/ask" => Some(crate::task::PermissionChange::SetApproval {
+                mode: ApprovalMode::Ask,
+            }),
+            "/deny" => Some(crate::task::PermissionChange::SetApproval {
+                mode: ApprovalMode::Deny,
+            }),
+            "/allow" => Some(crate::task::PermissionChange::SetApproval {
+                mode: ApprovalMode::Allow,
+            }),
+            "/yolo" => Some(crate::task::PermissionChange::ToggleYolo),
+            _ => None,
+        };
+        if let Some(change) = change {
+            return Box::pin(self.transition_task(json!({"action":"permission","change":change})))
+                .await;
         }
-        if text == "/write" {
-            return self.select_execution_mode(json!({ "mode": "write" }));
-        }
-        if text == "/yolo" {
-            return self.select_execution_mode(json!({ "mode": "yolo" }));
-        }
+        anyhow::ensure!(
+            !matches!(
+                text.split_whitespace().next(),
+                Some("/read" | "/write" | "/mode" | "/ask" | "/deny" | "/allow" | "/yolo")
+            ),
+            "Use /read full, /write, /write full, /ask, /deny, /allow, or /yolo"
+        );
         if text == "/clear" {
             return Box::pin(self.new_session(Value::Null)).await;
         }
@@ -5931,7 +5955,7 @@ Planning continuation: turn {} of {}.",
                     harness_session_id: request.harness_session_id.clone(),
                     workspace: request.workspace.clone(),
                     access: request.access.clone(),
-                    execution_mode: request.execution_mode,
+                    approval_mode: request.approval_mode,
                     backend_session_id: request.backend_session_id.clone(),
                 },
                 event,
@@ -5995,7 +6019,7 @@ Planning continuation: turn {} of {}.",
                     .map(|task| task.id),
                 shell: self.session.shell,
                 mode: request.mode,
-                permission: self.session.execution_mode,
+                permission: self.session.approval_mode,
                 permissions: Arc::clone(&self.permission_coordinator),
                 address: crate::backend::ProviderAddress {
                     owner: Some(request.owner()?),
@@ -7660,7 +7684,7 @@ Planning continuation: turn {} of {}.",
                 ordinal: self.store.next_exchange_ordinal(&self.session.id)?,
                 prompt: text.to_owned(),
                 kind: ExchangeKind::Chat,
-                mode: Some(self.session.execution_mode),
+                approval_mode: Some(self.session.approval_mode),
                 plan_id: None,
                 execution_id: None,
                 execution_phase: None,
@@ -7819,7 +7843,7 @@ Planning continuation: turn {} of {}.",
             }
         }
         let mut acceptance =
-            PlanAcceptance::new(review_digest, &self.capability.execution_mode_list)?;
+            PlanAcceptance::new(review_digest, &self.capability.approval_mode_list)?;
         if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == reviewed.saved_digest,
@@ -8152,12 +8176,12 @@ Planning continuation: turn {} of {}.",
             .acceptance
             .as_ref()
             .context("active plan has no acceptance state")?;
-        let execution_mode = acceptance.execution_mode()?;
+        let approval_mode = acceptance.approval_mode()?;
         self.accept_plan(json!({
             "plan_id": plan.id,
             "digest": acceptance.review_digest,
             "saved_source_digest": acceptance.saved_source_digest,
-            "execution_mode": execution_mode,
+            "approval_mode": approval_mode,
             "comment": acceptance.overall_comment,
         }))
         .await
@@ -8172,18 +8196,16 @@ Planning continuation: turn {} of {}.",
                 .any(|execution| execution.state == PlanExecutionState::Active),
             "another plan execution is already active"
         );
-        let execution_mode = serde_json::from_value::<PermissionMode>(
+        let approval_mode = serde_json::from_value::<ApprovalMode>(
             params
-                .get("execution_mode")
+                .get("approval_mode")
                 .cloned()
-                .context("execution_mode is required")?,
+                .context("approval_mode is required")?,
         )?;
         anyhow::ensure!(
-            self.capability
-                .execution_mode_list
-                .contains(&execution_mode),
+            self.capability.approval_mode_list.contains(&approval_mode),
             "execution mode {} is unavailable for this backend",
-            execution_mode.label()
+            approval_mode.label()
         );
         let plan_id = required_text(&params, "plan_id")?;
         let mut plan = self
@@ -8315,7 +8337,7 @@ Planning continuation: turn {} of {}.",
                 .context("plan executor thinking is not configured")?;
             self.session.context_window = None;
         }
-        self.session.execution_mode = execution_mode;
+        self.session.approval_mode = approval_mode;
         let mut task = self
             .current_task()?
             .filter(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
@@ -8324,7 +8346,8 @@ Planning continuation: turn {} of {}.",
                     self.session.id.clone(),
                     plan.title.clone(),
                     crate::task::TaskKind::Execute,
-                    execution_mode,
+                    self.session.access.clone(),
+                    approval_mode,
                     now_ms,
                 )
             });
@@ -8333,8 +8356,8 @@ Planning continuation: turn {} of {}.",
         task.phase = "implement".into();
         task.plan_id = Some(plan.id.clone());
         task.goal_id = Some(goal.id.clone());
-        task.permission = execution_mode;
-        task.last_write_permission = execution_mode;
+        task.approval_mode = approval_mode;
+        task.access = self.session.access.clone();
         task.begin(now_ms)?;
         self.session.current_task_id = Some(task.id.clone());
         let execution_created_at_ms = self.clock.now_ms();
@@ -8889,7 +8912,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     async fn set_goal(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let objective = required_text(&params, "objective")?;
         self.pause_task(false).await?;
-        self.select_execution_mode(json!({"mode":self.session.default_write_permission}))?;
+        self.configure_session(json!({"approval_mode":self.session.default_approval}))
+            .await?;
         let now_ms = self.clock.now_ms();
         let goal = GoalRecord {
             id: Uuid::new_v4().to_string(),
@@ -8908,7 +8932,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             self.session.id.clone(),
             objective.clone(),
             crate::task::TaskKind::Goal,
-            self.session.execution_mode,
+            self.session.access.clone(),
+            self.session.approval_mode,
             now_ms,
         );
         task.operation_id = self.active_operation_id.clone();
@@ -9882,13 +9907,13 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             params["access"] =
                 serde_json::to_value(settings.desired.access.clone().unwrap_or_default())?;
             params["shell"] = serde_json::to_value(settings.desired.shell.unwrap_or_default())?;
-            params["default_write_permission"] = serde_json::to_value(
+            params["default_approval"] = serde_json::to_value(
                 settings
                     .desired
-                    .default_write_permission
-                    .unwrap_or(PermissionMode::Write),
+                    .default_approval
+                    .unwrap_or(ApprovalMode::Ask),
             )?;
-            params["plan_permission"] = serde_json::to_value(settings.desired.plan_permission)?;
+            params["plan_approval"] = serde_json::to_value(settings.desired.plan_approval)?;
             params["plan_compact"] = json!(
                 settings.desired.plan_compact.unwrap_or(false) && self.capability.native_compact
             );
@@ -9937,16 +9962,15 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             configured.shell = serde_json::from_value(value.clone())?;
             configured.shell.executable()?;
         }
-        if let Some(value) = params.get("default_write_permission") {
-            let permission: PermissionMode = serde_json::from_value(value.clone())?;
-            anyhow::ensure!(
-                permission.is_write_default(),
-                "default write permission must be Write or YOLO"
-            );
-            configured.default_write_permission = permission;
+        if let Some(value) = params.get("approval_mode") {
+            configured.approval_mode = serde_json::from_value(value.clone())?;
         }
-        if let Some(value) = params.get("plan_permission") {
-            configured.plan_permission = serde_json::from_value(value.clone())?;
+        if let Some(value) = params.get("default_approval") {
+            let permission: ApprovalMode = serde_json::from_value(value.clone())?;
+            configured.default_approval = permission;
+        }
+        if let Some(value) = params.get("plan_approval") {
+            configured.plan_approval = serde_json::from_value(value.clone())?;
         }
         if let Some(value) = params.get("approval_timeout") {
             configured.approval_timeout =
@@ -10143,7 +10167,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                         harness_session_id: configured.id.clone(),
                         workspace: configured.workspace.clone(),
                         access: configured.access.clone(),
-                        execution_mode: configured.execution_mode,
+                        approval_mode: configured.approval_mode,
                         backend_session_id: configured.backend_session_id.clone(),
                     },
                     &selection,
@@ -10176,11 +10200,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 &self.session.id,
                 &self.session.backend,
             )?;
-            let scope = if params.get("auto_compaction").is_some() {
-                crate::settings::SettingScope::Session
-            } else {
-                crate::settings::SettingScope::Global
-            };
+            let scope =
+                if params.get("auto_compaction").is_some() || params["session_policy"] == true {
+                    crate::settings::SettingScope::Session
+                } else {
+                    crate::settings::SettingScope::Global
+                };
             let mut portable =
                 settings.layer_settings(scope, &self.session.workspace, &self.session.id)?;
             let mut changed = false;
@@ -10200,12 +10225,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 portable.automatic_checks = Some(value);
                 changed = true;
             }
-            if params.get("default_write_permission").is_some() {
-                portable.default_write_permission = Some(self.session.default_write_permission);
+            if params.get("default_approval").is_some() {
+                portable.default_approval = Some(self.session.default_approval);
                 changed = true;
             }
-            if params.get("plan_permission").is_some() {
-                portable.plan_permission = self.session.plan_permission;
+            if params.get("plan_approval").is_some() {
+                portable.plan_approval = self.session.plan_approval;
                 changed = true;
             }
             if params.get("auto_compaction").is_some() {
@@ -10276,7 +10301,13 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         Ok((
             serde_json::to_value(&self.session)?,
-            vec![self.event("session_configured", serde_json::to_value(&self.session)?)?],
+            vec![self.event(
+                "session_configured",
+                json!({
+                    "session": self.session,
+                    "access_abbreviation": self.session.access.abbreviation(),
+                }),
+            )?],
         ))
     }
 
@@ -10574,7 +10605,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             context_window: self.session.context_window.clone(),
             service_tier: self.session.service_tier,
             access: self.session.access.clone(),
-            execution_mode: self.session.execution_mode,
+            approval_mode: self.session.approval_mode,
             backend_session_id: self.session.backend_session_id.clone(),
             submission: None,
             recovered_input: Vec::new(),
@@ -10788,8 +10819,8 @@ fn preference_for_session(
         access: session.access.clone(),
         shell: session.shell,
 
-        default_write_permission: session.default_write_permission,
-        plan_permission: session.plan_permission,
+        default_approval: session.default_approval,
+        plan_approval: session.plan_approval,
         model: session.model.clone(),
         effort: session.effort.clone(),
         model_setting,
@@ -11005,7 +11036,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.session.execution_mode = PermissionMode::Yolo;
+        broker.session.approval_mode = ApprovalMode::Allow;
         broker.session.shell = crate::session::CheckShell::Nushell;
         let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         broker.backend = Arc::new(AutomaticCheckBackend {
@@ -11084,7 +11115,7 @@ mod test {
                         .dispatch(Request {
                             id: 1,
                             method: "task.transition".into(),
-                            params: json!({"action":"permission","mode":"write","resume":true}),
+                            params: json!({"action":"permission","change":{"kind":"set_approval","mode":"ask"},"resume":true}),
                         })
                         .await;
                     anyhow::ensure!(
@@ -11568,6 +11599,7 @@ mod test {
             id: "pause-before-close".into(),
             session_id: session_id.clone(),
             action: json!({"action":"pause"}),
+            permission_selection: None,
             state: "outcome_unknown".into(),
             error: Some(
                 "Runtime stopped before the operation settled. Inspect task state before resuming"
@@ -11868,6 +11900,49 @@ mod test {
     }
 
     #[tokio::test]
+    async fn yolo_toggles_sandbox_in_direct_and_admitted_transitions() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        for (backend, sandbox_supported) in [("codex", true), ("copilot", false)] {
+            broker.session.backend = backend.into();
+            for admitted in [false, true] {
+                broker
+                    .configure_session(json!({"access":crate::session::AccessPolicy {
+                    sandbox: sandbox_supported, ..Default::default()
+                }, "approval_mode":"ask"}))
+                    .await
+                    .unwrap();
+                for (sandbox, approval) in [
+                    (false, "allow"),
+                    (sandbox_supported, "ask"),
+                    (false, "allow"),
+                ] {
+                    let mut action = json!({"change":{"kind":"enable_yolo"}});
+                    if admitted {
+                        action["permission_selection"] = json!({
+                            "sandbox":sandbox,"read_access":"full","write_access":"full","approval_mode":approval
+                        });
+                    }
+                    broker
+                        .transition_settings(action, "permission".into())
+                        .await
+                        .unwrap();
+                    let stored = broker
+                        .store
+                        .load_session(&broker.session.id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(stored.access.sandbox, sandbox);
+                    assert_eq!(stored.access.abbreviation(), "rxwx");
+                    assert_eq!(stored.approval_mode.label().to_lowercase(), approval);
+                    assert!(broker.store.list_task(&stored.id).unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sandbox_preferences_resolve_on_load_and_configuration_for_each_provider() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -11917,7 +11992,7 @@ mod test {
             .unwrap();
         assert!(!stored.access.sandbox);
         assert_eq!(stored.access.writable_directory.len(), 1);
-        assert_eq!(stored.execution_mode, PermissionMode::Write);
+        assert_eq!(stored.approval_mode, ApprovalMode::Ask);
         let preference = broker
             .store
             .load_preference(&stored.workspace, &stored.backend)
@@ -11925,19 +12000,17 @@ mod test {
             .unwrap();
         assert_eq!(preference.access, stored.access);
         broker
-            .select_execution_mode(json!({"mode":"yolo"}))
+            .configure_session(json!({"approval_mode":"allow"}))
+            .await
             .unwrap();
         assert_eq!(broker.session.access, stored.access);
         assert!(
             broker
-                .configure_session(json!({"default_write_permission":"yolo","effort":""}))
+                .configure_session(json!({"default_approval":"allow","effort":""}))
                 .await
                 .is_err()
         );
-        assert_eq!(
-            broker.session.default_write_permission,
-            PermissionMode::Write
-        );
+        assert_eq!(broker.session.default_approval, ApprovalMode::Ask);
         assert!(broker.configure_session(json!({"access":{"sandbox":true,"write_access":"workspace","writable_directory":["relative"],"windows_sandbox":"elevated"}})).await.is_err());
         assert_eq!(broker.session.access, stored.access);
     }
@@ -11989,13 +12062,15 @@ mod test {
             .unwrap();
         broker.pause_task(false).await.unwrap();
         broker
-            .transition_task(json!({"action":"permission","mode":"write"}))
+            .transition_task(
+                json!({"action":"permission","change":{"kind":"set_approval","mode":"ask"}}),
+            )
             .await
             .unwrap();
         let task = broker.current_task().unwrap().unwrap();
         assert_eq!(task.status, TaskStatus::Paused);
-        assert_eq!(task.permission, PermissionMode::Write);
-        assert_eq!(task.last_write_permission, PermissionMode::Write);
+        assert_eq!(task.approval_mode, ApprovalMode::Ask);
+        assert_eq!(task.access, broker.session.access);
         assert!(
             broker
                 .store
@@ -12018,6 +12093,7 @@ mod test {
             id: "clear-before-shutdown".into(),
             session_id: broker.session.id.clone(),
             action: json!({"action":"clear"}),
+            permission_selection: None,
             state: "accepted".into(),
             error: None,
             exchange_id: None,
@@ -12064,6 +12140,7 @@ mod test {
             id: "original".into(),
             session_id: broker.session.id.clone(),
             action: json!({"action":"plan","text":"Original"}),
+            permission_selection: None,
             state: "running".into(),
             error: None,
             exchange_id: None,
@@ -12115,6 +12192,7 @@ mod test {
             id: "failed-operation".into(),
             session_id: broker.session.id.clone(),
             action: json!({"action":"plan"}),
+            permission_selection: None,
             state: "failed".into(),
             error: Some("provider failed".into()),
             exchange_id: Some(exchange.id.clone()),
@@ -12761,11 +12839,8 @@ mod test {
                 .read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1)
                 .is_err()
         );
-        broker.capability.execution_mode_list = vec![
-            PermissionMode::Read,
-            PermissionMode::Write,
-            PermissionMode::Yolo,
-        ];
+        broker.capability.approval_mode_list =
+            vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow];
         broker
             .begin_plan_acceptance(json!({"plan_id":plan.id,"digest":draft.review_digest}))
             .await
@@ -12781,7 +12856,7 @@ mod test {
             .dispatch(Request {
                 id: 2,
                 method: "plan.accept".into(),
-                params: json!({"plan_id":plan.id,"digest":"stale","execution_mode":"write"}),
+                params: json!({"plan_id":plan.id,"digest":"stale","approval_mode":"ask"}),
             })
             .await;
         assert!(invalid.response.error().is_some());
@@ -12796,7 +12871,7 @@ mod test {
             revision: plan.model_revision + 1,
         });
         let accepted = broker.dispatch(Request { id: 3, method: "plan.accept".into(),
-            params: json!({"plan_id":plan.id,"digest":draft.review_digest,"execution_mode":"write"}) }).await;
+            params: json!({"plan_id":plan.id,"digest":draft.review_digest,"approval_mode":"ask"}) }).await;
         assert!(
             accepted.response.error().is_none(),
             "{:?}",
@@ -12905,7 +12980,7 @@ mod test {
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
             broker.backend = Arc::new(StoppedExecutionBackend { cancelled });
             let (result, _) = broker
-                .accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"}))
+                .accept_plan(json!({"plan_id":plan.id,"approval_mode":"ask"}))
                 .await
                 .unwrap();
             assert_eq!(result["execution_error"].as_str().is_some(), !cancelled);
@@ -13056,7 +13131,7 @@ mod test {
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
         broker.backend = Arc::new(NoProgressExecutionBackend);
         let (_, first) = broker
-            .accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"}))
+            .accept_plan(json!({"plan_id":plan.id,"approval_mode":"ask"}))
             .await
             .unwrap();
         assert!(
@@ -13351,7 +13426,7 @@ mod test {
             Ok(crate::backend::BackendOutput {
                 backend_session_id: Some("semantic-execution".into()),
                 capability: crate::backend::BackendCapability {
-                    execution_mode_list: vec![PermissionMode::Write],
+                    approval_mode_list: vec![ApprovalMode::Ask],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -13412,7 +13487,7 @@ mod test {
     fn completed_interaction(id: &str, session_id: &str, node_list: Vec<ExchangeNode>) -> Exchange {
         Exchange {
             lifecycle: None,
-            mode: None,
+            approval_mode: None,
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
@@ -13743,7 +13818,7 @@ mod test {
                 request.backend_session_id.as_deref(),
                 Some("restart-thread")
             );
-            assert_eq!(request.execution_mode, PermissionMode::Write);
+            assert_eq!(request.approval_mode, ApprovalMode::Ask);
             assert!(request.input.text().contains("Read to Write"));
             assert!(request.input.text().contains("saved approval rules"));
             if self.clarification {
@@ -13790,7 +13865,7 @@ mod test {
         let repository = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.session.execution_mode = PermissionMode::Read;
+        broker.session.approval_mode = ApprovalMode::Ask;
         broker.backend = Arc::new(RestartBackend {
             cancellation: Arc::clone(&broker.turn_cancellation),
             invocation: std::sync::atomic::AtomicUsize::new(0),
@@ -13831,7 +13906,7 @@ mod test {
         );
         broker.turn_cancellation.arm(false);
         broker
-            .transition_task(json!({"action": "permission", "mode": "write", "resume": true}))
+            .transition_task(json!({"action": "permission", "change":{"kind":"set_approval","mode":"ask"}, "resume": true}))
             .await
             .unwrap();
         let after = broker.store.list_exchange(&broker.session.id).unwrap();
@@ -13892,7 +13967,7 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), true);
-            broker.session.execution_mode = PermissionMode::Read;
+            broker.session.approval_mode = ApprovalMode::Ask;
             let prompted = broker
                 .dispatch(Request {
                     id: 1,
@@ -13926,7 +14001,7 @@ mod test {
             assert!(before[0].execution_started_at_ms.is_none());
             broker.turn_cancellation.arm(false);
             broker
-                .transition_task(json!({"action":"permission","mode":"write","resume":true}))
+                .transition_task(json!({"action":"permission","change":{"kind":"set_approval","mode":"ask"},"resume":true}))
                 .await
                 .unwrap();
             let snapshot = broker.snapshot().unwrap();
@@ -14007,11 +14082,30 @@ mod test {
             });
             broker.backend = restart.clone();
             broker.capability = crate::backend::mock_capability();
+            let (event_sink, mut event_stream) = crate::backend::events::channel();
+            broker.event_sink = Some(event_sink);
+            let forwarded = tokio::spawn(async move {
+                let mut event = Vec::new();
+                while let Some(next) = event_stream.recv().await.unwrap() {
+                    event.push(next);
+                }
+                event
+            });
             broker
-                .transition_task(json!({"action":"permission","mode":"write","resume":false}))
+                .transition_task(json!({"action":"permission","change":{"kind":"toggle_write_enabled"},"resume":false}))
                 .await
                 .unwrap();
+            broker.event_sink = None;
+            let event = forwarded.await.unwrap();
             let after = broker.snapshot().unwrap();
+            assert_eq!(
+                after.session.access.write_access,
+                crate::session::WriteScope::Off
+            );
+            assert!(event.iter().any(|event| {
+                event.kind == "configuration_applied"
+                    && event.data["access_abbreviation"] == after.access_abbreviation
+            }));
             assert_eq!(restart.invocation.load(Ordering::SeqCst), 0);
             assert_eq!(after.exchange.len(), before.exchange.len());
             assert_eq!(after.exchange[0].id, before.exchange[0].id);
@@ -15015,7 +15109,7 @@ mod test {
                     PromptMode::PlanDiscussion
                 }
             );
-            assert_eq!(request.execution_mode, PermissionMode::Write);
+            assert_eq!(request.approval_mode, ApprovalMode::Ask);
             if turn < 4 {
                 assert!(
                     request
@@ -16304,10 +16398,10 @@ mod test {
             service_tier: crate::backend::ServiceTier::Standard,
             access: Default::default(),
             shell: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             current_task_id: None,
-            default_write_permission: PermissionMode::Write,
-            plan_permission: None,
+            default_approval: ApprovalMode::Ask,
+            plan_approval: None,
             created_at_ms: 0,
             updated_at_ms: 0,
             goal_id: None,
@@ -16337,8 +16431,8 @@ mod test {
             Some(HarnessPreference {
                 access: Default::default(),
                 shell: Default::default(),
-                default_write_permission: PermissionMode::Write,
-                plan_permission: None,
+                default_approval: ApprovalMode::Ask,
+                plan_approval: None,
                 model: "other-model".into(),
                 effort: "high".into(),
                 model_setting,
@@ -16942,7 +17036,7 @@ mod test {
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
             let (mut setup, _, _) = broker
-                .interaction_for_turn("/checks setup", true, 100)
+                .interaction_for_turn("Configure project checks", true, 100)
                 .await
                 .unwrap();
             setup.check_setup = Some(state);
@@ -16990,7 +17084,7 @@ mod test {
                 task_id: None,
                 shell: broker.session.shell,
                 mode: PromptMode::Chat,
-                permission: PermissionMode::Yolo,
+                permission: ApprovalMode::Allow,
                 permissions: Arc::clone(&broker.permission_coordinator),
                 address: crate::backend::ProviderAddress {
                     owner: None,
@@ -17067,7 +17161,7 @@ mod test {
                 &json!({"checks":{"configured":{"trigger":{"auto":false},"action":{"command":"echo configured-check","label":"Configured check","category":"test"}}}}),
             )?,
         )?;
-        for permission in [PermissionMode::Read, PermissionMode::Write] {
+        for permission in [ApprovalMode::Ask, ApprovalMode::Ask] {
             save_check_exchange(
                 &mut broker,
                 &format!("configured-check-{permission:?}"),
@@ -17182,7 +17276,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let (mut setup, _, _) = broker
-            .interaction_for_turn("/checks setup", true, 100)
+            .interaction_for_turn("Configure project checks", true, 100)
             .await
             .unwrap();
         setup.check_setup = Some(crate::checks::CheckSetupState::Reviewed);
@@ -17227,7 +17321,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let (mut setup, _, _) = broker
-            .interaction_for_turn("/checks setup", true, 100)
+            .interaction_for_turn("Configure project checks", true, 100)
             .await
             .unwrap();
         let admission = ExchangeAdmission::chat("Ordinary chat".into());
@@ -17843,8 +17937,8 @@ mod test {
         assert_ne!(first.session.id, second.session.id);
         assert_eq!(first.session.name, "first");
         assert_eq!(second.session.name, "second");
-        assert_eq!(first.session.execution_mode, PermissionMode::Write);
-        assert_eq!(second.session.execution_mode, PermissionMode::Write);
+        assert_eq!(first.session.approval_mode, ApprovalMode::Ask);
+        assert_eq!(second.session.approval_mode, ApprovalMode::Ask);
         assert_eq!(second.store.list_session(None).unwrap().len(), 2);
     }
 
@@ -17923,7 +18017,7 @@ mod test {
                 .is_none()
         );
         stored.backend = "mock".into();
-        stored.execution_mode = PermissionMode::Read;
+        stored.approval_mode = ApprovalMode::Ask;
         stored.workspace = format!("{}//./", stored.workspace);
         source.store.save_session(&stored).unwrap();
 
@@ -17931,7 +18025,7 @@ mod test {
             HarnessBroker::initialize_with_clock(request, Box::new(FixedClock(140))).unwrap();
         assert_eq!(resumed.session.id, source.session.id);
         assert_eq!(resumed.session.name, "source");
-        assert_eq!(resumed.session.execution_mode, PermissionMode::Read);
+        assert_eq!(resumed.session.approval_mode, ApprovalMode::Ask);
         assert_eq!(resumed.store.list_session(None).unwrap().len(), 2);
     }
 
@@ -17969,8 +18063,8 @@ mod test {
         source
             .dispatch(Request {
                 id: 0,
-                method: "session.execution_mode".into(),
-                params: json!({ "mode": "write" }),
+                method: "session.permission".into(),
+                params: json!({ "change":{"kind":"set_approval","mode":"ask"} }),
             })
             .await;
         let prompt = source
@@ -18048,7 +18142,7 @@ mod test {
         let snapshot = serde_json::to_value(child_controller.snapshot().unwrap()).unwrap();
         assert_ne!(snapshot["session"]["id"], source_session_id);
         assert_eq!(snapshot["session"]["name"], "fork investigation");
-        assert_eq!(snapshot["session"]["execution_mode"], "read");
+        assert_eq!(snapshot["session"]["approval_mode"], "ask");
         assert_eq!(snapshot["session"]["provider_fork_state"]["state"], "ready");
         assert_eq!(snapshot["session"]["context_usage"]["used"], 50);
         assert_eq!(snapshot["session"]["context_usage"]["size"], 200);
@@ -18291,8 +18385,8 @@ mod test {
         let selected = broker
             .dispatch(Request {
                 id: 0,
-                method: "session.execution_mode".into(),
-                params: json!({ "mode": "yolo" }),
+                method: "session.permission".into(),
+                params: json!({ "change":{"kind":"enable_yolo"} }),
             })
             .await;
         assert!(selected.response.error().is_none());
@@ -18388,7 +18482,7 @@ mod test {
         assert_eq!(session["effort"], "low");
         assert_eq!(session["context_window"], "default");
         assert_eq!(session["service_tier"], "ultrafast");
-        assert_eq!(session["execution_mode"], "write");
+        assert_eq!(session["approval_mode"], "ask");
         drop(broker);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
@@ -18417,8 +18511,8 @@ mod test {
         let selected = broker
             .dispatch(Request {
                 id: 21,
-                method: "session.execution_mode".into(),
-                params: json!({ "mode": "write" }),
+                method: "session.permission".into(),
+                params: json!({ "change":{"kind":"set_approval","mode":"ask"} }),
             })
             .await;
         assert!(selected.response.error().is_none());
@@ -18487,7 +18581,7 @@ mod test {
             restarted.session.service_tier,
             crate::backend::ServiceTier::Ultrafast
         );
-        assert_eq!(restarted.session.execution_mode, PermissionMode::Write);
+        assert_eq!(restarted.session.approval_mode, ApprovalMode::Ask);
         assert!(
             !restarted
                 .snapshot()
@@ -18532,8 +18626,8 @@ mod test {
         let mut initial =
             HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(100)))
                 .unwrap();
-        assert_eq!(initial.session.execution_mode, PermissionMode::Write);
-        initial.session.execution_mode = PermissionMode::Read;
+        assert_eq!(initial.session.approval_mode, ApprovalMode::Ask);
+        initial.session.approval_mode = ApprovalMode::Ask;
         initial.save_session().unwrap();
         let original_id = initial.session.id.clone();
         let mut settings = crate::settings::SettingsStore::open(data.path()).unwrap();
@@ -18547,7 +18641,7 @@ mod test {
                 .unwrap();
         assert_eq!(resumed.session.id, original_id);
         assert_eq!(resumed.session.model, "original-model");
-        assert_eq!(resumed.session.execution_mode, PermissionMode::Read);
+        assert_eq!(resumed.session.approval_mode, ApprovalMode::Ask);
         let created = resumed
             .dispatch(Request {
                 id: 1,
@@ -18560,7 +18654,7 @@ mod test {
         assert_eq!(child["effort"], "high");
         assert_eq!(child["context_window"], "long_context");
         assert_eq!(child["service_tier"], "fast");
-        assert_eq!(child["execution_mode"], "write");
+        assert_eq!(child["approval_mode"], "ask");
 
         let fresh = HarnessBroker::initialize_with_clock(
             InitializeRequest {
@@ -18572,7 +18666,7 @@ mod test {
         )
         .unwrap();
         assert_eq!(fresh.session.model, "preferred-model");
-        assert_eq!(fresh.session.execution_mode, PermissionMode::Write);
+        assert_eq!(fresh.session.approval_mode, ApprovalMode::Ask);
         assert_eq!(
             fresh.session.resolved_model.as_deref(),
             Some("preferred-model")
@@ -18639,12 +18733,12 @@ mod test {
         let invalid_mode = broker
             .dispatch(Request {
                 id: 3,
-                method: "session.execution_mode".into(),
+                method: "session.permission".into(),
                 params: json!({ "mode": "invalid" }),
             })
             .await;
         assert!(invalid_mode.response.error().is_some());
-        assert_eq!(broker.session.execution_mode, PermissionMode::Write);
+        assert_eq!(broker.session.approval_mode, ApprovalMode::Ask);
     }
 
     #[tokio::test]
@@ -19194,12 +19288,12 @@ mod test {
     }
 
     #[tokio::test]
-    async fn abort_plan_clears_review_and_question_waits_and_restores_execution_mode() {
+    async fn abort_plan_clears_review_and_question_waits_and_restores_approval_mode() {
         for structured in [false, true] {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), structured);
-            broker.session.execution_mode = PermissionMode::Write;
+            broker.session.approval_mode = ApprovalMode::Ask;
             let planned = broker
                 .dispatch(Request {
                     id: 1,
@@ -19223,7 +19317,7 @@ mod test {
             assert!(cancelled.response.error().is_none());
             let snapshot = broker.snapshot().unwrap();
             assert!(snapshot.active_plan.is_none());
-            assert_eq!(broker.session.execution_mode, PermissionMode::Write);
+            assert_eq!(broker.session.approval_mode, ApprovalMode::Ask);
             assert!(snapshot.active_elicitation.is_none());
             assert!(snapshot.timeline.iter().any(|entry| matches!(
                 entry,

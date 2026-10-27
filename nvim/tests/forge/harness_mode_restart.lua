@@ -13,7 +13,7 @@ vim.defer_fn = function() end
 local function reset()
   if state.working_timer then state.working_timer:stop() state.working_timer:close() end
   state.working_timer, state.working_started_ns = nil, nil
-  state.session = { id = "permission-transition", execution_mode = "write", current_task_id = "task" }
+  state.session = { id = "permission-transition", approval_mode = "ask", current_task_id = "task" }
   state.task = { { id = "task", kind = "goal", phase = "continue", status = "running" } }
   state.busy, state.no_checkpoint = true, false
   state.execution_notice, state.host_error, state.task_operation = nil, nil, nil
@@ -32,9 +32,9 @@ local function last(method)
 end
 for _, acknowledged_first in ipairs({ true, false }) do
   reset()
-  controller.set_mode("yolo")
+  controller.task_transition({ action = "permission", change = { kind = "enable_yolo" } })
   local change = last("task.transition")
-  assert(change.params.action == "permission" and change.params.mode == "yolo" and not change.params.target)
+  assert(change.params.action == "permission" and change.params.change.kind == "enable_yolo" and not change.params.target)
   if acknowledged_first then change.reply({ state = "accepted" }) end
   task.receive(state, { id = change.params.operation_id, state = "running" })
   if not acknowledged_first then change.reply({ state = "accepted" }) end
@@ -51,9 +51,9 @@ for _, acknowledged_first in ipairs({ true, false }) do
   assert(last("state.get") and #failures == 0)
 end
 reset()
-controller.set_mode("write")
+controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "ask" } })
 local previous = last("task.transition")
-controller.set_mode("read")
+controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "ask" } })
 local latest = last("task.transition")
 assert(previous.params.operation_id ~= latest.params.operation_id)
 task.receive(state, { id = previous.params.operation_id, state = "superseded" })
@@ -61,26 +61,18 @@ assert(state.busy and state.task_operation.id == latest.params.operation_id)
 task.receive(state, { id = latest.params.operation_id, state = "failed", error = "cleanup did not settle" })
 assert(not state.busy and state.execution_notice == "cleanup did not settle" and #failures == 1)
 assert(last("state.get"))
-reset()
-state.session.execution_mode = "read"
-state.approval = { { id = "write-request", required_mode = "write", item_list = {} } }
-local approval = require("forge.views.harness.approval")
-local original_open, approval_host = approval.open, nil
-approval.open = function(_, host) approval_host = host end
-controller.present_approval()
-approval.open = original_open
-local mode_completed
-approval_host.switch_mode("write", function(changed) mode_completed = changed end)
-local mode_operation = last("task.transition")
-assert(mode_operation.params.action == "permission" and mode_operation.params.mode == "write")
-assert(mode_completed == nil, "approval mode choice must wait for the task transition")
-mode_operation.reply({ state = "accepted" })
-task.receive(state, { id = mode_operation.params.operation_id, state = "completed" })
-assert(mode_completed == true)
-state.approval = {}
-local request_count = #requests
-approval_host.switch_mode("write", function(changed) assert(changed == false) end)
-assert(#requests == request_count, "stale approval changed the task mode")
+for _, mode in ipairs({ "n", "i" }) do
+  reset()
+  local buffer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_current_buf(buffer)
+  require("forge.shared.keymaps").setup_view_keymaps(buffer, "harness", controller.composer_command_set())
+  local mapping = vim.fn.maparg("<S-Tab>", mode, false, true)
+  assert(mapping.callback, "Shift-Tab is missing in " .. mode)
+  mapping.callback()
+  assert(last("task.transition").params.change.kind == "toggle_write_enabled")
+  assert(state.session.approval_mode == "ask", "Shift-Tab changed unconfirmed approval state")
+  vim.api.nvim_buf_delete(buffer, { force = true })
+end
 reset()
 state.host_error, state.execution_notice, state.busy = "host stopped", "Reopen Harness", false
 state.queue = { { text = "keep queued", task_id = "task" } }

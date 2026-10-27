@@ -477,7 +477,7 @@ local function dispatch_message(message, timing)
       and pending.method:sub(1, 7) ~= "review."
       and pending.method ~= "state.get"
       and pending.method ~= "session.configure"
-      and pending.method ~= "session.execution_mode"
+      and pending.method ~= "session.permission"
     then
       for _, subscriber in pairs(client.subscriber) do
         local ok, err = pcall(subscriber, "state_invalidated", { method = pending.method })

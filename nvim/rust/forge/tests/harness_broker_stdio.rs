@@ -979,7 +979,7 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
         "params": {
             "operation_id": "restart-in-write-mode",
             "action": "permission",
-            "mode": "write"
+            "change":{"kind":"set_approval","mode":"ask"}
         }
     }));
     let restart = broker.read_response(3);
@@ -1025,7 +1025,7 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
         snapshot
             .last()
             .unwrap()
-            .pointer("/result/session/execution_mode")
+            .pointer("/result/session/approval_mode")
             .and_then(Value::as_str),
         Some("write")
     );
@@ -1075,8 +1075,8 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
 
     broker.request(json!({
         "id": 2,
-        "method": "session.execution_mode",
-        "params": { "mode": "write" }
+        "method": "session.permission",
+        "params": { "change":{"kind":"set_approval","mode":"ask"} }
     }));
     broker.read_response(2);
     let prompt = "/plan reconsider this\nbefore doing anything";
@@ -1139,7 +1139,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
         snapshot
             .last()
             .unwrap()
-            .pointer("/result/session/execution_mode")
+            .pointer("/result/session/approval_mode")
             .and_then(Value::as_str),
         Some("write")
     );

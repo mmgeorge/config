@@ -423,10 +423,20 @@ impl CapabilityManifest {
                 }
             }
         }
+        capability.push(Capability {
+            id: "filesystem_access",
+            group: "Security",
+            label: "Filesystem access scopes",
+            required: false,
+            implementation: "forge",
+            support: Support::Limited,
+            application: "execution_restart",
+            reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions. Codex does not enforce the selected read scope as OS read confinement",
+        });
         Self {
             backend: descriptor.kind,
             label: descriptor.label,
-            revision: 5,
+            revision: 6,
             capability,
             provider_version: None,
             availability: "ready",

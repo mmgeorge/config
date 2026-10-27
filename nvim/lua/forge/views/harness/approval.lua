@@ -33,7 +33,6 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@field deadline? {expires_at_ms: number}
 ---@field resolution_source? 'user'|'timeout'
 ---@field item_list ForgeApprovalItem[]
----@field required_mode? 'write'
 
 ---@class ForgeApprovalAnswer
 ---@field item_id string
@@ -47,7 +46,6 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@field interrupt fun()
 ---@field closed fun()
 ---@field resolve fun(id: string, answer_list: ForgeApprovalAnswer[], callback: fun(resolved: boolean))
----@field switch_mode? fun(mode: string, callback: fun(changed: boolean))
 
 ---@class ForgeApprovalSession
 ---@field request ForgeApprovalRequest
@@ -151,21 +149,7 @@ local function build_spec(instance)
     }
   end
   local page_list = {}
-  if request.required_mode == "write" then
-    page_list[1] = {
-      id = "write-mode", title = "Switch to Write mode?",
-      content_list = { { text = "This task needs to edit files. Write mode allows changes within your configured access and permission rules. The task will restart and continue.",
-        group = "ForgePickerText" } },
-      column_headers = { "Decision" },
-      option_list = {
-        { key = config.options.picker.choice_keys[1], value = "switch_write", label = "Switch to Write mode" },
-        { key = config.options.picker.choice_keys[2], value = "stay_read", label = "Stay in Read mode" },
-      },
-      footer = "↑↓ select  Enter confirm  q close"
-        .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. " interrupt") or ""),
-    }
-  else
-    for _, item in ipairs(request.item_list) do
+  for _, item in ipairs(request.item_list) do
       local option_list, selected_index = {}, 1
       for index, choice in ipairs(item.choice_list) do
         option_list[#option_list + 1] = {
@@ -186,7 +170,6 @@ local function build_spec(instance)
           .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. " interrupt") or ""),
       }
     end
-  end
   return {
     owner = "approval", action_list = actions,
     deadline = request.deadline,
@@ -197,19 +180,6 @@ local function build_spec(instance)
     page_list = page_list, initial_page = instance.page_index,
     on_confirm = function(result)
       if active ~= instance or instance.submitting then return false end
-      if request.required_mode == "write" then
-        if result.option.value == "switch_write" then
-          instance.submitting = true
-          assert(host.switch_mode, "write mode prompt requires a task transition")("write", function(changed)
-            instance.submitting = false
-            if active == instance and changed then active = nil picker.close(false) end
-          end)
-        else
-          for _, item in ipairs(request.item_list) do instance.selection[item.id] = { id = "deny_once" } end
-          submit(instance, false)
-        end
-        return false
-      end
       if result.option.value == "cancel" then
         submit(instance, true)
         return false

@@ -47,12 +47,12 @@ local success, failure = xpcall(function()
   instance.spec.on_field_action({ field = options["execute-permission"].fields[1] }, "change", 1)
   assert(#configured == 2, "configuration picker blocked a second edit before acknowledgement")
   assert(configured[1].params.plan_auto_approve_revisions == false)
-  assert(configured[2].params.default_write_permission == "yolo")
+  assert(configured[2].params.default_approval == "allow")
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true))
   configured[1].completed(false)
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true),
     "configuration displayed pending status after an older completion")
-  state.session.default_write_permission = "yolo"
+  state.session.default_approval = "allow"
   state.session.plan_auto_approve_revisions = false
   configured[2].completed(true)
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true))
@@ -102,10 +102,10 @@ local success, failure = xpcall(function()
     configuration_request[#configuration_request + 1] = { params = action.config, callback = callback }
   end
   local first_applied, second_applied
-  controller.configure({ default_write_permission = "write" }, true, function(result) first_applied = result end)
+  controller.configure({ default_approval = "ask" }, true, function(result) first_applied = result end)
   controller.configure({ plan_auto_approve_revisions = true }, true, function(result) second_applied = result end)
   assert(#configuration_request == 1 and second_applied == nil)
-  state.session.default_write_permission = "write"
+  state.session.default_approval = "ask"
   configuration_request[1].callback(true)
   controller.drain()
   assert(vim.wait(1000, function() return #configuration_request == 2 end, 10),

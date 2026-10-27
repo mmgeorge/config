@@ -1,4 +1,4 @@
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 use serde::{Deserialize, Serialize};
 
 /// Applies saved model controls while retaining provider defaults for unset values.
@@ -44,7 +44,7 @@ pub struct BackendCatalogRequest {
     pub harness_session_id: String,
     pub workspace: String,
     pub access: crate::session::AccessPolicy,
-    pub execution_mode: PermissionMode,
+    pub approval_mode: ApprovalMode,
     pub backend_session_id: Option<String>,
 }
 

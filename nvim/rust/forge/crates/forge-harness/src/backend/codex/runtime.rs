@@ -2,7 +2,7 @@ use super::json_rpc::CodexJsonRpc;
 use super::process;
 use crate::backend::BackendEventSink;
 use crate::backend::approval::PermissionCoordinator;
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use process_wrap::tokio::ChildWrapper;
@@ -68,7 +68,7 @@ impl CodexRuntime {
     pub async fn connect(
         &self,
         workspace: &str,
-        execution_mode: PermissionMode,
+        approval_mode: ApprovalMode,
         permission_coordinator: Arc<PermissionCoordinator>,
         event_sink: Option<BackendEventSink>,
         trace: Arc<TraceStore>,
@@ -95,7 +95,7 @@ impl CodexRuntime {
             match CodexJsonRpc::connect(
                 &endpoint,
                 workspace,
-                execution_mode,
+                approval_mode,
                 Arc::clone(&permission_coordinator),
                 event_sink.clone(),
                 Arc::clone(&trace),

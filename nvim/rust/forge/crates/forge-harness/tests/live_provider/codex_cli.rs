@@ -5,7 +5,7 @@ use forge_harness::backend::{
 };
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::plan::PlanPrompt;
-use forge_harness::session::PermissionMode;
+use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
 use std::fs;
 use std::path::Path;
@@ -32,10 +32,10 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         context_window: None,
         service_tier: forge_harness::backend::ServiceTier::Fast,
         access: Default::default(),
-        execution_mode: if mode == PromptMode::Plan {
-            PermissionMode::Read
+        approval_mode: if mode == PromptMode::Plan {
+            ApprovalMode::Ask
         } else {
-            PermissionMode::Write
+            ApprovalMode::Ask
         },
         backend_session_id: None,
         submission: None,
@@ -79,7 +79,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
         harness_session_id: "catalog-session".into(),
         workspace: repository.path().to_string_lossy().into_owned(),
         access: Default::default(),
-        execution_mode: PermissionMode::Read,
+        approval_mode: ApprovalMode::Ask,
         backend_session_id: None,
     };
 
@@ -266,7 +266,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         PromptMode::ExecutePlan,
         "Execute the accepted plan now. Create harness-integration.txt containing exactly `verified` followed by a newline, then call goal_complete.",
     );
-    execute.execution_mode = PermissionMode::Yolo;
+    execute.approval_mode = ApprovalMode::Allow;
     execute.backend_session_id = planned.backend_session_id.clone();
     let (event_sink, mut event_stream) = forge_harness::backend::events::channel();
     let executed = tokio::time::timeout(
@@ -351,7 +351,7 @@ async fn streams_structured_child_agent_lifecycle() {
         PromptMode::Chat,
         "Spawn an explorer subagent to read README.md and report its heading. Wait for it to finish.",
     );
-    backend_request.execution_mode = PermissionMode::Read;
+    backend_request.approval_mode = ApprovalMode::Ask;
     let output = tokio::time::timeout(Duration::from_secs(90), backend.prompt(backend_request))
         .await
         .expect("Codex subagent turn exceeded 90 seconds")

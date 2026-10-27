@@ -54,8 +54,8 @@ client.request_for = function(session_id, method, params, callback)
     end
     if params.shell then configured_session.shell = params.shell end
     if params.access then configured_session.access = params.access end
-    if params.default_write_permission then configured_session.default_write_permission = params.default_write_permission end
-    if params.plan_permission then configured_session.plan_permission = params.plan_permission end
+    if params.default_approval then configured_session.default_approval = params.default_approval end
+    if params.plan_approval then configured_session.plan_approval = params.plan_approval end
     if params.plan_executor_enabled ~= nil then configured_session.plan_executor.enabled = params.plan_executor_enabled end
     if params.plan_compact ~= nil then configured_session.plan_compact = params.plan_compact end
     if params.plan_auto_approve_revisions ~= nil then configured_session.plan_auto_approve_revisions = params.plan_auto_approve_revisions end
@@ -117,9 +117,9 @@ local success, failure = xpcall(function()
   end
   assert(#instance.spec.page_list[1].option_list == 20, "settings are not grouped into 20 rows")
   assert(find("check-timing").section == "Checks")
-  assert(find("plan-permission").section == "Planning")
+  assert(find("plan-approval").section == "Planning")
   assert(find("plan-revisions").section == "Planning")
-  assert(find("default-write-permission").section == "Execute")
+  assert(find("default-approval").section == "Execute")
   for _, row in ipairs(instance.spec.page_list[1].option_list) do
     assert(row.id ~= "permission-defaults" and row.label ~= "Defaults", "obsolete Defaults row remains")
   end
@@ -161,18 +161,18 @@ local success, failure = xpcall(function()
   assert(state.check_editing == true)
   key("check-editing", "<Space>")
   assert(state.check_editing == false)
-  key("default-write-permission", "<Right>")
-  assert(configured_session.default_write_permission == "yolo")
-  local _, execute_permission = find("default-write-permission")
-  assert(execute_permission.value == "YOLO")
-  key("default-write-permission", "<Left>")
-  assert(configured_session.default_write_permission == "write")
-  local _, execute_permission = find("default-write-permission")
-  assert(execute_permission.value == "Write")
-  key("plan-permission", "<Right>")
-  assert(configured_session.plan_permission == "read")
-  key("plan-permission", "<Left>")
-  assert(configured_session.plan_permission == vim.NIL)
+  key("default-approval", "<Right>")
+  assert(configured_session.default_approval == "deny")
+  local _, execute_permission = find("default-approval")
+  assert(execute_permission.value == "deny")
+  key("default-approval", "<Left>")
+  assert(configured_session.default_approval == "ask")
+  local _, execute_permission = find("default-approval")
+  assert(execute_permission.value == "ask")
+  key("plan-approval", "<Right>")
+  assert(configured_session.plan_approval == "ask")
+  key("plan-approval", "<Left>")
+  assert(configured_session.plan_approval == vim.NIL)
   key("plan-revisions", "<Space>")
   assert(configured_session.plan_auto_approve_revisions == false)
   key("plan-revisions", "<Space>")
@@ -222,6 +222,8 @@ local success, failure = xpcall(function()
   assert(failure_message and configured_session.access.sandbox == false)
   key("read-access", "<Right>")
   assert(configured_session.access.read_access == "workspace")
+  key("write-access", "<Right>")
+  assert(configured_session.access.write_access == "off")
   key("write-access", "<Right>")
   assert(configured_session.access.write_access == "workspace")
   picker.close()

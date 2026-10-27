@@ -3,7 +3,8 @@ use super::matcher::{
     CompiledPermissionDocument, PermissionEvaluation, PermissionRequest, PermissionTarget,
     path_starts_with,
 };
-use crate::session::{AccessPolicy, DirectoryScope, PermissionMode};
+use crate::session::WriteScope;
+use crate::session::{AccessPolicy, DirectoryScope};
 use crate::settings::{SettingScope, SettingsStore};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -34,7 +35,6 @@ impl DirectoryPolicy {
     pub(crate) fn evaluate(
         &self,
         compiled: &CompiledPermissionDocument,
-        mode: PermissionMode,
         request: &mut PermissionRequest,
     ) -> Result<PermissionEvaluation> {
         let compiled =
@@ -48,36 +48,46 @@ impl DirectoryPolicy {
             }
         }
         let access = self.effective_access()?;
-        let mut evaluation = compiled.evaluate(mode, request)?;
+        let mut evaluation = compiled.evaluate(request)?;
         let mut denied = evaluation.decision == PermissionDecision::Deny;
         for (target, original) in request.target_list.iter().zip(original_target_list) {
-            let (path, scope, directories, write) = match target {
-                PermissionTarget::Read { path } => {
-                    (path, access.read_access, &access.readable_directory, false)
+            let (path, full, directories) = match target {
+                PermissionTarget::Read { path } => (
+                    path,
+                    access.read_access == DirectoryScope::Full,
+                    &access.readable_directory,
+                ),
+                PermissionTarget::Write { .. }
+                | PermissionTarget::UnknownFile {
+                    operation: DirectoryOperation::Write,
+                } if access.write_access == WriteScope::Off => {
+                    denied = true;
+                    evaluation
+                        .pending_target_list
+                        .retain(|pending| pending != target);
+                    continue;
                 }
-                PermissionTarget::Write { path } => {
-                    (path, access.write_access, &access.writable_directory, true)
-                }
+                PermissionTarget::Write { path } => (
+                    path,
+                    access.write_access == WriteScope::Full,
+                    &access.writable_directory,
+                ),
                 _ => continue,
             };
             let single = PermissionRequest {
                 target_list: vec![target.clone()],
                 ..request.clone()
             };
-            let explicit = compiled.evaluate(PermissionMode::Write, &single)?;
-            let original = compiled.evaluate(
-                PermissionMode::Write,
-                &PermissionRequest {
-                    target_list: vec![original],
-                    ..request.clone()
-                },
-            )?;
-            let covered = scope == DirectoryScope::Full
-                || path_starts_with(
+            let explicit = compiled.evaluate(&single)?;
+            let original = compiled.evaluate(&PermissionRequest {
+                target_list: vec![original],
+                ..request.clone()
+            })?;
+            let covered =
+                full || path_starts_with(
                     Path::new(path),
                     &resolve_path(&self.workspace, &self.workspace)?,
-                )
-                || directories
+                ) || directories
                     .iter()
                     .any(|directory| path_starts_with(Path::new(path), Path::new(directory)));
             let specific_allow = explicit.decision == PermissionDecision::Allow
@@ -90,7 +100,6 @@ impl DirectoryPolicy {
             {
                 PermissionDecision::Deny
             } else if (!covered && !specific_allow)
-                || (write && mode == PermissionMode::Read)
                 || [&explicit, &original].into_iter().any(|evaluation| {
                     evaluation.decision == PermissionDecision::Ask
                         && !evaluation.matched_pattern_list.is_empty()
@@ -234,6 +243,51 @@ mod test {
     use crate::permissions::document::parse_permission_document;
 
     #[test]
+    fn write_off_rejects_known_and_unknown_writes_despite_grants() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let workspace = dunce::canonicalize(root.path())?;
+        let mut policy = DirectoryPolicy {
+            access: AccessPolicy {
+                write_access: WriteScope::Off,
+                writable_directory: vec![workspace.display().to_string()],
+                ..Default::default()
+            },
+            workspace: workspace.clone(),
+            session_id: "fixture".into(),
+            settings_root: None,
+        };
+        let compiled = CompiledPermissionDocument::compile(
+            parse_permission_document(
+                r#"{"permission":{"read":{"*":"allow"},"edit":{"*":"allow",".":"allow"}}}"#,
+            )?,
+            &workspace,
+        );
+        for read_access in [DirectoryScope::Workspace, DirectoryScope::Full] {
+            policy.access.read_access = read_access;
+            for target in [
+                PermissionTarget::Write {
+                    path: "new/file".into(),
+                },
+                PermissionTarget::UnknownFile {
+                    operation: DirectoryOperation::Write,
+                },
+            ] {
+                let mut request = PermissionRequest {
+                    id: "write".into(),
+                    provider: "test".into(),
+                    reason: None,
+                    target_list: vec![target],
+                };
+                assert_eq!(
+                    policy.evaluate(&compiled, &mut request)?.decision,
+                    PermissionDecision::Deny
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn directory_scope_applies_without_sandbox_and_preserves_modes_and_rules() -> Result<()> {
         let root = tempfile::tempdir()?;
         let workspace = dunce::canonicalize(root.path())?.join("workspace");
@@ -254,11 +308,7 @@ mod test {
             r#"{"permission":{"read":{"*":"allow"},"edit":{".":"allow"}}}"#,
         )?;
         let mut compiled = CompiledPermissionDocument::compile(document.clone(), &workspace);
-        for mode in [
-            PermissionMode::Read,
-            PermissionMode::Write,
-            PermissionMode::Yolo,
-        ] {
+        {
             for (path, expected) in [
                 (workspace.join("new/deep/file"), PermissionDecision::Allow),
                 (external.join("file"), PermissionDecision::Ask),
@@ -275,10 +325,7 @@ mod test {
                         path: path.display().to_string(),
                     }],
                 };
-                assert_eq!(
-                    policy.evaluate(&compiled, mode, &mut request)?.decision,
-                    expected
-                );
+                assert_eq!(policy.evaluate(&compiled, &mut request)?.decision, expected);
             }
         }
         policy
@@ -294,18 +341,14 @@ mod test {
             }],
         };
         assert_eq!(
-            policy
-                .evaluate(&compiled, PermissionMode::Write, &mut request)?
-                .decision,
+            policy.evaluate(&compiled, &mut request)?.decision,
             PermissionDecision::Allow
         );
         request.target_list = vec![PermissionTarget::Write {
             path: external.join("new/deep/file").display().to_string(),
         }];
         assert_eq!(
-            policy
-                .evaluate(&compiled, PermissionMode::Write, &mut request)?
-                .decision,
+            policy.evaluate(&compiled, &mut request)?.decision,
             PermissionDecision::Ask
         );
         policy
@@ -313,18 +356,15 @@ mod test {
             .writable_directory
             .push(external.display().to_string());
         assert_eq!(
-            policy
-                .evaluate(&compiled, PermissionMode::Write, &mut request)?
-                .decision,
+            policy.evaluate(&compiled, &mut request)?.decision,
             PermissionDecision::Allow
         );
+        policy.access.write_access = WriteScope::Off;
         assert_eq!(
-            policy
-                .evaluate(&compiled, PermissionMode::Read, &mut request)?
-                .decision,
-            PermissionDecision::Ask
+            policy.evaluate(&compiled, &mut request)?.decision,
+            PermissionDecision::Deny
         );
-        policy.access.write_access = DirectoryScope::Full;
+        policy.access.write_access = WriteScope::Full;
         document
             .permission
             .get_mut("edit")
@@ -332,19 +372,13 @@ mod test {
             .insert(external.display().to_string(), PermissionDecision::Deny);
         compiled = CompiledPermissionDocument::compile(document, &workspace);
         assert_eq!(
-            policy
-                .evaluate(&compiled, PermissionMode::Yolo, &mut request)?
-                .decision,
+            policy.evaluate(&compiled, &mut request)?.decision,
             PermissionDecision::Deny
         );
         request.target_list = vec![PermissionTarget::Read {
             path: String::new(),
         }];
-        assert!(
-            policy
-                .evaluate(&compiled, PermissionMode::Write, &mut request)
-                .is_err()
-        );
+        assert!(policy.evaluate(&compiled, &mut request).is_err());
         Ok(())
     }
 
@@ -363,7 +397,7 @@ mod test {
             parse_permission_document(r#"{"permission":{"read":{"*":"allow","blocked":"deny"}}}"#)?,
             root.path(),
         );
-        for mode in [PermissionMode::Write, PermissionMode::Yolo] {
+        {
             let mut request = PermissionRequest {
                 id: "file".into(),
                 provider: "test".into(),
@@ -373,7 +407,7 @@ mod test {
                 }],
             };
             assert_eq!(
-                policy.evaluate(&compiled, mode, &mut request)?.decision,
+                policy.evaluate(&compiled, &mut request)?.decision,
                 PermissionDecision::Deny
             );
         }
@@ -410,9 +444,7 @@ mod test {
             target_list: vec![PermissionTarget::Read { path }],
         };
         assert_eq!(
-            policy
-                .evaluate(&compiled, PermissionMode::Write, &mut request)?
-                .decision,
+            policy.evaluate(&compiled, &mut request)?.decision,
             PermissionDecision::Allow
         );
         Ok(())
@@ -613,9 +645,7 @@ mod test {
             }],
         };
         assert_eq!(
-            policy
-                .evaluate(&compiled, PermissionMode::Yolo, &mut request)?
-                .decision,
+            policy.evaluate(&compiled, &mut request)?.decision,
             PermissionDecision::Ask
         );
         assert_eq!(
@@ -637,19 +667,13 @@ mod test {
             &workspace,
         );
         assert_eq!(
-            policy
-                .evaluate(&write_compiled, PermissionMode::Write, &mut request)?
-                .decision,
+            policy.evaluate(&write_compiled, &mut request)?.decision,
             PermissionDecision::Ask
         );
         request.target_list = vec![PermissionTarget::Read {
             path: "dangling/file".into(),
         }];
-        assert!(
-            policy
-                .evaluate(&compiled, PermissionMode::Write, &mut request)
-                .is_err()
-        );
+        assert!(policy.evaluate(&compiled, &mut request).is_err());
         Ok(())
     }
 
@@ -732,9 +756,7 @@ mod test {
             }],
         };
         assert_eq!(
-            policy
-                .evaluate(&compiled, PermissionMode::Write, &mut request)?
-                .decision,
+            policy.evaluate(&compiled, &mut request)?.decision,
             PermissionDecision::Allow
         );
         let snapshot = settings.get("", "", "")?;
@@ -742,9 +764,7 @@ mod test {
         global.access.as_mut().unwrap().readable_directory.clear();
         settings.update(snapshot.revision, SettingScope::Global, "", "", &global)?;
         assert_eq!(
-            policy
-                .evaluate(&compiled, PermissionMode::Write, &mut request)?
-                .decision,
+            policy.evaluate(&compiled, &mut request)?.decision,
             PermissionDecision::Ask
         );
         assert!(

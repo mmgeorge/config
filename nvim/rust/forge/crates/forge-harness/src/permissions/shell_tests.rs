@@ -5,7 +5,7 @@ use crate::permissions::document::parse_permission_document;
 use crate::permissions::matcher::{
     CompiledPermissionDocument, PermissionRequest, PermissionTarget,
 };
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 
 fn policy(default: &str, probe: &str) -> CompiledPermissionDocument {
     let document = serde_json::json!({"permission": {"bash": {"*": default, "probe *": probe}}});
@@ -46,15 +46,9 @@ fn check_matrix(shell: CommandShell, fixture_list: &[&str]) {
                 shell: Some(shell),
             }],
         };
-        let allowed = policy("allow", "allow")
-            .evaluate(PermissionMode::Write, &request)
-            .unwrap();
-        let denied = policy("allow", "deny")
-            .evaluate(PermissionMode::Write, &request)
-            .unwrap();
-        let asked = policy("allow", "ask")
-            .evaluate(PermissionMode::Write, &request)
-            .unwrap();
+        let allowed = policy("allow", "allow").evaluate(&request).unwrap();
+        let denied = policy("allow", "deny").evaluate(&request).unwrap();
+        let asked = policy("allow", "ask").evaluate(&request).unwrap();
         if parsed.failure.is_some() || allowed.decision != PermissionDecision::Allow
             || denied.decision != PermissionDecision::Deny || asked.decision != PermissionDecision::Ask
             || asked.pending_target_list.is_empty()
@@ -86,12 +80,8 @@ fn reject_matrix(shell: CommandShell, fixture_list: &[&str]) {
                 shell: Some(shell),
             }],
         };
-        for mode in [
-            PermissionMode::Read,
-            PermissionMode::Write,
-            PermissionMode::Yolo,
-        ] {
-            if policy("allow", "allow").evaluate(mode, &request).is_ok() {
+        for mode in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {
+            if policy("allow", "allow").evaluate(&request).is_ok() {
                 failure_list.push(format!("{mode:?}: {source}"));
             }
         }
@@ -166,7 +156,7 @@ fn powershell_comma_arguments_keep_independent_permissions_and_source_ranges() {
                     shell: Some(CommandShell::PowerShell),
                 }],
             };
-            let result = compiled.evaluate(PermissionMode::Write, &request).unwrap();
+            let result = compiled.evaluate(&request).unwrap();
             assert_eq!(
                 result.decision,
                 if decision == "ask" {
@@ -288,7 +278,7 @@ fn check_execution(shell: CommandShell, source: &str, expected: &[&str]) {
                     shell: Some(shell),
                 }],
             };
-            let evaluated = compiled.evaluate(PermissionMode::Write, &request).unwrap();
+            let evaluated = compiled.evaluate(&request).unwrap();
             if invocation.structural && decision == "ask" {
                 assert_eq!(
                     evaluated.decision,
@@ -780,10 +770,7 @@ fn wrapper_denials_and_body_denials_cannot_be_bypassed() {
             ".",
         );
         assert_eq!(
-            compiled
-                .evaluate(PermissionMode::Write, &request)
-                .unwrap()
-                .decision,
+            compiled.evaluate(&request).unwrap().decision,
             PermissionDecision::Allow
         );
         let document =
@@ -793,10 +780,7 @@ fn wrapper_denials_and_body_denials_cannot_be_bypassed() {
             ".",
         );
         assert_eq!(
-            compiled
-                .evaluate(PermissionMode::Write, &request)
-                .unwrap()
-                .decision,
+            compiled.evaluate(&request).unwrap().decision,
             PermissionDecision::Deny
         );
     }
@@ -825,10 +809,7 @@ fn powershell_foreach_ranges_are_expressions_and_only_loop_commands_need_permiss
             ".",
         );
         assert_eq!(
-            compiled
-                .evaluate(PermissionMode::Write, &request)
-                .unwrap()
-                .decision,
+            compiled.evaluate(&request).unwrap().decision,
             PermissionDecision::Allow
         );
     }

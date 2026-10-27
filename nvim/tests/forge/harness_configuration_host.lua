@@ -3,7 +3,7 @@ local root = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(root .. "/nvim")
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
-local executable = require("forge.builder").binary_path()
+local executable = vim.fn.fnamemodify(require("forge.builder").binary_path(), ":p")
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind)
   return (kind == "data" or kind == "config") and data or original_stdpath(kind)
@@ -24,7 +24,7 @@ client.subscribe(function(event, payload)
 end)
 local function await(predicate, message)
   assert(vim.wait(10000, function() return #errors > 0 or predicate() end, 10),
-    message .. ": " .. vim.inspect({ starts = starts, mode = state.session and state.session.execution_mode,
+    message .. ": " .. vim.inspect({ starts = starts, mode = state.session and state.session.approval_mode,
       task = task.current(state), operation = state.task_operation, error = state.configuration_error }))
   assert(#errors == 0, table.concat(errors, "\n"))
 end
@@ -50,16 +50,16 @@ local success, failure = xpcall(function()
   assert(task.current(state).id == task_id, "configuration replaced the running task")
   assert(not state.configuration_error, state.configuration_error)
 
-  controller.set_mode("read")
-  await(function() return starts == 3 and state.session.execution_mode == "read" end,
-    "Read mode did not resume active work")
-  controller.set_mode("write")
-  await(function() return starts == 4 and state.session.execution_mode == "write" end,
-    "Write mode did not resume active work")
+  controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "deny" } })
+  await(function() return starts == 3 and state.session.approval_mode == "deny" end,
+    "Deny did not resume active work")
+  controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "allow" } })
+  await(function() return starts == 4 and state.session.approval_mode == "allow" end,
+    "Allow did not resume active work")
   assert(task.current(state).id == task_id, "permission change replaced the running task")
   await(function()
     local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-    return transcript:find("Permission changed to Write", 1, true) ~= nil
+    return transcript:find("Permission changed to allow", 1, true) ~= nil
   end, "permission notice replaced the task lifecycle heading")
 
   controller.task_transition({ action = "pause" })

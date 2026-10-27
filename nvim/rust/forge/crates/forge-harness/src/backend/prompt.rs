@@ -72,13 +72,13 @@ impl BackendRequest {
             .and_then(|context| context.checks.as_ref())
             .is_some_and(|scope| scope.editing_enabled())
         {
-            "enabled. Use the harness-checks skill when configuring checks. Submit through check_definition_edit, which requires approval outside YOLO."
+            "enabled. Use the harness-checks skill when configuring checks. Submit through check_definition_edit, which uses the selected tool approval policy."
         } else {
-            "disabled. The user can enable it with /checks setup on. Configuration guidance is in the harness-checks skill."
+            "disabled. The user can enable it with /checks edit on. Configuration guidance is in the harness-checks skill."
         };
         format!(
-            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Checks run automatically at the configured queue boundary, after the queue by default. Manual runs are generally unnecessary. You may optionally call check_run for earlier feedback. Read recorded results through check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must leave validation to their parent's completion gate.\n{question}{lsp}",
-            self.execution_mode.label(),
+            "Current Harness interaction\nTool approval: {}.\nAccess configuration: {}.\nWhen write_access is off, reported file writes are rejected in every approval mode. Only the user can enable writes with /write.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Checks run automatically at the configured queue boundary, after the queue by default. Manual runs are generally unnecessary. You may optionally call check_run for earlier feedback. Read recorded results through check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must leave validation to their parent's completion gate.\n{question}{lsp}",
+            self.approval_mode.label(),
             serde_json::to_string(&self.access).expect("access policy serializes")
         )
     }
@@ -89,7 +89,7 @@ mod test {
     use super::*;
     use crate::backend::{BackendInput, ServiceTier};
     use crate::control_tools::ControlTurnContext;
-    use crate::session::PermissionMode;
+    use crate::session::ApprovalMode;
 
     #[test]
     fn background_profile_excludes_workflow_instructions_and_tools() {
@@ -119,20 +119,16 @@ mod test {
             context_window: None,
             service_tier: ServiceTier::Standard,
             access: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: Some("existing".into()),
             submission: None,
             recovered_input: Vec::new(),
             control_context: Some(ControlTurnContext::inactive(PromptMode::Chat)),
         };
-        for permission in [
-            PermissionMode::Read,
-            PermissionMode::Write,
-            PermissionMode::Yolo,
-        ] {
-            request.execution_mode = permission;
+        for permission in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {
+            request.approval_mode = permission;
             let contract = request.interaction_contract();
-            assert!(contract.contains(&format!("Effective permission: {}.", permission.label())));
+            assert!(contract.contains(&format!("Tool approval: {}.", permission.label())));
             assert!(contract.contains("currently pending question"));
             assert!(!contract.contains("already recorded"));
         }

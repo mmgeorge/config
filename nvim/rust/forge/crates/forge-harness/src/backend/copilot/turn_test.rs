@@ -190,7 +190,7 @@ async fn copilot_disables_tool_search_and_binds_session_files_on_create_and_resu
         let context = backend.permission_context(&request.runtime_key()?).await;
         context.configure(
             request.owner()?,
-            PermissionMode::Read,
+            ApprovalMode::Ask,
             request.workspace.clone(),
             Some(sink),
         )?;
@@ -229,7 +229,7 @@ async fn copilot_file_callbacks_apply_directory_scopes_without_sandbox() -> Resu
     let (root, backend, mut request) = fixture()?;
     let external = tempfile::tempdir()?;
     request.access.read_access = crate::session::DirectoryScope::Workspace;
-    request.execution_mode = PermissionMode::Write;
+    request.approval_mode = ApprovalMode::Ask;
     assert!(!request.access.sandbox);
     let coordinator = backend.permission_coordinator.clone();
     let _directories = coordinator.directories(Some(&root.path().join("settings")), &request)?;
@@ -237,7 +237,7 @@ async fn copilot_file_callbacks_apply_directory_scopes_without_sandbox() -> Resu
     let context = Arc::new(CopilotPermissionContext::new(coordinator.clone()));
     context.configure(
         request.owner()?,
-        PermissionMode::Write,
+        ApprovalMode::Ask,
         request.workspace.clone(),
         Some(sink),
     )?;
@@ -675,7 +675,7 @@ fn fixture() -> Result<(tempfile::TempDir, CopilotBackend, BackendRequest)> {
         harness_session_id: "copilot-cancel".into(),
         workspace: fixture.path().to_string_lossy().into_owned(),
         access: BackendKind::Copilot.resolve_access(crate::session::AccessPolicy::default()),
-        execution_mode: PermissionMode::Read,
+        approval_mode: ApprovalMode::Ask,
         backend_session_id: None,
     });
     Ok((fixture, backend, request))

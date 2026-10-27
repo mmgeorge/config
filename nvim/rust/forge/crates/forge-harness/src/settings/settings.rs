@@ -5,6 +5,41 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+const SETTINGS_FORMAT_VERSION: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+struct SettingsRecord<Payload> {
+    format_version: u32,
+    payload: Payload,
+}
+
+impl<Payload> SettingsRecord<Payload> {
+    fn encode(payload: &Payload) -> Result<String>
+    where
+        Payload: Serialize,
+    {
+        Ok(serde_json::to_string(&SettingsRecord {
+            format_version: SETTINGS_FORMAT_VERSION,
+            payload,
+        })?)
+    }
+
+    fn decode(encoded: &str) -> Result<Option<Payload>>
+    where
+        Payload: serde::de::DeserializeOwned,
+    {
+        let record: Value = serde_json::from_str(encoded).context("read saved settings record")?;
+        if record.get("format_version").and_then(Value::as_u64)
+            != Some(u64::from(SETTINGS_FORMAT_VERSION))
+        {
+            return Ok(None);
+        }
+        let record: Self =
+            serde_json::from_value(record).context("decode current settings record")?;
+        Ok(Some(record.payload))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Selects preference inheritance without coupling preferences to conversation formats.
@@ -33,10 +68,10 @@ pub struct PortableSettings {
     pub automatic_checks: Option<bool>,
     /// Allows the root agent to edit project checks in this conversation.
     pub check_editing: Option<bool>,
-    /// Selects the ordinary writable approval mode.
-    pub default_write_permission: Option<crate::session::PermissionMode>,
-    /// Selects the permission used when planning.
-    pub plan_permission: Option<crate::session::PermissionMode>,
+    /// Selects approval handling for ordinary work independently of filesystem access.
+    pub default_approval: Option<crate::session::ApprovalMode>,
+    /// Selects approval handling when planning.
+    pub plan_approval: Option<crate::session::ApprovalMode>,
     /// Selects compaction before accepted plan execution.
     pub plan_compact: Option<bool>,
     /// Selects automatic review of execution plan revisions.
@@ -79,11 +114,11 @@ impl PortableSettings {
         if overriding.check_editing.is_some() {
             self.check_editing = overriding.check_editing;
         }
-        if overriding.default_write_permission.is_some() {
-            self.default_write_permission = overriding.default_write_permission;
+        if overriding.default_approval.is_some() {
+            self.default_approval = overriding.default_approval;
         }
-        if overriding.plan_permission.is_some() {
-            self.plan_permission = overriding.plan_permission;
+        if overriding.plan_approval.is_some() {
+            self.plan_approval = overriding.plan_approval;
         }
         if overriding.plan_compact.is_some() {
             self.plan_compact = overriding.plan_compact;
@@ -129,11 +164,11 @@ impl PortableSettings {
             shell.executable()?;
             session.shell = shell;
         }
-        if let Some(permission) = self.default_write_permission {
-            session.default_write_permission = permission;
+        if let Some(permission) = self.default_approval {
+            session.default_approval = permission;
         }
-        if let Some(permission) = self.plan_permission {
-            session.plan_permission = Some(permission);
+        if let Some(permission) = self.plan_approval {
+            session.plan_approval = Some(permission);
         }
         if let Some(enabled) = self.plan_compact {
             session.plan_compact = enabled && native_compact;
@@ -395,7 +430,8 @@ impl SettingsStore {
         Ok(preview)
     }
 
-    /// Resolve portable layers and provider-local tuning without implicit imports.
+    /// Resolve current portable layers and provider-local tuning without implicit imports.
+    /// Ignore unsupported saved formats and propagate current-format decoding failures.
     pub fn get(&self, workspace: &str, session: &str, backend: &str) -> Result<SettingsSnapshot> {
         let (revision, global, workspace, session, provider) = self.connection.query_row(
             "SELECT revision,
@@ -417,7 +453,9 @@ impl SettingsStore {
         )?;
         let mut desired = PortableSettings::default();
         for payload in [global, workspace, session].into_iter().flatten() {
-            desired.inherit(serde_json::from_str(&payload)?);
+            if let Some(settings) = SettingsRecord::decode(&payload)? {
+                desired.inherit(settings);
+            }
         }
         let provider = provider
             .map(|payload| serde_json::from_str(&payload))
@@ -469,8 +507,9 @@ impl SettingsStore {
             )
             .optional()?;
         let mut settings: PortableSettings = payload
-            .map(|payload| serde_json::from_str(&payload))
+            .map(|payload| SettingsRecord::decode(&payload))
             .transpose()?
+            .flatten()
             .unwrap_or_default();
         let access = settings.access.get_or_insert_with(Default::default);
         for grant in grants {
@@ -486,7 +525,7 @@ impl SettingsStore {
         transaction.execute(
             "INSERT INTO setting_layer VALUES ('global','',?1)
             ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload",
-            [serde_json::to_string(&settings)?],
+            [SettingsRecord::encode(&settings)?],
         )?;
         transaction.execute(
             "UPDATE setting_revision SET revision=revision+1 WHERE id=1",
@@ -514,11 +553,13 @@ impl SettingsStore {
         let Some((owner, payload)) = saved else {
             return Ok(None);
         };
+        let Some(receipt) = SettingsRecord::<SettingsReceipt>::decode(&payload)? else {
+            return Ok(None);
+        };
         ensure!(
             owner == session,
             "settings operation belongs to another session"
         );
-        let receipt: SettingsReceipt = serde_json::from_str(&payload)?;
         ensure!(
             receipt.request == *request,
             "settings operation ID was reused with a different request"
@@ -615,12 +656,6 @@ impl SettingsStore {
         if let Some(shell) = setting.shell {
             shell.executable()?;
         }
-        if let Some(permission) = setting.default_write_permission {
-            ensure!(
-                permission != crate::session::PermissionMode::Read,
-                "default_write_permission must be Write or Yolo"
-            );
-        }
         let (scope, identity) = match scope {
             SettingScope::Global => ("global", ""),
             SettingScope::Workspace => ("workspace", workspace),
@@ -646,8 +681,9 @@ impl SettingsStore {
         );
         let previous = self
             .layer(scope, identity)?
-            .map(|payload| serde_json::from_str::<PortableSettings>(&payload))
+            .map(|payload| SettingsRecord::<PortableSettings>::decode(&payload))
             .transpose()?
+            .flatten()
             .unwrap_or_default();
         let previous = serde_json::to_value(previous)?;
         let current = serde_json::to_value(setting)?;
@@ -675,7 +711,7 @@ impl SettingsStore {
             }
         }
         transaction.execute("INSERT INTO setting_layer VALUES (?1,?2,?3) ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload",
-            params![scope,identity,serde_json::to_string(setting)?])?;
+            params![scope,identity,SettingsRecord::encode(setting)?])?;
         let next = revision
             .checked_add(1)
             .context("settings revision exhausted")?;
@@ -693,7 +729,7 @@ impl SettingsStore {
                 params![
                     operation,
                     session,
-                    serde_json::to_string(&SettingsReceipt {
+                    SettingsRecord::encode(&SettingsReceipt {
                         request: request.clone(),
                         mutation: mutation.clone()
                     })?
@@ -737,7 +773,9 @@ impl SettingsStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        if let Some(payload) = payload {
+        if let Some(payload) = payload
+            && SettingsRecord::<PortableSettings>::decode(&payload)?.is_some()
+        {
             transaction.execute(
                 "INSERT INTO setting_layer VALUES ('session',?1,?2)",
                 params![target, payload],
@@ -837,8 +875,9 @@ impl SettingsStore {
         };
         Ok(self
             .layer(scope, identity)?
-            .map(|payload| serde_json::from_str(&payload))
+            .map(|payload| SettingsRecord::decode(&payload))
             .transpose()?
+            .flatten()
             .unwrap_or_default())
     }
 
@@ -853,8 +892,9 @@ impl SettingsStore {
             )
             .optional()?;
         Ok(payload
-            .map(|payload| serde_json::from_str(&payload))
+            .map(|payload| SettingsRecord::decode(&payload))
             .transpose()?
+            .flatten()
             .unwrap_or_else(|| SettingsApplication {
                 state: "unverified".into(),
                 ..Default::default()
@@ -927,7 +967,7 @@ impl SettingsStore {
 
     fn save_application(&self, session: &str, application: &SettingsApplication) -> Result<()> {
         self.connection.execute("INSERT INTO setting_application VALUES (?1,?2) ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload",
-            params![session,serde_json::to_string(application)?])?;
+            params![session,SettingsRecord::encode(application)?])?;
         Ok(())
     }
 }
@@ -935,6 +975,144 @@ impl SettingsStore {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn incompatible_settings_stay_hidden_across_every_persistence_path() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let mut store = SettingsStore::open(fixture.path())?;
+        let obsolete = r#"{"default_write_permission":"write","plan_permission":"read","status_thoughts":false}"#;
+        for (scope, identity) in [
+            ("global", ""),
+            ("workspace", "workspace"),
+            ("session", "source"),
+        ] {
+            store.connection.execute(
+                "INSERT INTO setting_layer VALUES (?1,?2,?3)",
+                params![scope, identity, obsolete],
+            )?;
+        }
+        store.connection.execute(
+            "INSERT INTO setting_application VALUES ('source',?1)",
+            [format!(r#"{{"desired_revision":0,"generation":0,"state":"applied","effective":{obsolete}}}"#)],
+        )?;
+        store.connection.execute(
+            "INSERT INTO setting_operation VALUES ('old','source',?1)",
+            [r#"{"request":{},"mutation":{"revision":0,"field":["default_write_permission"]}}"#],
+        )?;
+        store.save_provider(0, "mock", &serde_json::json!({"model":"saved-model"}))?;
+        let before = store.get("workspace", "source", "mock")?;
+        assert!(before.desired.default_approval.is_none());
+        assert!(before.desired.status_thoughts.is_none());
+        assert_eq!(before.provider["model"], "saved-model");
+        for scope in [
+            SettingScope::Global,
+            SettingScope::Workspace,
+            SettingScope::Session,
+        ] {
+            assert!(
+                store
+                    .layer_settings(scope, "workspace", "source")?
+                    .default_approval
+                    .is_none()
+            );
+        }
+        assert_eq!(store.application("source")?.state, "unverified");
+        assert!(
+            store
+                .operation("source", "old", &serde_json::json!({}))?
+                .is_none()
+        );
+        assert!(
+            store
+                .operation("other", "old", &serde_json::json!({}))?
+                .is_none()
+        );
+        store.fork_session("source", "obsolete-fork")?;
+        assert!(store.layer("session", "obsolete-fork")?.is_none());
+        assert_eq!(store.layer("global", "")?.as_deref(), Some(obsolete));
+
+        store.grant_directories(&[crate::permissions::directory::DirectoryGrant {
+            operation: crate::permissions::directory::DirectoryOperation::Read,
+            path: fixture.path().to_string_lossy().into_owned(),
+        }])?;
+        let current = PortableSettings {
+            default_approval: Some(crate::session::ApprovalMode::Deny),
+            status_thoughts: Some(true),
+            ..Default::default()
+        };
+        let revision = store.get("workspace", "source", "mock")?.revision;
+        store.update(
+            revision,
+            SettingScope::Workspace,
+            "workspace",
+            "source",
+            &current,
+        )?;
+        let revision = store.get("workspace", "source", "mock")?.revision;
+        let request = serde_json::json!({"settings": current});
+        let mutation = store.update_operation(
+            revision,
+            SettingScope::Session,
+            "workspace",
+            "source",
+            &current,
+            "current",
+            &request,
+        )?;
+        store.begin_application("source", "current", mutation.revision)?;
+        store.confirm_application("source", "current", mutation.revision, current)?;
+        store.fork_session("source", "current-fork")?;
+        drop(store);
+
+        let store = SettingsStore::open(fixture.path())?;
+        for session in ["source", "current-fork"] {
+            let settings = store.get("workspace", session, "mock")?;
+            assert_eq!(
+                settings.desired.default_approval,
+                Some(crate::session::ApprovalMode::Deny)
+            );
+            assert_eq!(settings.desired.status_thoughts, Some(true));
+            assert_eq!(settings.desired.access.unwrap().readable_directory.len(), 1);
+            assert_eq!(settings.provider["model"], "saved-model");
+        }
+        assert_eq!(store.application("source")?.state, "applied");
+        assert_eq!(
+            store
+                .operation("source", "current", &request)?
+                .unwrap()
+                .revision,
+            mutation.revision
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_settings_decode_failures_remain_visible() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let store = SettingsStore::open(fixture.path())?;
+        for payload in [
+            "{",
+            r#"{"format_version":1,"payload":{"default_approval":"write"}}"#,
+        ] {
+            store.connection.execute(
+                "INSERT OR REPLACE INTO setting_layer VALUES ('global','',?1)",
+                [payload],
+            )?;
+            assert!(store.get("workspace", "session", "mock").is_err());
+        }
+        store.connection.execute(
+            "UPDATE setting_layer SET payload=?1",
+            [r#"{"format_version":2,"payload":{"future_setting":true}}"#],
+        )?;
+        assert!(
+            store
+                .get("workspace", "session", "mock")?
+                .desired
+                .default_approval
+                .is_none()
+        );
+        Ok(())
+    }
 
     #[test]
     fn status_thoughts_inherit_and_survive_reopening_the_store() -> Result<()> {

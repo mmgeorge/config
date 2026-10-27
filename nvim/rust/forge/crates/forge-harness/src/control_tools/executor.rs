@@ -231,7 +231,6 @@ mod test {
             "exchange".into(),
             directory.path().into(),
             policy,
-            crate::session::PermissionMode::Read,
             Arc::new(AtomicBool::new(false)),
         );
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);

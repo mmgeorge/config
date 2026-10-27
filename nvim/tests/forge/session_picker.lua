@@ -87,10 +87,10 @@ local ok, failure = pcall(function()
   local now = 1700000000
   datetime.now_override = function() return now end
   local entry_list = {
-    { id = "active", name = "Architecture review", workspace = workspace, backend = "mock", execution_mode = "read", created_at_ms = (now - 2 * 86400) * 1000 },
-    { id = "beta", name = "Beta cleanup", workspace = workspace, backend = "mock", execution_mode = "write", created_at_ms = (now - 2 * 3600) * 1000 },
-    { id = "gamma", name = "Gamma migration", workspace = workspace, backend = "mock", execution_mode = "read" },
-    { id = "remote", name = "Remote review", workspace = workspace .. "-other", backend = "mock", execution_mode = "read" },
+    { id = "active", name = "Architecture review", workspace = workspace, backend = "mock", approval_mode = "ask", created_at_ms = (now - 2 * 86400) * 1000 },
+    { id = "beta", name = "Beta cleanup", workspace = workspace, backend = "mock", approval_mode = "ask", created_at_ms = (now - 2 * 3600) * 1000 },
+    { id = "gamma", name = "Gamma migration", workspace = workspace, backend = "mock", approval_mode = "ask" },
+    { id = "remote", name = "Remote review", workspace = workspace .. "-other", backend = "mock", approval_mode = "ask" },
   }
   state.session = entry_list[1]
   state.interaction = {}

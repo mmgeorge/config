@@ -109,11 +109,58 @@ file list but have no excerpts, including license files with Markdown or text ex
 
 ## Harness and permissions
 
-New interactive sessions start in Write mode. Reopening a session preserves its
-saved permission mode. Use `/read`, `/write`, or `/yolo` to change the current mode.
+New interactive sessions start with full reads, workspace writes, and `ask` approval.
+Reopening a session preserves its filesystem access and tool approval independently.
+The winbar separates every field with a small gray `·`. One gray access/approval code
+appends `dx` for Deny or `ax` for Allow to the filesystem abbreviation. Ask adds no suffix:
+`rxwx` means full reads/writes with Ask, `rxwxdx` with Deny, and `rxwxax` with Allow.
+Enabled sandbox status precedes the model.
+Opening Harness waits for the session snapshot before showing permission and model
+fields. New sessions reuse the last confirmed default model for that workspace and
+provider while refreshing the catalog in the background. Without a cached model,
+the field shows `resolving model` until the provider responds.
+The model field reads `<speed icon> <model> <thinking>`: Fast uses a gray outlined
+lightning glyph (`󱐌`), Ultrafast a filled glyph (`󱐋`) in YOLO's neon red, and Standard no icon.
+Model, thinking, or speed changes waiting for existing work share one trailing `*`
+after thinking. Idle and paused changes show no marker. The marker disappears when
+all selected values are applied.
+Only full reads, full writes, `allow`, and sandbox off add red `YOLO` text:
+`YOLO · rxwxax`. Working, planning, revision, and review labels remain white
+regardless of the selected policy.
+
+| Access | Read scope | Write scope |
+| --- | --- | --- |
+| `r` | Workspace | Off |
+| `rx` | Full | Off |
+| `rw` | Workspace | Workspace |
+| `rxw` | Full | Workspace |
+| `rwx` | Workspace | Full |
+| `rxwx` | Full | Full |
+
+The suffix `x` means full filesystem scope for the preceding operation.
+
+| Command | Effect |
+| --- | --- |
+| `/read full` | Toggle workspace/full reads, preserving writes and approval. |
+| `/write` or Shift-Tab | Toggle writes between off and workspace, preserving reads and approval. |
+| `/write full` | Toggle workspace/full writes, enabling full writes from off. |
+| `/ask` | Apply saved rules and ask for remaining tool requests. |
+| `/deny` | Apply saved rules and reject requests that still need approval. |
+| `/allow` | Apply saved rules and approve remaining tool requests once. |
+| `/yolo` | Toggle YOLO. Enter with full reads/writes, `allow`, and sandbox off. Exit with full reads/writes, `ask`, and sandbox enabled where supported. |
+
+Disabling full writes discards that full selection. The next `/write` enables
+workspace writes. Approval commands do not enable writes or change scope. Enabling
+the sandbox removes the `YOLO` indicator. Bare `/read`, `/mode`, and the `all` forms are removed.
+
+Saved denies, protected targets, malformed shell commands, and write-off remain
+authoritative in every approval mode. An out-of-scope file request can receive an
+explicit grant under `ask`, an automatic rejection under `deny`, or a once-only
+approval under `allow`. Automatic approval never saves a rule or directory grant.
 
 Copilot can read and write its current session's notes directory without approval,
-including in Read mode. Harness gets that directory from the native CLI, so the
+when writes are enabled. Write-off also rejects session-note writes. Harness gets
+that directory from the native CLI, so the
 location can differ across platforms and installations. The exception does not
 include other sessions, Copilot configuration, or symlink targets outside that
 directory. Explicit deny rules and protected Harness files still apply.
@@ -133,9 +180,9 @@ Forge checks provider history before sending again. When acceptance cannot be
 confirmed, Forge keeps both prompts saved and displays the failure instead of
 risking duplicate execution. This also applies to live steering.
 
-A file-write request in Read mode offers **Switch to Write mode** or **Stay in Read mode**.
-Switching resumes the task under the configured directory limits and permission rules.
-Staying in Read mode rejects that request.
+A reported write while writing is off is rejected without a mode-switch popup.
+Use `/write` explicitly to enable workspace writes. Plan, Execute, Goal, and task
+resumption retain selected filesystem access.
 
 File-write permission popups offer **Always allow writes in this workspace** for
 paths inside the current workspace. The choice persists a workspace-specific rule,
@@ -216,8 +263,9 @@ Shell-backed tool headings show the underlying command rather than the shell too
 wrapper, both while running and after completion. Expanding the call retains its
 full arguments. Native tools such as `rg` keep their structured call headings.
 The live status line shows the current phase, elapsed time, and interrupt key.
-Thought headers retain tool totals and append failed-tool and changed-file counts
-when nonzero. Repeated successful edits to one file count once.
+Thought headers show successful/total tools and append changed-file counts when
+nonzero. Repeated successful edits to one file count once. Individual tool errors
+and compaction details remain available in the expanded timeline.
 Enable **Thoughts** in `/config` under **Display** to show the latest thought below it in
 italics, aligned with the phase label on one line, with `...` when it exceeds the available width. The option
 defaults to Off, persists across sessions, and applies without interrupting an
@@ -307,8 +355,9 @@ changing interactive plan navigation or starting language servers.
 Tools, Display, Provider, and Debug. Use Up/Down to select a row,
 Tab/Shift-Tab to select its fields, Left/Right to change values, Space to toggle
 `●` enabled or `○` disabled, and Enter to edit a number or open a selector.
-Planning has its own permission and Auto-approve controls. Execute has a Permission
-choice of Write or YOLO, applied to new goals and accepted plan execution.
+Planning has an approval preference (Keep current, ask, deny, or allow) and an
+Auto-approve control. Execute has an approval default (ask, deny, or allow) for new
+goals and accepted plans. Neither preference changes filesystem access.
 Tools contains Timeouts and separate Space toggles for Subagents and LSP. Display contains Thoughts, and Debug at the
 end contains Logging. The explanation below the rows follows the focused field. Related settings share
 rows, including model and thinking, automatic compaction and its threshold,
@@ -329,11 +378,12 @@ extending an existing deadline. If another execution prevents a clarification
 from being submitted, Harness shows **Not submitted**, keeps the question open,
 and restores the clarification text for retry.
 
-`/checks` opens project checks. `/checks setup on` and
-`/checks setup off` toggle check-editing permission without sending a prompt.
+`/checks` opens project checks. `/checks edit on` and
+`/checks edit off` toggle check-editing permission without sending a prompt.
 Request configuration changes in chat after enabling editing. The `harness-checks`
-skill supplies setup guidance. Bare `/checks setup` is not a command.
-The Harness winbar shows enabled editing. See [Project checks](checks.md) for
+skill supplies setup guidance. Bare `/checks edit` is not a command.
+The Harness winbar appends `ce` to the permissions code while editing is enabled.
+See [Project checks](checks.md) for
 publication approval, declared inputs, and repository callbacks.
 
 PlanReview shows declaration changes with nearby context lines and enclosing

@@ -77,7 +77,7 @@ local success, failure = xpcall(function()
   request(session_id, "task.transition", { operation_id = "settings-after-pause", action = "permission", mode = "write" })
   await(function() return operation["settings-after-pause"] and operation["settings-after-pause"].state == "completed" end, "settings did not collect the pause")
   local changed = snapshot(session_id)
-  assert(changed.task[1].status == "paused" and changed.session.execution_mode == "write" and starts == 3,
+  assert(changed.task[1].status == "paused" and changed.session.approval_mode == "ask" and starts == 3,
     "settings after pause restarted execution")
   request(session_id, "task.transition", { operation_id = "resume-before-kill", action = "resume" })
   await(function() return starts == 4 end, "explicit resume did not start")

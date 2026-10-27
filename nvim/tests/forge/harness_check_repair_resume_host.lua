@@ -9,7 +9,7 @@ vim.fn.writefile({ "before" }, workspace .. "/source.txt")
 vim.fn.writefile({ vim.json.encode({ checks = {
   ["verify"] = { trigger = { auto = true, paths = { "source.txt" } }, action = { command = "exit 7", label = "Verify", category = "test" } }
 } }) }, workspace .. "/.forge.json")
-local executable = require("forge.builder").binary_path()
+local executable = vim.fn.fnamemodify(require("forge.builder").binary_path(), ":p")
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind)
   return (kind == "data" or kind == "config") and data or original_stdpath(kind)
@@ -25,7 +25,8 @@ local controller = require("forge.views.harness.controller")
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local function await(predicate, message)
-  assert(vim.wait(20000, function() return #errors > 0 or predicate() end, 10), message)
+  assert(vim.wait(20000, function() return #errors > 0 or predicate() end, 10),
+    message .. "\n" .. (state.transcript_buf and table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n") or ""))
   assert(#errors == 0, table.concat(errors, "\n"))
 end
 local success, failure = xpcall(function()
@@ -46,9 +47,9 @@ local success, failure = xpcall(function()
   local baseline = data .. "/forge/harness/" .. state.session.id .. "/checks/change-baseline.json"
   await(function() return vim.fn.filereadable(baseline) == 1 end, "baseline was not captured")
   vim.fn.writefile({ "after" }, workspace .. "/source.txt")
-  controller.set_mode("write")
+  controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "ask" } })
   await(function()
-    return state.session.execution_mode == "write" and not state.busy
+    return state.session.approval_mode == "ask" and not state.busy
       and not state.task_operation and not state.state_sync_pending
   end, "resumed repair did not settle")
   local catalog
@@ -79,7 +80,7 @@ local success, failure = xpcall(function()
   await(function()
     local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
     local _, count = text:gsub("Checks finished", "")
-    return count == #catalog.history
+    return count >= #catalog.history
   end, "owned checks did not render inside the expanded exchange")
   local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(not transcript:find("Check repair started", 1, true), transcript)

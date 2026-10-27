@@ -43,7 +43,7 @@ local success, failure = xpcall(function()
   controller.submit()
   await(function() return not state.busy and state.active_plan and state.active_plan.state == "awaiting_review" end, "Plan did not arrive")
   local plan = state.active_plan
-  request("plan.accept", { plan_id = plan.id, digest = plan.review_digest, execution_mode = "write" })
+  request("plan.accept", { plan_id = plan.id, digest = plan.review_digest, approval_mode = "ask" })
   await(function() return not state.busy and state.goal and state.goal.state == "stalled" end, "Mock implementation did not stop at its continuation guard")
   local snapshot = request("state.get", {})
   assert(snapshot.goal_execution.phase == "implement")

@@ -41,15 +41,22 @@ fn definition_list_groups_categories_before_names() -> Result<()> {
         ("b-test", CheckCategory::Test),
         ("c-check", CheckCategory::Check),
         ("d-format", CheckCategory::Format),
-    ].into_iter().map(|(id, category)| {
+    ]
+    .into_iter()
+    .map(|(id, category)| {
         let mut selected = definition(id, "exit 0");
         selected.category = category;
         selected
-    }).collect();
+    })
+    .collect();
     save(workspace.path(), definitions);
     let list = super::response::definitions(workspace.path())?;
-    let ids: Vec<_> = list["definitions"].as_array().unwrap().iter()
-        .map(|definition| definition["check_id"].as_str().unwrap()).collect();
+    let ids: Vec<_> = list["definitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|definition| definition["check_id"].as_str().unwrap())
+        .collect();
     assert_eq!(ids, ["d-format", "c-check", "b-test", "a-build"]);
     Ok(())
 }

@@ -1,7 +1,7 @@
 use super::{CheckConfig, CheckSupervisor, ConfigSnapshot, RunRequest};
 use crate::{
     backend::{BackendEventSink, PromptMode},
-    session::{CheckShell, PermissionMode},
+    session::{ApprovalMode, CheckShell},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,7 @@ pub(crate) struct CheckToolScope {
     task_id: Option<String>,
     shell: CheckShell,
     mode: PromptMode,
-    permission: PermissionMode,
+    permission: ApprovalMode,
     permissions: Arc<crate::backend::approval::PermissionCoordinator>,
     address: crate::backend::ProviderAddress,
     editing: Arc<AtomicBool>,
@@ -79,7 +79,7 @@ pub(crate) struct CheckAuthority {
     pub task_id: Option<String>,
     pub shell: CheckShell,
     pub mode: PromptMode,
-    pub permission: PermissionMode,
+    pub permission: ApprovalMode,
     pub permissions: Arc<crate::backend::approval::PermissionCoordinator>,
     pub address: crate::backend::ProviderAddress,
     pub authorization_sink: BackendEventSink,
@@ -211,7 +211,7 @@ impl CheckToolScope {
             "check_definition_edit" => {
                 ensure!(
                     self.editing_enabled(),
-                    "Check editing is disabled. The user can enable it with /checks setup on, then request changes using the harness-checks skill."
+                    "Check editing is disabled. The user can enable it with /checks edit on, then request changes using the harness-checks skill."
                 );
                 ensure!(
                     self.agent.active_count() == 0,
@@ -253,17 +253,13 @@ impl CheckToolScope {
                         },
                     )
                     .collect();
-                self.authorize(
-                    if self.permission == PermissionMode::Read {
-                        PermissionMode::Write
-                    } else {
-                        self.permission
-                    },
-                    target_list,
-                    &delivery.authorization,
-                )
-                .await?;
-                if self.permission != PermissionMode::Yolo {
+                self.authorize(self.permission, target_list, &delivery.authorization)
+                    .await?;
+                ensure!(
+                    self.permission != ApprovalMode::Deny,
+                    "check configuration review is denied by the selected approval policy"
+                );
+                if self.permission == ApprovalMode::Ask {
                     let resolution = self
                         .permissions
                         .review(
@@ -360,7 +356,7 @@ impl CheckToolScope {
 
     async fn authorize(
         &self,
-        mode: PermissionMode,
+        mode: ApprovalMode,
         target_list: Vec<crate::permissions::matcher::PermissionTarget>,
         authorization: &BackendEventSink,
     ) -> Result<()> {

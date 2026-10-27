@@ -9,7 +9,7 @@ pub struct AccessPolicy {
     pub sandbox: bool,
     #[serde(default)]
     pub read_access: DirectoryScope,
-    pub write_access: DirectoryScope,
+    pub write_access: WriteScope,
     #[serde(default)]
     pub readable_directory: Vec<String>,
     pub writable_directory: Vec<String>,
@@ -21,7 +21,7 @@ impl Default for AccessPolicy {
         Self {
             sandbox: true,
             read_access: DirectoryScope::Full,
-            write_access: DirectoryScope::Workspace,
+            write_access: WriteScope::Workspace,
             readable_directory: Vec::new(),
             writable_directory: Vec::new(),
             windows_sandbox: WindowsSandbox::Elevated,
@@ -34,6 +34,19 @@ impl Default for AccessPolicy {
 pub enum DirectoryScope {
     Workspace,
     #[default]
+    Full,
+}
+
+/// Selects write authorization independently of read scope and approval handling.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteScope {
+    /// Reject reported writes, including writes covered by saved grants.
+    Off,
+    /// Authorize workspace writes and configured directory grants.
+    #[default]
+    Workspace,
+    /// Authorize writes across the filesystem.
     Full,
 }
 
@@ -92,9 +105,24 @@ impl AccessPolicy {
         Ok(self)
     }
 
+    /// Return the six-state access label without incorporating approval handling.
+    pub const fn abbreviation(&self) -> &'static str {
+        match (self.read_access, self.write_access) {
+            (DirectoryScope::Workspace, WriteScope::Off) => "r",
+            (DirectoryScope::Full, WriteScope::Off) => "rx",
+            (DirectoryScope::Workspace, WriteScope::Workspace) => "rw",
+            (DirectoryScope::Full, WriteScope::Workspace) => "rxw",
+            (DirectoryScope::Workspace, WriteScope::Full) => "rwx",
+            (DirectoryScope::Full, WriteScope::Full) => "rxwx",
+        }
+    }
+
     /// Include every mounted drive when sandboxed writes have full scope.
     pub fn writable_roots(&self, workspace: &str) -> Vec<String> {
-        if self.write_access == DirectoryScope::Workspace {
+        if self.write_access == WriteScope::Off {
+            return Vec::new();
+        }
+        if self.write_access == WriteScope::Workspace {
             let mut roots = vec![workspace.to_owned()];
             roots.extend(self.writable_directory.clone());
             return roots;

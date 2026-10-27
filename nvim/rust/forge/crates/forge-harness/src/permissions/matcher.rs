@@ -4,7 +4,6 @@ use super::document::{
     CATEGORY_WEBFETCH, PermissionDecision, PermissionDocument,
 };
 use super::shell::{CommandAnalysisFailure, CommandShell};
-use crate::session::PermissionMode;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
@@ -274,7 +273,6 @@ impl CompiledPermissionDocument {
         &self,
         command: &str,
         shell: Option<CommandShell>,
-        mode: PermissionMode,
     ) -> Result<Vec<TargetEvaluation>, CommandAnalysisError> {
         let CommandNormalization {
             invocation_list,
@@ -289,27 +287,26 @@ impl CompiledPermissionDocument {
         Ok(invocation_list
             .iter()
             .map(|invocation| {
-                let (decision, matched_pattern) = if mode == PermissionMode::Yolo {
-                    (PermissionDecision::Allow, None)
-                } else if invocation.token_list.first().is_some_and(|command| {
-                    matches!(
-                        command.to_ascii_lowercase().as_str(),
-                        "read" | "write" | "webfetch" | "mcp" | "elevate" | "tool"
-                    )
-                }) {
-                    (PermissionDecision::Deny, None)
-                } else {
-                    let (decision, pattern) =
-                        self.best_rule(CATEGORY_BASH, command, Some(invocation));
-                    (
-                        if invocation.structural && decision != PermissionDecision::Deny {
-                            PermissionDecision::Allow
-                        } else {
-                            decision
-                        },
-                        pattern,
-                    )
-                };
+                let (decision, matched_pattern) =
+                    if invocation.token_list.first().is_some_and(|command| {
+                        matches!(
+                            command.to_ascii_lowercase().as_str(),
+                            "read" | "write" | "webfetch" | "mcp" | "elevate" | "tool"
+                        )
+                    }) {
+                        (PermissionDecision::Deny, None)
+                    } else {
+                        let (decision, pattern) =
+                            self.best_rule(CATEGORY_BASH, command, Some(invocation));
+                        (
+                            if invocation.structural && decision != PermissionDecision::Deny {
+                                PermissionDecision::Allow
+                            } else {
+                                decision
+                            },
+                            pattern,
+                        )
+                    };
                 TargetEvaluation {
                     target: PermissionTarget::Command {
                         command: invocation.source.clone(),
@@ -334,28 +331,18 @@ impl CompiledPermissionDocument {
     /// Evaluates parsed targets, rejecting unresolved shell syntax before any approval is created.
     pub fn evaluate(
         &self,
-        mode: PermissionMode,
         request: &PermissionRequest,
     ) -> Result<PermissionEvaluation, CommandAnalysisError> {
         let mut result_list = Vec::new();
         for target in &request.target_list {
             if let PermissionTarget::Command { command, shell } = target {
-                result_list.extend(self.evaluate_command(command, *shell, mode)?);
+                result_list.extend(self.evaluate_command(command, *shell)?);
                 continue;
             }
             if matches!(target, PermissionTarget::UnknownFile { .. }) {
                 result_list.push(TargetEvaluation {
                     target: target.clone(),
                     decision: PermissionDecision::Ask,
-                    matched_pattern: None,
-                    command: None,
-                });
-                continue;
-            }
-            if mode == PermissionMode::Yolo {
-                result_list.push(TargetEvaluation {
-                    target: target.clone(),
-                    decision: PermissionDecision::Allow,
                     matched_pattern: None,
                     command: None,
                 });
@@ -369,17 +356,7 @@ impl CompiledPermissionDocument {
                     unreachable!("commands are parsed before policy evaluation")
                 }
                 PermissionTarget::Read { path } => self.best_rule(CATEGORY_READ, path, None),
-                PermissionTarget::Write { path } => {
-                    let (decision, pattern) = self.best_rule(CATEGORY_EDIT, path, None);
-                    (
-                        if mode == PermissionMode::Read && decision == PermissionDecision::Allow {
-                            PermissionDecision::Ask
-                        } else {
-                            decision
-                        },
-                        pattern,
-                    )
-                }
+                PermissionTarget::Write { path } => self.best_rule(CATEGORY_EDIT, path, None),
                 PermissionTarget::Network { target } => {
                     self.best_rule(CATEGORY_WEBFETCH, target, None)
                 }
@@ -444,10 +421,7 @@ mod test {
             }],
         };
         assert_eq!(
-            permission
-                .evaluate(PermissionMode::Read, &allowed)
-                .unwrap()
-                .decision,
+            permission.evaluate(&allowed).unwrap().decision,
             PermissionDecision::Allow
         );
         let denied = PermissionRequest {
@@ -458,10 +432,7 @@ mod test {
             ..allowed
         };
         assert_eq!(
-            permission
-                .evaluate(PermissionMode::Read, &denied)
-                .unwrap()
-                .decision,
+            permission.evaluate(&denied).unwrap().decision,
             PermissionDecision::Deny
         );
     }
@@ -489,10 +460,7 @@ mod test {
                 }],
             };
             assert_eq!(
-                permission
-                    .evaluate(PermissionMode::Read, &request)
-                    .unwrap()
-                    .decision,
+                permission.evaluate(&request).unwrap().decision,
                 expected,
                 "{command}"
             );
@@ -516,17 +484,11 @@ mod test {
             ("deny", PermissionDecision::Deny),
         ] {
             let permission = compiled(&format!(r#"{{"permission":{{"bash":{{"*":"{rule}"}}}}}}"#));
-            assert_eq!(
-                permission
-                    .evaluate(PermissionMode::Read, &request)
-                    .unwrap()
-                    .decision,
-                expected
-            );
+            assert_eq!(permission.evaluate(&request).unwrap().decision, expected);
         }
         assert_eq!(
             compiled(r#"{"permission":{"bash":{"git":"allow"}}}"#)
-                .evaluate(PermissionMode::Read, &request)
+                .evaluate(&request)
                 .unwrap()
                 .decision,
             PermissionDecision::Ask
@@ -557,10 +519,7 @@ mod test {
                 shell: None,
             }];
             assert_eq!(
-                permission
-                    .evaluate(PermissionMode::Read, &request)
-                    .unwrap()
-                    .decision,
+                permission.evaluate(&request).unwrap().decision,
                 expected,
                 "command: {command}"
             );
@@ -571,7 +530,7 @@ mod test {
         }];
         assert_eq!(
             compiled(r#"{"permission":{"bash":{"*":"allow","git status":"deny"}}}"#)
-                .evaluate(PermissionMode::Read, &request)
+                .evaluate(&request)
                 .unwrap()
                 .decision,
             PermissionDecision::Deny
@@ -579,49 +538,19 @@ mod test {
     }
 
     #[test]
-    fn approval_mode_does_not_define_filesystem_scope() {
+    fn rule_evaluation_does_not_define_filesystem_scope() {
         let permission = compiled(r#"{"permission":{"edit":{"*":"allow"}}}"#);
-        let workspace_write = PermissionRequest {
-            id: "1".into(),
-            provider: "test".into(),
-            reason: None,
-            target_list: vec![PermissionTarget::Write {
-                path: "D:/repo/src/main.rs".into(),
-            }],
-        };
-        assert_eq!(
-            permission
-                .evaluate(PermissionMode::Read, &workspace_write)
-                .unwrap()
-                .decision,
-            PermissionDecision::Ask
-        );
-        assert_eq!(
-            permission
-                .evaluate(PermissionMode::Write, &workspace_write)
-                .unwrap()
-                .decision,
-            PermissionDecision::Allow
-        );
-        let outside = PermissionRequest {
-            target_list: vec![PermissionTarget::Write {
-                path: "D:/outside.txt".into(),
-            }],
-            ..workspace_write
-        };
-        assert_eq!(
-            permission
-                .evaluate(PermissionMode::Write, &outside)
-                .unwrap()
-                .decision,
-            PermissionDecision::Allow
-        );
-        assert_eq!(
-            permission
-                .evaluate(PermissionMode::Write, &outside)
-                .unwrap()
-                .decision,
-            PermissionDecision::Allow
-        );
+        for path in ["D:/repo/src/main.rs", "D:/outside.txt"] {
+            let request = PermissionRequest {
+                id: "rule".into(),
+                provider: "test".into(),
+                reason: None,
+                target_list: vec![PermissionTarget::Write { path: path.into() }],
+            };
+            assert_eq!(
+                permission.evaluate(&request).unwrap().decision,
+                PermissionDecision::Allow
+            );
+        }
     }
 }

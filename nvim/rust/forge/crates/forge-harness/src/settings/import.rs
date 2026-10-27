@@ -709,7 +709,7 @@ mod test {
                 harness_session_id: "session".into(),
                 workspace: workspace.clone(),
                 access: Default::default(),
-                execution_mode: crate::session::PermissionMode::Read,
+                approval_mode: crate::session::ApprovalMode::Ask,
                 backend_session_id: None,
             };
             assert!(
@@ -726,7 +726,7 @@ mod test {
             harness_session_id: "session".into(),
             workspace: workspace.clone(),
             access: Default::default(),
-            execution_mode: crate::session::PermissionMode::Read,
+            approval_mode: crate::session::ApprovalMode::Ask,
             backend_session_id: None,
         };
         let launched = SessionResources::load(root.path(), &request, "antigravity", "test")?;

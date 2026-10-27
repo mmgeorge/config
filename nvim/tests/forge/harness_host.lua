@@ -2,6 +2,7 @@ vim.loader.enable(false)
 local root = vim.fs.normalize(vim.fn.getcwd())
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
+vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
 local name = "forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 local executable = data .. "/" .. name
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), executable))
@@ -29,19 +30,28 @@ local success, failure = xpcall(function()
   require("forge.views.harness.settings").log(state.session.id, "on")
   assert(vim.wait(3000, function() return require("forge.infra.perf").enabled("harness") end, 10))
   local prompt = "literal ** prompt with native ownership"
+  local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")
+  local held_response = mock.hold(state.session.id, "chat")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { prompt })
   controller.submit()
+  local pending_response = held_response:wait()
+  assert(pending_response.prompt == prompt and pending_response.mode == "chat",
+    "mock response hold captured a different request")
+  assert(not table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+    :find("Mock response:", 1, true), "mock provider responded before explicit release")
+  held_response:release()
   assert(vim.wait(10000, function()
     local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
     return #errors > 0 or (not state.busy and text:find("Mock response:", 1, true) ~= nil)
   end, 10), "native Harness response did not settle")
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "durable native admission did not clear composer")
-  local summary_found = false
-  for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-    if line:match("^● Thought %d+s$") then summary_found = true end
-  end
-  assert(summary_found, "fresh host did not render the current metrics header")
+  assert(vim.wait(10000, function()
+    for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
+      if line:match("^● Thought %d+s$") then return true end
+    end
+  end, 10), "fresh host did not render the current metrics header:\n"
+    .. table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n"))
   local response_marker = false
   for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(state.transcript_buf,
     state.presentation.transcript.namespace, 0, -1, { details = true })) do

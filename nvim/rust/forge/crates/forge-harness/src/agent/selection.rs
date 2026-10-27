@@ -19,5 +19,5 @@ pub struct AgentSelection {
     /// Prevents cross-provider creation from weakening the root's access policy.
     pub access: crate::session::AccessPolicy,
     /// Retains the root's effective approval mode.
-    pub execution_mode: crate::session::PermissionMode,
+    pub approval_mode: crate::session::ApprovalMode,
 }

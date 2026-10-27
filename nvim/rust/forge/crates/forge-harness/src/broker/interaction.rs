@@ -88,7 +88,6 @@ impl HarnessBroker {
                 interaction.id.clone(),
                 PathBuf::from(&self.session.workspace),
                 policy.clone(),
-                self.session.execution_mode,
                 Arc::clone(&self.turn_cancellation.requested),
                 Arc::clone(&self.repositories),
                 Arc::clone(&self.diff),
@@ -98,7 +97,6 @@ impl HarnessBroker {
             interaction.id.clone(),
             PathBuf::from(&self.session.workspace),
             policy,
-            self.session.execution_mode,
             self.turn_cancellation.requested.clone(),
         );
         if let Some(context) = &mut backend_request.control_context {
@@ -293,7 +291,7 @@ impl HarnessBroker {
             ))
             .await?;
         event.append(&mut admission_event);
-        interaction.mode = Some(self.session.execution_mode);
+        interaction.approval_mode = Some(self.session.approval_mode);
         if new_interaction && let Some(admission) = admission {
             if self.check_setup {
                 interaction.check_setup = Some(crate::checks::CheckSetupState::Discovery);

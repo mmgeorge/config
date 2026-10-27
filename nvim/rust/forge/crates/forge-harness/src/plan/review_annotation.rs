@@ -105,17 +105,17 @@ impl ReviewAnnotationStore {
         &self.annotation
     }
 
-    /// Rebuild display ranges from saved semantic targets.
+    /// Rebuild display ranges without collapsing repeated semantic targets.
     pub(crate) fn reanchor(&mut self, current: &super::PlanNavigationIndex) -> Result<()> {
         for annotation in &mut self.annotation {
             let anchor = annotation
                 .anchor
                 .as_ref()
                 .context("plan comment has no saved semantic anchor")?;
-            let start = find_target(current, &anchor.start)
-                .context("comment start is absent from the formatted design")?;
-            let end = find_target(current, &anchor.end)
-                .context("comment end is absent from the formatted design")?;
+            let start = find_target(current, &anchor.start, annotation.source.start_line)
+                .context("comment start is absent or ambiguous in the formatted design")?;
+            let end = find_target(current, &anchor.end, annotation.source.end_line)
+                .context("comment end is absent or ambiguous in the formatted design")?;
             annotation.source.start_line = start.min(end);
             annotation.source.end_line = start.max(end);
         }
@@ -144,36 +144,45 @@ impl ReviewAnnotationStore {
     }
 }
 
+/// Resolve the saved row or a uniquely relocated semantic target.
 fn find_target(
     index: &super::PlanNavigationIndex,
     target: &super::PlanReviewTarget,
+    saved_line: u32,
 ) -> Option<u32> {
-    index
-        .anchor
-        .iter()
-        .find(|anchor| {
-            if &anchor.target == target {
-                return true;
-            }
-            match (target, &anchor.target) {
-                (
-                    super::PlanReviewTarget::Declaration {
-                        path,
-                        side,
-                        line,
-                        column: None,
-                    },
-                    super::PlanReviewTarget::Declaration {
-                        path: current_path,
-                        side: current_side,
-                        line: current_line,
-                        ..
-                    },
-                ) => path == current_path && side == current_side && line == current_line,
-                _ => false,
-            }
-        })
-        .map(|anchor| anchor.line)
+    let mut relocated = None;
+    let mut ambiguous = false;
+    for anchor in index.anchor.iter().filter(|anchor| {
+        if &anchor.target == target {
+            return true;
+        }
+        match (target, &anchor.target) {
+            (
+                super::PlanReviewTarget::Declaration {
+                    path,
+                    side,
+                    line,
+                    column: None,
+                },
+                super::PlanReviewTarget::Declaration {
+                    path: current_path,
+                    side: current_side,
+                    line: current_line,
+                    ..
+                },
+            ) => path == current_path && side == current_side && line == current_line,
+            _ => false,
+        }
+    }) {
+        if anchor.line == saved_line {
+            return Some(saved_line);
+        }
+        if relocated.is_some_and(|line| line != anchor.line) {
+            ambiguous = true;
+        }
+        relocated = Some(anchor.line);
+    }
+    if ambiguous { None } else { relocated }
 }
 
 fn read_optional(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
@@ -279,6 +288,35 @@ pub(crate) fn thread_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_targets_preserve_saved_rows_and_reject_ambiguous_relocation() {
+        let target = super::super::PlanReviewTarget::Section {
+            section: super::super::PlanSection::Requirements,
+        };
+        let mut index = super::super::PlanNavigationIndex {
+            plan_id: "plan".into(),
+            plan_version: 1,
+            anchor: [4, 5, 6]
+                .into_iter()
+                .map(|line| super::super::PlanNavigationAnchor {
+                    line,
+                    target: target.clone(),
+                    json_path: "/design/document/requirements".into(),
+                    path: None,
+                    label: "Requirements".into(),
+                })
+                .collect(),
+        };
+        assert_eq!(find_target(&index, &target, 5), Some(5));
+        assert_eq!(find_target(&index, &target, 6), Some(6));
+        for anchor in &mut index.anchor {
+            anchor.line += 10;
+        }
+        assert_eq!(find_target(&index, &target, 5), None);
+        index.anchor.truncate(1);
+        assert_eq!(find_target(&index, &target, 5), Some(14));
+    }
 
     #[test]
     fn persisted_declaration_targets_follow_display_spacing_changes() {

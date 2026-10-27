@@ -243,7 +243,11 @@ function M.open(state, host)
         end
         if id == "sandbox" then policy.sandbox = not policy.sandbox
         elseif id == "read-access" then policy.read_access = policy.read_access == "workspace" and "full" or "workspace"
-        elseif id == "write-access" then policy.write_access = policy.write_access == "workspace" and "full" or "workspace"
+        elseif id == "write-access" then
+          local values = { "off", "workspace", "full" }
+          local position = 1
+          for index, value in ipairs(values) do if value == policy.write_access then position = index end end
+          policy.write_access = values[(position - 1 + (direction or 1)) % #values + 1]
         else
           local values = { "elevated", "unelevated", "mxc" }
           local position = 1
@@ -258,9 +262,9 @@ function M.open(state, host)
           id == "readable-directories" and "read" or "write")
         return
       end
-      if id == "default-write-permission" or id == "plan-permission" then
-        local field = id == "default-write-permission" and "default_write_permission" or "plan_permission"
-        local values = field == "plan_permission" and { "keep", "read", "write", "yolo" } or { "write", "yolo" }
+      if id == "default-approval" or id == "plan-approval" then
+        local field = id == "default-approval" and "default_approval" or "plan_approval"
+        local values = field == "plan_approval" and { "keep", "ask", "deny", "allow" } or { "ask", "deny", "allow" }
         local selected = active[field]
         if not selected or selected == vim.NIL then selected = "keep" end
         local position = 1
@@ -443,21 +447,21 @@ function M.open(state, host)
             row("check-editing", "Checks", "Setup", {
               field("check-editing", "toggle", state.check_editing == true, "Enabled", "Allow the agent to edit project checks. Changes permission without sending a prompt."),
             }),
-            row("plan-permission", "Planning", "Permission", {
-              field("plan-permission", "choice", ({ read = "Read", write = "Write", yolo = "YOLO" })[active.plan_permission] or "Keep current", nil, "Approval mode applied when starting a planning task."),
+            row("plan-approval", "Planning", "Approval", {
+              field("plan-approval", "choice", ({ ask = "ask", deny = "deny", allow = "allow" })[active.plan_approval] or "Keep current", nil, "Approval mode applied when starting a planning task."),
             }),
             row("plan-revisions", "Planning", "Auto-approve", {
               field("plan-revisions", "toggle", active.plan_auto_approve_revisions ~= false, "Auto-approve", "Automatically accept validated execution plan revisions."),
             }, true),
-            row("execute-permission", "Execute", "Permission", {
-              field("default-write-permission", "choice", active.default_write_permission == "yolo" and "YOLO" or "Write", nil, "Approval mode applied to new goals and accepted plan execution. Choose Write or YOLO."),
+            row("execute-approval", "Execute", "Approval", {
+              field("default-approval", "choice", active.default_approval or "ask", nil, "Approval mode applied to new goals and accepted plan execution. Choose ask, deny, or allow without changing filesystem access."),
             }),
             row("read-access", "Permissions", "Read", {
-              field("read-access", "choice", policy.read_access, nil, "Approval scope for reported file reads. This does not configure OS confinement."),
+              field("read-access", "choice", policy.read_access, nil, "Filesystem scope for reported file reads. This does not configure OS read confinement."),
               field("readable-directories", "action", tostring(#policy.readable_directory) .. "…", "Extra directories", "Add, edit, or remove additional readable directories."),
             }),
             row("write-access", "Permissions", "Write", {
-              field("write-access", "choice", policy.write_access, nil, "Approval scope for reported file writes, independent of the sandbox."),
+              field("write-access", "choice", policy.write_access, nil, "Filesystem scope for reported file writes. Off rejects writes in every approval mode."),
               field("writable-directories", "action", tostring(#policy.writable_directory) .. "…", "Extra directories", "Add, edit, or remove additional writable directories."),
             }),
             row("sandbox", "Permissions", "Sandbox", sandbox),

@@ -1146,19 +1146,12 @@ impl TimelineRenderer<'_> {
                     column: 0,
                 },
             },
-            capture: if matches!(
-                interaction.kind,
-                ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
-            ) {
-                "ForgeHarnessPlan".into()
-            } else if let Some(mode) = interaction.mode {
-                format!(
-                    "ForgeHarness{}",
-                    match mode {
-                        crate::session::PermissionMode::Yolo => "Yolo",
-                        mode => mode.label(),
-                    }
-                )
+            capture: if interaction.approval_mode.is_some()
+                || matches!(
+                    interaction.kind,
+                    ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
+                ) {
+                "ForgeHarnessRead".into()
             } else if interaction.completed_at_ms.is_some() {
                 "ForgeHarnessThought".into()
             } else {
@@ -3003,34 +2996,6 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
         .map(|turn| turn.tools().count())
         .sum();
     let mut sections = vec![summary];
-    let compaction: Vec<_> = interaction
-        .node_list
-        .iter()
-        .filter_map(|node| {
-            if let ExchangeNode::Compaction { compaction, .. } = node {
-                Some(compaction)
-            } else {
-                None
-            }
-        })
-        .collect();
-    if !compaction.is_empty() {
-        let mut label = format!("Compactions {}", compaction.len());
-        for (state, name) in [
-            (crate::backend::CompactionState::Running, "active"),
-            (crate::backend::CompactionState::Failed, "failed"),
-            (crate::backend::CompactionState::Unconfirmed, "unconfirmed"),
-        ] {
-            let count = compaction
-                .iter()
-                .filter(|compaction| compaction.state == state)
-                .count();
-            if count > 0 {
-                label.push_str(&format!(" · {count} {name}"));
-            }
-        }
-        sections.push(label);
-    }
     if count > 0 {
         let passed = interaction
             .turn
@@ -3081,27 +3046,14 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
     if !tokens.is_empty() {
         sections.push(tokens.join(" · "));
     }
-    let failed = interaction
-        .turn
-        .iter()
-        .flat_map(|turn| turn.tools())
-        .filter(|tool| tool.failed || tool.state() == crate::turn::ToolState::Failed)
-        .count();
     let mut changes = crate::exchange::ProviderChangeIndex::default();
     changes.record(interaction);
-    let mut outcomes = Vec::new();
-    if failed > 0 {
-        outcomes.push(format!("{failed} failed"));
-    }
     if !changes.is_empty() {
         let files = changes.paths().len();
-        outcomes.push(format!(
+        sections.push(format!(
             "{files} file{} changed",
             if files == 1 { "" } else { "s" }
         ));
-    }
-    if !outcomes.is_empty() {
-        sections.push(outcomes.join(" · "));
     }
     let mut summary = sections.join(" │ ");
     if let Some(error) = &interaction.finalization_error {
@@ -3386,7 +3338,7 @@ mod tests {
             .iter()
             .find(|block| block.id.0 == "exchange:summary")
             .unwrap();
-        assert!(activity.text.row(0).unwrap().contains("Compactions 1"));
+        assert!(!activity.text.row(0).unwrap().contains("Compactions"));
         let header = projected
             .entry
             .block
@@ -3760,20 +3712,20 @@ mod tests {
     #[test]
     fn activity_summary_uses_permission_and_separate_planning_kind() {
         for (mode, capture) in [
-            ("read", "ForgeHarnessRead"),
-            ("write", "ForgeHarnessWrite"),
-            ("yolo", "ForgeHarnessYolo"),
+            ("ask", "ForgeHarnessRead"),
+            ("deny", "ForgeHarnessRead"),
+            ("allow", "ForgeHarnessRead"),
         ] {
             for completed in [false, true] {
                 let exchange: Exchange = serde_json::from_value(json!({
                     "id":"colored", "session_id":"session", "agent_id":"primary", "ordinal":1,
-                    "prompt":"Inspect", "kind":"chat", "mode":mode, "state": if completed { "complete" } else { "running" },
+                    "prompt":"Inspect", "kind":"chat", "approval_mode":mode, "state": if completed { "complete" } else { "running" },
                     "created_at_ms":0, "completed_at_ms": if completed { Some(1000) } else { None },
                     "attributed_matches_checkpoint":false, "node_list":[]
                 })).unwrap();
                 let restored: Exchange =
                     serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
-                assert_eq!(restored.mode, exchange.mode);
+                assert_eq!(restored.approval_mode, exchange.approval_mode);
                 let rendered = project_at(
                     &TimelineEntry::Exchange {
                         id: "colored".into(),
@@ -3843,7 +3795,7 @@ mod tests {
                     .metadata
                     .decoration
                     .iter()
-                    .any(|decoration| decoration.capture == "ForgeHarnessPlan")
+                    .any(|decoration| decoration.capture == "ForgeHarnessRead")
             );
         }
     }
@@ -6111,7 +6063,7 @@ mod tests {
                         context_window: None,
                         service_tier,
                         access: Default::default(),
-                        execution_mode: crate::session::PermissionMode::Write,
+                        approval_mode: crate::session::ApprovalMode::Ask,
                     });
                     exchange[0].state = state;
                     exchange[0].completed_at_ms =
@@ -7162,7 +7114,7 @@ mod tests {
                 .metadata
                 .decoration
                 .iter()
-                .any(|decoration| decoration.capture == "ForgeHarnessPlan"
+                .any(|decoration| decoration.capture == "ForgeHarnessRead"
                     && decoration.range.start.row == 1)
         );
         assert!(matches!(projected.action.get(&target.id),
@@ -8154,7 +8106,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_header_retains_failures_and_distinct_files_during_refresh_and_reload()
+    fn activity_header_retains_tool_totals_and_distinct_files_during_refresh_and_reload()
     -> anyhow::Result<()> {
         let mut calls = serde_json::Map::new();
         let mut order = Vec::new();
@@ -8183,7 +8135,7 @@ mod tests {
         let exchange: Exchange = serde_json::from_value(source.clone())?;
         let live = super::exchange_activity_summary(&exchange, 2000);
         assert!(live.contains("3/6 tools"));
-        assert!(live.ends_with("│ 2 failed · 2 files changed"));
+        assert!(live.ends_with("│ 2 files changed"));
         let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
         assert_eq!(super::exchange_activity_summary(&restored, 2000), live);
         source["turn"][0]["tool"]["item"]["pending"]["status"] = json!("completed");
@@ -8208,7 +8160,7 @@ mod tests {
             .unwrap();
         let text = heading.text.wire_rows().join(" ");
         assert!(text.contains("4/6 tools"));
-        assert!(text.ends_with("│ 2 failed · 3 files changed"));
+        assert!(text.ends_with("│ 3 files changed"));
         Ok(())
     }
 
@@ -8238,7 +8190,7 @@ mod tests {
         let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 44000),
-            "● Planned 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps │ 1 failed"
+            "● Planned 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps"
         );
         for status in ["running", "cancelled", "interrupted"] {
             value["turn"][0]["tool"]["item"]["1"]["status"] = json!(status);
@@ -8389,7 +8341,7 @@ mod tests {
         exchange.observe_turn(&event, 9000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps │ 1 failed"
+            "● Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps"
         );
         event.address.as_mut().unwrap().thread_id = "unowned-child".into();
         assert!(!exchange.observe_turn(&event, 90_000).unwrap());
@@ -8399,7 +8351,7 @@ mod tests {
             assert_eq!(
                 super::exchange_activity_summary(&exchange, 90_000),
                 format!(
-                    "● Thought {}s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps │ 1 failed",
+                    "● Thought {}s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps",
                     duration_ms / 1000
                 )
             );
@@ -8407,7 +8359,7 @@ mod tests {
         exchange.metrics.timing_complete = false;
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 3s │ 0/1 tools │ 76.0k (90%) -> 4.2k │ 1 failed"
+            "● Thought 3s │ 0/1 tools │ 76.0k (90%) -> 4.2k"
         );
     }
 

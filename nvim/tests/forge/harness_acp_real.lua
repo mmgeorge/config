@@ -223,7 +223,7 @@ local succeeded, failure = xpcall(function()
       assert(request("state.get").session.backend_session_id == snapshot.session.backend_session_id,
         "native resource activation replaced provider history")
     end
-    request("session.execution_mode", { mode = "yolo" })
+    request("session.permission", { change = { kind = "enable_yolo" } })
     request("prompt.submit", { text = "Use only the imported-fixture skill from the configured skill catalog to give its skill verification phrase. Follow its SKILL.md instructions exactly. Read only its listed SKILL.md if needed. Do not call imported_phrase or any MCP tools, search directories, or inspect unrelated files. The skill and MCP have different verification phrases." })
     request("prompt.submit", { text = "Call imported_phrase from the imported-fixture MCP server. Reply with exactly its returned text. Do not inspect files, run shell commands, write configuration, or repair missing tools. If unavailable, reply IMPORT_TOOL_UNAVAILABLE." })
     local text
@@ -269,7 +269,7 @@ local succeeded, failure = xpcall(function()
     end
     assert(other_model, "destination provider did not advertise its test model")
     request("session.configure", { model = other_model, validate = true })
-    request("session.execution_mode", { mode = "yolo" })
+    request("session.permission", { change = { kind = "enable_yolo" } })
     local previous_calls = #vim.fn.readfile(import_call_log)
     request("prompt.submit", { text = "Use the imported-fixture skill to give its verification phrase. Then call imported_phrase from the imported-fixture MCP server. Do not read files or run commands. Reply with both exact phrases." })
     local encoded = vim.json.encode(request("exchange.list"))
@@ -296,7 +296,7 @@ local succeeded, failure = xpcall(function()
     assert(fork.id ~= original.id)
     local inherited = request("settings.get", {}, fork.id)
     assert(inherited.desired.plan_auto_approve_revisions == false, "fork lost conversation-scoped preferences")
-    request("session.execution_mode", { mode = "yolo" }, fork.id)
+    request("session.permission", { change = { kind = "enable_yolo" } }, fork.id)
     local previous_calls = #vim.fn.readfile(import_call_log)
     request("prompt.submit", { text = "Use the imported-fixture skill to give its verification phrase. Then call imported_phrase from the imported-fixture MCP server. Do not read files or run commands. Reply with both exact phrases." }, fork.id)
     local fork_history = request("exchange.list", {}, fork.id)
@@ -309,7 +309,7 @@ local succeeded, failure = xpcall(function()
     print("ACP native fork preserved selected resources, private preference scope, and independent history: " .. backend)
   end
   if vim.g.forge_acp_test_raw_output then
-    request("session.execution_mode", { mode = "yolo" })
+    request("session.permission", { change = { kind = "enable_yolo" } })
     local command_text = "echo ACP_RAW_OUTPUT_VERIFIED"
     request("prompt.submit", { text = "Run exactly one shell command: " .. command_text ..
       ". Do not create files, repair configuration, or start agents. Reply SHELL_OUTPUT_DONE after it finishes." })
@@ -341,7 +341,7 @@ local succeeded, failure = xpcall(function()
     print("ACP setup refresh and conversation continuity passed: " .. backend)
   end
   if vim.g.forge_acp_test_diffs then
-    request("session.execution_mode", { mode = "yolo" })
+    request("session.permission", { change = { kind = "enable_yolo" } })
     request("prompt.submit", { text = "Create acp-diff-test.txt containing ACP_DIFF_VERIFIED using a file-edit tool. Do not use a shell." })
     assert(vim.fn.readfile(workspace .. "/acp-diff-test.txt")[1] == "ACP_DIFF_VERIFIED", "diff fixture file was not created")
     local exchange = request("exchange.list")
@@ -513,7 +513,7 @@ local succeeded, failure = xpcall(function()
     local before = request("settings.get")
     local configured = request("settings.update", { expected_revision = before.revision, scope = "global", desired = {
       access = { sandbox = false, write_access = "workspace", writable_directory = {}, windows_sandbox = "elevated" },
-      shell = "system", default_write_permission = "write", plan_compact = true,
+      shell = "system", default_approval = "ask", plan_compact = true,
     } })
     local operation
     assert(vim.wait(30000, function()
@@ -537,8 +537,8 @@ local succeeded, failure = xpcall(function()
       table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n"))
     local continued = request("state.get")
     assert(continued.session.backend_session_id == snapshot.session.backend_session_id, "continuation replaced provider history")
-    request("session.execution_mode", { mode = "read" })
-    assert(request("state.get").session.execution_mode == "read", "approval fixture must use Read permission")
+    request("session.permission", { change = { kind = "set_approval", mode = "ask" } })
+    assert(request("state.get").session.approval_mode == "ask", "approval fixture must use Read permission")
     print("ACP settings restart and history continuity passed: " .. backend)
     local settled, prompt_error, answered = false, nil, {}
     client.request("prompt.submit", { text = "Create approval-test.txt containing APPROVED_ONCE using a file-edit tool. Do not use a shell. Then reply APPROVAL_VERIFIED." }, function(_, request_error)
@@ -566,7 +566,7 @@ local succeeded, failure = xpcall(function()
     }))
     assert(vim.fn.readfile(workspace .. "/approval-test.txt")[1] == "APPROVED_ONCE", "approved file edit was not applied")
     print("ACP once-only approval workflow passed: " .. backend)
-    request("session.execution_mode", { mode = "yolo" })
+    request("session.permission", { change = { kind = "enable_yolo" } })
     request("prompt.submit", { text = "Create yolo-test.txt containing YOLO_VERIFIED using a file-edit tool. Do not use a shell." })
     assert(vim.fn.readfile(workspace .. "/yolo-test.txt")[1] == "YOLO_VERIFIED", "Yolo file edit did not finish")
     assert(not next(state.approval or {}), "ordinary Yolo work unexpectedly requested approval")

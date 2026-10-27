@@ -19,8 +19,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 48;
-const PREFERENCE_FORMAT_VERSION: u32 = 40;
+const SESSION_FORMAT_VERSION: u32 = 51;
+const PREFERENCE_FORMAT_VERSION: u32 = 41;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -38,6 +38,28 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Returns the last resolved provider default in the same workspace and backend.
+    pub(crate) fn latest_resolved_default_model(
+        &self,
+        workspace: &str,
+        backend: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT json_extract(payload,'$.session.resolved_model') FROM session_record \
+             WHERE workspace=?1 AND json_extract(payload,'$.format_version')=?2 \
+             AND json_extract(payload,'$.session.backend')=?3 \
+             AND json_extract(payload,'$.session.model')='default' \
+             AND json_type(payload,'$.session.resolved_model')='text' \
+             AND trim(json_extract(payload,'$.session.resolved_model'))<>'' \
+             ORDER BY updated_at_ms DESC, rowid DESC LIMIT 1",
+                params![workspace, SESSION_FORMAT_VERSION, backend],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Keeps related observations on one committed SQLite snapshot while writers continue.
     pub(crate) fn read_snapshot<Value>(
         &self,
@@ -664,7 +686,7 @@ impl SqliteStore {
                 |row| row.get(0),
             )?;
             let mut child = Exchange::delegated(&interaction.session_id, agent, ordinal as u64);
-            child.mode = interaction.mode;
+            child.approval_mode = interaction.approval_mode;
             transaction.execute(
                 "INSERT INTO exchange_record(id, session_id, agent_id, ordinal, payload) VALUES(?1,?2,?3,?4,?5)",
                 params![child.id, child.session_id, child.agent_id, ordinal, encode(&child)?],
@@ -1507,6 +1529,95 @@ mod test {
     use super::*;
 
     #[test]
+    fn default_model_cache_is_scoped_and_ignores_explicit_or_incompatible_sessions() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(temporary.path())?;
+        assert_eq!(
+            store.latest_resolved_default_model("D:/work", "copilot")?,
+            None
+        );
+        for (ordinal, (id, workspace, backend, model, resolved)) in [
+            (
+                "older",
+                "D:/work",
+                "copilot",
+                "default",
+                Some("older-default"),
+            ),
+            (
+                "latest",
+                "D:/work",
+                "copilot",
+                "default",
+                Some("latest-default"),
+            ),
+            ("explicit", "D:/work", "copilot", "chosen", Some("chosen")),
+            ("empty", "D:/work", "copilot", "default", Some("")),
+            ("unresolved", "D:/work", "copilot", "default", None),
+            (
+                "workspace",
+                "D:/elsewhere",
+                "copilot",
+                "default",
+                Some("workspace-default"),
+            ),
+            (
+                "backend",
+                "D:/work",
+                "codex",
+                "default",
+                Some("codex-default"),
+            ),
+            (
+                "incompatible",
+                "D:/work",
+                "copilot",
+                "default",
+                Some("obsolete"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = session(id, workspace);
+            record.backend = backend.into();
+            record.model = model.into();
+            record.resolved_model = resolved.map(str::to_owned);
+            record.updated_at_ms = ordinal as i64;
+            store.save_session(&record)?;
+        }
+        store.connection.execute(
+            "UPDATE session_record SET payload=json_set(payload,'$.format_version',?1) WHERE id='incompatible'",
+            [SESSION_FORMAT_VERSION - 1],
+        )?;
+        drop(store);
+        let store = SqliteStore::open(temporary.path())?;
+        assert_eq!(
+            store
+                .latest_resolved_default_model("D:/work", "copilot")?
+                .as_deref(),
+            Some("latest-default")
+        );
+        assert_eq!(
+            store
+                .latest_resolved_default_model("D:/work", "codex")?
+                .as_deref(),
+            Some("codex-default")
+        );
+        assert_eq!(
+            store
+                .latest_resolved_default_model("D:/elsewhere", "copilot")?
+                .as_deref(),
+            Some("workspace-default")
+        );
+        assert_eq!(
+            store.latest_resolved_default_model("D:/missing", "copilot")?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
     fn child_admission_is_atomic_and_reopening_retains_outcomes_without_replay() -> Result<()> {
         use crate::agent::{AgentSource, AgentTask};
         let temporary = tempfile::tempdir()?;
@@ -1856,10 +1967,10 @@ mod test {
             service_tier: crate::backend::ServiceTier::Standard,
             access: Default::default(),
             shell: Default::default(),
-            execution_mode: crate::session::PermissionMode::Read,
+            approval_mode: crate::session::ApprovalMode::Ask,
             current_task_id: None,
-            default_write_permission: crate::session::PermissionMode::Write,
-            plan_permission: None,
+            default_approval: crate::session::ApprovalMode::Ask,
+            plan_approval: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             goal_id: None,
@@ -1941,7 +2052,7 @@ mod test {
             ordinal: 1,
             prompt: "work".into(),
             kind: ExchangeKind::Chat,
-            mode: None,
+            approval_mode: None,
             state: ExchangeState::Running,
             plan_id: None,
             execution_id: None,
@@ -2032,7 +2143,7 @@ mod test {
             ordinal: 1,
             prompt: "report".into(),
             kind: crate::exchange::ExchangeKind::Chat,
-            mode: None,
+            approval_mode: None,
             state: crate::exchange::ExchangeState::Complete,
             plan_id: None,
             execution_id: None,
@@ -2191,8 +2302,8 @@ mod test {
         let preference = HarnessPreference {
             access: Default::default(),
             shell: Default::default(),
-            default_write_permission: crate::session::PermissionMode::Write,
-            plan_permission: None,
+            default_approval: crate::session::ApprovalMode::Ask,
+            plan_approval: None,
             model: "remembered-model".into(),
             effort: "low".into(),
             model_setting: Default::default(),

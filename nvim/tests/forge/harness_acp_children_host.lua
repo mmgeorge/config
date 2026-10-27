@@ -73,7 +73,7 @@ local success, failure = xpcall(function()
   assert(vim.wait(10000, function() return state.ready and state.session end, 10))
   request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {}, windows_sandbox = "elevated" } })
   request("backend.models")
-  request("session.execution_mode", { mode = "yolo" })
+  request("session.permission", { change = { kind = "enable_yolo" } })
   request("prompt.submit", { text = "Read the simulated ACP child updates" })
   local snapshot = request("state.get")
   local child, nested, unfinished, unfinished_nested

@@ -105,8 +105,11 @@ impl HarnessService {
             access: backend
                 .descriptor()
                 .kind
-                .resolve_access(crate::session::AccessPolicy::default()),
-            execution_mode: crate::session::PermissionMode::Read,
+                .resolve_access(crate::session::AccessPolicy {
+                    write_access: crate::session::WriteScope::Off,
+                    ..Default::default()
+                }),
+            approval_mode: crate::session::ApprovalMode::Ask,
             backend_session_id: None,
         };
         generate_isolated_text(
@@ -799,6 +802,9 @@ impl HarnessService {
                     controller.plan_review.close_all()?;
                     *controller.mcp_discovery.lock().await = Default::default();
                     controller.cancellation.request(false);
+                    if let Some(control) = controller.backend.mock_response_control() {
+                        control.cancel_session(None);
+                    }
                     if let Some(id) = controller.checks.active()? {
                         controller.checks.cancel(&id)?;
                         while controller.checks.active()?.is_some() {
@@ -1751,6 +1757,18 @@ async fn route_request(
     }
     let controller = registry.resolve(&session_id).await?;
     controller.attach_compaction(message_sink).await?;
+    if method == HarnessMethod::BackendMockResponse {
+        let control = controller
+            .backend
+            .mock_response_control()
+            .context("backend.mock_response requires the mock provider")?;
+        let command = serde_json::from_value(request.params)?;
+        let result = control.dispatch(&session_id, command).await?;
+        message_sink
+            .send_response(Response::success(request.id, result)?)
+            .await?;
+        return Ok(());
+    }
     if method == HarnessMethod::QueueUpdate {
         controller.observer.update_queue(&request.params)?;
         message_sink
@@ -1787,7 +1805,7 @@ async fn route_request(
                     context_window: selected.context_window,
                     service_tier: selected.service_tier,
                     access: catalog.access,
-                    execution_mode: catalog.execution_mode,
+                    approval_mode: catalog.approval_mode,
                     backend_session_id: catalog.backend_session_id,
                     submission: None,
                     recovered_input: Vec::new(),
@@ -2405,7 +2423,7 @@ async fn route_request(
                     context_window: None,
                     service_tier: Default::default(),
                     access: catalog.access,
-                    execution_mode: catalog.execution_mode,
+                    approval_mode: catalog.approval_mode,
                     backend_session_id: None,
                     submission: None,
                     recovered_input: Vec::new(),
@@ -2445,6 +2463,17 @@ async fn route_request(
             )?))
             .await?;
         return Ok(());
+    }
+    if method == HarnessMethod::SessionPermission {
+        let mut request = request;
+        request.params["action"] = json!("permission");
+        if request.params.get("operation_id").is_none() {
+            request.params["operation_id"] =
+                json!(format!("permission:{session_id}:{}", request.id));
+        }
+        request.method = "task.transition".into();
+        return route_task_transition(registry, controller, session_id, request, message_sink)
+            .await;
     }
     if method == HarnessMethod::TaskTransition {
         return route_task_transition(registry, controller, session_id, request, message_sink)
@@ -2713,22 +2742,13 @@ fn admit_task_intent(
         );
     }
     if action == "permission" {
-        let permission: crate::session::PermissionMode = serde_json::from_value(
+        let _: crate::task::PermissionChange = serde_json::from_value(
             request
                 .params
-                .get("mode")
+                .get("change")
                 .cloned()
-                .context("permission is required")?,
+                .context("permission change is required")?,
         )?;
-        ensure!(
-            controller
-                .backend
-                .descriptor()
-                .capability
-                .execution_mode_list
-                .contains(&permission),
-            "permission is unavailable for this backend"
-        );
     }
     if matches!(action, "plan" | "goal") {
         ensure!(
@@ -2740,9 +2760,9 @@ fn admit_task_intent(
             "task objective is required"
         );
     }
-    let selected = crate::session::SessionStore::load_session(store, session_id)?
-        .context("session is missing")?
-        .current_task_id;
+    let session = crate::session::SessionStore::load_session(store, session_id)?
+        .context("session is missing")?;
+    let selected = session.current_task_id;
     let task = store
         .list_task(&session_id)?
         .into_iter()
@@ -2791,10 +2811,36 @@ fn admit_task_intent(
     } else {
         running_intent
     };
+    let permission_selection = if action == "permission" {
+        let mut access = session.access;
+        let mut approval = session.approval_mode;
+        if let Some(selection) = pending.and_then(|operation| operation.permission_selection) {
+            access.sandbox = selection.sandbox;
+            access.read_access = selection.read_access;
+            access.write_access = selection.write_access;
+            approval = selection.approval_mode;
+        }
+        let change: crate::task::PermissionChange =
+            serde_json::from_value(request.params["change"].clone())?;
+        change.apply(
+            &mut access,
+            &mut approval,
+            crate::backend::BackendKind::parse(&session.backend)?.supports_sandbox(),
+        );
+        Some(crate::task::PermissionSelection {
+            sandbox: access.sandbox,
+            read_access: access.read_access,
+            write_access: access.write_access,
+            approval_mode: approval,
+        })
+    } else {
+        None
+    };
     let operation = crate::task::TaskOperation {
         id,
         session_id: session_id.to_owned(),
         action: request.params.clone(),
+        permission_selection,
         state: "admitted".into(),
         error: None,
         exchange_id: None,
@@ -2996,6 +3042,9 @@ async fn execute_task_transition(
         return Ok(());
     }
     let mut action = operation.action.clone();
+    if let Some(selection) = operation.permission_selection {
+        action["permission_selection"] = serde_json::to_value(selection)?;
+    }
     if matches!(
         action["action"].as_str(),
         Some("permission" | "configure" | "compact")
@@ -3021,7 +3070,7 @@ async fn execute_task_transition(
                 config.keys().any(|field| {
                     matches!(
                         field.as_str(),
-                        "access" | "execution_mode" | "sandbox_enabled" | "backend" | "provider"
+                        "access" | "approval_mode" | "sandbox_enabled" | "backend" | "provider"
                     )
                 }) || config
                     .get("setting_fields")
@@ -3032,7 +3081,7 @@ async fn execute_task_transition(
                                 field.split('.').next(),
                                 Some(
                                     "access"
-                                        | "execution_mode"
+                                        | "approval_mode"
                                         | "sandbox_enabled"
                                         | "backend"
                                         | "provider"
@@ -3910,7 +3959,7 @@ mod tests {
             harness_session_id: "generation-fixture".into(),
             workspace: "commit-workspace".into(),
             access: Default::default(),
-            execution_mode: crate::session::PermissionMode::Read,
+            approval_mode: crate::session::ApprovalMode::Ask,
             backend_session_id: None,
         };
         let text = generate_isolated_text(
@@ -3965,7 +4014,7 @@ mod tests {
             harness_session_id: "generation-failure".into(),
             workspace: "commit-workspace".into(),
             access: Default::default(),
-            execution_mode: crate::session::PermissionMode::Read,
+            approval_mode: crate::session::ApprovalMode::Ask,
             backend_session_id: None,
         };
         let failure = generate_isolated_text(
@@ -4110,6 +4159,7 @@ mod tests {
             id: "terminal-config".into(),
             session_id: registry.initial_session_id.clone(),
             action: json!({"action":"configure"}),
+            permission_selection: None,
             state: "applying".into(),
             error: None,
             exchange_id: None,
@@ -4803,6 +4853,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_permission_intents_compose_before_superseded_operations_run() -> Result<()> {
+        for (changes, expected_access, expected_approval, initial_sandbox) in [
+            (
+                vec![json!({"kind":"enable_yolo"}), json!({"kind":"enable_yolo"})],
+                "rxwx",
+                "ask",
+                false,
+            ),
+            (
+                vec![
+                    json!({"kind":"enable_yolo"}),
+                    json!({"kind":"enable_yolo"}),
+                    json!({"kind":"enable_yolo"}),
+                ],
+                "rxwx",
+                "allow",
+                false,
+            ),
+            (
+                vec![
+                    json!({"kind":"toggle_write_scope"}),
+                    json!({"kind":"set_approval","mode":"deny"}),
+                ],
+                "rxwx",
+                "deny",
+                false,
+            ),
+            (
+                vec![
+                    json!({"kind":"toggle_write_enabled"}),
+                    json!({"kind":"toggle_write_enabled"}),
+                ],
+                "rxw",
+                "ask",
+                false,
+            ),
+            (
+                vec![
+                    json!({"kind":"enable_yolo"}),
+                    json!({"kind":"toggle_write_enabled"}),
+                    json!({"kind":"toggle_read_scope"}),
+                    json!({"kind":"set_approval","mode":"ask"}),
+                ],
+                "r",
+                "ask",
+                true,
+            ),
+        ] {
+            let fixture = tempfile::tempdir()?;
+            let service = service();
+            let opened = service
+                .open_session(1, initialize(&fixture, "mock"))
+                .await?;
+            let session_id = opened.result().unwrap()["session"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let registry = service.registry().await?;
+            let controller = registry.resolve(&session_id).await?;
+            let mut store = SqliteStore::open(&controller.data_root)?;
+            let mut initial = store.load_session(&session_id)?.unwrap();
+            initial.access.sandbox = initial_sandbox;
+            store.save_session(&initial)?;
+            let mut operations = Vec::new();
+            for (index, change) in changes.into_iter().enumerate() {
+                let request = Request {
+                    id: index as u64 + 2,
+                    method: "task.transition".into(),
+                    params: json!({"operation_id":format!("permission-{index}"),"action":"permission","change":change}),
+                };
+                let operation = admit_task_intent(&controller, &session_id, &request, &mut store)?;
+                let duplicate = admit_task_intent(&controller, &session_id, &request, &mut store)?;
+                assert_eq!(
+                    operation.permission_selection,
+                    duplicate.permission_selection
+                );
+                assert_eq!(
+                    store.load_session(&session_id)?.unwrap().access,
+                    initial.access
+                );
+                operations.push(operation);
+            }
+            let mut latest = operations.pop().unwrap();
+            assert!(!latest.permission_selection.unwrap().sandbox);
+            let (sink, _output) = forge_protocol::outbound::channel();
+            for mut superseded in operations {
+                execute_task_transition(&registry, &controller, &mut superseded, &mut store, &sink)
+                    .await?;
+                assert_eq!(superseded.state, "superseded");
+            }
+            execute_task_transition(&registry, &controller, &mut latest, &mut store, &sink).await?;
+            let confirmed = store.load_session(&session_id)?.unwrap();
+            assert_eq!(confirmed.access.abbreviation(), expected_access);
+            assert_eq!(
+                confirmed.approval_mode.label().to_lowercase(),
+                expected_approval
+            );
+            assert!(!confirmed.access.sandbox);
+            assert_eq!(
+                confirmed.access.readable_directory,
+                initial.access.readable_directory
+            );
+            assert_eq!(
+                confirmed.access.writable_directory,
+                initial.access.writable_directory
+            );
+            service.shutdown(Duration::from_secs(1)).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn active_chat_settings_ignore_completed_idle_operations_but_preserve_pending_pause()
     -> Result<()> {
         let fixture = tempfile::tempdir()?;
@@ -4909,6 +5071,144 @@ mod tests {
             drop(occupied);
         }
         service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "blocking"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let broker = controller.broker.lock().await;
+        let execution = controller.execution_admission.acquire().await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            service.dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 2,
+                    method: "backend.mock_response".into(),
+                    params: json!({"operation":"hold","mode":"chat"}),
+                },
+                &sink,
+            ),
+        )
+        .await??;
+        let frame = output.recv().await?.context("missing hold response")?;
+        let held: Value = serde_json::from_slice(frame.bytes())?;
+        let hold_id = held["result"]["id"]
+            .as_str()
+            .context("missing hold ID")?
+            .to_owned();
+        let backend = controller.backend.clone();
+        let prompt_session = session_id.clone();
+        let prompt = tokio::spawn(async move {
+            backend
+                .prompt(crate::backend::BackendRequest {
+                    execution_owner: None,
+                    harness_session_id: prompt_session,
+                    workspace: ".".into(),
+                    input: crate::backend::BackendInput::from_text("held prompt"),
+                    mode: crate::backend::PromptMode::Chat,
+                    model: "mock-model".into(),
+                    effort: "low".into(),
+                    context_window: None,
+                    service_tier: Default::default(),
+                    access: Default::default(),
+                    approval_mode: crate::session::ApprovalMode::Ask,
+                    backend_session_id: None,
+                    submission: None,
+                    recovered_input: Vec::new(),
+                    control_context: None,
+                })
+                .await
+        });
+        for (request_id, operation) in [(3, "wait"), (4, "release")] {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                service.dispatch(
+                    Some(session_id.clone()),
+                    Request {
+                        id: request_id,
+                        method: "backend.mock_response".into(),
+                        params: json!({"operation":operation,"id":hold_id}),
+                    },
+                    &sink,
+                ),
+            )
+            .await??;
+            let frame = output
+                .recv()
+                .await?
+                .context("missing mock control response")?;
+            let result: Value = serde_json::from_slice(frame.bytes())?;
+            assert_eq!(result["id"], request_id);
+            assert!(result.get("error").is_none(), "{result}");
+            if operation == "wait" {
+                assert_eq!(result["result"]["prompt"], "held prompt");
+                assert!(!prompt.is_finished(), "arrival released the response");
+            } else {
+                assert_eq!(result["result"]["released"], true);
+            }
+        }
+        let completed = tokio::time::timeout(Duration::from_secs(2), prompt).await???;
+        assert_eq!(
+            completed.event[0].text.as_deref(),
+            Some("Mock response: held prompt")
+        );
+        drop(execution);
+        drop(broker);
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_unclaimed_mock_response_wait() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let control = controller.backend.mock_response_control().unwrap();
+        let held = control
+            .dispatch(
+                &session_id,
+                crate::backend::mock_response::MockResponseCommand::Hold { mode: None },
+            )
+            .await?;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        let mut waiting = Box::pin(service.dispatch(
+            Some(session_id),
+            Request {
+                id: 2,
+                method: "backend.mock_response".into(),
+                params: json!({"operation":"wait", "id":held["id"]}),
+            },
+            &sink,
+        ));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        assert!(
+            service.activity.try_write().is_err(),
+            "wait never entered dispatch"
+        );
+        let (waited, shutdown) = tokio::join!(waiting, service.shutdown(Duration::from_secs(2)));
+        assert!(waited.unwrap_err().to_string().contains("cancelled"));
+        shutdown?;
         Ok(())
     }
 
@@ -5198,15 +5498,36 @@ mod tests {
     #[tokio::test]
     async fn idle_root_model_catalog_publishes_and_persists_default_resolution() {
         let fixture = tempfile::tempdir().unwrap();
-        let service = service();
-        let opened = service
+        let seed_service = service();
+        let seeded = seed_service
             .open_session(1, initialize(&fixture, "mock"))
             .await
             .unwrap();
+        assert!(seeded.result().unwrap()["session"]["resolved_model"].is_null());
+        let seed_id = seeded.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        seed_service.shutdown(Duration::from_secs(1)).await.unwrap();
+        let mut store = SqliteStore::open(&fixture.path().join("data")).unwrap();
+        let mut seed = store.load_session(&seed_id).unwrap().unwrap();
+        seed.resolved_model = Some("previous-default".into());
+        store.save_session(&seed).unwrap();
+        drop(store);
+        let service = service();
+        let mut request = initialize(&fixture, "mock");
+        request.new_session_name = Some("Cached default".into());
+        let opened = service.open_session(1, request).await.unwrap();
+        assert_eq!(
+            opened.result().unwrap()["session"]["resolved_model"],
+            "previous-default"
+        );
+        assert_eq!(opened.result().unwrap()["session"]["model"], "default");
         let session_id = opened.result().unwrap()["session"]["id"]
             .as_str()
             .unwrap()
             .to_owned();
+        assert_ne!(session_id, seed_id);
         let (sink, mut output) = forge_protocol::outbound::channel();
         service
             .dispatch(
@@ -5552,9 +5873,8 @@ mod tests {
         let approval_owner = owner.clone();
         let pending = tokio::spawn(async move {
             permission
-                .authorize_callback(
-                    crate::session::PermissionMode::Read,
-                    true,
+                .authorize(
+                    crate::session::ApprovalMode::Ask,
                     PermissionRequest {
                         id: "child-request".into(),
                         provider: "Mock".into(),
@@ -5681,7 +6001,7 @@ mod tests {
 
     #[tokio::test]
     async fn permission_transition_releases_child_quiescence_before_resuming() -> Result<()> {
-        for mode in ["write", "yolo"] {
+        for mode in ["ask", "deny", "allow"] {
             let fixture = tempfile::tempdir()?;
             let service = service();
             let opened = service
@@ -5709,7 +6029,7 @@ mod tests {
                 &Request {
                     id: 2,
                     method: "task.transition".into(),
-                    params: json!({"operation_id":"change-permission","action":"permission","mode":mode}),
+                    params: json!({"operation_id":"change-permission","action":"permission","change":{"kind":"set_approval","mode":mode}}),
                 },
                 &mut store,
             )?;
@@ -5727,8 +6047,8 @@ mod tests {
             assert!(exchanges.last().unwrap().completed_at_ms.is_some());
             let session = crate::session::SessionStore::load_session(&store, &session_id)?.unwrap();
             assert_eq!(
-                session.execution_mode,
-                serde_json::from_value::<crate::session::PermissionMode>(json!(mode))?
+                session.approval_mode,
+                serde_json::from_value::<crate::session::ApprovalMode>(json!(mode))?
             );
             service.shutdown(Duration::from_secs(1)).await?;
         }

@@ -333,7 +333,7 @@ mod tests {
             context_window: None,
             service_tier: Default::default(),
             access: Default::default(),
-            execution_mode: crate::session::PermissionMode::Read,
+            approval_mode: crate::session::ApprovalMode::Ask,
             backend_session_id: None,
             submission: None,
             recovered_input: Vec::new(),

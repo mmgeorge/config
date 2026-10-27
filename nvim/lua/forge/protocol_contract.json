@@ -1,5 +1,5 @@
 {
-  "version": 23,
+  "version": 24,
   "node": {
     "kind": [
       "exchange",
@@ -25,7 +25,9 @@
   "session": {
     "background_error": {
       "route": "handle",
-      "required": { "error": "string" }
+      "required": {
+        "error": "string"
+      }
     },
     "task_operation": {
       "route": "handle",
@@ -100,14 +102,6 @@
       "required": {}
     },
     "session_configured": {
-      "route": "handle",
-      "required": {}
-    },
-    "mode_changed": {
-      "route": "handle",
-      "required": {}
-    },
-    "execution_mode_changed": {
       "route": "handle",
       "required": {}
     },
@@ -320,7 +314,10 @@
   "request": {
     "repository.generate.progress": {
       "route": "progress",
-      "required": { "session_id": "string", "event": "object" }
+      "required": {
+        "session_id": "string",
+        "event": "object"
+      }
     },
     "result.part": {
       "route": "transport",

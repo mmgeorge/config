@@ -4526,7 +4526,7 @@ mod tests {
             ordinal: 1,
             prompt: format!("Prompt {identity}"),
             kind: ExchangeKind::Chat,
-            mode: None,
+            approval_mode: None,
             plan_id: None,
             execution_id: None,
             execution_phase: None,

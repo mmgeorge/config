@@ -72,16 +72,23 @@ local ok, failure = xpcall(function()
   item(complete(commands, "/"), "/model")
   item(complete(commands, "/b"), "/bg")
   item(complete(commands, "/rec"), "/recap")
-  local check_setup = complete(commands, "/checks setup")
-  assert(#check_setup == 2, "check setup must only offer permission toggles")
-  item(check_setup, "/checks setup on")
-  item(check_setup, "/checks setup off")
+  local check_edit = complete(commands, "/checks edit")
+  assert(#check_edit == 2, "check edit must only offer permission toggles")
+  item(check_edit, "/checks edit on")
+  item(check_edit, "/checks edit off")
   local task_items = complete(commands, "/task new")
   item(task_items, "/task new")
   for _, entry in ipairs(task_items) do
     assert(entry.label:match("^/task "), "task completion offered an unrelated command: " .. entry.label)
   end
-  item(complete(commands, "/mode "), "write")
+  item(complete(commands, "/read "), "full")
+    item(complete(commands, "/write "), "full")
+    item(complete(commands, "/"), "/ask")
+    item(complete(commands, "/"), "/deny")
+    item(complete(commands, "/"), "/allow")
+    for _, entry in ipairs(complete(commands, "/")) do
+      assert(entry.label ~= "/mode" and entry.label ~= "/read", "removed permission command is advertised")
+    end
   session.harness.agent = { run = { { id = "child", definition = "explorer", state = "ready" } }, exchange = {} }
   session.harness.timeline = { { kind = "agent_lifecycle", run = session.harness.agent.run[1],
     exchange = { { id = "child-exchange", agent_id = "child", state = "running", turn = {} } }, agent = {} } }

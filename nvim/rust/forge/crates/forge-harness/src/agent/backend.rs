@@ -142,12 +142,12 @@ impl AgentBackendFactory {
         } else {
             serde_json::from_value(serde_json::json!(profile.service_tier))?
         };
-        let execution_mode = if profile.permission_mode == "inherit" {
-            root.execution_mode
+        let approval_mode = if profile.approval_mode == "inherit" {
+            root.approval_mode
         } else {
             narrow_permission(
-                root.execution_mode,
-                serde_json::from_value(serde_json::json!(profile.permission_mode))?,
+                root.approval_mode,
+                serde_json::from_value(serde_json::json!(profile.approval_mode))?,
             )
         };
         let mut selection = AgentSelection {
@@ -163,7 +163,7 @@ impl AgentBackendFactory {
             },
             service_tier,
             access: provider.resolve_access(root.access.clone()),
-            execution_mode,
+            approval_mode,
         };
         ensure!(
             service_tier == crate::backend::ServiceTier::Standard
@@ -260,7 +260,7 @@ impl AgentBackendFactory {
             context_window: selection.context_window.clone(),
             service_tier: selection.service_tier,
             access: selection.provider.resolve_access(root.access.clone()),
-            execution_mode: narrow_permission(root.execution_mode, selection.execution_mode),
+            approval_mode: narrow_permission(root.approval_mode, selection.approval_mode),
             backend_session_id: agent.provider_thread_id.clone(),
             submission: None,
             recovered_input: Vec::new(),
@@ -279,14 +279,14 @@ pub struct AgentModelCatalog {
 }
 
 fn narrow_permission(
-    root: crate::session::PermissionMode,
-    selected: crate::session::PermissionMode,
-) -> crate::session::PermissionMode {
-    use crate::session::PermissionMode;
+    root: crate::session::ApprovalMode,
+    selected: crate::session::ApprovalMode,
+) -> crate::session::ApprovalMode {
+    use crate::session::ApprovalMode;
     match (root, selected) {
-        (PermissionMode::Read, _) | (_, PermissionMode::Read) => PermissionMode::Read,
-        (PermissionMode::Write, _) | (_, PermissionMode::Write) => PermissionMode::Write,
-        _ => PermissionMode::Yolo,
+        (ApprovalMode::Deny, _) | (_, ApprovalMode::Deny) => ApprovalMode::Deny,
+        (ApprovalMode::Ask, _) | (_, ApprovalMode::Ask) => ApprovalMode::Ask,
+        _ => ApprovalMode::Allow,
     }
 }
 

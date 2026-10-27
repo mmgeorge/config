@@ -574,7 +574,7 @@ impl CheckSupervisor {
             } else if operation.is_none() {
                 (
                     CheckState::ConfigurationError,
-                    Some("Requested scope is unsupported. Enable /checks setup on and request a correction in chat.".into()),
+                    Some("Requested scope is unsupported. Enable /checks edit on and request a correction in chat.".into()),
                 )
             } else {
                 (CheckState::Pending, None)

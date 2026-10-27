@@ -191,13 +191,13 @@ for _, malformed in ipairs({
     "an invalid initial response must not publish partial check rows")
   picker.close(false)
 end
-catalog.configured, catalog.snapshot, catalog.error = false, nil, "checks_not_configured: enable /checks setup on and request configuration in chat"
+catalog.configured, catalog.snapshot, catalog.error = false, nil, "checks_not_configured: enable /checks edit on and request configuration in chat"
 checks.open(session.harness, host)
 current = picker._state_for_test()
 page = picker_state.page(current.state, current.spec)
 assert(page.title:find("Unconfigured", 1, true))
 assert(#page.option_list == 0, "missing configuration must leave no execution actions")
-assert(page.empty_text:find("/checks setup on", 1, true))
+assert(page.empty_text:find("/checks edit on", 1, true))
 picker.close(false)
 load_failure = "invalid .forge.json: expected a JSON object"
 checks.open(session.harness, host)

@@ -24,7 +24,7 @@ use crate::control_tools::{
     ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext,
     apply_invocation, control_tool_failure_json,
 };
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use event_decoder::CopilotEventDecoder;
@@ -387,7 +387,7 @@ impl CopilotBackend {
             harness_session_id: request.harness_session_id.clone(),
             workspace: request.workspace.clone(),
             access: request.access.clone(),
-            execution_mode: request.execution_mode,
+            approval_mode: request.approval_mode,
             backend_session_id: request.backend_session_id.clone(),
         };
         let resources = self
@@ -673,7 +673,7 @@ impl CopilotBackend {
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: request.access.clone(),
-            execution_mode: request.execution_mode,
+            approval_mode: request.approval_mode,
             backend_session_id: request.backend_session_id.clone(),
             submission: None,
             recovered_input: Vec::new(),
@@ -762,11 +762,7 @@ fn capability() -> BackendCapability {
         ultrafast_mode: false,
         permission_control: true,
         background_terminals: true,
-        execution_mode_list: vec![
-            PermissionMode::Read,
-            PermissionMode::Write,
-            PermissionMode::Yolo,
-        ],
+        approval_mode_list: vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow],
         agent: AgentCapability::default(),
         catalog: CatalogCapability {
             skill: true,
@@ -1069,7 +1065,7 @@ impl Backend for CopilotBackend {
             .await
             .configure(
                 request.owner()?,
-                request.execution_mode,
+                request.approval_mode,
                 request.workspace.clone(),
                 event_sink.clone(),
             )?;
@@ -2218,7 +2214,7 @@ impl ToolHandler for CopilotControlToolHandler {
 struct CopilotPermissionState {
     checkpoint: Option<crate::checkpoint::ToolGate>,
     owner: Option<crate::backend::ExecutionOwner>,
-    execution_mode: PermissionMode,
+    approval_mode: ApprovalMode,
     workspace: String,
     event_sink: Option<BackendEventSink>,
     session_directory: Option<SessionDirectory>,
@@ -2236,7 +2232,7 @@ impl CopilotPermissionContext {
             state: StandardMutex::new(CopilotPermissionState {
                 checkpoint: None,
                 owner: None,
-                execution_mode: PermissionMode::Read,
+                approval_mode: ApprovalMode::Ask,
                 workspace: ".".into(),
                 event_sink: None,
                 session_directory: None,
@@ -2247,7 +2243,7 @@ impl CopilotPermissionContext {
     fn configure(
         &self,
         owner: crate::backend::ExecutionOwner,
-        execution_mode: PermissionMode,
+        approval_mode: ApprovalMode,
         workspace: String,
         event_sink: Option<BackendEventSink>,
     ) -> Result<()> {
@@ -2259,7 +2255,7 @@ impl CopilotPermissionContext {
         *state = CopilotPermissionState {
             checkpoint: None,
             owner: Some(owner),
-            execution_mode,
+            approval_mode,
             workspace,
             event_sink,
             session_directory,
@@ -2312,10 +2308,10 @@ impl PermissionHandler for CopilotPermissionHandler {
         request_id: RequestId,
         data: PermissionRequestData,
     ) -> PermissionResult {
-        let (execution_mode, workspace, event_sink, owner, session_directory) =
+        let (approval_mode, workspace, event_sink, owner, session_directory) =
             match self.context.state.lock() {
                 Ok(state) => (
-                    state.execution_mode,
+                    state.approval_mode,
                     state.workspace.clone(),
                     state.event_sink.clone(),
                     state.owner.clone(),
@@ -2328,6 +2324,25 @@ impl PermissionHandler for CopilotPermissionHandler {
         let kind = permission_kind(data.kind);
         let params = serde_json::to_value(data).unwrap_or(Value::Null);
         let request = permission_from_copilot(request_id.to_string(), kind, params, &workspace);
+        if request.target_list.iter().any(|target| {
+            matches!(
+                target,
+                crate::permissions::matcher::PermissionTarget::Write { .. }
+                    | crate::permissions::matcher::PermissionTarget::UnknownFile {
+                        operation: crate::permissions::directory::DirectoryOperation::Write
+                    }
+            )
+        }) {
+            match self.context.coordinator.writes_disabled(owner.as_ref()) {
+                Ok(true) => {
+                    return PermissionResult::reject(Some(
+                        "Filesystem writing is off. The user can enable it with /write.".into(),
+                    ));
+                }
+                Ok(false) => {}
+                Err(error) => return PermissionResult::reject(Some(format!("{error:#}"))),
+            }
+        }
         let protected = match self.context.coordinator.store().read() {
             Ok(store) => protected_target(&request, &store),
             Err(_) => return PermissionResult::reject(Some("permission store unavailable".into())),
@@ -2347,7 +2362,7 @@ impl PermissionHandler for CopilotPermissionHandler {
                         .and_then(|store| {
                             store
                                 .compiled()
-                                .evaluate(PermissionMode::Write, &request)
+                                .evaluate(&request)
                                 .map_err(anyhow::Error::from)
                         });
                     return match evaluation {
@@ -2368,7 +2383,7 @@ impl PermissionHandler for CopilotPermissionHandler {
         match self
             .context
             .coordinator
-            .authorize(execution_mode, request, Some(crate::backend::ProviderAddress {owner,thread_id:session_id.to_string(),turn_id:String::new()}), event_sink.as_ref())
+            .authorize(approval_mode, request, Some(crate::backend::ProviderAddress {owner,thread_id:session_id.to_string(),turn_id:String::new()}), event_sink.as_ref())
             .await
         {
             Ok(
@@ -2622,7 +2637,7 @@ mod test {
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: Default::default(),
-            execution_mode: PermissionMode::Read,
+            approval_mode: ApprovalMode::Ask,
             backend_session_id: None,
             submission: None,
             recovered_input: Vec::new(),

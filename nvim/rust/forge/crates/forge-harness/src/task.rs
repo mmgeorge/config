@@ -1,5 +1,82 @@
-use crate::session::PermissionMode;
+use crate::session::{AccessPolicy, ApprovalMode, DirectoryScope, WriteScope};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+/// Captures a policy intent resolved once against authoritative session state.
+pub enum PermissionChange {
+    /// Toggle workspace and full reads without changing writes or approval.
+    ToggleReadScope,
+    /// Toggle writes between off and workspace without remembering full scope.
+    ToggleWriteEnabled,
+    /// Toggle enabled writes between workspace and full, enabling full from off.
+    ToggleWriteScope,
+    /// Change only the tool approval selection.
+    SetApproval { mode: ApprovalMode },
+    #[serde(rename = "enable_yolo")]
+    /// Toggle full unsandboxed Allow to full-access Ask with supported sandboxing.
+    ToggleYolo,
+}
+
+impl PermissionChange {
+    /// Apply this intent to candidate state before validation and persistence.
+    pub fn apply(
+        self,
+        access: &mut AccessPolicy,
+        approval_mode: &mut ApprovalMode,
+        sandbox_supported: bool,
+    ) {
+        match self {
+            Self::ToggleReadScope => {
+                access.read_access = match access.read_access {
+                    DirectoryScope::Workspace => DirectoryScope::Full,
+                    DirectoryScope::Full => DirectoryScope::Workspace,
+                }
+            }
+            Self::ToggleWriteEnabled => {
+                access.write_access = match access.write_access {
+                    WriteScope::Off => WriteScope::Workspace,
+                    WriteScope::Workspace | WriteScope::Full => WriteScope::Off,
+                }
+            }
+            Self::ToggleWriteScope => {
+                access.write_access = match access.write_access {
+                    WriteScope::Off | WriteScope::Workspace => WriteScope::Full,
+                    WriteScope::Full => WriteScope::Workspace,
+                }
+            }
+            Self::SetApproval { mode } => *approval_mode = mode,
+            Self::ToggleYolo => {
+                let was_yolo = access.read_access == DirectoryScope::Full
+                    && access.write_access == WriteScope::Full
+                    && *approval_mode == ApprovalMode::Allow
+                    && !access.sandbox;
+                access.sandbox = was_yolo && sandbox_supported;
+                access.read_access = DirectoryScope::Full;
+                access.write_access = WriteScope::Full;
+                *approval_mode = if was_yolo {
+                    ApprovalMode::Ask
+                } else {
+                    ApprovalMode::Allow
+                };
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+/// Retains the cumulative policy selected by admitted permission intents.
+pub struct PermissionSelection {
+    /// Selected provider sandbox enablement.
+    pub sandbox: bool,
+    /// Selected read boundary, independent of directory grants.
+    pub read_access: DirectoryScope,
+    /// Selected write boundary, independent of directory grants.
+    pub write_access: WriteScope,
+    /// Selected approval behavior.
+    pub approval_mode: ApprovalMode,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -65,10 +142,10 @@ pub struct TaskRecord {
     pub plan_id: Option<String>,
     /// Associated continuation evidence when executing or pursuing a goal.
     pub goal_id: Option<String>,
-    /// Last permission selected for this workflow.
-    pub permission: PermissionMode,
-    /// Writable permission restored when resuming Execute or Goal.
-    pub last_write_permission: PermissionMode,
+    /// Confirmed filesystem policy restored when this task resumes.
+    pub access: AccessPolicy,
+    /// Confirmed tool approval policy, independent of filesystem access.
+    pub approval_mode: ApprovalMode,
     /// Revision used to reject stale picker selections.
     pub generation: u64,
     /// Identity of the latest admitted attempt.
@@ -87,7 +164,8 @@ impl TaskRecord {
         session_id: String,
         title: String,
         kind: TaskKind,
-        permission: PermissionMode,
+        access: AccessPolicy,
+        approval_mode: ApprovalMode,
         now_ms: i64,
     ) -> Self {
         Self {
@@ -105,12 +183,8 @@ impl TaskRecord {
             reason: None,
             plan_id: None,
             goal_id: None,
-            permission,
-            last_write_permission: if permission.is_write_default() {
-                permission
-            } else {
-                PermissionMode::Write
-            },
+            access,
+            approval_mode,
             generation: 0,
             attempt_id: None,
             operation_id: None,
@@ -143,6 +217,8 @@ pub struct TaskOperation {
     pub session_id: String,
     /// Immutable submitted action used to validate duplicate identities.
     pub action: serde_json::Value,
+    /// Resolved policy including earlier pending permission intents.
+    pub permission_selection: Option<PermissionSelection>,
     /// Durable admission, execution, or settlement outcome.
     pub state: String,
     /// Failure detail retained for reconnect and inspection.
@@ -165,5 +241,131 @@ impl TaskOperation {
             "action": self.action.get("action"),
             "error": self.error.as_ref().map(|error| error.chars().take(4096).collect::<String>()),
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn yolo_toggles_only_from_full_unsandboxed_allow() {
+        for sandbox_supported in [false, true] {
+            for sandbox in [false, true] {
+                for read in [DirectoryScope::Workspace, DirectoryScope::Full] {
+                    for write in [WriteScope::Off, WriteScope::Workspace, WriteScope::Full] {
+                        for approval in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow]
+                        {
+                            let mut access = AccessPolicy {
+                                sandbox,
+                                read_access: read,
+                                write_access: write,
+                                readable_directory: vec!["read-grant".into()],
+                                writable_directory: vec!["write-grant".into()],
+                                ..Default::default()
+                            };
+                            let original = access.clone();
+                            let mut mode = approval;
+                            let was_yolo = !sandbox
+                                && read == DirectoryScope::Full
+                                && write == WriteScope::Full
+                                && approval == ApprovalMode::Allow;
+                            PermissionChange::ToggleYolo.apply(
+                                &mut access,
+                                &mut mode,
+                                sandbox_supported,
+                            );
+                            assert_eq!(access.abbreviation(), "rxwx");
+                            assert_eq!(
+                                mode,
+                                if was_yolo {
+                                    ApprovalMode::Ask
+                                } else {
+                                    ApprovalMode::Allow
+                                }
+                            );
+                            assert_eq!(access.sandbox, was_yolo && sandbox_supported);
+                            assert_eq!(access.readable_directory, original.readable_directory);
+                            assert_eq!(access.writable_directory, original.writable_directory);
+                            assert_eq!(access.windows_sandbox, original.windows_sandbox);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn policy_transitions_preserve_independent_dimensions() {
+        for approval in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {
+            for read in [DirectoryScope::Workspace, DirectoryScope::Full] {
+                for write in [WriteScope::Off, WriteScope::Workspace, WriteScope::Full] {
+                    let original = AccessPolicy {
+                        read_access: read,
+                        write_access: write,
+                        ..Default::default()
+                    };
+                    for next_approval in
+                        [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow]
+                    {
+                        let mut access = original.clone();
+                        let mut mode = approval;
+                        PermissionChange::SetApproval {
+                            mode: next_approval,
+                        }
+                        .apply(&mut access, &mut mode, true);
+                        assert_eq!(access, original);
+                        assert_eq!(mode, next_approval);
+                    }
+                    let mut access = original.clone();
+                    let mut mode = approval;
+                    PermissionChange::ToggleReadScope.apply(&mut access, &mut mode, true);
+                    assert_ne!(access.read_access, read);
+                    assert_eq!(access.write_access, write);
+                    assert_eq!(mode, approval);
+                    PermissionChange::ToggleReadScope.apply(&mut access, &mut mode, true);
+                    assert_eq!(access, original);
+
+                    PermissionChange::ToggleWriteEnabled.apply(&mut access, &mut mode, true);
+                    assert_eq!(access.read_access, read);
+                    assert_eq!(
+                        access.write_access,
+                        if write == WriteScope::Off {
+                            WriteScope::Workspace
+                        } else {
+                            WriteScope::Off
+                        }
+                    );
+                    PermissionChange::ToggleWriteEnabled.apply(&mut access, &mut mode, true);
+                    assert_eq!(
+                        access.write_access,
+                        if write == WriteScope::Off {
+                            WriteScope::Off
+                        } else {
+                            WriteScope::Workspace
+                        }
+                    );
+                    assert_eq!(mode, approval);
+
+                    access = original.clone();
+                    PermissionChange::ToggleWriteScope.apply(&mut access, &mut mode, true);
+                    assert_eq!(access.read_access, read);
+                    assert_eq!(
+                        access.write_access,
+                        if write == WriteScope::Full {
+                            WriteScope::Workspace
+                        } else {
+                            WriteScope::Full
+                        }
+                    );
+                    assert_eq!(mode, approval);
+                    PermissionChange::ToggleYolo.apply(&mut access, &mut mode, true);
+                    assert_eq!(access.abbreviation(), "rxwx");
+                    assert_eq!(mode, ApprovalMode::Allow);
+                    assert!(!access.sandbox);
+                    assert_eq!(access.windows_sandbox, original.windows_sandbox);
+                }
+            }
+        }
     }
 }

@@ -88,12 +88,12 @@ local first = marks[1][4].sign_text
 local state = require("forge.session").harness
 local original_session = state.session
 for _, mode in ipairs({ "read", "write", "yolo", "plan" }) do
-  state.session = { execution_mode = mode }
+  state.session = { approval_mode = mode }
   hint.render(transcript, command_set, 120)
   local _, colored = working_marks()
-  local capture = require("forge.infra.highlights").harness_mode(mode)
+  local capture = "ForgeTimelineStatus"
   assert(colored[1][4].hl_group == capture, "Working text has the wrong mode color")
-  assert(colored[1][4].sign_hl_group == capture, "spinner differs from Working text")
+  assert(colored[1][4].sign_hl_group == "ForgeTimelineStatusSpinner", "spinner differs from Working text")
 end
 state.session = original_session
 transcript.status_notice = { text = "Host stopped. Reopen Harness to reconnect.", animated = false, failed = true }

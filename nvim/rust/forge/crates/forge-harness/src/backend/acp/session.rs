@@ -3,7 +3,7 @@ use crate::backend::approval::{ApprovalResolution, PermissionCoordinator};
 use crate::backend::*;
 use crate::control_tools::{ControlToolExecutor, ControlToolInvocation, ControlTurnContext};
 use crate::permissions::matcher::{PermissionRequest, PermissionTarget};
-use crate::session::PermissionMode;
+use crate::session::ApprovalMode;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -29,7 +29,7 @@ pub(super) struct AcpSessionState {
 /// Captures immutable callback routing for the admitted provider turn.
 pub(super) struct ActiveTurn {
     pub(super) owner: crate::backend::ExecutionOwner,
-    pub(super) mode: PermissionMode,
+    pub(super) mode: ApprovalMode,
     pub(super) sink: Option<BackendEventSink>,
 }
 
@@ -67,7 +67,7 @@ impl AcpSessionState {
         )));
         *self.active.write().await = Some(ActiveTurn {
             owner: request.owner().expect("validated ACP request owner"),
-            mode: request.execution_mode,
+            mode: request.approval_mode,
             sink,
         });
     }
@@ -265,7 +265,6 @@ impl AcpSessionState {
                 .context("ACP agent did not advertise protected-target rejection")?;
             return Ok(json!({"outcome":{"outcome":"selected","optionId":option["optionId"]}}));
         }
-        let forced = active.mode == PermissionMode::Yolo;
         let control = request.target_list.as_slice();
         let internal = matches!(control, [PermissionTarget::Mcp { target }]
             if target.strip_prefix("forge-harness-control/").is_some_and(|name|
@@ -274,13 +273,7 @@ impl AcpSessionState {
             ApprovalResolution::AllowOnce
         } else {
             self.permission
-                .authorize_callback(
-                    active.mode,
-                    forced,
-                    request,
-                    approval.address,
-                    active.sink.as_ref(),
-                )
+                .authorize(active.mode, request, approval.address, active.sink.as_ref())
                 .await?
         };
         if resolution == ApprovalResolution::Cancel {
@@ -701,7 +694,7 @@ mod test {
                 AcpSessionState::new(kind, PermissionCoordinator::transient(fixture.path())?);
             *state.active.write().await = Some(ActiveTurn {
                 owner: crate::backend::ExecutionOwner::root("root"),
-                mode: PermissionMode::Read,
+                mode: ApprovalMode::Ask,
                 sink: None,
             });
             let mut context = ControlTurnContext::inactive(PromptMode::Chat);
@@ -747,7 +740,7 @@ mod test {
         );
         *state.active.write().await = Some(ActiveTurn {
             owner: crate::backend::ExecutionOwner::root("root"),
-            mode: PermissionMode::Read,
+            mode: ApprovalMode::Ask,
             sink: None,
         });
         *state.control.lock().await = Some(Arc::new(ControlToolExecutor::new(
@@ -797,7 +790,7 @@ mod test {
         *state.children.lock().await = super::super::children::AcpChildren::new("root".into());
         *state.active.write().await = Some(ActiveTurn {
             owner: crate::backend::ExecutionOwner::root("test"),
-            mode: PermissionMode::Read,
+            mode: ApprovalMode::Ask,
             sink: None,
         });
         state
@@ -876,7 +869,7 @@ mod test {
         ));
         *state.active.write().await = Some(ActiveTurn {
             owner: crate::backend::ExecutionOwner::root("test"),
-            mode: PermissionMode::Yolo,
+            mode: ApprovalMode::Allow,
             sink: None,
         });
         for (tool, expected) in [
@@ -957,7 +950,7 @@ mod test {
         assert_eq!(state.catalog.read().await["availableCommands"], json!([]));
         *state.active.write().await = Some(ActiveTurn {
             owner: crate::backend::ExecutionOwner::root("test"),
-            mode: PermissionMode::Read,
+            mode: ApprovalMode::Ask,
             sink: None,
         });
         for update in [
@@ -1041,7 +1034,7 @@ mod test {
         );
         *state.active.write().await = Some(ActiveTurn {
             owner: crate::backend::ExecutionOwner::root("test"),
-            mode: PermissionMode::Write,
+            mode: ApprovalMode::Ask,
             sink: None,
         });
         state.notification("session/update", json!({"update":{
@@ -1085,7 +1078,7 @@ mod test {
         );
         *state.active.write().await = Some(ActiveTurn {
             owner: crate::backend::ExecutionOwner::root("test"),
-            mode: PermissionMode::Write,
+            mode: ApprovalMode::Ask,
             sink: None,
         });
         for update in [

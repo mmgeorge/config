@@ -63,6 +63,19 @@ transports and expose capability values that drive broker and editor behavior. `
 remains private to the Codex implementation. `CopilotEventDecoder` remains private to the native
 Copilot SDK implementation. Consumer-owned traits stay beside the feature that consumes them.
 
+`MockBackend` implements the same provider boundary with deterministic responses.
+Its `backend/mock_response.rs` control stores session-scoped, one-response holds.
+The `backend.mock_response` host route handles hold, wait, release, and cancel
+without taking the broker execution lock, so a test can control a response while
+its real Harness turn owns that lock. The route rejects providers that do not
+expose mock response control. Holds match the next prompt in the selected session
+and optional prompt mode before provider output or side effects begin. A claimed
+hold replaces configured timer delays while preserving steering. Watch
+notifications publish arrival, release, and cancellation without polling. Prompt
+drop, execution cleanup, and shutdown invalidate outstanding holds, and completed
+holds leave no retained history. Editor tests consume this route through
+`nvim/tests/forge/support/mock_provider.lua`.
+
 `AcpBackend` owns one stable ACP v1 connection and collected process tree per Harness root.
 Claude Code uses the published Claude ACP adapter. Antigravity uses its standalone ACP server.
 The official Rust ACP SDK frames transport requests and dispatches permission callbacks independently
@@ -118,9 +131,17 @@ cancellation release the editor configuration lock, and sign-in has a 120-second
 
 Claude sessions use strict MCP configuration and session-scoped native ask rules. Forge evaluates
 callbacks through `PermissionCoordinator` and returns native once-only decisions. Mandatory callbacks
-remain answerable in Yolo. Native provider policy can still reject an action before a callback reaches
+follow the selected approval mode. Native provider policy can still reject an action before a callback reaches
 Forge. Antigravity enterprise terminal policy can also execute a command without an ACP callback, so
 its approval capability remains limited even when personal OAuth approval checks pass.
+All three approval selections retain identical native callback setup. Codex uses
+`untrusted`, Claude retains native ask rules and default permission mode, and
+Copilot retains its SDK callback. Harness applies Ask/Deny/Allow after rules and
+reported-file access checks. Native operations without callbacks remain outside
+this boundary. Codex read scope does not create OS read confinement. Antigravity
+terminal policy can omit callbacks. Copilot's session-directory exemption cannot
+override write-off or explicit denies.
+
 `BackendKind::supports_sandbox` owns the OS sandbox allowlist, which currently includes only Codex.
 Portable settings resolve sandbox to off for Copilot, ACP providers, and the test adapter on session
 creation, recovery, and configuration. Shared requested preferences remain independent of the effective
@@ -544,7 +565,8 @@ an empty discovery result for an already-active tool from blocking planning.
 
 Copilot's native session metadata supplies its session-state directory. The adapter
 automatically approves file reads and writes confined to that directory for the
-matching native session, including in Read mode. It resolves paths and symlinks
+matching native session when writes are enabled. Write-off rejects reported writes
+to that directory. It resolves paths and symlinks
 before checking containment. Other sessions, provider configuration, commands, and
 mixed requests retain normal permission handling. Explicit denials and protected
 Harness files remain denied. Missing or relative directory metadata grants no access.

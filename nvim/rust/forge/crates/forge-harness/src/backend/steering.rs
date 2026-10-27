@@ -348,7 +348,7 @@ mod test {
             harness_session_id: "steering".into(),
             workspace: "workspace".into(),
             access: Default::default(),
-            execution_mode: crate::session::PermissionMode::Read,
+            approval_mode: crate::session::ApprovalMode::Ask,
             backend_session_id: None,
         };
         let submission = store.prepare_steering(

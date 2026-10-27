@@ -12,6 +12,7 @@ pub mod copilot;
 pub mod events;
 mod execution;
 pub(crate) mod mcp;
+pub mod mock_response;
 mod prompt;
 pub(crate) mod retry;
 mod service_tier;

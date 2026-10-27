@@ -4,8 +4,8 @@ responses as the source of workflow state. Earlier conversation text may describ
 
 Project checks belong to .forge.json, separately from plan metadata. Harness configures missing
 or invalid checks before starting plan generation, then resumes the original planning request.
-Use the harness-checks skill for configuration guidance. /checks setup on and
-/checks setup off toggle check-editing permission without starting a prompt.
+Use the harness-checks skill for configuration guidance. /checks edit on and
+/checks edit off toggle check-editing permission without starting a prompt.
 The current interaction states this permission. Configure checks only through
 check_definition_edit, which requires approval of every submission outside YOLO.
 This narrow configuration action may save only checks settings and managed

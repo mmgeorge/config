@@ -79,11 +79,20 @@ client.request_for = function(session_id, method, params, callback)
 end
 local success, failure = xpcall(function()
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab = require("forge.views.harness.layout").open("native-controller")
-  state.session = { id = "native-controller", backend = "mock", provider_label = "Mock CLI", model = "mock", execution_mode = "read" }
+  state.session = { id = "native-controller", backend = "mock", provider_label = "Mock CLI", model = "mock", approval_mode = "ask" }
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "native draft" })
+  state.initial_snapshot_pending = true
   controller.attach()
   controller.render()
+  assert(not state.presentation, "startup opened the retained session before synchronization")
+  local pending_title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+    { use_winbar = true, maxwidth = 200 }).str
+  assert(not pending_title:find("rxw", 1, true) and not pending_title:find("mock", 1, true),
+    "startup displayed stale permissions or model: " .. pending_title)
+  controller.activate_snapshot({ session = state.session, access_abbreviation = "rxwx" })
+  assert(not state.initial_snapshot_pending, "initial snapshot did not release startup presentation")
   assert(vim.wait(1000, function() return state.presentation and state.presentation.ready end))
+  state.access_abbreviation = nil
   local null_snapshot = vim.json.decode([[{
     "goal": null, "goal_execution": null, "active_plan": null,
     "active_elicitation": null, "active_wait": null,
@@ -169,10 +178,95 @@ local success, failure = xpcall(function()
   controller.refresh_winbar()
   local title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str
-  assert(title:find("Read • mock", 1, true), "winbar lost execution mode or model")
+  assert(title:find("rxw · sandbox · mock", 1, true), "winbar lost access, sandbox order, or model")
+  for _, sandbox in ipairs({ true, false }) do
+    state.session.access = { sandbox = sandbox }
+    for _, access in ipairs({ "r", "rx", "rw", "rxw", "rwx", "rxwx" }) do
+      for _, approval in ipairs({ "ask", "deny", "allow" }) do
+        for _, check_editing in ipairs({ false, true }) do
+          state.check_editing = check_editing
+          state.access_abbreviation, state.session.approval_mode = access, approval
+          controller.refresh_winbar()
+          local winbar = vim.wo[state.transcript_win].winbar
+          local displayed = vim.api.nvim_eval_statusline(winbar, { use_winbar = true, maxwidth = 200 }).str
+          local yolo = access == "rxwx" and approval == "allow" and not sandbox
+          local policy_label = access .. (({ deny = "dx", allow = "ax" })[approval] or "")
+            .. (check_editing and "ce" or "")
+          assert(displayed:find(policy_label .. " · ", 1, true), displayed)
+          assert(not displayed:find("check editing", 1, true), "check editing retained a separate field")
+          assert(not displayed:find(" · " .. approval .. " · ", 1, true), "approval retained a separate field")
+          assert((displayed:find("YOLO · ", 1, true) ~= nil) == yolo, displayed)
+          assert(winbar:find("%#ForgeStatusLabel#" .. policy_label .. "%*", 1, true), "policy lost its gray status capture")
+          assert((winbar:find("ForgeHarnessYoloIndicator", 1, true) ~= nil) == yolo)
+          assert(not displayed:find("•", 1, true), "winbar mixed separator sizes")
+          local _, dots = displayed:gsub("·", "")
+          local _, gray_dots = winbar:gsub("%%#ForgeStatusHint# · %%%*", "")
+          assert(dots > 0 and gray_dots == dots, "winbar separator inherited a value's highlight: " .. winbar)
+          assert((displayed:find(" · sandbox · mock", 1, true) ~= nil) == sandbox,
+            "sandbox must precede the model only when enabled")
+        end
+      end
+    end
+  end
+  state.session.access = { sandbox = true }
+  state.check_editing = false
+  state.access_abbreviation, state.session.approval_mode = "rxw", "ask"
+  local previous_effort = state.session.effort
+  state.session.effort = "high"
+  require("forge.infra.highlights").setup()
+  assert(vim.api.nvim_get_hl(0, { name = "ForgeStatusLabel", link = false }).fg == 0xc0c0c0)
+  assert(vim.deep_equal(vim.api.nvim_get_hl(0, { name = "ForgeHarnessUltrafast", link = false }),
+    vim.api.nvim_get_hl(0, { name = "ForgeHarnessYoloIndicator", link = false })),
+    "Ultrafast must use the same neon red as YOLO")
+  for _, speed in ipairs({
+    { tier = "default", text = "mock high", icon = nil },
+    { tier = "fast", text = "󱐌 mock high", icon = "󱐌", group = "ForgeStatusLabel" },
+    { tier = "ultrafast", text = "󱐋 mock high", icon = "󱐋", group = "ForgeHarnessUltrafast" },
+  }) do
+    state.session.service_tier = speed.tier
+    controller.refresh_winbar()
+    local winbar = vim.wo[state.transcript_win].winbar
+    local displayed = vim.api.nvim_eval_statusline(winbar, { use_winbar = true, maxwidth = 200 }).str
+    assert(displayed:find("sandbox · " .. speed.text .. " · Main", 1, true), displayed)
+    assert(not displayed:find("+", 1, true), "legacy speed marker remains")
+    if speed.icon then
+      assert(winbar:find("%#" .. speed.group .. "#" .. speed.icon .. "%*", 1, true), winbar)
+      assert(winbar:find("%#ForgeStatusLabel# mock high%*", 1, true), "speed color leaked into model text")
+    else
+      assert(not displayed:find("󱐌", 1, true) and not displayed:find("󱐋", 1, true))
+    end
+  end
+  state.session.effort, state.session.service_tier = previous_effort, nil
+  local previous_operation = state.task_operation
+  for _, action in ipairs({ "permission", "configure", "compact" }) do
+    for _, operation_state in ipairs({ "submitting", "accepted", "stopping", "applying", "verifying", "resuming" }) do
+      state.task_operation = { action = action, state = operation_state }
+      controller.refresh_winbar()
+      local displayed = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+        { use_winbar = true, maxwidth = 200 }).str
+      assert(not displayed:find("Task ", 1, true), "configuration was presented as a task: " .. displayed)
+      assert(displayed:find("rxw · ", 1, true), "pending configuration replaced the confirmed policy")
+    end
+  end
+  for _, action in ipairs({ "plan", "goal", "execute", "resume", "pause", "clear" }) do
+    state.task_operation = { action = action, state = "submitting" }
+    controller.refresh_winbar()
+    local displayed = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+      { use_winbar = true, maxwidth = 200 }).str
+    assert(displayed:find("Task submitting", 1, true), "workflow control lost its progress label")
+  end
+  state.task_operation = { action = "configure", state = "failed" }
+  state.configuration_error = "fixture rejected"
+  controller.refresh_winbar()
+  assert(vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+    { use_winbar = true, maxwidth = 200 }).str:find("Settings rejected: fixture rejected", 1, true),
+    "configuration failure was hidden")
+  state.configuration_error = nil
+  state.task_operation = previous_operation
+  controller.refresh_winbar()
   assert(not title:find("Mock CLI", 1, true), "winbar still shows the CLI provider")
   assert(not title:find("Parser 100% coverage", 1, true), "session name remains in top bar")
-  assert(title:find(" • sandbox • ", 1, true), "sandbox indicator missing from top bar")
+  assert(title:find(" · sandbox · ", 1, true), "sandbox indicator missing from top bar")
   state.session.access = { sandbox = false }
   controller.refresh_winbar()
   title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
@@ -283,26 +377,33 @@ local success, failure = xpcall(function()
   assert(vim.wo[state.composer_win].winbar == "", "busy composer restored key hints")
   state.goal = { state = "paused", created_at_ms = 1000 }
   receive("backend_event", { kind = "execution_state", data = {
-    session = { id = "native-controller", backend = "mock", model = "mock", execution_mode = "write", current_task_id = "execution" },
+    session = { id = "native-controller", backend = "mock", model = "mock", approval_mode = "ask", current_task_id = "execution" },
     task = { { id = "execution", kind = "execute", phase = "implement", status = "running" } },
     goal = { state = "active", created_at_ms = 1000 },
     goal_execution = { state = "active", created_at_ms = 1000, scheduler = { task = { { state = "active" } } } },
   } }, "native-controller")
-  assert(state.busy and state.goal.state == "active" and state.session.execution_mode == "write")
-  assert(vim.wo[state.transcript_win].winbar:find("execute · implement", 1, true))
-  assert(not vim.wo[state.transcript_win].winbar:find("running", 1, true))
+  assert(state.busy and state.goal.state == "active" and state.session.approval_mode == "ask")
+  title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+    { use_winbar = true, maxwidth = 200 }).str
+  assert(title:find("execute · implement", 1, true))
+  assert(not title:find("running", 1, true))
   receive("backend_event", { kind = "execution_state", data = {
     session = state.session, goal = vim.NIL, goal_execution = vim.NIL,
   } }, "native-controller")
   assert(state.goal == nil and state.goal_execution == nil, "absent execution state retained stale goal labels")
   state.busy = false
-  state.session.execution_mode = "read"
+  state.session.approval_mode = "ask"
   for _, kind in ipairs({ "plan", "execute", "goal" }) do
     for _, status in ipairs({ "paused", "blocked", "failed", "waiting" }) do
       state.task = { { id = "execution", kind = kind, phase = "review", status = status } }
       controller.refresh_winbar()
-      assert(vim.wo[state.transcript_win].winbar:find(kind .. " · review · " .. status, 1, true),
+      local winbar = vim.wo[state.transcript_win].winbar
+      title = vim.api.nvim_eval_statusline(winbar, { use_winbar = true, maxwidth = 200 }).str
+      assert(title:find(kind .. " · review · " .. status, 1, true),
         "durable task lifecycle disappeared from the winbar")
+      local _, dots = title:gsub("·", "")
+      local _, gray_dots = winbar:gsub("%%#ForgeStatusHint# · %%%*", "")
+      assert(gray_dots == dots, "lifecycle separator inherited a value's highlight")
     end
   end
   state.goal, state.goal_execution, state.task = nil, nil, {}

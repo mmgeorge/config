@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
                 "provider_fork_state": { "state": "ready" },
                 "model": "",
                 "effort": "",
-                "execution_mode": "read",
+                "approval_mode": "ask",
                 "created_at_ms": 0,
                 "updated_at_ms": 0
             }),
