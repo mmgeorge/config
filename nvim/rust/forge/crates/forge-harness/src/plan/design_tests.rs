@@ -130,9 +130,9 @@ pub(super) fn validate(files: &[DesignTestFile]) -> Result<()> {
         let mut names = BTreeSet::new();
         for case in &file.cases {
             ensure!(
-                case.target.as_ref().is_none_or(|target| !target.is_empty()
-                    && target.len() <= 256
-                    && !target.chars().any(char::is_control)),
+                case.target.as_ref().is_none_or(
+                    |target| !target.is_empty() && !target.chars().any(char::is_control)
+                ),
                 "invalid planned test target"
             );
             ensure!(

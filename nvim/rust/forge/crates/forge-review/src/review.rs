@@ -215,16 +215,8 @@ impl ReviewDocument {
             if !field.dirty {
                 return Ok(None);
             }
-            let mutation = reviewer::change(
-                field.baseline,
-                field.text,
-                self.target
-                    .repository
-                    .repository_name()
-                    .split('/')
-                    .next()
-                    .expect("validated repository"),
-            )?;
+            let mutation =
+                reviewer::change(field.baseline, field.text, self.target.repository.owner())?;
             let Some(mutation) = mutation else {
                 let text = field.text.to_owned();
                 self.edits

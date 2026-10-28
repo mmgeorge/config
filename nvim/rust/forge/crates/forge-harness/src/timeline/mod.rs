@@ -348,7 +348,9 @@ impl TimelineProjector {
     ) -> Result<Vec<TimelineEntry>> {
         let retired: std::collections::HashSet<_> = exchanges
             .into_iter()
-            .filter(|exchange| exchange.disposition != crate::exchange::HistoryDisposition::Current)
+            .filter(|exchange| {
+                exchange.disposition() != crate::exchange::HistoryDisposition::Current
+            })
             .map(|exchange| exchange.id.as_str())
             .collect();
         Self::with_checks(
@@ -380,7 +382,9 @@ impl TimelineProjector {
         let retired: std::collections::HashSet<_> = interaction_list
             .iter()
             .chain(&agent_exchange_list)
-            .filter(|exchange| exchange.disposition != crate::exchange::HistoryDisposition::Current)
+            .filter(|exchange| {
+                exchange.disposition() != crate::exchange::HistoryDisposition::Current
+            })
             .map(|exchange| exchange.id.clone())
             .collect();
         let mut interaction_list = interaction_list;
@@ -469,7 +473,7 @@ impl TimelineProjector {
         )?;
         result.retain(|entry| {
             !matches!(entry, TimelineEntry::Exchange { exchange, .. }
-            if exchange.disposition != crate::exchange::HistoryDisposition::Current)
+            if exchange.disposition() != crate::exchange::HistoryDisposition::Current)
         });
         result.sort_by_key(TimelineEntry::order_key);
         Ok(result)
@@ -550,13 +554,11 @@ fn project_agent_tree(
                 agent_by_id,
                 ..
             } = timeline_entry
-            {
-                if interaction.node_list.iter().any(|node| matches!(node,
+                && interaction.node_list.iter().any(|node| matches!(node,
                     crate::exchange::ExchangeNode::AgentReference { agent } if agent.child_agent_id == run_id)) {
                     agent_by_id.insert(run_id.clone(), entry.clone());
                     attached = true;
                 }
-            }
         }
         if !attached {
             result.push(entry);
@@ -581,7 +583,7 @@ fn build_agent_entry(
         .into_iter()
         .flatten()
         .filter(|exchange| {
-            exchange.disposition == crate::exchange::HistoryDisposition::Current
+            exchange.disposition() == crate::exchange::HistoryDisposition::Current
                 && exchange_id.is_none_or(|id| exchange.id == id)
         })
         .cloned()
@@ -653,7 +655,7 @@ mod test {
             retained.push(SessionEventRecord {
                 id: state.into(),
                 session_id: "session".into(),
-                owner: crate::timeline::TimelineOwner::session(&"session"),
+                owner: crate::timeline::TimelineOwner::session("session"),
                 created_at_ms: 1,
                 detail: SessionEventKind::Configuration {
                     operation_id: state.into(),
@@ -689,7 +691,6 @@ mod test {
             lifecycle: None,
             finalization_error: None,
             check_owner: None,
-            finalization_outcome: None,
             output_store: None,
             archived_output: Default::default(),
             input_message_id: None,
@@ -705,7 +706,7 @@ mod test {
             execution_id: None,
             execution_phase: None,
             goal_id: None,
-            state: ExchangeState::Complete,
+            phase: crate::exchange::ExchangePhase::fixture(ExchangeState::Complete, Some(2), None),
             checkpoint_before: None,
             checkpoint_after: None,
             attributed_diff_text: None,
@@ -713,18 +714,15 @@ mod test {
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
             check_setup: None,
-            disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 1,
-            completed_at_ms: Some(2),
             node_list: Vec::new(),
-            awaiting_input: false,
-            elicitation: None,
-            duration_ms: 1,
-            execution_started_at_ms: None,
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
+
+            question: crate::exchange::ExchangeQuestion::None,
+            clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 1 },
         }
     }
 
@@ -753,7 +751,7 @@ mod test {
 
     #[test]
     fn reused_agent_projects_later_exchange_without_recursing_into_earlier_exchange() {
-        use crate::exchange::{ExchangeNode, ExchangeState};
+        use crate::exchange::ExchangeNode;
         let first_agent = run("first-agent", None, None, "first-thread");
         let second_agent = run("second-agent", None, None, "second-thread");
         let mut first = interaction("first-exchange");
@@ -767,8 +765,12 @@ mod test {
             (&mut second, "first-agent", "later-exchange"),
             (&mut later, "first-agent", "first-exchange"),
         ] {
-            exchange.state = ExchangeState::Running;
-            exchange.completed_at_ms = None;
+            exchange.phase = crate::exchange::ExchangePhase::Running;
+            exchange.phase = crate::exchange::ExchangePhase::fixture(
+                exchange.state(),
+                None,
+                exchange.finalization_outcome(),
+            );
             exchange
                 .append_delegation(child, "spawn", "task", 1)
                 .unwrap();
@@ -776,7 +778,9 @@ mod test {
                 unreachable!()
             };
             agent.child_exchange_id = target.into();
-            exchange.finish(ExchangeState::Complete, 2).unwrap();
+            exchange
+                .finish(crate::exchange::ExchangeOutcome::Complete, 2)
+                .unwrap();
         }
         let owners = std::collections::HashMap::from([
             (first_agent.id.clone(), first_agent),
@@ -834,25 +838,37 @@ mod test {
     #[test]
     fn projects_nested_agent_turns_under_their_spawning_interaction() {
         let mut parent = interaction("parent");
-        parent.state = crate::exchange::ExchangeState::Running;
-        parent.completed_at_ms = None;
+        parent.phase = crate::exchange::ExchangePhase::fixture(
+            crate::exchange::ExchangeState::Running,
+            parent.completed_at_ms(),
+            parent.finalization_outcome(),
+        );
+        parent.phase = crate::exchange::ExchangePhase::fixture(
+            parent.state(),
+            None,
+            parent.finalization_outcome(),
+        );
         parent
             .append_delegation("root-run", "spawn", "inspect", 1)
             .unwrap();
         parent
-            .finish(crate::exchange::ExchangeState::Complete, 3)
+            .finish(crate::exchange::ExchangeOutcome::Complete, 3)
             .unwrap();
         let child_interaction = interaction("child-turn");
         let root_run = run("root-run", Some("parent"), None, "root-thread");
         let mut root_exchange = interaction("root-exchange");
         root_exchange.agent_id = root_run.id.clone();
-        root_exchange.state = crate::exchange::ExchangeState::Running;
-        root_exchange.completed_at_ms = None;
+        root_exchange.phase = crate::exchange::ExchangePhase::Running;
+        root_exchange.phase = crate::exchange::ExchangePhase::fixture(
+            root_exchange.state(),
+            None,
+            root_exchange.finalization_outcome(),
+        );
         root_exchange
             .append_delegation("child-run", "spawn", "nested task", 2)
             .unwrap();
         root_exchange
-            .finish(crate::exchange::ExchangeState::Complete, 3)
+            .finish(crate::exchange::ExchangeOutcome::Complete, 3)
             .unwrap();
         let child_run = run(
             "child-run",
@@ -906,8 +922,12 @@ mod test {
         let mut first = interaction("first");
         let mut second = interaction("second");
         for exchange in [&mut first, &mut second] {
-            exchange.state = crate::exchange::ExchangeState::Running;
-            exchange.completed_at_ms = None;
+            exchange.phase = crate::exchange::ExchangePhase::Running;
+            exchange.phase = crate::exchange::ExchangePhase::fixture(
+                exchange.state(),
+                None,
+                exchange.finalization_outcome(),
+            );
         }
         first
             .append_delegation("child", "spawn", "first task", 1)
@@ -917,7 +937,7 @@ mod test {
             .unwrap();
         for exchange in [&mut first, &mut second] {
             exchange
-                .finish(crate::exchange::ExchangeState::Complete, 3)
+                .finish(crate::exchange::ExchangeOutcome::Complete, 3)
                 .unwrap();
         }
         let mut entries = vec![

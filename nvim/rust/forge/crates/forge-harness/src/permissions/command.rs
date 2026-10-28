@@ -76,7 +76,7 @@ impl CommandDisplay {
             .enumerate()
             .filter(|(_, original)| original.start < range.end && original.end > range.start);
         let first = matched.next()?.0;
-        Some(first..matched.last().map_or(first, |(index, _)| index) + 1)
+        Some(first..matched.next_back().map_or(first, |(index, _)| index) + 1)
     }
 }
 

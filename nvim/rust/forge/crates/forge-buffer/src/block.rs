@@ -330,19 +330,19 @@ impl BufferBlock {
             return Err(ContractError("status requires a physical row"));
         }
         if let Some(layout) = &self.metadata.layout {
-            if !(2..=256).contains(&layout.indent) || layout.source_indent > layout.indent - 2 {
-                return Err(ContractError("content indent must contain 2..=256 cells"));
+            if layout.indent < 2 || layout.source_indent > layout.indent - 2 {
+                return Err(ContractError(
+                    "content indent must contain at least two cells",
+                ));
             }
-            if let Some(marker) = &layout.marker {
-                if marker.text.chars().count() != 1
+            if let Some(marker) = &layout.marker
+                && (marker.text.chars().count() != 1
                     || marker.text.chars().any(char::is_control)
-                    || marker.capture.is_empty()
-                    || marker.capture.len() > 256
-                {
-                    return Err(ContractError(
-                        "content marker requires one printable character and a capture",
-                    ));
-                }
+                    || marker.capture.is_empty())
+            {
+                return Err(ContractError(
+                    "content marker requires one printable character and a capture",
+                ));
             }
         }
         self.id.validate()?;
@@ -389,8 +389,8 @@ impl BufferBlock {
             .chain(&self.metadata.source_highlight)
         {
             decoration.range.validate(&self.text)?;
-            if decoration.capture.is_empty() || decoration.capture.len() > 256 {
-                return Err(ContractError("capture name must contain 1..=256 bytes"));
+            if decoration.capture.is_empty() {
+                return Err(ContractError("capture name must not be empty"));
             }
         }
         for conceal in &self.metadata.conceal {
@@ -410,7 +410,6 @@ impl BufferBlock {
                 || overlay.text.is_empty()
                 || overlay.text.chars().any(char::is_control)
                 || overlay.capture.is_empty()
-                || overlay.capture.len() > 256
             {
                 return Err(ContractError(
                     "source overlay requires a physical row range and printable text",
@@ -457,10 +456,7 @@ impl BufferBlock {
                 return Err(ContractError("gutter requires a physical row"));
             }
             for chunk in &gutter.chunk {
-                if chunk.text.contains(['\n', '\0'])
-                    || chunk.capture.is_empty()
-                    || chunk.capture.len() > 256
-                {
+                if chunk.text.contains(['\n', '\0']) || chunk.capture.is_empty() {
                     return Err(ContractError("gutter chunk has invalid text or capture"));
                 }
             }
@@ -474,5 +470,68 @@ impl BufferBlock {
             .iter()
             .find(|target| target.range.start <= position && position < target.range.end)
             .map(|target| &target.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_layout_and_long_captures_survive_snapshot_roundtrip() {
+        let capture = "Capture".repeat(100);
+        let range = TextRange {
+            start: TextPosition { row: 0, column: 0 },
+            end: TextPosition { row: 0, column: 3 },
+        };
+        let block = BufferBlock {
+            id: BlockId("deep-layout".into()),
+            text: BufferText::from_rows(["row"]).unwrap(),
+            metadata: BlockMetadata {
+                layout: Some(ContentLayout {
+                    indent: 600,
+                    source_indent: 0,
+                    marker: Some(TextChunk {
+                        text: "•".into(),
+                        capture: capture.clone(),
+                    }),
+                }),
+                decoration: vec![Decoration {
+                    range: range.clone(),
+                    capture: capture.clone(),
+                    priority: 1,
+                }],
+                source_overlay: vec![SourceOverlay {
+                    range,
+                    text: "label".into(),
+                    capture: capture.clone(),
+                    priority: 1,
+                }],
+                gutter: vec![Gutter {
+                    position: TextPosition { row: 0, column: 0 },
+                    placement: GutterPlacement::Inline,
+                    chunk: vec![TextChunk {
+                        text: "•".into(),
+                        capture,
+                    }],
+                    priority: 1,
+                }],
+                ..Default::default()
+            },
+        };
+        block.validate().unwrap();
+        let document = crate::document::BufferDocument::new(
+            crate::identity::DocumentId("deep".into()),
+            vec![block],
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&document.snapshot()).unwrap();
+        let snapshot: crate::patch::BufferSnapshot = serde_json::from_slice(&encoded).unwrap();
+        snapshot.block[0].validate().unwrap();
+        assert_eq!(
+            snapshot.block[0].metadata.layout.as_ref().unwrap().indent,
+            600
+        );
+        assert_eq!(snapshot.block[0].metadata.decoration[0].capture.len(), 700);
     }
 }

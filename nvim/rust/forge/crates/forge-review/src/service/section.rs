@@ -515,7 +515,7 @@ fn required(record: &Value, key: &str) -> Result<String> {
 
 fn identity(record: &Value) -> Result<String> {
     match record.get("id") {
-        Some(Value::String(value)) if !value.is_empty() && value.len() <= 256 => Ok(value.clone()),
+        Some(Value::String(value)) if !value.is_empty() => Ok(value.clone()),
         Some(Value::Number(value)) if value.as_u64().is_some_and(|value| value > 0) => {
             Ok(value.to_string())
         }

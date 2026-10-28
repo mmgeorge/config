@@ -179,7 +179,7 @@ mod tests {
                             .filter(|span| {
                                 span.range.start.column <= column && span.range.end.column > column
                             })
-                            .last()
+                            .next_back()
                             .unwrap();
                         assert!(
                             winning.capture.starts_with(capture),

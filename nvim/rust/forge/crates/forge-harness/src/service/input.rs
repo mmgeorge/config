@@ -256,11 +256,10 @@ impl SessionController {
                             Some(Err(error)) => {
                                 let Some(controller) = owner.upgrade() else { break };
                                 if let Some(id) = job_owner.remove(&error.id()) {
-                                    if let Ok(snapshot) = controller.coordinator.submissions.snapshot() {
-                                        if snapshot.messages.iter().any(|message| message.id == id && message.route == Some(InputRoute::Steering)) {
+                                    if let Ok(snapshot) = controller.coordinator.submissions.snapshot()
+                                        && snapshot.messages.iter().any(|message| message.id == id && message.route == Some(InputRoute::Steering)) {
                                             steering = false;
                                         }
-                                    }
                                     if let Err(failure) = controller.input_failure(&id, format!("Input worker failed: {error}"), &sink).await {
                                         let _ = sink.send_event(SessionEvent {
                                             session_id: controller.catalog_request.read().await.harness_session_id.clone(),
@@ -319,20 +318,20 @@ impl SessionController {
             return self.complete_input_checks(sink, jobs).await;
         };
         if snapshot.checks_running && message.intent == InputIntent::Auto {
-            if let Some(run_id) = self.checks.active()? {
-                if let Err(error) = self.interrupt_checks(&snapshot.session.id, &run_id).await {
-                    self.publish_input(
-                        self.coordinator.submissions.delivery(
-                            &message.id,
-                            Some(InputDelivery::Failed),
-                            None,
-                            Some(format!("Could not interrupt checks: {error:#}")),
-                        )?,
-                        sink,
-                    )
-                    .await?;
-                    return Ok(InputProgress::Waiting);
-                }
+            if let Some(run_id) = self.checks.active()?
+                && let Err(error) = self.interrupt_checks(&snapshot.session.id, &run_id).await
+            {
+                self.publish_input(
+                    self.coordinator.submissions.delivery(
+                        &message.id,
+                        Some(InputDelivery::Failed),
+                        None,
+                        Some(format!("Could not interrupt checks: {error:#}")),
+                    )?,
+                    sink,
+                )
+                .await?;
+                return Ok(InputProgress::Waiting);
             }
             self.coordinator.submissions.changed.notify_one();
             return Ok(InputProgress::Waiting);

@@ -10,13 +10,10 @@ use forge_diff::raw::compute_hunks;
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
 
 fn diff(old: &str, new: &str) -> AnalysisHandle {
-    retain(
-        compute_hunks(SourcePair {
-            old: SourceVersion::new(old.as_bytes().to_vec(), Representation::Raw).unwrap(),
-            new: SourceVersion::new(new.as_bytes().to_vec(), Representation::Raw).unwrap(),
-        })
-        .unwrap(),
-    )
+    retain(compute_hunks(SourcePair {
+        old: SourceVersion::new(old.as_bytes().to_vec(), Representation::Raw).unwrap(),
+        new: SourceVersion::new(new.as_bytes().to_vec(), Representation::Raw).unwrap(),
+    }))
 }
 
 fn drain(cursor: &mut DisplayCursor, limits: ChunkLimits) -> Vec<DisplayRow> {
@@ -65,12 +62,14 @@ fn first_giant_hunk_obeys_the_same_chunk_limit_as_later_hunks() {
     assert!(rows.iter().all(|row| row.raw_id == Some(identity)));
     assert_eq!(
         rows.iter()
-            .filter(|row| row.kind == RowKind::Removed)
+            .filter(|row| row.kind() == RowKind::Removed)
             .count(),
         800
     );
     assert_eq!(
-        rows.iter().filter(|row| row.kind == RowKind::Added).count(),
+        rows.iter()
+            .filter(|row| row.kind() == RowKind::Added)
+            .count(),
         900
     );
 }
@@ -96,13 +95,13 @@ fn display_context_merges_without_duplicate_source_lines() {
     );
     assert_eq!(
         rows.iter()
-            .filter_map(|row| row.old.map(|coordinate| coordinate.line))
+            .filter_map(|row| row.old_coordinate().map(|coordinate| coordinate.line))
             .collect::<Vec<_>>(),
         (1..6).collect::<Vec<_>>()
     );
     assert_eq!(
         rows.iter()
-            .filter_map(|row| row.new.map(|coordinate| coordinate.line))
+            .filter_map(|row| row.new_coordinate().map(|coordinate| coordinate.line))
             .collect::<Vec<_>>(),
         (1..6).collect::<Vec<_>>()
     );
@@ -156,8 +155,8 @@ fn byte_and_decoration_limits_preserve_unemitted_rows() {
         rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
         ["é🙂", "second", "last\r"]
     );
-    assert!(rows.iter().all(|row| row.old.is_none()));
-    assert_eq!(rows[2].new.unwrap().line, 2);
+    assert!(rows.iter().all(|row| row.old_coordinate().is_none()));
+    assert_eq!(rows[2].new_coordinate().unwrap().line, 2);
 }
 
 #[test]
@@ -223,18 +222,21 @@ fn compact_context_preserves_changed_spans_across_insertions_and_deletions() {
             let new_lines = new.split_inclusive('\n').collect::<Vec<_>>();
             assert_eq!(
                 rows.iter()
-                    .filter_map(|row| row.old.map(|coordinate| coordinate.line))
+                    .filter_map(|row| row.old_coordinate().map(|coordinate| coordinate.line))
                     .collect::<Vec<_>>(),
                 old_range.collect::<Vec<_>>()
             );
             assert_eq!(
                 rows.iter()
-                    .filter_map(|row| row.new.map(|coordinate| coordinate.line))
+                    .filter_map(|row| row.new_coordinate().map(|coordinate| coordinate.line))
                     .collect::<Vec<_>>(),
                 new_range.collect::<Vec<_>>()
             );
             for row in rows {
-                for (coordinate, lines) in [(row.old, &old_lines), (row.new, &new_lines)] {
+                for (coordinate, lines) in [
+                    (row.old_coordinate(), &old_lines),
+                    (row.new_coordinate(), &new_lines),
+                ] {
                     if let Some(coordinate) = coordinate {
                         let line = lines[coordinate.line];
                         let text = line
@@ -281,8 +283,8 @@ fn a_decoration_budget_that_cannot_fit_one_emphasized_row_uses_base_styles() {
         },
     );
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].kind, RowKind::Removed);
-    assert_eq!(rows[1].kind, RowKind::Added);
+    assert_eq!(rows[0].kind(), RowKind::Removed);
+    assert_eq!(rows[1].kind(), RowKind::Added);
     assert!(rows.iter().all(|row| row.emphasis.is_empty()
         && row.emphasis_fallback == Some(FallbackReason::DecorationLimit)));
 }

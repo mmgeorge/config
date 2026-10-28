@@ -1528,7 +1528,7 @@ async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
         rows.iter().filter(|row| row.starts_with("new ")).count(),
         180
     );
-    assert!(rows.iter().any(|row| *row == "Newer local title"));
+    assert!(rows.contains(&"Newer local title"));
     assert_eq!(diff.analysis_pool().usage().admitted_jobs, 0);
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/review-interleave-fixture.json");

@@ -329,8 +329,20 @@ async fn mcp_timeout_preserves_healthy_servers_and_session() {
         let fixture = Fixture::new(&["healthy"]).await;
         let session = fixture.backend.session(&fixture.prompt()).await.unwrap();
         let launch = vec![
-            ("stalled".into(), json!({"command":"unused","args":[]})),
-            ("healthy".into(), json!({"command":"unused","args":[]})),
+            (
+                "stalled".into(),
+                serde_json::Map::from_iter([
+                    ("command".into(), json!("unused")),
+                    ("args".into(), json!([])),
+                ]),
+            ),
+            (
+                "healthy".into(),
+                serde_json::Map::from_iter([
+                    ("command".into(), json!("unused")),
+                    ("args".into(), json!([])),
+                ]),
+            ),
         ];
         let failed = start(
             &session,

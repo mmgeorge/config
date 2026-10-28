@@ -91,7 +91,13 @@ struct ReadReservation {
 pub struct ReadTask<Output> {
     id: ReadId,
     cancellation: ReadCancellation,
-    handle: Option<JoinHandle<ReadCompletion<Output>>>,
+    handle: JoinHandle<ReadCompletion<Output>>,
+}
+
+struct ReadAdmission {
+    runtime: tokio::runtime::Handle,
+    cancellation: ReadCancellation,
+    reservation: ReadReservation,
 }
 
 struct ReadCompletion<Output> {
@@ -123,7 +129,7 @@ impl BlockingReadPool {
         input_bytes: usize,
         work: impl FnOnce(ReadCancellation) -> Result<Output> + Send + 'static,
     ) -> std::result::Result<ReadTask<Output>, ReadAdmissionError> {
-        self.submit_retained(input_bytes, &mut Some(work))
+        Ok(self.reserve(input_bytes)?.start(work))
     }
 
     /// Wait for native job capacity without blocking the executor.
@@ -134,27 +140,25 @@ impl BlockingReadPool {
         work: impl FnOnce(ReadCancellation) -> Result<Output> + Send + 'static,
     ) -> std::result::Result<ReadTask<Output>, ReadAdmissionError> {
         let mut changed = self.shared.changed.subscribe();
-        let mut work = Some(work);
         loop {
             changed.borrow_and_update();
-            match self.submit_retained(input_bytes, &mut work) {
+            match self.reserve(input_bytes) {
                 Err(ReadAdmissionError::Busy) => {
                     changed
                         .changed()
                         .await
                         .map_err(|_| ReadAdmissionError::Closed)?;
                 }
-                result => return result,
+                Ok(admission) => return Ok(admission.start(work)),
+                Err(error) => return Err(error),
             }
         }
     }
 
-    /// Consumes retained work only after reserving native capacity.
-    fn submit_retained<Output: Send + 'static>(
+    fn reserve(
         &self,
         input_bytes: usize,
-        work: &mut Option<impl FnOnce(ReadCancellation) -> Result<Output> + Send + 'static>,
-    ) -> std::result::Result<ReadTask<Output>, ReadAdmissionError> {
+    ) -> std::result::Result<ReadAdmission, ReadAdmissionError> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| ReadAdmissionError::NoRuntime)?;
         let cancellation = ReadCancellation {
@@ -191,24 +195,10 @@ impl BlockingReadPool {
             id,
             input_bytes,
         };
-        let work = work.take().expect("admitted repository read work");
-        let worker_cancellation = cancellation.clone();
-        let handle = runtime.spawn_blocking(move || {
-            let result = (move || {
-                worker_cancellation.check()?;
-                let result = work(worker_cancellation.clone());
-                worker_cancellation.check()?;
-                result
-            })();
-            ReadCompletion {
-                result,
-                _reservation: reservation,
-            }
-        });
-        Ok(ReadTask {
-            id,
+        Ok(ReadAdmission {
+            runtime,
             cancellation,
-            handle: Some(handle),
+            reservation,
         })
     }
 
@@ -254,6 +244,38 @@ impl BlockingReadPool {
     }
 }
 
+impl ReadAdmission {
+    fn start<Output: Send + 'static>(
+        self,
+        work: impl FnOnce(ReadCancellation) -> Result<Output> + Send + 'static,
+    ) -> ReadTask<Output> {
+        let Self {
+            runtime,
+            cancellation,
+            reservation,
+        } = self;
+        let id = reservation.id;
+        let worker_cancellation = cancellation.clone();
+        let handle = runtime.spawn_blocking(move || {
+            let result = (move || {
+                worker_cancellation.check()?;
+                let result = work(worker_cancellation.clone());
+                worker_cancellation.check()?;
+                result
+            })();
+            ReadCompletion {
+                result,
+                _reservation: reservation,
+            }
+        });
+        ReadTask {
+            id,
+            cancellation,
+            handle,
+        }
+    }
+}
+
 impl PoolShared {
     fn close(&self) {
         let mut state = self.state.lock().expect("repository read state lock");
@@ -294,10 +316,7 @@ impl<Output> ReadTask<Output> {
     }
 
     pub async fn finish(mut self) -> Result<Output> {
-        let completion = self
-            .handle
-            .take()
-            .expect("repository read result owner")
+        let completion = (&mut self.handle)
             .await
             .context("repository read worker did not complete normally")?;
         self.cancellation.check()?;
@@ -317,7 +336,7 @@ mod tests {
 
     async fn wait_for_native_completion<Output>(task: &ReadTask<Output>) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !task.handle.as_ref().unwrap().is_finished() {
+            while !task.handle.is_finished() {
                 tokio::task::yield_now().await;
             }
         })

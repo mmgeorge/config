@@ -28,7 +28,7 @@ impl SqliteStore {
                 .get(id.as_str())
                 .context("rollback descendant state is missing")?;
             ensure!(
-                exchange.completed_at_ms.is_some(),
+                exchange.is_finished(),
                 "rollback requires settled descendant exchanges"
             );
             ensure!(

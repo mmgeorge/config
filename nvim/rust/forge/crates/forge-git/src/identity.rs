@@ -34,6 +34,13 @@ pub struct RepositoryPath {
 }
 
 impl RepositoryPath {
+    /// Returns the fixed repository-relative Forge project configuration path.
+    pub fn project_config() -> Self {
+        Self {
+            raw: b".forge.json".to_vec(),
+        }
+    }
+
     pub fn new(raw: Vec<u8>) -> Result<Self> {
         ensure!(
             !raw.is_empty() && !raw.contains(&0),

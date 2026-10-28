@@ -6,8 +6,7 @@ fn fixture(text: &str) -> (AnalysisKey, AnalysisBytes, RawDiff) {
     let diff = compute_hunks(SourcePair {
         old: SourceVersion::new(b"old\n".to_vec(), Representation::Raw).unwrap(),
         new: SourceVersion::new(text.as_bytes().to_vec(), Representation::Raw).unwrap(),
-    })
-    .unwrap();
+    });
     let key = AnalysisKey {
         old: diff.source().old.identity(),
         new: diff.source().new.identity(),
@@ -140,14 +139,12 @@ fn shared_source_allocation_is_charged_once_within_one_result() {
     let diff = compute_hunks(SourcePair {
         old: source.clone(),
         new: source,
-    })
-    .unwrap();
+    });
     assert_eq!(diff.retained_source_bytes(), 5);
     let distinct = compute_hunks(SourcePair {
         old: SourceVersion::new(b"same\n".to_vec(), Representation::Raw).unwrap(),
         new: SourceVersion::new(b"same\n".to_vec(), Representation::Raw).unwrap(),
-    })
-    .unwrap();
+    });
     assert_eq!(distinct.retained_source_bytes(), 10);
 }
 

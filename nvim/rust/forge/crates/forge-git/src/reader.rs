@@ -142,7 +142,7 @@ impl StatusReader {
             .tree_index_track_renames(renames)
             .into_iter(patterns)?;
         let mut records = HashMap::new();
-        while let Some(item) = iterator.next() {
+        for item in iterator.by_ref() {
             check()?;
             match item? {
                 gix::status::Item::TreeIndex(change) => insert_tree_index(&mut records, change)?,
@@ -207,7 +207,7 @@ fn insert_tree_index(
         } => {
             let index = ObjectState {
                 mode: entry_mode.bits(),
-                object: id.into_owned().into(),
+                object: id.into_owned(),
             };
             (
                 location.to_vec(),
@@ -227,7 +227,7 @@ fn insert_tree_index(
         } => {
             let head = ObjectState {
                 mode: entry_mode.bits(),
-                object: id.into_owned().into(),
+                object: id.into_owned(),
             };
             (
                 location.to_vec(),
@@ -255,11 +255,11 @@ fn insert_tree_index(
             },
             ObjectState {
                 mode: previous_entry_mode.bits(),
-                object: previous_id.into_owned().into(),
+                object: previous_id.into_owned(),
             },
             ObjectState {
                 mode: entry_mode.bits(),
-                object: id.into_owned().into(),
+                object: id.into_owned(),
             },
         ),
         Change::Rewrite {
@@ -274,11 +274,11 @@ fn insert_tree_index(
         } => {
             let index = ObjectState {
                 mode: entry_mode.bits(),
-                object: id.into_owned().into(),
+                object: id.into_owned(),
             };
             let head = ObjectState {
                 mode: source_entry_mode.bits(),
-                object: source_id.into_owned().into(),
+                object: source_id.into_owned(),
             };
             let record = tracked(location.to_vec(), index.mode, index.object);
             let mut record = record;

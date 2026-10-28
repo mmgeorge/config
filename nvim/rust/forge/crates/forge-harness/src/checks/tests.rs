@@ -89,10 +89,10 @@ async fn compact_tool_responses_separate_definitions_status_and_complete_logs() 
     assert_eq!(runner.running_summaries()?, serde_json::json!({"runs":[]}));
     let prepared = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
+        crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
             ids: vec!["named".into()],
             ..Default::default()
-        },
+        }),
         None,
         crate::session::CheckShell::Nushell,
         "Explicit".into(),
@@ -101,14 +101,14 @@ async fn compact_tool_responses_separate_definitions_status_and_complete_logs() 
     run.commands[0].started_at_ms = Some(run.started_at_ms);
     run.commands[0].state = CheckState::Running;
     run.commands[0].preview = "first\n\u{1b}[32mCompiling example\u{1b}[0m\n\n".into();
-    let summary = super::response::summary(&run);
+    let summary = super::response::summary(&run.clone().into_record());
     assert_eq!(summary["latest_output"], "Compiling example");
     assert_eq!(summary["completed"], 0);
     assert_eq!(summary["total"], 1);
     assert!(summary.get("commands").is_none());
     let mut request: super::DetailRequest =
         serde_json::from_value(serde_json::json!({"run_id":run.id}))?;
-    let pending = super::response::detail(&run, &request)?;
+    let pending = super::response::detail(&run.clone().into_record(), &request)?;
     assert!(
         pending["message"]
             .as_str()
@@ -116,14 +116,14 @@ async fn compact_tool_responses_separate_definitions_status_and_complete_logs() 
             .contains("check_status")
     );
     assert!(pending.get("text").is_none());
-    runner.publish(&run, None).await?;
+    runner.publish(&run.clone().into_record(), None).await?;
     assert_eq!(runner.running_summaries()?["runs"][0]["run_id"], run.id);
     assert_eq!(runner.status_summary(&run.id, 1).await?["state"], "running");
     let waiting_id = run.id.clone();
     let waiting = runner.status_summary(&waiting_id, 1000);
     tokio::pin!(waiting);
     assert!(futures_util::poll!(waiting.as_mut()).is_pending());
-    runner.publish(&run, None).await?;
+    runner.publish(&run.clone().into_record(), None).await?;
     assert!(futures_util::poll!(waiting.as_mut()).is_pending());
     let output = format!(
         "{}{}{}",
@@ -138,17 +138,17 @@ async fn compact_tool_responses_separate_definitions_status_and_complete_logs() 
     run.commands[0].state = CheckState::Failed;
     run.commands[0].completed_at_ms = run.completed_at_ms;
     run.commands[0].exit_code = Some(7);
-    runner.publish(&run, None).await?;
+    runner.publish(&run.clone().into_record(), None).await?;
     assert_eq!(waiting.await?["state"], "failed");
     assert_eq!(runner.running_summaries()?, serde_json::json!({"runs":[]}));
     assert!(runner.status_summary("missing", 0).await.is_err());
-    let summary = super::response::summary(&run);
+    let summary = super::response::summary(&run.clone().into_record());
     assert_eq!(summary["state"], "failed");
     assert_eq!(summary["exit_code"], 7);
     assert_eq!(summary["elapsed_ms"], 25);
     let mut combined = String::new();
     loop {
-        let page = super::response::detail(&run, &request)?;
+        let page = super::response::detail(&run.clone().into_record(), &request)?;
         assert_eq!(
             page["command"]["invocation"]["program"],
             "uninstalled-runner"
@@ -170,27 +170,36 @@ async fn compact_tool_responses_separate_definitions_status_and_complete_logs() 
     std::fs::write(&second.output, "second command")?;
     run.commands.push(second);
     request.cursor.offset = output.len() as u64;
-    let boundary = super::response::detail(&run, &request)?;
+    let boundary = super::response::detail(&run.clone().into_record(), &request)?;
     assert_eq!(boundary["next_cursor"]["command_index"], 1);
     request.cursor = serde_json::from_value(boundary["next_cursor"].clone())?;
     assert_eq!(
-        super::response::detail(&run, &request)?["text"],
+        super::response::detail(&run.clone().into_record(), &request)?["text"],
         "second command"
     );
     run.commands.pop();
     request.cursor = Default::default();
     request.cursor.offset = output.len() as u64 + 1;
-    assert!(super::response::detail(&run, &request).is_err());
+    assert!(super::response::detail(&run.clone().into_record(), &request).is_err());
     request.cursor = Default::default();
     std::fs::remove_file(&run.commands[0].output)?;
-    assert!(super::response::detail(&run, &request).is_err());
+    assert!(super::response::detail(&run.clone().into_record(), &request).is_err());
     run.commands[0].started_at_ms = None;
     run.commands[0].state = CheckState::Skipped;
-    assert_eq!(super::response::detail(&run, &request)?["text"], "");
+    assert_eq!(
+        super::response::detail(&run.clone().into_record(), &request)?["text"],
+        ""
+    );
     run.commands[0].reused_from = Some(("prior-run".into(), "prior-command".into()));
-    assert!(super::response::detail(&run, &request).is_err());
-    assert_eq!(super::response::summary(&run)["reused"], 1);
-    assert_eq!(super::response::summary(&run)["executed"], 0);
+    assert!(super::response::detail(&run.clone().into_record(), &request).is_err());
+    assert_eq!(
+        super::response::summary(&run.clone().into_record())["reused"],
+        1
+    );
+    assert_eq!(
+        super::response::summary(&run.clone().into_record())["executed"],
+        0
+    );
     Ok(())
 }
 
@@ -383,7 +392,7 @@ fn reopening_history_excludes_obsolete_check_configuration_without_rewriting_it(
         "User requested".into(),
     )?;
     let current_path = data.path().join(&run.id).join("record.json");
-    super::supervisor::write_record(&current_path, &run)?;
+    super::supervisor::write_record(&current_path, &run.clone().into_record())?;
     let mut obsolete = crate::codec::to_value(&run)?;
     obsolete["id"] = serde_json::json!("obsolete");
     obsolete["context"]["snapshot"]["config"] =
@@ -434,16 +443,16 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
     let runner = make_runner(workspace.path(), data.path());
     let mut run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
+        crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
             ids: (0..4).map(|index| format!("check-{index}")).collect(),
             ..Default::default()
-        },
+        }),
         None,
         crate::session::CheckShell::Nushell,
         "User requested".into(),
     )?;
     assert_eq!(run.commands.len(), 33);
-    let activity = CheckActivity::from_run(&run).unwrap();
+    let activity = CheckActivity::from_run(&run.clone().into_record()).unwrap();
     assert_eq!((activity.completed_count, activity.total_count), (0, 4));
     let states = [
         CheckState::Passed,
@@ -459,14 +468,14 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
     {
         command.state = state;
     }
-    let activity = CheckActivity::from_run(&run).unwrap();
+    let activity = CheckActivity::from_run(&run.clone().into_record()).unwrap();
     assert_eq!((activity.completed_count, activity.total_count), (2, 4));
     let running = run
         .commands
         .iter_mut()
         .find(|command| command.state == CheckState::Running)
         .unwrap();
-    let context = running.context.as_mut().unwrap();
+    let context = &mut running.context;
     let current = CheckCase {
         file: "src/lib.rs".into(),
         name: "tests::current".into(),
@@ -488,7 +497,7 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
         cases: vec![current],
     });
     running.preview = "Compiling test executable".into();
-    let activity = CheckActivity::from_run(&run).unwrap();
+    let activity = CheckActivity::from_run(&run.clone().into_record()).unwrap();
     assert!(activity.command_list[0].title.contains("tests::current"));
     assert!(!activity.command_list[0].title.contains("tests::queued"));
     assert_eq!(
@@ -500,12 +509,12 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
         .iter_mut()
         .find(|command| command.state == CheckState::Running)
         .unwrap();
-    let context = running.context.as_mut().unwrap();
+    let context = &mut running.context;
     context.invocation = None;
     context.selection = CheckSelection::Files {
         files: vec!["nvim/tests/forge/harness_health.lua".into()],
     };
-    let activity = CheckActivity::from_run(&run).unwrap();
+    let activity = CheckActivity::from_run(&run.clone().into_record()).unwrap();
     assert!(
         activity.command_list[0]
             .title
@@ -520,7 +529,7 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
     package_command.id = "expanded-package".into();
     package_command.state = CheckState::Pending;
     run.commands.push(package_command);
-    let activity = CheckActivity::from_run(&run).unwrap();
+    let activity = CheckActivity::from_run(&run.clone().into_record()).unwrap();
     assert_eq!((activity.completed_count, activity.total_count), (1, 4));
     run.commands.last_mut().unwrap().state = CheckState::Passed;
     run.commands
@@ -557,19 +566,16 @@ async fn completion_wait_ignores_progress_and_observes_terminal_states() -> Resu
     ] {
         let run = runner.prepare_request(
             crate::timeline::TimelineOwner::session("checks-test"),
-            RunRequest {
-                all: true,
-                ..Default::default()
-            },
+            crate::checks::RunRequest::All,
             None,
             crate::session::CheckShell::Nushell,
             "wait test".into(),
         )?;
-        runner.publish(&run, None).await?;
+        runner.publish(&run.clone().into_record(), None).await?;
         let waiting = runner.status(&run.id, 1000, true);
         tokio::pin!(waiting);
         assert!(futures_util::poll!(waiting.as_mut()).is_pending());
-        runner.publish(&run, None).await?;
+        runner.publish(&run.clone().into_record(), None).await?;
         assert!(
             futures_util::poll!(waiting.as_mut()).is_pending(),
             "progress completed a terminal wait"
@@ -577,11 +583,11 @@ async fn completion_wait_ignores_progress_and_observes_terminal_states() -> Resu
         let progress = runner.status(&run.id, 1000, false);
         tokio::pin!(progress);
         assert!(futures_util::poll!(progress.as_mut()).is_pending());
-        runner.publish(&run, None).await?;
+        runner.publish(&run.clone().into_record(), None).await?;
         assert_eq!(progress.await?.state, CheckState::Running);
         let mut completed = run.clone();
         completed.state = state;
-        runner.publish(&completed, None).await?;
+        runner.publish(&completed.into_record(), None).await?;
         assert_eq!(waiting.await?.state, state);
         assert_eq!(runner.status(&run.id, 1000, true).await?.state, state);
     }
@@ -597,15 +603,12 @@ async fn completion_wait_returns_running_when_deadline_expires() -> Result<()> {
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "wait test".into(),
     )?;
-    runner.publish(&run, None).await?;
+    runner.publish(&run.clone().into_record(), None).await?;
     assert_eq!(
         runner.status(&run.id, 0, true).await?.state,
         CheckState::Running
@@ -674,7 +677,7 @@ async fn automatic_failure_reuses_evidence_and_stops_unchanged_repairs() -> Resu
         crate::session::CheckShell::Nushell,
         "Automatic".into(),
     )?;
-    next.context.as_mut().unwrap().automatic = true;
+    next.context.automatic = true;
     let next = runner.run(next, None, None).await?;
     assert!(next.commands[0].reused_from.is_some());
     assert!(automatic.observe(&next)?.is_none());
@@ -703,10 +706,10 @@ fn explicit_plan_checks_include_nonautomatic_checks_and_prerequisites() -> Resul
     )?;
     assert!(automatic.iter().all(|selection| !selection.selected));
     let explicit = super::applicability::resolve(
-        &RunRequest {
+        &crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
             include: vec!["optional".into()],
             ..Default::default()
-        },
+        }),
         &config,
         Some(&[]),
         true,
@@ -792,10 +795,7 @@ async fn preparation_changes_inputs_and_allows_dependent_verification() -> Resul
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
         "Explicit".into(),
@@ -856,10 +856,7 @@ async fn check_order_matches_preview_and_execution_without_success_dependencies(
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
         "Explicit".into(),
@@ -867,7 +864,7 @@ async fn check_order_matches_preview_and_execution_without_success_dependencies(
     assert_eq!(
         run.commands
             .iter()
-            .map(|command| { command.context.as_ref().unwrap().definition_id.as_str() })
+            .map(|command| { command.context.definition_id.as_str() })
             .collect::<Vec<_>>(),
         vec!["prepare", "unit", "format", "build", "integration"],
     );
@@ -917,10 +914,10 @@ async fn configured_command_failure_preserves_project_output() -> Result<()> {
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
+        crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
             selections: BTreeMap::from([("tests".into(), CheckSelection::All)]),
             ..Default::default()
-        },
+        }),
         None,
         crate::session::CheckShell::Nushell,
         "Explicit".into(),
@@ -946,10 +943,10 @@ async fn changing_source_during_a_check_cannot_certify_stale_inputs() -> Result<
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
+        crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
             ids: vec!["mutating".into()],
             ..Default::default()
-        },
+        }),
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
         "Explicit".into(),
@@ -1000,7 +997,7 @@ async fn automatic_coverage_reuses_a_helpers_resolved_case_mapping() -> Result<(
         crate::session::CheckShell::Nushell,
         "Automatic".into(),
     )?;
-    repeated.context.as_mut().unwrap().automatic = true;
+    repeated.context.automatic = true;
     let repeated = runner.run(repeated, None, None).await?;
     assert!(repeated.commands[0].reused_from.is_some());
     Ok(())
@@ -1014,11 +1011,7 @@ async fn output_directory_failure_does_not_retain_execution_admission() -> Resul
     let runner = make_runner(workspace.path(), data.path());
     let prepared = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            include: Vec::new(),
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "test".into(),
@@ -1051,7 +1044,7 @@ async fn direct_file_arguments_do_not_become_shell_source() -> Result<()> {
     let path = "src/spaces $value; [quoted].rs";
     let prepared = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
+        crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
             include: Vec::new(),
             ids: vec!["file".into()],
             selections: BTreeMap::from([(
@@ -1061,7 +1054,7 @@ async fn direct_file_arguments_do_not_become_shell_source() -> Result<()> {
                 },
             )]),
             ..Default::default()
-        },
+        }),
         None,
         crate::session::CheckShell::Nushell,
         "test".into(),
@@ -1127,7 +1120,7 @@ async fn declared_inputs_freeze_before_admission_and_change_evidence_identity() 
     for value in ["first", "first", "second"] {
         let prepared = runner.prepare_request(
             crate::timeline::TimelineOwner::session("checks-test"),
-            RunRequest {
+            crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
                 ids: vec!["named".into()],
                 selections: BTreeMap::from([(
                     "named".into(),
@@ -1136,7 +1129,7 @@ async fn declared_inputs_freeze_before_admission_and_change_evidence_identity() 
                     },
                 )]),
                 ..Default::default()
-            },
+            }),
             None,
             crate::session::CheckShell::Nushell,
             "Explicit".into(),
@@ -1147,8 +1140,6 @@ async fn declared_inputs_freeze_before_admission_and_change_evidence_identity() 
         assert_eq!(
             resolved.commands[0]
                 .context
-                .as_ref()
-                .unwrap()
                 .invocation
                 .as_ref()
                 .unwrap()
@@ -1156,18 +1147,18 @@ async fn declared_inputs_freeze_before_admission_and_change_evidence_identity() 
             vec![value.to_owned()]
         );
         signatures.push(super::evidence::signature(
-            &resolved,
-            &resolved.commands[0],
+            &resolved.clone().into_record(),
+            &resolved.commands[0].clone().into_record(),
         )?);
     }
     assert_eq!(signatures[0], signatures[1]);
     assert_ne!(signatures[0], signatures[2]);
     let prepared = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
+        crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
             ids: vec!["named".into()],
             ..Default::default()
-        },
+        }),
         None,
         crate::session::CheckShell::Nushell,
         "Missing value".into(),
@@ -1190,7 +1181,7 @@ async fn ordinary_command_output_does_not_trigger_test_or_report_interpretation(
     let runner = make_runner(workspace.path(), data.path());
     let prepared = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest::default(),
+        RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "Explicit".into(),
@@ -1331,19 +1322,16 @@ async fn changes_select_overlapping_areas_and_required_builds_without_running_un
             revision: 0,
         },
     )?;
+    assert_eq!(prepared.commands[0].context.reason, "Required by native");
     assert_eq!(
-        prepared.commands[0].context.as_ref().unwrap().reason,
-        "Required by native"
-    );
-    assert_eq!(
-        prepared.commands[1].context.as_ref().unwrap().matched_files,
+        prepared.commands[1].context.matched_files,
         ["src/nested/removed.rs"]
     );
     assert_eq!(
         prepared
             .commands
             .iter()
-            .find(|command| { command.context.as_ref().unwrap().definition_id == "other" })
+            .find(|command| { command.context.definition_id == "other" })
             .unwrap()
             .state,
         CheckState::Skipped
@@ -1488,12 +1476,12 @@ async fn explicit_case_selection_rejects_empty_requests_without_running_the_help
         ),
         (case_selection.clone(), CheckState::Passed),
     ] {
-        let request = RunRequest {
+        let request = crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
             include: Vec::new(),
-            all: false,
+
             ids: vec!["unit".into()],
             selections: BTreeMap::from([("unit".into(), selection)]),
-        };
+        });
         let prepared = runner.prepare(
             ConfigSnapshot::load(workspace.path())?,
             CheckAdmission {
@@ -1694,11 +1682,7 @@ async fn independent_failures_continue_and_dependents_skip() -> Result<()> {
     let runner = make_runner(workspace.path(), data.path());
     let prepared = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            include: Vec::new(),
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "Test".into(),
@@ -1735,9 +1719,9 @@ async fn scoped_handlers_need_receipts_and_never_fallback_to_all() -> Result<()>
     };
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
-    let request = RunRequest {
+    let request = crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
         include: Vec::new(),
-        all: false,
+
         ids: vec!["unit".into()],
         selections: BTreeMap::from([(
             "unit".into(),
@@ -1745,7 +1729,7 @@ async fn scoped_handlers_need_receipts_and_never_fallback_to_all() -> Result<()>
                 files: vec!["src/special $name.rs".into()],
             },
         )]),
-    };
+    });
     let prepared = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
         request,
@@ -1779,12 +1763,12 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
     };
     let prepared = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
+        crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
             include: Vec::new(),
-            all: false,
+
             ids: vec!["unit".into()],
             selections: BTreeMap::from([("unit".into(), selection.clone())]),
-        },
+        }),
         None,
         crate::session::CheckShell::Nushell,
         "Test".into(),
@@ -1863,12 +1847,12 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
         runner
             .prepare_request(
                 crate::timeline::TimelineOwner::session("checks-test"),
-                RunRequest {
+                crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
                     include: Vec::new(),
-                    all: false,
+
                     ids: vec!["unit".into()],
                     selections: BTreeMap::new()
-                },
+                }),
                 Some("task-one".into()),
                 crate::session::CheckShell::Nushell,
                 "Test".into()
@@ -1949,10 +1933,7 @@ async fn disabled_prerequisite_is_a_configuration_error_and_independent_checks_c
         ConfigSnapshot::load(workspace.path())?,
         CheckAdmission {
             owner: crate::timeline::TimelineOwner::session("checks-test"),
-            request: RunRequest {
-                all: true,
-                ..Default::default()
-            },
+            request: crate::checks::RunRequest::All,
             overrides: BTreeMap::from([("prerequisite".into(), false)]),
             files: None,
             cases: None,
@@ -1994,22 +1975,14 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     let runner = make_runner(workspace.path(), data.path());
     let first = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            include: Vec::new(),
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "Test".into(),
     )?;
     let second = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            include: Vec::new(),
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "Test".into(),
@@ -2031,15 +2004,12 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     );
     let mut automatic = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "Automatic".into(),
     )?;
-    automatic.context.as_mut().unwrap().automatic = true;
+    automatic.context.automatic = true;
     let stopped = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         runner.run(automatic, None, None),
@@ -2058,11 +2028,7 @@ async fn provider_turn_cancellation_collects_its_background_checks() -> Result<(
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            include: Vec::new(),
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "Agent requested".into(),
@@ -2122,10 +2088,7 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
     }
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "Backpressure test".into(),
@@ -2204,10 +2167,7 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     let prepare = || {
         runner.prepare_request(
             crate::timeline::TimelineOwner::session("checks-test"),
-            RunRequest {
-                all: true,
-                ..Default::default()
-            },
+            crate::checks::RunRequest::All,
             Some("recorded-task".into()),
             crate::session::CheckShell::Nushell,
             "Cancellation test".into(),
@@ -2225,7 +2185,7 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     assert_eq!(cancelled.state, CheckState::Interrupted);
     assert!(cancelled.cancelled_inputs.is_some());
     let mut automatic = prepare()?;
-    automatic.context.as_mut().unwrap().automatic = true;
+    automatic.context.automatic = true;
     let blocked =
         tokio::time::timeout(Duration::from_secs(2), runner.run(automatic, None, None)).await??;
     assert_eq!(blocked.commands[0].state, CheckState::Stopped);
@@ -2236,15 +2196,12 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     let reopened = make_runner(workspace.path(), data.path());
     let mut recovered = reopened.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
         "Recovered automatic run".into(),
     )?;
-    recovered.context.as_mut().unwrap().automatic = true;
+    recovered.context.automatic = true;
     assert_eq!(
         reopened.run(recovered, None, None).await?.state,
         CheckState::Stopped
@@ -2253,13 +2210,13 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     let retry = runner.run(prepare()?, None, None).await?;
     assert_eq!(retry.state, CheckState::Passed);
     let mut automatic = prepare()?;
-    automatic.context.as_mut().unwrap().automatic = true;
+    automatic.context.automatic = true;
     let repeated = runner.run(automatic, None, None).await?;
     assert_eq!(repeated.state, CheckState::Passed);
     assert!(repeated.commands[0].reused_from.is_some());
     std::fs::write(workspace.path().join("source.txt"), "new inputs")?;
     let mut automatic = prepare()?;
-    automatic.context.as_mut().unwrap().automatic = true;
+    automatic.context.automatic = true;
     let changed = runner.run(automatic, None, None).await?;
     assert_eq!(changed.state, CheckState::Passed);
     assert!(changed.commands[0].reused_from.is_none());
@@ -2282,10 +2239,7 @@ fn summary_retains_a_single_failure_and_interrupted_work() -> Result<()> {
     let runner = make_runner(workspace.path(), data.path());
     let mut run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "Summary".into(),
@@ -2314,10 +2268,7 @@ async fn output_failure_collects_the_process_before_releasing_admission() -> Res
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            all: true,
-            ..Default::default()
-        },
+        crate::checks::RunRequest::All,
         None,
         crate::session::CheckShell::Nushell,
         "Output failure".into(),

@@ -72,10 +72,7 @@ impl RepositoryToolScope {
         diff: Arc<DiffEngine>,
     ) -> Result<(Arc<Self>, RepositoryToolLease)> {
         ensure!(
-            !session.is_empty()
-                && session.len() <= 256
-                && !interaction.is_empty()
-                && interaction.len() <= 256,
+            !session.is_empty() && !interaction.is_empty(),
             "repository tools require an active session and interaction"
         );
         ensure!(

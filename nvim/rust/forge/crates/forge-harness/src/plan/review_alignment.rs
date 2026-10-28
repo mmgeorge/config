@@ -86,12 +86,12 @@ impl ReviewAlignment {
 
     /// Styles revisions without changing old/new source coordinates or raw edit counts.
     pub fn modified(&self, row: &forge_diff::display::DisplayRow) -> bool {
-        row.new.is_some_and(|coordinate| {
+        row.new_coordinate().is_some_and(|coordinate| {
             let next = self
                 .modified_body
                 .partition_point(|scope| scope.end <= coordinate.line);
             self.modified_signature.contains(&coordinate.line)
-                || row.kind == forge_diff::display::RowKind::Added
+                || row.kind() == forge_diff::display::RowKind::Added
                     && self
                         .modified_body
                         .get(next)

@@ -336,6 +336,38 @@ struct SelectedSource {
     group: Vec<(crate::document::DisplayGroupTarget, Vec<RawHunkId>)>,
 }
 
+impl SelectedSource {
+    fn capture(file: &FileTarget, hunk: &HashMap<TargetId, crate::document::HunkTarget>) -> Self {
+        Self {
+            observed: observed(file),
+            section: file.section,
+            analysis: file.projection.analysis().cloned(),
+            generation: file.generation,
+            body_revision: file.body.as_ref().map(|body| body.revision()),
+            block: file
+                .body
+                .as_ref()
+                .map(|body| {
+                    body.snapshot()
+                        .block
+                        .into_iter()
+                        .map(|block| (block.id, block.metadata.target))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            hunk: file.hunk.clone(),
+            group: file
+                .group
+                .values()
+                .filter_map(|group| {
+                    hunk.get(&group.target)
+                        .map(|hunk| (group.clone(), hunk.raw.clone()))
+                })
+                .collect(),
+        }
+    }
+}
+
 impl SelectionVersion {
     fn retained_bytes(&self) -> usize {
         self.file
@@ -370,40 +402,7 @@ impl SelectionVersion {
             file: document
                 .file
                 .values()
-                .map(|file| {
-                    (
-                        file.id,
-                        SelectedSource {
-                            observed: observed(file),
-                            section: file.section,
-                            analysis: file.analysis.clone(),
-                            generation: file.generation,
-                            body_revision: file.body.as_ref().map(|body| body.revision()),
-                            block: file
-                                .body
-                                .as_ref()
-                                .map(|body| {
-                                    body.snapshot()
-                                        .block
-                                        .into_iter()
-                                        .map(|block| (block.id, block.metadata.target))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            hunk: file.hunk.clone(),
-                            group: file
-                                .group
-                                .values()
-                                .filter_map(|group| {
-                                    document
-                                        .hunk
-                                        .get(&group.target)
-                                        .map(|hunk| (group.clone(), hunk.raw.clone()))
-                                })
-                                .collect(),
-                        },
-                    )
-                })
+                .map(|file| (file.id, SelectedSource::capture(file, &document.hunk)))
                 .collect(),
             target: document
                 .hunk
@@ -499,7 +498,7 @@ fn observed(file: &FileTarget) -> ObservedPath {
 }
 
 fn empty() -> SourceVersion {
-    SourceVersion::new(Vec::new(), Representation::GitCanonical).expect("empty canonical source")
+    SourceVersion::empty(Representation::GitCanonical)
 }
 
 fn object_state(record: &PathRecord) -> (ObjectState, ObjectState) {
@@ -735,27 +734,26 @@ impl StatusService {
                     .map_err(anyhow::Error::from)
                 })
                 .transpose()?;
-            if let Some(selected) = &mut edit {
-                if let Some(projected) = state.projected.get(&source.observed.change.path)
-                    && let Some(pair) =
-                        projected
-                            .captured_sources(StatusSection::Unstaged)
-                            .or_else(|| {
-                                projected
-                                    .captured_sources(StatusSection::Staged)
-                                    .map(|pair| SourcePair {
-                                        old: pair.new.clone(),
-                                        new: pair.new,
-                                    })
-                            })
-                {
-                    *selected = rebase(
-                        selected,
-                        &pair.old,
-                        &source.observed.change.path,
-                        &state.transition,
-                    )?;
-                }
+            if let Some(selected) = &mut edit
+                && let Some(projected) = state.projected.get(&source.observed.change.path)
+                && let Some(pair) =
+                    projected
+                        .captured_sources(StatusSection::Unstaged)
+                        .or_else(|| {
+                            projected
+                                .captured_sources(StatusSection::Staged)
+                                .map(|pair| SourcePair {
+                                    old: pair.new.clone(),
+                                    new: pair.new,
+                                })
+                        })
+            {
+                *selected = rebase(
+                    selected,
+                    &pair.old,
+                    &source.observed.change.path,
+                    &state.transition,
+                )?;
             }
             let (head, _) = object_state(&source.observed.change);
             let after_exists = if stage {
@@ -1120,7 +1118,12 @@ impl StatusService {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in selected {
-                let file = document.file.get_mut(&id).expect("projected file exists");
+                let std::collections::hash_map::Entry::Occupied(mut entry) =
+                    document.file.entry(id)
+                else {
+                    continue;
+                };
+                let file = entry.get_mut();
                 file.projected = journal.projected.get(&file.record.path).cloned();
                 let Some(projection) = &file.projected else {
                     continue;
@@ -1131,7 +1134,7 @@ impl StatusService {
                 let Some(source) = projection.captured_sources(file.section) else {
                     continue;
                 };
-                if file.analysis.as_ref().is_some_and(|analysis| {
+                if file.projection.analysis().is_some_and(|analysis| {
                     analysis.source().old.identity() == source.old.identity()
                         && analysis.source().new.identity() == source.new.identity()
                 }) && file.body.is_some()
@@ -1146,7 +1149,7 @@ impl StatusService {
                     })
                     .await
                     .map_err(|error| anyhow::anyhow!("optimistic diff unavailable: {error:?}"))?;
-                let mut file = document.file.remove(&id).expect("selected projected file");
+                let (id, mut file) = entry.remove_entry();
                 let result = (|| -> Result<BodyDelivery> {
                     reset_body(&mut document, &mut file)?;
                     file.old_syntax = syntax
@@ -1167,19 +1170,15 @@ impl StatusService {
                     } else {
                         file.record.unstaged_stats = stats;
                     }
-                    file.cursor =
-                        Some(DisplayCursor::new(analysis.clone(), 3).with_syntax_context(
-                            file.old_syntax.as_ref(),
-                            file.new_syntax.as_ref(),
-                        ));
-                    file.analysis = Some(analysis);
+                    let cursor = DisplayCursor::new(analysis.clone(), 3)
+                        .with_syntax_context(file.old_syntax.as_ref(), file.new_syntax.as_ref());
+                    file.projection = crate::document::SourceProjection::loaded(analysis, cursor);
                     if let Some(previous) = before.file.get(&file.id) {
                         preserve_identity(&mut document, &mut file, previous, &journal.transition);
                     }
-                    file.state = BodyState::Partial;
                     let limit = loaded[&file.record.path].min(2048);
                     let mut rows = 0;
-                    while file.state == BodyState::Partial && rows < limit {
+                    while file.projection.state() == BodyState::Partial && rows < limit {
                         self.deliver(&mut document, &id, &mut file)?;
                         rows += 128;
                     }
@@ -1219,7 +1218,7 @@ impl StatusService {
             }
             let (Some(language), Some(analysis)) = (
                 crate::source::language(&file.record.path),
-                file.analysis.clone(),
+                file.projection.analysis().cloned(),
             ) else {
                 continue;
             };
@@ -1258,19 +1257,18 @@ impl StatusService {
                         &document, file_id, generation, &analysis, old, new, diagnostic, started,
                     )
                     .await
+                    && let Ok(snapshot) = service.snapshot(&document).await
                 {
-                    if let Ok(snapshot) = service.snapshot(&document).await {
-                        let _ = service.mutation.event.send(Arc::new(StatusUpdate {
-                            document,
-                            delta: crate::reconcile::delta(&snapshot, &snapshot),
-                            body: Vec::new(),
-                            operation_id: 0,
-                            phase: "context_failed",
-                            diagnostic: vec![format!("Hunk context update failed: {error:#}")],
-                            elapsed_us: started.elapsed().as_micros(),
-                            resync: true,
-                        }));
-                    }
+                    let _ = service.mutation.event.send(Arc::new(StatusUpdate {
+                        document,
+                        delta: crate::reconcile::delta(&snapshot, &snapshot),
+                        body: Vec::new(),
+                        operation_id: 0,
+                        phase: "context_failed",
+                        diagnostic: vec![format!("Hunk context update failed: {error:#}")],
+                        elapsed_us: started.elapsed().as_micros(),
+                        resync: true,
+                    }));
                 }
             });
         }
@@ -1295,23 +1293,25 @@ impl StatusService {
             return Ok(());
         }
         let target = file_target(file_id);
-        let Some(file) = document.file.get(&target) else {
+        let snapshot = document.snapshot();
+        let before = SelectionVersion::capture(&document);
+        let StatusDocument {
+            file: files, hunk, ..
+        } = &mut *document;
+        let std::collections::hash_map::Entry::Occupied(entry) = files.entry(target) else {
             return Ok(());
         };
+        let file = entry.get();
         if file.generation != generation
-            || file.analysis.as_ref().is_none_or(|current| {
+            || file.projection.analysis().is_none_or(|current| {
                 current.source().old.identity() != analysis.source().old.identity()
                     || current.source().new.identity() != analysis.source().new.identity()
             })
         {
             return Ok(());
         }
-        let snapshot = document.snapshot();
-        let before = SelectionVersion::capture(&document);
-        let mut file = document
-            .file
-            .remove(&target)
-            .expect("validated context file");
+        let previous = SelectedSource::capture(entry.get(), hunk);
+        let (target, mut file) = entry.remove_entry();
         let result = (|| -> Result<BodyDelivery> {
             let limit = file
                 .body
@@ -1329,19 +1329,12 @@ impl StatusService {
             file.context_requested = true;
             file.old_syntax = old;
             file.new_syntax = new;
-            file.cursor = Some(
-                DisplayCursor::new(analysis.clone(), 3)
-                    .with_syntax_context(file.old_syntax.as_ref(), file.new_syntax.as_ref()),
-            );
-            file.state = BodyState::Partial;
-            preserve_identity(
-                &mut document,
-                &mut file,
-                &before.file[&file_id],
-                &VecDeque::new(),
-            );
+            let cursor = DisplayCursor::new(analysis.clone(), 3)
+                .with_syntax_context(file.old_syntax.as_ref(), file.new_syntax.as_ref());
+            file.projection = crate::document::SourceProjection::loaded(analysis.clone(), cursor);
+            preserve_identity(&mut document, &mut file, &previous, &VecDeque::new());
             let mut rows = 0;
-            while file.state == BodyState::Partial && rows < limit {
+            while file.projection.state() == BodyState::Partial && rows < limit {
                 self.deliver(&mut document, &target, &mut file)?;
                 rows += 128;
             }
@@ -1455,25 +1448,25 @@ impl StatusService {
                 });
                 if let Some(actual) = actual {
                     state.confirmed.insert(path.clone(), actual.clone());
-                } else if outcome.settled.is_some() {
-                    if let Some(mut observed) = state.confirmed.get(path).cloned() {
-                        observed.change.staged = ChangeKind::Unchanged;
-                        observed.change.unstaged = ChangeKind::Unchanged;
-                        let (head, _) = object_state(&observed.change);
-                        observed.change.state = PathState::Tracked {
-                            head: head.clone(),
-                            index: head.clone(),
-                            relocation: None,
-                        };
-                        observed.change.worktree_mode = (head.mode != 0).then_some(head.mode);
-                        state.confirmed.insert(path.clone(), observed);
-                    }
+                } else if outcome.settled.is_some()
+                    && let Some(mut observed) = state.confirmed.get(path).cloned()
+                {
+                    observed.change.staged = ChangeKind::Unchanged;
+                    observed.change.unstaged = ChangeKind::Unchanged;
+                    let (head, _) = object_state(&observed.change);
+                    observed.change.state = PathState::Tracked {
+                        head: head.clone(),
+                        index: head.clone(),
+                        relocation: None,
+                    };
+                    observed.change.worktree_mode = (head.mode != 0).then_some(head.mode);
+                    state.confirmed.insert(path.clone(), observed);
                 }
-                if !succeeded && let Some(edit) = &target.edit {
-                    if let Ok(inverse) = edit.apply().and_then(|applied| applied.inverse().apply())
-                    {
-                        state.transition.push_back((path.clone(), inverse));
-                    }
+                if !succeeded
+                    && let Some(edit) = &target.edit
+                    && let Ok(inverse) = edit.apply().and_then(|applied| applied.inverse().apply())
+                {
+                    state.transition.push_back((path.clone(), inverse));
                 }
                 if let Some(actual) = state.confirmed.get(path) {
                     let (_, index) = object_state(&actual.change);
@@ -1698,7 +1691,7 @@ fn preserve_identity(
     previous: &SelectedSource,
     transition: &VecDeque<(RepositoryPath, AppliedEdit)>,
 ) {
-    let (Some(before), Some(after)) = (&previous.analysis, &file.analysis) else {
+    let (Some(before), Some(after)) = (&previous.analysis, file.projection.analysis()) else {
         return;
     };
     let direction = if file.section == StatusSection::Staged {
@@ -1748,7 +1741,7 @@ fn preserve_identity(
             }
         }
     }
-    let Some(cursor) = &file.cursor else {
+    let Some(cursor) = file.projection.cursor() else {
         return;
     };
     let mut index = 0;
@@ -1783,7 +1776,7 @@ fn reset_body(document: &mut StatusDocument, file: &mut FileTarget) -> Result<()
     file.hunk.clear();
     file.group.clear();
     file.source_row.clear();
-    file.loading = None;
+    file.projection = crate::document::SourceProjection::Deferred;
     file.notice_delivered = false;
     file.context_requested = false;
     document
@@ -1799,8 +1792,8 @@ fn full_delivery(document: &StatusDocument, file: &FileTarget) -> BodyDelivery {
         generation: file.generation,
         snapshot: file.body.as_ref().map(|body| body.snapshot()),
         patch: None,
-        state: file.state.clone(),
-        more: file.state == BodyState::Partial,
+        state: file.projection.state().clone(),
+        more: file.projection.state() == BodyState::Partial,
         syntax_diagnostic: None,
     }
 }
@@ -1958,7 +1951,7 @@ fn write_action(target: &[MutationTarget]) -> Result<GitWriteAction> {
             let analysis = compute_hunks(SourcePair {
                 old: selection.before().clone(),
                 new: applied.after().clone(),
-            })?;
+            });
             let selected = analysis.hunks().iter().map(|hunk| hunk.id).collect();
             let before_exists = object_state(&target.observed.change).1.mode != 0;
             action.push(GitWriteAction::Patch {
@@ -2020,7 +2013,7 @@ fn apply_prediction(state: &mut WorktreeJournal, target: &MutationTarget) -> Res
             IndexSource::Head
         },
         mode: if target.stage {
-            target.observed.change.worktree_mode.unwrap_or_else(|| {
+            target.observed.change.worktree_mode.unwrap_or({
                 if matches!(
                     target.observed.change.state,
                     PathState::Untracked | PathState::Ignored

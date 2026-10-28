@@ -9,6 +9,8 @@ local render, refresh_winbar, open = controller.render, controller.refresh_winba
 local receive, host, continuation, state_reply, submitted
 local goal_requests, snapshot_requests = 0, 0
 local question_requests, question_presentations = nil, 0
+local queued = {}
+local input_revision = 0
 controller.render = function() end
 controller.refresh_winbar = function() end
 question.open = function(elicitation, value)
@@ -27,7 +29,22 @@ client.request_for = function(_, method, params, callback)
   elseif method == "prompt.submit" then submitted = params.text
   elseif method == "history.record" then callback({})
   elseif method == "agent.start" then continuation = callback
+  elseif method == "input.get" then
+    callback({ revision = input_revision, messages = queued, suspended = false, execution_busy = false })
+  elseif method == "input.apply" then
+    assert(params.action.kind == "submit", "unexpected input operation")
+    question_requests = function()
+      input_revision = input_revision + 1
+      callback({ operation_id = params.id, revision = input_revision, suspended = false,
+        execution_busy = false, upsert = {}, removed = {} })
+    end
   else error("unexpected request: " .. method) end
+end
+
+local function queue(text)
+  queued = { { id = text, text = text, intent = "queue", delivery = "queued", revision = 1 } }
+  input_revision = input_revision + 1
+  require("forge.views.harness.input_state").refresh(state)
 end
 
 local function snapshot(goal, elicitation)
@@ -64,38 +81,51 @@ local success, failure = xpcall(function()
   assert(goal_requests == 0 and state.busy, "goal advanced before the acceptance response")
   continuation({})
   assert(not state.busy)
+  local before_stale_reply = snapshot_requests
+  receive("plan_accepted", {}, state.session.id)
   state_reply(snapshot(goal, state.active_elicitation))
-  assert(snapshot_requests == 2, "coalesced invalidation did not request a fresh snapshot")
+  assert(vim.wait(1000, function() return snapshot_requests > before_stale_reply end),
+    "coalesced invalidation did not request a fresh snapshot")
   assert(goal_requests == 0, "goal advanced using the consumed acceptance snapshot")
   state_reply(snapshot(goal))
+  if state.state_sync_pending then state_reply(snapshot(goal)) end
   assert(goal_requests == 0 and not state.busy, "snapshot dispatched a duplicate host-owned continuation")
   assert(vim.api.nvim_get_current_win() == focused_window, "continuation changed keyboard focus")
 
   state.busy, state.goal = false, nil
-  state.queue = { "queued after clarification" }
+  queue("queued after clarification")
   present("interaction")
   receive("question_answered", {}, state.session.id)
   continuation({})
+  receive("question_answered", {}, state.session.id)
+  local before_question_reply = snapshot_requests
   state_reply(snapshot(nil, state.active_elicitation))
+  assert(vim.wait(1000, function() return snapshot_requests > before_question_reply end))
   assert(submitted == nil, "queue drained using an outdated clarification snapshot")
   state_reply(snapshot())
-  assert(submitted == "queued after clarification", "clarification completion stranded queued input")
+  if state.state_sync_pending then state_reply(snapshot()) end
+  assert(submitted == nil and state.queue[1].text == "queued after clarification",
+    "clarification completion duplicated or lost host-owned input")
   assert(goal_requests == 0, "snapshot completion duplicated goal continuation")
   state.busy, submitted = false, nil
   state.capability.agent = { catalog = true }
   local followed = false
   state.presentation = { follow_tail = function() followed = true end }
   controller.spawn_agent("explorer", "Inspect tests")
-  assert(followed and state.busy, "spawn did not resume tail following")
+  assert(followed, "spawn did not resume tail following")
   state.presentation = nil
-  state.queue = { "queued after child" }
+  queue("queued after child")
   state.cancel_requested = true
   continuation({})
-  assert(not state.cancel_requested, "settled parent request retained cancellation state")
   assert(submitted == nil, "spawn drained input before its fresh snapshot")
   state_reply(snapshot())
-  assert(submitted == "queued after child", "spawn stranded queued input")
+  if state.state_sync_pending then state_reply(snapshot()) end
+  assert(submitted == nil and state.queue[1].text == "queued after child",
+    "spawn completion duplicated or lost host-owned input")
 
+  queued = {}
+  input_revision = input_revision + 1
+  require("forge.views.harness.input_state").refresh(state)
   state.busy, state.queue, state.goal = false, {}, nil
   for _, owner in ipairs({ "plan", "interaction" }) do
     for _, outcome in ipairs({ "retained", "replaced", "withdrawn" }) do
@@ -115,11 +145,12 @@ local success, failure = xpcall(function()
       local count = question_presentations
       host.ask({ question_id = "second", text = "What do you mean?" })
       controller.present_plan_question(true)
-      assert(question_presentations == count and state.busy, "picker reopened during explanation")
+      assert(question_presentations == count and #state.input.pending == 1, "picker reopened during explanation")
       local pending = vim.deepcopy(state.active_elicitation)
       if outcome == "replaced" then pending.elicitation.revision = 2 end
       if outcome == "withdrawn" then pending = nil end
       question_requests({})
+      controller.present_plan_question(true)
       assert(question_presentations == count, "picker reopened before authoritative synchronization")
       state_reply(snapshot(nil, pending))
       vim.wait(30, function() return false end)

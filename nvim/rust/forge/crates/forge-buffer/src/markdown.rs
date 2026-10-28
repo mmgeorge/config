@@ -300,10 +300,15 @@ impl MarkdownRenderer {
                 .saturating_sub(1);
             if first_source > scanned_source {
                 state.flush_source();
-                for row in scanned_source..first_source {
-                    let blank = source_line[row].trim().is_empty()
+                for (row, source_line) in source_line
+                    .iter()
+                    .enumerate()
+                    .take(first_source)
+                    .skip(scanned_source)
+                {
+                    let blank = source_line.trim().is_empty()
                         || (state.quote_depth > 0
-                            && source_line[row]
+                            && source_line
                                 .chars()
                                 .all(|character| character == '>' || character.is_whitespace()));
                     if blank

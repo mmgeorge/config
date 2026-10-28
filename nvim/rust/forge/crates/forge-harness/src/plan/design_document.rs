@@ -196,15 +196,11 @@ impl DesignDocument {
     /// Validate metadata while allowing incomplete drafts.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
-            self.checks
-                .iter()
-                .all(|id| !id.is_empty() && id.len() <= 128),
+            self.checks.iter().all(|id| !id.is_empty()),
             "invalid planned check id"
         );
         ensure!(
-            self.disabled_checks
-                .iter()
-                .all(|id| !id.is_empty() && id.len() <= 128),
+            self.disabled_checks.iter().all(|id| !id.is_empty()),
             "invalid disabled plan checks"
         );
         ensure!(

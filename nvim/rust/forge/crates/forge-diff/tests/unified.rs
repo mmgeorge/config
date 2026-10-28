@@ -57,8 +57,7 @@ fn git_applies_and_reverses_exact_unified_bytes_including_crlf_and_missing_newli
         let diff = compute_hunks(SourcePair {
             old: SourceVersion::new(before.as_bytes().to_vec(), Representation::Raw).unwrap(),
             new: SourceVersion::new(after.as_bytes().to_vec(), Representation::Raw).unwrap(),
-        })
-        .unwrap();
+        });
         let mut patch = Vec::new();
         write_file_header("a/source name 雪.txt", "b/source name 雪.txt", &mut patch).unwrap();
         if before.is_empty() {
@@ -118,8 +117,7 @@ fn writer_errors_stop_serialization_and_unchanged_sources_emit_nothing() {
     let equal = compute_hunks(SourcePair {
         old: old.clone(),
         new: old.clone(),
-    })
-    .unwrap();
+    });
     write_unified(
         &equal,
         "a/source",
@@ -131,8 +129,7 @@ fn writer_errors_stop_serialization_and_unchanged_sources_emit_nothing() {
     let changed = compute_hunks(SourcePair {
         old,
         new: SourceVersion::new(b"changed\n".to_vec(), Representation::Raw).unwrap(),
-    })
-    .unwrap();
+    });
     let error = write_unified(
         &changed,
         "a/source",

@@ -85,16 +85,14 @@ impl OutputDocument {
             directory.is_absolute(),
             "tool export directory must be absolute"
         );
-        if self.export.is_none() {
-            self.export = Some(
+        let export = match &mut self.export {
+            Some(export) => export,
+            missing @ None => missing.insert(
                 self.output
                     .export_saved_output(directory, trace, session_id)?,
-            );
-        }
-        Ok(self
-            .export
-            .as_ref()
-            .expect("owned export was installed")
+            ),
+        };
+        Ok(export
             .path()
             .context("owned tool export has already closed")?
             .to_owned())
@@ -117,7 +115,10 @@ mod tests {
     #[test]
     fn demand_preserves_a_line_larger_than_its_page_byte_budget() -> Result<()> {
         let line = "λ".repeat(128 * 1024);
-        let output = ToolOutputView::new("call".into(), &format!("{line}\nlast\n"))?;
+        let output = ToolOutputView::new(
+            crate::buffer::identity::DisplayId::test(),
+            &format!("{line}\nlast\n"),
+        );
         let mut document =
             OutputDocument::new(DocumentId("tool:large".into()), output.snapshot()?)?;
         let first = document.demand(DocumentRevision(0))?;
@@ -135,7 +136,7 @@ mod tests {
         let source = (0..1001)
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
-        let output = ToolOutputView::new("call".into(), &source)?;
+        let output = ToolOutputView::new(crate::buffer::identity::DisplayId::test(), &source);
         let mut document = OutputDocument::new(DocumentId("tool:test".into()), output.snapshot()?)?;
         assert!(document.demand(DocumentRevision(1)).is_err());
         let mut revision = DocumentRevision(0);

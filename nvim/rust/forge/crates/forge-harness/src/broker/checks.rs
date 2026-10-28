@@ -150,10 +150,10 @@ impl HarnessBroker {
                         .context("plan checks require their execution exchange")?;
                     crate::timeline::TimelineOwner::exchange(&exchange)
                 },
-                request: crate::checks::RunRequest {
+                request: crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
                     include: design.document.checks.clone(),
                     ..Default::default()
-                },
+                }),
                 overrides: enabled,
                 files,
                 cases: Some(cases),
@@ -165,7 +165,7 @@ impl HarnessBroker {
                 revision: execution.revision,
             },
         )?;
-        run.context.as_mut().unwrap().automatic = true;
+        run.context.automatic = true;
         run.progress = progress;
         run.workspace_identity = workspace_identity.clone();
         run.workspace_digest = run.progress.source_digest.clone();
@@ -178,7 +178,7 @@ impl HarnessBroker {
                     previous
                         .context
                         .as_ref()
-                        .zip(run.context.as_ref())
+                        .zip(Some(&run.context))
                         .is_some_and(|(previous, current)| {
                             previous.trigger == "Plan execution"
                                 && previous.task_id == current.task_id
@@ -202,14 +202,14 @@ impl HarnessBroker {
                     && previous
                         .context
                         .as_ref()
-                        .zip(run.context.as_ref())
+                        .zip(Some(&run.context))
                         .is_some_and(|(previous, current)| {
                             previous.snapshot == current.snapshot
                                 && previous.overrides == current.overrides
                         })
             });
         if let Some(previous) = previous {
-            run = previous.clone();
+            run = previous.clone().try_into()?;
             run.state = CheckState::Running;
             run.completed_at_ms = None;
             run.record(
@@ -284,19 +284,13 @@ impl HarnessBroker {
         if matches!(
             execution.state,
             PlanExecutionState::Complete | PlanExecutionState::Blocked
-        ) {
-            if let Some(mut exchange) = self
-                .store
-                .latest_execution_exchange(&self.session.id, &execution.id)?
-            {
-                self.capture_implementation_report(
-                    &mut execution,
-                    &mut exchange,
-                    self.clock.now_ms(),
-                )
+        ) && let Some(mut exchange) = self
+            .store
+            .latest_execution_exchange(&self.session.id, &execution.id)?
+        {
+            self.capture_implementation_report(&mut execution, &mut exchange, self.clock.now_ms())
                 .await?;
-                self.store.save_exchange(&exchange)?;
-            }
+            self.store.save_exchange(&exchange)?;
         }
         execution.generation += 1;
         goal.updated_at_ms = self.clock.now_ms();

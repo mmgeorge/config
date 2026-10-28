@@ -1,4 +1,4 @@
-vim.opt.runtimepath:prepend("nvim")
+vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 vim.loader.enable(false)
 local origin = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()

@@ -110,6 +110,16 @@ local ok, failure = xpcall(function()
   assert(not session.editable.fault)
   assert(session.editable.native and session.editable.native.active)
   assert(vim.api.nvim_buf_get_lines(session.buffer, 0, 1, true)[1] == "typed")
+  local deep = replica.open("deep-layout", {})
+  local capture = "String"
+  local deep_block = block("deep", { "row" })
+  deep_block.metadata.layout = { indent = 600, source_indent = 0, marker = { text = "•", capture = capture } }
+  deep_block.metadata.decoration = {
+    { range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = 3 } }, capture = capture, priority = 1 },
+  }
+  assert(replica.apply_snapshot(deep, { document = "deep-layout", revision = 0, block = { deep_block } }).kind == "Applied")
+  assert(vim.api.nvim_buf_get_lines(deep.buffer, 0, -1, true)[1] == "row")
+  replica.close(deep)
 end, debug.traceback)
 
 editable.detach(session.editable)

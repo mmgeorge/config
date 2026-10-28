@@ -28,12 +28,9 @@ impl DocumentInput {
         if let Some(target) = &self.target {
             target.validate()?;
         }
-        if self.action.is_empty()
-            || self.action.len() > 256
-            || self.action.chars().any(char::is_control)
-        {
+        if self.action.is_empty() || self.action.chars().any(char::is_control) {
             return Err(ContractError(
-                "input action must contain 1..=256 bytes without controls",
+                "input action must be nonempty and contain no controls",
             ));
         }
         Ok(())

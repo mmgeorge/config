@@ -88,13 +88,11 @@ impl AgentRegistry {
                 && parent_thread_id.is_none_or(|thread_id| {
                     execution
                         .and_then(|value| value.parent_thread_id.as_deref())
-                        .as_deref()
                         .is_none_or(|known_thread_id| known_thread_id == thread_id)
                 })
                 && turn_id.is_none_or(|active_turn_id| {
                     execution
                         .and_then(|value| value.active_turn_id.as_deref())
-                        .as_deref()
                         .is_none_or(|known_turn_id| known_turn_id == active_turn_id)
                 })
         });

@@ -118,17 +118,18 @@ fn agent_summaries(
     runs.iter().map(|run| {
         let owned: Vec<_> = exchanges.iter().filter(|exchange| exchange.agent_id == run.id).collect();
         let tools: Vec<_> = owned.iter().flat_map(|exchange| exchange.turn.iter()).flat_map(|turn|turn.tools()).collect();
-        let latest = owned.iter().rev().find(|exchange| exchange.state == ExchangeState::Running)
+        let latest = owned.iter().rev().find(|exchange| exchange.state() == ExchangeState::Running)
             .or_else(|| owned.last());
         let target = latest.and_then(|exchange| exchange.turn.iter().rev().find(|turn| matches!(turn.state(),crate::turn::TurnState::Running)))
             .map(|turn| serde_json::to_value(turn.provider()).expect("provider address"));
-        (run.id.clone(), json!({"state":latest.map(|exchange| serde_json::to_value(exchange.state).expect("exchange state")).unwrap_or_else(|| serde_json::to_value(run.state).expect("agent state")),
+        (run.id.clone(), json!({"state":latest.map(|exchange| serde_json::to_value(exchange.state()).expect("exchange state")).unwrap_or_else(|| serde_json::to_value(run.state).expect("agent state")),
             "tool_count":tools.len(),"failed_count":tools.iter().filter(|tool|tool.failed).count(),"target":target,
             "exchange_count":owned.len(),"latest_exchange_id":latest.map(|exchange|exchange.id.as_str())}))
     }).collect()
 }
 
 fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
+    let mut display = crate::buffer::identity::DisplayRegistry::default();
     let width = forge_buffer::width::WidthProfile {
         columns: 100,
         ..Default::default()
@@ -141,6 +142,7 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
             index > 0,
             &Default::default(),
             &Default::default(),
+            &mut display,
         )?;
         for block in crate::buffer::sections::preview(projected.entry)?.block {
             for row in block.text.wire_rows() {
@@ -1153,28 +1155,27 @@ impl HarnessBroker {
             "Background request requires a Background session"
         );
         service_tier.validate(&self.capability)?;
-        if let Some(previous) = &self.session.background {
-            if !previous.reason.is_empty()
-                && self
-                    .store
-                    .current_exchange_state(&self.session.id)?
-                    .latest
-                    .is_none()
-            {
-                self.store
-                    .save_session_event(&crate::timeline::SessionEventRecord {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        session_id: self.session.id.clone(),
-                        owner: crate::timeline::TimelineOwner::session(&self.session.id),
-                        created_at_ms: self.clock.now_ms(),
-                        detail: crate::timeline::SessionEventKind::Configuration {
-                            operation_id: uuid::Uuid::new_v4().to_string(),
-                            state: "completed".into(),
-                            field: vec!["background_session".into()],
-                            reason: Some(previous.reason.clone()),
-                        },
-                    })?;
-            }
+        if let Some(previous) = &self.session.background
+            && !previous.reason.is_empty()
+            && self
+                .store
+                .current_exchange_state(&self.session.id)?
+                .latest
+                .is_none()
+        {
+            self.store
+                .save_session_event(&crate::timeline::SessionEventRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    session_id: self.session.id.clone(),
+                    owner: crate::timeline::TimelineOwner::session(&self.session.id),
+                    created_at_ms: self.clock.now_ms(),
+                    detail: crate::timeline::SessionEventKind::Configuration {
+                        operation_id: uuid::Uuid::new_v4().to_string(),
+                        state: "completed".into(),
+                        field: vec!["background_session".into()],
+                        reason: Some(previous.reason.clone()),
+                    },
+                })?;
         }
         self.session.background = Some(identity);
         self.session.model = model;
@@ -1362,12 +1363,10 @@ impl HarnessBroker {
             && !outcome
                 .as_ref()
                 .is_err_and(|error| error.is::<RequestNotAdmitted>())
-        {
-            if let Err(error) =
+            && let Err(error) =
                 self.settle_task(outcome.as_ref().err().map(|error| format!("{error:#}")))
-            {
-                outcome = Err(error.context("persist task outcome"));
-            }
+        {
+            outcome = Err(error.context("persist task outcome"));
         }
         if let Some(stage) = settle_stage {
             stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }}));
@@ -1783,7 +1782,7 @@ impl HarnessBroker {
             | HarnessMethod::BackendMcpSetEnabled => {
                 anyhow::bail!("Harness control method requires the process coordinator")
             }
-            _ => unreachable!("asynchronous method bypassed handler routing"),
+            _ => anyhow::bail!("method requires asynchronous handler routing"),
         }
     }
 
@@ -1851,12 +1850,16 @@ impl HarnessBroker {
                 !answer.trim().is_empty(),
                 "plan question completed without an answer"
             );
-            self.plan_review
-                .answer(&document, &question, answer.clone(), exchange.duration_ms)?;
+            self.plan_review.answer(
+                &document,
+                &question,
+                answer.clone(),
+                exchange.duration_ms(),
+            )?;
             self.trace.record(
                 &self.session.id,
                 "plan.question.answered",
-                json!({"id":question.id,"answer":answer,"duration_ms":exchange.duration_ms}),
+                json!({"id":question.id,"answer":answer,"duration_ms":exchange.duration_ms()}),
             );
         }
         Ok((
@@ -1925,30 +1928,30 @@ impl HarnessBroker {
         self.retry_finalization().await?;
         let mut events = Vec::new();
         let mut task = self.current_task()?;
-        if let Some(task) = task.as_mut() {
-            if !task.status.terminal() {
-                if self
-                    .current_goal()?
-                    .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
-                {
-                    events.extend(self.pause_goal().await?.1);
-                }
-                task.status = if clear {
-                    TaskStatus::Cancelled
-                } else {
-                    TaskStatus::Paused
-                };
-                task.generation += 1;
-                task.reason = Some(
-                    if clear {
-                        "Cleared by user"
-                    } else {
-                        "Paused by user"
-                    }
-                    .into(),
-                );
-                task.updated_at_ms = self.clock.now_ms();
+        if let Some(task) = task.as_mut()
+            && !task.status.terminal()
+        {
+            if self
+                .current_goal()?
+                .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
+            {
+                events.extend(self.pause_goal().await?.1);
             }
+            task.status = if clear {
+                TaskStatus::Cancelled
+            } else {
+                TaskStatus::Paused
+            };
+            task.generation += 1;
+            task.reason = Some(
+                if clear {
+                    "Cleared by user"
+                } else {
+                    "Paused by user"
+                }
+                .into(),
+            );
+            task.updated_at_ms = self.clock.now_ms();
         }
 
         self.session.goal_id = None;
@@ -2307,7 +2310,7 @@ impl HarnessBroker {
                 .latest_exchange(&self.session.id)?
                 .context("interrupted exchange is missing")?;
             let notice = permission_notice.as_deref().unwrap_or("Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions.");
-            let prompt = if previous.elicitation.is_some() {
+            let prompt = if previous.elicitation().is_some() {
                 notice.to_owned()
             } else {
                 format!("{notice}\n\nOriginal request: {}", previous.prompt)
@@ -2621,8 +2624,8 @@ impl HarnessBroker {
             .latest_exchange(&self.session.id)?
             .context("no Harness interaction is available to resume")?;
         anyhow::ensure!(
-            interaction.state == ExchangeState::Running
-                && interaction.execution_started_at_ms.is_none()
+            interaction.state() == ExchangeState::Running
+                && interaction.execution_started_at_ms().is_none()
                 && interaction
                     .turn
                     .iter()
@@ -2637,7 +2640,7 @@ impl HarnessBroker {
         let elicitation = pending_plan
             .as_ref()
             .and_then(|plan| plan.elicitation.as_ref())
-            .or(interaction.elicitation.as_ref());
+            .or(interaction.elicitation());
         if let Some(elicitation) = elicitation {
             if !elicitation.clarification_active {
                 return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
@@ -2683,7 +2686,7 @@ impl HarnessBroker {
             };
         }
         anyhow::ensure!(
-            !interaction.awaiting_input,
+            !interaction.awaiting_input(),
             "the latest Harness exchange is awaiting a user decision"
         );
         if let Some(mut task) = self
@@ -2732,7 +2735,7 @@ impl HarnessBroker {
     async fn handle_agent_request(
         &mut self,
         request: crate::agent::AgentRequest,
-        mut parent: Option<&mut Exchange>,
+        parent: Option<&mut Exchange>,
         event: &mut Vec<SessionEvent>,
     ) -> Result<Value> {
         use crate::agent::{AgentOperation, AgentSource};
@@ -2773,7 +2776,14 @@ impl HarnessBroker {
             );
             return Ok(json!({"agent":agent,"task":task,"status":"admitted","replayed":true}));
         }
-        match &request.operation {
+        enum ChildWork<'request> {
+            Spawn(&'request crate::agent::SpawnAgentRequest),
+            Followup {
+                target: &'request str,
+                message: &'request str,
+            },
+        }
+        let work = match &request.operation {
             AgentOperation::Activity { target, limit } => {
                 let limit = limit.unwrap_or(5);
                 let (agent, task) = self.agent_coordinator.inspection(target)?;
@@ -2892,14 +2902,14 @@ impl HarnessBroker {
                     && backend
                         .has_active_turn(
                             &crate::backend::ExecutionOwner {
-                                session_id: self.session.id.clone(),
-                                agent_id: agent.id.clone(),
+                                session_id: (self.session.id.clone()).into(),
+                                agent_id: (agent.id.clone()).into(),
                             }
                             .runtime_key(),
                         )
                         .await
                 {
-                    match backend.steer_session(&crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()}.runtime_key(), message.clone().into()).await {
+                    match backend.steer_session(&crate::backend::ExecutionOwner {session_id: (self.session.id.clone()).into(),agent_id: (agent.id.clone()).into()}.runtime_key(), message.clone().into()).await {
                         Ok(()) => delivery = crate::agent::MessageDelivery::Steered,
                         Err(error) => self.trace.record(&self.session.id,"agent.message_queued",json!({
                             "agent_id":agent.id,"reason":"steering_not_accepted","error":format!("{error:#}")})),
@@ -2937,8 +2947,9 @@ impl HarnessBroker {
                 }
                 return Ok(json!({"status":"interrupting"}));
             }
-            AgentOperation::Spawn(_) | AgentOperation::Followup { .. } => {}
-        }
+            AgentOperation::Spawn(spawn) => ChildWork::Spawn(spawn),
+            AgentOperation::Followup { target, message } => ChildWork::Followup { target, message },
+        };
         let mut admitted_parent = if let Some(parent) = parent.as_deref() {
             parent.clone()
         } else {
@@ -2949,8 +2960,8 @@ impl HarnessBroker {
                 self.clock.now_ms(),
             )
         };
-        let admission = match &request.operation {
-            AgentOperation::Spawn(spawn) => {
+        let admission = match work {
+            ChildWork::Spawn(spawn) => {
                 let mut root =
                     self.backend_request(BackendInput::from_text(String::new()), PromptMode::Chat);
                 if root.model == "default"
@@ -2981,7 +2992,7 @@ impl HarnessBroker {
                     self.clock.now_ms(),
                 )?
             }
-            AgentOperation::Followup { target, message } => {
+            ChildWork::Followup { target, message } => {
                 let agent = self.agent_coordinator.resolve(target)?;
                 self.agent_backend_factory
                     .profiles
@@ -2994,7 +3005,6 @@ impl HarnessBroker {
                     self.clock.now_ms(),
                 )?
             }
-            _ => unreachable!(),
         };
         let persisted = (|| -> Result<()> {
             admitted_parent.append_agent_task(&admission.task)?;
@@ -3002,15 +3012,25 @@ impl HarnessBroker {
                 .admit_agent_task(&admission.agent, &admission.task, &admitted_parent)
         })();
         if let Err(error) = persisted {
-            self.agent_coordinator.reject(&request.operation_id);
-            return Err(error);
+            return Err(match admission.cancel() {
+                Ok(()) => error,
+                Err(cancellation) => {
+                    error.context(format!("release child reservation: {cancellation:#}"))
+                }
+            });
         }
-        let launch = self.agent_coordinator.commit(&admission)?;
+        let (admission, launch) = match admission.commit()? {
+            crate::agent::AgentCommit::Admitted(work) => (work, true),
+            crate::agent::AgentCommit::Existing(work) => (work, false),
+        };
         self.agent_registry.insert(admission.agent.clone());
-        if let Some(parent) = parent.as_deref_mut() {
+        if let Some(parent) = parent {
             *parent = admitted_parent;
         } else {
-            admitted_parent.finish(ExchangeState::Complete, self.clock.now_ms())?;
+            admitted_parent.finish(
+                crate::exchange::ExchangeOutcome::Complete,
+                self.clock.now_ms(),
+            )?;
             self.store.save_exchange(&admitted_parent)?;
         }
         self.trace.record(&self.session.id,"agent.admitted",json!({"agent_id":admission.agent.id,"exchange_id":admission.task.id,"parent_exchange_id":admission.task.parent_exchange_id,"source":admission.task.source}));
@@ -3072,7 +3092,7 @@ impl HarnessBroker {
         for approval in pending {
             if let Some(runtime) = self
                 .child_exchange_runtime_by_agent
-                .get_mut(&owner.agent_id)
+                .get_mut(owner.agent_id.as_str())
             {
                 runtime.exchange.observe_blocker(
                     format!("approval:{}", approval.id),
@@ -3107,8 +3127,8 @@ impl HarnessBroker {
     ) -> Result<()> {
         let agent = self.agent_coordinator.resolve(target)?;
         let owner = crate::backend::ExecutionOwner {
-            session_id: self.session.id.clone(),
-            agent_id: agent.id.clone(),
+            session_id: (self.session.id.clone()).into(),
+            agent_id: (agent.id.clone()).into(),
         };
         let cancelled = self.agent_coordinator.interrupt(target)?;
         self.cancel_agent_approvals(&owner, event).await?;
@@ -3116,7 +3136,10 @@ impl HarnessBroker {
             task.state = ExchangeState::Cancelled;
             task.completed_at_ms = Some(self.clock.now_ms());
             if let Some(mut exchange) = self.store.load_exchange(&task.id)? {
-                exchange.finish(ExchangeState::Cancelled, self.clock.now_ms())?;
+                exchange.finish(
+                    crate::exchange::ExchangeOutcome::Cancelled,
+                    self.clock.now_ms(),
+                )?;
                 self.store.complete_agent_task(&agent, &task, &exchange)?;
             }
             self.agent_coordinator.retain(agent.clone(), task)?;
@@ -3148,7 +3171,7 @@ impl HarnessBroker {
             self.agent_coordinator.retain(agent, task.clone())?;
             self.agent_coordinator
                 .settled(&owner.agent_id, &task.id, false)?;
-            self.child_backend_by_agent.remove(&owner.agent_id);
+            self.child_backend_by_agent.remove(owner.agent_id.as_str());
         }
         self.publish_agent_state(event).await?;
         Ok(())
@@ -3156,13 +3179,14 @@ impl HarnessBroker {
 
     async fn launch_managed_agent(
         &mut self,
-        mut admission: crate::agent::AgentAdmission,
+        mut admission: crate::agent::AgentWork,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        let owner = crate::backend::ExecutionOwner {
-            session_id: self.session.id.clone(),
-            agent_id: admission.agent.id.clone(),
-        };
+        let owner = admission.owner().clone();
+        anyhow::ensure!(
+            owner.session_id == self.session.id,
+            "child execution belongs to another session"
+        );
         let prepared = (|| -> Result<_> {
             let mut message = admission.task.message.clone();
             for incoming in admission
@@ -3180,7 +3204,7 @@ impl HarnessBroker {
             }
             let mut request = self.agent_backend_factory.request(
                 &self.backend_request(BackendInput::from_text(String::new()), PromptMode::Chat),
-                &admission.agent,
+                &admission,
                 message,
             )?;
             let backend = self.agent_backend_factory.build(
@@ -3229,7 +3253,7 @@ impl HarnessBroker {
                 submission_store: self.submission_store.clone(),
                 permission: self.permission_coordinator.clone(),
                 request,
-                task_id: admission.task.id.clone(),
+                task_id: admission.task_id().to_string(),
                 cancellation,
                 sender: self.agent_coordinator.sender(),
                 lsp_lease,
@@ -3432,21 +3456,24 @@ impl HarnessBroker {
         }
         anyhow::ensure!(
             self.child_exchange_runtime_by_agent
-                .get(&owner.agent_id)
+                .get(owner.agent_id.as_str())
                 .is_none_or(|runtime| runtime.exchange.id == task_id),
             "late child event cannot update a newer task"
         );
-        let mut runtime = match self.child_exchange_runtime_by_agent.remove(&owner.agent_id) {
+        let mut runtime = match self
+            .child_exchange_runtime_by_agent
+            .remove(owner.agent_id.as_str())
+        {
             Some(runtime) => runtime,
             None => {
                 let mut exchange = self
                     .store
                     .load_exchange(task_id)?
                     .context("child task exchange missing")?;
-                if exchange.completed_at_ms.is_some() {
+                if exchange.is_finished() {
                     return Ok(());
                 }
-                exchange.state = ExchangeState::Running;
+                exchange.phase = crate::exchange::ExchangePhase::Running;
                 exchange.resume(self.clock.now_ms())?;
                 ChildExchangeRuntime {
                     exchange,
@@ -3472,7 +3499,7 @@ impl HarnessBroker {
             )?
             else {
                 self.child_exchange_runtime_by_agent
-                    .insert(owner.agent_id, runtime);
+                    .insert(owner.agent_id.to_string(), runtime);
                 return Ok(());
             };
             runtime
@@ -3534,7 +3561,7 @@ impl HarnessBroker {
         self.agent_coordinator
             .retain(self.agent_coordinator.resolve(&owner.agent_id)?, task)?;
         self.child_exchange_runtime_by_agent
-            .insert(owner.agent_id, runtime);
+            .insert(owner.agent_id.to_string(), runtime);
         if matches!(
             backend_event.kind.as_str(),
             "approval_requested" | "approval_resolved" | "approval_cancelled"
@@ -3588,7 +3615,9 @@ impl HarnessBroker {
                 .clone()
                 .or(agent.provider_thread_id);
         }
-        let runtime = self.child_exchange_runtime_by_agent.remove(&owner.agent_id);
+        let runtime = self
+            .child_exchange_runtime_by_agent
+            .remove(owner.agent_id.as_str());
         let mut exchange = if let Some(mut runtime) = runtime {
             let outcome = match task.state {
                 ExchangeState::Complete => crate::turn::TurnOutcome::Completed,
@@ -3607,7 +3636,7 @@ impl HarnessBroker {
                 .load_exchange(&task_id)?
                 .context("child completion exchange missing")?
         };
-        exchange.finish(task.state, self.clock.now_ms())?;
+        exchange.finish(task.state.try_into()?, self.clock.now_ms())?;
         exchange.finalization_error = cleanup_error.clone();
         if exchange.turn.is_empty() {
             for message in agent.inbox.iter_mut().filter(|message| {
@@ -3653,7 +3682,7 @@ impl HarnessBroker {
             self.agent_coordinator
                 .settled(&owner.agent_id, &task_id, cleanup_error.is_some())?;
         if cleanup_error.is_none() {
-            self.child_backend_by_agent.remove(&owner.agent_id);
+            self.child_backend_by_agent.remove(owner.agent_id.as_str());
         }
         self.trace.record(&self.session.id,"agent.completed",json!({"agent_id":owner.agent_id,"exchange_id":task_id,"state":task.state,"cleanup_error":cleanup_error}));
         self.publish_agent_state(event).await?;
@@ -3963,8 +3992,7 @@ impl HarnessBroker {
         }
         if let Some(interaction) = self.find_active_interaction_elicitation()? {
             let question_id = interaction
-                .elicitation
-                .as_ref()
+                .elicitation()
                 .and_then(|elicitation| {
                     elicitation
                         .current_question()
@@ -4175,8 +4203,7 @@ impl HarnessBroker {
         )?;
         let mut interaction = self.active_interaction_elicitation()?;
         interaction
-            .elicitation
-            .as_mut()
+            .elicitation_mut()
             .context("active interaction has no elicitation state")?
             .answer(&question_id, response)?;
         self.store.save_exchange(&interaction)?;
@@ -4210,8 +4237,7 @@ impl HarnessBroker {
         } else {
             let mut interaction = self.active_interaction_elicitation()?;
             let elicitation = interaction
-                .elicitation
-                .as_mut()
+                .elicitation_mut()
                 .context("active interaction has no elicitation state")?;
             elicitation.answer_from_model(&answer.question_id, answer.response)?;
             has_pending_question = elicitation.current_question().is_some();
@@ -4270,8 +4296,8 @@ impl HarnessBroker {
             return Ok(());
         }
         let mut interaction = self.active_interaction_elicitation()?;
-        interaction.awaiting_input = false;
-        interaction.elicitation = None;
+        interaction.set_awaiting_input(false);
+        interaction.set_elicitation(None);
         self.store.save_exchange(&interaction)?;
         event.push(self.event(
             "question_withdrawn",
@@ -4327,8 +4353,7 @@ impl HarnessBroker {
             return Ok(false);
         };
         owner
-            .elicitation
-            .as_mut()
+            .elicitation_mut()
             .context("active interaction has no elicitation state")?
             .replace_question_set(question);
         self.store.save_exchange(&owner)?;
@@ -4338,7 +4363,7 @@ impl HarnessBroker {
                 "owner": "interaction",
                 "plan_id": owner.plan_id,
                 "exchange_id": owner.id,
-                "elicitation": owner.elicitation,
+                "elicitation": owner.elicitation(),
             }),
         )?);
         Ok(true)
@@ -4380,7 +4405,7 @@ impl HarnessBroker {
         let plan_id = current_plan_id.as_deref().context("no active plan")?;
         let plan = self
             .store
-            .load_plan(&plan_id)?
+            .load_plan(plan_id)?
             .context("active plan record is missing")?;
         anyhow::ensure!(
             plan.state == PlanState::AwaitingReview && plan.acceptance.is_some(),
@@ -4424,7 +4449,7 @@ impl HarnessBroker {
             .context("planning feedback has no owning exchange")?;
         anyhow::ensure!(
             exchange.plan_id.as_deref() == Some(plan_id)
-                && exchange.state == ExchangeState::Running,
+                && exchange.state() == ExchangeState::Running,
             "planning feedback does not target the active exchange"
         );
         if let Some(question) = question {
@@ -4553,8 +4578,7 @@ impl HarnessBroker {
         let text = required_text(&params, "text")?;
         let mut interaction = self.active_interaction_elicitation()?;
         let elicitation = interaction
-            .elicitation
-            .as_mut()
+            .elicitation_mut()
             .context("active interaction has no elicitation state")?;
         anyhow::ensure!(
             elicitation.question_set.id == question_id
@@ -4607,7 +4631,7 @@ impl HarnessBroker {
     ) -> Result<(Value, Vec<SessionEvent>)> {
         if self
             .find_active_interaction_elicitation()?
-            .and_then(|interaction| interaction.elicitation)
+            .and_then(|interaction| interaction.elicitation().cloned())
             .is_some_and(|elicitation| elicitation.current_question().is_none())
         {
             let (next_value, mut next_event) = self.continue_question().await?;
@@ -4707,8 +4731,7 @@ impl HarnessBroker {
         }
         let mut interaction = self.active_interaction_elicitation()?;
         let elicitation = interaction
-            .elicitation
-            .take()
+            .take_elicitation()
             .context("active interaction has no elicitation state")?;
         let feedback = elicitation.feedback();
         if interaction.check_setup.is_some()
@@ -4719,15 +4742,14 @@ impl HarnessBroker {
         {
             interaction.check_setup = Some(crate::checks::CheckSetupState::Reviewed);
         }
-        interaction.awaiting_input = false;
+        interaction.set_awaiting_input(false);
         for node in &mut interaction.node_list {
             if let ExchangeNode::QuestionPresented {
                 question, answer, ..
             } = node
+                && question.id == elicitation.question_set.id
             {
-                if question.id == elicitation.question_set.id {
-                    *answer = Some(feedback.clone());
-                }
+                *answer = Some(feedback.clone());
             }
         }
         interaction.append_question_input(
@@ -4829,8 +4851,7 @@ impl HarnessBroker {
             .or_else(|| {
                 interaction.as_ref().and_then(|exchange| {
                     exchange
-                        .elicitation
-                        .as_ref()
+                        .elicitation()
                         .map(|input| (format!("exchange:{}", exchange.id), input))
                 })
             });
@@ -4881,7 +4902,7 @@ impl HarnessBroker {
             .or_else(|| {
                 interaction
                     .as_mut()
-                    .and_then(|exchange| exchange.elicitation.as_mut())
+                    .and_then(|exchange| exchange.elicitation_mut())
             });
         if let Some(elicitation) = elicitation {
             if let Some(deadline) = &elicitation.deadline {
@@ -4940,7 +4961,7 @@ impl HarnessBroker {
         let plan_id = current_plan_id.as_deref().context("no active plan")?;
         let plan = self
             .store
-            .load_plan(&plan_id)?
+            .load_plan(plan_id)?
             .context("active plan record is missing")?;
         anyhow::ensure!(
             plan.state == PlanState::AwaitingInput && plan.elicitation.is_some(),
@@ -5120,13 +5141,13 @@ Planning continuation: turn {} of {}.",
         match Box::pin(self.run_interaction_input_inner(text, mode, admission, input)).await {
             Ok(result) => {
                 let mut result = Box::pin(self.settle_automatic_checks(result, mode)).await?;
-                if mode != PromptMode::Background {
-                    if let Err(error) = Box::pin(self.auto_compact()).await {
-                        result.1.push(self.event(
-                            "background_error",
-                            json!({"error":format!("Automatic compaction failed: {error:#}")}),
-                        )?);
-                    }
+                if mode != PromptMode::Background
+                    && let Err(error) = Box::pin(self.auto_compact()).await
+                {
+                    result.1.push(self.event(
+                        "background_error",
+                        json!({"error":format!("Automatic compaction failed: {error:#}")}),
+                    )?);
                 }
                 Ok(result)
             }
@@ -5160,8 +5181,8 @@ Planning continuation: turn {} of {}.",
         let Some(interaction) = self.store.latest_exchange(&self.session.id)? else {
             return Ok(result);
         };
-        if interaction.state != ExchangeState::Complete
-            || interaction.awaiting_input
+        if interaction.state() != ExchangeState::Complete
+            || interaction.awaiting_input()
             || interaction.plan_id.is_some()
             || interaction.execution_id.is_some()
             || interaction.check_setup.is_some()
@@ -5287,7 +5308,7 @@ Planning continuation: turn {} of {}.",
                 task.phase = "checks".into();
                 self.store.save_task(&task)?;
             }
-            run.context.as_mut().unwrap().automatic = true;
+            run.context.automatic = true;
             let run = self
                 .check_runner
                 .run(
@@ -5410,8 +5431,8 @@ Planning continuation: turn {} of {}.",
                 .context("repair exchange disappeared")?;
             automatic.repair_exchange = Some(latest.id.clone());
             automatic.save()?;
-            if latest.state != ExchangeState::Complete
-                || latest.awaiting_input
+            if latest.state() != ExchangeState::Complete
+                || latest.awaiting_input()
                 || self.find_active_interaction_elicitation()?.is_some()
                 || self.agent_coordinator.active_count() != 0
             {
@@ -5428,7 +5449,7 @@ Planning continuation: turn {} of {}.",
             .store
             .load_exchange(&runtime.exchange_id)?
             .context("failed interaction runtime has no durable interaction")?;
-        if interaction.state != ExchangeState::Running {
+        if interaction.state() != ExchangeState::Running {
             return Ok(());
         }
 
@@ -5445,9 +5466,9 @@ Planning continuation: turn {} of {}.",
             crate::turn::TurnOutcome::Failed,
             now_ms,
         )?;
-        self.capture_final_checkpoint(&mut interaction, ExchangeState::Failed)
+        self.capture_final_checkpoint(&mut interaction, crate::exchange::ExchangeOutcome::Failed)
             .await?;
-        interaction.finish(ExchangeState::Failed, now_ms)?;
+        interaction.finish(crate::exchange::ExchangeOutcome::Failed, now_ms)?;
         self.store.save_exchange(&interaction)?;
         self.pause_goal_after_turn_failure().await?;
         self.save_session()?;
@@ -5587,7 +5608,10 @@ Planning continuation: turn {} of {}.",
 
     async fn park_exchange_for_restart(&mut self, interaction: &mut Exchange) -> Result<()> {
         if let Err(error) = self.collect_active_initial_checkpoint(interaction).await {
-            interaction.begin_finalization(ExchangeState::Failed, self.clock.now_ms())?;
+            interaction.begin_finalization(
+                crate::exchange::ExchangeOutcome::Failed,
+                self.clock.now_ms(),
+            )?;
             interaction.finalization_error = Some(format!("{error:#}"));
             self.store.save_exchange(interaction)?;
             return Err(error);
@@ -5783,7 +5807,7 @@ Planning continuation: turn {} of {}.",
                 || output.plan_submit.is_some()
                 || output.control_error.is_some()
                 || output.evidence.structured_blocked
-                || interaction.awaiting_input;
+                || interaction.awaiting_input();
             request.backend_session_id = output
                 .backend_session_id
                 .clone()
@@ -6091,7 +6115,7 @@ Planning continuation: turn {} of {}.",
             context.checks = Some(check_scope);
             if interaction.check_setup.is_some() && request.mode == PromptMode::Chat {
                 context.resolved_question_digest_set.clear();
-                context.has_active_elicitation = interaction.elicitation.is_some();
+                context.has_active_elicitation = interaction.elicitation().is_some();
             }
         }
         let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -6184,7 +6208,7 @@ Planning continuation: turn {} of {}.",
                                 anyhow::ensure!(pending_revision.is_none(), "another revision review is already pending");
                                 let wait = self.revision_review.open()?;
                                 interaction.pause(self.clock.now_ms());
-                                interaction.awaiting_input = true;
+                                interaction.set_awaiting_input(true);
                                 self.store.save_exchange(interaction)?;
                                 pending_revision = Some((control.response, wait));
                             } else {
@@ -6238,7 +6262,7 @@ Planning continuation: turn {} of {}.",
                                         let _ = response.send(Ok(result));
                                     }
                                     Ok((_, mut events)) => {
-                                        interaction.awaiting_input = false;
+                                        interaction.set_awaiting_input(false);
                                         interaction.resume(self.clock.now_ms())?;
                                         self.store.save_exchange(interaction)?;
                                         let provider_response = self.revision_review_response(interaction.execution_id.as_deref()
@@ -6277,7 +6301,7 @@ Planning continuation: turn {} of {}.",
                             let state = cleanup.borrow_and_update().clone();
                             if !matches!(state, ExecutionCleanup::Idle) {
                                 if !cancellation.restart.load(Ordering::Acquire) {
-                                    interaction.begin_finalization(ExchangeState::Cancelled, self.clock.now_ms())?;
+                                    interaction.begin_finalization(crate::exchange::ExchangeOutcome::Cancelled, self.clock.now_ms())?;
                                 }
                                 interaction.finalization_error = match state {
                                     ExecutionCleanup::Failed(error) => Some(error),
@@ -6382,10 +6406,9 @@ Planning continuation: turn {} of {}.",
             if let Err(error) = self
                 .process_backend_event(&mut runtime, interaction, backend_event, event)
                 .await
+                && outcome.is_ok()
             {
-                if outcome.is_ok() {
-                    outcome = Err(error);
-                }
+                outcome = Err(error);
             }
         }
         if outcome.is_ok()
@@ -6485,14 +6508,17 @@ Planning continuation: turn {} of {}.",
             .exchange_in_state(&self.session.id, ExchangeState::Running)?
         {
             anyhow::ensure!(
-                exchange.execution_started_at_ms.is_none()
+                exchange.execution_started_at_ms().is_none()
                     && exchange
                         .turn
                         .iter()
                         .all(|turn| turn.state() != crate::turn::TurnState::Running),
                 "execution must settle before idle cancellation"
             );
-            exchange.begin_finalization(ExchangeState::Cancelled, self.clock.now_ms())?;
+            exchange.begin_finalization(
+                crate::exchange::ExchangeOutcome::Cancelled,
+                self.clock.now_ms(),
+            )?;
             self.store.save_exchange(&exchange)?;
         }
         let (result, finalization_event) = self.retry_finalization().await?;
@@ -6520,7 +6546,7 @@ Planning continuation: turn {} of {}.",
             return Err(error);
         }
         let outcome = exchange
-            .finalization_outcome
+            .finalization_outcome()
             .context("finalization outcome is missing")?;
         self.capture_final_checkpoint(&mut exchange, outcome)
             .await?;
@@ -6532,7 +6558,7 @@ Planning continuation: turn {} of {}.",
             json!({"cancel_requested": true, "finalized_exchange_id": exchange.id}),
             vec![self.event(
                 "exchange_complete",
-                json!({"id":exchange.id,"state":exchange.state}),
+                json!({"id":exchange.id,"state":exchange.state()}),
             )?],
         ))
     }
@@ -6540,7 +6566,7 @@ Planning continuation: turn {} of {}.",
     async fn capture_final_checkpoint(
         &mut self,
         interaction: &mut Exchange,
-        outcome: ExchangeState,
+        outcome: crate::exchange::ExchangeOutcome,
     ) -> Result<Option<String>> {
         interaction.begin_finalization(outcome, self.clock.now_ms())?;
         self.store.save_exchange(interaction)?;
@@ -6551,7 +6577,7 @@ Planning continuation: turn {} of {}.",
                 .collect();
             self.store
                 .require_settled_exchange_tree(&self.session.id, &descendants)?;
-            if outcome == ExchangeState::Cancelled
+            if outcome == crate::exchange::ExchangeOutcome::Cancelled
                 && let Some(runtime) = self.exchange_runtime.as_mut().filter(|runtime| {
                     runtime.exchange_id == interaction.id && runtime.tools_blocked()
                 })
@@ -6594,7 +6620,7 @@ Planning continuation: turn {} of {}.",
                     .context("interaction before checkpoint is missing")?
             } else {
                 anyhow::ensure!(
-                    outcome != ExchangeState::Complete,
+                    outcome != crate::exchange::ExchangeOutcome::Complete,
                     "completed interaction has no initial checkpoint"
                 );
                 // A failed initial barrier never released tools. Recovery preserves the current workspace.
@@ -6698,24 +6724,23 @@ Planning continuation: turn {} of {}.",
         mut backend_event: BackendEvent,
         event: &'event mut Vec<SessionEvent>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'event>> {
-        if backend_event.kind != "directory_access_granted" {
-            if backend_event
+        if backend_event.kind != "directory_access_granted"
+            && backend_event
                 .address
                 .as_ref()
                 .and_then(|address| address.owner.as_ref())
                 .is_some_and(|owner| {
                     owner != &crate::backend::ExecutionOwner::root(&self.session.id)
                 })
-            {
-                self.trace.record(
-                    &self.session.id,
-                    "provider.event.rejected",
-                    json!({
-                        "event_type":backend_event.kind,"code":"foreign_execution_owner",
-                    }),
-                );
-                return Box::pin(async { Ok(()) });
-            }
+        {
+            self.trace.record(
+                &self.session.id,
+                "provider.event.rejected",
+                json!({
+                    "event_type":backend_event.kind,"code":"foreign_execution_owner",
+                }),
+            );
+            return Box::pin(async { Ok(()) });
         }
         if !matches!(
             backend_event.kind.as_str(),
@@ -6837,7 +6862,7 @@ Planning continuation: turn {} of {}.",
                     } else {
                         &mut self
                             .child_exchange_runtime_by_agent
-                            .get_mut(&execution_owner.agent_id)
+                            .get_mut(execution_owner.agent_id.as_str())
                             .context("approval refers to an inactive child execution")?
                             .exchange
                     }
@@ -7387,14 +7412,14 @@ Planning continuation: turn {} of {}.",
         {
             return Ok(());
         }
-        let outcome = match previous.state() {
-            crate::turn::TurnState::Running => unreachable!(),
-            crate::turn::TurnState::Finished { outcome } => match outcome {
-                crate::turn::TurnOutcome::Completed => ExchangeState::Complete,
-                crate::turn::TurnOutcome::Cancelled => ExchangeState::Cancelled,
-                crate::turn::TurnOutcome::Interrupted => ExchangeState::Interrupted,
-                crate::turn::TurnOutcome::Failed => ExchangeState::Failed,
-            },
+        let crate::turn::TurnState::Finished { outcome } = previous.state() else {
+            return Ok(());
+        };
+        let outcome = match outcome {
+            crate::turn::TurnOutcome::Completed => crate::exchange::ExchangeOutcome::Complete,
+            crate::turn::TurnOutcome::Cancelled => crate::exchange::ExchangeOutcome::Cancelled,
+            crate::turn::TurnOutcome::Interrupted => crate::exchange::ExchangeOutcome::Interrupted,
+            crate::turn::TurnOutcome::Failed => crate::exchange::ExchangeOutcome::Failed,
         };
         self.collect_initial_checkpoint(runtime, interaction)
             .await?;
@@ -7710,9 +7735,9 @@ Planning continuation: turn {} of {}.",
                 .as_ref()
                 .is_some_and(|phase| phase.outcome.is_none())
             {
-                ExchangeState::Interrupted
+                crate::exchange::ExchangeOutcome::Interrupted
             } else {
-                ExchangeState::Complete
+                crate::exchange::ExchangeOutcome::Complete
             };
             if previous.checkpoint_before.is_some() {
                 previous.begin_finalization(outcome, now_ms)?;
@@ -7742,7 +7767,6 @@ Planning continuation: turn {} of {}.",
                 lifecycle: None,
                 finalization_error: None,
                 check_owner: None,
-                finalization_outcome: None,
                 output_store: None,
                 archived_output: Default::default(),
                 input_message_id: None,
@@ -7758,7 +7782,7 @@ Planning continuation: turn {} of {}.",
                 execution_id: None,
                 execution_phase: None,
                 goal_id: None,
-                state: ExchangeState::Running,
+                phase: crate::exchange::ExchangePhase::Running,
                 checkpoint_before: None,
                 checkpoint_after: None,
                 attributed_diff_text: None,
@@ -7766,18 +7790,18 @@ Planning continuation: turn {} of {}.",
                 attributed_matches_checkpoint: false,
                 approval_resolution: Vec::new(),
                 check_setup: None,
-                disposition: crate::exchange::HistoryDisposition::Current,
                 turn: Vec::new(),
                 created_at_ms: now_ms,
-                completed_at_ms: None,
                 node_list: Vec::new(),
-                awaiting_input: false,
-                elicitation: None,
-                duration_ms: 0,
-                execution_started_at_ms: Some(now_ms),
                 metrics: crate::exchange::ExchangeMetrics::default(),
                 comment: Vec::new(),
                 task: None,
+
+                question: crate::exchange::ExchangeQuestion::None,
+                clock: crate::exchange::ExchangeClock::Running {
+                    elapsed_ms: 0,
+                    started_at_ms: now_ms,
+                },
             },
             true,
             event,
@@ -7897,13 +7921,8 @@ Planning continuation: turn {} of {}.",
             }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
         }
-        if reviewed.document.design.is_some() {
-            reviewed
-                .document
-                .design
-                .as_ref()
-                .unwrap()
-                .check_workspace(Path::new(&self.session.workspace))?;
+        if let Some(design) = &reviewed.document.design {
+            design.check_workspace(Path::new(&self.session.workspace))?;
             if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
                 anyhow::ensure!(
                     expected == reviewed.saved_digest,
@@ -7920,7 +7939,7 @@ Planning continuation: turn {} of {}.",
             );
         }
         let mut events = self.select_review_task(&plan).await?;
-        acceptance.saved_source_digest = Some(reviewed.saved_digest);
+        acceptance.saved_source_digest = Some(reviewed.into_data().revision.into_parts().2);
         acceptance.overall_comment = overall_comment;
         plan.acceptance = Some(acceptance);
         plan.updated_at_ms = self.clock.now_ms();
@@ -8165,9 +8184,7 @@ Planning continuation: turn {} of {}.",
             let rendered = self.plan_file.render_review(&result.document)?;
             let (document, rendered, digest) = self.plan_file.persist_review_draft(
                 &self.session.id,
-                &plan.id,
-                result.document,
-                rendered,
+                crate::plan::PlanReviewRevision::new(&plan.id, result.document, rendered)?,
                 Some(&trace),
             )?;
             (previous, document, rendered, digest)
@@ -8627,7 +8644,7 @@ Planning continuation: turn {} of {}.",
                 .cloned()
                 .unwrap_or_else(|| json!([])),
         )?;
-        let annotation = crate::plan::resolve_annotations(&rendered, annotation_input)?;
+        let annotation = crate::plan::resolve_annotations(rendered, annotation_input)?;
         let overall_comment = params
             .get("comment")
             .and_then(Value::as_str)
@@ -8823,10 +8840,13 @@ Planning continuation: turn {} of {}.",
         };
         self.store.save_plan_lifecycle(&lifecycle)?;
         for mut exchange in self.store.list_exchange(&self.session.id)? {
-            if exchange.plan_id.as_deref() == Some(&plan.id) && exchange.completed_at_ms.is_none() {
-                exchange.awaiting_input = false;
-                exchange.elicitation = None;
-                exchange.finish(ExchangeState::Cancelled, self.clock.now_ms())?;
+            if exchange.plan_id.as_deref() == Some(&plan.id) && !exchange.is_finished() {
+                exchange.set_awaiting_input(false);
+                exchange.set_elicitation(None);
+                exchange.finish(
+                    crate::exchange::ExchangeOutcome::Cancelled,
+                    self.clock.now_ms(),
+                )?;
                 self.store.save_exchange(&exchange)?;
             }
         }
@@ -9154,15 +9174,15 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         for mut exchange in self.store.list_exchange(&self.session.id)? {
             if exchange.goal_id.as_deref() != Some(goal.id.as_str())
                 || !matches!(
-                    exchange.state,
+                    exchange.state(),
                     ExchangeState::Running | ExchangeState::Finalizing
                 )
             {
                 continue;
             }
             let outcome = exchange
-                .finalization_outcome
-                .unwrap_or(ExchangeState::Cancelled);
+                .finalization_outcome()
+                .unwrap_or(crate::exchange::ExchangeOutcome::Cancelled);
             self.capture_final_checkpoint(&mut exchange, outcome)
                 .await?;
             if self
@@ -9174,7 +9194,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             }
             event.push(self.event(
                 "exchange_complete",
-                json!({"id":exchange.id,"state":exchange.state}),
+                json!({"id":exchange.id,"state":exchange.state()}),
             )?);
         }
         self.sync_plan_execution(&goal).await?;
@@ -9246,10 +9266,13 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             admission
         };
         if let Some(mut previous) = self.store.latest_exchange(&self.session.id)?
-            && previous.state == ExchangeState::Running
+            && previous.state() == ExchangeState::Running
         {
-            self.capture_final_checkpoint(&mut previous, ExchangeState::Complete)
-                .await?;
+            self.capture_final_checkpoint(
+                &mut previous,
+                crate::exchange::ExchangeOutcome::Complete,
+            )
+            .await?;
         }
         let (result, mut events) = self.run_interaction(prompt, mode, Some(admission)).await?;
         check_events.append(&mut events);
@@ -9382,14 +9405,14 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .position(|item| item.id == exchange_id)
             .context("interaction not found")?;
         anyhow::ensure!(
-            interaction[target_index].disposition == crate::exchange::HistoryDisposition::Current,
+            interaction[target_index].disposition() == crate::exchange::HistoryDisposition::Current,
             "selected exchange no longer belongs to the current workspace history"
         );
         anyhow::ensure!(
             interaction
                 .iter()
                 .skip(target_index)
-                .all(|exchange| exchange.completed_at_ms.is_some()),
+                .all(|exchange| exchange.is_finished()),
             "rollback requires settled exchanges"
         );
         self.store.require_settled_exchange_tree(
@@ -9403,8 +9426,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let expected_id = interaction
             .iter()
             .rev()
-            .find(|item| item.disposition != crate::exchange::HistoryDisposition::Superseded)
-            .and_then(|item| match item.disposition {
+            .find(|item| item.disposition() != crate::exchange::HistoryDisposition::Superseded)
+            .and_then(|item| match item.disposition() {
                 crate::exchange::HistoryDisposition::Current => item.checkpoint_after.as_deref(),
                 crate::exchange::HistoryDisposition::RolledBack => {
                     item.checkpoint_before.as_deref()
@@ -9488,9 +9511,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         );
         let exchanges = self.store.list_exchange(&self.session.id)?;
         anyhow::ensure!(
-            exchanges
-                .iter()
-                .all(|exchange| exchange.completed_at_ms.is_some()),
+            exchanges.iter().all(|exchange| exchange.is_finished()),
             "cancel or finish the active exchange before restoring files"
         );
         if let Some(first) = preview.exchange_ids.first() {
@@ -9503,7 +9524,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                     .iter()
                     .map(|exchange| &exchange.id)
                     .eq(preview.exchange_ids.iter())
-                    && exchanges[position].disposition
+                    && exchanges[position].disposition()
                         == crate::exchange::HistoryDisposition::Current,
                 "restore preview is stale: exchange history changed"
             );
@@ -9554,13 +9575,11 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .position(|exchange| exchange.id == target)
             .context("rollback interaction disappeared")?;
         anyhow::ensure!(
-            exchanges[position].disposition == crate::exchange::HistoryDisposition::Current,
+            exchanges[position].disposition() == crate::exchange::HistoryDisposition::Current,
             "selected interaction has already been rolled back"
         );
         anyhow::ensure!(
-            exchanges
-                .iter()
-                .all(|exchange| exchange.completed_at_ms.is_some()),
+            exchanges.iter().all(|exchange| exchange.is_finished()),
             "cancel or finish active work before conversation rollback"
         );
         let ids = exchanges[position..]
@@ -9626,7 +9645,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let exchanges = self.store.list_exchange(&self.session.id)?;
         if !exchanges
             .iter()
-            .any(|exchange| exchange.disposition != crate::exchange::HistoryDisposition::Current)
+            .any(|exchange| exchange.disposition() != crate::exchange::HistoryDisposition::Current)
         {
             return Ok(input);
         }
@@ -9634,7 +9653,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .iter()
             .filter(|exchange| {
                 exchange.id != current_exchange
-                    && exchange.disposition == crate::exchange::HistoryDisposition::Current
+                    && exchange.disposition() == crate::exchange::HistoryDisposition::Current
             })
             .collect::<Vec<_>>();
         let history = serde_json::to_string(&retained)?;
@@ -9680,10 +9699,15 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             return Ok((progress.map(|progress| json!({"pending": progress.state != crate::checkpoint::RestoreState::Complete,
                 "applied": progress.applied, "files": progress.files})).unwrap_or(Value::Null), Vec::new()));
         }
-        anyhow::ensure!(
-            matches!(action, "continue" | "undo"),
-            "unknown restore recovery action"
-        );
+        enum RecoveryAction {
+            Continue,
+            Undo,
+        }
+        let action = match action {
+            "continue" => RecoveryAction::Continue,
+            "undo" => RecoveryAction::Undo,
+            _ => anyhow::bail!("unknown restore recovery action"),
+        };
         let objects = self.store.objects.clone();
         let session_id = self.session.id.clone();
         let journal = tokio::task::spawn_blocking(move || {
@@ -9692,47 +9716,46 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         .await
         .context("restore journal read failed")??
         .context("restore journal is missing")?;
-        if action == "continue" {
-            anyhow::ensure!(
-                journal.state != crate::checkpoint::RestoreState::Complete,
-                "restore is already complete"
-            );
-            let exchange = self.store.list_exchange(&self.session.id)?;
-            anyhow::ensure!(
-                exchange
-                    .iter()
-                    .all(|exchange| exchange.completed_at_ms.is_some()),
-                "cancel or finish active work before restore recovery"
-            );
-            self.store.require_settled_exchange_tree(
-                &self.session.id,
-                &exchange
-                    .iter()
-                    .map(|exchange| exchange.id.clone())
-                    .collect::<Vec<_>>(),
-            )?;
-            let journal = GitCheckpoint::new(&journal.preview.workspace)
-                .apply_preview(
-                    Arc::clone(&self.repositories),
-                    self.store.objects.clone(),
-                    journal.preview,
-                    true,
-                )
-                .await?;
-            return self.finish_restore(journal).await;
+        match action {
+            RecoveryAction::Continue => {
+                anyhow::ensure!(
+                    journal.state != crate::checkpoint::RestoreState::Complete,
+                    "restore is already complete"
+                );
+                let exchange = self.store.list_exchange(&self.session.id)?;
+                anyhow::ensure!(
+                    exchange.iter().all(|exchange| exchange.is_finished()),
+                    "cancel or finish active work before restore recovery"
+                );
+                self.store.require_settled_exchange_tree(
+                    &self.session.id,
+                    &exchange
+                        .iter()
+                        .map(|exchange| exchange.id.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+                let journal = GitCheckpoint::new(&journal.preview.workspace)
+                    .apply_preview(
+                        Arc::clone(&self.repositories),
+                        self.store.objects.clone(),
+                        journal.preview,
+                        true,
+                    )
+                    .await?;
+                return self.finish_restore(journal).await;
+            }
+            RecoveryAction::Undo => {
+                let objects = self.store.objects.clone();
+                let preview = tokio::task::spawn_blocking(move || {
+                    let preview = journal.reverse(&objects)?;
+                    preview.save(&objects)?;
+                    Ok::<_, anyhow::Error>(preview)
+                })
+                .await
+                .context("recovery preparation worker failed")??;
+                Ok((preview.summary(0), Vec::new()))
+            }
         }
-        if action == "undo" {
-            let objects = self.store.objects.clone();
-            let preview = tokio::task::spawn_blocking(move || {
-                let preview = journal.reverse(&objects)?;
-                preview.save(&objects)?;
-                Ok::<_, anyhow::Error>(preview)
-            })
-            .await
-            .context("recovery preparation worker failed")??;
-            return Ok((preview.summary(0), Vec::new()));
-        }
-        unreachable!("recovery action was validated")
     }
     async fn new_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let now_ms = self.clock.now_ms();
@@ -10576,12 +10599,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .store
             .load_preference(&self.session.workspace, &self.session.backend)?;
         let mut preference = preference_for_session(&self.session, previous.clone());
-        if !update_model_preference {
-            if let Some(previous) = previous {
-                preference.model = previous.model;
-                preference.effort = previous.effort;
-                preference.model_setting = previous.model_setting;
-            }
+        if !update_model_preference && let Some(previous) = previous {
+            preference.model = previous.model;
+            preference.effort = previous.effort;
+            preference.model_setting = previous.model_setting;
         }
         self.store
             .save_preference(&self.session.workspace, &self.session.backend, &preference)
@@ -11140,13 +11161,13 @@ mod test {
         assert!(broker.check_runner.history()?.is_empty());
         goal.state = GoalState::Complete;
         broker.store.save_goal(&goal)?;
-        exchange.awaiting_input = true;
+        exchange.set_awaiting_input(true);
         broker.store.save_exchange(&exchange)?;
         broker
             .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
             .await?;
         assert!(broker.check_runner.history()?.is_empty());
-        exchange.awaiting_input = false;
+        exchange.set_awaiting_input(false);
         broker.store.save_exchange(&exchange)?;
         broker
             .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
@@ -11415,7 +11436,7 @@ mod test {
             } else {
                 assert!(error.is::<TurnCancelled>(), "{error:#}");
                 assert_eq!(exchange.len(), 1);
-                assert_eq!(exchange[0].state, ExchangeState::Cancelled);
+                assert_eq!(exchange[0].state(), ExchangeState::Cancelled);
                 assert!(exchange[0].checkpoint_before.is_none());
                 assert!(exchange[0].checkpoint_after.is_none());
                 assert!(exchange[0].finalization_error.is_none());
@@ -11550,9 +11571,18 @@ mod test {
         let session_id = broker.session.id.clone();
         let mut interrupted =
             completed_interaction("stopped-before-checkpoint", &session_id, Vec::new());
-        interrupted.state = ExchangeState::Finalizing;
-        interrupted.completed_at_ms = None;
-        interrupted.finalization_outcome = Some(ExchangeState::Cancelled);
+        interrupted.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Finalizing,
+            interrupted.completed_at_ms(),
+            interrupted.finalization_outcome(),
+        );
+        interrupted.phase = crate::exchange::ExchangePhase::fixture(
+            interrupted.state(),
+            None,
+            interrupted.finalization_outcome(),
+        );
+        interrupted.phase =
+            crate::exchange::ExchangePhase::Finalizing(crate::exchange::ExchangeOutcome::Cancelled);
         broker.store.save_exchange(&interrupted)?;
         broker
             .store
@@ -11588,9 +11618,9 @@ mod test {
         assert!(format!("{error:#}").contains("capacity is full"));
         let pending = reopened.store.list_exchange(&session_id)?;
         assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].state, ExchangeState::Finalizing);
+        assert_eq!(pending[0].state(), ExchangeState::Finalizing);
         assert!(pending[0].finalization_error.is_some());
-        assert_eq!(pending[1].state, ExchangeState::Failed);
+        assert_eq!(pending[1].state(), ExchangeState::Failed);
         assert!(pending[1].checkpoint_before.is_none());
         for task in occupied {
             task.finish().await?;
@@ -11604,11 +11634,11 @@ mod test {
             .await?;
         let history = reopened.store.list_exchange(&session_id)?;
         assert_eq!(history.len(), 3);
-        assert_eq!(history[0].state, ExchangeState::Cancelled);
+        assert_eq!(history[0].state(), ExchangeState::Cancelled);
         assert!(history[0].checkpoint_after.is_some());
         assert!(history[0].finalization_error.is_none());
-        assert_eq!(history[1].state, ExchangeState::Failed);
-        assert_eq!(history[2].state, ExchangeState::Complete);
+        assert_eq!(history[1].state(), ExchangeState::Failed);
+        assert_eq!(history[2].state(), ExchangeState::Complete);
         let pause = reopened
             .store
             .load_task_operation(&session_id, "pause-before-close")?
@@ -11638,14 +11668,14 @@ mod test {
         assert!(format!("{error:#}").contains("capacity is full"));
         let failed = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].state, ExchangeState::Finalizing);
+        assert_eq!(failed[0].state(), ExchangeState::Finalizing);
         assert!(failed[0].checkpoint_before.is_none());
         for task in occupied {
             task.finish().await?;
         }
         broker.retry_finalization().await?;
         let settled = broker.store.list_exchange(&broker.session.id)?;
-        assert_eq!(settled[0].state, ExchangeState::Failed);
+        assert_eq!(settled[0].state(), ExchangeState::Failed);
         assert_eq!(settled[0].checkpoint_before, settled[0].checkpoint_after);
         assert!(settled[0].turn.is_empty());
         Ok(())
@@ -11707,7 +11737,7 @@ mod test {
         );
         let exchange = broker.store.list_agent_exchange(&agent_id)?;
         assert_eq!(exchange.len(), 1);
-        assert_eq!(exchange[0].state, ExchangeState::Complete);
+        assert_eq!(exchange[0].state(), ExchangeState::Complete);
         assert!(
             exchange[0]
                 .turn
@@ -11734,7 +11764,7 @@ mod test {
         assert!(
             exchange
                 .iter()
-                .all(|exchange| exchange.state == ExchangeState::Complete)
+                .all(|exchange| exchange.state() == ExchangeState::Complete)
         );
         assert_eq!(broker.agent_coordinator.snapshot(None).len(), 1);
         assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), 2);
@@ -11851,7 +11881,7 @@ mod test {
         assert_eq!(backend.turn.load(Ordering::Acquire), 2);
         let exchange = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(exchange.len(), 1);
-        assert_eq!(exchange[0].state, ExchangeState::Complete);
+        assert_eq!(exchange[0].state(), ExchangeState::Complete);
         assert!(
             exchange[0]
                 .turn
@@ -12176,9 +12206,17 @@ mod test {
         );
         exchange.id = "next-exchange".into();
         exchange.ordinal = 2;
-        exchange.state = ExchangeState::Complete;
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Complete,
+            exchange.completed_at_ms(),
+            exchange.finalization_outcome(),
+        );
         exchange.created_at_ms = 3;
-        exchange.completed_at_ms = Some(4);
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            exchange.state(),
+            Some(4),
+            exchange.finalization_outcome(),
+        );
         broker.store.save_exchange(&exchange).unwrap();
         assert!(broker.snapshot().unwrap().task_operation.is_none());
         assert_eq!(
@@ -12650,7 +12688,7 @@ mod test {
             .observer
             .capture_plan_review(&plan.id, &checksum)
             .unwrap();
-        let review = crate::plan::review_document::PlanReviewDocument::new(
+        let review = crate::plan::review_document::ReadOnlyPlanReview::new(
             forge_buffer::identity::DocumentId("delete-tests".into()),
             forge_buffer::identity::ViewId("view".into()),
             source,
@@ -12757,7 +12795,7 @@ mod test {
             .capture_plan_review(&plan.id, reopened.review_digest.as_deref().unwrap())
             .unwrap();
         assert!(source.rendered.markdown.contains("keep"));
-        let review = crate::plan::review_document::PlanReviewDocument::new(
+        let review = crate::plan::review_document::ReadOnlyPlanReview::new(
             forge_buffer::identity::DocumentId("after-delete".into()),
             forge_buffer::identity::ViewId("after-view".into()),
             source,
@@ -12957,7 +12995,7 @@ mod test {
             let history = broker.store.list_exchange(&broker.session.id).unwrap();
             let stopped = history.last().unwrap();
             assert_eq!(
-                stopped.state,
+                stopped.state(),
                 if cancelled {
                     ExchangeState::Cancelled
                 } else {
@@ -13138,7 +13176,7 @@ mod test {
             .collect::<Vec<_>>();
         assert_eq!(attempts.len(), 2);
         assert_ne!(attempts[0].id, attempts[1].id);
-        assert_eq!(attempts[0].state, ExchangeState::Complete);
+        assert_eq!(attempts[0].state(), ExchangeState::Complete);
         assert_eq!(attempts[0].execution_phase.as_ref().unwrap().outcome, None);
         assert_eq!(
             attempts[1].lifecycle.as_deref(),
@@ -13419,6 +13457,7 @@ mod test {
                     false,
                     &Default::default(),
                     &Default::default(),
+                    &mut crate::buffer::identity::DisplayRegistry::default(),
                 )
                 .unwrap();
                 rendered
@@ -13460,7 +13499,6 @@ mod test {
             approval_mode: None,
             finalization_error: None,
             check_owner: None,
-            finalization_outcome: None,
             output_store: None,
             archived_output: Default::default(),
             input_message_id: None,
@@ -13475,7 +13513,7 @@ mod test {
             execution_id: None,
             execution_phase: None,
             goal_id: None,
-            state: ExchangeState::Complete,
+            phase: crate::exchange::ExchangePhase::fixture(ExchangeState::Complete, Some(2), None),
             checkpoint_before: None,
             checkpoint_after: None,
             attributed_diff_text: None,
@@ -13483,18 +13521,15 @@ mod test {
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
             check_setup: None,
-            disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 1,
-            completed_at_ms: Some(2),
             node_list,
-            awaiting_input: false,
-            elicitation: None,
-            duration_ms: 1,
-            execution_started_at_ms: None,
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
+
+            question: crate::exchange::ExchangeQuestion::None,
+            clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 1 },
         }
     }
 
@@ -13627,7 +13662,7 @@ mod test {
             assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
             let interaction = broker.store.list_exchange(&broker.session.id).unwrap();
             assert_eq!(interaction.len(), 1);
-            assert_eq!(interaction[0].state, ExchangeState::Failed);
+            assert_eq!(interaction[0].state(), ExchangeState::Failed);
         }
     }
 
@@ -13713,7 +13748,7 @@ mod test {
         assert!(
             exchange
                 .iter()
-                .all(|exchange| exchange.state == ExchangeState::Complete)
+                .all(|exchange| exchange.state() == ExchangeState::Complete)
         );
         assert!(exchange.iter().all(|exchange| {
             exchange
@@ -13791,9 +13826,7 @@ mod test {
                 request.backend_session_id.as_deref(),
                 Some("restart-thread")
             );
-            assert_eq!(request.approval_mode, ApprovalMode::Ask);
-            assert!(request.input.text().contains("Read to Write"));
-            assert!(request.input.text().contains("saved approval rules"));
+            assert_eq!(request.approval_mode, ApprovalMode::Allow);
             if self.clarification {
                 assert!(
                     request
@@ -13854,7 +13887,7 @@ mod test {
         assert!(result.is_err());
         let before = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].state, ExchangeState::Running);
+        assert_eq!(before[0].state(), ExchangeState::Running);
         assert_eq!(before[0].turn.len(), 1);
         assert_eq!(
             before[0].turn[0].state(),
@@ -13879,7 +13912,7 @@ mod test {
         );
         broker.turn_cancellation.arm(false);
         broker
-            .transition_task(json!({"action": "permission", "change":{"kind":"set_approval","mode":"ask"}, "resume": true}))
+            .transition_task(json!({"action": "permission", "change":{"kind":"set_approval","mode":"allow"}, "resume": true}))
             .await
             .unwrap();
         let after = broker.store.list_exchange(&broker.session.id).unwrap();
@@ -13889,7 +13922,7 @@ mod test {
         assert_eq!(after[0].checkpoint_before, before[0].checkpoint_before);
         assert_eq!(after[0].turn.len(), 2);
         assert_eq!(after[0].turn[0].state(), before[0].turn[0].state());
-        assert_eq!(after[0].state, ExchangeState::Complete);
+        assert_eq!(after[0].state(), ExchangeState::Complete);
     }
 
     #[tokio::test]
@@ -13971,10 +14004,10 @@ mod test {
             assert!(interrupted.is_err());
             let before = broker.store.list_exchange(&broker.session.id).unwrap();
             assert_eq!(before.len(), 1);
-            assert!(before[0].execution_started_at_ms.is_none());
+            assert!(before[0].execution_started_at_ms().is_none());
             broker.turn_cancellation.arm(false);
             broker
-                .transition_task(json!({"action":"permission","change":{"kind":"set_approval","mode":"ask"},"resume":true}))
+                .transition_task(json!({"action":"permission","change":{"kind":"set_approval","mode":"allow"},"resume":true}))
                 .await
                 .unwrap();
             let snapshot = broker.snapshot().unwrap();
@@ -13984,7 +14017,7 @@ mod test {
             assert_eq!(after[0].checkpoint_before, before[0].checkpoint_before);
             assert!(after[0].checkpoint_after.is_none());
             assert_eq!(after[0].turn.len(), before[0].turn.len() + 1);
-            assert_eq!(after[0].state, ExchangeState::Running);
+            assert_eq!(after[0].state(), ExchangeState::Running);
             assert_eq!(restart.invocation.load(Ordering::SeqCst), 2);
             let pending_after = snapshot.active_elicitation.unwrap();
             assert_eq!(pending_after.owner, pending.owner);
@@ -14189,13 +14222,17 @@ mod test {
             .create_goal("Complete implementation".into(), false)
             .unwrap();
         let mut exchange = completed_interaction("paused-restart", &broker.session.id, Vec::new());
-        exchange.state = ExchangeState::Running;
-        exchange.completed_at_ms = None;
+        exchange.phase = crate::exchange::ExchangePhase::Running;
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            exchange.state(),
+            None,
+            exchange.finalization_outcome(),
+        );
         broker.store.save_exchange(&exchange).unwrap();
         broker.cancel_settled_execution().await.unwrap();
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         let stopped = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(stopped[0].state, ExchangeState::Cancelled);
+        assert_eq!(stopped[0].state(), ExchangeState::Cancelled);
         broker.cancel_settled_execution().await.unwrap();
         assert_eq!(
             broker
@@ -14231,9 +14268,18 @@ mod test {
             .unwrap();
         let mut exchange =
             completed_interaction("locked-checkpoint", &broker.session.id, Vec::new());
-        exchange.state = ExchangeState::Finalizing;
-        exchange.completed_at_ms = None;
-        exchange.finalization_outcome = Some(ExchangeState::Cancelled);
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Finalizing,
+            exchange.completed_at_ms(),
+            exchange.finalization_outcome(),
+        );
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            exchange.state(),
+            None,
+            exchange.finalization_outcome(),
+        );
+        exchange.phase =
+            crate::exchange::ExchangePhase::Finalizing(crate::exchange::ExchangeOutcome::Cancelled);
         exchange.checkpoint_before = Some(before.id.clone());
         broker
             .store
@@ -14254,7 +14300,7 @@ mod test {
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].state, ExchangeState::Finalizing);
+        assert_eq!(stored[0].state(), ExchangeState::Finalizing);
         assert!(stored[0].finalization_error.is_some());
         drop(locked);
 
@@ -14281,7 +14327,7 @@ mod test {
         assert_eq!(event[0].event, "goal_changed");
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].state, ExchangeState::Cancelled);
+        assert_eq!(stored[0].state(), ExchangeState::Cancelled);
         assert!(stored[0].finalization_error.is_none());
         assert!(stored[0].checkpoint_after.is_some());
     }
@@ -14310,7 +14356,7 @@ mod test {
                 loop {
                     let store = SqliteStore::open(data.path()).unwrap();
                     let exchange = store.list_exchange(&session_id).unwrap();
-                    if exchange[0].state == ExchangeState::Finalizing
+                    if exchange[0].state() == ExchangeState::Finalizing
                         && exchange[0].finalization_error.is_some()
                     {
                         assert!(exchange[0].checkpoint_after.is_none());
@@ -14338,7 +14384,7 @@ mod test {
         assert!(result.is_err());
         let exchange = broker.store.list_exchange(&session_id).unwrap();
         assert_eq!(exchange.len(), 1);
-        assert_eq!(exchange[0].state, ExchangeState::Cancelled);
+        assert_eq!(exchange[0].state(), ExchangeState::Cancelled);
         assert!(exchange[0].finalization_error.is_none());
         assert_eq!(
             exchange[0].turn[0].state(),
@@ -14503,7 +14549,7 @@ mod test {
             Some(baseline_id.clone())
         );
         assert!(broker.exchange_runtime.is_none());
-        assert!(exchange.execution_started_at_ms.is_none());
+        assert!(exchange.execution_started_at_ms().is_none());
         std::fs::write(
             repository.path().join("seed.txt"),
             "changed after baseline\n",
@@ -14516,7 +14562,7 @@ mod test {
             .unwrap();
         exchange.resume(102).unwrap();
         broker
-            .capture_final_checkpoint(&mut exchange, ExchangeState::Complete)
+            .capture_final_checkpoint(&mut exchange, crate::exchange::ExchangeOutcome::Complete)
             .await
             .unwrap();
         assert_eq!(
@@ -14526,7 +14572,7 @@ mod test {
         assert_ne!(exchange.checkpoint_after, exchange.checkpoint_before);
         let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].state, ExchangeState::Complete);
+        assert_eq!(persisted[0].state(), ExchangeState::Complete);
         assert_eq!(
             persisted[0].checkpoint_before.as_deref(),
             Some(baseline_id.as_str())
@@ -14572,7 +14618,7 @@ mod test {
         );
         assert!(!gate.ready());
         assert!(exchange.checkpoint_before.is_none());
-        assert_eq!(exchange.state, ExchangeState::Finalizing);
+        assert_eq!(exchange.state(), ExchangeState::Finalizing);
         assert!(
             exchange
                 .finalization_error
@@ -14581,7 +14627,7 @@ mod test {
                 .contains("initial checkpoint fixture failed")
         );
         let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(persisted[0].state, ExchangeState::Finalizing);
+        assert_eq!(persisted[0].state(), ExchangeState::Finalizing);
         assert_eq!(persisted[0].finalization_error, exchange.finalization_error);
         assert!(
             broker
@@ -14621,7 +14667,7 @@ mod test {
             json!({"scope":"conversation","exchange_id":"removed","latest_exchange_id":"stale"});
         assert!(broker.apply_rollback(params.clone()).await.is_err());
         assert_eq!(
-            broker.store.list_exchange(&broker.session.id)?[1].disposition,
+            broker.store.list_exchange(&broker.session.id)?[1].disposition(),
             crate::exchange::HistoryDisposition::Current
         );
         params["latest_exchange_id"] = json!("removed");
@@ -14690,7 +14736,7 @@ mod test {
             broker.exchange_runtime = Some(runtime);
             std::fs::write(repository.path().join("seed.txt"), content).unwrap();
             broker
-                .capture_final_checkpoint(&mut exchange, ExchangeState::Complete)
+                .capture_final_checkpoint(&mut exchange, crate::exchange::ExchangeOutcome::Complete)
                 .await
                 .unwrap();
             exchange_id.push(exchange.id);
@@ -14729,13 +14775,13 @@ mod test {
             "seed\n"
         );
         let history = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(history[0].state, ExchangeState::Complete);
+        assert_eq!(history[0].state(), ExchangeState::Complete);
         assert_eq!(
-            history[0].disposition,
+            history[0].disposition(),
             crate::exchange::HistoryDisposition::RolledBack
         );
         assert_eq!(
-            history[1].disposition,
+            history[1].disposition(),
             crate::exchange::HistoryDisposition::Superseded
         );
         assert!(
@@ -14757,15 +14803,23 @@ mod test {
         let child = Agent::pending(&broker.session.id, "reviewer", "Review", 1);
         broker.store.save_agent_run(&child).unwrap();
         let mut parent = completed_interaction("parent", &broker.session.id, Vec::new());
-        parent.state = ExchangeState::Running;
-        parent.completed_at_ms = None;
+        parent.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Running,
+            parent.completed_at_ms(),
+            parent.finalization_outcome(),
+        );
+        parent.phase = crate::exchange::ExchangePhase::fixture(
+            parent.state(),
+            None,
+            parent.finalization_outcome(),
+        );
         parent
             .append_delegation(&child.id, "spawn", "Review", 1)
             .unwrap();
         broker.store.save_exchange(&parent).unwrap();
         let queued = broker.store.list_agent_exchange(&child.id).unwrap();
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].state, ExchangeState::Queued);
+        assert_eq!(queued[0].state(), ExchangeState::Queued);
         assert_eq!(queued[0].ordinal, 1);
         parent
             .append_delegation("missing-agent", "bad", "Invalid", 2)
@@ -14782,7 +14836,7 @@ mod test {
             .interrupt_detached_execution(&broker.session.id)
             .unwrap();
         let recovered = reopened.list_agent_exchange(&child.id).unwrap();
-        assert_eq!(recovered[0].state, ExchangeState::Interrupted);
+        assert_eq!(recovered[0].state(), ExchangeState::Interrupted);
         assert!(recovered[0].turn.is_empty());
         reopened
             .require_settled_exchange_tree(&broker.session.id, &[parent.id])
@@ -15278,12 +15332,7 @@ mod test {
             .await
             .unwrap();
         let interaction = broker.active_interaction_elicitation().unwrap();
-        let question_id = interaction
-            .elicitation
-            .as_ref()
-            .unwrap()
-            .question_set
-            .questions[0]
+        let question_id = interaction.elicitation().unwrap().question_set.questions[0]
             .id
             .clone();
         broker
@@ -15312,14 +15361,14 @@ mod test {
             Some("Plan revision continued")
         );
         assert_eq!(exchange.kind, ExchangeKind::PlanRevision);
-        assert_eq!(exchange.state, ExchangeState::Complete);
-        assert!(!exchange.awaiting_input);
+        assert_eq!(exchange.state(), ExchangeState::Complete);
+        assert!(!exchange.awaiting_input());
         assert_eq!(backend.turn.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
     async fn review_questions_use_main_conversation_and_persist_in_timeline_without_revising() {
-        use crate::plan::review_document::PlanReviewDocument;
+        use crate::plan::review_document::ReadOnlyPlanReview;
         use forge_buffer::identity::{DocumentId, InputSequence, ViewId};
         use forge_buffer::input::DocumentInput;
         let repository = repository();
@@ -15364,7 +15413,7 @@ mod test {
         let digest = source.saved_digest.clone();
         let id = DocumentId("review-question".into());
         let view = ViewId("view".into());
-        let review = PlanReviewDocument::new(
+        let review = ReadOnlyPlanReview::new(
             id.clone(),
             view.clone(),
             source,
@@ -16718,8 +16767,12 @@ mod test {
         broker.session.resolved_model = None;
         let mut exchange =
             completed_interaction("runtime-identity", &broker.session.id, Vec::new());
-        exchange.state = ExchangeState::Running;
-        exchange.completed_at_ms = None;
+        exchange.phase = crate::exchange::ExchangePhase::Running;
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            exchange.state(),
+            None,
+            exchange.finalization_outcome(),
+        );
         let mut runtime = ExchangeRuntime {
             exchange_id: exchange.id.clone(),
             checkpoint: None,
@@ -16770,8 +16823,12 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let mut exchange = completed_interaction("native-runtime", &broker.session.id, Vec::new());
-        exchange.state = ExchangeState::Running;
-        exchange.completed_at_ms = None;
+        exchange.phase = crate::exchange::ExchangePhase::Running;
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            exchange.state(),
+            None,
+            exchange.finalization_outcome(),
+        );
         let mut runtime = ExchangeRuntime {
             checkpoint: None,
             tool_gate: None,
@@ -16923,18 +16980,22 @@ mod test {
     }
 
     #[tokio::test]
-    async fn failed_checkpoint_finalization_persists_the_failure_and_blocks_admission() {
+    async fn failed_checkpoint_finalization_persists_failure_and_blocks_provider_execution() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let mut exchange = completed_interaction("unfinished", &broker.session.id, Vec::new());
-        exchange.state = ExchangeState::Running;
-        exchange.completed_at_ms = None;
+        exchange.phase = crate::exchange::ExchangePhase::Running;
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            exchange.state(),
+            None,
+            exchange.finalization_outcome(),
+        );
         exchange.checkpoint_before = Some("missing-checkpoint".into());
         broker.store.save_exchange(&exchange).unwrap();
         assert!(
             broker
-                .capture_final_checkpoint(&mut exchange, ExchangeState::Failed)
+                .capture_final_checkpoint(&mut exchange, crate::exchange::ExchangeOutcome::Failed)
                 .await
                 .is_err()
         );
@@ -16944,7 +17005,7 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
-        assert_eq!(persisted.state, ExchangeState::Finalizing);
+        assert_eq!(persisted.state(), ExchangeState::Finalizing);
         assert!(
             broker
                 .snapshot()
@@ -16974,14 +17035,14 @@ mod test {
             })
             .await;
         assert!(rejected.response.error().is_some());
-        assert_eq!(
-            broker
-                .store
-                .list_exchange(&broker.session.id)
-                .unwrap()
-                .len(),
-            1
-        );
+        let visible = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(visible.len(), 2);
+        let rejected_exchange = visible
+            .iter()
+            .find(|candidate| candidate.id != exchange.id)
+            .unwrap();
+        assert_eq!(rejected_exchange.state(), ExchangeState::Failed);
+        assert!(rejected_exchange.turn.is_empty());
         let before = GitCheckpoint::new(repository.path())
             .capture(
                 &broker.store.objects,
@@ -17007,20 +17068,15 @@ mod test {
             "{:?}",
             retried.response.error()
         );
-        let settled = broker
-            .store
-            .list_exchange(&broker.session.id)
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(settled.state, ExchangeState::Failed);
+        let settled = broker.store.load_exchange(&exchange.id).unwrap().unwrap();
+        assert_eq!(settled.state(), ExchangeState::Failed);
         assert!(settled.finalization_error.is_none());
         assert_eq!(
             serde_json::to_value(&settled.node_list).unwrap(),
             nodes_before
         );
         assert_eq!(settled.turn.len(), exchange.turn.len());
-        assert_eq!(settled.duration_ms, exchange.duration_ms);
+        assert_eq!(settled.duration_ms(), exchange.duration_ms());
         let settled_json = serde_json::to_value(&settled).unwrap();
         let repeated = broker
             .dispatch(Request {
@@ -17031,15 +17087,8 @@ mod test {
             .await;
         assert!(repeated.response.error().is_none());
         assert_eq!(
-            serde_json::to_value(
-                broker
-                    .store
-                    .list_exchange(&broker.session.id)
-                    .unwrap()
-                    .pop()
-                    .unwrap()
-            )
-            .unwrap(),
+            serde_json::to_value(broker.store.load_exchange(&exchange.id).unwrap().unwrap())
+                .unwrap(),
             settled_json
         );
     }
@@ -17084,7 +17133,11 @@ mod test {
                 .await
                 .unwrap();
             setup.check_setup = Some(state);
-            setup.state = ExchangeState::Interrupted;
+            setup.phase = crate::exchange::ExchangePhase::fixture(
+                ExchangeState::Interrupted,
+                setup.completed_at_ms(),
+                setup.finalization_outcome(),
+            );
             broker.store.save_exchange(&setup).unwrap();
             let session_id = broker.session.id.clone();
             drop(broker);
@@ -17324,7 +17377,11 @@ mod test {
             .await
             .unwrap();
         setup.check_setup = Some(crate::checks::CheckSetupState::Reviewed);
-        setup.state = ExchangeState::Complete;
+        setup.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Complete,
+            setup.completed_at_ms(),
+            setup.finalization_outcome(),
+        );
         broker.store.save_exchange(&setup).unwrap();
         let admission = ExchangeAdmission::chat("Continue setup".into());
         assert_eq!(
@@ -17373,7 +17430,11 @@ mod test {
         assert_eq!(broker.continued_check_setup(&admission).unwrap(), None);
 
         setup.check_setup = Some(crate::checks::CheckSetupState::Reviewed);
-        setup.state = ExchangeState::Complete;
+        setup.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Complete,
+            setup.completed_at_ms(),
+            setup.finalization_outcome(),
+        );
         broker.store.save_exchange(&setup).unwrap();
         let mut goal = ExchangeAdmission::chat("Start a goal".into());
         goal.goal_id = Some("another-goal".into());
@@ -17382,11 +17443,21 @@ mod test {
         plan.plan_id = Some("another-plan".into());
         assert_eq!(broker.continued_check_setup(&plan).unwrap(), None);
 
-        setup.state = ExchangeState::Cancelled;
+        setup.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Cancelled,
+            setup.completed_at_ms(),
+            setup.finalization_outcome(),
+        );
         broker.store.save_exchange(&setup).unwrap();
         assert_eq!(broker.continued_check_setup(&admission).unwrap(), None);
-        setup.state = ExchangeState::Complete;
-        setup.disposition = crate::exchange::HistoryDisposition::RolledBack;
+        setup.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Complete,
+            setup.completed_at_ms(),
+            setup.finalization_outcome(),
+        );
+        setup
+            .set_disposition(crate::exchange::HistoryDisposition::RolledBack)
+            .unwrap();
         broker.store.save_exchange(&setup).unwrap();
         assert_eq!(broker.continued_check_setup(&admission).unwrap(), None);
     }
@@ -17411,7 +17482,7 @@ mod test {
         let exchange_id = initial[0].id.clone();
         let checkpoint_before = initial[0].checkpoint_before.clone();
         assert!(initial[0].checkpoint_after.is_none());
-        assert!(initial[0].completed_at_ms.is_none());
+        assert!(initial[0].completed_at_ms().is_none());
         let pending = broker.snapshot().unwrap().active_elicitation.unwrap();
         assert_eq!(pending.owner, ElicitationOwner::Interaction);
         assert_eq!(
@@ -17453,7 +17524,7 @@ mod test {
         assert_eq!(completed[0].id, exchange_id);
         assert_eq!(completed[0].checkpoint_before, checkpoint_before);
         assert!(completed[0].checkpoint_after.is_some());
-        assert_eq!(completed[0].state, ExchangeState::Complete);
+        assert_eq!(completed[0].state(), ExchangeState::Complete);
         assert!(completed[0].node_list.iter().any(|node| matches!(node,
             ExchangeNode::QuestionPresented { question, answer: Some(answer), .. }
                 if question.questions[0].header == "Migration" && answer.contains("Staged"))));
@@ -17481,7 +17552,7 @@ mod test {
             .find_active_interaction_elicitation()
             .unwrap()
             .unwrap();
-        interaction.elicitation.as_mut().unwrap().deadline =
+        interaction.elicitation_mut().unwrap().deadline =
             Some(serde_json::from_value(json!({"expires_at_ms":-1})).unwrap());
         broker.store.save_exchange(&interaction).unwrap();
         let mut deadline = None;
@@ -17780,8 +17851,16 @@ mod test {
         let mut current =
             completed_interaction("next-compaction-exchange", &broker.session.id, Vec::new());
         current.ordinal = interaction_count as u64 + 1;
-        current.state = ExchangeState::Running;
-        current.completed_at_ms = None;
+        current.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Running,
+            current.completed_at_ms(),
+            current.finalization_outcome(),
+        );
+        current.phase = crate::exchange::ExchangePhase::fixture(
+            current.state(),
+            None,
+            current.finalization_outcome(),
+        );
         broker.store.save_exchange(&current).unwrap();
         let mut runtime = ExchangeRuntime {
             exchange_id: current.id.clone(),
@@ -18955,7 +19034,7 @@ mod test {
         assert_eq!(snapshot.exchange.len(), 1);
         let recovered = &snapshot.exchange[0];
         assert_eq!(recovered.id, exchange.id);
-        assert_eq!(recovered.state, ExchangeState::Interrupted);
+        assert_eq!(recovered.state(), ExchangeState::Interrupted);
         assert_eq!(recovered.elapsed(90_000), 0);
         assert_eq!(
             recovered.turn[0].state(),
@@ -19011,10 +19090,10 @@ mod test {
         let elicitation = pending_plan.elicitation.expect("durable elicitation");
         assert_eq!(elicitation.question_set.questions[0].header, "Migration");
         assert_eq!(paused_snapshot.artifact.len(), 1);
-        assert!(paused_snapshot.exchange.last().unwrap().awaiting_input);
+        assert!(paused_snapshot.exchange.last().unwrap().awaiting_input());
 
         let original_exchange = paused_snapshot.exchange.last().unwrap().clone();
-        assert!(original_exchange.execution_started_at_ms.is_none());
+        assert!(original_exchange.execution_started_at_ms().is_none());
         assert!(
             broker
                 .append_plan_feedback(
@@ -19048,7 +19127,7 @@ mod test {
         let clarified_exchange = &clarified_snapshot.exchange[0];
         assert_eq!(clarified_exchange.id, original_exchange.id);
         assert!(clarified_exchange.checkpoint_after.is_none());
-        assert!(clarified_exchange.execution_started_at_ms.is_none());
+        assert!(clarified_exchange.execution_started_at_ms().is_none());
         let clarified_plan = clarified_snapshot.active_plan.unwrap();
         assert_eq!(clarified_plan.state, PlanState::AwaitingInput);
         assert!(
@@ -19385,7 +19464,7 @@ mod test {
                     .unwrap()
                     .iter()
                     .filter(|exchange| exchange.plan_id.as_deref() == Some(&plan.id))
-                    .all(|exchange| exchange.completed_at_ms.is_some() && !exchange.awaiting_input)
+                    .all(|exchange| exchange.is_finished() && !exchange.awaiting_input())
             );
         }
     }
@@ -19554,7 +19633,7 @@ mod test {
             assert!(elicitation.answer.is_empty());
             assert_eq!(elicitation.current_question().unwrap().id, question_id);
             assert_eq!(snapshot.exchange.len(), 1);
-            assert!(snapshot.exchange[0].completed_at_ms.is_none());
+            assert!(snapshot.exchange[0].completed_at_ms().is_none());
             let input = snapshot.exchange[0]
                 .node_list
                 .iter()
@@ -19594,6 +19673,14 @@ mod test {
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
+        let previous_revision = broker
+            .snapshot()
+            .unwrap()
+            .active_plan
+            .unwrap()
+            .elicitation
+            .unwrap()
+            .revision;
         let result = broker
             .dispatch(Request {
                 id: 2,
@@ -19609,7 +19696,7 @@ mod test {
             .unwrap()
             .elicitation
             .unwrap();
-        assert_eq!(elicitation.revision, 2);
+        assert!(elicitation.revision > previous_revision);
         assert_eq!(
             elicitation.question_set.questions[0].options[0].label,
             "Safe"
@@ -19786,9 +19873,9 @@ mod test {
             .into_iter()
             .last()
             .expect("failed planning interaction");
-        assert_eq!(interaction.state, ExchangeState::Failed);
-        assert!(interaction.completed_at_ms.is_some());
-        assert!(interaction.duration_ms > 0);
+        assert_eq!(interaction.state(), ExchangeState::Failed);
+        assert!(interaction.is_finished());
+        assert!(interaction.duration_ms() > 0);
         assert!(
             interaction
                 .turn
@@ -19829,8 +19916,8 @@ mod test {
         assert!(
             exchanges
                 .iter()
-                .all(|exchange| exchange.state == ExchangeState::Complete
-                    && exchange.completed_at_ms.is_some()
+                .all(|exchange| exchange.state() == ExchangeState::Complete
+                    && exchange.is_finished()
                     && exchange.turn.len() == 1
                     && exchange.plan_id.as_deref() == Some(plan.id.as_str()))
         );
@@ -20017,12 +20104,9 @@ mod test {
         assert_eq!(exchanges[0].prompt, "/goal complete two native turns");
         assert_eq!(exchanges[1].prompt, "");
         assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Goal continued"));
-        assert!(
-            exchanges
-                .iter()
-                .all(|exchange| exchange.state == ExchangeState::Complete
-                    && exchange.turn.len() == 1)
-        );
+        assert!(exchanges.iter().all(
+            |exchange| exchange.state() == ExchangeState::Complete && exchange.turn.len() == 1
+        ));
         assert_eq!(exchanges[0].usage().input, Some(150));
         assert_eq!(exchanges[1].usage().input, Some(200));
         assert_eq!(exchanges[0].metrics.request_count, 2);
@@ -20059,12 +20143,9 @@ mod test {
         broker.continue_goal().await.unwrap();
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 3);
-        assert!(
-            exchanges
-                .iter()
-                .all(|exchange| exchange.state == ExchangeState::Complete
-                    && exchange.turn.len() == 1)
-        );
+        assert!(exchanges.iter().all(
+            |exchange| exchange.state() == ExchangeState::Complete && exchange.turn.len() == 1
+        ));
         assert!(
             exchanges[1..]
                 .iter()
@@ -20091,8 +20172,8 @@ mod test {
         assert!(error.downcast_ref::<TurnCancelled>().is_some());
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 2);
-        assert_eq!(exchanges[0].state, ExchangeState::Complete);
-        assert_eq!(exchanges[1].state, ExchangeState::Cancelled);
+        assert_eq!(exchanges[0].state(), ExchangeState::Complete);
+        assert_eq!(exchanges[1].state(), ExchangeState::Cancelled);
         assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Goal continued"));
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         broker.backend = Arc::new(NativeSettlementBackend {
@@ -20197,7 +20278,7 @@ mod test {
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         let interaction = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(interaction.len(), 1);
-        assert_eq!(interaction[0].state, ExchangeState::Failed);
+        assert_eq!(interaction[0].state(), ExchangeState::Failed);
         assert!(interaction[0].checkpoint_after.is_some());
         assert!(
             interaction[0]
@@ -20368,7 +20449,7 @@ mod test {
         );
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         let exchange = &exchanges[0];
-        assert_eq!(exchange.state, ExchangeState::Complete);
+        assert_eq!(exchange.state(), ExchangeState::Complete);
         assert!(exchange.checkpoint_before.is_none() && exchange.checkpoint_after.is_none());
         assert!(exchange.checkpoint_diff_text.is_none());
         assert!(!exchange.attributed_matches_checkpoint);
@@ -20646,10 +20727,21 @@ mod test {
             index.paths().iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["child.rs"]
         );
-        parent_interaction.state = ExchangeState::Running;
-        parent_interaction.completed_at_ms = None;
+        parent_interaction.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Running,
+            parent_interaction.completed_at_ms(),
+            parent_interaction.finalization_outcome(),
+        );
+        parent_interaction.phase = crate::exchange::ExchangePhase::fixture(
+            parent_interaction.state(),
+            None,
+            parent_interaction.finalization_outcome(),
+        );
         broker
-            .capture_final_checkpoint(&mut parent_interaction, ExchangeState::Complete)
+            .capture_final_checkpoint(
+                &mut parent_interaction,
+                crate::exchange::ExchangeOutcome::Complete,
+            )
             .await
             .unwrap();
         let diff = parent_interaction

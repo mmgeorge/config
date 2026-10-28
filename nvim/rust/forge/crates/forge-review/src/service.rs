@@ -171,7 +171,6 @@ fn validate_workspace(directory: &std::path::Path) -> Result<()> {
     let bytes = directory.as_os_str().as_encoded_bytes();
     ensure!(
         directory.is_absolute()
-            && bytes.len() <= 32_768
             && !bytes.contains(&0)
             && !directory
                 .components()
@@ -331,7 +330,8 @@ impl ReviewService {
                     }
                     Err(_) => ("outcome_unknown", false, false),
                 };
-                let result = async {
+
+                async {
                     let _publication = guard.owner.publication.lock().await;
                     let (snapshot, viewed_file, draft) = {
                         let mut document = guard
@@ -362,8 +362,7 @@ impl ReviewService {
                         operation_id: (!terminal).then_some(operation_id),
                     })
                 }
-                .await;
-                result
+                .await
             }
             .await;
             drop(guard);
@@ -1007,7 +1006,8 @@ impl ReviewService {
         };
         let settled = async {
                 let _publication = guard.owner.publication.lock().await;
-                if outcome.is_err() && remote_result.outcome == PullRequestOutcome::Rejected {
+                let outcome = match outcome {
+                    Err(error) if remote_result.outcome == PullRequestOutcome::Rejected => {
                     let draft = {
                         let mut document = guard.owner.document.lock().expect("review document poisoned");
                         document.complete_save(Some(&remote_result))?;
@@ -1017,8 +1017,10 @@ impl ReviewService {
                         service.github.review_draft_write(resource.clone(), draft).await
                             .map_err(forge_github::service::not_started)?;
                     }
-                    return Err(forge_github::service::not_started(outcome.unwrap_err()));
-                }
+                    return Err(forge_github::service::not_started(error));
+                    }
+                    outcome => outcome,
+                };
                 if let Ok(record) = &outcome
                     && matches!(record.state, RecoveryPhase::Confirmed { .. } | RecoveryPhase::Rejected { .. }) {
                     let mut snapshot = guard.owner.document.lock().expect("review document poisoned").snapshot()?;

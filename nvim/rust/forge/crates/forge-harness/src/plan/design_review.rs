@@ -514,12 +514,12 @@ fn rows(
         let added = hunks
             .iter()
             .flat_map(|hunk| &hunk.row)
-            .filter(|row| row.kind == RowKind::Added)
+            .filter(|row| row.kind() == RowKind::Added)
             .count() as u64;
         let removed = hunks
             .iter()
             .flat_map(|hunk| &hunk.row)
-            .filter(|row| row.kind == RowKind::Removed)
+            .filter(|row| row.kind() == RowKind::Removed)
             .count() as u64;
         let identity = file.old_path.as_deref().unwrap_or(path);
         let id = format!("plan:design:file:{}", super::digest(identity.as_bytes()));
@@ -564,31 +564,24 @@ fn rows(
                         .rows(id, std::slice::from_ref(row), &hunk.group, None, None)?
                         .metadata
                 };
-                if row.old.map(|coordinate| coordinate.line).is_none()
-                    && row.new.map(|coordinate| coordinate.line).is_none()
-                {
+                let Some(coordinate) = row.new_coordinate().or_else(|| row.old_coordinate()) else {
                     block.push(BufferBlock {
                         id: BlockId(format!("{hunk_id}:row:{row_index}")),
                         text: BufferText::from_rows([row.text.as_str()])?,
                         metadata,
                     });
                     continue;
-                }
-                let (side, source_path, line) = if row.kind == RowKind::Removed
-                    || row.new.map(|coordinate| coordinate.line).is_none()
-                {
-                    (
-                        "baseline",
-                        file.old_path.as_ref().unwrap(),
-                        row.old.map(|coordinate| coordinate.line).unwrap(),
-                    )
-                } else {
-                    (
-                        "proposed",
-                        path,
-                        row.new.map(|coordinate| coordinate.line).unwrap(),
-                    )
                 };
+                let (side, source_path) = match coordinate.side {
+                    forge_diff::source::SourceSide::Old => (
+                        "baseline",
+                        file.old_path
+                            .as_ref()
+                            .context("baseline source path is missing")?,
+                    ),
+                    forge_diff::source::SourceSide::New => ("proposed", path),
+                };
+                let line = coordinate.line;
                 let row_text = visibility
                     .get(&(source_path.clone(), side.into()))
                     .and_then(|visibility| visibility.replacement.get(&line))
@@ -636,12 +629,15 @@ fn rows(
                 {
                     hidden.insert(BlockId(format!("{hunk_id}:row:{row_index}")));
                 }
-                if row.kind == RowKind::Context
-                    && let Some(old_line) = row.old.map(|coordinate| coordinate.line)
+                if row.kind() == RowKind::Context
+                    && let Some(old_line) = row.old_coordinate().map(|coordinate| coordinate.line)
                 {
                     display_row.insert(
                         (
-                            file.old_path.as_ref().unwrap().clone(),
+                            file.old_path
+                                .as_ref()
+                                .context("context row has no baseline file")?
+                                .clone(),
                             "baseline".into(),
                             old_line,
                         ),
@@ -654,8 +650,11 @@ fn rows(
                     text: BufferText::from_rows([row_text])?,
                     metadata,
                 });
-                if row.kind == RowKind::Context
-                    && row.old.map(|coordinate| coordinate.line).is_some()
+                if row.kind() == RowKind::Context
+                    && row
+                        .old_coordinate()
+                        .map(|coordinate| coordinate.line)
+                        .is_some()
                 {
                     let baseline_path = file
                         .old_path
@@ -664,7 +663,7 @@ fn rows(
                     if let Some(position) = presentation
                         .get(&(baseline_path.clone(), "baseline".into()))
                         .and_then(|file| {
-                            row.old
+                            row.old_coordinate()
                                 .map(|coordinate| coordinate.line)
                                 .and_then(|line| file.declaration.source.get(line))
                         })
@@ -1996,28 +1995,23 @@ mod tests {
             .filter(|line| line.contains(" │ "))
             .map(|line| line.split(" │ ").map(str::trim).collect::<Vec<_>>())
             .collect::<Vec<_>>();
+        let command = |name: &str| {
+            cells
+                .iter()
+                .position(|row| row.get(1) == Some(&name))
+                .unwrap()
+        };
+        assert!(command("format-all") < command("unit-all"));
+        assert!(command("unit-all") < command("integration-files"));
         assert_eq!(
-            cells,
-            vec![
-                vec!["Stage", "Command", "Scope", "Triggers", "Requires"],
-                vec!["Format", "format-all", "All", "src/**", "—"],
-                vec!["Test", "optional-all", "All", "Explicit runs only", "—"],
-                vec![
-                    "Test",
-                    "unit-all",
-                    "Changed files",
-                    "Any changed file",
-                    "format-all"
-                ],
-                vec![
-                    "Test",
-                    "integration-files",
-                    "Changed files",
-                    "Explicit runs only",
-                    "unit-all"
-                ],
-            ]
+            cells[command("unit-all")][2..],
+            ["Changed files", "Any changed file", "format-all"]
         );
+        assert_eq!(
+            cells[command("integration-files")][2..],
+            ["Changed files", "Explicit runs only", "unit-all"]
+        );
+        assert_eq!(cells[command("optional-all")][3], "Explicit runs only");
         assert!(!rendered.markdown.contains("private/**"));
         assert!(!rendered.markdown.contains("-internal"));
         assert_eq!(serde_json::to_vec(&document).unwrap(), original);

@@ -134,33 +134,28 @@ fn successful_status(status: &str) -> bool {
 fn merge_change(projection_list: &mut Vec<FileProjection>, change: &ProviderFileChange) {
     let path = normalize_path(&change.path);
     let move_path = change.move_path.as_deref().map(normalize_path);
-    let projection_index = projection_list.iter().position(|projection| {
+    let hunk_list = operation_hunk_list(
+        change.kind,
+        ProviderFileChange::split_move_report(change.kind, &change.diff).0,
+    );
+    if let Some(projection) = projection_list.iter_mut().find(|projection| {
         projection.new_path.as_deref() == Some(path.as_str())
             || projection.old_path.as_deref() == Some(path.as_str())
-    });
-    let projection = match projection_index {
-        Some(index) => &mut projection_list[index],
-        None => {
-            let (old_path, new_path) = operation_path(change.kind, &path, move_path.as_deref());
-            projection_list.push(FileProjection {
-                old_path,
-                new_path,
-                hunk_list: Vec::new(),
-            });
-            projection_list.last_mut().expect("projection was appended")
-        }
-    };
-    if projection_index.is_some() {
+    }) {
         projection.new_path = match change.kind {
             ProviderChangeKind::Delete => None,
             ProviderChangeKind::Move => move_path.or_else(|| Some(path.clone())),
             ProviderChangeKind::Add | ProviderChangeKind::Update => Some(path.clone()),
         };
+        projection.hunk_list.extend(hunk_list);
+    } else {
+        let (old_path, new_path) = operation_path(change.kind, &path, move_path.as_deref());
+        projection_list.push(FileProjection {
+            old_path,
+            new_path,
+            hunk_list,
+        });
     }
-    projection.hunk_list.extend(operation_hunk_list(
-        change.kind,
-        ProviderFileChange::split_move_report(change.kind, &change.diff).0,
-    ));
 }
 
 fn operation_path(

@@ -31,8 +31,8 @@ impl PageQuota {
         for block in blocks {
             self.bytes = self.bytes.saturating_sub(block.text.byte_count());
             if let Some(width) = &self.width {
-                for row in 0..block.text.row_count() {
-                    let cells = width.cells(block.text.row(row).expect("source row"), 0)?;
+                for row in block.text.rows() {
+                    let cells = width.cells(row, 0)?;
                     self.rows = self
                         .rows
                         .saturating_sub(cells.div_ceil(width.columns).max(1));
@@ -62,6 +62,14 @@ pub(super) struct SectionProjection {
     pending: HashSet<String>,
     #[cfg(test)]
     pub projected_entries: usize,
+}
+
+struct ToolBodyChange {
+    owner: String,
+    node: forge_buffer::identity::FoldId,
+    anchor: BlockId,
+    removed: usize,
+    block: Vec<BufferBlock>,
 }
 
 impl SectionProjection {
@@ -123,28 +131,18 @@ impl SectionProjection {
             if source.dirty.contains(&change.owner) {
                 continue;
             }
-            let call = change
-                .anchor
-                .0
-                .strip_suffix(":preview")
-                .or_else(|| change.anchor.0.split_once(":output:").map(|(call, _)| call))
-                .or_else(|| change.anchor.0.strip_suffix(":hidden"));
-            let node_id = call.map(|call| format!("{call}:tool"));
-            let mut heading = node_id
-                .as_ref()
-                .and_then(|id| self.document.document.block(&BlockId(id.clone())).cloned());
-            if let Some(id) = &node_id {
-                self.nodes.advance(id)?;
-            }
+            let node_id = &change.node.0;
+            let mut heading = self
+                .document
+                .document
+                .block(&BlockId(node_id.clone()))
+                .cloned();
+            self.nodes.advance(node_id)?;
             if self.document.document.block_index(&change.anchor).is_none() {
                 continue;
             }
             if change.removed.iter().any(|id| !self.complete.contains(id)) {
-                if let Some(id) = node_id {
-                    self.pending.insert(id);
-                } else {
-                    source.dirty.insert(change.owner);
-                }
+                self.pending.insert(node_id.clone());
                 continue;
             }
             let blocks = change
@@ -165,8 +163,9 @@ impl SectionProjection {
                 .map(|block| block.text.byte_count())
                 .sum();
             let inserted_bytes: usize = blocks.iter().map(|block| block.text.byte_count()).sum();
-            if let Some(heading) = &mut heading {
-                let node = heading.metadata.node.as_mut().expect("tool heading node");
+            if let Some(heading) = &mut heading
+                && let Some(node) = &mut heading.metadata.node
+            {
                 let next_bytes = node.loaded_bytes.saturating_sub(removed_bytes) + inserted_bytes;
                 let maximum = self
                     .quota
@@ -201,8 +200,9 @@ impl SectionProjection {
             for id in &change.inserted {
                 self.complete.insert(id.clone());
             }
-            splices.push(TranscriptChange::ToolBody {
+            splices.push(ToolBodyChange {
                 owner: change.owner,
+                node: change.node,
                 anchor: change.anchor,
                 removed: change.removed.len(),
                 block: blocks,
@@ -230,11 +230,8 @@ impl SectionProjection {
             let Some(current) = source.document.block(&id) else {
                 continue;
             };
-            if current
-                .metadata
-                .node
-                .as_ref()
-                .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Message)
+            if let Some(node) = &current.metadata.node
+                && node.kind == forge_buffer::node::NodeKind::Message
             {
                 if current.metadata.fold.is_empty() != previous.metadata.fold.is_empty() {
                     source.dirty.insert(owner.to_owned());
@@ -242,8 +239,7 @@ impl SectionProjection {
                 }
                 if !current.metadata.fold.is_empty() {
                     self.nodes.register(current)?;
-                    self.pending
-                        .insert(current.metadata.node.as_ref().unwrap().id.0.clone());
+                    self.pending.insert(node.id.0.clone());
                     continue;
                 }
             }
@@ -288,7 +284,7 @@ impl SectionProjection {
             }
             let original = source.source_entry(id)?;
             for block in &original.block {
-                self.nodes.register(&block)?;
+                self.nodes.register(block)?;
             }
             prepared_sections.insert(
                 id.clone(),
@@ -341,11 +337,14 @@ impl SectionProjection {
             .collect();
         let mut patch = Vec::new();
         for change in splices {
-            let TranscriptChange::ToolBody { owner, .. } = &change else {
-                unreachable!()
-            };
-            if !dirty.contains(owner) {
-                patch.extend(self.document.tool_layout(vec![change])?);
+            if !dirty.contains(&change.owner) {
+                patch.extend(self.document.tool_layout(vec![TranscriptChange::ToolBody {
+                    owner: change.owner,
+                    node: change.node,
+                    anchor: change.anchor,
+                    removed: change.removed,
+                    block: change.block,
+                }])?);
             }
         }
         for mut block in direct {
@@ -516,6 +515,7 @@ impl SectionProjection {
             }
             patch.extend(self.document.tool_layout(vec![TranscriptChange::ToolBody {
                 owner: candidate.id,
+                node: forge_buffer::identity::FoldId(id.to_owned()),
                 anchor: anchor.clone(),
                 removed,
                 block: candidate.block,
@@ -635,7 +635,7 @@ impl SectionProjection {
         more: bool,
         page: Option<(usize, WidthProfile)>,
     ) -> Result<()> {
-        let last = self.view.get(&view).context("section view is closed")?;
+        let last = self.view.get_mut(&view).context("section view is closed")?;
         ensure!(
             sequence <= forge_buffer::MAX_COUNTER,
             "section sequence exhausted"
@@ -655,17 +655,17 @@ impl SectionProjection {
         } else {
             None
         };
-        if let Some(loaded) = &loaded {
-            if !loaded.block.iter().any(|block| {
+        if let Some(loaded) = &loaded
+            && !loaded.block.iter().any(|block| {
                 block
                     .metadata
                     .section
                     .iter()
                     .any(|section| section.id.0 == id && section.more)
-            }) {
-                *self.view.get_mut(&view).expect("validated section view") = sequence;
-                return Ok(());
-            }
+            })
+        {
+            *last = sequence;
+            return Ok(());
         }
         if let Some((rows, width)) = &page {
             ensure!(
@@ -680,19 +680,15 @@ impl SectionProjection {
         let loaded_rows = if more && paged && resized {
             if let Some((_, width)) = &page {
                 let loaded = Self::subtree(&self.nodes, &self.document, &affected)?;
-                let start = loaded
-                    .block
-                    .iter()
-                    .position(|block| block.metadata.fold.iter().any(|fold| fold.id.0 == id));
-                if let Some(start) = start {
-                    let end_id = &loaded.block[start]
+                let start = loaded.block.iter().enumerate().find_map(|(index, block)| {
+                    block
                         .metadata
                         .fold
                         .iter()
                         .find(|fold| fold.id.0 == id)
-                        .unwrap()
-                        .end
-                        .block;
+                        .map(|fold| (index, &fold.end.block))
+                });
+                if let Some((start, end_id)) = start {
                     let end = loaded
                         .block
                         .iter()
@@ -703,11 +699,8 @@ impl SectionProjection {
                         if block.id.0.ends_with(":deferred-body") {
                             continue;
                         }
-                        for row in 0..block.text.row_count() {
-                            rows += width
-                                .cells(block.text.row(row).unwrap(), 0)?
-                                .div_ceil(width.columns)
-                                .max(1);
+                        for row in block.text.rows() {
+                            rows += width.cells(row, 0)?.div_ceil(width.columns).max(1);
                         }
                     }
                     rows
@@ -792,7 +785,7 @@ impl SectionProjection {
                 return Err(error);
             }
         };
-        *self.view.get_mut(&view).expect("validated section view") = sequence;
+        *last = sequence;
         if !expanded {
             for child in self.nodes.descendants(id) {
                 self.quota.remove(&child);
@@ -920,15 +913,12 @@ fn render(
             return Ok(true);
         }
         let source_block = source[cursor];
-        if source_block
-            .metadata
-            .node
-            .as_ref()
-            .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Message)
+        if let Some(node) = &source_block.metadata.node
+            && node.kind == forge_buffer::node::NodeKind::Message
             && !source_block.metadata.fold.is_empty()
         {
-            let id = &source_block.metadata.node.as_ref().unwrap().id.0;
-            let block = super::message::project(source_block, intent.get(id).copied())?;
+            let id = &node.id.0;
+            let block = super::message::project(source_block, node, intent.get(id).copied())?;
             budget.consume(std::slice::from_ref(&block))?;
             output.push(block);
             cursor += 1;
@@ -1033,7 +1023,7 @@ fn render(
                     },
                 });
             }
-            let last = output.last().expect("section body");
+            let last = output[heading + 1..].last().unwrap_or(&output[heading]);
             let mut fold = original.clone();
             fold.end = BlockAnchor {
                 block: last.id.clone(),
@@ -1111,11 +1101,11 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
     let mut rows = Vec::new();
     let mut remaining = budget.bytes;
     let mut remaining_rows = budget.rows;
-    for index in 0..source.text.row_count() {
+    let mut last_column = 0;
+    for row in source.text.rows() {
         if remaining == 0 || remaining_rows == 0 {
             break;
         }
-        let row = source.text.row(index).expect("source row");
         let mut end = row.len().min(remaining.saturating_sub(1));
         while !row.is_char_boundary(end) {
             end -= 1;
@@ -1127,6 +1117,7 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
             remaining_rows = remaining_rows.saturating_sub(1);
         }
         rows.push(&row[..end]);
+        last_column = end;
         remaining = remaining.saturating_sub(end + 1);
         if end != row.len() {
             break;
@@ -1147,7 +1138,7 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
     } else {
         TextPosition {
             row: rows.len() - 1,
-            column: rows.last().expect("prefix row").len(),
+            column: last_column,
         }
     };
     let metadata = &source.metadata;

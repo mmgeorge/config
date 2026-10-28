@@ -11,8 +11,7 @@ impl ReviewDocument {
         if !field.dirty {
             return Ok(());
         }
-        let repository = self.target.repository.repository_name();
-        let owner = repository.split('/').next().expect("validated repository");
+        let owner = self.target.repository.owner();
         let requested = selection(field.text, owner)?;
         ensure!(
             !requested
@@ -26,15 +25,7 @@ impl ReviewDocument {
 
     /// Refreshes requested reviewers without replacing local edits or an unresolved submission.
     pub(crate) fn refresh_reviewers(&mut self, detail: &[(String, String)]) -> Result<()> {
-        let text = reviewer_text(
-            detail,
-            self.target
-                .repository
-                .repository_name()
-                .split('/')
-                .next()
-                .expect("validated repository"),
-        );
+        let text = reviewer_text(detail, self.target.repository.owner());
         let region = RegionId("reviewers".into());
         if !self.reviewers_loaded {
             self.edits.insert(region, RegionRevision(0), text)?;
@@ -54,8 +45,7 @@ impl ReviewDocument {
 
     /// Retains submitted spelling when the remote reviewer set matches despite ordering or casing.
     pub(crate) fn observed_reviewers(&self, detail: &[(String, String)]) -> Result<String> {
-        let repository = self.target.repository.repository_name();
-        let owner = repository.split('/').next().expect("validated repository");
+        let owner = self.target.repository.owner();
         let observed = reviewer_text(detail, owner);
         if let Some(submitted) = self
             .pending
@@ -150,7 +140,6 @@ fn selection(text: &str, owner: &str) -> Result<ReviewerSelection> {
         };
         ensure!(
             !name.is_empty()
-                && name.len() <= 100
                 && name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
@@ -163,9 +152,5 @@ fn selection(text: &str, owner: &str) -> Result<ReviewerSelection> {
             names.push(name.to_owned());
         }
     }
-    ensure!(
-        selection.reviewer.len() + selection.team.len() <= 100,
-        "too many requested reviewers"
-    );
     Ok(selection)
 }

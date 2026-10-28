@@ -68,7 +68,11 @@ fn record(number: u64) -> NotificationRecord {
         id: number.to_string(),
         repository: GithubRepositoryId::new(
             "github.com",
-            if number % 2 == 0 { "first" } else { "second" },
+            if number.is_multiple_of(2) {
+                "first"
+            } else {
+                "second"
+            },
             "repo",
         )
         .unwrap(),
@@ -79,11 +83,19 @@ fn record(number: u64) -> NotificationRecord {
         updated_at: "today".into(),
         subject_endpoint: Some(format!(
             "repos/{}/repo/issues/7",
-            if number % 2 == 0 { "first" } else { "second" }
+            if number.is_multiple_of(2) {
+                "first"
+            } else {
+                "second"
+            }
         )),
         comment_endpoint: Some(format!(
             "repos/{}/repo/issues/comments/9",
-            if number % 2 == 0 { "first" } else { "second" }
+            if number.is_multiple_of(2) {
+                "first"
+            } else {
+                "second"
+            }
         )),
         number: Some(7),
         browser_url: Some("https://github.com/first/repo/issues/7".into()),

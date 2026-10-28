@@ -30,7 +30,7 @@ impl SessionDirectory {
         request: &PermissionRequest,
         workspace: &Path,
     ) -> Result<bool> {
-        if session_id != &self.session_id || request.target_list.is_empty() {
+        if session_id != self.session_id || request.target_list.is_empty() {
             return Ok(false);
         }
         for target in &request.target_list {

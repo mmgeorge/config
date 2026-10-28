@@ -26,6 +26,21 @@ pub struct EditAcknowledgement {
 }
 
 #[derive(Debug, Clone)]
+/// Committed text and its acknowledgement after exclusive preparation succeeds.
+pub struct AcceptedLocalEdit {
+    pub acknowledgement: EditAcknowledgement,
+    pub patch: BufferPatch,
+}
+
+#[derive(Debug, Clone)]
+/// Rejections returned before a document replacement acquires its exclusive borrow.
+pub enum LocalEditRejection {
+    Conflict { current: RegionRevision },
+    UnknownRegion,
+    StaleSequence,
+}
+
+#[derive(Debug, Clone)]
 pub enum LocalEditResult {
     Accepted {
         acknowledgement: EditAcknowledgement,
@@ -36,6 +51,25 @@ pub enum LocalEditResult {
     },
     UnknownRegion,
     StaleSequence,
+}
+
+impl From<AcceptedLocalEdit> for LocalEditResult {
+    fn from(accepted: AcceptedLocalEdit) -> Self {
+        Self::Accepted {
+            acknowledgement: accepted.acknowledgement,
+            patch: Box::new(accepted.patch),
+        }
+    }
+}
+
+impl From<LocalEditRejection> for LocalEditResult {
+    fn from(rejection: LocalEditRejection) -> Self {
+        match rejection {
+            LocalEditRejection::Conflict { current } => Self::Conflict { current },
+            LocalEditRejection::UnknownRegion => Self::UnknownRegion,
+            LocalEditRejection::StaleSequence => Self::StaleSequence,
+        }
+    }
 }
 
 pub(crate) fn replace_region(

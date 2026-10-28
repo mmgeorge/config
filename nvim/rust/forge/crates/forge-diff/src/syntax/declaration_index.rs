@@ -288,17 +288,16 @@ fn lua_symbols(root: Node<'_>, source: &str, index: &mut DeclarationIndex, scope
     let mut local = std::collections::HashSet::new();
     let mut exported = std::collections::HashSet::new();
     for statement in children(root) {
-        if statement.kind() == "return_statement" {
-            if let Some(value) = children(statement)
+        if statement.kind() == "return_statement"
+            && let Some(value) = children(statement)
                 .into_iter()
                 .find(|child| child.kind() == "expression_list")
+        {
+            for name in children(value)
+                .into_iter()
+                .filter(|child| child.kind() == "identifier")
             {
-                for name in children(value)
-                    .into_iter()
-                    .filter(|child| child.kind() == "identifier")
-                {
-                    exported.insert(contents(name, source).to_owned());
-                }
+                exported.insert(contents(name, source).to_owned());
             }
         }
         if statement.kind() == "variable_declaration" {
@@ -1036,28 +1035,27 @@ fn walk(node: Node<'_>, source: &str, language: SyntaxLanguage, index: &mut Decl
         ) {
             nested.push(synthetic_scope(ordinal, node.kind()));
         }
-        if kind == "infer_type" {
-            if let Some(name) = children(node)
+        if kind == "infer_type"
+            && let Some(name) = children(node)
                 .into_iter()
                 .find(|child| child.kind() == "type_identifier")
-            {
-                index.symbol.push(DeclarationSymbol {
-                    role: DeclarationRole::Binding,
-                    external_entry: false,
-                    property: false,
-                    name: contents(name, source).into(),
-                    scope: scope.to_vec(),
-                    position: position(name),
-                    visibility: SymbolVisibility::Private,
-                    type_namespace: true,
-                    macro_namespace: false,
-                    value_namespace: false,
-                    conditional,
-                    global: false,
-                    parameter: true,
-                });
-                continue;
-            }
+        {
+            index.symbol.push(DeclarationSymbol {
+                role: DeclarationRole::Binding,
+                external_entry: false,
+                property: false,
+                name: contents(name, source).into(),
+                scope: scope.to_vec(),
+                position: position(name),
+                visibility: SymbolVisibility::Private,
+                type_namespace: true,
+                macro_namespace: false,
+                value_namespace: false,
+                conditional,
+                global: false,
+                parameter: true,
+            });
+            continue;
         }
         if kind == "type_query" {
             if let Some(target) = children(node)
@@ -1079,43 +1077,43 @@ fn walk(node: Node<'_>, source: &str, language: SyntaxLanguage, index: &mut Decl
             }
             continue;
         }
-        if kind == "mod_item" {
-            if let Some(name) = name_node {
-                index.module.push(DeclarationModule {
-                    scope: scope.to_vec(),
-                    name: contents(name, source).into(),
-                    path: quoted_attribute(attributes, "path"),
-                    inline: node.child_by_field_name("body").is_some(),
-                    conditional,
-                });
-            }
+        if kind == "mod_item"
+            && let Some(name) = name_node
+        {
+            index.module.push(DeclarationModule {
+                scope: scope.to_vec(),
+                name: contents(name, source).into(),
+                path: quoted_attribute(attributes, "path"),
+                inline: node.child_by_field_name("body").is_some(),
+                conditional,
+            });
         }
-        if kind == "impl_item" {
-            if let Some(owner) = node.child_by_field_name("type") {
-                let owner_text = contents(owner, source)
-                    .split('<')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_owned();
-                nested.push(owner_text);
-                nested.push(synthetic_scope(ordinal, "impl"));
-                index.symbol.push(DeclarationSymbol {
-                    role: DeclarationRole::Binding,
-                    external_entry: false,
-                    property: false,
-                    name: "Self".into(),
-                    scope: nested.clone(),
-                    position: position(owner),
-                    visibility: SymbolVisibility::Private,
-                    type_namespace: true,
-                    macro_namespace: false,
-                    value_namespace: false,
-                    conditional,
-                    global: false,
-                    parameter: true,
-                });
-            }
+        if kind == "impl_item"
+            && let Some(owner) = node.child_by_field_name("type")
+        {
+            let owner_text = contents(owner, source)
+                .split('<')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            nested.push(owner_text);
+            nested.push(synthetic_scope(ordinal, "impl"));
+            index.symbol.push(DeclarationSymbol {
+                role: DeclarationRole::Binding,
+                external_entry: false,
+                property: false,
+                name: "Self".into(),
+                scope: nested.clone(),
+                position: position(owner),
+                visibility: SymbolVisibility::Private,
+                type_namespace: true,
+                macro_namespace: false,
+                value_namespace: false,
+                conditional,
+                global: false,
+                parameter: true,
+            });
         }
         if kind == "trait_item" {
             index.symbol.push(DeclarationSymbol {
@@ -1321,18 +1319,18 @@ fn rust_attribute(
                 if token.kind() == "identifier" {
                     first.get_or_insert(token);
                     path.push(contents(token, source).to_owned());
-                } else if matches!(token.kind(), "," | ")") {
-                    if let Some(start) = first.take() {
-                        index.reference.push(DeclarationReference {
-                            path: std::mem::take(&mut path),
-                            position: position(start),
-                            length: token.start_byte() - start.start_byte(),
-                            scope: scope.to_vec(),
-                            value_namespace: false,
-                            macro_namespace: true,
-                            conditional,
-                        });
-                    }
+                } else if matches!(token.kind(), "," | ")")
+                    && let Some(start) = first.take()
+                {
+                    index.reference.push(DeclarationReference {
+                        path: std::mem::take(&mut path),
+                        position: position(start),
+                        length: token.start_byte() - start.start_byte(),
+                        scope: scope.to_vec(),
+                        value_namespace: false,
+                        macro_namespace: true,
+                        conditional,
+                    });
                 }
             }
         }

@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 
-use super::{CommentAnchor, CommentId, CommentStore, RemoteComment, RemoteCommentIdentity};
+use super::{
+    CommentAnchor, CommentId, CommentRecord, CommentStore, RemoteComment, RemoteCommentIdentity,
+};
 use crate::edit::{EditStore, SaveOutcome, SaveSubmission};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
@@ -36,7 +38,20 @@ struct CommentSaveRecord {
 
 pub(super) struct PendingCommentSave {
     record: Arc<CommentSaveRecord>,
-    uncertain: bool,
+    phase: SettlementPhase,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SettlementPhase {
+    InFlight,
+    Uncertain,
+}
+
+struct CommentSettlement<'store> {
+    comment: &'store mut CommentRecord,
+    pending: &'store mut PendingCommentSave,
+    remote: &'store mut std::collections::BTreeMap<String, CommentId>,
+    reply: &'store mut std::collections::BTreeMap<CommentId, CommentId>,
 }
 
 #[derive(Debug)]
@@ -59,6 +74,12 @@ impl CommentSave {
     pub fn text(&self) -> &str {
         self.record.submission.text()
     }
+}
+
+enum CommentConfirmation {
+    Body(RemoteComment),
+    Deleted,
+    Uncertain,
 }
 
 impl CommentStore {
@@ -114,9 +135,7 @@ impl CommentStore {
                 "comment body is empty"
             );
         }
-        let submission = edits
-            .capture(&record.region, true)?
-            .expect("required comment capture");
+        let submission = edits.capture(&record.region)?;
         let record = Arc::new(CommentSaveRecord {
             comment,
             mutation,
@@ -126,7 +145,7 @@ impl CommentStore {
             comment,
             PendingCommentSave {
                 record: Arc::clone(&record),
-                uncertain: false,
+                phase: SettlementPhase::InFlight,
             },
         );
         Ok(Some(CommentSave { record }))
@@ -139,19 +158,26 @@ impl CommentStore {
         save: &CommentSave,
         outcome: CommentSaveOutcome,
     ) -> Result<()> {
-        self.check_save(edits, save, false)?;
-        if matches!(outcome, CommentSaveOutcome::Rejected) {
-            edits.complete_save(&save.record.submission, SaveOutcome::Rejected)?;
-            self.pending.remove(&save.comment());
-            return Ok(());
-        }
+        let confirmation_validity = match &outcome {
+            CommentSaveOutcome::Confirmed(remote) => self.validate_remote(remote),
+            _ => Ok(()),
+        };
+        let settlement = self.check_save(edits, save, SettlementPhase::InFlight)?;
+        let confirmation = match outcome {
+            CommentSaveOutcome::Rejected => {
+                edits.complete_save(&save.record.submission, SaveOutcome::Rejected)?;
+                self.pending.remove(&save.comment());
+                return Ok(());
+            }
+            CommentSaveOutcome::Confirmed(remote) => CommentConfirmation::Body(remote),
+            CommentSaveOutcome::Deleted => CommentConfirmation::Deleted,
+            CommentSaveOutcome::Uncertain => CommentConfirmation::Uncertain,
+        };
         edits.complete_save(&save.record.submission, SaveOutcome::Uncertain)?;
-        self.pending
-            .get_mut(&save.comment())
-            .expect("validated comment save")
-            .uncertain = true;
-        match outcome {
-            CommentSaveOutcome::Confirmed(remote) => {
+        settlement.pending.phase = SettlementPhase::Uncertain;
+        confirmation_validity?;
+        match confirmation {
+            CommentConfirmation::Body(remote) => {
                 ensure!(
                     remote.body == save.text(),
                     "comment confirmation differs from submitted text"
@@ -160,18 +186,19 @@ impl CommentStore {
                     !matches!(save.mutation(), CommentMutation::Delete { .. }),
                     "deletion received a body confirmation"
                 );
-                self.reconcile_save(edits, save, Some(remote))
+                settlement.reconcile(edits, save, Some(remote))?;
             }
-            CommentSaveOutcome::Deleted => {
+            CommentConfirmation::Deleted => {
                 ensure!(
                     matches!(save.mutation(), CommentMutation::Delete { .. }),
                     "non-delete operation received deletion confirmation"
                 );
-                self.reconcile_save(edits, save, None)
+                settlement.reconcile(edits, save, None)?;
             }
-            CommentSaveOutcome::Uncertain => Ok(()),
-            CommentSaveOutcome::Rejected => unreachable!(),
+            CommentConfirmation::Uncertain => return Ok(()),
         }
+        self.pending.remove(&save.comment());
+        Ok(())
     }
 
     pub(crate) fn close_unknown(
@@ -179,7 +206,7 @@ impl CommentStore {
         edits: &mut EditStore,
         save: &CommentSave,
     ) -> Result<()> {
-        self.check_save(edits, save, true)?;
+        self.check_save(edits, save, SettlementPhase::Uncertain)?;
         edits.close_unknown(&save.record.submission)?;
         self.pending.remove(&save.comment());
         Ok(())
@@ -192,12 +219,57 @@ impl CommentStore {
         save: &CommentSave,
         observed: Option<RemoteComment>,
     ) -> Result<()> {
-        self.check_save(edits, save, true)?;
+        if let Some(remote) = &observed {
+            self.validate_remote(remote)?;
+        }
+        self.check_save(edits, save, SettlementPhase::Uncertain)?
+            .reconcile(edits, save, observed)?;
+        self.pending.remove(&save.comment());
+        Ok(())
+    }
+
+    fn check_save(
+        &mut self,
+        edits: &EditStore,
+        save: &CommentSave,
+        phase: SettlementPhase,
+    ) -> Result<CommentSettlement<'_>> {
+        self.check_owner(edits)?;
+        let comment = self
+            .comment
+            .get_mut(&save.comment())
+            .context("unknown comment")?;
+        let pending = self
+            .pending
+            .get_mut(&save.comment())
+            .context("unknown comment save")?;
+        ensure!(
+            Arc::ptr_eq(&pending.record, &save.record),
+            "comment save belongs to another operation"
+        );
+        ensure!(
+            pending.phase == phase,
+            "comment save requires a different settlement phase"
+        );
+        Ok(CommentSettlement {
+            comment,
+            pending,
+            remote: &mut self.remote,
+            reply: &mut self.reply,
+        })
+    }
+}
+
+impl CommentSettlement<'_> {
+    fn reconcile(
+        self,
+        edits: &mut EditStore,
+        save: &CommentSave,
+        observed: Option<RemoteComment>,
+    ) -> Result<()> {
         let comment = save.comment();
         match observed {
             Some(remote) => {
-                self.validate_remote(&remote)?;
-                let existing = self.record(comment)?;
                 ensure!(
                     remote.viewer_did_author,
                     "mutation observation is not viewer authored"
@@ -213,7 +285,7 @@ impl CommentStore {
                     }
                     CommentMutation::Create { .. } | CommentMutation::Reply { .. } => {
                         ensure!(
-                            remote.anchor == existing.anchor,
+                            remote.anchor == self.comment.anchor,
                             "creation observation has another anchor"
                         );
                         ensure!(
@@ -224,7 +296,7 @@ impl CommentStore {
                 }
                 edits.reconcile_save(&save.record.submission, remote.body)?;
                 self.remote.insert(remote.identity.node_id.clone(), comment);
-                let record = self.comment.get_mut(&comment).expect("validated comment");
+                let record = self.comment;
                 record.remote = Some(remote.identity);
                 record.anchor = remote.anchor;
                 if let Some(parent) = record.reply_to.take() {
@@ -240,30 +312,9 @@ impl CommentStore {
                     "absence cannot resolve an unknown creation"
                 );
                 edits.reconcile_save(&save.record.submission, String::new())?;
-                self.comment
-                    .get_mut(&comment)
-                    .expect("validated comment")
-                    .deleted = true;
+                self.comment.deleted = true;
             }
         }
-        self.pending.remove(&comment);
-        Ok(())
-    }
-
-    fn check_save(&self, edits: &EditStore, save: &CommentSave, uncertain: bool) -> Result<()> {
-        self.check_owner(edits)?;
-        let pending = self
-            .pending
-            .get(&save.comment())
-            .context("unknown comment save")?;
-        ensure!(
-            Arc::ptr_eq(&pending.record, &save.record),
-            "comment save belongs to another operation"
-        );
-        ensure!(
-            pending.uncertain == uncertain,
-            "comment save requires a different settlement phase"
-        );
         Ok(())
     }
 }

@@ -93,7 +93,7 @@ impl DraftStore {
                     .and_then(Value::as_u64)
                     .context("creation draft sequence is missing")?;
                 ensure!(
-                    incoming > 0 && incoming <= (1u64 << 53) - 1,
+                    incoming > 0 && incoming < (1u64 << 53),
                     "creation draft sequence is invalid"
                 );
                 if let Some(existing) = fields.get(key) {

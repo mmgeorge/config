@@ -145,7 +145,6 @@ impl ReviewReadRequest {
         if let ReviewSection::ThreadComments { thread_node_id } = &self.view {
             ensure!(
                 !thread_node_id.is_empty()
-                    && thread_node_id.len() <= 256
                     && thread_node_id.bytes().all(|byte| byte.is_ascii_graphic()),
                 "invalid GitHub thread identity"
             );

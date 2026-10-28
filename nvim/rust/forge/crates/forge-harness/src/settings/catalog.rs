@@ -55,9 +55,75 @@ pub(crate) struct ServerResource {
     /// Records which provider targets can express this definition.
     pub(crate) targets: Vec<String>,
     /// Records the configured transport independently of live availability.
-    pub(crate) transport: String,
+    pub(crate) transport: ServerTransport,
     #[serde(skip)]
     definition: Value,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ServerTransport {
+    Stdio,
+    Http,
+    Sse,
+}
+
+impl ServerTransport {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+            Self::Sse => "sse",
+        }
+    }
+}
+
+enum ResolvedLaunch {
+    Stdio {
+        command: String,
+        argument: Vec<String>,
+        environment: BTreeMap<String, String>,
+    },
+    Http(RemoteLaunch),
+    Sse(RemoteLaunch),
+}
+
+struct RemoteLaunch {
+    url: String,
+    headers: BTreeMap<String, String>,
+}
+
+impl ResolvedLaunch {
+    fn into_native(self) -> serde_json::Map<String, Value> {
+        let fields = match self {
+            Self::Stdio {
+                command,
+                argument,
+                environment,
+            } => [
+                ("type", json!("stdio")),
+                ("command", json!(command)),
+                ("args", json!(argument)),
+                ("env", json!(environment)),
+            ]
+            .into_iter()
+            .collect::<Vec<_>>(),
+            Self::Http(remote) => vec![
+                ("type", json!("http")),
+                ("url", json!(remote.url)),
+                ("headers", json!(remote.headers)),
+            ],
+            Self::Sse(remote) => vec![
+                ("type", json!("sse")),
+                ("url", json!(remote.url)),
+                ("headers", json!(remote.headers)),
+            ],
+        };
+        fields
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect()
+    }
 }
 
 impl ServerResource {
@@ -75,16 +141,18 @@ impl ServerResource {
             } else {
                 "stdio"
             });
-        ensure!(
-            matches!(transport, "stdio" | "http" | "sse"),
-            "unsupported MCP transport {transport}"
-        );
+        let transport = match transport {
+            "stdio" => ServerTransport::Stdio,
+            "http" => ServerTransport::Http,
+            "sse" => ServerTransport::Sse,
+            _ => anyhow::bail!("unsupported MCP transport {transport}"),
+        };
         Ok(Self {
             id,
             name,
             source,
             scope: None,
-            transport: transport.into(),
+            transport,
             targets: definition["targets"]
                 .as_array()
                 .into_iter()
@@ -96,37 +164,18 @@ impl ServerResource {
     }
 
     /// Resolve a native SDK launch definition without persisting credential values.
-    pub(crate) fn native(&self) -> Result<Value> {
-        let mut launch = self.acp()?;
-        launch["type"] = json!(self.transport);
-        launch
-            .as_object_mut()
-            .context("MCP launch must be an object")?
-            .remove("name");
-        for field in ["env", "headers"] {
-            if let Some(entries) = launch[field].as_array() {
-                let value = entries
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry["name"].as_str().unwrap_or_default().to_owned(),
-                            entry["value"].clone(),
-                        )
-                    })
-                    .collect::<serde_json::Map<_, _>>();
-                launch[field] = Value::Object(value);
-            }
-        }
+    pub(crate) fn native(&self) -> Result<serde_json::Map<String, Value>> {
+        let mut launch = self.resolve()?.into_native();
         for field in ["tools", "timeout", "cwd"] {
             if let Some(value) = self.definition.get(field) {
-                launch[field] = value.clone();
+                launch.insert(field.into(), value.clone());
             }
         }
         Ok(launch)
     }
 
     /// Resolve credential references only into the ephemeral ACP launch payload.
-    pub(crate) fn acp(&self) -> Result<Value> {
+    fn resolve(&self) -> Result<ResolvedLaunch> {
         let definition = &self.definition;
         let mut native = super::import::NativeValues::default();
         native.validate(&self.name, definition)?;
@@ -157,21 +206,28 @@ impl ServerResource {
         for (name, reference) in definition["native_env"].as_object().into_iter().flatten() {
             environment.insert(name.clone(), native.resolve(reference)?);
         }
-        if self.transport == "stdio" {
-            let command = definition["command"]
-                .as_str()
-                .context("stdio MCP command missing")?;
-            let argument = if let Some(reference) = definition["native_args"].as_array() {
-                reference
-                    .iter()
-                    .map(|reference| native.resolve(reference))
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                serde_json::from_value(definition.get("args").cloned().unwrap_or(json!([])))?
-            };
-            return Ok(json!({"name":self.name,"command":command,"args":argument,
-                "env":environment.into_iter().map(|(name,value)|json!({"name":name,"value":value})).collect::<Vec<_>>()}));
-        }
+        let remote: fn(RemoteLaunch) -> ResolvedLaunch = match self.transport {
+            ServerTransport::Stdio => {
+                let command = definition["command"]
+                    .as_str()
+                    .context("stdio MCP command missing")?;
+                let argument = if let Some(reference) = definition["native_args"].as_array() {
+                    reference
+                        .iter()
+                        .map(|reference| native.resolve(reference))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    serde_json::from_value(definition.get("args").cloned().unwrap_or(json!([])))?
+                };
+                return Ok(ResolvedLaunch::Stdio {
+                    command: command.into(),
+                    argument,
+                    environment,
+                });
+            }
+            ServerTransport::Http => ResolvedLaunch::Http,
+            ServerTransport::Sse => ResolvedLaunch::Sse,
+        };
         let mut headers = BTreeMap::<String, String>::new();
         for key in ["headers", "http_headers"] {
             for (name, value) in definition[key].as_object().into_iter().flatten() {
@@ -226,8 +282,7 @@ impl ServerResource {
                 .context("HTTP MCP URL missing")?
                 .to_owned()
         };
-        Ok(json!({"type":self.transport,"name":self.name,"url":url,
-            "headers":headers.into_iter().map(|(name,value)|json!({"name":name,"value":value})).collect::<Vec<_>>()}))
+        Ok(remote(RemoteLaunch { url, headers }))
     }
 }
 
@@ -373,32 +428,14 @@ impl ResourceCatalog {
                     "rulesync:{}",
                     hex::encode(Sha256::digest(identity.as_bytes()))
                 );
-                let transport =
-                    definition["type"]
-                        .as_str()
-                        .unwrap_or(if definition["url"].is_string() {
-                            "http"
-                        } else {
-                            "stdio"
-                        });
-                ensure!(
-                    matches!(transport, "stdio" | "http" | "sse"),
-                    "unsupported Rulesync MCP transport {transport}"
-                );
-                server_list.push(ServerResource {
+                let mut server = ServerResource::imported(
                     id,
-                    name: name.clone(),
-                    source: source.display().to_string(),
-                    scope: Some(scope),
-                    targets: definition["targets"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|target| target.as_str().map(str::to_owned))
-                        .collect(),
-                    transport: transport.into(),
-                    definition: definition.clone(),
-                });
+                    name.clone(),
+                    source.display().to_string(),
+                    definition.clone(),
+                )?;
+                server.scope = Some(scope);
+                server_list.push(server);
             }
         }
         Ok(server_list)

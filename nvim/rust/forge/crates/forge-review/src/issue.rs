@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use forge_buffer::{
     block::{BlockMetadata, BufferBlock, EditableRegion, TextPosition, TextRange},
     document::{BufferDocument, LocalEditPreparation, PreparedLocalEdit},
-    editable::{EditAcknowledgement, LocalEdit, LocalEditResult},
+    editable::{EditAcknowledgement, LocalEdit},
     identity::{BlockId, DocumentId, RegionId, RegionRevision},
     patch::{BufferPatch, BufferSnapshot},
     text::BufferText,
@@ -102,12 +102,10 @@ impl PreparedIssueEdit<'_> {
     }
     pub fn commit(self) -> IssueEditResult {
         let acknowledgement = self.field.commit();
-        let LocalEditResult::Accepted { patch, .. } = self.buffer.commit() else {
-            unreachable!("prepared issue buffer edit")
-        };
+        let patch = self.buffer.commit().patch;
         IssueEditResult {
             acknowledgement,
-            patch: *patch,
+            patch,
         }
     }
 }
@@ -283,7 +281,6 @@ impl IssueDocument {
                 .operation_id
                 .as_ref()
                 .is_none_or(|identity| !identity.is_empty()
-                    && identity.len() <= 256
                     && identity.bytes().all(|byte| byte.is_ascii_graphic())),
             "invalid draft operation identity"
         );
@@ -535,14 +532,14 @@ impl IssueDocument {
             add_assignees,
             remove_assignees,
         } = &mutation
+            && add_assignees.is_empty()
+            && remove_assignees.is_empty()
         {
-            if add_assignees.is_empty() && remove_assignees.is_empty() {
-                if let Some(submission) = self.edits.begin_save(&RegionId("assignees".into()))? {
-                    self.edits
-                        .complete_save(&submission, SaveOutcome::Confirmed)?;
-                }
-                return Ok(None);
+            if let Some(submission) = self.edits.begin_save(&RegionId("assignees".into()))? {
+                self.edits
+                    .complete_save(&submission, SaveOutcome::Confirmed)?;
             }
+            return Ok(None);
         }
         for field in ISSUE_FIELD {
             match self.edits.begin_save(&RegionId(field.into())) {
@@ -590,9 +587,7 @@ fn validate_detail(
         "issue detail belongs to another repository"
     );
     ensure!(
-        !node_id.is_empty()
-            && node_id.len() <= 256
-            && node_id.bytes().all(|byte| byte.is_ascii_graphic()),
+        !node_id.is_empty() && node_id.bytes().all(|byte| byte.is_ascii_graphic()),
         "invalid issue node identity"
     );
     ensure!(!detail.title.contains(['\n', '\r']), "invalid issue title");
@@ -644,7 +639,6 @@ fn assignee_logins(text: &str) -> Result<Vec<String>> {
         let token = token.strip_prefix('@').unwrap_or(token);
         ensure!(
             !token.is_empty()
-                && token.len() <= 100
                 && token.bytes().all(|byte| byte.is_ascii_alphanumeric()
                     || matches!(byte, b'-' | b'_' | b'[' | b']')),
             "invalid issue assignee login"

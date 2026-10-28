@@ -109,61 +109,6 @@ impl LineStatsCache {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry() -> CountEntry {
-        CountEntry {
-            input: CountInput {
-                old: None,
-                new: None,
-                worktree_mode: None,
-            },
-            worktree: Some(CountStamp::Missing),
-            count: LineStats::Exact {
-                added: 0,
-                deleted: 0,
-            },
-            analysis: None,
-        }
-    }
-
-    #[test]
-    fn invalidation_expires_worktree_entries_and_rejects_old_publications() {
-        let cache = LineStatsCache::default();
-        let epoch = cache.epoch();
-        let worktree = (RepositoryPath::new(b"worktree".to_vec()).unwrap(), false);
-        let staged = (RepositoryPath::new(b"staged".to_vec()).unwrap(), true);
-        cache.insert(epoch, worktree.clone(), entry());
-        cache.insert(epoch, staged.clone(), entry());
-        cache.invalidate();
-        cache.insert(epoch, worktree.clone(), entry());
-        assert!(cache.get(&worktree).is_none());
-        assert!(cache.get(&staged).is_some());
-        cache.insert(cache.epoch(), worktree.clone(), entry());
-        assert!(cache.get(&worktree).is_some());
-    }
-
-    #[test]
-    fn count_retention_evicts_old_entries_within_both_limits() {
-        let cache = LineStatsCache::default();
-        for number in 0..MAX_COUNT_ENTRIES + 8 {
-            let path = RepositoryPath::new(format!("file-{number}").into_bytes()).unwrap();
-            cache.insert(0, (path, false), entry());
-        }
-        let state = cache.state.lock().unwrap();
-        assert!(state.entry.len() <= MAX_COUNT_ENTRIES);
-        assert_eq!(state.order.len(), state.entry.len());
-        assert!(state.bytes <= MAX_COUNT_BYTES);
-        assert!(
-            !state
-                .entry
-                .contains_key(&(RepositoryPath::new(b"file-0".to_vec()).unwrap(), false))
-        );
-    }
-}
-
 impl CountEntry {
     pub(super) fn retained_bytes(&self, key: &CountKey) -> usize {
         std::mem::size_of::<Self>()
@@ -224,5 +169,60 @@ impl CountStamp {
             WorktreeStamp::Directory(_) | WorktreeStamp::Other(_) => Some(Self::Other),
             WorktreeStamp::Unobserved => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> CountEntry {
+        CountEntry {
+            input: CountInput {
+                old: None,
+                new: None,
+                worktree_mode: None,
+            },
+            worktree: Some(CountStamp::Missing),
+            count: LineStats::Exact {
+                added: 0,
+                deleted: 0,
+            },
+            analysis: None,
+        }
+    }
+
+    #[test]
+    fn invalidation_expires_worktree_entries_and_rejects_old_publications() {
+        let cache = LineStatsCache::default();
+        let epoch = cache.epoch();
+        let worktree = (RepositoryPath::new(b"worktree".to_vec()).unwrap(), false);
+        let staged = (RepositoryPath::new(b"staged".to_vec()).unwrap(), true);
+        cache.insert(epoch, worktree.clone(), entry());
+        cache.insert(epoch, staged.clone(), entry());
+        cache.invalidate();
+        cache.insert(epoch, worktree.clone(), entry());
+        assert!(cache.get(&worktree).is_none());
+        assert!(cache.get(&staged).is_some());
+        cache.insert(cache.epoch(), worktree.clone(), entry());
+        assert!(cache.get(&worktree).is_some());
+    }
+
+    #[test]
+    fn count_retention_evicts_old_entries_within_both_limits() {
+        let cache = LineStatsCache::default();
+        for number in 0..MAX_COUNT_ENTRIES + 8 {
+            let path = RepositoryPath::new(format!("file-{number}").into_bytes()).unwrap();
+            cache.insert(0, (path, false), entry());
+        }
+        let state = cache.state.lock().unwrap();
+        assert!(state.entry.len() <= MAX_COUNT_ENTRIES);
+        assert_eq!(state.order.len(), state.entry.len());
+        assert!(state.bytes <= MAX_COUNT_BYTES);
+        assert!(
+            !state
+                .entry
+                .contains_key(&(RepositoryPath::new(b"file-0".to_vec()).unwrap(), false))
+        );
     }
 }

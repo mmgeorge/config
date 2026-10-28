@@ -43,7 +43,8 @@ pub(super) struct Coverage {
 #[serde(deny_unknown_fields)]
 pub(super) struct Reply {
     pub rows: Vec<Row>,
-    pub source: String,
+    #[serde(rename = "source")]
+    _source: String,
     pub next_offset: Option<u32>,
     pub next_line: Option<u32>,
     pub warnings: Option<Vec<String>>,
@@ -59,12 +60,6 @@ pub(super) struct Reply {
 }
 
 pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> Result<String> {
-    ensure!(
-        reply.rows.len() <= 100
-            && reply.omitted_visibility.len() <= 16
-            && reply.source.len() <= 256,
-        "invalid LSP result size"
-    );
     let maximum = (arguments.token_budget.unwrap_or(2000) as usize * 4).max(128);
     if arguments.operation == Operation::Paths {
         return render_paths(reply, workspace, maximum);
@@ -251,10 +246,10 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
         previous_section = section.to_owned();
         previous_signature = Some(signature);
     }
-    if let Some(hover) = reply.hover.as_ref().filter(|text| !text.is_empty()) {
-        if output.len() + hover.len() + 128 <= maximum {
-            output.push_str(&format!("\ntype information\n{hover}\n"));
-        }
+    if let Some(hover) = reply.hover.as_ref().filter(|text| !text.is_empty())
+        && output.len() + hover.len() + 128 <= maximum
+    {
+        output.push_str(&format!("\ntype information\n{hover}\n"));
     }
     if reply.rows.is_empty() {
         let partial = reply
@@ -292,7 +287,7 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
     }
     if let Some(message) = &reply.message {
         let message = super::single_line(message, 256);
-        if output.len() + message.len() + 1 <= maximum {
+        if output.len() + message.len() < maximum {
             output.push_str(&format!("{message}\n"));
         }
     }
@@ -357,7 +352,7 @@ fn render_paths(reply: Reply, workspace: &Path, maximum: usize) -> Result<String
     }
     if let Some(message) = &reply.message {
         let message = super::single_line(message, 256);
-        if output.len() + message.len() + 1 <= maximum {
+        if output.len() + message.len() < maximum {
             output.push_str(&message);
             output.push('\n');
         }

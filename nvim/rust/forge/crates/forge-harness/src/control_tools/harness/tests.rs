@@ -406,8 +406,12 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     let fixture = Fixture::new()?;
     let mut store = SqliteStore::open(fixture.root.path())?;
     let mut exchange = exchange(&fixture.scope.session, "exchange", "Initial question");
-    exchange.state = ExchangeState::Running;
-    exchange.completed_at_ms = None;
+    exchange.phase = crate::exchange::ExchangePhase::Running;
+    exchange.phase = crate::exchange::ExchangePhase::fixture(
+        exchange.state(),
+        None,
+        exchange.finalization_outcome(),
+    );
     exchange.resume(0)?;
     let mut event = BackendEvent {
         received_at_ms: None,

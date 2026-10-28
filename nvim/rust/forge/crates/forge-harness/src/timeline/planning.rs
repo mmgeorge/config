@@ -134,7 +134,7 @@ pub(super) fn attach(
                     if lifecycle.kind == PlanLifecycleKind::QuestionAsked
                         && lifecycle.question.as_ref().is_some_and(|question| question.id == elicitation.question_set.id)))))
         {
-            exchange.elicitation = Some(elicitation.clone());
+            exchange.set_elicitation(Some(elicitation.clone()));
         }
     }
 }
@@ -143,23 +143,19 @@ pub(super) fn attach(
 fn pair_questions(events: Vec<(i64, ExchangePlanEvent)>) -> Vec<ExchangePlanEvent> {
     let mut paired: Vec<ExchangePlanEvent> = Vec::new();
     for (_, event) in events {
-        if let PlanEventContent::Lifecycle { lifecycle, .. } = &event.content {
-            if matches!(
+        if let PlanEventContent::Lifecycle { lifecycle, .. } = &event.content
+            && matches!(
                 lifecycle.kind,
                 PlanLifecycleKind::QuestionAnswered | PlanLifecycleKind::QuestionWithdrawn
-            ) {
-                if let Some(question) = &lifecycle.question {
-                    if let Some(prior) = paired.iter_mut().rev().find(|prior| matches!(&prior.content,
+            )
+                && let Some(question) = &lifecycle.question
+                    && let Some(prior) = paired.iter_mut().rev().find(|prior| matches!(&prior.content,
                         PlanEventContent::Lifecycle { lifecycle: asked, .. }
                         if asked.kind == PlanLifecycleKind::QuestionAsked && asked.question.as_ref().is_some_and(|asked|
-                            asked.questions.iter().map(|question| &question.id).eq(question.questions.iter().map(|question| &question.id))))) {
-                        if let PlanEventContent::Lifecycle { lifecycle: asked, .. } = &mut prior.content {
+                            asked.questions.iter().map(|question| &question.id).eq(question.questions.iter().map(|question| &question.id)))))
+                        && let PlanEventContent::Lifecycle { lifecycle: asked, .. } = &mut prior.content {
                             asked.answer = lifecycle.answer.clone();
                         }
-                    }
-                }
-            }
-        }
         paired.push(event);
     }
     paired
@@ -182,15 +178,10 @@ fn legacy_anchor(
     let exchange = if admission {
         matching()
             .find(|exchange| exchange.created_at_ms >= time)
-            .or_else(|| {
-                matching()
-                    .filter(|exchange| exchange.created_at_ms <= time)
-                    .last()
-            })
+            .or_else(|| matching().rfind(|exchange| exchange.created_at_ms <= time))
     } else {
         matching()
-            .filter(|exchange| exchange.created_at_ms <= time)
-            .last()
+            .rfind(|exchange| exchange.created_at_ms <= time)
             .or_else(|| matching().next())
     }?;
     Some(legacy_position(exchange, time))
@@ -430,6 +421,7 @@ mod tests {
                 false,
                 &Default::default(),
                 &Default::default(),
+                &mut crate::buffer::identity::DisplayRegistry::default(),
             )
             .unwrap();
             let text = rendered

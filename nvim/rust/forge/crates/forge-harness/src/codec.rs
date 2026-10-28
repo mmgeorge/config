@@ -1,6 +1,17 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+struct StackSafe<'value, Value: ?Sized>(&'value Value);
+
+impl<Value: Serialize + ?Sized> Serialize for StackSafe<'_, Value> {
+    fn serialize<Serializer: serde::Serializer>(
+        &self,
+        serializer: Serializer,
+    ) -> Result<Serializer::Ok, Serializer::Error> {
+        self.0.serialize(serde_stacker::Serializer::new(serializer))
+    }
+}
+
 /// Decode complete JSON with stack growth instead of a total nesting limit.
 pub(crate) fn from_str<Value: DeserializeOwned>(source: &str) -> Result<Value, serde_json::Error> {
     let mut reader = serde_json::Deserializer::from_str(source);
@@ -47,7 +58,13 @@ pub(crate) fn to_vec_pretty<Value: Serialize + ?Sized>(
 pub(crate) fn to_string_pretty<Value: Serialize + ?Sized>(
     value: &Value,
 ) -> Result<String, serde_json::Error> {
-    Ok(String::from_utf8(to_vec_pretty(value)?).expect("JSON serialization produces UTF-8"))
+    serde_json::to_string_pretty(&StackSafe(value))
+}
+
+pub(crate) fn to_string<Value: Serialize + ?Sized>(
+    value: &Value,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&StackSafe(value))
 }
 
 /// Build a JSON value without a recursive serialization limit.

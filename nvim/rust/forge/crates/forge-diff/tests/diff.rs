@@ -44,7 +44,7 @@ fn applying_and_reversing_raw_hunks_reconstruct_exact_canonical_bytes() {
     }
     for old in &fixture {
         for new in &fixture {
-            let diff = compute_hunks(pair(old, new, Representation::GitCanonical)).unwrap();
+            let diff = compute_hunks(pair(old, new, Representation::GitCanonical));
             assert_eq!(
                 forge_diff::raw::compute_counts(diff.source()),
                 diff.line_counts()
@@ -70,7 +70,7 @@ fn added_and_deleted_sources_have_exact_synthetic_ranges() {
         assert_eq!(synthetic.hunks().len(), 1);
         assert_eq!(synthetic.hunks()[0].old_bytes, 0..old.len());
         assert_eq!(synthetic.hunks()[0].new_bytes, 0..new.len());
-        assert_eq!(synthetic.hunks(), compute_hunks(source).unwrap().hunks());
+        assert_eq!(synthetic.hunks(), compute_hunks(source).hunks());
         assert_eq!(reconstruct(&synthetic, false), new);
     }
     assert!(
@@ -88,41 +88,39 @@ fn patch_bodies_preserve_crlf_and_missing_final_newline_markers() {
         b"before\r\nlast",
         b"after\r\nfinal",
         Representation::GitCanonical,
-    ))
-    .unwrap();
+    ));
     assert_eq!(diff.hunks().len(), 1);
     assert_eq!(patch_body(&diff, diff.hunks()[0].id).unwrap().bytes,
         b"-before\r\n-last\n\\ No newline at end of file\n+after\r\n+final\n\\ No newline at end of file\n");
-    let newline_only =
-        compute_hunks(pair(b"same", b"same\n", Representation::GitCanonical)).unwrap();
+    let newline_only = compute_hunks(pair(b"same", b"same\n", Representation::GitCanonical));
     assert_eq!(newline_only.hunks().len(), 1);
     assert_eq!(reconstruct(&newline_only, false), b"same\n");
 }
 
 #[test]
 fn patch_body_rejects_foreign_hunks_and_noncanonical_sources() {
-    let first = compute_hunks(pair(b"old", b"new", Representation::GitCanonical)).unwrap();
-    let other = compute_hunks(pair(b"old", b"different", Representation::GitCanonical)).unwrap();
+    let first = compute_hunks(pair(b"old", b"new", Representation::GitCanonical));
+    let other = compute_hunks(pair(b"old", b"different", Representation::GitCanonical));
     assert_eq!(
         patch_body(&other, first.hunks()[0].id),
         Err(PatchError::UnknownHunk)
     );
     for representation in [Representation::Raw, Representation::DisplayOnly] {
-        let diff = compute_hunks(pair(b"old", b"new", representation)).unwrap();
+        let diff = compute_hunks(pair(b"old", b"new", representation));
         assert_eq!(
             patch_body(&diff, diff.hunks()[0].id),
             Err(PatchError::NonCanonicalSource)
         );
         assert_ne!(diff.hunks()[0].id, first.hunks()[0].id);
     }
-    let repeated = compute_hunks(pair(b"old", b"new", Representation::GitCanonical)).unwrap();
+    let repeated = compute_hunks(pair(b"old", b"new", Representation::GitCanonical));
     assert_eq!(first.hunks(), repeated.hunks());
 }
 
 #[test]
 fn raw_changes_do_not_truncate_at_preview_line_limits() {
     let new = b"added\n".repeat(1200);
-    let diff = compute_hunks(pair(b"", &new, Representation::GitCanonical)).unwrap();
+    let diff = compute_hunks(pair(b"", &new, Representation::GitCanonical));
     assert_eq!(diff.hunks()[0].new_lines, 0..1200);
     assert_eq!(
         patch_body(&diff, diff.hunks()[0].id).unwrap().bytes,

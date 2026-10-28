@@ -147,17 +147,17 @@ fn visit(
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
-            if kind == "variable_declarator" {
-                if let Some(container) = node.parent().filter(|container| {
+            if kind == "variable_declarator"
+                && let Some(container) = node.parent().filter(|container| {
                     container.kind() == "lexical_declaration"
                         || container.kind() == "variable_declaration"
-                }) {
-                    signature = format!(
-                        "{}{}",
-                        &source[container.start_byte()..node.start_byte()],
-                        signature
-                    );
-                }
+                })
+            {
+                signature = format!(
+                    "{}{}",
+                    &source[container.start_byte()..node.start_byte()],
+                    signature
+                );
             }
             if language == SyntaxLanguage::Lua && kind == "function_declaration" {
                 signature = signature

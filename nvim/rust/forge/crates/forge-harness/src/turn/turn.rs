@@ -130,11 +130,10 @@ impl Turn {
 
     pub(crate) fn record_tool_event(
         &mut self,
-        event: &crate::backend::BackendEvent,
+        event: crate::backend::ToolEvent<'_>,
         now_ms: i64,
     ) -> Result<()> {
-        let activity = event.activity.as_ref().expect("tool event");
-        let timestamp = |path: &str| event.data.pointer(path).and_then(serde_json::Value::as_i64);
+        let activity = event.activity();
         let observed = event.observed_at_ms(now_ms);
         let settled = self
             .tool
@@ -144,9 +143,9 @@ impl Turn {
         if !settled {
             self.tool.timing(
                 &activity.id,
-                timestamp("/params/startedAtMs"),
-                timestamp("/params/completedAtMs"),
-                timestamp("/params/item/durationMs"),
+                event.timestamp("/params/startedAtMs"),
+                event.timestamp("/params/completedAtMs"),
+                event.timestamp("/params/item/durationMs"),
             );
         }
         Ok(())
@@ -221,16 +220,15 @@ impl Turn {
         if text.is_empty() {
             return Ok(());
         }
-        if let Some(index) = self.current_message {
-            if self.message[index].kind == kind
-                && self.message[index].delivery == delivery
-                && provider_id.is_none()
-                && self.message[index].provider_id.is_none()
-                && !snapshot
-            {
-                self.message[index].text.push_str(text);
-                return Ok(());
-            }
+        if let Some(index) = self.current_message
+            && self.message[index].kind == kind
+            && self.message[index].delivery == delivery
+            && provider_id.is_none()
+            && self.message[index].provider_id.is_none()
+            && !snapshot
+        {
+            self.message[index].text.push_str(text);
+            return Ok(());
         }
         let index = self.message.len();
         let id = format!("{}:message:{}", self.id, index + 1);
@@ -298,11 +296,13 @@ mod tests {
             summary: None,
             task_update: None,
         };
-        turn.record_tool_event(&event, 10000).unwrap();
+        turn.record_tool_event(event.tool_event().unwrap(), 10000)
+            .unwrap();
         assert_eq!(turn.tools().next().unwrap().elapsed_ms(20000), Some(383));
         let mut late = event;
         late.data = serde_json::json!({"params":{"startedAtMs":1,"completedAtMs":20000,"item":{"durationMs":19999}}});
-        turn.record_tool_event(&late, 20000).unwrap();
+        turn.record_tool_event(late.tool_event().unwrap(), 20000)
+            .unwrap();
         assert_eq!(turn.tools().next().unwrap().elapsed_ms(30000), Some(383));
     }
 

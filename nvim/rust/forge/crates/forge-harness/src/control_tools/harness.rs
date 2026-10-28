@@ -517,8 +517,8 @@ fn conversation(exchange: &Exchange) -> Vec<Value> {
 
 fn exchange_summary(exchange: &Exchange) -> Value {
     let mut value = json!({"session_id":exchange.session_id,"exchange_id":exchange.id,"messages":conversation(exchange)});
-    if exchange.state != ExchangeState::Complete {
-        value["state"] = json!(exchange.state);
+    if exchange.state() != ExchangeState::Complete {
+        value["state"] = json!(exchange.state());
     }
     if !exchange
         .turn

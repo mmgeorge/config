@@ -46,7 +46,7 @@ local function update(state, result, failure, view, captured)
   if failure then state.notice(failure) return end
   if not result then state.notice("Missing notification result") return end
   local effect = result.effect ~= vim.NIL and result.effect or nil
-  if effect and view and captured and type(effect.id) == "string" and #effect.id > 0 and #effect.id <= 256
+  if effect and view and captured and type(effect.id) == "string" and #effect.id > 0
     and effect.document == captured.document and effect.revision == captured.revision
     and effect.view == captured.view and effect.sequence == captured.sequence
     and effect.block == captured.block and effect.target == captured.target

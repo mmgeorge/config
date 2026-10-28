@@ -6,7 +6,7 @@ use std::iter::Peekable;
 use std::ops::Range;
 use std::str::SplitTerminator;
 
-use crate::display::RowKind;
+use crate::display::{RowCoordinates, RowKind};
 
 #[derive(Debug, PartialEq, Eq)]
 /// Rejects malformed input without returning a partial patch.
@@ -194,6 +194,14 @@ impl<'source> PatchHunk<'source> {
             };
             let old_line = (kind != RowKind::Added).then_some(old);
             let new_line = (kind != RowKind::Removed).then_some(new);
+            let coordinates = match kind {
+                RowKind::Added => RowCoordinates::Added { new_line: new },
+                RowKind::Removed => RowCoordinates::Removed { old_line: old },
+                RowKind::Context => RowCoordinates::Context {
+                    old_line: old,
+                    new_line: new,
+                },
+            };
             if old_line.is_some() && old == old_lines.end
                 || new_line.is_some() && new == new_lines.end
             {
@@ -208,10 +216,8 @@ impl<'source> PatchHunk<'source> {
                 lines.next();
             }
             row.push(PatchRow {
-                kind,
                 text,
-                old_line,
-                new_line,
+                coordinates,
                 no_newline,
             });
         }
@@ -230,16 +236,27 @@ impl<'source> PatchHunk<'source> {
 #[derive(Clone, Debug)]
 /// Borrows one source row with its exact old and new file coordinates.
 pub struct PatchRow<'source> {
-    /// Determines side attribution and diff highlighting.
-    pub kind: RowKind,
     /// Original content without the unified-diff prefix or line feed.
     pub text: &'source str,
-    /// Zero-based old source line, absent for additions.
-    pub old_line: Option<usize>,
-    /// Zero-based new source line, absent for removals.
-    pub new_line: Option<usize>,
+    coordinates: RowCoordinates,
     /// The patch explicitly marks this source row as lacking a final newline.
     pub no_newline: bool,
+}
+
+impl PatchRow<'_> {
+    pub fn coordinates(&self) -> RowCoordinates {
+        self.coordinates
+    }
+
+    pub fn kind(&self) -> RowKind {
+        self.coordinates.kind()
+    }
+    pub fn old_line(&self) -> Option<usize> {
+        self.coordinates.old_line()
+    }
+    pub fn new_line(&self) -> Option<usize> {
+        self.coordinates.new_line()
+    }
 }
 
 fn display_hunk(
@@ -248,19 +265,19 @@ fn display_hunk(
     if !hunk
         .row
         .iter()
-        .any(|row| row.kind != RowKind::Context && !row.no_newline && row.text.ends_with('\r'))
+        .any(|row| row.kind() != RowKind::Context && !row.no_newline && row.text.ends_with('\r'))
     {
         return Ok((vec![hunk], 0));
     }
     let old: Vec<_> = hunk
         .row
         .iter()
-        .filter(|row| row.kind != RowKind::Added)
+        .filter(|row| row.kind() != RowKind::Added)
         .collect();
     let new: Vec<_> = hunk
         .row
         .iter()
-        .filter(|row| row.kind != RowKind::Removed)
+        .filter(|row| row.kind() != RowKind::Removed)
         .collect();
     let source = |rows: &[&PatchRow<'_>]| {
         let mut text = String::new();
@@ -280,7 +297,7 @@ fn display_hunk(
     let diff = crate::raw::compute_hunks(crate::source::SourcePair {
         old: source(&old)?,
         new: source(&new)?,
-    })?;
+    });
     let mut old_position = 0;
     let mut new_position = 0;
     let mut line_ending_changes = 0;
@@ -320,22 +337,26 @@ fn display_hunk(
         for change in &diff.hunks()[group.raw_range] {
             while old_position < change.old_lines.start {
                 let mut row = new[new_position].clone();
-                row.kind = RowKind::Context;
-                row.old_line = old[old_position].old_line;
+                row.coordinates = RowCoordinates::Context {
+                    old_line: hunk.old_lines.start + old_position,
+                    new_line: hunk.new_lines.start + new_position,
+                };
                 rows.push(row);
                 old_position += 1;
                 new_position += 1;
             }
-            for row in &old[change.old_lines.clone()] {
+            for (index, row) in old[change.old_lines.clone()].iter().enumerate() {
                 let mut row = (*row).clone();
-                row.kind = RowKind::Removed;
-                row.new_line = None;
+                row.coordinates = RowCoordinates::Removed {
+                    old_line: hunk.old_lines.start + change.old_lines.start + index,
+                };
                 rows.push(row);
             }
-            for row in &new[change.new_lines.clone()] {
+            for (index, row) in new[change.new_lines.clone()].iter().enumerate() {
                 let mut row = (*row).clone();
-                row.kind = RowKind::Added;
-                row.old_line = None;
+                row.coordinates = RowCoordinates::Added {
+                    new_line: hunk.new_lines.start + change.new_lines.start + index,
+                };
                 rows.push(row);
             }
             old_position = change.old_lines.end;
@@ -343,8 +364,10 @@ fn display_hunk(
         }
         while old_position < group.old_lines.end {
             let mut row = new[new_position].clone();
-            row.kind = RowKind::Context;
-            row.old_line = old[old_position].old_line;
+            row.coordinates = RowCoordinates::Context {
+                old_line: hunk.old_lines.start + old_position,
+                new_line: hunk.new_lines.start + new_position,
+            };
             rows.push(row);
             old_position += 1;
             new_position += 1;
@@ -490,8 +513,7 @@ mod tests {
         let raw = compute_hunks(SourcePair {
             old: SourceVersion::new(old.into_bytes(), Representation::Raw).unwrap(),
             new: SourceVersion::new(new.into_bytes(), Representation::Raw).unwrap(),
-        })
-        .unwrap();
+        });
         let mut bytes = Vec::new();
         write_file_header("a/source.rs", "b/source.rs", &mut bytes).unwrap();
         write_unified(&raw, "a/source.rs", "b/source.rs", 3, &mut bytes).unwrap();
@@ -507,19 +529,19 @@ mod tests {
         assert_eq!(
             hunk.row
                 .iter()
-                .filter(|row| row.kind == RowKind::Added)
+                .filter(|row| row.kind() == RowKind::Added)
                 .count(),
             1
         );
         assert_eq!(
             hunk.row
                 .iter()
-                .filter(|row| row.kind == RowKind::Removed)
+                .filter(|row| row.kind() == RowKind::Removed)
                 .count(),
             1
         );
-        assert_eq!(hunk.row[3].old_line, Some(2500));
-        assert_eq!(hunk.row[4].new_line, Some(2500));
+        assert_eq!(hunk.row[3].old_line(), Some(2500));
+        assert_eq!(hunk.row[4].new_line(), Some(2500));
         assert_eq!(
             UnifiedPatch::parse(&source).unwrap().file[0].hunk[0]
                 .row
@@ -542,7 +564,7 @@ mod tests {
             display.file[0].hunk[0]
                 .row
                 .iter()
-                .filter(|row| row.kind == RowKind::Added)
+                .filter(|row| row.kind() == RowKind::Added)
                 .count(),
             1
         );
@@ -550,7 +572,7 @@ mod tests {
             display.file[0].hunk[0]
                 .row
                 .iter()
-                .filter(|row| row.kind == RowKind::Removed)
+                .filter(|row| row.kind() == RowKind::Removed)
                 .count(),
             1
         );
@@ -569,8 +591,7 @@ mod tests {
                     .unwrap(),
                 new: SourceVersion::new(after.as_bytes().to_vec(), Representation::GitCanonical)
                     .unwrap(),
-            })
-            .unwrap();
+            });
             let mut bytes = Vec::new();
             write_file_header("a/folder/a\t中.rs", "b/folder/a\t中.rs", &mut bytes).unwrap();
             write_unified(
@@ -604,8 +625,8 @@ mod tests {
             let mut reconstructed_new = String::new();
             for row in file.hunk.iter().flat_map(|hunk| &hunk.row) {
                 for output in [
-                    row.old_line.map(|_| &mut reconstructed_old),
-                    row.new_line.map(|_| &mut reconstructed_new),
+                    row.old_line().map(|_| &mut reconstructed_old),
+                    row.new_line().map(|_| &mut reconstructed_new),
                 ]
                 .into_iter()
                 .flatten()
@@ -630,9 +651,9 @@ mod tests {
         assert_eq!(hunk.new_lines, 119..121);
         assert_eq!(hunk.row[0].text, "-- source");
         assert_eq!(hunk.row[1].text, "++ source");
-        assert_eq!(hunk.row[2].old_line, Some(100));
-        assert_eq!(hunk.row[2].new_line, Some(120));
-        assert_eq!(patch.file[0].hunk[1].row[0].old_line, Some(899));
+        assert_eq!(hunk.row[2].old_line(), Some(100));
+        assert_eq!(hunk.row[2].new_line(), Some(120));
+        assert_eq!(patch.file[0].hunk[1].row[0].old_line(), Some(899));
     }
 
     #[test]

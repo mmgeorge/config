@@ -185,9 +185,7 @@ impl HarnessBroker {
         let rendered = self.plan_file.render_review(&document)?;
         let (_, _, digest) = self.plan_file.persist_review_draft(
             &self.session.id,
-            plan_id,
-            document,
-            rendered,
+            crate::plan::PlanReviewRevision::new(plan_id, document, rendered)?,
             None,
         )?;
         plan.submitted_version = None;

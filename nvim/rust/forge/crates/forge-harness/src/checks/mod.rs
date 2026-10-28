@@ -35,9 +35,11 @@ pub use preview::CheckPreview;
 pub(crate) use preview::plan as preview_plan;
 pub use queue::CheckTiming;
 pub(crate) use queue::CompletionQueue;
-pub use report::{CheckReport, CheckResult};
+pub use report::{CheckReport, CheckResult, CheckResultState};
 pub(crate) use response::DetailRequest;
-pub use selection::{CheckCase, CheckReceipt, CheckRunRequest, CheckSelection, RunRequest};
+pub use selection::{
+    CheckCase, CheckReceipt, CheckRunRequest, CheckSelection, RunRequest, SelectedChecks,
+};
 pub(crate) use supervisor::CheckAdmission;
 pub use supervisor::CheckSupervisor;
 pub(crate) use tools::CheckAuthority;

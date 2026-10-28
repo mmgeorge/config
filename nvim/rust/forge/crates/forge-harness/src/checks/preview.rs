@@ -1,4 +1,4 @@
-use super::{CheckCategory, CheckConfig, CheckScope, CheckSelection, RunRequest};
+use super::{CheckCategory, CheckConfig, CheckScope, CheckSelection};
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -78,19 +78,19 @@ pub(super) async fn resolve(
     new_cases: Option<&[super::CheckCase]>,
     included: &[String],
 ) -> Result<Vec<CheckPreview>> {
-    let request = RunRequest {
+    let request = crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
         include: included.to_vec(),
         ..Default::default()
-    };
+    });
     let applicability = super::applicability::resolve(&request, config, Some(files), true)?;
-    let request = RunRequest {
+    let request = crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
         ids: applicability
             .iter()
             .filter(|item| item.selected)
             .map(|item| item.id.clone())
             .collect(),
         ..Default::default()
-    };
+    });
     let selection = if request.ids.is_empty() {
         BTreeMap::new()
     } else {
@@ -99,10 +99,7 @@ pub(super) async fn resolve(
     let mut result = Vec::new();
     for index in config.order_selected(&request.ids.iter().cloned().collect())? {
         let definition = &config.definitions[index];
-        let applicable = applicability
-            .iter()
-            .find(|item| item.id == definition.id)
-            .unwrap();
+        let applicable = &applicability[index];
         let scope = selection
             .get(&definition.id)
             .cloned()

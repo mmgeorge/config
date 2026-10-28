@@ -353,11 +353,11 @@ impl BrokerObserver {
                 interaction
                     .iter()
                     .rev()
-                    .filter(|interaction| interaction.awaiting_input)
+                    .filter(|interaction| interaction.awaiting_input())
                     .find_map(|interaction| {
                         interaction
-                            .elicitation
-                            .clone()
+                            .elicitation()
+                            .cloned()
                             .map(|elicitation| ActiveElicitation {
                                 owner: ElicitationOwner::Interaction,
                                 plan_id: interaction.plan_id.clone(),
@@ -906,7 +906,11 @@ impl BrokerObserver {
             plan_id,
             execution.revision,
         )?;
-        let delta = crate::plan::revision::DeclarationDelta::between(Some(&original), &current)?;
+        let design = current
+            .design
+            .as_ref()
+            .context("accepted execution plan has no declaration design")?;
+        let delta = crate::plan::revision::DeclarationDelta::between(Some(&original), design)?;
         report.push_str("\n### Original approved to current accepted revision\n\n");
         if delta.document.is_empty() && delta.files.is_empty() {
             report.push_str("No revisions to the approved design.\n");

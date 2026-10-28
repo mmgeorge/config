@@ -417,7 +417,7 @@ async fn invalid_scope_and_byte_overflow_do_not_consume_admission() {
     use forge_github::queue::RemoteScope;
     let queue = RemoteQueue::default();
     let target = resource("github.com", 7);
-    for identity in ["".to_owned(), "x".repeat(257), "bad identity".to_owned()] {
+    for identity in ["".to_owned(), "bad identity".to_owned()] {
         assert!(
             queue
                 .enqueue_scoped(
@@ -461,4 +461,37 @@ async fn invalid_scope_and_byte_overflow_do_not_consume_admission() {
             .enqueue(target, RemoteIntent::Mutation, 16 * 1024 * 1024)
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn long_scopes_keep_exact_reconciliation_identity_and_accounting() {
+    use forge_github::queue::RemoteScope;
+    let queue = RemoteQueue::default();
+    let target = resource("github.com", 8);
+    let identity = "scope".repeat(1024);
+    let scope = RemoteScope::Comment(identity.clone().into_boxed_str());
+    let mut active = queue
+        .enqueue_scoped(target.clone(), scope.clone(), RemoteIntent::Mutation, 17)
+        .unwrap()
+        .ready()
+        .await
+        .unwrap();
+    assert_eq!(queue.retained_bytes(), identity.len() + 17);
+    active.begin_mutation().unwrap();
+    drop(active);
+    assert_eq!(queue.retained_bytes(), 0);
+    assert!(
+        queue
+            .enqueue_scoped(target.clone(), scope.clone(), RemoteIntent::Mutation, 0)
+            .is_err()
+    );
+    queue
+        .enqueue_scoped(target.clone(), scope, RemoteIntent::Reconcile, 0)
+        .unwrap()
+        .ready()
+        .await
+        .unwrap()
+        .complete(RemoteCompletion::Reconciled)
+        .unwrap();
+    assert!(queue.enqueue(target, RemoteIntent::Mutation, 0).is_ok());
 }

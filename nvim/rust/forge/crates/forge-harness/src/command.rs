@@ -119,11 +119,11 @@ impl SessionCoordinator {
                 existing.method == method && existing.params == *params,
                 "command identity was reused for a different intent"
             );
-            if !existing
+            if existing
                 .response
                 .as_ref()
                 .and_then(Response::error)
-                .is_some_and(|error| error.code == "not_admitted")
+                .is_none_or(|error| error.code != "not_admitted")
             {
                 return Ok(match &existing.response {
                     Some(response) => CommandAdmission::Recorded(response.clone()),

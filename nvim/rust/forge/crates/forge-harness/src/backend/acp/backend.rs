@@ -91,7 +91,8 @@ impl AcpBackend {
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             return Err(crate::broker::TurnCancelled.into());
         }
-        let runtime_key = request.runtime_key()?;
+        let owner = request.owner()?;
+        let runtime_key = owner.runtime_key();
         let preparation = self
             .preparation
             .lock()
@@ -151,7 +152,7 @@ impl AcpBackend {
         *state.tool_definition.write().await = tools.unwrap_or_else(|| {
             crate::control_tools::ControlToolRegistry
                 .definition_list_for_owner(
-                    &request.owner().expect("validated runtime owner"),
+                    &owner,
                     setting.desired.subagent_tools.unwrap_or(false),
                     setting.desired.lsp_tools.unwrap_or(false),
                 )
@@ -199,20 +200,15 @@ impl AcpBackend {
                     );
                 }
             }
-            Some(ResourceProfile::antigravity(
+            ResourceProfile::antigravity(
                 &self.settings_root,
                 &ResourceProfile::native_home()?,
                 selected_skill,
-            )?)
+            )?
         } else {
-            Some(ResourceProfile::claude(
-                &self.settings_root,
-                selected_skill,
-            )?)
+            ResourceProfile::claude(&self.settings_root, selected_skill)?
         };
-        let environment_profile = (self.kind == BackendKind::Antigravity)
-            .then(|| profile.as_ref().map(ResourceProfile::path))
-            .flatten();
+        let environment_profile = (self.kind == BackendKind::Antigravity).then(|| profile.path());
         let transport = AcpTransport::launch(
             &self.runtime.resolve()?,
             &request.workspace,
@@ -259,7 +255,7 @@ impl AcpBackend {
             parameter["_meta"]["claudeCode"]["options"]["settings"] =
                 json!({"permissions":{"ask":["*"]}});
             parameter["_meta"]["claudeCode"]["options"]["plugins"] = json!([
-                {"type":"local","path":profile.as_ref().expect("Claude profile").path()}
+                {"type":"local","path":profile.path()}
             ]);
             parameter["_meta"]["claudeCode"]["options"]["skills"] = json!(
                 selected_skill
@@ -300,7 +296,7 @@ impl AcpBackend {
             turn: Mutex::new(()),
             initialized,
             configuration: parameter,
-            _profile: profile,
+            _profile: Some(profile),
         });
         if has_history {
             self.conversation
@@ -369,11 +365,7 @@ impl AcpBackend {
         } else {
             None
         };
-        let desired = if let Some(mode) = plan_mode {
-            mode
-        } else {
-            "default"
-        };
+        let desired = plan_mode.unwrap_or("default");
         if modes.is_some_and(|modes| modes.iter().any(|mode| mode["id"] == desired)) {
             session
                 .transport
@@ -700,7 +692,7 @@ impl Backend for AcpBackend {
                     scope: server.scope,
                     source_path: Some(server.source),
                     name: server.name,
-                    transport: server.transport,
+                    transport: server.transport.as_str().into(),
                     enabled,
                     status: if enabled {
                         McpStatus::Unavailable
@@ -806,7 +798,10 @@ impl Backend for AcpBackend {
         let prompt =
             crate::attachment::acp_input(prompt, &request.input_attachments(), image_supported)
                 .await?;
-        session.state.begin(&request, &session.id, sink).await;
+        session
+            .state
+            .begin(&request, request.owner()?, &session.id, sink)
+            .await;
         self.conversation
             .lock()
             .await

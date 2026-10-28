@@ -506,9 +506,8 @@ async fn every_parsed_function_language_omits_added_and_removed_bodies() {
                 "{path}: {output}"
             );
             if !closing.is_empty() {
-                assert_eq!(
-                    output.contains(&format!("{marker} {}", closing.trim_end())),
-                    false,
+                assert!(
+                    !output.contains(&format!("{marker} {}", closing.trim_end())),
                     "{path}: {output}"
                 );
             }

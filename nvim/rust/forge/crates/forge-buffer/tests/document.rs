@@ -69,6 +69,7 @@ fn node_enum_spelling_matches_the_editor_contract() {
     let mut kind = serde_json::json!([
         NodeKind::Exchange,
         NodeKind::Message,
+        NodeKind::Thought,
         NodeKind::ToolGroup,
         NodeKind::Tool,
         NodeKind::Changes,

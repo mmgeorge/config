@@ -141,12 +141,164 @@ impl AgentCommandSender {
     }
 }
 
-#[derive(Clone, Debug)]
-/// Reserves capacity before persistence and separates admission from provider launch.
-pub struct AgentAdmission {
+#[derive(Debug)]
+/// Owns committed child work with immutable session, agent, task, and exchange identities.
+pub struct AgentWork {
     pub agent: Agent,
     pub task: AgentTask,
     pub launch: bool,
+    execution: AdmittedExecution,
+}
+
+#[derive(Debug)]
+/// Exposes candidate data while only the coordinator can admit its execution.
+pub struct ReservedAgentWork {
+    pub agent: Agent,
+    pub task: AgentTask,
+    pub launch: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AdmittedExecution {
+    owner: ExecutionOwner,
+    task: crate::backend::TaskId,
+    exchange: crate::backend::ExchangeId,
+}
+
+impl AgentWork {
+    pub fn owner(&self) -> &ExecutionOwner {
+        &self.execution.owner
+    }
+    pub fn task_id(&self) -> &crate::backend::TaskId {
+        &self.execution.task
+    }
+    pub fn exchange_id(&self) -> &crate::backend::ExchangeId {
+        &self.execution.exchange
+    }
+}
+
+impl ReservedAgentWork {
+    fn committed(&self) -> AgentWork {
+        AgentWork {
+            agent: self.agent.clone(),
+            task: self.task.clone(),
+            launch: self.launch,
+            execution: AdmittedExecution {
+                owner: ExecutionOwner {
+                    session_id: self.agent.session_id.clone().into(),
+                    agent_id: self.agent.id.clone().into(),
+                },
+                task: self.task.id.clone().into(),
+                exchange: self.task.id.clone().into(),
+            },
+        }
+    }
+}
+
+#[must_use]
+/// Owns reserved capacity until commit, cancellation, or the last handle is dropped.
+pub struct AgentAdmission {
+    owner: Arc<Mutex<AgentStateStore>>,
+    work: Arc<ReservedAgentWork>,
+}
+
+pub enum AgentCommit {
+    Admitted(AgentWork),
+    Existing(AgentWork),
+}
+
+enum AdmissionRelease {
+    Cancel,
+    LastHandle,
+}
+
+impl std::ops::Deref for AgentAdmission {
+    type Target = ReservedAgentWork;
+
+    fn deref(&self) -> &Self::Target {
+        &self.work
+    }
+}
+
+impl AgentAdmission {
+    pub fn commit(self) -> Result<AgentCommit> {
+        let mut state = self
+            .owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent state poisoned"))?;
+        let admission = &self.work;
+        if state.task_by_id.contains_key(&admission.task.id) {
+            return Ok(AgentCommit::Existing(admission.committed()));
+        }
+        ensure!(
+            state
+                .admission_by_operation
+                .get(&admission.task.operation_id)
+                .is_some_and(|reserved| Arc::ptr_eq(reserved, admission)),
+            "child reservation was cancelled"
+        );
+        if admission.launch {
+            ensure!(
+                !state.execution_by_agent.contains_key(&admission.agent.id),
+                "child already owns an active provider turn"
+            );
+            let (cancellation, _) = watch::channel(false);
+            state.execution_by_agent.insert(
+                admission.agent.id.clone(),
+                ChildExecution {
+                    active_task_id: admission.task.id.clone(),
+                    pending: VecDeque::new(),
+                    cancellation,
+                    cleanup_failed: false,
+                },
+            );
+        } else {
+            state
+                .execution_by_agent
+                .get_mut(&admission.agent.id)
+                .context("queued task lost its active child")?
+                .pending
+                .push_back(admission.task.id.clone());
+        }
+        state
+            .agent_by_id
+            .insert(admission.agent.id.clone(), admission.agent.clone());
+        state
+            .task_by_id
+            .insert(admission.task.id.clone(), admission.task.clone());
+        Ok(AgentCommit::Admitted(admission.committed()))
+    }
+
+    pub fn cancel(self) -> Result<()> {
+        self.release(AdmissionRelease::Cancel)
+    }
+
+    fn release(&self, mode: AdmissionRelease) -> Result<()> {
+        let mut state = self
+            .owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent state poisoned"))?;
+        if matches!(mode, AdmissionRelease::LastHandle) && Arc::strong_count(&self.work) != 2 {
+            return Ok(());
+        }
+        if !state.task_by_id.contains_key(&self.work.task.id)
+            && state
+                .admission_by_operation
+                .get(&self.work.task.operation_id)
+                .is_some_and(|reserved| Arc::ptr_eq(reserved, &self.work))
+        {
+            state
+                .admission_by_operation
+                .remove(&self.work.task.operation_id);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AgentAdmission {
+    fn drop(&mut self) {
+        let _ = self.release(AdmissionRelease::LastHandle);
+    }
 }
 
 struct ChildExecution {
@@ -161,7 +313,7 @@ struct AgentStateStore {
     quiescence_count: usize,
     agent_by_id: HashMap<String, Agent>,
     task_by_id: HashMap<String, AgentTask>,
-    admission_by_operation: HashMap<String, AgentAdmission>,
+    admission_by_operation: HashMap<String, Arc<ReservedAgentWork>>,
     execution_by_agent: HashMap<String, ChildExecution>,
 }
 
@@ -169,7 +321,7 @@ struct AgentStateStore {
 pub struct AgentCoordinator {
     session_id: String,
     enabled: AtomicBool,
-    state: Mutex<AgentStateStore>,
+    state: Arc<Mutex<AgentStateStore>>,
     receiver: Mutex<mpsc::Receiver<AgentCommand>>,
     sender: AgentCommandSender,
     activity: watch::Sender<u64>,
@@ -204,7 +356,7 @@ impl AgentCoordinator {
         Arc::new(Self {
             session_id,
             enabled: AtomicBool::new(false),
-            state: Mutex::new(AgentStateStore::default()),
+            state: Arc::new(Mutex::new(AgentStateStore::default())),
             receiver: Mutex::new(receiver),
             sender: AgentCommandSender { sender, revision },
             activity,
@@ -342,7 +494,10 @@ impl AgentCoordinator {
                     && existing.task.parent_exchange_id == parent_exchange_id,
                 "operation identity was reused for different child work"
             );
-            return Ok(existing.clone());
+            return Ok(AgentAdmission {
+                owner: self.state.clone(),
+                work: existing.clone(),
+            });
         }
         ensure!(
             state.quiescence_count == 0,
@@ -399,15 +554,18 @@ impl AgentCoordinator {
             last_activity_at_ms: None,
             completed_at_ms: None,
         };
-        let admission = AgentAdmission {
+        let admission = Arc::new(ReservedAgentWork {
             agent,
             task,
             launch: true,
-        };
+        });
         state
             .admission_by_operation
             .insert(request.operation_id.clone(), admission.clone());
-        Ok(admission)
+        Ok(AgentAdmission {
+            owner: self.state.clone(),
+            work: admission,
+        })
     }
 
     pub fn reserve_followup(
@@ -429,7 +587,10 @@ impl AgentCoordinator {
                     && existing.task.parent_exchange_id == parent_exchange_id,
                 "operation identity was reused for different child work"
             );
-            return Ok(existing.clone());
+            return Ok(AgentAdmission {
+                owner: self.state.clone(),
+                work: existing.clone(),
+            });
         }
         ensure!(
             state.quiescence_count == 0,
@@ -507,70 +668,18 @@ impl AgentCoordinator {
             last_activity_at_ms: None,
             completed_at_ms: None,
         };
-        let admission = AgentAdmission {
+        let admission = Arc::new(ReservedAgentWork {
             agent,
             task,
             launch,
-        };
+        });
         state
             .admission_by_operation
             .insert(request.operation_id.clone(), admission.clone());
-        Ok(admission)
-    }
-
-    pub fn reject(&self, operation_id: &str) {
-        let mut state = self.state.lock().expect("agent state poisoned");
-        if state
-            .admission_by_operation
-            .get(operation_id)
-            .is_some_and(|admission| !state.task_by_id.contains_key(&admission.task.id))
-        {
-            state.admission_by_operation.remove(operation_id);
-        }
-    }
-
-    pub fn commit(&self, admission: &AgentAdmission) -> Result<bool> {
-        let mut state = self.state.lock().expect("agent state poisoned");
-        if state.task_by_id.contains_key(&admission.task.id) {
-            return Ok(false);
-        }
-        ensure!(
-            state
-                .admission_by_operation
-                .get(&admission.task.operation_id)
-                .is_some_and(|reserved| reserved.task.id == admission.task.id),
-            "child admission has no capacity reservation"
-        );
-        if admission.launch {
-            ensure!(
-                !state.execution_by_agent.contains_key(&admission.agent.id),
-                "child already owns an active provider turn"
-            );
-            let (cancellation, _) = watch::channel(false);
-            state.execution_by_agent.insert(
-                admission.agent.id.clone(),
-                ChildExecution {
-                    active_task_id: admission.task.id.clone(),
-                    pending: VecDeque::new(),
-                    cancellation,
-                    cleanup_failed: false,
-                },
-            );
-        } else {
-            state
-                .execution_by_agent
-                .get_mut(&admission.agent.id)
-                .context("queued task lost its active child")?
-                .pending
-                .push_back(admission.task.id.clone());
-        }
-        state
-            .agent_by_id
-            .insert(admission.agent.id.clone(), admission.agent.clone());
-        state
-            .task_by_id
-            .insert(admission.task.id.clone(), admission.task.clone());
-        Ok(true)
+        Ok(AgentAdmission {
+            owner: self.state.clone(),
+            work: admission,
+        })
     }
 
     pub fn cancellation(&self, agent_id: &str, task_id: &str) -> Result<watch::Receiver<bool>> {
@@ -704,7 +813,7 @@ impl AgentCoordinator {
         agent_id: &str,
         task_id: &str,
         cleanup_failed: bool,
-    ) -> Result<Option<AgentAdmission>> {
+    ) -> Result<Option<AgentWork>> {
         let mut state = self.state.lock().expect("agent state poisoned");
         let Some(execution) = state.execution_by_agent.get_mut(agent_id) else {
             return Ok(None);
@@ -737,7 +846,15 @@ impl AgentCoordinator {
                 .get(&next)
                 .context("queued child task missing")?
                 .clone();
-            Ok(Some(AgentAdmission {
+            Ok(Some(AgentWork {
+                execution: AdmittedExecution {
+                    owner: ExecutionOwner {
+                        session_id: self.session_id.clone().into(),
+                        agent_id: agent.id.clone().into(),
+                    },
+                    task: task.id.clone().into(),
+                    exchange: task.id.clone().into(),
+                },
                 agent,
                 task,
                 launch: true,

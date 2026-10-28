@@ -1038,12 +1038,24 @@ mod tests {
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace)?;
         let original = store.prepare(&request("cancel me"), super::super::BackendKind::Codex)?;
-        original.sending(SubmissionTarget::Untracked)?;
         original.cancel()?;
         let next = store.prepare(&request("new"), super::super::BackendKind::Codex)?;
         let mut new = request("new");
         next.recover(&Provider::new(), &mut new).await?;
         assert!(new.recovered_input.is_empty());
+        next.sending(SubmissionTarget::Untracked)?;
+        next.cancel()?;
+        assert!(matches!(
+            next.record()?.delivery,
+            SubmissionState::Sending { .. }
+        ));
+        let following = store.prepare(&request("following"), super::super::BackendKind::Codex)?;
+        assert!(
+            following
+                .recover(&Provider::new(), &mut request("following"))
+                .await
+                .is_err()
+        );
         Ok(())
     }
 }

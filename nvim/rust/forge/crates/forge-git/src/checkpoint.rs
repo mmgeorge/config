@@ -267,18 +267,17 @@ pub fn inventory(
                             gix::attrs::State::Unspecified | gix::attrs::State::Unset
                         )
                     }))
+                && let Some(size) = signature.checkout_size.get(path)
             {
-                if let Some(size) = signature.checkout_size.get(path) {
-                    let physical_size = u64::from(*size);
-                    let blob_size = repository
-                        .find_header(gix::ObjectId::from_hex(file.object_id.as_bytes())?)?
-                        .size();
-                    if physical_size >= blob_size && physical_size <= blob_size.saturating_mul(2) {
-                        rule.crlf = physical_size > blob_size;
-                        rule.automatic = false;
-                    } else {
-                        candidate.insert(path.clone());
-                    }
+                let physical_size = u64::from(*size);
+                let blob_size = repository
+                    .find_header(gix::ObjectId::from_hex(file.object_id.as_bytes())?)?
+                    .size();
+                if physical_size >= blob_size && physical_size <= blob_size.saturating_mul(2) {
+                    rule.crlf = physical_size > blob_size;
+                    rule.automatic = false;
+                } else {
+                    candidate.insert(path.clone());
                 }
             }
             file.checkout = rule;

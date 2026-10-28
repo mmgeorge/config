@@ -348,18 +348,22 @@ pub fn append_display_row(
     change: Option<crate::presentation::RowChange>,
     indent: usize,
 ) -> Result<(), ContractError> {
-    let change = change.unwrap_or_else(|| match display.kind {
+    let change = change.unwrap_or_else(|| match display.kind() {
         RowKind::Added => crate::presentation::RowChange::Added,
         RowKind::Removed => crate::presentation::RowChange::Removed,
         RowKind::Context => crate::presentation::RowChange::Context,
     });
     let (_, background, number, emphasis) = change.style();
-    let old = display.old.map_or(String::new(), |coordinate| {
-        (coordinate.line + 1).to_string()
-    });
-    let new = display.new.map_or(String::new(), |coordinate| {
-        (coordinate.line + 1).to_string()
-    });
+    let old = display
+        .old_coordinate()
+        .map_or(String::new(), |coordinate| {
+            (coordinate.line + 1).to_string()
+        });
+    let new = display
+        .new_coordinate()
+        .map_or(String::new(), |coordinate| {
+            (coordinate.line + 1).to_string()
+        });
     let old_width = group.old_lines.end.to_string().len().max(3);
     let new_width = group.new_lines.end.to_string().len().max(3);
     append_change_row(
@@ -369,7 +373,7 @@ pub fn append_display_row(
         vec![
             TextChunk {
                 text: format!("{old:>old_width$}"),
-                capture: if display.old.is_some() {
+                capture: if display.old_coordinate().is_some() {
                     number
                 } else {
                     background
@@ -382,7 +386,7 @@ pub fn append_display_row(
             },
             TextChunk {
                 text: format!("{new:>new_width$}"),
-                capture: if display.new.is_some() {
+                capture: if display.new_coordinate().is_some() {
                     number
                 } else {
                     background
@@ -409,10 +413,10 @@ pub fn append_display_row(
             priority: 100,
         });
     }
-    let (syntax, coordinate) = if display.kind == RowKind::Removed {
-        (old_syntax, display.old)
+    let (syntax, coordinate) = if display.kind() == RowKind::Removed {
+        (old_syntax, display.old_coordinate())
     } else {
-        (new_syntax, display.new)
+        (new_syntax, display.new_coordinate())
     };
     if let (Some(syntax), Some(coordinate)) = (syntax, coordinate) {
         append_syntax_row(metadata, syntax, coordinate.line, row, &display.text)?;
@@ -473,7 +477,6 @@ pub fn append_syntax_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{SourceCoordinate, SourceSide};
 
     #[test]
     fn shared_diff_margin_aligns_headers_and_preserves_source_coordinates() {
@@ -528,7 +531,7 @@ mod tests {
                 assert_eq!(metadata.gutter[0].chunk.remove(0).text, prefix);
             }
             assert_eq!(metadata.gutter, baseline.gutter);
-            assert_eq!(hunk.row[1].new_line, Some(0));
+            assert_eq!(hunk.row[1].new_line(), Some(0));
         }
     }
 
@@ -638,12 +641,8 @@ mod tests {
         let row = DisplayRow {
             group_index: 0,
             text: "λnew".into(),
-            kind: RowKind::Added,
-            old: None,
-            new: Some(SourceCoordinate {
-                side: SourceSide::New,
-                line: 6,
-                byte_column: 0,
+            source: crate::display::DisplaySource::Diff(crate::display::RowCoordinates::Added {
+                new_line: 6,
             }),
             raw_id: None,
             emphasis: vec![0..2],
@@ -707,9 +706,9 @@ mod tests {
         let row = DisplayRow {
             group_index: 0,
             text: "new".into(),
-            kind: RowKind::Added,
-            old: None,
-            new: None,
+            source: crate::display::DisplaySource::Diff(crate::display::RowCoordinates::Added {
+                new_line: 0,
+            }),
             raw_id: None,
             emphasis: Vec::new(),
             emphasis_fallback: None,
@@ -740,16 +739,13 @@ mod tests {
             let row = DisplayRow {
                 group_index: 0,
                 text: "text".into(),
-                kind,
-                old: (kind != RowKind::Added).then_some(SourceCoordinate {
-                    side: SourceSide::Old,
-                    line: 998,
-                    byte_column: 0,
-                }),
-                new: (kind != RowKind::Removed).then_some(SourceCoordinate {
-                    side: SourceSide::New,
-                    line: 6,
-                    byte_column: 0,
+                source: crate::display::DisplaySource::Diff(match kind {
+                    RowKind::Added => crate::display::RowCoordinates::Added { new_line: 6 },
+                    RowKind::Removed => crate::display::RowCoordinates::Removed { old_line: 998 },
+                    RowKind::Context => crate::display::RowCoordinates::Context {
+                        old_line: 998,
+                        new_line: 6,
+                    },
                 }),
                 raw_id: None,
                 emphasis: Vec::new(),

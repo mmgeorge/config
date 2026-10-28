@@ -277,7 +277,6 @@ mod tests {
             new: SourceVersion::new(after.as_bytes().to_vec(), Representation::GitCanonical)
                 .unwrap(),
         })
-        .unwrap()
     }
 
     #[test]

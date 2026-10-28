@@ -504,8 +504,9 @@ fn project_annotation(
         &format!("# {}", annotation.title),
         content_width,
     )?;
-    push(&mut blocks, "annotation:anchor", anchor, content_width)?;
-    color_block(blocks.last_mut().unwrap(), "ForgeWalkthroughLocation");
+    let mut location = render_block("annotation:anchor", anchor, content_width)?;
+    color_block(&mut location, "ForgeWalkthroughLocation");
+    blocks.push(location);
     if stale {
         push(
             &mut blocks,
@@ -527,8 +528,8 @@ fn project_annotation(
 }
 
 fn color_block(block: &mut BufferBlock, capture: &str) {
-    for row in 0..block.text.row_count() {
-        let length = block.text.row(row).unwrap().len();
+    for (row, text) in block.text.rows().enumerate() {
+        let length = text.len();
         if length > 0 {
             block.metadata.decoration.push(Decoration {
                 range: TextRange {
@@ -554,16 +555,17 @@ fn frame_annotation(blocks: &mut Vec<BufferBlock>, width: &WidthProfile) -> Resu
                 decoration.range.end.column += "│ ".len();
             }
         }
-        let rows = (0..row_count)
-            .map(|row| {
-                let text = block.text.row(row).unwrap();
+        let rows = block
+            .text
+            .rows()
+            .map(|text| {
                 let padding = width.columns.saturating_sub(width.cells(text, 0)? + 4);
                 Ok(format!("│ {text}{} │", " ".repeat(padding)))
             })
             .collect::<Result<Vec<_>>>()?;
         block.text = BufferText::from_rows(rows)?;
-        for row in 0..row_count {
-            let length = block.text.row(row).unwrap().len();
+        for (row, text) in block.text.rows().enumerate() {
+            let length = text.len();
             for (start, end) in [(0, "│".len()), (length - "│".len(), length)] {
                 block.metadata.decoration.push(Decoration {
                     range: TextRange {
@@ -576,22 +578,20 @@ fn frame_annotation(blocks: &mut Vec<BufferBlock>, width: &WidthProfile) -> Resu
             }
         }
     }
-    let mut edge = Vec::new();
-    push(
-        &mut edge,
+    let mut edge = render_block(
         "annotation:top",
         &format!("╭{}╮", "─".repeat(width.columns - 2)),
         width,
     )?;
-    color_block(&mut edge[0], "ForgeReviewCommentHeader");
-    blocks.insert(0, edge.remove(0));
-    push(
-        blocks,
+    color_block(&mut edge, "ForgeReviewCommentHeader");
+    blocks.insert(0, edge);
+    let mut edge = render_block(
         "annotation:bottom",
         &format!("╰{}╯", "─".repeat(width.columns - 2)),
         width,
     )?;
-    color_block(blocks.last_mut().unwrap(), "ForgeReviewCommentHeader");
+    color_block(&mut edge, "ForgeReviewCommentHeader");
+    blocks.push(edge);
     Ok(())
 }
 fn reflow(document: &mut WalkthroughDocument, width: WidthProfile) -> Result<Option<BufferPatch>> {
@@ -660,15 +660,12 @@ fn project(
                 })
                 .collect::<Vec<_>>()
                 .join("   ·   ");
-            push(
-                &mut block,
+            let mut inventory = render_block(
                 "inventory",
                 &format!("## Semantic inventory\n{text}"),
                 width,
             )?;
-            let inventory = block.last_mut().unwrap();
-            for row in 0..inventory.text.row_count() {
-                let text = inventory.text.row(row).unwrap();
+            for (row, text) in inventory.text.rows().enumerate() {
                 for (column, character) in text.char_indices() {
                     let capture = match character {
                         '+' => "ForgeWalkthroughActionAdd",
@@ -696,6 +693,7 @@ fn project(
                     });
                 }
             }
+            block.push(inventory);
         }
         None if document.inventory_diagnostic.is_none() => {}
         None => push(
@@ -713,22 +711,19 @@ fn project(
     }
     for (task_index, task) in document.artifact.tasks.iter().enumerate() {
         let task_id = format!("task:{task_index}");
-        let task_header = block.len();
-        push(
-            &mut block,
+        let mut task_header = render_block(
             &task_id,
             &format!("## {}. {}", task_index + 1, task.title),
             width,
         )?;
-        color_block(block.last_mut().unwrap(), "ForgeWalkthroughItemTitle");
+        color_block(&mut task_header, "ForgeWalkthroughItemTitle");
+        let mut task_body = Vec::new();
         if let Some(text) = &task.justification {
-            push(&mut block, &format!("{task_id}:why"), text, width)?;
+            push(&mut task_body, &format!("{task_id}:why"), text, width)?;
         }
         for (subtask_index, subtask) in task.subtasks.iter().enumerate() {
             let subtask_id = format!("{task_id}:subtask:{subtask_index}");
-            let subtask_header = block.len();
-            push(
-                &mut block,
+            let mut subtask_header = render_block(
                 &subtask_id,
                 &format!(
                     "### {}.{}. {}",
@@ -738,14 +733,14 @@ fn project(
                 ),
                 width,
             )?;
-            color_block(block.last_mut().unwrap(), "ForgeWalkthroughItemTitle");
+            color_block(&mut subtask_header, "ForgeWalkthroughItemTitle");
+            let mut subtask_body = Vec::new();
             if let Some(text) = &subtask.justification {
-                push(&mut block, &format!("{subtask_id}:why"), text, width)?;
+                push(&mut subtask_body, &format!("{subtask_id}:why"), text, width)?;
             }
             for (change_index, change) in subtask.changes.iter().enumerate() {
                 let change_id = format!("{subtask_id}:change:{change_index}");
-                push(
-                    &mut block,
+                let mut current = render_block(
                     &change_id,
                     &format!(
                         "**{}.{}.{} · {:?} {:?}: {}**\n{}{}{}",
@@ -774,13 +769,12 @@ fn project(
                     ),
                     width,
                 )?;
-                let current = block.last_mut().expect("change block");
                 current.metadata.decoration.push(Decoration {
                     range: TextRange {
                         start: TextPosition { row: 0, column: 0 },
                         end: TextPosition {
                             row: 0,
-                            column: current.text.row(0).unwrap().len(),
+                            column: current.text.rows().next().map_or(0, str::len),
                         },
                     },
                     capture: match change.action {
@@ -792,7 +786,6 @@ fn project(
                     priority: 140,
                 });
                 if change.annotation.is_some() {
-                    let current = block.last_mut().expect("change block");
                     let id = TargetId(format!("walkthrough:{change_id}"));
                     current.metadata.target.clear();
                     current.metadata.target.push(TargetRange {
@@ -807,22 +800,38 @@ fn project(
                     });
                     target.insert(id, (task_index, subtask_index, change_index));
                 }
+                subtask_body.push(current);
             }
-            fold(&mut block, subtask_header, &subtask_id, true);
+            append_fold(
+                &mut task_body,
+                subtask_header,
+                subtask_body,
+                &subtask_id,
+                true,
+            );
         }
-        fold(&mut block, task_header, &task_id, false);
+        append_fold(&mut block, task_header, task_body, &task_id, false);
     }
     Ok((block, target))
 }
 fn push(block: &mut Vec<BufferBlock>, id: &str, source: &str, width: &WidthProfile) -> Result<()> {
+    block.push(render_block(id, source, width)?);
+    Ok(())
+}
+fn render_block(id: &str, source: &str, width: &WidthProfile) -> Result<BufferBlock> {
     let mut rendered =
         MarkdownRenderer::render(BlockId(format!("walkthrough:{id}")), source, width)?.block;
     rendered.metadata.target.clear();
-    block.push(rendered);
-    Ok(())
+    Ok(rendered)
 }
-fn fold(block: &mut [BufferBlock], header: usize, id: &str, closed: bool) {
-    let last = block.last().expect("fold body");
+fn append_fold(
+    block: &mut Vec<BufferBlock>,
+    mut header: BufferBlock,
+    body: Vec<BufferBlock>,
+    id: &str,
+    closed: bool,
+) {
+    let last = body.last().unwrap_or(&header);
     let end = BlockAnchor {
         block: last.id.clone(),
         position: TextPosition {
@@ -830,7 +839,6 @@ fn fold(block: &mut [BufferBlock], header: usize, id: &str, closed: bool) {
             column: 0,
         },
     };
-    let header = &mut block[header];
     header.metadata.fold.push(FoldRange {
         collapsed_suffix: None,
         heading_start: None,
@@ -844,6 +852,8 @@ fn fold(block: &mut [BufferBlock], header: usize, id: &str, closed: bool) {
         end,
         closed,
     });
+    block.push(header);
+    block.extend(body);
 }
 
 fn validate_input(document: &WalkthroughDocument, input: &DocumentInput) -> Result<()> {

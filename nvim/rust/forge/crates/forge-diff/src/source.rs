@@ -46,7 +46,7 @@ pub struct SourceIdentity {
 /// Owns validated immutable UTF-8 content. Clones share the original byte allocation.
 #[derive(Clone, Debug)]
 pub struct SourceVersion {
-    content: Arc<Vec<u8>>,
+    content: Arc<String>,
     identity: Arc<OnceLock<SourceIdentity>>,
     representation: Representation,
     newline: NewlineMetadata,
@@ -96,22 +96,37 @@ impl SourceIdentity {
 impl SourceVersion {
     /// Admits immutable UTF-8 bytes and preserves line endings without computing a content hash.
     pub fn new(content: Vec<u8>, representation: Representation) -> Result<Self, SourceError> {
-        Self::from_shared(Arc::new(content), representation)
+        if content.contains(&0) {
+            return Err(SourceError::Binary);
+        }
+        let text = String::from_utf8(content).map_err(|_| SourceError::UnsupportedEncoding)?;
+        Ok(Self::from_text(Arc::new(text), representation))
     }
 
     /// Shares validated content. The first identity request hashes it once across all clones.
     pub fn from_shared(
-        content: Arc<Vec<u8>>,
+        content: Arc<String>,
         representation: Representation,
     ) -> Result<Self, SourceError> {
-        validate_text(&content)?;
-        let newline = newline_metadata(&content);
-        Ok(Self {
+        if content.as_bytes().contains(&0) {
+            return Err(SourceError::Binary);
+        }
+        Ok(Self::from_text(content, representation))
+    }
+
+    /// Constructs an empty source without a decoding or binary-content failure path.
+    pub fn empty(representation: Representation) -> Self {
+        Self::from_text(Arc::new(String::new()), representation)
+    }
+
+    fn from_text(content: Arc<String>, representation: Representation) -> Self {
+        let newline = newline_metadata(content.as_bytes());
+        Self {
             content,
             identity: Arc::new(OnceLock::new()),
             representation,
             newline,
-        })
+        }
     }
 
     /// Validates supplied acquisition metadata before allowing it to identify an analysis.
@@ -131,17 +146,17 @@ impl SourceVersion {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.content
+        self.content.as_bytes()
     }
 
     pub fn text(&self) -> &str {
-        std::str::from_utf8(&self.content).expect("source construction validates UTF-8")
+        self.content.as_str()
     }
 
     pub fn identity(&self) -> SourceIdentity {
         *self
             .identity
-            .get_or_init(|| SourceIdentity::from_bytes(&self.content, self.representation))
+            .get_or_init(|| SourceIdentity::from_bytes(self.bytes(), self.representation))
     }
 
     pub fn newline(&self) -> NewlineMetadata {
@@ -155,22 +170,6 @@ impl SourceVersion {
     pub(crate) fn shares_bytes(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.content, &other.content)
     }
-}
-
-/// Validates both sides without converting bytes or treating mixed representations as write-safe.
-/// Mutation eligibility belongs to the repository owner, independently of analysis validity.
-pub fn validate_source_pair(pair: &SourcePair) -> Result<(), SourceError> {
-    validate_text(pair.old.bytes())?;
-    validate_text(pair.new.bytes())?;
-    Ok(())
-}
-
-fn validate_text(content: &[u8]) -> Result<(), SourceError> {
-    if content.contains(&0) {
-        return Err(SourceError::Binary);
-    }
-    std::str::from_utf8(content).map_err(|_| SourceError::UnsupportedEncoding)?;
-    Ok(())
 }
 
 fn newline_metadata(content: &[u8]) -> NewlineMetadata {
@@ -189,6 +188,25 @@ fn newline_metadata(content: &[u8]) -> NewlineMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_text_preserves_owned_allocation_and_shared_storage() {
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.extend_from_slice("λ\r\nretained".as_bytes());
+        let address = bytes.as_ptr();
+        let capacity = bytes.capacity();
+        let source = SourceVersion::new(bytes, Representation::Raw).unwrap();
+        assert_eq!(source.bytes().as_ptr(), address);
+        assert_eq!(source.retained_bytes(), capacity);
+        let shared = Arc::new("shared λ\n".to_owned());
+        let source = SourceVersion::from_shared(Arc::clone(&shared), Representation::Raw).unwrap();
+        assert_eq!(source.text().as_ptr(), shared.as_ptr());
+        assert_eq!(source.text(), shared.as_str());
+        assert!(matches!(
+            SourceVersion::from_shared(Arc::new("bad\0text".into()), Representation::Raw),
+            Err(SourceError::Binary)
+        ));
+    }
 
     #[test]
     fn preserves_sources_and_spare_capacity_beyond_former_byte_limit() {

@@ -265,6 +265,10 @@ pub trait SessionStore {
     fn delete_session(&mut self, session_id: &str) -> Result<()>;
 }
 
+fn auto_approve_revisions() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod context_usage_test {
     use super::ContextUsage;
@@ -282,8 +286,4 @@ mod context_usage_test {
         let usage = ContextUsage::reported(156_000, 200_000).expect("valid reported usage");
         assert_eq!(usage.remaining_percent, 22);
     }
-}
-
-fn auto_approve_revisions() -> bool {
-    true
 }

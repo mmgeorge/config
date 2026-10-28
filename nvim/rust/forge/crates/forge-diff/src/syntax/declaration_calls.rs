@@ -175,10 +175,9 @@ fn callable_name(node: Node<'_>, source: &str) -> Option<String> {
             | "method_definition"
             | "method_signature"
             | "function_definition"
-    ) {
-        if let Some(name) = node.child_by_field_name("name") {
-            return Some(contents(name, source).to_owned());
-        }
+    ) && let Some(name) = node.child_by_field_name("name")
+    {
+        return Some(contents(name, source).to_owned());
     }
     if matches!(
         node.kind(),
@@ -415,17 +414,15 @@ fn collect_returns(
         if matches!(
             node.kind(),
             "field_declaration" | "public_field_definition" | "property_signature"
+        ) && let (Some(name), Some(value), Some(owner)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("type"),
+            scope.last(),
         ) {
-            if let (Some(name), Some(value), Some(owner)) = (
-                node.child_by_field_name("name"),
-                node.child_by_field_name("type"),
-                scope.last(),
-            ) {
-                output.insert(
-                    format!("field:{owner}.{}", contents(name, source)),
-                    base_type(contents(value, source)),
-                );
-            }
+            output.insert(
+                format!("field:{owner}.{}", contents(name, source)),
+                base_type(contents(value, source)),
+            );
         }
         let mut cursor = node.walk();
         pending.extend(
@@ -500,14 +497,13 @@ fn populate(
 }
 
 fn receiver_owner(node: Node<'_>, source: &str) -> Option<String> {
-    if node.kind() == "function_definition" {
-        if let Some((owner, _)) = node
+    if node.kind() == "function_definition"
+        && let Some((owner, _)) = node
             .child_by_field_name("name")
             .map(|name| contents(name, source))
             .and_then(|name| name.rsplit_once(':'))
-        {
-            return Some(owner.into());
-        }
+    {
+        return Some(owner.into());
     }
     let mut parent = node.parent();
     while let Some(node) = parent {
@@ -917,10 +913,9 @@ fn calls(
         if matches!(
             node.kind(),
             "closure_expression" | "arrow_function" | "function_expression"
-        ) {
-            if let Some(parameters) = node.child_by_field_name("parameters") {
-                parameter_types(parameters, source, binding);
-            }
+        ) && let Some(parameters) = node.child_by_field_name("parameters")
+        {
+            parameter_types(parameters, source, binding);
         }
         let pending_binding = if matches!(node.kind(), "let_declaration" | "variable_declarator") {
             if let Some(name) = node
@@ -947,46 +942,43 @@ fn calls(
         if matches!(
             node.kind(),
             "call_expression" | "function_call" | "new_expression"
-        ) {
-            if let Some(function) = node
-                .child_by_field_name("function")
-                .or_else(|| node.child_by_field_name("name"))
-                .or_else(|| node.child_by_field_name("constructor"))
-            {
-                let name = call_name(function, source, returns, binding);
-                if !(language == SyntaxLanguage::Rust
-                    && matches!(name.as_str(), "Ok" | "Err" | "Some"))
-                {
-                    output.push(DeclarationCall {
-                        kind: if node.kind() == "new_expression" {
-                            DeclarationCallKind::Construct
-                        } else {
-                            DeclarationCallKind::Call
-                        },
-                        name,
-                        expression: contents(function, source).into(),
-                        unresolved: shadowed_target(function, source, returns, binding),
-                        line: reference_token(function).start_position().row as u32 + 1,
-                        column: reference_token(function).start_position().column as u32,
-                    });
-                }
-            }
-        }
-        if language == SyntaxLanguage::Rust && node.kind() == "struct_expression" {
-            if let Some(target) = node
-                .child_by_field_name("name")
-                .or_else(|| node.child_by_field_name("type"))
+        ) && let Some(function) = node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.child_by_field_name("constructor"))
+        {
+            let name = call_name(function, source, returns, binding);
+            if !(language == SyntaxLanguage::Rust && matches!(name.as_str(), "Ok" | "Err" | "Some"))
             {
                 output.push(DeclarationCall {
-                    kind: DeclarationCallKind::Construct,
-                    name: base_type(contents(target, source))
-                        .unwrap_or_else(|| contents(target, source).into()),
-                    expression: contents(target, source).into(),
-                    unresolved: false,
-                    line: reference_token(target).start_position().row as u32 + 1,
-                    column: reference_token(target).start_position().column as u32,
+                    kind: if node.kind() == "new_expression" {
+                        DeclarationCallKind::Construct
+                    } else {
+                        DeclarationCallKind::Call
+                    },
+                    name,
+                    expression: contents(function, source).into(),
+                    unresolved: shadowed_target(function, source, returns, binding),
+                    line: reference_token(function).start_position().row as u32 + 1,
+                    column: reference_token(function).start_position().column as u32,
                 });
             }
+        }
+        if language == SyntaxLanguage::Rust
+            && node.kind() == "struct_expression"
+            && let Some(target) = node
+                .child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("type"))
+        {
+            output.push(DeclarationCall {
+                kind: DeclarationCallKind::Construct,
+                name: base_type(contents(target, source))
+                    .unwrap_or_else(|| contents(target, source).into()),
+                expression: contents(target, source).into(),
+                unresolved: false,
+                line: reference_token(target).start_position().row as u32 + 1,
+                column: reference_token(target).start_position().column as u32,
+            });
         }
         if language == SyntaxLanguage::Rust
             && matches!(

@@ -39,6 +39,7 @@ pub(crate) use review_delivery::reconstruct;
 mod edit;
 pub(crate) mod edit_trace;
 pub(crate) mod event;
+mod source_edit;
 pub use event::{ExchangeAnchor, ExchangePlanEvent, PlanEventContent};
 mod graph;
 mod prompt;
@@ -46,6 +47,7 @@ mod render;
 mod resolution;
 mod review_annotation;
 mod review_cache;
+pub(crate) use review_cache::PlanReviewRevision;
 mod review_feedback;
 pub(crate) mod revision;
 pub(crate) mod revision_review;
@@ -93,7 +95,8 @@ pub use resolution::{
     PlanTestSummary, build_plan_resolution,
 };
 pub use scheduler::{
-    PlanScheduler, PlanTaskExecution, PlanTaskReport, PlanTaskState, PlanTestResult, PlanTestStatus,
+    PlanScheduler, PlanTaskExecution, PlanTaskOutcome, PlanTaskReport, PlanTaskState,
+    PlanTestResult, PlanTestStatus,
 };
 pub use validation::{
     PlanValidationError, PlanValidationPhase, PlanViolation, validate_plan_edit,
@@ -501,11 +504,11 @@ impl PlanElicitation {
                     feedback: None,
                 }
             });
-            self.answer(&question.id, response)?;
-            self.answer
-                .last_mut()
-                .expect("committed timeout answer")
-                .source = crate::session::ResolutionSource::Timeout;
+            self.record_answer(
+                &question.id,
+                response,
+                crate::session::ResolutionSource::Timeout,
+            )?;
         }
         self.resolution_source = crate::session::ResolutionSource::Timeout;
         self.deadline = None;
@@ -592,6 +595,19 @@ impl PlanElicitation {
 
     /// Commit one response and advance presentation to the next question.
     pub fn answer(&mut self, question_id: &str, response: PlanQuestionResponse) -> Result<()> {
+        self.record_answer(
+            question_id,
+            response,
+            crate::session::ResolutionSource::User,
+        )
+    }
+
+    fn record_answer(
+        &mut self,
+        question_id: &str,
+        response: PlanQuestionResponse,
+        source: crate::session::ResolutionSource,
+    ) -> Result<()> {
         let question_index = self
             .question_set
             .questions
@@ -602,7 +618,7 @@ impl PlanElicitation {
         self.answer
             .retain(|answer| answer.question_id != question_id);
         self.answer.push(PlanQuestionAnswer {
-            source: crate::session::ResolutionSource::User,
+            source,
             question_id: question_id.to_owned(),
             response,
         });
@@ -961,8 +977,11 @@ impl PlanFileStore {
         let rendered = measure(trace, "rename.render_changed_plan", || {
             design_review::render(&renamed)
         })?;
-        let (document, rendered, digest) =
-            self.persist_review_draft(session_id, plan_id, renamed, rendered, trace)?;
+        let (document, rendered, digest) = self.persist_review_draft(
+            session_id,
+            PlanReviewRevision::new(plan_id, renamed, rendered)?,
+            trace,
+        )?;
         Ok((definition.name, document, rendered, digest))
     }
 
@@ -1027,21 +1046,18 @@ impl PlanFileStore {
         if let Some(design) = &mut document.design {
             design.check_configuration =
                 Some(crate::checks::ConfigSnapshot::load(&self.workspace)?);
-            if design
-                .validation
-                .as_ref()
-                .is_none_or(|report| report.fingerprint != crate::declaration::fingerprint(design))
-            {
-                design.validation = Some(
-                    crate::declaration::DeclarationResolver::planned(
-                        &self.workspace,
-                        design,
-                        false,
-                    )?
-                    .validate(design),
-                );
-            }
-            design.validation.as_ref().unwrap().ensure_valid()?;
+            let fingerprint = crate::declaration::fingerprint(design);
+            let report = match design.validation.take() {
+                Some(report) if report.fingerprint == fingerprint => report,
+                _ => crate::declaration::DeclarationResolver::planned(
+                    &self.workspace,
+                    design,
+                    false,
+                )?
+                .validate(design),
+            };
+            report.ensure_valid()?;
+            design.validation = Some(report);
         }
         self.persist_revision(session_id, plan_id, revision, document, None)
     }
@@ -1101,7 +1117,11 @@ impl PlanFileStore {
         } else {
             render_plan_at(document, &self.workspace)?
         };
-        self.review_cache.remember(document, &rendered)?;
+        self.review_cache.remember(&PlanReviewRevision::new(
+            &document.plan_id,
+            document.clone(),
+            rendered.clone(),
+        )?)?;
         Ok(rendered)
     }
 
@@ -1114,8 +1134,11 @@ impl PlanFileStore {
         rendered: RenderedPlan,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        let (document, rendered, checksum) =
-            self.persist_review_draft(session_id, plan_id, document, rendered, trace)?;
+        let (document, rendered, checksum) = self.persist_review_draft(
+            session_id,
+            PlanReviewRevision::new(plan_id, document, rendered)?,
+            trace,
+        )?;
         let revision_directory = self.plan_dir(session_id, plan_id).join("revisions");
         measure(trace, "persist.revision_directory", || {
             Ok(fs::create_dir_all(&revision_directory)?)
@@ -1143,18 +1166,12 @@ impl PlanFileStore {
     pub(crate) fn persist_review_draft(
         &self,
         session_id: &str,
-        plan_id: &str,
-        document: PlanDocument,
-        rendered: RenderedPlan,
+        revision: PlanReviewRevision,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        anyhow::ensure!(
-            document.plan_id == plan_id
-                && rendered.navigation.plan_id == plan_id
-                && rendered.navigation.plan_version == document.version,
-            "rendered plan identity changed"
-        );
-        let plan_directory = self.plan_dir(session_id, plan_id);
+        let plan_directory = self.plan_dir(session_id, &revision.document.plan_id);
+        let document = &revision.document;
+        let rendered = &revision.rendered;
         measure(trace, "persist.working_directory", || {
             Ok(fs::create_dir_all(&plan_directory)?)
         })?;
@@ -1170,11 +1187,8 @@ impl PlanFileStore {
                 &rendered.navigation,
             )
         })?;
-        let checksum = measure(trace, "persist.digest", || {
-            Ok(digest(crate::plan::codec::to_vec(&document)?.as_slice()))
-        })?;
-        self.review_cache.remember(&document, &rendered)?;
-        Ok((document, rendered, checksum))
+        self.review_cache.remember(&revision)?;
+        Ok(revision.into_parts())
     }
 
     /// Freeze an unchanged reviewed draft at the final review decision.
@@ -1320,8 +1334,11 @@ impl PlanFileStore {
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let path = self.plan_dir(session_id, plan_id).join("working.json");
-        let (document, rendered, checksum) =
-            self.persist_review_draft(session_id, plan_id, document, rendered, trace)?;
+        let (document, rendered, checksum) = self.persist_review_draft(
+            session_id,
+            PlanReviewRevision::new(plan_id, document, rendered)?,
+            trace,
+        )?;
         let reanchor = trace.map(|trace| trace.stage("delete.reanchor_annotations"));
         let mut retained = Vec::new();
         for mut item in annotation {

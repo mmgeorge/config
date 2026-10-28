@@ -12,14 +12,14 @@ use std::time::Duration;
 /// Failure to enforce the selected server set still rejects the session.
 pub(super) async fn start(
     session: &SharedCopilotSession,
-    launch: &[(String, Value)],
+    launch: &[(String, serde_json::Map<String, Value>)],
     trace: &TraceStore,
     harness_session_id: &str,
     timeout: Duration,
 ) -> Result<HashMap<String, String>> {
     let request = launch
         .iter()
-        .map(|(name, payload)| mcp_launch_request(name, payload))
+        .map(|(name, payload)| mcp_launch_request(name, &Value::Object(payload.clone())))
         .collect::<Vec<_>>();
     let mut startup = stream::iter(request)
         .map(|request| async move {

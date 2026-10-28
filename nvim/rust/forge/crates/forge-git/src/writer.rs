@@ -34,17 +34,160 @@ const RECEIPT_RESERVATION: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum BulkAction {
+    Git(PathCommand),
+    DeleteUntracked,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PathCommand {
     Stage,
     Unstage,
     DiscardIndex,
     DiscardHead,
-    DeleteUntracked,
 }
 
-struct WriteGroup {
-    bulk_action: Option<BulkAction>,
-    patch_direction: Option<PatchDirection>,
-    target: Vec<Option<RepositoryPath>>,
+#[derive(Clone, Copy)]
+enum ReversePatchStep {
+    CheckIndex,
+    CheckWorktree,
+    ApplyIndex,
+    ApplyWorktree,
+}
+
+struct PathBatch {
+    first: RepositoryPath,
+    rest: Vec<RepositoryPath>,
+}
+
+impl PathBatch {
+    fn iter(&self) -> impl Iterator<Item = &RepositoryPath> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+}
+
+struct PatchCapture<'action> {
+    target: &'action PatchTarget,
+    before_exists: bool,
+    after_exists: bool,
+}
+
+struct PatchBatch<'action> {
+    first: PatchCapture<'action>,
+    rest: Vec<PatchCapture<'action>>,
+}
+
+impl<'action> PatchBatch<'action> {
+    fn iter(&self) -> impl Iterator<Item = &PatchCapture<'action>> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GroupPatchDirection {
+    Stage,
+    Unstage,
+    Discard,
+}
+
+enum SingleWrite<'action> {
+    DiscardStaged(&'action PatchTarget),
+    DiscardCombined {
+        staged: &'action PatchTarget,
+        unstaged: &'action PatchTarget,
+    },
+    CreateBranch {
+        name: &'action str,
+    },
+    Commit {
+        message: &'action str,
+    },
+    CommitWithEditor {
+        command: &'action str,
+        nvim_server: &'action str,
+        amend: bool,
+    },
+    UpdateRepositoryConfig {
+        expected: &'action Option<Vec<u8>>,
+        replacement: &'action [u8],
+    },
+    Push,
+    PublishBranch {
+        name: &'action str,
+    },
+    Pull,
+}
+
+impl SingleWrite<'_> {
+    fn target(&self) -> Option<RepositoryPath> {
+        match self {
+            Self::DiscardStaged(target) | Self::DiscardCombined { staged: target, .. } => {
+                Some(target.path.clone())
+            }
+            Self::UpdateRepositoryConfig { .. } => Some(RepositoryPath::project_config()),
+            Self::CreateBranch { .. }
+            | Self::Commit { .. }
+            | Self::CommitWithEditor { .. }
+            | Self::Push
+            | Self::PublishBranch { .. }
+            | Self::Pull => None,
+        }
+    }
+}
+
+enum WriteGroup<'action> {
+    Bulk {
+        action: BulkAction,
+        target: PathBatch,
+    },
+    Patch {
+        direction: GroupPatchDirection,
+        target: PatchBatch<'action>,
+    },
+    Single(SingleWrite<'action>),
+}
+
+fn append_bulk_group(groups: &mut Vec<WriteGroup<'_>>, action: BulkAction, path: &RepositoryPath) {
+    if let Some(WriteGroup::Bulk {
+        action: previous,
+        target,
+    }) = groups.last_mut()
+        && *previous == action
+        && target.rest.len() < 255
+    {
+        target.rest.push(path.clone());
+    } else {
+        groups.push(WriteGroup::Bulk {
+            action,
+            target: PathBatch {
+                first: path.clone(),
+                rest: Vec::new(),
+            },
+        });
+    }
+}
+
+fn append_patch_group<'action>(
+    groups: &mut Vec<WriteGroup<'action>>,
+    direction: GroupPatchDirection,
+    patch: PatchCapture<'action>,
+) {
+    if let Some(WriteGroup::Patch {
+        direction: previous,
+        target,
+    }) = groups.last_mut()
+        && *previous == direction
+        && target.rest.len() < 255
+    {
+        target.rest.push(patch);
+    } else {
+        groups.push(WriteGroup::Patch {
+            direction,
+            target: PatchBatch {
+                first: patch,
+                rest: Vec::new(),
+            },
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +283,24 @@ pub struct GitWriteIntent {
     reservation: IntentReservation,
     progress: Option<CommandProgressSink>,
     settlement: Option<SettlementHandler>,
+}
+
+struct WriteExecution<'intent> {
+    intent: &'intent GitWriteIntent,
+    precondition: WritePrecondition,
+}
+
+impl std::ops::Deref for WriteExecution<'_> {
+    type Target = GitWriteIntent;
+    fn deref(&self) -> &Self::Target {
+        self.intent
+    }
+}
+
+impl WriteExecution<'_> {
+    fn precondition(&self) -> &WritePrecondition {
+        &self.precondition
+    }
 }
 
 struct IntentReservation {
@@ -488,12 +649,6 @@ impl GitWriteIntent {
         Ok(())
     }
 
-    fn precondition(&self) -> &WritePrecondition {
-        self.precondition
-            .as_ref()
-            .expect("write execution requires prepared sources")
-    }
-
     pub fn set_settlement_handler(&mut self, handler: SettlementHandler) -> Result<()> {
         ensure!(
             self.settlement.is_none(),
@@ -577,21 +732,6 @@ impl GitWriteAction {
         }
     }
 
-    fn bulk_action(&self) -> Option<BulkAction> {
-        match self {
-            Self::Stage { .. } => Some(BulkAction::Stage),
-            Self::Unstage { .. } => Some(BulkAction::Unstage),
-            Self::Discard {
-                source: DiscardSource::Index,
-                ..
-            } => Some(BulkAction::DiscardIndex),
-            Self::Discard {
-                source: DiscardSource::Head,
-                ..
-            } => Some(BulkAction::DiscardHead),
-            _ => None,
-        }
-    }
     fn paths(&self) -> Vec<RepositoryPath> {
         match self {
             Self::Batch { action } => action.iter().flat_map(Self::paths).collect(),
@@ -602,7 +742,7 @@ impl GitWriteAction {
                 vec![target.path.clone()]
             }
             Self::UpdateRepositoryConfig { .. } => {
-                vec![RepositoryPath::new(b".forge.json".to_vec()).expect("fixed config path")]
+                vec![RepositoryPath::project_config()]
             }
             _ => Vec::new(),
         }
@@ -617,61 +757,95 @@ impl GitWriteAction {
         }
     }
 
-    fn write_groups(&self, precondition: &WritePrecondition) -> Vec<WriteGroup> {
-        let actions = match self {
-            Self::Batch { action } => action.as_slice(),
-            action => std::slice::from_ref(action),
-        };
-        let mut groups: Vec<WriteGroup> = Vec::new();
-        for action in actions {
-            let patch_direction = match action {
-                Self::Patch {
-                    direction: PatchDirection::Index { .. },
-                    ..
-                } => Some(PatchDirection::Stage),
-                Self::Patch { direction, .. } if *direction != PatchDirection::DiscardStaged => {
-                    Some(*direction)
+    fn write_groups(&self, precondition: &WritePrecondition) -> Vec<WriteGroup<'_>> {
+        let mut pending = vec![self];
+        let mut groups = Vec::new();
+        while let Some(action) = pending.pop() {
+            let single = match action {
+                Self::Batch { action } => {
+                    pending.extend(action.iter().rev());
+                    continue;
                 }
-                _ => None,
-            };
-            for target in action.targets() {
-                let bulk_action = match action.bulk_action() {
-                    Some(BulkAction::DiscardIndex | BulkAction::DiscardHead)
-                        if target
-                            .as_ref()
-                            .is_some_and(|path| !precondition.tracked(path)) =>
-                    {
-                        Some(BulkAction::DeleteUntracked)
+                Self::Stage { path } => {
+                    for path in path {
+                        append_bulk_group(&mut groups, BulkAction::Git(PathCommand::Stage), path);
                     }
-                    bulk_action => bulk_action,
-                };
-                if let Some(group) = groups.last_mut().filter(|group| {
-                    (bulk_action.is_some() || patch_direction.is_some())
-                        && group.bulk_action == bulk_action
-                        && group.patch_direction == patch_direction
-                        && group.target.len() < 256
-                }) {
-                    group.target.push(target);
-                } else {
-                    groups.push(WriteGroup {
-                        bulk_action,
-                        patch_direction,
-                        target: vec![target],
-                    });
+                    continue;
                 }
-            }
+                Self::Unstage { path } => {
+                    for path in path {
+                        append_bulk_group(&mut groups, BulkAction::Git(PathCommand::Unstage), path);
+                    }
+                    continue;
+                }
+                Self::Discard { path, source } => {
+                    for path in path {
+                        let command = match source {
+                            DiscardSource::Index => PathCommand::DiscardIndex,
+                            DiscardSource::Head => PathCommand::DiscardHead,
+                        };
+                        let action = if precondition.tracked(path) {
+                            BulkAction::Git(command)
+                        } else {
+                            BulkAction::DeleteUntracked
+                        };
+                        append_bulk_group(&mut groups, action, path);
+                    }
+                    continue;
+                }
+                Self::Patch { direction, target } => {
+                    let (before_exists, after_exists) =
+                        precondition.patch_presence(&target.path, *direction);
+                    let direction = match direction {
+                        PatchDirection::Index { .. } | PatchDirection::Stage => {
+                            GroupPatchDirection::Stage
+                        }
+                        PatchDirection::Unstage => GroupPatchDirection::Unstage,
+                        PatchDirection::Discard => GroupPatchDirection::Discard,
+                        PatchDirection::DiscardStaged => {
+                            groups.push(WriteGroup::Single(SingleWrite::DiscardStaged(target)));
+                            continue;
+                        }
+                    };
+                    append_patch_group(
+                        &mut groups,
+                        direction,
+                        PatchCapture {
+                            target,
+                            before_exists,
+                            after_exists,
+                        },
+                    );
+                    continue;
+                }
+                Self::DiscardCombined { staged, unstaged } => {
+                    SingleWrite::DiscardCombined { staged, unstaged }
+                }
+                Self::CreateBranch { name } => SingleWrite::CreateBranch { name },
+                Self::Commit { message } => SingleWrite::Commit { message },
+                Self::CommitWithEditor {
+                    command,
+                    nvim_server,
+                    amend,
+                } => SingleWrite::CommitWithEditor {
+                    command,
+                    nvim_server,
+                    amend: *amend,
+                },
+                Self::UpdateRepositoryConfig {
+                    expected,
+                    replacement,
+                } => SingleWrite::UpdateRepositoryConfig {
+                    expected,
+                    replacement,
+                },
+                Self::Push => SingleWrite::Push,
+                Self::PublishBranch { name, .. } => SingleWrite::PublishBranch { name },
+                Self::Pull => SingleWrite::Pull,
+            };
+            groups.push(WriteGroup::Single(single));
         }
         groups
-    }
-
-    fn for_target(&self, path: Option<&RepositoryPath>) -> Result<&Self> {
-        match self {
-            Self::Batch { action } => action
-                .iter()
-                .find(|action| path.is_some_and(|path| action.paths().contains(path)))
-                .context("batch target has no action"),
-            action => Ok(action),
-        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -814,7 +988,7 @@ impl GitWriteAction {
             .clone()
             .context("write requires worktree")?;
         let mut scopes = vec![MutationScope::Index(worktree.clone())];
-        if self.bulk_action() != Some(BulkAction::Unstage)
+        if !matches!(self, Self::Unstage { .. })
             && !matches!(
                 self,
                 Self::Unstage { .. }
@@ -861,58 +1035,65 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
         );
         Ok(())
     };
-    let prepared = (|| -> Result<()> {
+    let prepared = (|| -> Result<WritePrecondition> {
         let mut local = intent.repository.local_repository()?;
-        if intent.precondition.is_none() {
-            intent.precondition = Some(WritePrecondition::capture(
+        let precondition = match intent.precondition.take() {
+            Some(precondition) => precondition,
+            None => WritePrecondition::capture(
                 &mut local,
                 &intent.repository,
                 &intent.action,
                 &mut check,
                 &mut intent.preparation_timing,
-            )?);
-        }
+            )?,
+        };
         if let Some((head, observed)) = intent
             .expected
             .lock()
             .expect("write expected-source lock")
             .as_ref()
         {
-            intent.precondition().validate_observed(head, observed)?;
+            precondition.validate_observed(head, observed)?;
         }
-        intent
-            .precondition()
-            .validate(&mut local, &intent.repository, &intent.action, &mut check)
+        precondition.validate(&mut local, &intent.repository, &intent.action, &mut check)?;
+        Ok(precondition)
     })();
-    if let Err(error) = prepared {
-        intent
-            .store
-            .writes
-            .phase(intent.operation(), "rejected_settlement");
-        let mut outcome = intent.failure(
-            TargetCompletion::Rejected,
-            format!("write precondition rejected: {error:#}"),
-        );
-        if !outcome.affected.is_empty() {
-            match settle_paths(&intent.repository, &outcome.affected) {
-                Ok(path) => outcome.settled = Some(path),
-                Err(error) => {
+    let precondition = match prepared {
+        Ok(precondition) => precondition,
+        Err(error) => {
+            intent
+                .store
+                .writes
+                .phase(intent.operation(), "rejected_settlement");
+            let mut outcome = intent.failure(
+                TargetCompletion::Rejected,
+                format!("write precondition rejected: {error:#}"),
+            );
+            if !outcome.affected.is_empty() {
+                match settle_paths(&intent.repository, &outcome.affected) {
+                    Ok(path) => outcome.settled = Some(path),
+                    Err(error) => {
+                        outcome.settlement_diagnostic =
+                            Some(format!("rejected write reconciliation failed: {error:#}"))
+                    }
+                }
+                if let Err(error) = intent.repository.invalidate() {
                     outcome.settlement_diagnostic =
-                        Some(format!("rejected write reconciliation failed: {error:#}"))
+                        Some(format!("rejected write invalidation failed: {error:#}"));
                 }
             }
-            if let Err(error) = intent.repository.invalidate() {
-                outcome.settlement_diagnostic =
-                    Some(format!("rejected write invalidation failed: {error:#}"));
+            if !outcome.affected.is_empty() && outcome.settled.is_none() {
+                let _ = guard.finish_quarantined(OperationCompletion::Failed);
+            } else {
+                let _ = guard.finish(OperationCompletion::Failed);
             }
+            return outcome;
         }
-        if !outcome.affected.is_empty() && outcome.settled.is_none() {
-            let _ = guard.finish_quarantined(OperationCompletion::Failed);
-        } else {
-            let _ = guard.finish(OperationCompletion::Failed);
-        }
-        return outcome;
-    }
+    };
+    let intent = WriteExecution {
+        intent: &intent,
+        precondition,
+    };
 
     let mut outcome = WriteOutcome {
         operation: intent.operation(),
@@ -924,7 +1105,14 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
     intent.store.writes.phase(intent.operation(), "executing");
     let mut stopped = false;
     for group in intent.action.write_groups(intent.precondition()) {
-        let chunk = group.target;
+        let chunk: Vec<_> = match &group {
+            WriteGroup::Bulk { target, .. } => target.iter().cloned().map(Some).collect(),
+            WriteGroup::Patch { target, .. } => target
+                .iter()
+                .map(|target| Some(target.target.path.clone()))
+                .collect(),
+            WriteGroup::Single(action) => vec![action.target()],
+        };
         if stopped {
             outcome
                 .target
@@ -937,16 +1125,18 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
             continue;
         }
         let path: Vec<_> = chunk.iter().flatten().cloned().collect();
-        let validated = if group.bulk_action.is_some() || group.patch_direction.is_some() {
-            intent
+        let validated = match &group {
+            WriteGroup::Bulk { .. } | WriteGroup::Patch { .. } => intent
                 .precondition()
-                .validate_targets(&intent.repository, &path, &mut check)
-        } else if let Some(path) = path.first() {
-            intent
-                .precondition()
-                .validate_target(&intent.repository, path, &mut check)
-        } else {
-            Ok(())
+                .validate_targets(&intent.repository, &path, &mut check),
+            WriteGroup::Single(action) => match action.target() {
+                Some(path) => {
+                    intent
+                        .precondition()
+                        .validate_target(&intent.repository, &path, &mut check)
+                }
+                None => Ok(()),
+            },
         };
         if let Err(error) = validated {
             outcome
@@ -967,12 +1157,14 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
             stopped = true;
             continue;
         }
-        let result = if let Some(bulk_action) = group.bulk_action {
-            run_path_chunk(&intent, bulk_action, &path, &mut check)
-        } else if let Some(direction) = group.patch_direction {
-            run_patch_group(&intent, direction, &path, &mut check)
-        } else {
-            run_target(&intent, chunk[0].as_ref(), &mut check)
+        let result = match &group {
+            WriteGroup::Bulk { action, target } => {
+                run_path_chunk(&intent, *action, target, &mut check)
+            }
+            WriteGroup::Patch { direction, target } => {
+                run_patch_group(&intent, *direction, target, &mut check)
+            }
+            WriteGroup::Single(action) => run_single_write(&intent, action, &mut check),
         };
         let exit_code = result.as_ref().ok().and_then(|output| output.status.code());
         let (completion, diagnostic) = match result {
@@ -1107,64 +1299,62 @@ fn bounded_diagnostic(text: &str) -> String {
 }
 
 fn run_path_chunk(
-    intent: &GitWriteIntent,
+    intent: &WriteExecution<'_>,
     action: BulkAction,
-    path: &[RepositoryPath],
+    path: &PathBatch,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<std::process::Output> {
-    ensure!(
-        !path.is_empty() && path.len() <= 256,
-        "invalid write chunk size"
-    );
-    if action == BulkAction::DeleteUntracked {
-        for path in path {
-            check()?;
-            let destination = crate::validate_path(
-                intent
-                    .repository
-                    .identity
-                    .worktree_root
-                    .as_ref()
-                    .context("discard root missing")?,
-                path,
-            )?;
-            std::fs::remove_file(destination).context("delete captured untracked file")?;
+    let action = match action {
+        BulkAction::DeleteUntracked => {
+            for path in path.iter() {
+                check()?;
+                let destination = crate::validate_path(
+                    intent
+                        .repository
+                        .identity
+                        .worktree_root
+                        .as_ref()
+                        .context("discard root missing")?,
+                    path,
+                )?;
+                std::fs::remove_file(destination).context("delete captured untracked file")?;
+            }
+            #[cfg(unix)]
+            use std::os::unix::process::ExitStatusExt;
+            #[cfg(windows)]
+            use std::os::windows::process::ExitStatusExt;
+            return Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
         }
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        #[cfg(windows)]
-        use std::os::windows::process::ExitStatusExt;
-        return Ok(std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        });
-    }
+        BulkAction::Git(action) => action,
+    };
     let mut command = git_command(&intent.repository)?;
     match action {
-        BulkAction::Stage => {
+        PathCommand::Stage => {
             command.arg("add");
         }
-        BulkAction::Unstage if intent.precondition().unborn() => {
+        PathCommand::Unstage if intent.precondition().unborn() => {
             command.args(["rm", "--cached", "-f"]);
         }
-        BulkAction::Unstage => {
+        PathCommand::Unstage => {
             command.args(["reset", "--quiet", "HEAD"]);
         }
-        BulkAction::DiscardIndex => {
+        PathCommand::DiscardIndex => {
             command.args(["restore", "--worktree"]);
         }
-        BulkAction::DiscardHead if intent.precondition().unborn() => {
+        PathCommand::DiscardHead if intent.precondition().unborn() => {
             command.args(["rm", "-f"]);
         }
-        BulkAction::DiscardHead => {
+        PathCommand::DiscardHead => {
             command.args(["restore", "--source=HEAD", "--staged", "--worktree"]);
         }
-        BulkAction::DeleteUntracked => unreachable!("untracked deletion does not invoke Git"),
     }
     command.args(["--pathspec-from-file=-", "--pathspec-file-nul"]);
     let mut input = Vec::new();
-    for path in path {
+    for path in path.iter() {
         input.extend_from_slice(path.raw());
         input.push(0);
     }
@@ -1182,36 +1372,28 @@ fn run_path_chunk(
 }
 
 fn run_patch_group(
-    intent: &GitWriteIntent,
-    direction: PatchDirection,
-    path: &[RepositoryPath],
+    intent: &WriteExecution<'_>,
+    direction: GroupPatchDirection,
+    target: &PatchBatch<'_>,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<std::process::Output> {
     let mut input = Vec::new();
-    for path in path {
+    for capture in target.iter() {
         check()?;
-        let GitWriteAction::Patch { direction, target } = intent.action.for_target(Some(path))?
-        else {
-            anyhow::bail!("patch group contains a non-patch target");
-        };
-        let (before_exists, after_exists) = intent.precondition().patch_presence(path, *direction);
-        let patch = encode_patch(target, before_exists, after_exists)?;
+        let patch = encode_patch(capture.target, capture.before_exists, capture.after_exists)?;
         input.extend_from_slice(&patch);
     }
     let mut command = git_command(&intent.repository)?;
     command.args(["apply", "--unidiff-zero", "--whitespace=nowarn"]);
     match direction {
-        PatchDirection::Stage | PatchDirection::Index { .. } => {
+        GroupPatchDirection::Stage => {
             command.arg("--cached");
         }
-        PatchDirection::Unstage => {
+        GroupPatchDirection::Unstage => {
             command.args(["--cached", "--reverse"]);
         }
-        PatchDirection::Discard => {
+        GroupPatchDirection::Discard => {
             command.arg("--reverse");
-        }
-        PatchDirection::DiscardStaged => {
-            anyhow::bail!("staged discard requires ordered index and worktree steps")
         }
     }
     command.arg("-");
@@ -1228,28 +1410,20 @@ fn run_patch_group(
     )
 }
 
-fn run_target(
-    intent: &GitWriteIntent,
-    path: Option<&RepositoryPath>,
+fn run_single_write(
+    intent: &WriteExecution<'_>,
+    action: &SingleWrite<'_>,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<std::process::Output> {
     check()?;
     let mut command = git_command(&intent.repository)?;
     let mut input = None;
-    let action = intent.action.for_target(path)?;
-    if let GitWriteAction::Patch {
-        direction: PatchDirection::DiscardStaged,
-        target,
-    } = action
-    {
-        return discard_staged_patch(intent, target, check);
-    }
     match action {
-        GitWriteAction::Batch { .. } => anyhow::bail!("nested batch is invalid"),
-        GitWriteAction::DiscardCombined { staged, unstaged } => {
+        SingleWrite::DiscardStaged(target) => return discard_staged_patch(intent, target, check),
+        SingleWrite::DiscardCombined { staged, unstaged } => {
             return compound::discard(intent, staged, unstaged, check);
         }
-        GitWriteAction::UpdateRepositoryConfig {
+        SingleWrite::UpdateRepositoryConfig {
             expected,
             replacement,
         } => {
@@ -1261,20 +1435,14 @@ fn run_target(
                 check,
             );
         }
-        GitWriteAction::Stage { .. }
-        | GitWriteAction::Unstage { .. }
-        | GitWriteAction::Discard { .. } => {
-            anyhow::bail!("path mutation requires grouped execution")
-        }
-        GitWriteAction::Patch { .. } => anyhow::bail!("patch mutation requires grouped execution"),
-        GitWriteAction::CreateBranch { name } => {
+        SingleWrite::CreateBranch { name } => {
             command.args(["switch", "-c", name]);
         }
-        GitWriteAction::Commit { message } => {
+        SingleWrite::Commit { message } => {
             command.args(["commit", "--file=-"]);
             input = Some(message.as_bytes().to_vec());
         }
-        GitWriteAction::CommitWithEditor {
+        SingleWrite::CommitWithEditor {
             command: editor,
             nvim_server,
             amend,
@@ -1288,25 +1456,22 @@ fn run_target(
                 .env("GIT_SEQUENCE_EDITOR", editor)
                 .env("NVIM", nvim_server);
         }
-        GitWriteAction::Push => {
+        SingleWrite::Push => {
             command.args(["push", "--progress"]);
         }
-        GitWriteAction::PublishBranch { name, .. } => {
+        SingleWrite::PublishBranch { name, .. } => {
             command.args(["push", "--progress"]);
             if !intent.precondition().has_publish_upstream() {
                 command.args(["-u", "origin", name]);
             }
         }
-        GitWriteAction::Pull => {
+        SingleWrite::Pull => {
             command.args(["pull", "--progress"]);
         }
     }
-    if let Some(path) = path.filter(|_| !matches!(action, GitWriteAction::Patch { .. })) {
-        command.arg(resolve_argument(path)?);
-    }
     let limits = CommandLimits {
         stderr_bytes: 64 * 1024,
-        timeout: if matches!(intent.action, GitWriteAction::CommitWithEditor { .. }) {
+        timeout: if matches!(action, SingleWrite::CommitWithEditor { .. }) {
             Duration::MAX
         } else {
             Duration::from_secs(120)
@@ -1314,7 +1479,7 @@ fn run_target(
     };
     let run = if matches!(
         action,
-        GitWriteAction::Commit { .. } | GitWriteAction::CommitWithEditor { .. }
+        SingleWrite::Commit { .. } | SingleWrite::CommitWithEditor { .. }
     ) {
         diagnostic_command
     } else {
@@ -1331,7 +1496,7 @@ fn run_target(
 }
 
 fn discard_staged_patch(
-    intent: &GitWriteIntent,
+    intent: &WriteExecution<'_>,
     target: &PatchTarget,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<std::process::Output> {
@@ -1339,46 +1504,74 @@ fn discard_staged_patch(
         .precondition()
         .patch_presence(&target.path, PatchDirection::DiscardStaged);
     let patch = encode_patch(target, before_exists, after_exists)?;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    for (cached, verify) in [(true, true), (false, true), (true, false), (false, false)] {
-        check()?;
-        let mut command = git_command(&intent.repository)?;
-        command.args([
-            "apply",
-            "--reverse",
-            "--unidiff-zero",
-            "--whitespace=nowarn",
-        ]);
-        if cached {
-            command.arg("--cached");
+    let mut collected = run_reverse_patch(
+        intent,
+        &patch,
+        ReversePatchStep::CheckIndex,
+        64 * 1024,
+        check,
+    )?;
+    for step in [
+        ReversePatchStep::CheckWorktree,
+        ReversePatchStep::ApplyIndex,
+        ReversePatchStep::ApplyWorktree,
+    ] {
+        if !collected.status.success() {
+            return Ok(collected);
         }
-        if verify {
+        let output = run_reverse_patch(
+            intent,
+            &patch,
+            step,
+            64 * 1024 - collected.stderr.len(),
+            check,
+        )?;
+        collected.status = output.status;
+        collected.stdout.extend(output.stdout);
+        collected.stderr.extend(output.stderr);
+    }
+    Ok(collected)
+}
+
+fn run_reverse_patch(
+    intent: &WriteExecution<'_>,
+    patch: &[u8],
+    step: ReversePatchStep,
+    stderr_bytes: usize,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<std::process::Output> {
+    check()?;
+    let mut command = git_command(&intent.repository)?;
+    command.args([
+        "apply",
+        "--reverse",
+        "--unidiff-zero",
+        "--whitespace=nowarn",
+    ]);
+    match step {
+        ReversePatchStep::CheckIndex => {
+            command.args(["--cached", "--check"]);
+        }
+        ReversePatchStep::CheckWorktree => {
             command.arg("--check");
         }
-        command.arg("-");
-        intent.store.writes.command_started(intent.operation());
-        let output = progress_command(
-            &mut command,
-            CommandLimits {
-                stderr_bytes: 64 * 1024 - stderr.len(),
-                timeout: Duration::from_secs(120),
-            },
-            Some(&patch),
-            intent.progress.as_ref(),
-            &mut *check,
-        )?;
-        stdout.extend(output.stdout);
-        stderr.extend(output.stderr);
-        if !output.status.success() || (!cached && !verify) {
-            return Ok(std::process::Output {
-                status: output.status,
-                stdout,
-                stderr,
-            });
+        ReversePatchStep::ApplyIndex => {
+            command.arg("--cached");
         }
+        ReversePatchStep::ApplyWorktree => {}
     }
-    unreachable!("final worktree application returns its collected output")
+    command.arg("-");
+    intent.store.writes.command_started(intent.operation());
+    progress_command(
+        &mut command,
+        CommandLimits {
+            stderr_bytes,
+            timeout: Duration::from_secs(120),
+        },
+        Some(patch),
+        intent.progress.as_ref(),
+        check,
+    )
 }
 
 fn validate_patch_selection(target: &PatchTarget) -> Result<()> {

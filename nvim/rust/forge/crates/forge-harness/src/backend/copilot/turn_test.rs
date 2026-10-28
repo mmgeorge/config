@@ -333,9 +333,11 @@ async fn cancellation_during_copilot_startup_does_not_wait_or_send() -> Result<(
 async fn copilot_submission_fence_survives_cleanup_before_turn_activation() -> Result<()> {
     let turn = CopilotTurnEvent::default();
     let cancelled = Arc::new(AtomicBool::new(true));
-    let _active = turn.activate(None, Some(cancelled))?;
-    let error = turn
-        .send(async { panic!("a canceled startup sent a native prompt") })
+    let active = turn.activate(None, Some(cancelled))?;
+    let error = active
+        .send("before-send".into(), async {
+            panic!("a canceled startup sent a native prompt")
+        })
         .await
         .unwrap_err();
     assert!(error.is::<crate::broker::TurnCancelled>());
@@ -348,7 +350,7 @@ async fn copilot_cleanup_waits_for_committed_send_and_blocks_late_steering() -> 
     let turn = CopilotTurnEvent::default();
     let active = turn.activate(None, None)?;
     let (release, released) = tokio::sync::oneshot::channel();
-    let mut sending = Box::pin(turn.send(async {
+    let mut sending = Box::pin(active.send("before-send".into(), async {
         released.await?;
         Ok("send-response-id".into())
     }));
@@ -364,15 +366,18 @@ async fn copilot_cleanup_waits_for_committed_send_and_blocks_late_steering() -> 
     sending.await?;
     assert!(stopping.await?);
     assert!(
-        turn.send(async { panic!("steering escaped a stop fence") })
+        active
+            .send("before-send".into(), async {
+                panic!("steering escaped a stop fence")
+            })
             .await
             .is_err()
     );
     drop(active);
     tokio::time::timeout(std::time::Duration::from_millis(100), turn.wait_finished()).await?;
     assert!(
-        turn.retraction_target().is_err(),
-        "missing native event identity was silently accepted"
+        matches!(turn.retraction_target()?, CopilotRetraction::History(cursor) if cursor == "before-send"),
+        "a sent request must retain its required history boundary"
     );
     Ok(())
 }
@@ -404,14 +409,20 @@ async fn copilot_cleanup_sends_abort_before_a_pending_send_response() -> Result<
     let turn = backend.turn_event(&session_id).await;
     let active = turn.activate(None, None)?;
     let (submitted, submission) = tokio::sync::oneshot::channel();
-    let sending = turn.send(async {
-        session
-            .send(github_copilot_sdk::types::MessageOptions::new(
-                "pending send",
-            ))
-            .await
-            .context("fixture send failed")
-    });
+    let sending = async {
+        let result = active
+            .send("before-send".into(), async {
+                session
+                    .send(github_copilot_sdk::types::MessageOptions::new(
+                        "pending send",
+                    ))
+                    .await
+                    .context("fixture send failed")
+            })
+            .await;
+        drop(active);
+        result
+    };
     let stopping = async {
         submission.await?;
         backend.cleanup_execution(&session_id).await
@@ -435,7 +446,6 @@ async fn copilot_cleanup_sends_abort_before_a_pending_send_response() -> Result<
         let collected_abort = read_request(&mut server_read).await?;
         assert_eq!(collected_abort["method"], "session.abort");
         respond(&mut server_write, &collected_abort, json!({"result":{}})).await?;
-        drop(active);
         Ok::<_, anyhow::Error>(())
     };
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -449,7 +459,9 @@ async fn copilot_cleanup_sends_abort_before_a_pending_send_response() -> Result<
 async fn copilot_stop_retains_native_submission_after_consumer_drop() -> Result<()> {
     let turn = CopilotTurnEvent::default();
     let active = turn.activate(None, None)?;
-    turn.send(async { Ok("transport-id".into()) }).await?;
+    active
+        .send("before-send".into(), async { Ok("transport-id".into()) })
+        .await?;
     drop(active);
     assert!(!turn.is_active());
     assert!(
@@ -478,7 +490,9 @@ async fn copilot_new_admission_cannot_rewind_an_earlier_cancelled_turn() -> Resu
     let session_id = request.runtime_key()?;
     let turn = backend.turn_event(&session_id).await;
     let active = turn.activate(None, None)?;
-    turn.send(async { Ok("transport-id".into()) }).await?;
+    active
+        .send("before-send".into(), async { Ok("transport-id".into()) })
+        .await?;
     turn.observe(&serde_json::from_value(json!({
         "id":"previous-user", "type":"user.message", "timestamp":"2026-10-15T17:00:00Z", "data":{}
     }))?)?;

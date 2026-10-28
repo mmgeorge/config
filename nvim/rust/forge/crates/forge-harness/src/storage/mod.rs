@@ -554,7 +554,7 @@ impl SqliteStore {
         self.publish_admission_exchange(
             &interaction.session_id,
             &interaction.id,
-            Some(interaction.awaiting_input && interaction.elicitation.is_some()),
+            Some(interaction.awaiting_input() && interaction.elicitation().is_some()),
         )
     }
 
@@ -578,7 +578,7 @@ impl SqliteStore {
             written == 1,
             "an exchange cannot change its owning session or agent"
         );
-        tool_output::synchronize(&transaction, interaction)?;
+        tool_output::synchronize(transaction, interaction)?;
         for node in &interaction.node_list {
             let crate::exchange::ExchangeNode::AgentReference { agent } = node else {
                 continue;
@@ -664,7 +664,7 @@ impl SqliteStore {
         self.publish_admission_exchange(
             &parent.session_id,
             &parent.id,
-            Some(parent.awaiting_input && parent.elicitation.is_some()),
+            Some(parent.awaiting_input() && parent.elicitation().is_some()),
         )
     }
 
@@ -684,7 +684,7 @@ impl SqliteStore {
             "child completion crosses execution ownership"
         );
         anyhow::ensure!(
-            task.completed_at_ms.is_some() && exchange.state == task.state,
+            task.completed_at_ms.is_some() && exchange.state() == task.state,
             "child completion has inconsistent task and exchange outcomes"
         );
         let transaction = self
@@ -701,7 +701,7 @@ impl SqliteStore {
         self.publish_admission_exchange(
             &exchange.session_id,
             &exchange.id,
-            Some(exchange.awaiting_input && exchange.elicitation.is_some()),
+            Some(exchange.awaiting_input() && exchange.elicitation().is_some()),
         )
     }
 
@@ -893,7 +893,7 @@ impl SqliteStore {
             self.publish_admission_exchange(
                 &execution.session_id,
                 &exchange.id,
-                Some(exchange.awaiting_input && exchange.elicitation.is_some()),
+                Some(exchange.awaiting_input() && exchange.elicitation().is_some()),
             )?;
         }
         self.publish_admission(&execution.session_id)
@@ -1289,7 +1289,7 @@ impl SqliteStore {
         self.publish_admission_exchange(
             &exchange.session_id,
             &exchange.id,
-            Some(exchange.awaiting_input && exchange.elicitation.is_some()),
+            Some(exchange.awaiting_input() && exchange.elicitation().is_some()),
         )
     }
 
@@ -1493,8 +1493,7 @@ impl SessionStore for SqliteStore {
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<String> {
-    let bytes = crate::codec::to_vec(value).context("encode Harness storage payload")?;
-    Ok(String::from_utf8(bytes).expect("JSON serialization produces UTF-8"))
+    crate::codec::to_string(value).context("encode Harness storage payload")
 }
 
 fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
@@ -1707,7 +1706,7 @@ mod test {
         assert!(restored[0].parent_reported);
         assert!(restored[0].completed_at_ms.is_some());
         assert_eq!(
-            reopened.list_agent_exchange(&agent.id)?[0].state,
+            reopened.list_agent_exchange(&agent.id)?[0].state(),
             crate::exchange::ExchangeState::Interrupted
         );
         let restored_agent = reopened
@@ -2054,7 +2053,7 @@ mod test {
 
     #[test]
     fn recovery_is_atomic_and_preserves_waiting_exchanges() {
-        use crate::exchange::{ExchangeKind, ExchangeState, HistoryDisposition};
+        use crate::exchange::{ExchangeKind, ExchangeState};
         let temporary = tempfile::tempdir().unwrap();
         let mut store = SqliteStore::open(temporary.path()).unwrap();
         store.save_session(&session("session", "D:/work")).unwrap();
@@ -2063,7 +2062,6 @@ mod test {
             lifecycle: None,
             finalization_error: None,
             check_owner: None,
-            finalization_outcome: None,
             output_store: None,
             archived_output: Default::default(),
             input_message_id: None,
@@ -2075,7 +2073,7 @@ mod test {
             prompt: "work".into(),
             kind: ExchangeKind::Chat,
             approval_mode: None,
-            state: ExchangeState::Running,
+            phase: crate::exchange::ExchangePhase::Running,
             plan_id: None,
             execution_id: None,
             execution_phase: None,
@@ -2087,26 +2085,29 @@ mod test {
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
             check_setup: None,
-            disposition: HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 10,
-            completed_at_ms: None,
             node_list: Vec::new(),
-            awaiting_input: false,
-            elicitation: None,
-            duration_ms: 20,
-            execution_started_at_ms: Some(30),
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
+
+            question: crate::exchange::ExchangeQuestion::None,
+            clock: crate::exchange::ExchangeClock::Running {
+                elapsed_ms: 20,
+                started_at_ms: 30,
+            },
         };
         exchange.observe_blocker("approval:recovery".into(), true, 70);
         store.save_exchange(&exchange).unwrap();
         exchange.id = "waiting".into();
         exchange.ordinal = 2;
-        exchange.awaiting_input = true;
-        exchange.duration_ms = 20;
-        exchange.execution_started_at_ms = None;
+        exchange.set_awaiting_input(true);
+        exchange.clock =
+            crate::exchange::ExchangeClock::fixture(20, exchange.execution_started_at_ms());
+        exchange.clock = crate::exchange::ExchangeClock::Paused {
+            elapsed_ms: exchange.duration_ms(),
+        };
         store.save_exchange(&exchange).unwrap();
         let child = Agent::pending("session", "reviewer", "review", 10);
         store.save_agent_run(&child).unwrap();
@@ -2122,18 +2123,18 @@ mod test {
         assert!(
             unchanged
                 .iter()
-                .all(|exchange| exchange.state == ExchangeState::Running)
+                .all(|exchange| exchange.state() == ExchangeState::Running)
         );
-        assert_eq!(unchanged[0].execution_started_at_ms, None);
-        assert_eq!(unchanged[0].duration_ms, 60);
+        assert_eq!(unchanged[0].execution_started_at_ms(), None);
+        assert_eq!(unchanged[0].duration_ms(), 60);
         store.save_agent_run(&child).unwrap();
         store.interrupt_detached_execution("session").unwrap();
         let recovered = store.list_exchange("session").unwrap();
-        assert_eq!(recovered[0].state, ExchangeState::Interrupted);
+        assert_eq!(recovered[0].state(), ExchangeState::Interrupted);
         assert_eq!(recovered[0].elapsed(90_000), 60);
-        assert_eq!(recovered[0].completed_at_ms, Some(70));
-        assert_eq!(recovered[1].state, ExchangeState::Running);
-        assert!(recovered[1].awaiting_input);
+        assert_eq!(recovered[0].completed_at_ms(), Some(70));
+        assert_eq!(recovered[1].state(), ExchangeState::Running);
+        assert!(recovered[1].awaiting_input());
         assert_eq!(recovered[1].elapsed(90_000), 20);
         let snapshot = serde_json::to_value(&recovered).unwrap();
         store.interrupt_detached_execution("session").unwrap();
@@ -2157,7 +2158,6 @@ mod test {
             lifecycle: None,
             finalization_error: None,
             check_owner: None,
-            finalization_outcome: None,
             output_store: None,
             archived_output: Default::default(),
             input_message_id: None,
@@ -2169,7 +2169,11 @@ mod test {
             prompt: "report".into(),
             kind: crate::exchange::ExchangeKind::Chat,
             approval_mode: None,
-            state: crate::exchange::ExchangeState::Complete,
+            phase: crate::exchange::ExchangePhase::fixture(
+                crate::exchange::ExchangeState::Complete,
+                Some(4),
+                None,
+            ),
             plan_id: None,
             execution_id: None,
             execution_phase: None,
@@ -2181,18 +2185,15 @@ mod test {
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
             check_setup: None,
-            disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 3,
-            completed_at_ms: Some(4),
             node_list: Vec::new(),
-            awaiting_input: false,
-            elicitation: None,
-            duration_ms: 1,
-            execution_started_at_ms: None,
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
+
+            question: crate::exchange::ExchangeQuestion::None,
+            clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 1 },
         };
         interaction.agent_id = first.id.clone();
         store.save_exchange(&interaction).unwrap();

@@ -621,13 +621,13 @@ impl<'a> CodexTurnCoordinator<'a> {
         message: &Value,
         pending_command: &mut HashMap<u64, SteerCommand>,
     ) -> Result<()> {
-        if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
-            if let (Some(thread), Some(turn)) = (
+        if message.get("method").and_then(Value::as_str) == Some("turn/completed")
+            && let (Some(thread), Some(turn)) = (
                 message_thread_id(message),
                 message.pointer("/params/turn/id").and_then(Value::as_str),
-            ) {
-                self.completed_turn.insert((thread.into(), turn.into()));
-            }
+            )
+        {
+            self.completed_turn.insert((thread.into(), turn.into()));
         }
         settle_interruptions(
             &mut self.interrupted,
@@ -645,19 +645,25 @@ impl<'a> CodexTurnCoordinator<'a> {
             .context("Codex active-turn command response omitted its result")?
             .map(drop);
         if let Some(submission) = &command.submission {
-            if result.is_ok() {
-                let receipt = format!("turn/steer:{message}");
-                result = submission
-                    .persist(move |submission| submission.accepted(receipt))
-                    .await;
-            } else if matches!(
-                message.pointer("/error/code").and_then(Value::as_i64),
-                Some(-32600 | -32601 | -32602)
-            ) {
-                let error = result.as_ref().unwrap_err().to_string();
-                submission
-                    .persist(move |submission| submission.rejected(error))
-                    .await?;
+            match &result {
+                Ok(()) => {
+                    let receipt = format!("turn/steer:{message}");
+                    result = submission
+                        .persist(move |submission| submission.accepted(receipt))
+                        .await;
+                }
+                Err(error)
+                    if matches!(
+                        message.pointer("/error/code").and_then(Value::as_i64),
+                        Some(-32602..=-32600)
+                    ) =>
+                {
+                    let error = error.to_string();
+                    submission
+                        .persist(move |submission| submission.rejected(error))
+                        .await?;
+                }
+                Err(_) => {}
             }
         }
         if command.operation == ActiveTurnOperation::Interrupt && result.is_ok() {
@@ -695,7 +701,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                 .await;
             return;
         }
-        self.cleanup = Some(DescendantCleanup {
+        let mut cleanup = DescendantCleanup {
             command,
             thread: thread.into_iter().collect(),
             target: HashSet::new(),
@@ -705,7 +711,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                 thread_id: self.thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
             }),
-        });
+        };
         if self.provider_goal_active {
             match self
                 .process
@@ -718,23 +724,15 @@ impl<'a> CodexTurnCoordinator<'a> {
                 .await
             {
                 Ok(request_id) => {
-                    self.cleanup
-                        .as_mut()
-                        .expect("cleanup exists")
-                        .pending_request
-                        .insert(request_id);
+                    cleanup.pending_request.insert(request_id);
                 }
                 Err(error) => {
-                    self.cleanup
-                        .take()
-                        .expect("cleanup exists")
-                        .command
-                        .complete(Err(error))
-                        .await;
+                    cleanup.command.complete(Err(error)).await;
                     return;
                 }
             }
         }
+        self.cleanup = Some(cleanup);
         self.admit_cleanup_targets().await;
         if let Err(error) = self.process.collect_requests(self.output).await
             && let Some(cleanup) = self.cleanup.take()
@@ -751,7 +749,7 @@ impl<'a> CodexTurnCoordinator<'a> {
     }
 
     async fn admit_cleanup_targets(&mut self) {
-        let Some(cleanup) = self.cleanup.as_mut() else {
+        let Some(mut cleanup) = self.cleanup.take() else {
             return;
         };
         cleanup.thread.extend(self.descendant.active_thread_list());
@@ -776,19 +774,18 @@ impl<'a> CodexTurnCoordinator<'a> {
                 .await
             {
                 Ok(request_id) => {
-                    let cleanup = self.cleanup.as_mut().expect("cleanup exists");
                     cleanup
                         .target
                         .insert((target.thread_id.clone(), target.turn_id.clone()));
                     cleanup.pending_request.insert(request_id);
                 }
                 Err(error) => {
-                    let cleanup = self.cleanup.take().expect("cleanup exists");
                     cleanup.command.complete(Err(error)).await;
                     return;
                 }
             }
         }
+        self.cleanup = Some(cleanup);
         self.settle_cleanup(tokio::time::Instant::now()).await;
     }
 
@@ -797,25 +794,32 @@ impl<'a> CodexTurnCoordinator<'a> {
             self.settle_cleanup(tokio::time::Instant::now()).await;
             return Ok(());
         };
-        let Some(cleanup) = self.cleanup.as_mut() else {
+        let Some(mut cleanup) = self.cleanup.take() else {
             return Ok(());
         };
         if !cleanup.pending_request.remove(&request_id) {
+            self.cleanup = Some(cleanup);
             return Ok(());
         }
-        if let Err(error) = CodexJsonRpc::request_result(message, request_id, "child cleanup")
-            .context("Codex child cleanup response omitted its result")?
+        match CodexJsonRpc::request_result(message, request_id, "child cleanup")
+            .context("Codex child cleanup response omitted its result")
         {
-            let cleanup = self.cleanup.take().expect("cleanup exists");
-            cleanup.command.complete(Err(error)).await;
-            return Ok(());
+            Ok(Ok(_)) => self.cleanup = Some(cleanup),
+            Ok(Err(error)) => {
+                cleanup.command.complete(Err(error)).await;
+                return Ok(());
+            }
+            Err(error) => {
+                self.cleanup = Some(cleanup);
+                return Err(error);
+            }
         }
         self.settle_cleanup(tokio::time::Instant::now()).await;
         Ok(())
     }
 
     async fn settle_cleanup(&mut self, now: tokio::time::Instant) {
-        let Some(cleanup) = self.cleanup.as_ref() else {
+        let Some(cleanup) = self.cleanup.take() else {
             return;
         };
         if cleanup.pending_request.is_empty()
@@ -830,16 +834,16 @@ impl<'a> CodexTurnCoordinator<'a> {
                     .contains_key(thread_id)
             })
         {
-            let cleanup = self.cleanup.take().expect("cleanup exists");
             cleanup.command.complete(Ok(())).await;
         } else if now >= cleanup.deadline {
-            let cleanup = self.cleanup.take().expect("cleanup exists");
             cleanup
                 .command
                 .complete(Err(anyhow::anyhow!(
                     "Codex descendant cleanup did not reach terminal state within 30 seconds"
                 )))
                 .await;
+        } else {
+            self.cleanup = Some(cleanup);
         }
     }
 

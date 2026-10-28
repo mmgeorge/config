@@ -19,7 +19,7 @@ pub struct ToolOutputPreview<'a> {
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct ToolOutputBatch {
-    pub call_id: String,
+    pub call_id: super::identity::DisplayId,
     pub start_row: usize,
     pub row: Vec<String>,
     pub complete: bool,
@@ -27,7 +27,7 @@ pub struct ToolOutputBatch {
 }
 
 pub struct ToolOutputView {
-    call_id: String,
+    call_id: super::identity::DisplayId,
     file: Option<(PathBuf, u64, u64)>,
     database: Option<StoredOutput>,
     saved: Arc<String>,
@@ -118,7 +118,7 @@ impl ParsedOutput {
 
 /// A fixed output version shares parsed bytes without owning a streaming parser.
 pub struct ToolOutputSnapshot {
-    call_id: String,
+    call_id: super::identity::DisplayId,
     saved: Arc<String>,
     display: Arc<String>,
     row: Arc<Vec<Range<usize>>>,
@@ -145,13 +145,13 @@ impl Write for OutputCollector {
 
 impl ToolOutputView {
     pub(crate) fn stored(
-        call_id: String,
+        call_id: super::identity::DisplayId,
         root: &Path,
         exchange: &str,
         turn: &str,
         tool: &str,
-    ) -> Result<Self> {
-        let mut output = Self::new(call_id, "")?;
+    ) -> Self {
+        let mut output = Self::new(call_id, "");
         output.database = Some(StoredOutput {
             root: root.to_owned(),
             exchange: exchange.into(),
@@ -160,13 +160,13 @@ impl ToolOutputView {
             total: None,
             loaded: 0,
         });
-        Ok(output)
+        output
     }
 
-    pub(super) fn file(call_id: String, path: PathBuf, bytes: u64) -> Result<Self> {
-        let mut source = Self::new(call_id, "")?;
+    pub(super) fn file(call_id: super::identity::DisplayId, path: PathBuf, bytes: u64) -> Self {
+        let mut source = Self::new(call_id, "");
         source.file = Some((path, bytes, 0));
-        Ok(source)
+        source
     }
 
     pub(super) fn has_unloaded_output(&self) -> bool {
@@ -247,7 +247,7 @@ impl ToolOutputView {
     pub fn snapshot(&self) -> Result<ToolOutputSnapshot> {
         let parsed = self.parsed()?;
         Ok(ToolOutputSnapshot {
-            call_id: self.call_id.clone(),
+            call_id: self.call_id,
             saved: Arc::clone(&self.saved),
             display: Arc::clone(&parsed.display),
             row: Arc::clone(&parsed.row),
@@ -262,12 +262,12 @@ impl ToolOutputView {
     pub(crate) fn complete_snapshot(&self) -> Result<ToolOutputSnapshot> {
         if let Some(source) = &self.database {
             let deferred = Self::stored(
-                self.call_id.clone(),
+                self.call_id,
                 &source.root,
                 &source.exchange,
                 &source.turn,
                 &source.tool,
-            )?;
+            );
             let mut snapshot = deferred.snapshot()?;
             snapshot.deferred = Some(Box::new(deferred));
             return Ok(snapshot);
@@ -275,7 +275,7 @@ impl ToolOutputView {
         let Some((path, total, _)) = &self.file else {
             return self.snapshot();
         };
-        let deferred = Self::file(self.call_id.clone(), path.clone(), *total)?;
+        let deferred = Self::file(self.call_id, path.clone(), *total);
         let mut snapshot = deferred.snapshot()?;
         snapshot.deferred = Some(Box::new(deferred));
         Ok(snapshot)
@@ -381,12 +381,8 @@ impl ToolOutputView {
     }
 
     /// Retains raw output without parsing until a preview, expansion, or output view needs it.
-    pub fn new(call_id: String, saved: &str) -> Result<Self> {
-        ensure!(
-            !call_id.is_empty() && call_id.len() <= 256,
-            "invalid tool call identity"
-        );
-        Ok(Self {
+    pub fn new(call_id: super::identity::DisplayId, saved: &str) -> Self {
+        Self {
             call_id,
             file: None,
             database: None,
@@ -396,18 +392,15 @@ impl ToolOutputView {
             owner: String::new(),
             group: String::new(),
             live_preview: false,
-        })
+        }
     }
 
     pub fn append(&mut self, delta: &str) -> Result<()> {
-        if self.parsed.get().is_none() {
+        let Some(parsed) = self.parsed.get_mut() else {
             Arc::make_mut(&mut self.saved).push_str(delta);
             return Ok(());
-        }
-        let parsed = self
-            .parsed
-            .get_mut()
-            .expect("initialized parser")
+        };
+        let parsed = parsed
             .as_mut()
             .map_err(|error| anyhow::anyhow!(error.clone()))?;
         parsed.append(delta)?;
@@ -509,7 +502,7 @@ impl ToolOutputSnapshot {
             row.push(text.to_owned());
         }
         Ok(Some(ToolOutputBatch {
-            call_id: self.call_id.clone(),
+            call_id: self.call_id,
             start_row: self.loaded_rows,
             complete: self.loaded_rows + row.len() == self.total_rows
                 && !self
@@ -576,12 +569,12 @@ impl OwnedToolExport {
             .open(&path)
             .context("create owned tool output export")?;
         let mut export = Self {
-            file: Some(file),
+            file: None,
             path: Some(path),
             trace,
             session_id: session_id.into(),
         };
-        let output = export.file.as_mut().expect("created export");
+        let output = export.file.insert(file);
         for chunk in saved.as_bytes().chunks(65536) {
             output.write_all(chunk)?;
         }
@@ -659,7 +652,11 @@ mod tests {
         let path = directory.path().join("check.output");
         let saved = format!("{}last diagnostic λ\n", "output\n".repeat(30_000));
         std::fs::write(&path, &saved)?;
-        let source = ToolOutputView::file("check".into(), path.clone(), saved.len() as u64)?;
+        let source = ToolOutputView::file(
+            crate::buffer::identity::DisplayId::test(),
+            path.clone(),
+            saved.len() as u64,
+        );
         let mut snapshot = source.complete_snapshot()?;
         assert!(snapshot.saved.is_empty());
         snapshot.expand();
@@ -689,7 +686,11 @@ mod tests {
         let path = directory.path().join("check.output");
         let saved = "αβγ output\n".repeat(20_000);
         std::fs::write(&path, &saved)?;
-        let mut source = ToolOutputView::file("check".into(), path, saved.len() as u64)?;
+        let mut source = ToolOutputView::file(
+            crate::buffer::identity::DisplayId::test(),
+            path,
+            saved.len() as u64,
+        );
         assert!(source.saved.is_empty());
         assert!(source.has_unloaded_output());
         source.load_prefix(1024)?;
@@ -707,7 +708,7 @@ mod tests {
     #[test]
     fn large_line_is_preserved_in_a_batch_and_saved_output() -> Result<()> {
         let saved = format!("{}\nlast\n", "λ".repeat(80_000));
-        let source = ToolOutputView::new("call".into(), &saved)?;
+        let source = ToolOutputView::new(crate::buffer::identity::DisplayId::test(), &saved);
         let mut output = source.snapshot()?;
         output.expand();
         let batch = output.next_batch(256, 65536)?.unwrap();
@@ -729,7 +730,10 @@ mod tests {
 
     #[test]
     fn deferred_output_parses_once_on_demand_and_retains_incremental_state() {
-        let mut output = ToolOutputView::new("call".into(), "first\n\u{1b}[3").unwrap();
+        let mut output = ToolOutputView::new(
+            crate::buffer::identity::DisplayId::test(),
+            "first\n\u{1b}[3",
+        );
         output.append("1msecond").unwrap();
         assert!(
             output.parsed.get().is_none(),
@@ -742,7 +746,10 @@ mod tests {
 
     #[test]
     fn output_snapshot_shares_storage_and_survives_fragmented_live_appends() {
-        let mut output = ToolOutputView::new("call".into(), "first\n\u{1b}[3").unwrap();
+        let mut output = ToolOutputView::new(
+            crate::buffer::identity::DisplayId::test(),
+            "first\n\u{1b}[3",
+        );
         let mut snapshot = output.snapshot().unwrap();
         assert!(Arc::ptr_eq(&output.saved, &snapshot.saved));
         assert!(Arc::ptr_eq(
@@ -762,7 +769,7 @@ mod tests {
 
     #[test]
     fn append_preserves_fragmented_ansi_partial_rows_and_trailing_blanks() {
-        let mut output = ToolOutputView::new("call".into(), "").unwrap();
+        let mut output = ToolOutputView::new(crate::buffer::identity::DisplayId::test(), "");
         for chunk in [
             "\u{1b}[3",
             "1mλ",
@@ -793,7 +800,7 @@ mod tests {
             let saved = (0..count)
                 .map(|index| format!("line {index}\n"))
                 .collect::<String>();
-            let view = ToolOutputView::new("call".into(), &saved).unwrap();
+            let view = ToolOutputView::new(crate::buffer::identity::DisplayId::test(), &saved);
             let preview = view.preview(false).unwrap();
             assert_eq!(
                 preview.row,
@@ -807,7 +814,10 @@ mod tests {
 
     #[test]
     fn preview_advances_with_fragmented_output_without_reparsing_history() -> Result<()> {
-        let mut output = ToolOutputView::new("call".into(), "one\ntwo\nthree\nfour\nfive")?;
+        let mut output = ToolOutputView::new(
+            crate::buffer::identity::DisplayId::test(),
+            "one\ntwo\nthree\nfour\nfive",
+        );
         assert_eq!(output.preview(false)?.row, ["two", "three", "four", "five"]);
         let parser = output.parsed()? as *const ParsedOutput;
         output.append(" continued\n\u{1b}[3")?;
@@ -830,7 +840,7 @@ mod tests {
         let saved = (0..10000)
             .map(|row| format!("output {row}\n"))
             .collect::<String>();
-        let view = ToolOutputView::new("call".into(), &saved).unwrap();
+        let view = ToolOutputView::new(crate::buffer::identity::DisplayId::test(), &saved);
         assert_eq!(view.preview(false).unwrap().hidden_rows, 9996);
         let mut view = view.snapshot().unwrap();
         view.expand();
@@ -854,7 +864,7 @@ mod tests {
     fn export_keeps_complete_saved_bytes_and_cleans_its_owned_artifact() {
         let directory = tempfile::tempdir().unwrap();
         let saved = "\u{1b}[31mred\u{1b}[0m\r\n\0tail\n";
-        let view = ToolOutputView::new("call".into(), saved).unwrap();
+        let view = ToolOutputView::new(crate::buffer::identity::DisplayId::test(), saved);
         let mut export = view
             .snapshot()
             .unwrap()
@@ -874,7 +884,7 @@ mod tests {
     #[test]
     fn display_strips_ansi_and_normalizes_terminal_controls_without_changing_export() {
         let saved = "\u{1b}[31mred\u{1b}[0m\r\nprogress\rdone\n\0tail\n";
-        let view = ToolOutputView::new("call".into(), saved).unwrap();
+        let view = ToolOutputView::new(crate::buffer::identity::DisplayId::test(), saved);
         let collapsed = view.preview(false).unwrap();
 
         assert_eq!(collapsed.row, vec!["red", "progressdone", "tail"]);
@@ -884,10 +894,10 @@ mod tests {
 
     #[test]
     fn rejected_delivery_does_not_advance_the_output_cursor() {
-        let mut view = ToolOutputView::new("call".into(), "first\nlast\n")
-            .unwrap()
-            .snapshot()
-            .unwrap();
+        let mut view =
+            ToolOutputView::new(crate::buffer::identity::DisplayId::test(), "first\nlast\n")
+                .snapshot()
+                .unwrap();
         view.expand();
         let mut batch = view.next_batch(1, 65536).unwrap().unwrap();
         batch.complete = true;

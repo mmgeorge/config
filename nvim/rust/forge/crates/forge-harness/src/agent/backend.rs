@@ -2,9 +2,9 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Agent, AgentSelection, SpawnAgentRequest};
+use super::{AgentSelection, SpawnAgentRequest};
 use crate::backend::{
-    Backend, BackendInput, BackendKind, BackendLaunch, BackendRequest, ExecutionOwner, PromptMode,
+    Backend, BackendInput, BackendKind, BackendLaunch, BackendRequest, PromptMode,
 };
 
 /// Resolves configured adapters while retaining the root's portable preference scope.
@@ -227,15 +227,16 @@ impl AgentBackendFactory {
     pub fn request(
         &self,
         root: &BackendRequest,
-        agent: &Agent,
+        work: &super::AgentWork,
         message: String,
     ) -> Result<BackendRequest> {
+        let agent = &work.agent;
         let selection = agent
             .selection
             .as_ref()
             .context("child has no resolved provider selection")?;
         ensure!(
-            agent.session_id == root.harness_session_id && !agent.is_primary(),
+            work.owner().session_id == root.harness_session_id && !work.owner().is_root(),
             "child request crosses root ownership"
         );
         let message = if selection.instructions.trim().is_empty() {
@@ -247,10 +248,7 @@ impl AgentBackendFactory {
             )
         };
         Ok(BackendRequest {
-            execution_owner: Some(ExecutionOwner {
-                session_id: agent.session_id.clone(),
-                agent_id: agent.id.clone(),
-            }),
+            execution_owner: Some(work.owner().clone()),
             harness_session_id: root.harness_session_id.clone(),
             workspace: root.workspace.clone(),
             input: BackendInput::from_text(message),

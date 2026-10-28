@@ -559,12 +559,10 @@ fn apply_resource_patch<T>(
         }
     }
 
-    let insertion_key_list = set_list
-        .iter()
-        .filter(|value| !current_key_set.contains(semantic_key(value)))
-        .map(|value| semantic_key(value).to_owned())
-        .collect::<Vec<_>>();
-    let mut set_value_by_key = set_list
+    let (insertions, replacements): (Vec<_>, Vec<_>) = set_list
+        .into_iter()
+        .partition(|value| !current_key_set.contains(semantic_key(value)));
+    let mut set_value_by_key = replacements
         .into_iter()
         .map(|value| (semantic_key(&value).to_owned(), value))
         .collect::<HashMap<_, _>>();
@@ -572,7 +570,7 @@ fn apply_resource_patch<T>(
         value_list
             .len()
             .saturating_sub(delete_key_set.len())
-            .saturating_add(insertion_key_list.len()),
+            .saturating_add(insertions.len()),
     );
     for existing in std::mem::take(value_list) {
         let current_key = semantic_key(&existing).to_owned();
@@ -586,10 +584,7 @@ fn apply_resource_patch<T>(
             output.push(existing);
         }
     }
-    for key in insertion_key_list {
-        let mut value = set_value_by_key
-            .remove(&key)
-            .expect("validated insertion key must retain one complete value");
+    for mut value in insertions {
         prepare_value(None, &mut value);
         output.push(value);
     }
@@ -785,7 +780,7 @@ fn propagate_member_rename_in_edges(
     for edge in edge_list {
         if let EntityReference::PlannedEntity { entity } = &edge.target
             && let Some(rename_by_name) = rename_by_entity.get(entity)
-            && let Some(callable) = &mut edge.callable
+            && let Some(callable) = edge.callable_mut()
             && let Some(replacement) = rename_by_name.get(&callable.name)
         {
             callable.name.clone_from(replacement);
@@ -802,13 +797,13 @@ fn propagate_flow_edge_rename(
     rename_by_previous_name: &HashMap<String, String>,
 ) {
     for edge in edge_list {
-        if let Some(callable) = &mut edge.callable {
+        if let Some(callable) = edge.callable_mut() {
             replace_identifier_occurrences(&mut callable.name, rename_by_previous_name);
         }
-        if let Some(payload_type) = &mut edge.payload_type {
+        if let Some(payload_type) = edge.payload_type_mut() {
             replace_identifier_occurrences(payload_type, rename_by_previous_name);
         }
-        if let Some(return_type) = &mut edge.return_type {
+        if let Some(return_type) = edge.return_type_mut() {
             replace_identifier_occurrences(&mut return_type.value_type, rename_by_previous_name);
             if let Some(error_type) = &mut return_type.error_type {
                 replace_identifier_occurrences(error_type, rename_by_previous_name);
@@ -841,11 +836,13 @@ fn replace_identifier_occurrences(value: &mut String, rename_by_name: &HashMap<S
     }
     let original = std::mem::take(value);
     let mut rendered = String::with_capacity(original.len());
-    let mut byte_offset = 0;
-    while byte_offset < original.len() {
+    let mut remaining = original.as_str();
+    while let Some(character) = remaining.chars().next() {
+        let byte_offset = original.len() - remaining.len();
         let replacement = rename_by_name
             .iter()
-            .filter(|(name, _)| original[byte_offset..].starts_with(name.as_str()))
+            .filter(|(name, _)| !name.is_empty())
+            .filter(|(name, _)| remaining.starts_with(name.as_str()))
             .filter(|(name, _)| {
                 let previous = original[..byte_offset].chars().next_back();
                 let next = original[byte_offset + name.len()..].chars().next();
@@ -855,15 +852,11 @@ fn replace_identifier_occurrences(value: &mut String, rename_by_name: &HashMap<S
             .max_by_key(|(name, _)| name.len());
         if let Some((name, replacement)) = replacement {
             rendered.push_str(replacement);
-            byte_offset += name.len();
+            remaining = &remaining[name.len()..];
             continue;
         }
-        let character = original[byte_offset..]
-            .chars()
-            .next()
-            .expect("byte offset must remain on a character boundary");
         rendered.push(character);
-        byte_offset += character.len_utf8();
+        remaining = &remaining[character.len_utf8()..];
     }
     *value = rendered;
 }
@@ -1213,20 +1206,21 @@ mod test {
         });
         document.entity_changes.push(inspector.clone());
 
-        let call_edge = || PlanFlowEdge {
-            relation: PlanFlowRelation::Call,
+        let call_edge = || crate::plan::PlanFlowEdge {
+            operation: crate::plan::PlanFlowOperation::Call(crate::plan::PlanFlowCall {
+                callable: PlanCallable {
+                    kind: PlanCallableKind::Method,
+                    name: "inspect".into(),
+                },
+                payload_type: None,
+                return_type: Some(PlanFlowReturnType {
+                    value_type: "Report".into(),
+                    error_type: None,
+                }),
+            }),
             target: EntityReference::PlannedEntity {
                 entity: "Inspector".into(),
             },
-            callable: Some(PlanCallable {
-                kind: PlanCallableKind::Method,
-                name: "inspect".into(),
-            }),
-            payload_type: None,
-            return_type: Some(PlanFlowReturnType {
-                value_type: "Report".into(),
-                error_type: None,
-            }),
             expansion: Vec::new(),
             branches: Vec::new(),
         };
@@ -1262,7 +1256,7 @@ mod test {
 
         assert_eq!(document.entity_changes[0].members[0].name, "inspect_file");
         let root = &document.flows[0].edges[0];
-        let callable_name = |edge: &PlanFlowEdge| edge.callable.as_ref().unwrap().name.clone();
+        let callable_name = |edge: &PlanFlowEdge| edge.callable().unwrap().name.clone();
         assert_eq!(callable_name(root), "inspect_file");
         assert_eq!(callable_name(&root.expansion[0]), "inspect_file");
         assert_eq!(callable_name(&root.branches[0].edges[0]), "inspect_file");

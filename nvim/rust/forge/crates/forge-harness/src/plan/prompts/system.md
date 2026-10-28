@@ -45,8 +45,10 @@ during the task.
 
 ## Permissions and tasks
 
-Approval mode, filesystem access, and task are independent. Read asks before edits and
-untrusted commands. Write applies saved approval rules. YOLO skips approval prompts.
+Approval mode, filesystem access, and task are independent. Ask applies saved approval
+rules and requests a decision for remaining operations. Deny rejects operations that
+still require a decision. Allow approves remaining operations once while preserving
+explicit denials. YOLO is an independently selected access and approval preset.
 Sandbox and writable directories are configured separately through /config and do not change
 when approval mode changes. Provider restrictions remain authoritative. None of these settings
 authorize unrelated work.

@@ -14,6 +14,40 @@ pub enum ExchangeKind {
     PlanExecution,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExchangeOutcome {
+    Complete,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl ExchangeOutcome {
+    pub fn state(self) -> ExchangeState {
+        match self {
+            Self::Complete => ExchangeState::Complete,
+            Self::Failed => ExchangeState::Failed,
+            Self::Cancelled => ExchangeState::Cancelled,
+            Self::Interrupted => ExchangeState::Interrupted,
+        }
+    }
+}
+
+impl TryFrom<ExchangeState> for ExchangeOutcome {
+    type Error = anyhow::Error;
+
+    fn try_from(state: ExchangeState) -> Result<Self, Self::Error> {
+        match state {
+            ExchangeState::Complete => Ok(Self::Complete),
+            ExchangeState::Failed => Ok(Self::Failed),
+            ExchangeState::Cancelled => Ok(Self::Cancelled),
+            ExchangeState::Interrupted => Ok(Self::Interrupted),
+            _ => anyhow::bail!("exchange state has no terminal outcome"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Retains one phase attempt independently of later execution transitions.
 pub struct ExecutionPhase {
@@ -79,9 +113,6 @@ pub struct Exchange {
     /// Durable failure that keeps cleanup retryable without replaying execution.
     #[serde(default)]
     pub finalization_error: Option<String>,
-    /// Terminal outcome retained while checkpoint persistence remains retryable.
-    #[serde(default)]
-    pub finalization_outcome: Option<ExchangeState>,
     /// Persistent agent identity that owns this exchange.
     pub agent_id: String,
     pub id: String,
@@ -105,10 +136,8 @@ pub struct Exchange {
     #[serde(default)]
     /// Goal whose lifecycle caused this exchange.
     pub goal_id: Option<String>,
-    pub state: ExchangeState,
-    #[serde(default)]
-    /// Position of the exchange in the current workspace history.
-    pub disposition: HistoryDisposition,
+    #[serde(flatten)]
+    pub(crate) phase: super::ExchangePhase,
     pub checkpoint_before: Option<String>,
     pub checkpoint_after: Option<String>,
     pub attributed_diff_text: Option<String>,
@@ -120,20 +149,14 @@ pub struct Exchange {
     /// Owns the setup question boundary independently of the active plan.
     pub check_setup: Option<crate::checks::CheckSetupState>,
     pub created_at_ms: i64,
-    pub completed_at_ms: Option<i64>,
     pub node_list: Vec<ExchangeNode>,
     #[serde(default)]
     /// Provider executions owned by this request, independently of UI grouping.
     pub turn: Vec<crate::turn::Turn>,
-    #[serde(default)]
-    pub awaiting_input: bool,
-    #[serde(default)]
-    pub elicitation: Option<PlanElicitation>,
-    #[serde(default)]
-    pub duration_ms: u64,
-    /// Start of the current execution interval, excluding time awaiting user input.
-    #[serde(default)]
-    pub execution_started_at_ms: Option<i64>,
+    #[serde(flatten)]
+    pub(crate) question: super::ExchangeQuestion,
+    #[serde(flatten)]
+    pub(crate) clock: super::ExchangeClock,
     #[serde(default)]
     /// Retains usage identities and observed tool, approval, and delegated wait occupancy.
     pub metrics: ExchangeMetrics,
@@ -144,6 +167,45 @@ pub struct Exchange {
 }
 
 impl Exchange {
+    pub fn awaiting_input(&self) -> bool {
+        self.question.waiting()
+    }
+    pub fn elicitation(&self) -> Option<&PlanElicitation> {
+        self.question.elicitation()
+    }
+    pub fn elicitation_mut(&mut self) -> Option<&mut PlanElicitation> {
+        self.question.elicitation_mut()
+    }
+    pub fn take_elicitation(&mut self) -> Option<PlanElicitation> {
+        self.question.take_elicitation()
+    }
+    pub fn set_awaiting_input(&mut self, waiting: bool) {
+        self.question.set_waiting(waiting);
+    }
+    pub fn set_elicitation(&mut self, elicitation: Option<PlanElicitation>) {
+        self.question.set_elicitation(elicitation);
+    }
+    pub fn duration_ms(&self) -> u64 {
+        self.clock.duration_ms()
+    }
+    pub fn execution_started_at_ms(&self) -> Option<i64> {
+        self.clock.started_at_ms()
+    }
+    pub fn state(&self) -> ExchangeState {
+        self.phase.state()
+    }
+    pub fn is_finished(&self) -> bool {
+        matches!(self.phase, super::ExchangePhase::Finished(_))
+    }
+    pub fn completed_at_ms(&self) -> Option<i64> {
+        self.phase.completed_at_ms()
+    }
+    pub fn disposition(&self) -> HistoryDisposition {
+        self.phase.disposition()
+    }
+    pub fn finalization_outcome(&self) -> Option<ExchangeOutcome> {
+        self.phase.outcome()
+    }
     /// Create a causal root record for manual child admission without a root model turn.
     pub(crate) fn agent_admission(
         session_id: &str,
@@ -162,7 +224,7 @@ impl Exchange {
         };
         let mut exchange = Self::delegated(session_id, &delegation, ordinal);
         exchange.lifecycle = Some("agent_admission".into());
-        exchange.state = ExchangeState::Running;
+        exchange.phase = super::ExchangePhase::Running;
         exchange
     }
 
@@ -211,11 +273,9 @@ impl Exchange {
             execution_id: None,
             execution_phase: None,
             goal_id: None,
-            state: ExchangeState::Queued,
-            disposition: HistoryDisposition::Current,
+            phase: crate::exchange::ExchangePhase::Queued,
             finalization_error: None,
             check_owner: None,
-            finalization_outcome: None,
             output_store: None,
             archived_output: Default::default(),
             input_message_id: None,
@@ -228,53 +288,40 @@ impl Exchange {
             approval_resolution: Vec::new(),
             check_setup: None,
             created_at_ms: delegation.created_at_ms,
-            completed_at_ms: None,
             node_list: Vec::new(),
             turn: Vec::new(),
-            awaiting_input: false,
-            elicitation: None,
-            duration_ms: 0,
-            execution_started_at_ms: None,
             metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
+
+            question: crate::exchange::ExchangeQuestion::None,
+            clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
         }
     }
 
     /// Freeze execution before cleanup and checkpoint persistence begin.
     pub fn begin_finalization(
         &mut self,
-        outcome: ExchangeState,
+        outcome: ExchangeOutcome,
         now_ms: i64,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            matches!(
-                outcome,
-                ExchangeState::Complete
-                    | ExchangeState::Failed
-                    | ExchangeState::Cancelled
-                    | ExchangeState::Interrupted
-            ),
-            "finalization requires a terminal outcome"
-        );
-        anyhow::ensure!(
-            self.finalization_outcome
+            self.finalization_outcome()
                 .is_none_or(|previous| previous == outcome),
             "finalization cannot change the recorded outcome"
         );
         anyhow::ensure!(
             matches!(
-                self.state,
+                self.state(),
                 ExchangeState::Running | ExchangeState::Finalizing
-            ) && self.completed_at_ms.is_none(),
+            ),
             "only an open exchange can finalize"
         );
         self.pause(now_ms);
         self.metrics.settle(self.elapsed(now_ms));
-        self.awaiting_input = false;
-        self.state = ExchangeState::Finalizing;
+        self.set_awaiting_input(false);
+        self.phase = super::ExchangePhase::Finalizing(outcome);
         self.provider_retry = None;
-        self.finalization_outcome = Some(outcome);
         Ok(())
     }
 
@@ -339,8 +386,8 @@ impl Exchange {
         use crate::backend::TurnBoundary;
         use crate::turn::TurnState;
         if event.kind == "provider_retry" {
-            if self.state != ExchangeState::Running
-                || self.completed_at_ms.is_some()
+            if self.state() != ExchangeState::Running
+                || self.is_finished()
                 || !event
                     .address
                     .as_ref()
@@ -408,9 +455,10 @@ impl Exchange {
                     return Ok(false);
                 }
                 let item_count = turn.items().len();
-                if let Some(tool) = &event.activity {
+                if let Some(tool_event) = event.tool_event() {
+                    let tool = tool_event.activity();
                     let known = turn.tools().any(|existing| existing.id == tool.id);
-                    turn.record_tool_event(event, now_ms)?;
+                    turn.record_tool_event(tool_event, now_ms)?;
                     let running = turn
                         .tools()
                         .find(|existing| existing.id == tool.id)
@@ -419,11 +467,7 @@ impl Exchange {
                         self.metrics.timing_complete = false;
                     }
                     let id = format!("tool:{}:{}:{}", address.thread_id, address.turn_id, tool.id);
-                    let elapsed =
-                        self.duration_ms
-                            .saturating_add(self.execution_started_at_ms.map_or(0, |started| {
-                                event.observed_at_ms(now_ms).saturating_sub(started).max(0) as u64
-                            }));
+                    let elapsed = self.clock.elapsed(event.observed_at_ms(now_ms));
                     self.metrics.block(id, running, elapsed);
                 }
                 if let Some(text) = event.text.as_deref() {
@@ -495,13 +539,12 @@ impl Exchange {
         &mut self,
         address: crate::backend::ProviderAddress,
         now_ms: i64,
-    ) -> anyhow::Result<&mut crate::turn::Turn> {
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             matches!(
-                self.state,
+                self.state(),
                 ExchangeState::Running | ExchangeState::Finalizing
-            ) && self.completed_at_ms.is_none()
-                && self.disposition == HistoryDisposition::Current,
+            ),
             "completed exchange rejects new turns"
         );
         anyhow::ensure!(
@@ -517,7 +560,7 @@ impl Exchange {
                 self.turn[index].state() == crate::turn::TurnState::Running,
                 "completed provider turn cannot restart"
             );
-            return Ok(&mut self.turn[index]);
+            return Ok(());
         }
         anyhow::ensure!(
             self.turn
@@ -527,7 +570,7 @@ impl Exchange {
         );
         let id = format!("{}:turn:{}", self.id, self.turn.len() + 1);
         self.turn.push(crate::turn::Turn::new(id, address, now_ms));
-        Ok(self.turn.last_mut().expect("admitted provider turn"))
+        Ok(())
     }
 
     /// Resolve an execution address without creating work from a late content event.
@@ -544,14 +587,14 @@ impl Exchange {
     /// Reject continuation after the request has reached a terminal outcome.
     pub fn resume(&mut self, now_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.state == ExchangeState::Running && self.completed_at_ms.is_none(),
+            self.state() == ExchangeState::Running,
             "completed exchange cannot resume"
         );
-        self.awaiting_input = self.elicitation.is_some();
+        self.set_awaiting_input(self.elicitation().is_some());
         if self.metrics.awaiting_approval() {
             self.metrics.approval_resume = true;
         } else {
-            self.execution_started_at_ms.get_or_insert(now_ms);
+            self.clock.resume(now_ms);
         }
         Ok(())
     }
@@ -559,15 +602,13 @@ impl Exchange {
     /// Reopen completed source work for its automatic check repair without replacing its identity.
     pub(crate) fn repair_checks(&mut self, now_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.state == ExchangeState::Complete
-                && !self.awaiting_input
-                && self.elicitation.is_none()
+            self.state() == ExchangeState::Complete
+                && !self.awaiting_input()
+                && self.elicitation().is_none()
                 && self.check_owner.is_some(),
             "automatic repair requires a completed exchange with check ownership"
         );
-        self.state = ExchangeState::Running;
-        self.completed_at_ms = None;
-        self.finalization_outcome = None;
+        self.phase = super::ExchangePhase::Running;
         self.finalization_error = None;
         self.resume(now_ms)
     }
@@ -575,7 +616,7 @@ impl Exchange {
     /// Settle interrupted provider turns while retaining the request and its original checkpoint.
     pub(crate) fn pause_for_restart(&mut self, now_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.state == ExchangeState::Running && self.completed_at_ms.is_none(),
+            self.state() == ExchangeState::Running,
             "only an open exchange can pause for restart"
         );
         for turn in &mut self.turn {
@@ -590,19 +631,16 @@ impl Exchange {
 
     /// Return accumulated execution time without allowing terminal history to tick.
     pub fn elapsed(&self, now_ms: i64) -> u64 {
-        let active = if self.completed_at_ms.is_none() {
-            self.execution_started_at_ms
-                .map_or(0, |start| now_ms.saturating_sub(start).max(0) as u64)
+        if self.state() == ExchangeState::Running {
+            self.clock.elapsed(now_ms)
         } else {
-            0
-        };
-        self.duration_ms.saturating_add(active)
+            self.clock.duration_ms()
+        }
     }
 
     /// Resolves lifecycle ownership without treating a stopped clock as a task pause.
     pub(crate) fn activity(&self) -> ExchangeActivity {
-        if self.state != ExchangeState::Running
-            || self.completed_at_ms.is_some()
+        if self.state() != ExchangeState::Running
             || self
                 .execution_phase
                 .as_ref()
@@ -610,7 +648,7 @@ impl Exchange {
         {
             return ExchangeActivity::Settled;
         }
-        if self.execution_started_at_ms.is_none()
+        if self.execution_started_at_ms().is_none()
             && !self.metrics.approval_resume
             && self.turn.last().is_some_and(|turn| {
                 matches!(
@@ -627,8 +665,8 @@ impl Exchange {
         if self.metrics.awaiting_approval() {
             return ExchangeActivity::AwaitingApproval;
         }
-        if self.execution_started_at_ms.is_none()
-            && (self.awaiting_input || self.elicitation.is_some())
+        if self.execution_started_at_ms().is_none()
+            && (self.awaiting_input() || self.elicitation().is_some())
         {
             return ExchangeActivity::AwaitingInput;
         }
@@ -657,7 +695,7 @@ impl Exchange {
     pub(crate) fn observe_blocker(&mut self, id: String, running: bool, now_ms: i64) {
         let approval = id.starts_with("approval:");
         if approval && running && !self.metrics.awaiting_approval() {
-            let resume = self.execution_started_at_ms.is_some();
+            let resume = self.execution_started_at_ms().is_some();
             self.pause(now_ms);
             self.metrics.approval_resume = resume;
         }
@@ -665,12 +703,14 @@ impl Exchange {
         if approval && !running && !self.metrics.awaiting_approval() {
             let resume = std::mem::take(&mut self.metrics.approval_resume);
             if resume
-                && self.state == ExchangeState::Running
-                && self.completed_at_ms.is_none()
-                && !self.awaiting_input
-                && self.elicitation.is_none()
+                && self.state() == ExchangeState::Running
+                && !self.awaiting_input()
+                && self.elicitation().is_none()
             {
-                self.execution_started_at_ms = Some(now_ms);
+                self.clock = crate::exchange::ExchangeClock::Running {
+                    elapsed_ms: self.duration_ms(),
+                    started_at_ms: now_ms,
+                };
             }
         }
     }
@@ -678,39 +718,20 @@ impl Exchange {
     /// Freeze the active interval before waiting for user input or finalization.
     pub fn pause(&mut self, now_ms: i64) {
         self.metrics.approval_resume = false;
-        if let Some(start) = self.execution_started_at_ms.take() {
-            self.duration_ms = self
-                .duration_ms
-                .saturating_add(now_ms.saturating_sub(start).max(0) as u64);
-        }
+        self.clock.pause(now_ms);
     }
 
     /// Mark restored history without erasing the original execution outcome.
     pub fn set_disposition(&mut self, disposition: HistoryDisposition) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.completed_at_ms.is_some(),
-            "running exchange cannot leave current history"
-        );
-        self.disposition = disposition;
-        Ok(())
+        self.phase.set_disposition(disposition)
     }
 
     /// Settle every execution segment before publishing the terminal outcome.
-    pub fn finish(&mut self, outcome: ExchangeState, now_ms: i64) -> anyhow::Result<()> {
+    pub fn finish(&mut self, outcome: ExchangeOutcome, now_ms: i64) -> anyhow::Result<()> {
         self.provider_retry = None;
-        anyhow::ensure!(
-            matches!(
-                outcome,
-                ExchangeState::Complete
-                    | ExchangeState::Failed
-                    | ExchangeState::Cancelled
-                    | ExchangeState::Interrupted
-            ),
-            "exchange finish requires an execution outcome"
-        );
-        if self.completed_at_ms.is_some() {
+        if matches!(self.phase, super::ExchangePhase::Finished(_)) {
             anyhow::ensure!(
-                self.state == outcome,
+                self.state() == outcome.state(),
                 "completed exchange outcome cannot change"
             );
             return Ok(());
@@ -718,14 +739,15 @@ impl Exchange {
         for turn in &mut self.turn {
             if turn.state() == crate::turn::TurnState::Running {
                 anyhow::ensure!(
-                    outcome != ExchangeState::Complete,
+                    outcome != ExchangeOutcome::Complete,
                     "exchange completion requires settled provider turns"
                 );
                 turn.finish(
                     match outcome {
-                        ExchangeState::Cancelled => crate::turn::TurnOutcome::Cancelled,
-                        ExchangeState::Interrupted => crate::turn::TurnOutcome::Interrupted,
-                        _ => crate::turn::TurnOutcome::Failed,
+                        ExchangeOutcome::Cancelled => crate::turn::TurnOutcome::Cancelled,
+                        ExchangeOutcome::Interrupted => crate::turn::TurnOutcome::Interrupted,
+                        ExchangeOutcome::Failed => crate::turn::TurnOutcome::Failed,
+                        ExchangeOutcome::Complete => crate::turn::TurnOutcome::Completed,
                     },
                     now_ms,
                 )?;
@@ -733,9 +755,8 @@ impl Exchange {
         }
         self.pause(now_ms);
         self.metrics.settle(self.elapsed(now_ms));
-        self.state = outcome;
-        self.completed_at_ms = Some(now_ms);
-        self.awaiting_input = false;
+        self.phase.complete(outcome, now_ms);
+        self.set_awaiting_input(false);
         Ok(())
     }
 
@@ -749,10 +770,9 @@ impl Exchange {
     ) -> anyhow::Result<bool> {
         anyhow::ensure!(
             matches!(
-                self.state,
+                self.state(),
                 ExchangeState::Running | ExchangeState::Finalizing
-            ) && self.completed_at_ms.is_none()
-                && self.disposition == HistoryDisposition::Current,
+            ),
             "delegation requires a current running exchange"
         );
         let delegation_id = format!("{}:agent:{run_id}:{invocation_id}", self.id);
@@ -808,18 +828,27 @@ impl Exchange {
         text: String,
         now_ms: i64,
     ) -> anyhow::Result<ExchangeInput> {
-        if let Some(id) = &id {
-            if let Some(prompt) = self.node_list.iter().find_map(|node| match node {
+        self.record_input(id, intent, text, None, now_ms)
+    }
+
+    fn record_input(
+        &mut self,
+        id: Option<String>,
+        intent: InputIntent,
+        text: String,
+        question: Option<QuestionInput>,
+        now_ms: i64,
+    ) -> anyhow::Result<ExchangeInput> {
+        if let Some(id) = &id
+            && let Some(prompt) = self.node_list.iter().find_map(|node| match node {
                 ExchangeNode::ExchangeInput { prompt } if &prompt.id == id => Some(prompt),
                 _ => None,
-            }) {
-                return Ok(prompt.clone());
-            }
+            })
+        {
+            return Ok(prompt.clone());
         }
         anyhow::ensure!(
-            self.state == ExchangeState::Running
-                && self.completed_at_ms.is_none()
-                && self.disposition == HistoryDisposition::Current,
+            self.state() == ExchangeState::Running,
             "user input requires a current running exchange"
         );
         for turn in self
@@ -837,7 +866,7 @@ impl Exchange {
             .count()
             + 1;
         let prompt = ExchangeInput {
-            question: None,
+            question,
             intent,
             id: id.unwrap_or_else(|| format!("{}:input:{prompt_ordinal}", self.id)),
             text,
@@ -866,11 +895,7 @@ impl Exchange {
                 && (intent != InputIntent::Clarification || question.question_id.is_some()),
             "question clarification requires a durable question target"
         );
-        self.append_input(intent, text, now_ms)?;
-        let Some(ExchangeNode::ExchangeInput { prompt }) = self.node_list.last_mut() else {
-            unreachable!("input admission appends an input node")
-        };
-        prompt.question = Some(question);
+        self.record_input(None, intent, text, Some(question), now_ms)?;
         Ok(())
     }
 
@@ -995,12 +1020,36 @@ mod test {
         );
     }
 
+    #[test]
+    fn legacy_completion_without_timestamp_stays_terminal_after_roundtrip() {
+        let mut record = serde_json::to_value(interaction()).unwrap();
+        record["state"] = "complete".into();
+        record["completed_at_ms"] = serde_json::Value::Null;
+        record["duration_ms"] = 25.into();
+        record["execution_started_at_ms"] = 1.into();
+        let mut restored: Exchange = serde_json::from_value(record).unwrap();
+        assert!(restored.is_finished());
+        assert_eq!(restored.elapsed(100_000), 25);
+        assert!(restored.resume(100_000).is_err());
+        restored
+            .set_disposition(HistoryDisposition::RolledBack)
+            .unwrap();
+        let encoded = serde_json::to_value(&restored).unwrap();
+        assert_eq!(encoded["state"], "complete");
+        assert!(encoded["completed_at_ms"].is_null());
+        assert_eq!(encoded["duration_ms"], 25);
+        assert!(encoded.get("phase").is_none());
+        assert!(encoded.get("clock").is_none());
+        let reopened: Exchange = serde_json::from_value(encoded).unwrap();
+        assert_eq!(reopened.disposition(), HistoryDisposition::RolledBack);
+        assert_eq!(reopened.elapsed(200_000), 25);
+    }
+
     fn interaction() -> Exchange {
         Exchange {
             lifecycle: None,
             finalization_error: None,
             check_owner: None,
-            finalization_outcome: None,
             output_store: None,
             archived_output: Default::default(),
             input_message_id: None,
@@ -1016,7 +1065,7 @@ mod test {
             execution_id: None,
             execution_phase: None,
             goal_id: None,
-            state: ExchangeState::Running,
+            phase: crate::exchange::ExchangePhase::Running,
             checkpoint_before: None,
             checkpoint_after: None,
             attributed_diff_text: None,
@@ -1024,18 +1073,15 @@ mod test {
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
             check_setup: None,
-            disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 1,
-            completed_at_ms: None,
             node_list: Vec::new(),
-            awaiting_input: false,
-            elicitation: None,
-            duration_ms: 0,
-            execution_started_at_ms: None,
             metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
+
+            question: crate::exchange::ExchangeQuestion::None,
+            clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
         }
     }
 
@@ -1067,8 +1113,9 @@ mod test {
             task_update: None,
         };
         assert!(!exchange.observe_turn(&event, 1000)?);
+        exchange.start_turn(address.clone(), 1000)?;
         exchange
-            .start_turn(address.clone(), 1000)?
+            .turn_mut(&address)?
             .finish(crate::turn::TurnOutcome::Failed, 1001)?;
         assert!(exchange.observe_turn(&event, 1001)?);
         assert!(matches!(
@@ -1082,7 +1129,7 @@ mod test {
             SessionPhase::Working { .. }
         ));
         event.data = serde_json::to_value(&retry)?;
-        exchange.finish(ExchangeState::Failed, 2001)?;
+        exchange.finish(crate::exchange::ExchangeOutcome::Failed, 2001)?;
         assert!(!exchange.observe_turn(&event, 2002)?);
         assert!(exchange.provider_retry.is_none());
         Ok(())
@@ -1398,8 +1445,14 @@ mod test {
             .unwrap();
         assert_eq!(exchange.turn.len(), 2);
         assert_ne!(exchange.turn[1].id(), first_id);
-        assert!(exchange.finish(ExchangeState::Complete, 60).is_err());
-        exchange.finish(ExchangeState::Cancelled, 60).unwrap();
+        assert!(
+            exchange
+                .finish(crate::exchange::ExchangeOutcome::Complete, 60)
+                .is_err()
+        );
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Cancelled, 60)
+            .unwrap();
         assert_eq!(
             exchange.turn[1].state(),
             TurnState::Finished {
@@ -1418,7 +1471,9 @@ mod test {
             turn_id: "turn".into(),
         };
         exchange.start_turn(address, 100).unwrap();
-        exchange.finish(ExchangeState::Interrupted, 150).unwrap();
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Interrupted, 150)
+            .unwrap();
         assert_eq!(exchange.elapsed(90_000), 50);
         assert_eq!(
             exchange.turn[0].state(),
@@ -1427,18 +1482,24 @@ mod test {
             }
         );
         assert!(exchange.resume(90_000).is_err());
-        exchange.finish(ExchangeState::Interrupted, 90_000).unwrap();
-        assert_eq!(exchange.completed_at_ms, Some(150));
-        assert!(exchange.finish(ExchangeState::Cancelled, 90_000).is_err());
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Interrupted, 90_000)
+            .unwrap();
+        assert_eq!(exchange.completed_at_ms(), Some(150));
+        assert!(
+            exchange
+                .finish(crate::exchange::ExchangeOutcome::Cancelled, 90_000)
+                .is_err()
+        );
     }
 
     #[test]
     fn terminal_exchanges_reject_every_input_intent_without_mutation() {
         for outcome in [
-            ExchangeState::Complete,
-            ExchangeState::Cancelled,
-            ExchangeState::Failed,
-            ExchangeState::Interrupted,
+            ExchangeOutcome::Complete,
+            ExchangeOutcome::Cancelled,
+            ExchangeOutcome::Failed,
+            ExchangeOutcome::Interrupted,
         ] {
             let mut exchange = interaction();
             exchange.finish(outcome, 30).unwrap();
@@ -1465,14 +1526,14 @@ mod test {
         let mut exchange = interaction();
         exchange.resume(10).unwrap();
         exchange
-            .begin_finalization(ExchangeState::Complete, 30)
+            .begin_finalization(crate::exchange::ExchangeOutcome::Complete, 30)
             .unwrap();
         exchange
-            .begin_finalization(ExchangeState::Complete, 90)
+            .begin_finalization(crate::exchange::ExchangeOutcome::Complete, 90)
             .unwrap();
         assert!(
             exchange
-                .begin_finalization(ExchangeState::Cancelled, 90)
+                .begin_finalization(crate::exchange::ExchangeOutcome::Cancelled, 90)
                 .is_err()
         );
         assert_eq!(exchange.elapsed(1000), 20);
@@ -1487,7 +1548,9 @@ mod test {
                 .append_delegation("child", "late", "task", 1000)
                 .is_ok()
         );
-        exchange.finish(ExchangeState::Complete, 1000).unwrap();
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Complete, 1000)
+            .unwrap();
         assert!(
             exchange
                 .append_delegation("child", "after-terminal", "task", 1100)
@@ -1510,13 +1573,21 @@ mod test {
             .unwrap()
             .finish(crate::turn::TurnOutcome::Completed, 30)
             .unwrap();
-        exchange.finish(ExchangeState::Complete, 30).unwrap();
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Complete, 30)
+            .unwrap();
         assert!(exchange.resume(900).is_err());
         assert!(exchange.start_turn(address, 900).is_err());
-        exchange.finish(ExchangeState::Complete, 900).unwrap();
-        assert_eq!(exchange.completed_at_ms, Some(30));
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Complete, 900)
+            .unwrap();
+        assert_eq!(exchange.completed_at_ms(), Some(30));
         assert_eq!(exchange.turn[0].duration_ms(), 20);
-        assert!(exchange.finish(ExchangeState::Failed, 901).is_err());
+        assert!(
+            exchange
+                .finish(crate::exchange::ExchangeOutcome::Failed, 901)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1543,7 +1614,9 @@ mod test {
                 30,
             )
             .unwrap();
-        exchange.finish(ExchangeState::Cancelled, 50).unwrap();
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Cancelled, 50)
+            .unwrap();
         assert_eq!(exchange.turn[0].duration_ms(), 10);
         assert_eq!(exchange.turn[1].duration_ms(), 20);
         assert_eq!(
@@ -1608,21 +1681,23 @@ mod test {
             }
             exchange.observe_blocker("approval:request".into(), true, 3000);
             match boundary {
-                "user_input" => exchange.awaiting_input = true,
+                "user_input" => exchange.set_awaiting_input(true),
                 "pause" => exchange.pause(4000),
                 "restart" => exchange.pause_for_restart(4000).unwrap(),
                 "finalization" => {
                     exchange
-                        .begin_finalization(ExchangeState::Complete, 4000)
+                        .begin_finalization(crate::exchange::ExchangeOutcome::Complete, 4000)
                         .unwrap();
                 }
-                "cancelled" => exchange.finish(ExchangeState::Cancelled, 4000).unwrap(),
+                "cancelled" => exchange
+                    .finish(crate::exchange::ExchangeOutcome::Cancelled, 4000)
+                    .unwrap(),
                 _ => {}
             }
             let elapsed = exchange.elapsed(5000);
             exchange.observe_blocker("approval:request".into(), false, 90_000);
             assert_eq!(exchange.elapsed(100_000), elapsed, "{boundary}");
-            assert!(exchange.execution_started_at_ms.is_none(), "{boundary}");
+            assert!(exchange.execution_started_at_ms().is_none(), "{boundary}");
         }
     }
 
@@ -1635,7 +1710,7 @@ mod test {
             serde_json::from_value(serde_json::to_value(exchange).unwrap()).unwrap();
         recovered.observe_blocker("approval:request".into(), false, 90_000);
         assert_eq!(recovered.elapsed(100_000), 2000);
-        assert!(recovered.execution_started_at_ms.is_none());
+        assert!(recovered.execution_started_at_ms().is_none());
     }
 
     #[test]
@@ -1644,11 +1719,13 @@ mod test {
         exchange.resume(100).unwrap();
         assert_eq!(exchange.elapsed(250), 150);
         exchange.pause(300);
-        exchange.awaiting_input = true;
+        exchange.set_awaiting_input(true);
         assert_eq!(exchange.elapsed(10_000), 200);
         exchange.resume(10_000).unwrap();
         assert_eq!(exchange.elapsed(10_050), 250);
-        exchange.finish(ExchangeState::Complete, 10_100).unwrap();
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Complete, 10_100)
+            .unwrap();
         assert_eq!(exchange.elapsed(90_000), 300);
     }
 
@@ -1660,12 +1737,14 @@ mod test {
                 .set_disposition(HistoryDisposition::RolledBack)
                 .is_err()
         );
-        exchange.finish(ExchangeState::Failed, 30).unwrap();
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Failed, 30)
+            .unwrap();
         exchange
             .set_disposition(HistoryDisposition::RolledBack)
             .unwrap();
-        assert_eq!(exchange.state, ExchangeState::Failed);
-        assert_eq!(exchange.completed_at_ms, Some(30));
+        assert_eq!(exchange.state(), ExchangeState::Failed);
+        assert_eq!(exchange.completed_at_ms(), Some(30));
         assert!(exchange.resume(40).is_err());
     }
 

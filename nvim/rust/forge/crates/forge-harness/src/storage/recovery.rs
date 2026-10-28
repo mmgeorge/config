@@ -42,7 +42,7 @@ impl SqliteStore {
         for payload in exchange {
             let mut exchange: Exchange = serde_json::from_str(&payload)?;
             if !matches!(
-                exchange.state,
+                exchange.state(),
                 ExchangeState::Running | ExchangeState::Queued | ExchangeState::Finalizing
             ) {
                 continue;
@@ -51,21 +51,21 @@ impl SqliteStore {
                 .turn
                 .iter()
                 .any(|turn| turn.state() == TurnState::Running);
-            if exchange.state == ExchangeState::Finalizing && !running_turn {
+            if exchange.state() == ExchangeState::Finalizing && !running_turn {
                 continue;
             }
-            if exchange.awaiting_input
+            if exchange.awaiting_input()
                 && !running_turn
-                && exchange.execution_started_at_ms.is_none()
+                && exchange.execution_started_at_ms().is_none()
             {
                 continue;
             }
             // Recover only observed execution time, excluding the offline interval.
-            let observed_at = exchange.execution_started_at_ms.map_or_else(
+            let observed_at = exchange.execution_started_at_ms().map_or_else(
                 || {
                     exchange.created_at_ms.saturating_add(
                         exchange
-                            .duration_ms
+                            .duration_ms()
                             .max(exchange.metrics.observed_elapsed_ms)
                             .min(i64::MAX as u64) as i64,
                     )
@@ -74,14 +74,14 @@ impl SqliteStore {
                     let active = exchange
                         .metrics
                         .observed_elapsed_ms
-                        .saturating_sub(exchange.duration_ms);
+                        .saturating_sub(exchange.duration_ms());
                     started.saturating_add(active.min(i64::MAX as u64) as i64)
                 },
             );
-            if exchange.state == ExchangeState::Finalizing {
-                let outcome = match exchange.finalization_outcome {
-                    Some(ExchangeState::Cancelled) => TurnOutcome::Cancelled,
-                    Some(ExchangeState::Failed) => TurnOutcome::Failed,
+            if exchange.state() == ExchangeState::Finalizing {
+                let outcome = match exchange.finalization_outcome() {
+                    Some(crate::exchange::ExchangeOutcome::Cancelled) => TurnOutcome::Cancelled,
+                    Some(crate::exchange::ExchangeOutcome::Failed) => TurnOutcome::Failed,
                     _ => TurnOutcome::Interrupted,
                 };
                 for turn in &mut exchange.turn {
@@ -89,11 +89,15 @@ impl SqliteStore {
                         turn.finish(outcome, observed_at)?;
                     }
                 }
-                if exchange.finalization_outcome == Some(ExchangeState::Complete) {
-                    exchange.finalization_outcome = Some(ExchangeState::Interrupted);
+                if exchange.finalization_outcome()
+                    == Some(crate::exchange::ExchangeOutcome::Complete)
+                {
+                    exchange.phase = crate::exchange::ExchangePhase::Finalizing(
+                        crate::exchange::ExchangeOutcome::Interrupted,
+                    );
                 }
             } else {
-                exchange.finish(ExchangeState::Interrupted, observed_at)?;
+                exchange.finish(crate::exchange::ExchangeOutcome::Interrupted, observed_at)?;
             }
             transaction.execute(
                 "UPDATE exchange_record SET payload=?2 WHERE id=?1",

@@ -54,13 +54,10 @@ fn full_file_preview_delivers_every_line_beyond_former_cutoff_without_losing_raw
                 } else {
                     (content, Vec::new())
                 };
-                let raw = retain(
-                    compute_hunks(SourcePair {
-                        old: SourceVersion::new(old, Representation::GitCanonical).unwrap(),
-                        new: SourceVersion::new(new, Representation::GitCanonical).unwrap(),
-                    })
-                    .unwrap(),
-                );
+                let raw = retain(compute_hunks(SourcePair {
+                    old: SourceVersion::new(old, Representation::GitCanonical).unwrap(),
+                    new: SourceVersion::new(new, Representation::GitCanonical).unwrap(),
+                }));
                 let original = raw.hunks().to_vec();
                 let mut cursor = DisplayCursor::new(raw.clone(), 3);
                 {
@@ -92,13 +89,10 @@ fn full_file_preview_delivers_every_line_beyond_former_cutoff_without_losing_raw
 
 #[test]
 fn modified_file_expansion_is_independent_of_the_full_file_gate() {
-    let raw = retain(
-        compute_hunks(SourcePair {
-            old: SourceVersion::new(b"old\n".repeat(1200), Representation::Raw).unwrap(),
-            new: SourceVersion::new(b"new\n".repeat(1200), Representation::Raw).unwrap(),
-        })
-        .unwrap(),
-    );
+    let raw = retain(compute_hunks(SourcePair {
+        old: SourceVersion::new(b"old\n".repeat(1200), Representation::Raw).unwrap(),
+        new: SourceVersion::new(b"new\n".repeat(1200), Representation::Raw).unwrap(),
+    }));
     let mut cursor = DisplayCursor::new(raw, 3);
     let chunk = cursor.next_rows(ChunkLimits::default());
     assert_eq!(chunk.rows.len(), 256);

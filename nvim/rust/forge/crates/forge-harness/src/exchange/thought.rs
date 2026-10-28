@@ -146,7 +146,7 @@ impl Exchange {
                             | crate::plan::PlanLifecycleKind::QuestionWithdrawn)));
             if input_boundary {
                 if let Some(index) = active.take() {
-                    content.close(index, self.completed_at_ms.is_some());
+                    content.close(index, self.is_finished());
                 }
                 content.boundary(node);
                 continue;
@@ -165,7 +165,7 @@ impl Exchange {
                         continue;
                     }
                     if let Some(index) = active.take() {
-                        content.close(index, self.completed_at_ms.is_some());
+                        content.close(index, self.is_finished());
                     }
                     active = Some(content.begin(id, Some(message)));
                 }
@@ -213,7 +213,7 @@ impl Exchange {
                 }
             }
         }
-        if self.completed_at_ms.is_some()
+        if self.is_finished()
             && let Some(index) = active
         {
             content.close(index, true);

@@ -625,10 +625,10 @@ impl IssueDocumentService {
             let report = {
                 let mut state = self.state.lock().expect("issue registry");
                 while let Some(result) = state.task.try_join_next() {
-                    if let Err(error) = result {
-                        if state.failure.len() < MAX_JOBS {
-                            state.failure.push(error.to_string());
-                        }
+                    if let Err(error) = result
+                        && state.failure.len() < MAX_JOBS
+                    {
+                        state.failure.push(error.to_string());
                     }
                 }
                 IssueShutdown {
@@ -700,10 +700,10 @@ impl IssueDocumentService {
         let mut state = self.state.lock().expect("issue registry");
         ensure!(!state.closed, "issue service is closed");
         while let Some(result) = state.task.try_join_next() {
-            if let Err(failure) = result {
-                if state.failure.len() < MAX_JOBS {
-                    state.failure.push(failure.to_string());
-                }
+            if let Err(failure) = result
+                && state.failure.len() < MAX_JOBS
+            {
+                state.failure.push(failure.to_string());
             }
         }
         state.task.spawn(future);

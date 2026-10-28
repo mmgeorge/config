@@ -54,7 +54,7 @@ impl<'profile> TranscriptRenderer<'profile> {
     /// Projects one stable output chunk and an independent collapsed hidden-count block.
     pub(super) fn tool_body(
         &self,
-        call_id: &str,
+        call_id: &super::identity::DisplayId,
         output: &ToolOutputView,
         expanded: bool,
         chunk: usize,
@@ -98,7 +98,7 @@ impl<'profile> TranscriptRenderer<'profile> {
     /// Changes hidden output counts without replacing the heading or its preview.
     pub(super) fn tool_hidden(
         &self,
-        call_id: &str,
+        call_id: &super::identity::DisplayId,
         output: &ToolOutputView,
         expanded: bool,
     ) -> Result<BufferBlock> {
@@ -310,15 +310,22 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     /// Assigns a fold affordance while preserving tool dots and diff hunk labels.
     pub(super) fn fold_marker(block: &mut BufferBlock) {
-        let heading = block.text.row(0).unwrap_or("").trim_start();
-        if heading.starts_with('•') || heading.starts_with("@@") {
-            return;
-        }
         let layout = block.metadata.layout.get_or_insert(ContentLayout {
             indent: 2,
             source_indent: 0,
             marker: None,
         });
+        Self::fold_layout_marker(&block.text, layout);
+    }
+
+    pub(super) fn fold_layout_marker(
+        text: &forge_buffer::text::BufferText,
+        layout: &mut ContentLayout,
+    ) {
+        let heading = text.row(0).unwrap_or("").trim_start();
+        if heading.starts_with('•') || heading.starts_with("@@") {
+            return;
+        }
         let capture = layout
             .marker
             .as_ref()
@@ -875,7 +882,7 @@ mod test {
         };
         let source = "Inspect [Image #1]";
         let block =
-            TranscriptRenderer::new(&profile)?.prompt(BlockId("attachment".into()), &source)?;
+            TranscriptRenderer::new(&profile)?.prompt(BlockId("attachment".into()), source)?;
         assert_eq!(block.text.row_count(), 1);
         assert_eq!(block.text.row(0), Some("● Inspect [Image #1]"));
         Ok(())
@@ -1067,7 +1074,7 @@ mod test {
                 ..Default::default()
             };
             let renderer = TranscriptRenderer::new(&width)?;
-            let mut output = ToolOutputView::new("live".into(), "")?;
+            let mut output = ToolOutputView::new(crate::buffer::identity::DisplayId::test(), "");
             output.live_preview = true;
             for delta in [
                 "",
@@ -1076,7 +1083,12 @@ mod test {
                 "\n界".repeat(200).as_str(),
             ] {
                 output.append(delta)?;
-                let body = renderer.tool_body("live", &output, false, 0)?;
+                let body = renderer.tool_body(
+                    &crate::buffer::identity::DisplayId::test(),
+                    &output,
+                    false,
+                    0,
+                )?;
                 assert_eq!(body.text.row_count(), 4);
                 assert!(
                     body.text
@@ -1086,13 +1098,13 @@ mod test {
                 );
                 assert_eq!(
                     renderer
-                        .tool_hidden("live", &output, false)?
+                        .tool_hidden(&crate::buffer::identity::DisplayId::test(), &output, false)?
                         .text
                         .row_count(),
                     0
                 );
             }
-            assert!(output.preview(true)?.row.iter().any(|row| *row == "one"));
+            assert!(output.preview(true)?.row.contains(&"one"));
         }
         Ok(())
     }
@@ -1175,7 +1187,10 @@ mod test {
                 failed: false,
                 change: Default::default(),
             };
-            let mut output = ToolOutputView::new("shell".into(), "matching content\n")?;
+            let mut output = ToolOutputView::new(
+                crate::buffer::identity::DisplayId::test(),
+                "matching content\n",
+            );
             output.heading(&heading);
             let header = renderer.tool_header(
                 BlockId("shell".into()),
@@ -1187,7 +1202,12 @@ mod test {
                 false,
             )?;
             assert!(header.text.row(0).unwrap().ends_with(expected));
-            let body = renderer.tool_body("shell", &output, true, 0)?;
+            let body = renderer.tool_body(
+                &crate::buffer::identity::DisplayId::test(),
+                &output,
+                true,
+                0,
+            )?;
             let rendered = body.text.wire_rows().join("\n");
             assert!(rendered.contains(&format!("Command: {source}")));
             assert!(rendered.contains("matching content"));
@@ -1324,7 +1344,8 @@ mod test {
             failed: false,
             change: Default::default(),
         };
-        let mut output = ToolOutputView::new("call".into(), "tool result\n")?;
+        let mut output =
+            ToolOutputView::new(crate::buffer::identity::DisplayId::test(), "tool result\n");
         output.heading(&call);
         let header = renderer.tool_header(
             BlockId("call".into()),
@@ -1336,7 +1357,12 @@ mod test {
             true,
         )?;
         assert!(!header.text.row(0).unwrap().contains("456"));
-        let body = renderer.tool_body("call", &output, true, 0)?;
+        let body = renderer.tool_body(
+            &crate::buffer::identity::DisplayId::test(),
+            &output,
+            true,
+            0,
+        )?;
         let rows = body.text.wire_rows();
         let joined = rows
             .iter()
@@ -1468,9 +1494,9 @@ mod test {
         let profile = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&profile)?;
         let output = super::super::tool::ToolOutputView::new(
-            "preview".into(),
+            crate::buffer::identity::DisplayId::test(),
             "one\r\ntwo\nthree\nfour\nfive\n",
-        )?;
+        );
         let block = renderer.tool_preview(
             BlockId("active:tool".into()),
             TargetId("active:tool".into()),
@@ -1525,7 +1551,10 @@ mod test {
         };
         let renderer = TranscriptRenderer::new(&profile)?;
         let source = format!("{}\nsecond\nthird\n", "界".repeat(60));
-        let output = super::super::tool::ToolOutputView::new("wrapped".into(), &source)?;
+        let output = super::super::tool::ToolOutputView::new(
+            crate::buffer::identity::DisplayId::test(),
+            &source,
+        );
         let render = |expanded| {
             renderer.tool_preview(
                 BlockId("wrapped:tool".into()),

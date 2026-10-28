@@ -89,7 +89,7 @@ struct PoolShared {
 
 struct PoolState {
     queue: [VecDeque<WorkItem>; 3],
-    job: HashMap<u64, WorkRecord>,
+    job: HashMap<u64, Arc<WorkRecord>>,
     usage: PoolUsage,
     next_sequence: u64,
     closed: bool,
@@ -97,18 +97,20 @@ struct PoolState {
 
 struct WorkRecord {
     budget: WorkBudget,
-    running: bool,
+    // The pool state lock orders this flag with usage accounting.
+    running: AtomicBool,
 }
 
 struct WorkItem {
     // Input-owning closures must drop before the lease releases admission.
-    task: Option<Box<dyn FnOnce(WorkBudget) + Send>>,
+    task: Box<dyn FnOnce(WorkBudget) + Send>,
     lease: WorkLease,
 }
 
 struct WorkLease {
     shared: Arc<PoolShared>,
     sequence: u64,
+    record: Arc<WorkRecord>,
 }
 
 impl WorkBudget {
@@ -213,18 +215,17 @@ impl AnalysisPool {
         state.next_sequence = next_sequence;
         state.usage.admitted_jobs += 1;
         state.usage.input_bytes = input_bytes;
-        state.job.insert(
-            sequence,
-            WorkRecord {
-                budget,
-                running: false,
-            },
-        );
+        let record = Arc::new(WorkRecord {
+            budget,
+            running: AtomicBool::new(false),
+        });
+        state.job.insert(sequence, Arc::clone(&record));
         Ok(WorkPermit {
             priority,
             lease: WorkLease {
                 shared: Arc::clone(&self.shared),
                 sequence,
+                record,
             },
         })
     }
@@ -261,11 +262,9 @@ impl AnalysisPool {
             return false;
         }
         let mut state = self.shared.state.lock().expect("analysis pool poisoned");
-        if state
-            .job
-            .get(&ticket.sequence)
-            .is_none_or(|record| record.running || record.budget.check().is_err())
-        {
+        if state.job.get(&ticket.sequence).is_none_or(|record| {
+            record.running.load(Ordering::Relaxed) || record.budget.check().is_err()
+        }) {
             return false;
         }
         let promoted = state
@@ -375,7 +374,7 @@ impl WorkPermit {
         let ticket = self.ticket();
         shared.state.lock().expect("analysis pool poisoned").queue[self.priority as usize]
             .push_back(WorkItem {
-                task: Some(Box::new(task)),
+                task: Box::new(task),
                 lease: self.lease,
             });
         shared.ready.notify_one();
@@ -416,7 +415,7 @@ impl Drop for WorkLease {
         if let Some(record) = state.job.remove(&self.sequence) {
             state.usage.admitted_jobs -= 1;
             state.usage.input_bytes -= record.budget.input_bytes;
-            if record.running {
+            if record.running.load(Ordering::Relaxed) {
                 state.usage.running_jobs -= 1;
             }
         }
@@ -427,15 +426,12 @@ impl Drop for WorkLease {
 
 fn run_worker(shared: Arc<PoolShared>) {
     loop {
-        let (mut work, budget) = {
+        let (work, budget) = {
             let mut state = shared.state.lock().expect("analysis pool poisoned");
             loop {
                 if let Some(work) = state.queue.iter_mut().find_map(VecDeque::pop_front) {
-                    let record = state
-                        .job
-                        .get_mut(&work.lease.sequence)
-                        .expect("queued job missing");
-                    record.running = true;
+                    let record = &work.lease.record;
+                    record.running.store(true, Ordering::Relaxed);
                     let budget = record.budget.clone();
                     state.usage.running_jobs += 1;
                     break (work, budget);
@@ -449,11 +445,13 @@ fn run_worker(shared: Arc<PoolShared>) {
             }
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let WorkItem { task, lease } = work;
             if budget.check().is_ok() {
-                let task = work.task.take().expect("queued task missing");
                 task(budget);
+            } else {
+                drop(task);
             }
-            drop(work);
+            drop(lease);
         }));
     }
 }

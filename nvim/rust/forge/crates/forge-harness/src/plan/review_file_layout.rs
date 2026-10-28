@@ -779,12 +779,11 @@ fn resolve_package_import(
                 .strip_prefix(&package.name)
                 .unwrap_or("")
                 .trim_start_matches('/');
-            if !subpath.is_empty() {
-                if let Some(candidate) =
+            if !subpath.is_empty()
+                && let Some(candidate) =
                     resolve_typescript(&join(&package.directory, subpath), source)
-                {
-                    return Some(candidate);
-                }
+            {
+                return Some(candidate);
             }
             return package
                 .root
@@ -804,29 +803,29 @@ fn resolve_typescript_alias(
     let mut config = parent(path);
     loop {
         let config_path = join(&config, "tsconfig.json");
-        if let Some(text) = source.get(&config_path) {
-            if let Ok(config_value) = ConfigurationFormat::json_value(text) {
-                let options = &config_value["compilerOptions"];
-                let base = options["baseUrl"].as_str().unwrap_or(".");
-                if let Some(aliases) = options["paths"].as_object() {
-                    for (pattern, targets) in aliases {
-                        let capture = if let Some((prefix, suffix)) = pattern.split_once('*') {
-                            origin
-                                .strip_prefix(prefix)
-                                .and_then(|tail| tail.strip_suffix(suffix))
-                        } else {
-                            (pattern == origin).then_some("")
-                        };
-                        if let Some(capture) = capture
-                            && let Some(targets) = targets.as_array()
-                        {
-                            for target in targets.iter().filter_map(serde_json::Value::as_str) {
-                                let target = target.replace('*', capture);
-                                if let Some(destination) =
-                                    resolve_typescript(&join(&join(&config, base), &target), source)
-                                {
-                                    return Some(destination);
-                                }
+        if let Some(text) = source.get(&config_path)
+            && let Ok(config_value) = ConfigurationFormat::json_value(text)
+        {
+            let options = &config_value["compilerOptions"];
+            let base = options["baseUrl"].as_str().unwrap_or(".");
+            if let Some(aliases) = options["paths"].as_object() {
+                for (pattern, targets) in aliases {
+                    let capture = if let Some((prefix, suffix)) = pattern.split_once('*') {
+                        origin
+                            .strip_prefix(prefix)
+                            .and_then(|tail| tail.strip_suffix(suffix))
+                    } else {
+                        (pattern == origin).then_some("")
+                    };
+                    if let Some(capture) = capture
+                        && let Some(targets) = targets.as_array()
+                    {
+                        for target in targets.iter().filter_map(serde_json::Value::as_str) {
+                            let target = target.replace('*', capture);
+                            if let Some(destination) =
+                                resolve_typescript(&join(&join(&config, base), &target), source)
+                            {
+                                return Some(destination);
                             }
                         }
                     }
@@ -971,10 +970,9 @@ fn package_edges(
                                     .iter()
                                     .find(|(_, package)| package.name == *name)
                                     .map(|(identity, _)| identity.clone())
+                                    && target != *identity
                                 {
-                                    if target != *identity {
-                                        result.entry(identity.clone()).or_default().push(target);
-                                    }
+                                    result.entry(identity.clone()).or_default().push(target);
                                 }
                             }
                         }

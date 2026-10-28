@@ -52,7 +52,7 @@ pub(crate) fn destination(
         let file = &document.file[target];
         let same = origin_file.as_ref() == Some(target);
         let incomplete = matches!(
-            file.state,
+            file.projection.state(),
             BodyState::Deferred | BodyState::Loading | BodyState::Partial
         );
         let origin_body = if same {

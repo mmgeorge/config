@@ -87,8 +87,7 @@ fn selected_edits_preserve_output_beyond_former_source_limit() {
     let diff = compute_hunks(SourcePair {
         old: SourceVersion::new(Vec::new(), Representation::Raw).unwrap(),
         new: SourceVersion::new(bytes.clone(), Representation::Raw).unwrap(),
-    })
-    .unwrap();
+    });
     let selected = diff.hunks().iter().map(|hunk| hunk.id).collect::<Vec<_>>();
     let applied = EditSelection::capture(&diff, &selected, EditDirection::Forward)
         .unwrap()

@@ -66,10 +66,8 @@ impl AgentRuntime {
                 }
             }
           }.await;
-            if cancelled {
-                if let Some(submission) = &request.submission {
-                    submission.cancel()?;
-                }
+            if cancelled && let Some(submission) = &request.submission {
+                submission.cancel()?;
             }
             if cancelled || result.is_err() {
                 break result;
@@ -77,10 +75,10 @@ impl AgentRuntime {
             let Some(feedback) = self.permission.take_timeout_feedback(&owner)? else {
                 break result;
             };
-            if let Ok(output) = &result {
-                if output.backend_session_id.is_some() {
-                    request.backend_session_id = output.backend_session_id.clone();
-                }
+            if let Ok(output) = &result
+                && output.backend_session_id.is_some()
+            {
+                request.backend_session_id = output.backend_session_id.clone();
             }
             request.input = crate::backend::BackendInput::from_text(feedback);
             request.submission = None;

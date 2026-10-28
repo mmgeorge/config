@@ -128,10 +128,7 @@ impl StatusInput {
         self.revision.validate()?;
         self.view.validate()?;
         self.sequence.validate()?;
-        ensure!(
-            !self.action.is_empty() && self.action.len() <= 64,
-            "invalid status action"
-        );
+        ensure!(!self.action.is_empty(), "invalid status action");
         Ok(())
     }
 

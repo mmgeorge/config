@@ -91,6 +91,14 @@ struct SaveRecord {
     text: Arc<StoredText>,
 }
 
+struct SaveCandidate {
+    region: RegionId,
+    revision: RegionRevision,
+    sequence: EditSequence,
+    text: Arc<StoredText>,
+    needs_save: bool,
+}
+
 #[derive(Debug)]
 struct PendingSave {
     record: Arc<SaveRecord>,
@@ -462,14 +470,19 @@ impl EditStore {
     /// A local revert still needs a submission when an earlier write is pending. Duplicate captures,
     /// unresolved outcomes, and exhausted admission return errors without losing current text.
     pub fn begin_save(&mut self, region: &RegionId) -> Result<Option<SaveSubmission>, EditError> {
-        self.capture(region, false)
+        let candidate = self.prepare_save(region)?;
+        if !candidate.needs_save {
+            return Ok(None);
+        }
+        self.admit_capture(candidate).map(Some)
     }
 
-    pub(crate) fn capture(
-        &mut self,
-        region: &RegionId,
-        required: bool,
-    ) -> Result<Option<SaveSubmission>, EditError> {
+    pub(crate) fn capture(&mut self, region: &RegionId) -> Result<SaveSubmission, EditError> {
+        let candidate = self.prepare_save(region)?;
+        self.admit_capture(candidate)
+    }
+
+    fn prepare_save(&self, region: &RegionId) -> Result<SaveCandidate, EditError> {
         let field = self.field.get(region).ok_or(EditError::UnknownRegion)?;
         if field.remote.is_some() {
             return Err(EditError::RemoteConflict);
@@ -488,9 +501,16 @@ impl EditStore {
                 return Err(EditError::AlreadySaving);
             }
         }
-        if !required && !has_pending && field.current.value == field.baseline.value {
-            return Ok(None);
-        }
+        Ok(SaveCandidate {
+            region: region.clone(),
+            revision: field.revision,
+            sequence: field.sequence,
+            text: Arc::clone(&field.current),
+            needs_save: has_pending || field.current.value != field.baseline.value,
+        })
+    }
+
+    fn admit_capture(&mut self, candidate: SaveCandidate) -> Result<SaveSubmission, EditError> {
         if self.pending.len() >= self.limits.pending_saves {
             return Err(EditError::Capacity("review save admission is full"));
         }
@@ -501,10 +521,10 @@ impl EditStore {
         let record = Arc::new(SaveRecord {
             owner: Arc::clone(&self.owner),
             serial: self.next_save,
-            region: region.clone(),
-            revision: field.revision,
-            sequence: field.sequence,
-            text: Arc::clone(&field.current),
+            region: candidate.region,
+            revision: candidate.revision,
+            sequence: candidate.sequence,
+            text: candidate.text,
         });
         self.pending.insert(
             record.serial,
@@ -513,7 +533,7 @@ impl EditStore {
                 uncertain: false,
             },
         );
-        Ok(Some(SaveSubmission { record }))
+        Ok(SaveSubmission { record })
     }
 
     /// Settles one remote result. Confirmed text advances only its submitted baseline.

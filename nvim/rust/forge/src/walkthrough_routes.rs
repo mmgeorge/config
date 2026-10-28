@@ -108,8 +108,8 @@ pub(super) async fn route(host: &ForgeRuntime, params: Value) -> Result<Value> {
                 .walkthrough
                 .resolve_change(input.clone(), annotation_document.clone())
                 .await?;
-            if review.unwrap_or(false) {
-                if let Err(failure) = host
+            if review.unwrap_or(false)
+                && let Err(failure) = host
                     .walkthrough
                     .project_review(
                         &input,
@@ -119,12 +119,11 @@ pub(super) async fn route(host: &ForgeRuntime, params: Value) -> Result<Value> {
                         &host.syntax,
                     )
                     .await
-                {
-                    let _ = host
-                        .walkthrough
-                        .close_annotation(&parent, &annotation_document);
-                    return Err(failure);
-                }
+            {
+                let _ = host
+                    .walkthrough
+                    .close_annotation(&parent, &annotation_document);
+                return Err(failure);
             }
             let source = match host
                 .sources

@@ -121,7 +121,7 @@ pub enum SessionPhase {
     },
     Finalizing {
         exchange_id: String,
-        outcome: Option<ExchangeState>,
+        outcome: Option<crate::exchange::ExchangeOutcome>,
         error: Option<String>,
     },
     Working {
@@ -322,14 +322,15 @@ impl SessionPhase {
             _ => {}
         }
         let executing = exchange.is_some_and(|exchange| {
-            exchange.state == ExchangeState::Running && exchange.execution_started_at_ms.is_some()
+            exchange.state() == ExchangeState::Running
+                && exchange.execution_started_at_ms().is_some()
         });
         if let Some(exchange) =
-            exchange.filter(|exchange| exchange.state == ExchangeState::Finalizing)
+            exchange.filter(|exchange| exchange.state() == ExchangeState::Finalizing)
         {
             return Self::Finalizing {
                 exchange_id: exchange.id.clone(),
-                outcome: exchange.finalization_outcome,
+                outcome: exchange.finalization_outcome(),
                 error: exchange.finalization_error.clone(),
             };
         }
@@ -365,9 +366,9 @@ impl SessionPhase {
             };
         }
         if let Some(exchange) = exchange.filter(|exchange| {
-            exchange.state == ExchangeState::Running
+            exchange.state() == ExchangeState::Running
                 && !executing
-                && (exchange.awaiting_input || exchange.elicitation.is_some())
+                && (exchange.awaiting_input() || exchange.elicitation().is_some())
         }) {
             return Self::AwaitingInput {
                 owner: ElicitationOwner::Interaction,
@@ -397,8 +398,8 @@ impl SessionPhase {
             .map(|exchange| {
                 let activity = WorkflowActivity::from_exchange(exchange);
                 (
-                    exchange.execution_started_at_ms,
-                    exchange.duration_ms,
+                    exchange.execution_started_at_ms(),
+                    exchange.duration_ms(),
                     activity,
                     exchange.latest_reasoning_summary().map(str::to_owned),
                 )
@@ -550,7 +551,7 @@ mod test {
             },
             1,
         );
-        exchange.state = ExchangeState::Running;
+        exchange.phase = crate::exchange::ExchangePhase::Running;
         exchange.kind = ExchangeKind::PlanDraft;
         exchange.resume(42).unwrap();
         exchange
@@ -650,10 +651,10 @@ mod test {
             if planning {
                 plan.elicitation = Some(elicitation);
             } else {
-                exchange.elicitation = Some(elicitation);
+                exchange.set_elicitation(Some(elicitation));
             }
             let active_plan = planning.then_some(&plan);
-            exchange.awaiting_input = true;
+            exchange.set_awaiting_input(true);
             exchange.pause(50);
             assert!(matches!(
                 SessionPhase::resolve(active_plan, None, Some(&exchange)),
@@ -680,7 +681,9 @@ mod test {
             SessionPhase::resolve(Some(&plan), None, Some(&unrelated)),
             SessionPhase::Working { .. }
         ));
-        unrelated.finish(ExchangeState::Complete, 70).unwrap();
+        unrelated
+            .finish(crate::exchange::ExchangeOutcome::Complete, 70)
+            .unwrap();
         assert!(matches!(
             SessionPhase::resolve(Some(&plan), None, Some(&unrelated)),
             SessionPhase::AwaitingPlanReview { .. }
@@ -727,8 +730,10 @@ mod test {
     fn clarification_resume_and_terminal_phases_follow_exchange_state() {
         let mut exchange = exchange();
         exchange.kind = ExchangeKind::Chat;
-        exchange.awaiting_input = true;
-        exchange.execution_started_at_ms = None;
+        exchange.set_awaiting_input(true);
+        exchange.clock = crate::exchange::ExchangeClock::Paused {
+            elapsed_ms: exchange.duration_ms(),
+        };
         assert!(matches!(
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::AwaitingInput { .. }
@@ -744,7 +749,11 @@ mod test {
                 reasoning_summary: None,
             }
         );
-        exchange.state = ExchangeState::Finalizing;
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            ExchangeState::Finalizing,
+            exchange.completed_at_ms(),
+            exchange.finalization_outcome(),
+        );
         assert!(matches!(
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::Finalizing { .. }
@@ -755,7 +764,11 @@ mod test {
             ExchangeState::Cancelled,
             ExchangeState::Interrupted,
         ] {
-            exchange.state = state;
+            exchange.phase = crate::exchange::ExchangePhase::fixture(
+                state,
+                exchange.completed_at_ms(),
+                exchange.finalization_outcome(),
+            );
             assert_eq!(
                 SessionPhase::resolve(None, None, Some(&exchange)),
                 SessionPhase::Idle
@@ -766,7 +779,9 @@ mod test {
     #[test]
     fn running_exchange_without_timer_cannot_become_idle() {
         let mut exchange = exchange();
-        exchange.execution_started_at_ms = None;
+        exchange.clock = crate::exchange::ExchangeClock::Paused {
+            elapsed_ms: exchange.duration_ms(),
+        };
         assert!(matches!(
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::Working {
@@ -824,7 +839,11 @@ mod test {
                 42,
             );
             exchange.observe_blocker("approval:command".into(), true, 50);
-            exchange.state = state;
+            exchange.phase = crate::exchange::ExchangePhase::fixture(
+                state,
+                exchange.completed_at_ms(),
+                exchange.finalization_outcome(),
+            );
             assert_eq!(
                 exchange.activity(),
                 crate::exchange::ExchangeActivity::Settled

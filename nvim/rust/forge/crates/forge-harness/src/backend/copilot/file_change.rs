@@ -66,7 +66,7 @@ pub(super) fn from_output(output: &str, workspace: &str) -> Result<ProviderChang
                 diff.push_str(&hunk.header);
                 diff.push('\n');
                 for row in hunk.row {
-                    diff.push(match row.kind {
+                    diff.push(match row.kind() {
                         RowKind::Added => '+',
                         RowKind::Removed => '-',
                         RowKind::Context => ' ',
@@ -209,6 +209,7 @@ mod test {
                 false,
                 &Default::default(),
                 &Default::default(),
+                &mut crate::buffer::identity::DisplayRegistry::default(),
             )
             .unwrap();
             let rows = projected

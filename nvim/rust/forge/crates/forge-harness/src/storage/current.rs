@@ -106,7 +106,8 @@ impl SqliteStore {
             return Ok(None);
         };
         self.load_exchange(id).map(|exchange| {
-            exchange.filter(|exchange| exchange.awaiting_input && exchange.elicitation.is_some())
+            exchange
+                .filter(|exchange| exchange.awaiting_input() && exchange.elicitation().is_some())
         })
     }
 
@@ -216,13 +217,13 @@ mod tests {
         let mut store = SqliteStore::open(root.path())?;
         store.save_session(&super::super::test::session("session", "workspace"))?;
         let mut question = exchange("session", "question", 1);
-        question.awaiting_input = true;
-        question.elicitation = Some(crate::plan::PlanElicitation::new(serde_json::from_value(
+        question.set_awaiting_input(true);
+        question.set_elicitation(Some(crate::plan::PlanElicitation::new(serde_json::from_value(
             json!({
                 "id":"set","questions":[{"id":"choice","header":"Choice","question":"Which?",
                 "options":[{"label":"First","description":"First choice","recommended":true}],"allow_freeform":true}]
             }),
-        )?));
+        )?)));
         store.save_exchange(&question)?;
         store.save_exchange(&exchange("session", "latest", 2))?;
         assert_eq!(store.pending_exchange("session")?.unwrap().id, "question");
@@ -235,7 +236,7 @@ mod tests {
             store
                 .pending_exchange("session")?
                 .unwrap()
-                .elicitation
+                .elicitation()
                 .unwrap()
                 .answer
                 .is_empty()
@@ -248,7 +249,7 @@ mod tests {
             store
                 .pending_exchange("session")?
                 .unwrap()
-                .elicitation
+                .elicitation()
                 .unwrap()
                 .answer
                 .len(),
@@ -259,14 +260,14 @@ mod tests {
             store
                 .pending_exchange("session")?
                 .unwrap()
-                .elicitation
+                .elicitation()
                 .unwrap()
                 .answer
                 .len(),
             1
         );
-        question.elicitation = None;
-        question.awaiting_input = false;
+        question.set_elicitation(None);
+        question.set_awaiting_input(false);
         writer.save_exchange(&question)?;
         assert!(store.pending_exchange("session")?.is_none());
         Ok(())

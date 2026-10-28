@@ -39,13 +39,11 @@ pub fn configure(cache_path: &Path) -> Result<&'static str> {
     let Some(prefix) = prefix else {
         return Ok("unavailable");
     };
-    if cached {
-        if let Err(prefix) = gix::path::env::set_system_prefix(prefix) {
-            ensure!(
-                gix::path::env::system_prefix() == Some(prefix.as_path()),
-                "Git system prefix was initialized before its persisted location was loaded"
-            );
-        }
+    if cached && let Err(prefix) = gix::path::env::set_system_prefix(prefix) {
+        ensure!(
+            gix::path::env::system_prefix() == Some(prefix.as_path()),
+            "Git system prefix was initialized before its persisted location was loaded"
+        );
     }
     Ok(if cached { "hit" } else { "miss" })
 }

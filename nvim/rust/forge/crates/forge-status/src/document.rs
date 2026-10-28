@@ -63,28 +63,81 @@ pub(crate) struct FileTarget {
     pub origin_stamp: Option<WorktreeStamp>,
     pub retained_bytes: usize,
     pub section: StatusSection,
-    pub loading: Option<Arc<AtomicBool>>,
     pub hunk: HashMap<RawHunkId, TargetId>,
     pub group: HashMap<usize, DisplayGroupTarget>,
     pub source_row: HashMap<BlockId, Vec<Option<forge_diff::source::SourceCoordinate>>>,
-    pub state: BodyState,
-    pub analysis: Option<AnalysisHandle>,
-    pub cursor: Option<DisplayCursor>,
+    pub projection: SourceProjection,
     pub old_syntax: Option<SyntaxHandle>,
     pub new_syntax: Option<SyntaxHandle>,
     pub projected: Option<crate::mutation::ProjectedIndex>,
     pub context_requested: bool,
 }
 
+pub(crate) enum SourceProjection {
+    Deferred,
+    Loading(Arc<AtomicBool>),
+    Loaded {
+        analysis: AnalysisHandle,
+        cursor: DisplayCursor,
+        complete: bool,
+    },
+    Unavailable(String),
+    Failed(String),
+}
+
+impl SourceProjection {
+    pub fn state(&self) -> BodyState {
+        match self {
+            Self::Deferred => BodyState::Deferred,
+            Self::Loading(_) => BodyState::Loading,
+            Self::Loaded {
+                complete: false, ..
+            } => BodyState::Partial,
+            Self::Loaded { complete: true, .. } => BodyState::Ready,
+            Self::Unavailable(diagnostic) => BodyState::Unavailable(diagnostic.clone()),
+            Self::Failed(diagnostic) => BodyState::Failed(diagnostic.clone()),
+        }
+    }
+
+    pub fn analysis(&self) -> Option<&AnalysisHandle> {
+        match self {
+            Self::Loaded { analysis, .. } => Some(analysis),
+            _ => None,
+        }
+    }
+
+    pub fn cursor(&self) -> Option<&DisplayCursor> {
+        match self {
+            Self::Loaded { cursor, .. } => Some(cursor),
+            _ => None,
+        }
+    }
+
+    pub fn loading(&self) -> Option<&Arc<AtomicBool>> {
+        match self {
+            Self::Loading(active) => Some(active),
+            _ => None,
+        }
+    }
+
+    pub fn loaded(analysis: AnalysisHandle, cursor: DisplayCursor) -> Self {
+        Self::Loaded {
+            analysis,
+            cursor,
+            complete: false,
+        }
+    }
+}
+
 impl FileTarget {
     pub fn body_mut(&mut self) -> Result<&mut BufferDocument> {
-        if self.body.is_none() {
-            self.body = Some(BufferDocument::new(
+        match &mut self.body {
+            Some(body) => Ok(body),
+            slot @ None => Ok(slot.insert(BufferDocument::new(
                 DocumentId(format!("body:{}:{}", self.id, self.generation)),
                 Vec::new(),
-            )?);
+            )?)),
         }
-        Ok(self.body.as_mut().expect("initialized body"))
     }
 
     pub fn semantic(&self) -> StatusFile {
@@ -292,6 +345,7 @@ impl StatusDocument {
             },
         };
         let mut section: Vec<StatusSectionRecord> = Vec::new();
+        let mut current: Option<StatusSectionRecord> = None;
         let file: Vec<_> = self
             .order
             .iter()
@@ -303,18 +357,21 @@ impl StatusDocument {
             } else {
                 entry.section
             };
-            if section.last().is_none_or(|previous| previous.kind != kind) {
-                section.push(StatusSectionRecord {
+            if current
+                .as_ref()
+                .is_some_and(|previous| previous.kind != kind)
+            {
+                section.extend(current.take());
+            }
+            current
+                .get_or_insert_with(|| StatusSectionRecord {
                     kind,
                     file: Vec::new(),
-                });
-            }
-            section
-                .last_mut()
-                .expect("section inserted")
+                })
                 .file
                 .push(entry.id);
         }
+        section.extend(current);
         StatusSnapshot {
             document: self.id.clone(),
             revision: self.revision,
@@ -443,13 +500,10 @@ pub(crate) fn inventory(
                     retained_bytes: 0,
                     notice_delivered: false,
                     source_row: HashMap::new(),
-                    loading: None,
+                    projection: SourceProjection::Deferred,
                     hunk: HashMap::new(),
                     group: HashMap::new(),
                     section,
-                    state: BodyState::Deferred,
-                    analysis: None,
-                    cursor: None,
                     old_syntax: None,
                     new_syntax: None,
                     projected: None,

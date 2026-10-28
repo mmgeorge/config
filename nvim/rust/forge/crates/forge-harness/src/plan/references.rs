@@ -229,6 +229,7 @@ impl PlanReferenceIndex {
                         reference.position.line,
                         reference.position.column,
                         symbol,
+                        None,
                     );
                 }
             }
@@ -265,6 +266,7 @@ impl PlanReferenceIndex {
                             reference.position.line,
                             offset as u32,
                             symbol,
+                            None,
                         );
                     }
                     offset += part.len();
@@ -296,6 +298,7 @@ impl PlanReferenceIndex {
                         import.position.line,
                         import.position.column,
                         symbol,
+                        None,
                     );
                 }
             }
@@ -355,6 +358,7 @@ impl PlanReferenceIndex {
                                 position.line,
                                 position.column,
                                 symbol,
+                                None,
                             );
                         }
                     }
@@ -400,6 +404,7 @@ impl PlanReferenceIndex {
                             position.line,
                             position.column,
                             symbol,
+                            None,
                         );
                     }
                 }
@@ -520,6 +525,7 @@ impl PlanReferenceIndex {
         line: u32,
         column: u32,
         symbol: String,
+        anchor: Option<PlanNavigationAnchor>,
     ) {
         let id = super::digest(
             format!("{side}:{path}:{owner}:{name}:{kind}:{line}:{column}").as_bytes(),
@@ -535,7 +541,7 @@ impl PlanReferenceIndex {
             line,
             column,
             symbol,
-            anchor: None,
+            anchor,
         });
     }
 
@@ -610,8 +616,8 @@ impl PlanReferenceIndex {
                             anchor.line,
                             0,
                             format!("planned:{name}"),
+                            Some(anchor.clone()),
                         );
-                        output.occurrence.last_mut().unwrap().anchor = Some(anchor.clone());
                     }
                     continue;
                 }
@@ -630,8 +636,8 @@ impl PlanReferenceIndex {
                     anchor.line,
                     0,
                     symbol,
+                    Some(anchor.clone()),
                 );
-                output.occurrence.last_mut().unwrap().anchor = Some(anchor);
             }
         }
         Ok(output)
@@ -652,7 +658,9 @@ impl PlanReferenceIndex {
         else {
             return Ok(None);
         };
-        let design = document.design.as_ref().unwrap();
+        let Some(design) = document.design.as_ref() else {
+            return Ok(None);
+        };
         let text = if baseline {
             &design.baseline[path].text
         } else {
@@ -767,6 +775,10 @@ impl PlanReferenceIndex {
         identity: &str,
         name: &str,
     ) -> Result<PlanDocument> {
+        let original_design = document
+            .design
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("rename requires a declaration plan"))?;
         let (definition_path, symbol) = self.rename_definition(document, identity)?;
         let identifier = if symbol.name.starts_with('#') {
             name.strip_prefix('#').ok_or_else(|| {
@@ -802,7 +814,7 @@ impl PlanReferenceIndex {
         );
 
         let mut output = document.clone();
-        let design = output.design.as_mut().unwrap();
+        let mut design = original_design.clone();
         let mut algorithm_edits = BTreeMap::<(String, String), BTreeSet<(u32, u32)>>::new();
         for ((path, owner, line, column), (target, _, _)) in &self.algorithm {
             if target == identity {
@@ -823,20 +835,10 @@ impl PlanReferenceIndex {
             let Some(super::FunctionBehavior::Algorithm(source)) = &mut body.behavior else {
                 continue;
             };
-            let mut offsets = vec![0];
-            for (offset, byte) in source.bytes().enumerate() {
-                if byte == b'\n' {
-                    offsets.push(offset + 1);
-                }
-            }
-            for (line, column) in positions.into_iter().rev() {
-                let start = offsets[line as usize - 1] + column as usize;
-                ensure!(
-                    source.get(start..start + symbol.name.len()) == Some(symbol.name.as_str()),
-                    "Algorithm rename token changed"
-                );
-                source.replace_range(start..start + symbol.name.len(), name);
-            }
+            *source = super::source_edit::SourceRevision::new(source)
+                .prepare_tokens(positions, &symbol.name, name)
+                .map_err(|error| anyhow::anyhow!("Algorithm rename token changed: {error:#}"))?
+                .apply();
         }
         let index = DeclarationIndex::extract(&definition_path, &design.proposed[&definition_path])
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
@@ -979,44 +981,40 @@ impl PlanReferenceIndex {
                     let mut edits = Vec::new();
                     for (replacement, original) in replacement.iter().zip(&parts) {
                         if replacement != original {
-                            edits.push((offset, original.len(), replacement));
+                            edits.push(super::source_edit::SourceReplacement {
+                                range: offset..offset + original.len(),
+                                expected: original,
+                                replacement,
+                            });
                         }
                         offset += original.len() + separator.len();
                     }
-                    for (offset, length, replacement) in edits.into_iter().rev() {
-                        call.name
-                            .replace_range(offset..offset + length, replacement);
+                    if !edits.is_empty() {
+                        call.name = super::source_edit::SourceRevision::new(&call.name)
+                            .prepare(edits)?
+                            .apply();
                     }
                 }
             }
         }
-        for (path, positions) in edits {
-            let text = design.proposed.get_mut(&path).unwrap();
-            let mut offsets = vec![0];
-            for (offset, byte) in text.bytes().enumerate() {
-                if byte == b'\n' {
-                    offsets.push(offset + 1);
-                }
-            }
-            for (line, column) in positions.iter().rev() {
-                let start = offsets[*line as usize - 1] + *column as usize;
-                ensure!(
-                    text.get(start..start + symbol.name.len()) == Some(symbol.name.as_str()),
-                    "rename token changed"
-                );
-                text.replace_range(start..start + symbol.name.len(), name);
-            }
+        for (path, text) in &mut design.proposed {
+            let Some(positions) = edits.remove(path) else {
+                continue;
+            };
+            *text = super::source_edit::SourceRevision::new(text)
+                .prepare_tokens(positions, &symbol.name, name)?
+                .apply();
         }
+        ensure!(
+            edits.is_empty(),
+            "rename source changed outside the proposal"
+        );
         for (path, functions) in &mut design.proposed_calls {
-            if design.proposed.get(path) == document.design.as_ref().unwrap().proposed.get(path) {
+            if design.proposed.get(path) == original_design.proposed.get(path) {
                 continue;
             }
-            let before = DeclarationCalls::extract(
-                path,
-                &document.design.as_ref().unwrap().proposed[path],
-                true,
-            )
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let before = DeclarationCalls::extract(path, &original_design.proposed[path], true)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
             let after = DeclarationCalls::extract(path, &design.proposed[path], true)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
             ensure!(
@@ -1033,7 +1031,7 @@ impl PlanReferenceIndex {
         }
         design.validation = None;
         for (path, text) in &design.proposed {
-            let previous = document.design.as_ref().unwrap();
+            let previous = original_design;
             if previous.proposed.get(path) == Some(text)
                 && previous.proposed_calls.get(path) == design.proposed_calls.get(path)
             {
@@ -1053,6 +1051,7 @@ impl PlanReferenceIndex {
                 "rename changed callable ownership"
             );
         }
+        output.design = Some(design);
         output.version = output
             .version
             .checked_add(1)

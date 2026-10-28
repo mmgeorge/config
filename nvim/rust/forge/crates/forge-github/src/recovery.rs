@@ -211,13 +211,11 @@ impl RecoveryStore {
     }
 
     fn path(&self, resource: &RecoveryResource) -> PathBuf {
-        let repository = resource.repository.repository_name();
-        let (owner, name) = repository.split_once('/').expect("validated repository");
         let kind = resource.kind.label();
         self.directory
             .join(component(resource.repository.hostname()))
-            .join(component(owner))
-            .join(component(name))
+            .join(component(resource.repository.owner()))
+            .join(component(resource.repository.name()))
             .join(format!("{kind}-{}.json", resource.number))
     }
 

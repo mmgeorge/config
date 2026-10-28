@@ -12,10 +12,34 @@ pub struct CheckReport {
 #[serde(deny_unknown_fields)]
 pub struct CheckResult {
     pub file: String,
-    pub state: CheckState,
+    pub state: CheckResultState,
     pub duration_ms: Option<u64>,
     pub command: String,
     pub output: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckResultState {
+    Passed,
+    Failed,
+    Skipped,
+    Interrupted,
+    Blocked,
+    ExecutionError,
+}
+
+impl From<CheckResultState> for CheckState {
+    fn from(state: CheckResultState) -> Self {
+        match state {
+            CheckResultState::Passed => Self::Passed,
+            CheckResultState::Failed => Self::Failed,
+            CheckResultState::Skipped => Self::Skipped,
+            CheckResultState::Interrupted => Self::Interrupted,
+            CheckResultState::Blocked => Self::Blocked,
+            CheckResultState::ExecutionError => Self::ExecutionError,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -69,18 +93,6 @@ fn parse(reader: impl std::io::Read) -> Result<Vec<CheckResult>> {
             !result.command.trim().is_empty(),
             "reported command is empty"
         );
-        ensure!(
-            matches!(
-                result.state,
-                CheckState::Passed
-                    | CheckState::Failed
-                    | CheckState::Skipped
-                    | CheckState::Interrupted
-                    | CheckState::Blocked
-                    | CheckState::ExecutionError
-            ),
-            "reported result is not terminal"
-        );
     }
     Ok(document.result)
 }
@@ -99,7 +111,7 @@ mod tests {
         let parsed = parse(std::io::Cursor::new(value.to_string()))?;
         assert_eq!(parsed[0].output, diagnostic);
         assert_eq!(parsed[0].duration_ms, Some(12));
-        assert_eq!(parsed[0].state, CheckState::Failed);
+        assert_eq!(parsed[0].state, CheckResultState::Failed);
         Ok(())
     }
 

@@ -462,50 +462,6 @@ impl ConfigureChecks {
     }
 }
 
-#[cfg(test)]
-mod review_tests {
-    use super::*;
-
-    #[test]
-    fn check_configuration_review_includes_helper_changes_and_rejects_stale_captures() -> Result<()>
-    {
-        let workspace = tempfile::tempdir()?;
-        let document = json!({"branch_prefix":"keep","checks":{}});
-        std::fs::write(
-            workspace.path().join(".forge.json"),
-            serde_json::to_vec(&document)?,
-        )?;
-        std::fs::create_dir_all(workspace.path().join(".forge/checks"))?;
-        let destination = workspace.path().join(".forge/checks/example.nu");
-        let before = "def main [] { print 'before' }\n";
-        std::fs::write(&destination, before)?;
-        let request = ConfigureChecks {
-            expected_revision: crate::plan::digest(&serde_json::to_vec(&document)?),
-            config: serde_json::from_value(json!({}))?,
-            helpers: vec![CheckHelper {
-                path: ".forge/checks/example.nu".into(),
-                source: "def main [] { print 'after' }\n".into(),
-                expected_digest: Some(crate::plan::digest(before.as_bytes())),
-            }],
-        };
-        let detail = request.review(workspace.path())?;
-        assert!(detail.contains("Check definitions are unchanged."));
-        assert!(detail.contains("Managed helper: .forge/checks/example.nu"));
-        assert!(detail.contains("-def main [] { print 'before' }"));
-        assert!(detail.contains("+def main [] { print 'after' }"));
-        assert_eq!(std::fs::read_to_string(&destination)?, before);
-        std::fs::write(&destination, "newer helper")?;
-        assert!(
-            request
-                .review(workspace.path())
-                .unwrap_err()
-                .to_string()
-                .contains("helper changed since setup began")
-        );
-        Ok(())
-    }
-}
-
 impl CheckSupervisor {
     /// Adds effective completion policy and concrete task commands without running checks.
     pub(crate) async fn catalog_preview(
@@ -551,8 +507,12 @@ impl CheckSupervisor {
                         if command.state != super::CheckState::Pending {
                             continue;
                         }
-                        let previous = self.evidence(&run, command, &checkpoint)?;
-                        coverage.push(json!({"id":command.context.as_ref().unwrap().definition_id,"command":command.command,
+                        let previous = self.evidence(
+                            &run.clone().into_record(),
+                            &command.clone().into_record(),
+                            &checkpoint,
+                        )?;
+                        coverage.push(json!({"id":command.context.definition_id,"command":command.command,
                             "pending":previous.is_none(),"evidence":previous.map(|(run_id, command)| json!({"run_id":run_id,"state":command.state,"command_id":command.id}))}));
                     }
                     catalog["coverage"] = json!(coverage);
@@ -674,7 +634,7 @@ impl CheckSupervisor {
         task_id: Option<String>,
         shell: CheckShell,
         trigger: String,
-    ) -> Result<super::CheckRun> {
+    ) -> Result<super::model::PreparedCheckRun> {
         let mut snapshot = ConfigSnapshot::load(&self.workspace)?;
         let overrides = self.overrides(task_id.as_deref())?;
         let changes = self.changes.files()?;
@@ -891,7 +851,51 @@ impl CheckSupervisor {
                 request.config.definitions.len()
             ),
         );
-        self.publish(&run, sink).await?;
+        self.publish(&run.into_record(), sink).await?;
         self.catalog(None)
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn check_configuration_review_includes_helper_changes_and_rejects_stale_captures() -> Result<()>
+    {
+        let workspace = tempfile::tempdir()?;
+        let document = json!({"branch_prefix":"keep","checks":{}});
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            serde_json::to_vec(&document)?,
+        )?;
+        std::fs::create_dir_all(workspace.path().join(".forge/checks"))?;
+        let destination = workspace.path().join(".forge/checks/example.nu");
+        let before = "def main [] { print 'before' }\n";
+        std::fs::write(&destination, before)?;
+        let request = ConfigureChecks {
+            expected_revision: crate::plan::digest(&serde_json::to_vec(&document)?),
+            config: serde_json::from_value(json!({}))?,
+            helpers: vec![CheckHelper {
+                path: ".forge/checks/example.nu".into(),
+                source: "def main [] { print 'after' }\n".into(),
+                expected_digest: Some(crate::plan::digest(before.as_bytes())),
+            }],
+        };
+        let detail = request.review(workspace.path())?;
+        assert!(detail.contains("Check definitions are unchanged."));
+        assert!(detail.contains("Managed helper: .forge/checks/example.nu"));
+        assert!(detail.contains("-def main [] { print 'before' }"));
+        assert!(detail.contains("+def main [] { print 'after' }"));
+        assert_eq!(std::fs::read_to_string(&destination)?, before);
+        std::fs::write(&destination, "newer helper")?;
+        assert!(
+            request
+                .review(workspace.path())
+                .unwrap_err()
+                .to_string()
+                .contains("helper changed since setup began")
+        );
+        Ok(())
     }
 }

@@ -14,7 +14,7 @@ pub(crate) struct SessionResources {
     /// Contains every applicable server with credential failures isolated to its row.
     pub(crate) mcp: Vec<McpDefinition>,
     /// Contains resolved native launch payloads and must never be serialized into history.
-    pub(crate) launch: Vec<(String, Value)>,
+    pub(crate) launch: Vec<(String, serde_json::Map<String, Value>)>,
     /// Maps resources skipped for missing executables to their user-facing explanation.
     pub(crate) launch_notice: std::collections::HashMap<String, String>,
 }
@@ -26,8 +26,7 @@ impl SessionResources {
             ensure!(launch.get("tools").is_none_or(|tools| tools == &serde_json::json!(["*"]))
                 && launch.get("timeout").is_none() && launch.get("cwd").is_none(),
                 "ACP cannot preserve MCP tool selection, timeout, or working directory for {name}");
-            let mut server = launch.clone();
-            let fields = server.as_object_mut().expect("validated MCP launch object");
+            let mut fields = launch.clone();
             fields.remove("tools");
             if fields.get("type").and_then(Value::as_str) == Some("stdio") { fields.remove("type"); }
             fields.insert("name".into(), serde_json::json!(name));
@@ -37,7 +36,7 @@ impl SessionResources {
                     fields.insert(key.into(), serde_json::json!(value));
                 }
             }
-            Ok(server)
+            Ok(Value::Object(fields))
         }).collect()
     }
 
@@ -125,7 +124,7 @@ impl SessionResources {
                 source_path: Some(definition.source),
                 resource_id: Some(definition.id),
                 name: definition.name,
-                transport: definition.transport,
+                transport: definition.transport.as_str().into(),
                 enabled,
                 status,
                 status_detail,
@@ -145,7 +144,10 @@ impl SessionResources {
     }
 }
 
-fn unavailable_command(payload: &Value, workspace: &Path) -> Option<String> {
+fn unavailable_command(
+    payload: &serde_json::Map<String, Value>,
+    workspace: &Path,
+) -> Option<String> {
     if payload.get("type").and_then(Value::as_str) != Some("stdio") {
         return None;
     }

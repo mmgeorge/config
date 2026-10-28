@@ -418,13 +418,10 @@ fn prepared_edit_can_abort_then_commit_without_replacing_unrelated_storage() {
         LocalEditPreparation::Prepared(prepared) => prepared.commit(),
         LocalEditPreparation::Rejected(_) => panic!("aborted preparation consumed the edit"),
     };
-    let LocalEditResult::Accepted {
+    let forge_buffer::editable::AcceptedLocalEdit {
         acknowledgement,
         patch,
-    } = result
-    else {
-        panic!("prepared edit did not commit")
-    };
+    } = result;
     assert_eq!(acknowledgement.sequence, EditSequence(1));
     assert_eq!(acknowledgement.revision, RegionRevision(4));
     assert_eq!(patch.metadata_edit.len(), 1);

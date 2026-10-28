@@ -87,9 +87,8 @@ pub(super) struct ReferenceContext {
 impl ReferenceContext {
     /// Project one saved side once, reusing the review's existing syntax handles.
     pub(super) fn build(source: &PlanReviewSource, baseline: bool) -> Result<Self> {
-        let (blocks, targets) = if source.document.design.is_some() {
-            let mut document = source.document.clone();
-            let design = document.design.as_mut().unwrap();
+        let mut document = source.document.clone();
+        let (blocks, targets) = if let Some(design) = document.design.as_mut() {
             if baseline {
                 design.proposed.clear();
                 design.proposed_calls.clear();

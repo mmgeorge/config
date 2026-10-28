@@ -32,7 +32,7 @@ fn main() {
         let mut hunk_count = 0;
         for _ in 0..25 {
             let start = Instant::now();
-            let result = black_box(compute_hunks(black_box(source.clone())).unwrap());
+            let result = black_box(compute_hunks(black_box(source.clone())));
             sample.push(start.elapsed().as_micros());
             hunk_count = result.hunks().len();
         }

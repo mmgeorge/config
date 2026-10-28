@@ -96,8 +96,7 @@ impl<'exchange> QuestionHistory<'exchange> {
                 if let Some(answer) = answer.filter(|_| withdrawal.is_none()) {
                     group.legacy_answer(answer);
                 }
-                history.group.insert(id, group);
-                occurrence.push((position, id, set.id.as_str()));
+                occurrence.push((position, group));
             }
         }
         for (position, node) in exchange.node_list.iter().enumerate() {
@@ -107,19 +106,15 @@ impl<'exchange> QuestionHistory<'exchange> {
             if prompt.intent == InputIntent::Steering {
                 continue;
             }
-            let Some((_, id, _)) = occurrence.iter().rev().find(|(start, _, set_id)| {
+            let Some((_, group)) = occurrence.iter_mut().rev().find(|(start, group)| {
                 *start < position
                     && prompt
                         .question
                         .as_ref()
-                        .is_none_or(|target| target.set_id == *set_id)
+                        .is_none_or(|target| target.set_id == group.set.id)
             }) else {
                 continue;
             };
-            let group = history
-                .group
-                .get_mut(id)
-                .expect("question occurrence exists");
             history.nested.insert(node.id());
             if prompt.intent == InputIntent::Answer {
                 group.resolved = true;
@@ -161,72 +156,68 @@ impl<'exchange> QuestionHistory<'exchange> {
             let branch = if let Some(target) = target {
                 group
                     .branch
-                    .iter()
-                    .position(|branch| branch.question.id == target)
+                    .iter_mut()
+                    .find(|branch| branch.question.id == target)
             } else if group.branch.len() == 1 {
-                Some(0)
+                group.branch.first_mut()
             } else {
                 None
             };
             if let Some(branch) = branch {
-                group.branch[branch].clarification.push(clarification);
+                branch.clarification.push(clarification);
             } else {
                 // Records without question identity remain at set scope.
                 group.clarification.push(clarification);
             }
         }
         for node in &exchange.node_list {
-            if let ExchangeNode::PlanEvent { event } = node {
-                if let PlanEventContent::Lifecycle { lifecycle, .. } = &event.content {
-                    if matches!(
-                        lifecycle.kind,
-                        PlanLifecycleKind::QuestionAnswered | PlanLifecycleKind::QuestionWithdrawn
-                    ) {
-                        if let Some((_, id, _)) = occurrence.iter().rev().find(|(_, _, set_id)| {
-                            lifecycle
-                                .question
-                                .as_ref()
-                                .is_some_and(|question| question.id == *set_id)
-                        }) {
-                            let group = history.group.get_mut(id).unwrap();
-                            group.resolved = true;
-                            if lifecycle.kind == PlanLifecycleKind::QuestionAnswered {
-                                if let Some(answer) = &lifecycle.answer {
-                                    group.legacy_answer(answer);
-                                }
-                            }
-                            history.nested.insert(node.id());
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(elicitation) = &exchange.elicitation {
-            if let Some((_, id, _)) = occurrence
-                .iter()
-                .rev()
-                .find(|(_, _, set_id)| *set_id == elicitation.question_set.id)
+            if let ExchangeNode::PlanEvent { event } = node
+                && let PlanEventContent::Lifecycle { lifecycle, .. } = &event.content
+                && matches!(
+                    lifecycle.kind,
+                    PlanLifecycleKind::QuestionAnswered | PlanLifecycleKind::QuestionWithdrawn
+                )
+                && let Some((_, group)) = occurrence.iter_mut().rev().find(|(_, group)| {
+                    lifecycle
+                        .question
+                        .as_ref()
+                        .is_some_and(|question| question.id == group.set.id)
+                })
             {
-                let group = history.group.get_mut(id).unwrap();
-                if group.resolved {
-                    return history;
+                group.resolved = true;
+                if lifecycle.kind == PlanLifecycleKind::QuestionAnswered
+                    && let Some(answer) = &lifecycle.answer
+                {
+                    group.legacy_answer(answer);
                 }
-                for branch in &mut group.branch {
-                    branch.source = elicitation
-                        .answer
-                        .iter()
-                        .find(|answer| answer.question_id == branch.question.id)
-                        .map_or(crate::session::ResolutionSource::User, |answer| {
-                            answer.source
-                        });
-                    branch.answer = elicitation
-                        .answer
-                        .iter()
-                        .find(|answer| answer.question_id == branch.question.id)
-                        .map(|answer| response_text(&answer.response));
-                }
+                history.nested.insert(node.id());
             }
         }
+        if let Some(elicitation) = exchange.elicitation()
+            && let Some((_, group)) = occurrence
+                .iter_mut()
+                .rev()
+                .find(|(_, group)| group.set.id == elicitation.question_set.id)
+        {
+            for branch in group.branch.iter_mut().filter(|_| !group.resolved) {
+                branch.source = elicitation
+                    .answer
+                    .iter()
+                    .find(|answer| answer.question_id == branch.question.id)
+                    .map_or(crate::session::ResolutionSource::User, |answer| {
+                        answer.source
+                    });
+                branch.answer = elicitation
+                    .answer
+                    .iter()
+                    .find(|answer| answer.question_id == branch.question.id)
+                    .map(|answer| response_text(&answer.response));
+            }
+        }
+        history.group = occurrence
+            .into_iter()
+            .map(|(_, group)| (group.id, group))
+            .collect();
         history
     }
 }

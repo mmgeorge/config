@@ -89,8 +89,7 @@ fn loose_project_files(resolver: &mut DeclarationResolver) -> Result<()> {
             if resolver
                 .read(manifest.parent().unwrap().join("src/lib.rs").as_path())
                 .is_some()
-            {
-                if let Some(name) = resolver
+                && let Some(name) = resolver
                     .read(manifest)
                     .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
                     .and_then(|manifest| {
@@ -105,9 +104,8 @@ fn loose_project_files(resolver: &mut DeclarationResolver) -> Result<()> {
                             .and_then(toml::Value::as_str)
                             .map(|name| name.replace('-', "_"))
                     })
-                {
-                    state.dependency.insert(name, package.clone());
-                }
+            {
+                state.dependency.insert(name, package.clone());
             }
         }
         state.incomplete = true;

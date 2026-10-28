@@ -205,7 +205,11 @@ impl WalkthroughService {
                             old_syntax.as_ref(),
                             new_syntax.as_ref(),
                         )?;
-                        if let Some(coordinate) = if old_side { display.old } else { display.new } {
+                        if let Some(coordinate) = if old_side {
+                            display.old_coordinate()
+                        } else {
+                            display.new_coordinate()
+                        } {
                             source_target(&mut excerpt, &mut block, coordinate.line);
                         }
                         excerpt.block.push(block);

@@ -4,7 +4,7 @@ use crate::checks::{CheckCategory, CheckResult, CheckRun, CheckState, CommandChe
 struct CheckLeaf<'run> {
     check: &'run CommandCheck,
     result: Option<&'run CheckResult>,
-    call_id: String,
+    result_index: Option<usize>,
     group: String,
     scope: String,
     name: Option<String>,
@@ -12,7 +12,8 @@ struct CheckLeaf<'run> {
 
 impl CheckLeaf<'_> {
     fn state(&self) -> CheckState {
-        self.result.map_or(self.check.state, |result| result.state)
+        self.result
+            .map_or(self.check.state, |result| result.state.into())
     }
 
     fn elapsed_ms(&self, now_ms: i64) -> Option<u64> {
@@ -82,7 +83,7 @@ fn check_leaves(run: &CheckRun, category: CheckCategory) -> Vec<CheckLeaf<'_>> {
                 result.push(CheckLeaf {
                     check,
                     result: Some(fixture),
-                    call_id: format!("{}:result:{index}", check.id),
+                    result_index: Some(index),
                     group: format!("{}:checks", run.id),
                     scope: fixture.file.clone(),
                     name: None,
@@ -93,13 +94,13 @@ fn check_leaves(run: &CheckRun, category: CheckCategory) -> Vec<CheckLeaf<'_>> {
                     && report
                         .result
                         .iter()
-                        .all(|result| result.state != CheckState::Failed)
+                        .all(|result| result.state != crate::checks::CheckResultState::Failed)
             {
                 let (scope, _) = check_scope(check);
                 result.push(CheckLeaf {
                     check,
                     result: None,
-                    call_id: check.id.clone(),
+                    result_index: None,
                     group: format!("{}:checks", run.id),
                     scope,
                     name: Some("Runner result".into()),
@@ -110,7 +111,7 @@ fn check_leaves(run: &CheckRun, category: CheckCategory) -> Vec<CheckLeaf<'_>> {
             result.push(CheckLeaf {
                 check,
                 result: None,
-                call_id: check.id.clone(),
+                result_index: None,
                 group: format!("{}:checks", run.id),
                 scope,
                 name,
@@ -384,7 +385,8 @@ impl TimelineRenderer<'_> {
     /// Renders one execution with compact status and lazily expanded diagnostics.
     fn check_leaf(&mut self, leaf: &CheckLeaf<'_>, label: &str) -> Result<()> {
         let check = leaf.check;
-        let call_id = &leaf.call_id;
+        let call_id = self.display.check(&check.id, leaf.result_index);
+        let raw_id = self.display.check(&check.id, None);
         let state = leaf.state();
         let elapsed = leaf.elapsed_ms(self.now_ms);
         let failed = matches!(
@@ -408,7 +410,7 @@ impl TimelineRenderer<'_> {
             }
         );
         let heading = crate::turn::ToolCall {
-            id: call_id.clone(),
+            id: call_id.to_string(),
             kind: "check".into(),
             title: title.clone(),
             started_at_ms: elapsed.map(|_| 0),
@@ -421,12 +423,11 @@ impl TimelineRenderer<'_> {
         };
         let mut output = if let Some(result) = leaf.result {
             let details = format!("Command: {}\n{}", result.command, result.output);
-            let raw =
-                ToolOutputView::file(check.id.clone(), check.output.clone(), check.output_bytes)?;
-            self.tool.insert(check.id.clone(), raw);
-            ToolOutputView::new(call_id.clone(), &details)?
+            let raw = ToolOutputView::file(raw_id, check.output.clone(), check.output_bytes);
+            self.tool.insert(raw_id, raw);
+            ToolOutputView::new(call_id, &details)
         } else {
-            ToolOutputView::file(call_id.clone(), check.output.clone(), check.output_bytes)?
+            ToolOutputView::file(call_id, check.output.clone(), check.output_bytes)
         };
         output.heading(&heading);
         output.group = leaf.group.clone();
@@ -453,15 +454,13 @@ impl TimelineRenderer<'_> {
         )?)?;
         self.action.insert(
             TargetId(format!("{call_id}:tool")),
-            TranscriptAction::Tool {
-                call_id: check.id.clone(),
-            },
+            TranscriptAction::Tool { call_id: raw_id },
         );
         if expanded {
             for chunk in 0..output.inline_prefix_chunks(limit)? {
-                self.push(renderer.tool_body(call_id, &output, true, chunk)?)?;
+                self.push(renderer.tool_body(&call_id, &output, true, chunk)?)?;
             }
-            self.push(renderer.tool_hidden(call_id, &output, true)?)?;
+            self.push(renderer.tool_hidden(&call_id, &output, true)?)?;
         } else {
             for suffix in ["preview", "hidden"] {
                 self.push(BufferBlock {
@@ -489,7 +488,7 @@ impl TimelineRenderer<'_> {
         if let Some(node) = &mut self.block[start].metadata.node {
             node.more = expanded && output.has_unloaded_output();
         }
-        self.tool.insert(call_id.clone(), output);
+        self.tool.insert(call_id, output);
         Ok(())
     }
 }
@@ -500,7 +499,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn concrete_file_scopes_do_not_override_package_ownership_or_hide_runner_failures() -> Result<()>
+    fn legacy_package_metadata_does_not_override_file_scope_or_hide_runner_failures() -> Result<()>
     {
         let mut source = json!({
             "id":"command", "command":"runner", "state":"failed", "started_at_ms":1,
@@ -520,7 +519,7 @@ mod tests {
         source["context"]["invocation"]["package"] =
             json!({"name":"core","directory":"core","manifest":"core/Cargo.toml"});
         let command: CommandCheck = serde_json::from_value(source)?;
-        assert_eq!(check_scope(&command).0, "core");
+        assert_eq!(check_scope(&command).0, "src/one.rs");
         let run: CheckRun = serde_json::from_value(json!({
             "id":"run","owner":{"kind":"session","session_id":"session"},"revision":0,
             "shell":"system","executable":null,"workspace":".","environment_digest":"test",
@@ -571,6 +570,7 @@ mod tests {
             false,
             &HashMap::new(),
             &HashMap::new(),
+            &mut crate::buffer::identity::DisplayRegistry::default(),
         )?;
         let blocks = &projected.entry.block;
         let text = blocks
@@ -673,7 +673,7 @@ mod tests {
         repaired.id = "reported-retry".into();
         repaired.state = CheckState::Passed;
         let results = &mut repaired.report.as_mut().unwrap().result;
-        results[1].state = CheckState::Passed;
+        results[1].state = crate::checks::CheckResultState::Passed;
         results.reverse();
         reported.commands.push(repaired);
         assert_eq!(check_summary(&reported), "2/2 passed · 2 attempts");
@@ -691,6 +691,7 @@ mod tests {
             false,
             &HashMap::new(),
             &HashMap::new(),
+            &mut crate::buffer::identity::DisplayRegistry::default(),
         )?;
         let heading = failed_projection
             .entry

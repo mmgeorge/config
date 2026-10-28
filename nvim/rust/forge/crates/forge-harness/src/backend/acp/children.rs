@@ -44,11 +44,11 @@ impl AcpChildren {
             id != self.root,
             "ACP child cannot reuse the root session identity"
         );
-        if parent != self.root && !self.child.get(parent).is_some_and(|child| !child.closed) {
+        if parent != self.root && self.child.get(parent).is_none_or(|child| child.closed) {
             return Ok(Some(Vec::new()));
         }
         let starts_child = kind == "subagent_spawned";
-        let (state, boundary) = if starts_child {
+        let (state, boundary, address) = if starts_child {
             if self.child.get(id).is_some_and(|child| !child.closed) {
                 return Ok(Some(Vec::new()));
             }
@@ -57,23 +57,20 @@ impl AcpChildren {
                 ensure!(ancestor != id, "ACP child cannot become its own ancestor");
                 ancestor = &child.parent;
             }
-            ensure!(
-                self.child.contains_key(id) || self.child.len() < 256,
-                "ACP prompt exceeds 256 child sessions"
-            );
+            let address = ProviderAddress {
+                owner: None,
+                thread_id: id.into(),
+                turn_id: format!("acp-child:{}", uuid::Uuid::new_v4()),
+            };
             self.child.insert(
                 id.into(),
                 ChildExecution {
-                    address: ProviderAddress {
-                        owner: None,
-                        thread_id: id.into(),
-                        turn_id: format!("acp-child:{}", uuid::Uuid::new_v4()),
-                    },
+                    address: address.clone(),
                     parent: parent.into(),
                     closed: false,
                 },
             );
-            (AgentExecutionState::Running, TurnBoundary::Started)
+            (AgentExecutionState::Running, TurnBoundary::Started, address)
         } else {
             let Some(child) = self.child.get_mut(id) else {
                 return Ok(Some(Vec::new()));
@@ -90,9 +87,12 @@ impl AcpChildren {
                 _ => return Ok(Some(Vec::new())),
             };
             child.closed = true;
-            (state, TurnBoundary::Finished { outcome })
+            (
+                state,
+                TurnBoundary::Finished { outcome },
+                child.address.clone(),
+            )
         };
-        let address = self.child[id].address.clone();
         let lifecycle = AgentLifecycleEvent {
             operation: kind.into(),
             starts_child,
@@ -169,14 +169,12 @@ impl AcpChildren {
                     depth += 1;
                     parent = &ancestor.parent;
                 }
-                (std::cmp::Reverse(depth), id.clone())
+                (std::cmp::Reverse(depth), id, child)
             })
             .collect::<Vec<_>>();
-        pending.sort();
+        pending.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(right.1)));
         let mut events = Vec::new();
-        for (_, id) in pending {
-            let child = self.child.get_mut(&id).expect("retained ACP child");
-            child.closed = true;
+        for (_, id, child) in pending {
             events.push(BackendEvent {
                 received_at_ms: None,
                 address: Some(child.address.clone()),
@@ -200,7 +198,7 @@ impl AcpChildren {
                     operation: "subagent_state_update".into(),
                     starts_child: false,
                     parent_thread_id: Some(child.parent.clone()),
-                    provider_thread_id: Some(id),
+                    provider_thread_id: Some(id.clone()),
                     turn_id: Some(child.address.turn_id.clone()),
                     definition: None,
                     nickname: None,
@@ -211,6 +209,9 @@ impl AcpChildren {
                 summary: None,
                 task_update: None,
             });
+        }
+        for child in self.child.values_mut() {
+            child.closed = true;
         }
         Ok(events)
     }
@@ -226,6 +227,36 @@ struct ChildExecution {
 mod test {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn child_routing_preserves_all_sessions_beyond_former_limit() -> Result<()> {
+        let mut children = AcpChildren::new("root".into());
+        for index in 0..300 {
+            let id = format!("child-{index}");
+            let events = children
+                .lifecycle(
+                    "root",
+                    &json!({
+                        "sessionUpdate": "subagent_spawned",
+                        "subagentSessionId": id,
+                    }),
+                )?
+                .unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1].address.as_ref().unwrap().thread_id, id);
+        }
+        let events = children.finish()?;
+        assert_eq!(events.len(), 600);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.turn_boundary.is_some())
+                .count(),
+            300
+        );
+        assert!(children.finish()?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn child_generations_keep_content_and_completion_out_of_the_root() -> Result<()> {

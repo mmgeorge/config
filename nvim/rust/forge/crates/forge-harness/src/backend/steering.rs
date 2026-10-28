@@ -374,10 +374,10 @@ impl SteerCommand {
                     }
                 }
             }
-            if result.is_ok() {
-                if let Err(error) = event_sink.send_wait(event).await {
-                    result = Err(error.into());
-                }
+            if result.is_ok()
+                && let Err(error) = event_sink.send_wait(event).await
+            {
+                result = Err(error.into());
             }
         }
         if let Some(completion) = self.completion.take() {

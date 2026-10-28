@@ -222,9 +222,9 @@ impl ImplementationReport {
                             let expected_body = planned.iter().find(|body| body.owner == owner);
                             let actual_body = observed.iter().find(|body| body.owner == owner);
                             for (label, category) in [
-                                ("Calls", super::CallKind::Call),
-                                ("Constructs", super::CallKind::Construct),
-                                ("Accesses", super::CallKind::Property),
+                                ("Calls", super::calls::ReferenceCategory::Calls),
+                                ("Constructs", super::calls::ReferenceCategory::Constructs),
+                                ("Accesses", super::calls::ReferenceCategory::Accesses),
                             ] {
                                 let category_known = expected_body
                                     .and_then(|body| body.evidence)

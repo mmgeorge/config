@@ -373,7 +373,10 @@ fn complete_comment_text_and_occurrences_have_no_admission_cap() {
         EditStore::new(document.clone(), EditLimits::default(), budget.clone()).unwrap();
     let mut comments = CommentStore::new(document, target(), ReviewMode::Overview).unwrap();
     let text = "x".repeat(9 * 1024 * 1024);
-    let (comment, _) = comments.merge(&mut edits, remote(&text)).unwrap();
+    let mut remote = remote(&text);
+    remote.identity.node_id = "COMMENT_".to_owned() + &"x".repeat(300);
+    remote.identity.url = "https://github.com/owner/repo/pull/7#".to_owned() + &"x".repeat(5000);
+    let (comment, _) = comments.merge(&mut edits, remote).unwrap();
     assert_eq!(comment, CommentId(1));
     for _ in 0..300 {
         comments.draft(&mut edits, None).unwrap();

@@ -42,6 +42,10 @@ impl BufferText {
         self.storage.row_offset.len()
     }
 
+    pub fn rows(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.storage.text.split_terminator('\n')
+    }
+
     pub fn byte_count(&self) -> usize {
         self.storage.text.len()
     }
@@ -67,15 +71,23 @@ impl BufferText {
         if rows.start > rows.end || rows.end > self.row_count() {
             return Err(ContractError("row slice is outside text"));
         }
-        Ok(rows
-            .map(|row| self.row(row).expect("validated row"))
+        Ok(self.storage.row_offset[rows.clone()]
+            .iter()
+            .enumerate()
+            .map(|(offset, start)| {
+                let end = self
+                    .storage
+                    .row_offset
+                    .get(rows.start + offset + 1)
+                    .copied()
+                    .unwrap_or(self.storage.text.len());
+                &self.storage.text[*start..end - 1]
+            })
             .collect())
     }
 
     pub fn wire_rows(&self) -> Vec<&str> {
-        (0..self.row_count())
-            .map(|row| self.row(row).expect("stored row"))
-            .collect()
+        self.rows().collect()
     }
 }
 
@@ -85,10 +97,19 @@ impl Serialize for BufferText {
         serializer: SerializerType,
     ) -> Result<SerializerType::Ok, SerializerType::Error> {
         let mut sequence = serializer.serialize_seq(Some(self.row_count()))?;
-        for row in 0..self.row_count() {
-            sequence.serialize_element(self.row(row).expect("stored row"))?;
+        for row in self.rows() {
+            sequence.serialize_element(row)?;
         }
         sequence.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for BufferText {
+    fn deserialize<DeserializerType: Deserializer<'de>>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error> {
+        let rows = Vec::<String>::deserialize(deserializer)?;
+        Self::from_rows(rows).map_err(serde::de::Error::custom)
     }
 }
 
@@ -122,14 +143,5 @@ mod tests {
             let decoded: BufferText = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, text);
         }
-    }
-}
-
-impl<'de> Deserialize<'de> for BufferText {
-    fn deserialize<DeserializerType: Deserializer<'de>>(
-        deserializer: DeserializerType,
-    ) -> Result<Self, DeserializerType::Error> {
-        let rows = Vec::<String>::deserialize(deserializer)?;
-        Self::from_rows(rows).map_err(serde::de::Error::custom)
     }
 }

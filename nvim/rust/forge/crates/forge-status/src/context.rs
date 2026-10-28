@@ -249,12 +249,6 @@ fn collect_native(
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    ensure!(
-        branch_prefix
-            .as_ref()
-            .is_none_or(|value| value.len() <= 4096),
-        "branch prefix exceeds capacity"
-    );
     Ok(StatusContext {
         workspace: workspace.to_owned(),
         head,

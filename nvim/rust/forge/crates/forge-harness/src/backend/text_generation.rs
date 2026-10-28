@@ -119,7 +119,7 @@ pub(crate) fn history(entries: &[TimelineEntry]) -> Result<String> {
         let TimelineEntry::Exchange { exchange, .. } = entry else {
             continue;
         };
-        if exchange.disposition != HistoryDisposition::Current {
+        if exchange.disposition() != HistoryDisposition::Current {
             continue;
         }
         let mut messages = vec![("User", exchange.prompt.as_str())];
@@ -306,7 +306,12 @@ mod tests {
             format!("User: {large_prompt}\n\nAssistant: Visible progress")
         );
         if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
-            exchange.disposition = HistoryDisposition::Superseded;
+            exchange
+                .finish(crate::exchange::ExchangeOutcome::Interrupted, 2)
+                .unwrap();
+            exchange
+                .set_disposition(HistoryDisposition::Superseded)
+                .unwrap();
         }
         assert!(history(&entries).is_err());
     }

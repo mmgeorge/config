@@ -288,8 +288,36 @@ pub struct PlanFlowReturnType {
 
 /// Connects one flow participant to a concrete runtime receiver.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "PlanFlowEdgeWire", into = "PlanFlowEdgeWire")]
+#[schemars(with = "PlanFlowEdgeWire")]
 pub struct PlanFlowEdge {
+    pub operation: PlanFlowOperation,
+    pub target: EntityReference,
+    pub expansion: Vec<PlanFlowEdge>,
+    pub branches: Vec<PlanFlowBranch>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanFlowOperation {
+    Construct,
+    Call(PlanFlowCall),
+    Read(PlanFlowCall),
+    Write(PlanFlowCall),
+    Send(String),
+    Emit(String),
+    Return(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanFlowCall {
+    pub callable: PlanCallable,
+    pub payload_type: Option<String>,
+    pub return_type: Option<PlanFlowReturnType>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PlanFlowEdgeWire {
     pub relation: PlanFlowRelation,
     pub target: EntityReference,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,6 +329,159 @@ pub struct PlanFlowEdge {
     pub return_type: Option<PlanFlowReturnType>,
     pub expansion: Vec<PlanFlowEdge>,
     pub branches: Vec<PlanFlowBranch>,
+}
+
+impl TryFrom<PlanFlowEdgeWire> for PlanFlowEdge {
+    type Error = anyhow::Error;
+
+    fn try_from(mut edge: PlanFlowEdgeWire) -> Result<Self> {
+        let operation = match edge.relation {
+            PlanFlowRelation::Call => PlanFlowOperation::Call(edge.take_call()?),
+            PlanFlowRelation::Read => PlanFlowOperation::Read(edge.take_call()?),
+            PlanFlowRelation::Write => PlanFlowOperation::Write(edge.take_call()?),
+            PlanFlowRelation::Construct => {
+                anyhow::ensure!(
+                    edge.callable.is_none()
+                        && edge.payload_type.is_none()
+                        && edge.return_type.is_none(),
+                    "construction does not accept callable or payload fields"
+                );
+                PlanFlowOperation::Construct
+            }
+            PlanFlowRelation::Send => PlanFlowOperation::Send(edge.take_payload()?),
+            PlanFlowRelation::Emit => PlanFlowOperation::Emit(edge.take_payload()?),
+            PlanFlowRelation::Return => PlanFlowOperation::Return(edge.take_payload()?),
+        };
+        Ok(Self {
+            operation,
+            target: edge.target,
+            expansion: edge.expansion,
+            branches: edge.branches,
+        })
+    }
+}
+
+impl PlanFlowEdgeWire {
+    fn take_call(&mut self) -> Result<PlanFlowCall> {
+        Ok(PlanFlowCall {
+            callable: self
+                .callable
+                .take()
+                .context("callable is required for callable relations")?,
+            payload_type: self.payload_type.take(),
+            return_type: self.return_type.take(),
+        })
+    }
+
+    fn take_payload(&mut self) -> Result<String> {
+        anyhow::ensure!(
+            self.callable.is_none() && self.return_type.is_none(),
+            "payload relations do not accept callable fields"
+        );
+        self.payload_type
+            .take()
+            .context("payload_type is required for payload relations")
+    }
+}
+
+impl From<PlanFlowEdge> for PlanFlowEdgeWire {
+    fn from(edge: PlanFlowEdge) -> Self {
+        let relation = edge.relation();
+        let (callable, payload_type, return_type) = match edge.operation {
+            PlanFlowOperation::Construct => (None, None, None),
+            PlanFlowOperation::Call(call)
+            | PlanFlowOperation::Read(call)
+            | PlanFlowOperation::Write(call) => {
+                (Some(call.callable), call.payload_type, call.return_type)
+            }
+            PlanFlowOperation::Send(payload)
+            | PlanFlowOperation::Emit(payload)
+            | PlanFlowOperation::Return(payload) => (None, Some(payload), None),
+        };
+        Self {
+            relation,
+            target: edge.target,
+            callable,
+            payload_type,
+            return_type,
+            expansion: edge.expansion,
+            branches: edge.branches,
+        }
+    }
+}
+
+impl PlanFlowEdge {
+    pub fn relation(&self) -> PlanFlowRelation {
+        match self.operation {
+            PlanFlowOperation::Construct => PlanFlowRelation::Construct,
+            PlanFlowOperation::Call(_) => PlanFlowRelation::Call,
+            PlanFlowOperation::Read(_) => PlanFlowRelation::Read,
+            PlanFlowOperation::Write(_) => PlanFlowRelation::Write,
+            PlanFlowOperation::Send(_) => PlanFlowRelation::Send,
+            PlanFlowOperation::Emit(_) => PlanFlowRelation::Emit,
+            PlanFlowOperation::Return(_) => PlanFlowRelation::Return,
+        }
+    }
+
+    pub fn callable(&self) -> Option<&PlanCallable> {
+        match &self.operation {
+            PlanFlowOperation::Call(call)
+            | PlanFlowOperation::Read(call)
+            | PlanFlowOperation::Write(call) => Some(&call.callable),
+            _ => None,
+        }
+    }
+
+    pub fn callable_mut(&mut self) -> Option<&mut PlanCallable> {
+        match &mut self.operation {
+            PlanFlowOperation::Call(call)
+            | PlanFlowOperation::Read(call)
+            | PlanFlowOperation::Write(call) => Some(&mut call.callable),
+            _ => None,
+        }
+    }
+
+    pub fn payload_type(&self) -> Option<&String> {
+        match &self.operation {
+            PlanFlowOperation::Call(call)
+            | PlanFlowOperation::Read(call)
+            | PlanFlowOperation::Write(call) => call.payload_type.as_ref(),
+            PlanFlowOperation::Send(payload)
+            | PlanFlowOperation::Emit(payload)
+            | PlanFlowOperation::Return(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
+    pub fn payload_type_mut(&mut self) -> Option<&mut String> {
+        match &mut self.operation {
+            PlanFlowOperation::Call(call)
+            | PlanFlowOperation::Read(call)
+            | PlanFlowOperation::Write(call) => call.payload_type.as_mut(),
+            PlanFlowOperation::Send(payload)
+            | PlanFlowOperation::Emit(payload)
+            | PlanFlowOperation::Return(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
+    pub fn return_type(&self) -> Option<&PlanFlowReturnType> {
+        match &self.operation {
+            PlanFlowOperation::Call(call)
+            | PlanFlowOperation::Read(call)
+            | PlanFlowOperation::Write(call) => call.return_type.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn return_type_mut(&mut self) -> Option<&mut PlanFlowReturnType> {
+        match &mut self.operation {
+            PlanFlowOperation::Call(call)
+            | PlanFlowOperation::Read(call)
+            | PlanFlowOperation::Write(call) => call.return_type.as_mut(),
+            _ => None,
+        }
+    }
 }
 
 /// Represents one conditional continuation from a runtime relationship.
@@ -624,6 +805,27 @@ pub struct PlanDocument {
     pub assumptions: Vec<String>,
 }
 
+/// Borrows one task and its owning stage from a single immutable plan revision.
+pub(crate) struct PlanTaskEntry<'plan> {
+    stage: &'plan PlanStage,
+    task: &'plan PlanTask,
+    path: String,
+}
+
+impl<'plan> PlanTaskEntry<'plan> {
+    pub(crate) fn stage(&self) -> &'plan PlanStage {
+        self.stage
+    }
+
+    pub(crate) fn task(&self) -> &'plan PlanTask {
+        self.task
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+}
+
 impl PlanDocument {
     /// Apply one optimistic declaration patch without exposing the immutable baseline to edits.
     pub fn patch_design(
@@ -666,24 +868,29 @@ impl PlanDocument {
         self.stages.iter().flat_map(|stage| &stage.tasks)
     }
 
-    /// Resolve an execution ordinal into its canonical address.
-    pub fn task_path(&self, ordinal: usize) -> String {
-        let mut remaining = ordinal;
-        for (stage_index, stage) in self.stages.iter().enumerate() {
-            if remaining < stage.tasks.len() {
-                return format!("/stages/{stage_index}/tasks/{remaining}");
-            }
-            remaining -= stage.tasks.len();
-        }
-        panic!("canonical task ordinal is out of bounds");
+    /// Visit tasks with their owning stage and canonical address in this revision.
+    pub(crate) fn task_entries(&self) -> impl Iterator<Item = PlanTaskEntry<'_>> {
+        self.stages
+            .iter()
+            .enumerate()
+            .flat_map(|(stage_index, stage)| {
+                stage
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .map(move |(task_index, task)| PlanTaskEntry {
+                        stage,
+                        task,
+                        path: format!("/stages/{stage_index}/tasks/{task_index}"),
+                    })
+            })
     }
 
     /// Resolve a stable task identity into its current address and value.
     pub fn task_by_id(&self, id: &str) -> Option<(String, &PlanTask)> {
-        self.tasks()
-            .enumerate()
-            .find(|(_, task)| task.id == id)
-            .map(|(ordinal, task)| (self.task_path(ordinal), task))
+        self.task_entries()
+            .find(|entry| entry.task.id == id)
+            .map(|entry| (entry.path, entry.task))
     }
 
     /// Resolve a canonical task pointer without accepting descendant paths.
@@ -764,14 +971,12 @@ impl PlanDocument {
         if matches!(
             phase,
             super::PlanPhase::Implement | super::PlanPhase::Resolve
-        ) {
-            if let Some(document) = value
-                .get_mut("document")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                document.remove("verification");
-                document.remove("checks");
-            }
+        ) && let Some(document) = value
+            .get_mut("document")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            document.remove("verification");
+            document.remove("checks");
         }
         Ok(super::codec::to_string_pretty(&value)?)
     }
@@ -783,10 +988,9 @@ impl PlanDocument {
             return Ok(value);
         }
         let mut value = super::codec::to_value(self)?;
-        value
-            .as_object_mut()
-            .expect("PlanDocument serializes as an object")
-            .remove("prompt");
+        if let Some(object) = value.as_object_mut() {
+            object.remove("prompt");
+        }
         hide_derived_state(&mut value);
         Ok(value)
     }
@@ -839,19 +1043,16 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
             source: EntityReference::PlannedEntity {
                 entity: "PlanDocument".into(),
             },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Return,
-                target: EntityReference::ExternalEntity {
+            edges: vec![crate::plan::PlanFlowEdge {
+operation: crate::plan::PlanFlowOperation::Return("ExecutablePlan".into()),
+target: EntityReference::ExternalEntity {
                     entity_kind: ReferencedEntityKind::Endpoint,
                     name: "execution scheduler".into(),
                     dependency: None,
                 },
-                callable: None,
-                payload_type: Some("ExecutablePlan".into()),
-                return_type: None,
-                expansion: Vec::new(),
-                branches: Vec::new(),
-            }],
+expansion: Vec::new(),
+branches: Vec::new()
+}],
         }],
         stages: vec![PlanStage { id: "foundation".into(), title: "Establish plan state".into(), tasks: vec![PlanTask {
             id: "plan-state".into(), requires: Vec::new(),
@@ -979,8 +1180,8 @@ mod test {
             "return_type": {"value_type": "InspectionReport"}
         }))
         .unwrap();
-        assert_eq!(edge.relation, PlanFlowRelation::Call);
-        assert_eq!(edge.callable.unwrap().name, "inspect");
+        assert_eq!(edge.relation(), PlanFlowRelation::Call);
+        assert_eq!(edge.callable().unwrap().name, "inspect");
     }
 
     #[test]
@@ -1120,22 +1321,23 @@ mod test {
     #[test]
     fn model_json_omits_generated_node_ids() {
         let mut document = test_fixture("plan", "Build structured planning.");
-        document.flows[0].edges.push(PlanFlowEdge {
-            relation: PlanFlowRelation::Call,
+        document.flows[0].edges.push(crate::plan::PlanFlowEdge {
+            operation: crate::plan::PlanFlowOperation::Call(crate::plan::PlanFlowCall {
+                callable: PlanCallable {
+                    kind: PlanCallableKind::Method,
+                    name: "validate".into(),
+                },
+                payload_type: None,
+                return_type: Some(PlanFlowReturnType {
+                    value_type: "ValidatedPlan".into(),
+                    error_type: None,
+                }),
+            }),
             target: EntityReference::ExternalEntity {
                 entity_kind: ReferencedEntityKind::Type,
                 name: "PlanValidator".into(),
                 dependency: None,
             },
-            callable: Some(PlanCallable {
-                kind: PlanCallableKind::Method,
-                name: "validate".into(),
-            }),
-            payload_type: None,
-            return_type: Some(PlanFlowReturnType {
-                value_type: "ValidatedPlan".into(),
-                error_type: None,
-            }),
             expansion: Vec::new(),
             branches: Vec::new(),
         });

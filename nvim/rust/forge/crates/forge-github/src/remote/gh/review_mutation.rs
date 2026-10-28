@@ -788,10 +788,10 @@ impl GhClient {
                 if !comment.is_empty() {
                     payload["comments"] = json!(comment);
                 }
-                if pending_review_id.is_none() {
-                    if let Some(commit_id) = commit_id {
-                        payload["commit_id"] = json!(commit_id);
-                    }
+                if pending_review_id.is_none()
+                    && let Some(commit_id) = commit_id
+                {
+                    payload["commit_id"] = json!(commit_id);
                 }
                 (
                     pending_review_id.map_or_else(
@@ -976,19 +976,18 @@ fn validate_confirmation(
         | ReviewMutation::ReviewSubmit { body, .. } => Some(body),
         _ => None,
     };
-    if let Some(body) = expected_body {
-        if value.get("body").and_then(Value::as_str) != Some(body)
+    if let Some(body) = expected_body
+        && (value.get("body").and_then(Value::as_str) != Some(body)
             || value.pointer("/user/node_id").and_then(Value::as_str)
                 != Some(&request.actor_node_id)
             || value
                 .get("id")
                 .and_then(Value::as_u64)
-                .is_none_or(|id| id == 0)
-        {
-            return Err(invalid(
-                "remote write confirmation does not match captured body and actor",
-            ));
-        }
+                .is_none_or(|id| id == 0))
+    {
+        return Err(invalid(
+            "remote write confirmation does not match captured body and actor",
+        ));
     }
     if let ReviewMutation::PendingReviewComment {
         body,

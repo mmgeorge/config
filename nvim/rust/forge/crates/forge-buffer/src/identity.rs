@@ -12,8 +12,8 @@ macro_rules! identity {
 
         impl $name {
             pub fn validate(&self) -> Result<(), ContractError> {
-                if self.0.is_empty() || self.0.len() > 256 || self.0.chars().any(char::is_control) {
-                    return Err(ContractError("identity must contain 1..=256 bytes without control characters"));
+                if self.0.is_empty() || self.0.chars().any(char::is_control) {
+                    return Err(ContractError("identity must be nonempty without control characters"));
                 }
                 Ok(())
             }

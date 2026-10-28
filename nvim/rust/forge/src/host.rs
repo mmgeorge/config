@@ -94,11 +94,15 @@ pub(crate) struct ConnectionHost {
     requests: Arc<RequestTaskStore>,
 }
 
-struct ConnectionIo<Input> {
+struct ConnectionInput<Input> {
     input: JsonLineReader<BufReader<Input>>,
     input_open: bool,
-    sink: Option<MessageSender>,
     credit: Arc<ReceiveCredit>,
+}
+
+struct ConnectionDrain<Input> {
+    input: ConnectionInput<Input>,
+    sink: Option<MessageSender>,
     writer: Option<JoinHandle<Result<()>>>,
     writer_stop: Option<oneshot::Sender<()>>,
 }
@@ -239,58 +243,56 @@ impl ConnectionHost {
             .get("status_ignored_directory")
             .cloned();
         let mut response = handshake_response(initialize.request)?;
-        if response.error().is_none() {
-            if let Some(directory) = recovery_directory.filter(|value| !value.is_null()) {
-                let configured = serde_json::from_value(directory)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|directory| self.runtime.github.configure_recovery(directory));
-                if let Err(error) = configured {
-                    response =
-                        Response::failure(initialize_id, "invalid_request", format!("{error:#}"));
-                }
+        if response.error().is_none()
+            && let Some(directory) = recovery_directory.filter(|value| !value.is_null())
+        {
+            let configured = serde_json::from_value(directory)
+                .map_err(anyhow::Error::from)
+                .and_then(|directory| self.runtime.github.configure_recovery(directory));
+            if let Err(error) = configured {
+                response =
+                    Response::failure(initialize_id, "invalid_request", format!("{error:#}"));
             }
         }
-        if response.error().is_none() {
-            if let Some(directory) = status_ignored_directory.filter(|value| !value.is_null()) {
-                let configured = serde_json::from_value(directory)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|directory| {
-                        self.runtime.status.configure_ignored_directory(directory)
-                    });
-                if let Err(error) = configured {
-                    response =
-                        Response::failure(initialize_id, "invalid_request", format!("{error:#}"));
-                }
+        if response.error().is_none()
+            && let Some(directory) = status_ignored_directory.filter(|value| !value.is_null())
+        {
+            let configured = serde_json::from_value(directory)
+                .map_err(anyhow::Error::from)
+                .and_then(|directory| self.runtime.status.configure_ignored_directory(directory));
+            if let Err(error) = configured {
+                response =
+                    Response::failure(initialize_id, "invalid_request", format!("{error:#}"));
             }
         }
-        if response.error().is_none() {
-            if let Some(path) = git_config_cache_path.filter(|value| !value.is_null()) {
-                let configured: Result<&'static str> = async {
-                    let path: std::path::PathBuf = serde_json::from_value(path)?;
-                    self.runtime
-                        .repositories
-                        .reads
-                        .submit(path.as_os_str().len(), move |_| {
-                            forge_git::config_location::configure(&path)
-                        })?
-                        .finish()
-                        .await
-                }
-                .await;
-                let cache = match configured {
-                    Ok(state) => json!({ "state": state }),
-                    Err(error) => {
-                        json!({ "state": "error", "warning": format!("Git configuration location cache: {error:#}") })
-                    }
-                };
-                response = Response::success(
-                    initialize_id,
-                    json!({
-                        "protocol_version": forge_protocol::WIRE_VERSION,
-                        "git_config_cache": cache,
-                    }),
-                )?;
+        if response.error().is_none()
+            && let Some(path) = git_config_cache_path.filter(|value| !value.is_null())
+        {
+            let configured: Result<&'static str> = async {
+                let path: std::path::PathBuf = serde_json::from_value(path)?;
+                self.runtime
+                    .repositories
+                    .reads
+                    .submit(path.as_os_str().len(), move |_| {
+                        forge_git::config_location::configure(&path)
+                    })?
+                    .finish()
+                    .await
             }
+            .await;
+            let cache = match configured {
+                Ok(state) => json!({ "state": state }),
+                Err(error) => {
+                    json!({ "state": "error", "warning": format!("Git configuration location cache: {error:#}") })
+                }
+            };
+            response = Response::success(
+                initialize_id,
+                json!({
+                    "protocol_version": forge_protocol::WIRE_VERSION,
+                    "git_config_cache": cache,
+                }),
+            )?;
         }
         let accepted = response.error().is_none();
         if !accepted {
@@ -312,37 +314,43 @@ impl ConnectionHost {
         let credit = Arc::new(ReceiveCredit::default());
         let writer_credit = Arc::clone(&credit);
         let (writer_stop, stopped) = oneshot::channel();
-        let writer = tokio::spawn(async move {
+        let mut writer = tokio::spawn(async move {
             tokio::select! {
                 result = write_messages(output, stream, writer_credit) => result,
                 _ = stopped => anyhow::bail!("Forge writer stopped before output drained"),
             }
         });
-        let mut connection = ConnectionIo {
+        let mut input = ConnectionInput {
             input,
             input_open: true,
-            sink: Some(sink),
             credit,
-            writer: Some(writer),
+        };
+        let (ending, writer) = tokio::select! {
+            result = &mut writer => {
+                let ending = result.context("Forge writer task failed")
+                    .and_then(|result| result)
+                    .and_then(|_| anyhow::bail!("Forge writer ended before connection shutdown"));
+                (ending, None)
+            }
+            ending = self.read_requests(&mut input, &sink) => (ending, Some(writer)),
+        };
+        let mut connection = ConnectionDrain {
+            input,
+            sink: Some(sink),
+            writer,
             writer_stop: Some(writer_stop),
         };
-        let ending = self.read_requests(&mut connection).await;
         self.shutdown(&mut connection, ending).await
     }
 
     async fn read_requests<Input: AsyncRead + Unpin>(
         &self,
-        connection: &mut ConnectionIo<Input>,
+        connection: &mut ConnectionInput<Input>,
+        sink: &MessageSender,
     ) -> Result<Option<u64>> {
         let admission = RequestAdmission::new();
         loop {
-            let sink = connection.sink.as_ref().expect("active Forge output");
             let line = tokio::select! {
-                result = connection.writer.as_mut().expect("active Forge writer") => {
-                    connection.writer.take();
-                    result.context("Forge writer task failed")??;
-                    anyhow::bail!("Forge writer ended before connection shutdown");
-                }
                 error = sink.failed() => return Err(error.into()),
                 joined = self.requests.join_next(), if !self.requests.is_empty() => {
                     if let Some(result) = joined { result?; }
@@ -433,7 +441,7 @@ impl ConnectionHost {
 
     async fn shutdown<Input: AsyncRead + Unpin>(
         &self,
-        connection: &mut ConnectionIo<Input>,
+        connection: &mut ConnectionDrain<Input>,
         ending: Result<Option<u64>>,
     ) -> Result<()> {
         self.requests.close();
@@ -442,7 +450,7 @@ impl ConnectionHost {
             Ok(request_id) => request_id,
             Err(error) => {
                 failure.push(format!("{error:#}"));
-                connection.input_open = false;
+                connection.input.input_open = false;
                 None
             }
         };
@@ -504,7 +512,7 @@ impl ConnectionHost {
                 joined = self.requests.join_next(), if !pending.is_empty() => {
                     if let Some(Err(error)) = joined { failure.push(format!("{error:#}")); }
                 }
-                result = async { subscription.as_mut().expect("pending Forge status subscription").await }, if subscription.is_some() => {
+                result = pending_task(&mut subscription) => {
                     subscription.take();
                     subscription_done = true;
                     match result {
@@ -513,7 +521,7 @@ impl ConnectionHost {
                         Err(error) => failure.push(format!("Forge status subscription task failed: {error}")),
                     }
                 }
-                result = async { connection.writer.as_mut().expect("pending Forge writer").await }, if connection.writer.is_some() => {
+                result = pending_task(&mut connection.writer) => {
                     connection.writer.take();
                     match result {
                         Ok(Ok(())) => {},
@@ -521,19 +529,19 @@ impl ConnectionHost {
                         Err(error) => failure.push(format!("Forge writer task failed: {error}")),
                     }
                 }
-                line = connection.input.next_frame(), if connection.input_open => {
+                line = connection.input.input.next_frame(), if connection.input.input_open => {
                     match line {
                         Ok(Some(line)) => {
-                            let result = grant_credit(&connection.credit, &line);
+                            let result = grant_credit(&connection.input.credit, &line);
                             if let Err(error) = result {
                                 failure.push(format!("{error:#}"));
-                                connection.input_open = false;
+                                connection.input.input_open = false;
                             }
                         }
-                        Ok(None) => connection.input_open = false,
+                        Ok(None) => connection.input.input_open = false,
                         Err(error) => {
                             failure.push(error.to_string());
-                            connection.input_open = false;
+                            connection.input.input_open = false;
                         }
                     }
                 }
@@ -569,7 +577,7 @@ impl ConnectionHost {
             }
         }
         connection.sink.take();
-        connection.credit.close();
+        connection.input.credit.close();
         if let Some(stop) = connection.writer_stop.take() {
             let _ = stop.send(());
         }
@@ -581,6 +589,13 @@ impl ConnectionHost {
         }
         ensure!(failure.is_empty(), "{}", failure.join("\n"));
         Ok(())
+    }
+}
+
+async fn pending_task<Task: Future + Unpin>(task: &mut Option<Task>) -> Task::Output {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
     }
 }
 

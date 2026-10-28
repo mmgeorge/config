@@ -687,10 +687,10 @@ impl StatusService {
             .file
             .get_mut(&file_id)
             .context("target is not a status file")?;
-        if matches!(file.state, BodyState::Loading)
+        if matches!(file.projection.state(), BodyState::Loading)
             && file
-                .loading
-                .as_ref()
+                .projection
+                .loading()
                 .is_some_and(|active| active.load(Ordering::Acquire))
         {
             return Ok(BodyDelivery {
@@ -704,15 +704,14 @@ impl StatusService {
                 syntax_diagnostic: None,
             });
         }
-        if file.cursor.is_none()
+        if file.projection.cursor().is_none()
             && !matches!(
-                file.state,
+                file.projection.state(),
                 BodyState::Ready | BodyState::Unavailable(_) | BodyState::Failed(_)
             )
         {
             let active = Arc::new(AtomicBool::new(true));
-            file.loading = Some(Arc::clone(&active));
-            file.state = BodyState::Loading;
+            file.projection = crate::document::SourceProjection::Loading(Arc::clone(&active));
             let lease = LoadingLease(active);
             let captured = (
                 file.record.clone(),
@@ -746,29 +745,27 @@ impl StatusService {
                 file.record == captured.0
                     && file.stamp == captured.1
                     && file
-                        .loading
-                        .as_ref()
+                        .projection
+                        .loading()
                         .is_some_and(|active| Arc::ptr_eq(active, &lease.0)),
                 "status demand was superseded"
             );
             match loaded {
                 Ok((analysis, cursor, old_syntax, new_syntax, diagnostic)) => {
-                    file.analysis = Some(analysis);
-                    file.cursor = Some(cursor);
+                    file.projection = crate::document::SourceProjection::loaded(analysis, cursor);
                     file.old_syntax = old_syntax;
                     file.new_syntax = new_syntax;
                     file.context_requested = true;
                     syntax_diagnostic = diagnostic;
-                    file.state = BodyState::Partial;
                 }
                 Err(error) => {
-                    file.state = if error
+                    file.projection = if error
                         .downcast_ref::<crate::source::SourceUnavailable>()
                         .is_some()
                     {
-                        BodyState::Unavailable(format!("{error:#}"))
+                        crate::document::SourceProjection::Unavailable(format!("{error:#}"))
                     } else {
-                        BodyState::Failed(format!("{error:#}"))
+                        crate::document::SourceProjection::Failed(format!("{error:#}"))
                     };
                 }
             }
@@ -879,7 +876,7 @@ impl StatusService {
                 .get(&file.record.path)
                 .is_some_and(|(count, partial)| *count > 1 && *partial);
             if mixed {
-                if let Some(analysis) = &file.analysis {
+                if let Some(analysis) = file.projection.analysis() {
                     captured.insert(id.clone(), analysis.clone());
                 } else {
                     missing.push((
@@ -1000,7 +997,7 @@ impl StatusService {
                         path: file.record.path.clone(),
                         analysis: (**captured
                             .get(&id)
-                            .or(file.analysis.as_ref())
+                            .or(file.projection.analysis())
                             .context("selection analysis expired")?)
                         .clone(),
                         selected: if selected.whole {
@@ -1242,8 +1239,8 @@ impl StatusService {
             generation,
             patch: None,
             snapshot: file.body.as_ref().map(|body| body.snapshot()),
-            state: file.state.clone(),
-            more: matches!(file.state, BodyState::Partial),
+            state: file.projection.state().clone(),
+            more: matches!(file.projection.state(), BodyState::Partial),
             syntax_diagnostic: None,
         })
     }
@@ -1266,13 +1263,12 @@ impl StatusService {
         document._admission.check()?;
         file.body_mut()?;
         if matches!(
-            file.state,
+            file.projection.state(),
             BodyState::Ready | BodyState::Unavailable(_) | BodyState::Failed(_)
         ) {
             let patch = if !file.notice_delivered {
-                match &file.state {
+                match &file.projection.state() {
                     BodyState::Unavailable(diagnostic) | BodyState::Failed(diagnostic) => {
-                        let diagnostic: String = diagnostic.chars().take(512).collect();
                         let block = label(
                             BlockId(document.next_id("notice")?),
                             &diagnostic.replace(['\n', '\r'], " "),
@@ -1290,27 +1286,31 @@ impl StatusService {
             } else {
                 None
             };
-            return Ok(body_delivery(document, file, patch));
+            return body_delivery(document, file, patch);
         }
-        let chunk = file
-            .cursor
-            .as_mut()
-            .context("status body cursor missing")?
-            .next_rows(ChunkLimits {
-                rows: 128,
-                ..ChunkLimits::default()
-            });
+        let crate::document::SourceProjection::Loaded {
+            cursor, complete, ..
+        } = &mut file.projection
+        else {
+            return body_delivery(document, file, None);
+        };
+        let chunk = cursor.next_rows(ChunkLimits {
+            rows: 128,
+            ..ChunkLimits::default()
+        });
+        *complete = matches!(chunk.state, DisplayState::Complete);
         let mut block = match forge_diff::presentation::DiffPresenter::new(Default::default())
             .batch(
                 BlockId(document.next_id("body")?),
                 &chunk.rows,
-                |index| file.cursor.as_ref().and_then(|cursor| cursor.group(index)),
+                |index| cursor.group(index),
                 file.old_syntax.as_ref(),
                 file.new_syntax.as_ref(),
             ) {
             Ok(block) => block,
             Err(failure) => {
-                file.state = BodyState::Unavailable(failure.to_string());
+                file.projection =
+                    crate::document::SourceProjection::Unavailable(failure.to_string());
                 return self.deliver(document, target, file);
             }
         };
@@ -1324,7 +1324,7 @@ impl StatusService {
                 },
             };
             let row_target = if let Some(raw) = display.raw_id {
-                let id = if let Some(id) = file.hunk.get(&raw) {
+                if let Some(id) = file.hunk.get(&raw) {
                     id.clone()
                 } else {
                     let id = TargetId(document.next_id("hunk")?);
@@ -1337,8 +1337,7 @@ impl StatusService {
                         },
                     );
                     id
-                };
-                id
+                }
             } else {
                 target.clone()
             };
@@ -1348,12 +1347,8 @@ impl StatusService {
                     range: range.clone(),
                 });
             }
-            source_rows.push(display.new.or(display.old));
+            source_rows.push(display.new_coordinate().or(display.old_coordinate()));
         }
-        file.state = match &chunk.state {
-            DisplayState::More => BodyState::Partial,
-            DisplayState::Complete => BodyState::Ready,
-        };
         let retained = chunk.text_bytes
             + (block.metadata.decoration.len() + block.metadata.visible_decoration.len()) * 160
             + block.metadata.target.len() * 160
@@ -1389,7 +1384,7 @@ impl StatusService {
             file.retained_bytes += retained;
             patch
         };
-        Ok(body_delivery(document, file, patch))
+        body_delivery(document, file, patch)
     }
 
     async fn load(
@@ -1481,32 +1476,32 @@ pub(crate) async fn optional_syntax(
         Ok(syntax) => (Some(syntax), None),
         Err(error) => (
             None,
-            Some(
-                format!("Syntax highlighting unavailable: {error:?}")
-                    .chars()
-                    .take(256)
-                    .collect(),
-            ),
+            Some(format!("Syntax highlighting unavailable: {error:?}")),
         ),
     }
 }
 
 fn body_delivery(
     document: &StatusDocument,
-    file: &FileTarget,
+    file: &mut FileTarget,
     patch: Option<BufferPatch>,
-) -> BodyDelivery {
+) -> Result<BodyDelivery> {
     let first = patch.as_ref().is_some_and(|patch| patch.base.0 == 0);
-    BodyDelivery {
+    let snapshot = if first {
+        Some(file.body_mut()?.snapshot())
+    } else {
+        None
+    };
+    Ok(BodyDelivery {
         document: document.id.clone(),
         file: file.id,
         generation: file.generation,
-        snapshot: first.then(|| file.body.as_ref().expect("delivered body").snapshot()),
+        snapshot,
         patch: if first { None } else { patch },
-        state: file.state.clone(),
-        more: matches!(file.state, BodyState::Partial),
+        state: file.projection.state().clone(),
+        more: matches!(file.projection.state(), BodyState::Partial),
         syntax_diagnostic: None,
-    }
+    })
 }
 
 fn validate_input(document: &mut StatusDocument, input: &StatusInput) -> Result<TargetId> {
@@ -1533,10 +1528,6 @@ fn resolve_position(document: &StatusDocument, input: &StatusInput) -> Result<Op
                 .get(&input.view)
                 .is_none_or(|sequence| *sequence < input.sequence),
         "status input sequence was already accepted"
-    );
-    ensure!(
-        document.input.contains_key(&input.view) || document.input.len() < 64,
-        "status view admission is full"
     );
     resolve_location(document, &input.location)
 }
@@ -1565,7 +1556,6 @@ fn resolve_location(
             Ok(Some(TargetId(format!("section:{section:?}"))))
         }
         StatusLocation::Context { role } => {
-            ensure!(role.len() <= 128, "invalid context role");
             let target = TargetId(format!("status:context:{role}"));
             ensure!(
                 document

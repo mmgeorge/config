@@ -31,13 +31,30 @@ pub enum CallKind {
     Construct,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ReferenceCategory {
+    Calls,
+    Accesses,
+    Constructs,
+}
+
+impl ReferenceCategory {
+    fn default_kind(self) -> CallKind {
+        match self {
+            Self::Calls => CallKind::Call,
+            Self::Accesses => CallKind::Property,
+            Self::Constructs => CallKind::Construct,
+        }
+    }
+}
+
 impl CallKind {
     /// Group semantic references into editable body sections.
-    pub(crate) fn category(self) -> Self {
+    pub(crate) fn category(self) -> ReferenceCategory {
         match self {
-            Self::Call | Self::Callback => Self::Call,
-            Self::Property | Self::Value => Self::Property,
-            Self::Construct => Self::Construct,
+            Self::Call | Self::Callback => ReferenceCategory::Calls,
+            Self::Property | Self::Value => ReferenceCategory::Accesses,
+            Self::Construct => ReferenceCategory::Constructs,
         }
     }
     /// Preserve canonical bytes for older invocation-only plan snapshots.
@@ -141,12 +158,11 @@ pub struct ReferenceEvidence {
 
 impl ReferenceEvidence {
     /// Tests whether the category has known evidence, including an empty list.
-    pub(crate) fn contains(self, kind: CallKind) -> bool {
-        match kind.category() {
-            CallKind::Call => self.calls,
-            CallKind::Property => self.accesses,
-            CallKind::Construct => self.constructs,
-            _ => unreachable!(),
+    pub(crate) fn contains(self, category: ReferenceCategory) -> bool {
+        match category {
+            ReferenceCategory::Calls => self.calls,
+            ReferenceCategory::Accesses => self.accesses,
+            ReferenceCategory::Constructs => self.constructs,
         }
     }
 }
@@ -174,12 +190,12 @@ impl CallPresentation {
         &self,
         path: &str,
     ) -> Result<&[forge_diff::syntax::DeclarationCallable]> {
-        if self.callable.get().is_none() {
-            let callable = DeclarationCalls::extract(path, &self.plain, true)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let _ = self.callable.set(callable);
+        if let Some(callable) = self.callable.get() {
+            return Ok(callable);
         }
-        Ok(self.callable.get().unwrap())
+        let callable = DeclarationCalls::extract(path, &self.plain, true)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        Ok(self.callable.get_or_init(|| callable))
     }
 
     /// Preserve displayed coordinates while isolating Algorithm rows from native declarations.
@@ -211,12 +227,12 @@ impl CallPresentation {
 impl CallPresentation {
     /// Reuses container analysis for the same immutable declaration presentation.
     pub(crate) fn folds(&self, path: &str) -> Result<&[forge_diff::syntax::DeclarationFold]> {
-        if self.folding.get().is_none() {
-            let folding = forge_diff::syntax::DeclarationFolding::analyze(path, &self.plain)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let _ = self.folding.set(folding);
+        if let Some(folding) = self.folding.get() {
+            return Ok(folding);
         }
-        Ok(self.folding.get().unwrap())
+        let folding = forge_diff::syntax::DeclarationFolding::analyze(path, &self.plain)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        Ok(self.folding.get_or_init(|| folding))
     }
 }
 
@@ -455,7 +471,9 @@ pub(crate) fn resolve_algorithm_reference(
                 && !part.starts_with('\'')
                 && !matches!(*part, "mut" | "const" | "dyn" | "impl")
         })
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let qualified = reference.name.contains("::")
         || receiver.is_some_and(|receiver| receiver.chars().next().is_some_and(char::is_uppercase));
     let eligible = |call: &&CallSite| {
@@ -500,8 +518,8 @@ pub(crate) fn resolve_algorithm_reference(
             .collect::<std::collections::BTreeMap<_, _>>();
         if !typed.is_empty() {
             candidates = typed;
-        } else if types.len() == 1 {
-            let name = format!("{}{separator}{member}", types.first().unwrap());
+        } else if let [receiver_type] = types.as_slice() {
+            let name = format!("{receiver_type}{separator}{member}");
             let kind = if reference.invocation {
                 CallKind::Call
             } else {
@@ -539,11 +557,10 @@ pub(crate) fn resolve_algorithm_reference(
         }));
     }
     let name = if receiver.is_some() && !qualified {
-        ensure!(
-            types.len() == 1,
-            "Algorithm receiver has no unique signature type or Calls target"
-        );
-        format!("{}{separator}{member}", types.first().unwrap())
+        let [receiver_type] = types.as_slice() else {
+            anyhow::bail!("Algorithm receiver has no unique signature type or Calls target");
+        };
+        format!("{receiver_type}{separator}{member}")
     } else {
         reference.name
     };
@@ -572,8 +589,9 @@ pub(crate) fn present(
         let mut entries = cache
             .lock()
             .map_err(|_| anyhow::anyhow!("call presentation cache lock poisoned"))?;
-        if let Some(index) = entries.iter().position(|entry| entry.key == key) {
-            let entry = entries.remove(index).unwrap();
+        if let Some(index) = entries.iter().position(|entry| entry.key == key)
+            && let Some(entry) = entries.remove(index)
+        {
             let result = Arc::clone(&entry.value);
             entries.push_back(entry);
             return Ok(result);
@@ -698,10 +716,10 @@ pub(crate) fn insert(
             output.push_str(" {");
         }
         output.push('\n');
-        source.push(Some(DeclarationPosition {
+        source.push(DeclarationPosition {
             line: index as u32 + 1,
             column: 0,
-        }));
+        });
         if let Some(functions) = at.get(&(index + 1)) {
             for (function, calls) in functions {
                 let indent = &line[..line.len() - line.trim_start().len()];
@@ -725,13 +743,17 @@ pub(crate) fn insert(
                                 "{indent}{body_indent}{summary_indent}{summary}\n"
                             ));
                         }
-                        source.push(Some(DeclarationPosition {
+                        source.push(DeclarationPosition {
                             line: function.line,
                             column: function.column,
-                        }));
+                        });
                     }
                 }
-                for kind in [CallKind::Call, CallKind::Construct, CallKind::Property] {
+                for kind in [
+                    ReferenceCategory::Calls,
+                    ReferenceCategory::Constructs,
+                    ReferenceCategory::Accesses,
+                ] {
                     if calls
                         .evidence
                         .is_some_and(|evidence| !evidence.contains(kind))
@@ -750,7 +772,7 @@ pub(crate) fn insert(
                         .collect::<Vec<_>>();
                     if targets.is_empty()
                         && calls.evidence.is_none()
-                        && !(kind == CallKind::Call && occurrences.is_empty())
+                        && !(kind == ReferenceCategory::Calls && occurrences.is_empty())
                     {
                         continue;
                     }
@@ -762,26 +784,25 @@ pub(crate) fn insert(
                         }
                     }
                     let heading = match kind {
-                        CallKind::Call => "Calls",
-                        CallKind::Property => "Accesses",
-                        CallKind::Construct => "Constructs",
-                        _ => unreachable!(),
+                        ReferenceCategory::Calls => "Calls",
+                        ReferenceCategory::Accesses => "Accesses",
+                        ReferenceCategory::Constructs => "Constructs",
                     };
                     output.push_str(&format!("{indent}{body_indent}{heading}\n"));
-                    source.push(Some(DeclarationPosition {
+                    source.push(DeclarationPosition {
                         line: function.line,
                         column: function.column,
-                    }));
+                    });
                     for (name, semantic_kind) in targets {
                         call_row.insert(
                             source.len(),
                             (function.owner.clone(), name.to_owned(), semantic_kind),
                         );
                         output.push_str(&format!("{indent}{body_indent}  {name}\n"));
-                        source.push(Some(DeclarationPosition {
+                        source.push(DeclarationPosition {
                             line: function.line,
                             column: function.column,
-                        }));
+                        });
                     }
                 }
                 if review {
@@ -795,17 +816,17 @@ pub(crate) fn insert(
                         },
                     );
                     output.push_str(&format!("{indent}{}\n", if lua { "end" } else { "}" }));
-                    source.push(Some(DeclarationPosition {
+                    source.push(DeclarationPosition {
                         line: function.line,
                         column: function.column,
-                    }));
+                    });
                 }
             }
         }
     }
     let plain_row = source
         .iter()
-        .map(|position| position.unwrap().line as usize - 1)
+        .map(|position| position.line as usize - 1)
         .collect();
     Ok(CallPresentation {
         visibility: Default::default(),
@@ -814,7 +835,7 @@ pub(crate) fn insert(
         plain: text.into(),
         declaration: DeclarationPresentation {
             text: output,
-            source,
+            source: source.into_iter().map(Some).collect(),
         },
         call_row,
         behavior_row,
@@ -866,7 +887,7 @@ pub(crate) fn visibility(
 
 enum BodySection {
     Behavior(FunctionBehavior),
-    References(CallKind, Vec<(String, CallKind)>),
+    References(ReferenceCategory, Vec<(String, CallKind)>),
 }
 
 /// Require algorithms for new callables at submission while keeping draft edits incomplete.
@@ -910,7 +931,7 @@ pub(super) fn validate_behaviors(design: &super::DeclarationDesign) -> Result<()
                     "{path}: new callable {} requires a nonempty Algorithm block",
                     function.owner
                 );
-                if let Some(FunctionBehavior::Algorithm(text)) = behavior {
+                if let (Some(body), Some(FunctionBehavior::Algorithm(text))) = (body, behavior) {
                     let invocations =
                         forge_diff::syntax::validate_algorithm(text).map_err(|error| {
                             anyhow::anyhow!("{path}: {}: {error:?}", function.owner)
@@ -928,24 +949,26 @@ pub(super) fn validate_behaviors(design: &super::DeclarationDesign) -> Result<()
                         let line = reference.line;
                         let column = reference.column;
                         let Some(AlgorithmTarget::Reference(target)) =
-                            resolve_algorithm_reference(path, &function, body.unwrap(), reference)?
+                            resolve_algorithm_reference(path, &function, body, reference)?
                         else {
                             continue;
                         };
                         ensure!(
-                            body.unwrap().call.iter().flatten().any(|call| call
-                                .name
-                                .replace("::", ".")
-                                == target.name.replace("::", ".")
-                                && matches!(call.kind, CallKind::Property | CallKind::Value)),
+                            body.call
+                                .iter()
+                                .flatten()
+                                .any(|call| call.name.replace("::", ".")
+                                    == target.name.replace("::", ".")
+                                    && matches!(call.kind, CallKind::Property | CallKind::Value)),
                             "{path}: {}: Algorithm line {line}, column {column}: field {} requires a matching Accesses target",
                             function.owner,
                             target.name
                         );
                     }
                     for construction in body
-                        .into_iter()
-                        .flat_map(|body| body.call.iter().flatten())
+                        .call
+                        .iter()
+                        .flatten()
                         .filter(|call| call.kind == CallKind::Construct)
                     {
                         let matching = invocations
@@ -981,7 +1004,7 @@ pub(super) fn validate_behaviors(design: &super::DeclarationDesign) -> Result<()
 #[derive(Default)]
 struct FunctionSection {
     behavior: Option<FunctionBehavior>,
-    reference: BTreeMap<CallKind, Vec<(String, CallKind)>>,
+    reference: BTreeMap<ReferenceCategory, Vec<(String, CallKind)>>,
 }
 
 fn protected_declaration_lines(
@@ -1081,9 +1104,9 @@ pub(crate) fn parse(
         ) && !protected.contains(&index)
         {
             let kind = match line.trim() {
-                "Accesses" => CallKind::Property,
-                "Constructs" => CallKind::Construct,
-                _ => CallKind::Call,
+                "Accesses" => ReferenceCategory::Accesses,
+                "Constructs" => ReferenceCategory::Constructs,
+                _ => ReferenceCategory::Calls,
             };
             let indent = line.len() - line.trim_start().len();
             let preceding = original_line
@@ -1144,7 +1167,7 @@ pub(crate) fn parse(
                     break;
                 }
                 let name = value.trim();
-                names.push((name.to_owned(), kind));
+                names.push((name.to_owned(), kind.default_kind()));
                 index += 1;
             }
             block.push((
@@ -1207,9 +1230,13 @@ pub(crate) fn parse(
         let function = by_line[&line];
         let references_available = !sections.reference.is_empty();
         let evidence = references_available.then_some(ReferenceEvidence {
-            calls: sections.reference.contains_key(&CallKind::Call),
-            accesses: sections.reference.contains_key(&CallKind::Property),
-            constructs: sections.reference.contains_key(&CallKind::Construct),
+            calls: sections.reference.contains_key(&ReferenceCategory::Calls),
+            accesses: sections
+                .reference
+                .contains_key(&ReferenceCategory::Accesses),
+            constructs: sections
+                .reference
+                .contains_key(&ReferenceCategory::Constructs),
         });
         let mut category = sections
             .reference
@@ -1233,7 +1260,7 @@ pub(crate) fn parse(
             names.extend(remaining);
         }
         let mut remaining =
-            BTreeMap::<(String, CallKind), std::collections::VecDeque<CallSite>>::new();
+            BTreeMap::<(String, ReferenceCategory), std::collections::VecDeque<CallSite>>::new();
         for call in by_owner
             .get(function.owner.as_str())
             .into_iter()
@@ -1252,7 +1279,7 @@ pub(crate) fn parse(
                     .keys()
                     .any(|binding| name == *binding || name.starts_with(&format!("{binding}.")));
                 let captured = remaining
-                    .get_mut(&(name.clone(), kind))
+                    .get_mut(&(name.clone(), kind.category()))
                     .and_then(std::collections::VecDeque::pop_front);
                 ensure!(
                     captured.as_ref().is_some_and(|call| call.source.is_some())
@@ -1269,7 +1296,7 @@ pub(crate) fn parse(
                                 .contains(character))),
                     "Function uses contain only a qualified target name, without arguments: {name}"
                 );
-                let mut call = captured.unwrap_or_else(|| CallSite {
+                let mut call = captured.unwrap_or(CallSite {
                     kind,
                     name,
                     source: None,

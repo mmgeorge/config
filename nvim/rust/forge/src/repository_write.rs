@@ -271,25 +271,6 @@ fn decode_repository_paths(paths: Vec<String>) -> Result<Vec<RepositoryPath>> {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn path_admission_preserves_complete_collections_and_validates_paths() {
-        let accepted = (0..10_001)
-            .map(|index| STANDARD.encode(format!("source-{index}.rs")))
-            .collect();
-        assert_eq!(decode_repository_paths(accepted).unwrap().len(), 10_001);
-        let path = vec![b'x'; 1024 * 1024 + 1];
-        assert_eq!(
-            decode_repository_paths(vec![STANDARD.encode(&path)]).unwrap()[0].raw(),
-            path
-        );
-        assert!(decode_repository_paths(vec![STANDARD.encode("../outside")]).is_err());
-    }
-}
-
 pub(crate) fn outcome_value(outcome: &WriteOutcome) -> Value {
     let target: Vec<_> = outcome
         .target
@@ -316,4 +297,23 @@ pub(crate) fn outcome_value(outcome: &WriteOutcome) -> Value {
         "settlement_diagnostic":outcome.settlement_diagnostic,
         "requires_refresh":outcome.settled.is_none(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_admission_preserves_complete_collections_and_validates_paths() {
+        let accepted = (0..10_001)
+            .map(|index| STANDARD.encode(format!("source-{index}.rs")))
+            .collect();
+        assert_eq!(decode_repository_paths(accepted).unwrap().len(), 10_001);
+        let path = vec![b'x'; 1024 * 1024 + 1];
+        assert_eq!(
+            decode_repository_paths(vec![STANDARD.encode(&path)]).unwrap()[0].raw(),
+            path
+        );
+        assert!(decode_repository_paths(vec![STANDARD.encode("../outside")]).is_err());
+    }
 }

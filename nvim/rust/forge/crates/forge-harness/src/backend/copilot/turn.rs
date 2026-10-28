@@ -1,5 +1,5 @@
 use crate::backend::{BackendEvent, BackendEventSink};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use github_copilot_sdk::SessionEvent;
 use std::sync::{
     Arc, Mutex,
@@ -27,7 +27,10 @@ impl CopilotTurnEvent {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        anyhow::ensure!(!state.active, "Copilot turn is already active");
+        anyhow::ensure!(
+            !matches!(state.delivery, TurnDelivery::Active(_)),
+            "Copilot turn is already active"
+        );
         *state = CopilotTurnState::default();
         Ok(())
     }
@@ -42,52 +45,59 @@ impl CopilotTurnEvent {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        anyhow::ensure!(!state.active, "Copilot turn is already active");
+        anyhow::ensure!(
+            !matches!(state.delivery, TurnDelivery::Active(_)),
+            "Copilot turn is already active"
+        );
         *state = CopilotTurnState {
-            active: true,
-            event_sink,
-            submission_cancelled,
+            delivery: TurnDelivery::Active(ActiveDelivery {
+                event_sink,
+                submission_cancelled,
+            }),
             ..Default::default()
         };
         Ok(CopilotTurnEventGuard { owner: self })
     }
 
     pub(super) fn is_active(&self) -> bool {
-        self.state
-            .lock()
-            .expect("Copilot turn lock poisoned")
-            .active
+        matches!(
+            self.state
+                .lock()
+                .expect("Copilot turn lock poisoned")
+                .delivery,
+            TurnDelivery::Active(_)
+        )
     }
 
     pub(super) fn event_sink(&self) -> Option<BackendEventSink> {
-        self.state
-            .lock()
-            .expect("Copilot turn lock poisoned")
-            .event_sink
-            .clone()
+        let state = self.state.lock().expect("Copilot turn lock poisoned");
+        match &state.delivery {
+            TurnDelivery::Active(active) => active.event_sink.clone(),
+            TurnDelivery::Idle => None,
+        }
     }
 
-    /// Serialize native sends against stop requests without canceling a committed SDK send.
-    pub(super) async fn send(
+    pub(super) async fn steer(
         &self,
         send: impl std::future::Future<Output = Result<String>>,
     ) -> Result<()> {
         let _dispatch = self.dispatch.lock().await;
         {
-            let mut state = self
+            let state = self
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+            let TurnDelivery::Active(active) = &state.delivery else {
+                anyhow::bail!("Copilot turn is not active");
+            };
             if state.cancelled
-                || state
+                || active
                     .submission_cancelled
                     .as_ref()
                     .is_some_and(|flag| flag.load(Ordering::Acquire))
             {
                 return Err(anyhow::Error::new(crate::broker::TurnCancelled));
             }
-            anyhow::ensure!(state.active, "Copilot turn is not active");
-            state.submitted = true;
         }
         send.await?;
         Ok(())
@@ -101,7 +111,7 @@ impl CopilotTurnEvent {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        Ok(state.submitted)
+        Ok(matches!(state.submission, NativeSubmission::Sent { .. }))
     }
 
     /// Fence new sends immediately and identify a submitted send that still needs collection.
@@ -112,7 +122,7 @@ impl CopilotTurnEvent {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
             state.cancelled = true;
-            state.submitted
+            matches!(state.submission, NativeSubmission::Sent { .. })
         };
         Ok(StopRequest {
             submitted,
@@ -137,18 +147,12 @@ impl CopilotTurnEvent {
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-            if state.submitted && state.user_event_id.is_none() {
-                state.user_event_id = Some(event.id.clone());
+            if let NativeSubmission::Sent { user_event_id, .. } = &mut state.submission
+                && user_event_id.is_none()
+            {
+                *user_event_id = Some(event.id.clone());
             }
         }
-        Ok(())
-    }
-
-    pub(super) fn set_history_cursor(&self, cursor: String) -> Result<()> {
-        self.state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?
-            .history_cursor = Some(cursor);
         Ok(())
     }
 
@@ -158,21 +162,20 @@ impl CopilotTurnEvent {
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
         anyhow::ensure!(
-            !state.active,
+            !matches!(state.delivery, TurnDelivery::Active(_)),
             "Copilot turn must stop before history rewind"
         );
-        if !state.submitted {
-            return Ok(CopilotRetraction::Unsent);
-        }
-        if let Some(event_id) = &state.user_event_id {
-            return Ok(CopilotRetraction::Event(event_id.clone()));
-        }
-        Ok(CopilotRetraction::History(
-            state
-                .history_cursor
-                .clone()
-                .context("Copilot submission has no native history boundary for rewind")?,
-        ))
+        Ok(match &state.submission {
+            NativeSubmission::Unsent => CopilotRetraction::Unsent,
+            NativeSubmission::Sent {
+                user_event_id: Some(event_id),
+                ..
+            } => CopilotRetraction::Event(event_id.clone()),
+            NativeSubmission::Sent {
+                cursor,
+                user_event_id: None,
+            } => CopilotRetraction::History(cursor.clone()),
+        })
     }
 
     pub(super) fn finish_retraction(&self) -> Result<()> {
@@ -180,9 +183,7 @@ impl CopilotTurnEvent {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        state.submitted = false;
-        state.user_event_id = None;
-        state.history_cursor = None;
+        state.submission = NativeSubmission::Unsent;
         Ok(())
     }
 
@@ -192,12 +193,16 @@ impl CopilotTurnEvent {
         text: String,
         input_message_id: Option<String>,
     ) -> Result<()> {
-        let event_sink = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?
-            .event_sink
-            .clone();
+        let event_sink = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+            match &state.delivery {
+                TurnDelivery::Active(active) => active.event_sink.clone(),
+                TurnDelivery::Idle => None,
+            }
+        };
         if let Some(event_sink) = event_sink {
             let mut event = BackendEvent::steering_input(text);
             event.data = serde_json::json!({"input_message_id":input_message_id});
@@ -221,13 +226,31 @@ pub(super) struct StopRequest {
 /// Retains send ownership and the exact native history boundary across prompt completion.
 #[derive(Default)]
 struct CopilotTurnState {
-    active: bool,
-    submitted: bool,
+    delivery: TurnDelivery,
+    submission: NativeSubmission,
     cancelled: bool,
+}
+
+#[derive(Default)]
+enum TurnDelivery {
+    #[default]
+    Idle,
+    Active(ActiveDelivery),
+}
+
+struct ActiveDelivery {
     submission_cancelled: Option<Arc<AtomicBool>>,
-    user_event_id: Option<String>,
-    history_cursor: Option<String>,
     event_sink: Option<BackendEventSink>,
+}
+
+#[derive(Default)]
+enum NativeSubmission {
+    #[default]
+    Unsent,
+    Sent {
+        cursor: String,
+        user_event_id: Option<String>,
+    },
 }
 
 /// Clears active delivery while preserving the canceled submission's rewind target.
@@ -235,11 +258,44 @@ pub(super) struct CopilotTurnEventGuard<'a> {
     owner: &'a CopilotTurnEvent,
 }
 
+impl CopilotTurnEventGuard<'_> {
+    /// Keeps active delivery borrowed until the native send releases dispatch ownership.
+    pub(super) async fn send(
+        &self,
+        cursor: String,
+        send: impl std::future::Future<Output = Result<String>>,
+    ) -> Result<()> {
+        let _dispatch = self.owner.dispatch.lock().await;
+        {
+            let mut state = self
+                .owner
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+            let cancelled = match &state.delivery {
+                TurnDelivery::Active(active) => active
+                    .submission_cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire)),
+                TurnDelivery::Idle => true,
+            };
+            if state.cancelled || cancelled {
+                return Err(anyhow::Error::new(crate::broker::TurnCancelled));
+            }
+            state.submission = NativeSubmission::Sent {
+                cursor,
+                user_event_id: None,
+            };
+        }
+        send.await?;
+        Ok(())
+    }
+}
+
 impl Drop for CopilotTurnEventGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.owner.state.lock() {
-            state.active = false;
-            state.event_sink = None;
+            state.delivery = TurnDelivery::Idle;
         }
         self.owner.finished.notify_waiters();
     }

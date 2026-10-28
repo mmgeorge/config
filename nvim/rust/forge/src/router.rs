@@ -1084,48 +1084,43 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewSnapshot
-            | RoutedMethod::ReviewSave
-            | RoutedMethod::ReviewReconcile
-            | RoutedMethod::ReviewClose => {
+            RoutedMethod::ReviewSnapshot => {
                 let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
-                match method {
-                    RoutedMethod::ReviewSnapshot => {
-                        send_completed_result(
-                            sink,
-                            request.id,
-                            self.host.review.snapshot(&params.document)?,
-                        )
-                        .await?
-                    }
-                    RoutedMethod::ReviewSave => {
-                        send_completed_result(
-                            sink,
-                            request.id,
-                            self.host
-                                .review
-                                .save(&params.document, params.capture, params.draft_comment)
-                                .await?,
-                        )
-                        .await?
-                    }
-                    RoutedMethod::ReviewReconcile => {
-                        send_completed_result(
-                            sink,
-                            request.id,
-                            self.host.review.reconcile(&params.document).await?,
-                        )
-                        .await?
-                    }
-                    RoutedMethod::ReviewClose => {
-                        self.host.review.close_document(&params.document)?;
-                        sink.send(Message::Response(Response::success(
-                            request.id,
-                            json!({"closed":true}),
-                        )?))?;
-                    }
-                    _ => unreachable!("review document route"),
-                }
+                send_completed_result(
+                    sink,
+                    request.id,
+                    self.host.review.snapshot(&params.document)?,
+                )
+                .await?;
+            }
+            RoutedMethod::ReviewSave => {
+                let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
+                send_completed_result(
+                    sink,
+                    request.id,
+                    self.host
+                        .review
+                        .save(&params.document, params.capture, params.draft_comment)
+                        .await?,
+                )
+                .await?;
+            }
+            RoutedMethod::ReviewReconcile => {
+                let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
+                send_completed_result(
+                    sink,
+                    request.id,
+                    self.host.review.reconcile(&params.document).await?,
+                )
+                .await?;
+            }
+            RoutedMethod::ReviewClose => {
+                let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
+                self.host.review.close_document(&params.document)?;
+                sink.send(Message::Response(Response::success(
+                    request.id,
+                    json!({"closed":true}),
+                )?))?;
             }
             RoutedMethod::Metadata => {
                 let params: MetadataParams = serde_json::from_value(request.params)?;

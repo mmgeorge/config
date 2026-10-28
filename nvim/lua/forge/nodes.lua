@@ -23,7 +23,7 @@ function M.validate(sequence, changed, retired, state, read_row)
     return start + value.row, value.column
   end
   local function validate(owner, fold)
-    assert(type(fold.id) == "string" and #fold.id > 0 and #fold.id <= 256 and not fold.id:find("%c"),
+    assert(type(fold.id) == "string" and #fold.id > 0 and not fold.id:find("%c"),
       "invalid fold identity")
     assert(not seen[fold.id], "duplicate fold identity")
     seen[fold.id] = true

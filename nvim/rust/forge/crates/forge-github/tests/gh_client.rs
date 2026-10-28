@@ -17,6 +17,8 @@ struct FixtureExecutable {
     path: PathBuf,
 }
 static EXECUTABLE: OnceLock<FixtureExecutable> = OnceLock::new();
+// Each case controls its own native-process concurrency without competing with other cases.
+static NATIVE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn executable() -> &'static Path {
     &EXECUTABLE
@@ -96,6 +98,7 @@ fn request() -> IssuePageRequest {
 
 #[tokio::test]
 async fn immutable_source_acquires_raw_git_blob_without_text_or_symlink_conversion() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::{review_api::GithubReviewRemote, review_source::ReviewSourceRequest};
     let (root, client) = fixture("success")?;
     let bytes = b"../target\r\n\0\xff";
@@ -129,6 +132,7 @@ async fn immutable_source_acquires_raw_git_blob_without_text_or_symlink_conversi
 
 #[tokio::test]
 async fn immutable_source_absence_never_requests_a_blob() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::{review_api::GithubReviewRemote, review_source::ReviewSourceRequest};
     let (root, client) = fixture("success")?;
     fs::write(
@@ -152,6 +156,7 @@ async fn immutable_source_absence_never_requests_a_blob() -> Result<()> {
 #[tokio::test]
 async fn pending_submission_capture_and_preflight_reject_changed_membership_or_text() -> Result<()>
 {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::{
         recovery::{RecoveryResource, RecoveryResourceKind},
         remote::PendingReviewExpected,
@@ -273,6 +278,7 @@ async fn pending_submission_capture_and_preflight_reject_changed_membership_or_t
 
 #[tokio::test]
 async fn repository_users_merge_sources_and_preserve_partial_failure() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("success")?;
     fs::write(
         root.path().join("contributors.json"),
@@ -319,6 +325,7 @@ async fn repository_users_merge_sources_and_preserve_partial_failure() -> Result
 
 #[tokio::test]
 async fn repository_users_distinguish_empty_pages_from_invalid_pages() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("success")?;
     fs::write(root.path().join("contributors.json"), "[[]]")?;
     fs::write(root.path().join("collaborators.json"), "[]")?;
@@ -388,6 +395,7 @@ async fn started(root: &Path, count: usize) -> Result<Vec<PathBuf>> {
 
 #[tokio::test]
 async fn native_gh_arguments_input_decode_and_cleanup_preserve_the_remote_contract() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("success")?;
     let mut request = request();
     request.incremental = true;
@@ -420,6 +428,7 @@ async fn native_gh_arguments_input_decode_and_cleanup_preserve_the_remote_contra
 #[tokio::test]
 async fn native_issue_detail_preserves_normalized_records_and_explicit_host_routing() -> Result<()>
 {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("success")?;
     fs::write(
         root.path().join("response.json"),
@@ -460,6 +469,7 @@ async fn native_issue_detail_preserves_normalized_records_and_explicit_host_rout
 
 #[tokio::test]
 async fn detail_and_page_reads_share_admission_and_reap_abandoned_children() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("block")?;
     let mut caller = Vec::new();
     for position in 0..4 {
@@ -519,6 +529,7 @@ async fn detail_and_page_reads_share_admission_and_reap_abandoned_children() -> 
 #[tokio::test]
 async fn native_detail_failures_preserve_diagnostics_and_never_return_empty_records() -> Result<()>
 {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("failure")?;
     fs::write(root.path().join("response.json"), "remote failure body")?;
     let request = IssueDetailRequest {
@@ -539,6 +550,7 @@ async fn native_detail_failures_preserve_diagnostics_and_never_return_empty_reco
 
 #[tokio::test]
 async fn abandoned_native_request_is_reaped_before_its_ownership_is_released() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("block")?;
     let caller = {
         let client = client.clone();
@@ -566,6 +578,7 @@ async fn abandoned_native_request_is_reaped_before_its_ownership_is_released() -
 
 #[tokio::test]
 async fn four_native_requests_bound_admission_and_overflow_waits_for_capacity() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("block")?;
     let mut caller = Vec::new();
     for _ in 0..4 {
@@ -596,6 +609,7 @@ async fn four_native_requests_bound_admission_and_overflow_waits_for_capacity() 
 
 #[tokio::test]
 async fn oversized_output_and_command_failure_do_not_become_empty_success() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("success")?;
     let mut response: serde_json::Value =
         serde_json::from_slice(&fs::read(root.path().join("response.json"))?)?;
@@ -622,6 +636,7 @@ async fn oversized_output_and_command_failure_do_not_become_empty_success() -> R
 
 #[tokio::test]
 async fn checkout_contexts_share_one_native_admission_budget() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (first, client) = fixture("block")?;
     let (second, unused) = fixture("block")?;
     drop(unused);
@@ -658,6 +673,7 @@ async fn checkout_contexts_share_one_native_admission_budget() -> Result<()> {
 
 #[tokio::test]
 async fn inherited_pipe_handles_retain_admission_until_the_readers_exit() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("descendant")?;
     let caller = {
         let client = client.clone();
@@ -697,6 +713,7 @@ fn pr_request(operation: PullRequestOperation) -> PullRequestRequest {
 #[tokio::test]
 async fn native_pr_transition_reopens_before_draft_and_unknown_requires_read_only_reconciliation()
 -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("pr_success")?;
     let service = GithubService::default();
     let draft = pr_request(PullRequestOperation::Transition {
@@ -756,6 +773,7 @@ async fn native_pr_transition_reopens_before_draft_and_unknown_requires_read_onl
 #[tokio::test]
 async fn abandoned_pr_caller_retains_native_write_and_fifo_ownership_until_collection() -> Result<()>
 {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("pr_block")?;
     fs::write(root.path().join("pr-state"), "OPEN false")?;
     let service = GithubService::default();
@@ -819,6 +837,7 @@ async fn abandoned_pr_caller_retains_native_write_and_fifo_ownership_until_colle
 
 #[tokio::test]
 async fn shutdown_rejects_queued_mutations_and_retains_the_active_native_owner() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("pr_block")?;
     fs::write(root.path().join("pr-state"), "OPEN false")?;
     let service = GithubService::default();
@@ -879,6 +898,7 @@ async fn shutdown_rejects_queued_mutations_and_retains_the_active_native_owner()
 
 #[tokio::test]
 async fn native_pr_edits_preserve_exact_text_and_reconcile_without_reposting() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::pull_request::PullRequestEdit;
     let (root, client) = fixture("pr_success")?;
     let service = GithubService::default();
@@ -987,6 +1007,7 @@ async fn native_pr_edits_preserve_exact_text_and_reconcile_without_reposting() -
 
 #[tokio::test]
 async fn field_edits_and_lifecycle_changes_share_fifo_native_ownership() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::pull_request::PullRequestEdit;
     let (root, client) = fixture("pr_block")?;
     fs::write(root.path().join("pr-state"), "OPEN false")?;
@@ -1074,6 +1095,7 @@ fn comment_state(kind: forge_github::comment::CommentKind, body: &str) -> serde_
 #[tokio::test]
 async fn native_existing_comment_edits_and_deletes_validate_graphql_inputs_and_receipts()
 -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::comment::{CommentKind, CommentOperation, CommentResult};
     use forge_github::service::GithubService;
     for kind in [
@@ -1167,6 +1189,7 @@ async fn native_existing_comment_edits_and_deletes_validate_graphql_inputs_and_r
 
 #[tokio::test]
 async fn native_unknown_comment_write_reconciles_without_reposting() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::comment::{CommentKind, CommentOperation, CommentResult};
     use forge_github::service::GithubService;
     let kind = CommentKind::PullRequestReviewComment;
@@ -1223,6 +1246,7 @@ async fn native_unknown_comment_write_reconciles_without_reposting() -> Result<(
 
 #[tokio::test]
 async fn native_comment_decoder_rejects_missing_nodes_and_foreign_receipts() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::comment::{
         CommentKind, CommentOperation, CommentResult, GithubCommentRemote,
     };
@@ -1297,6 +1321,7 @@ async fn native_comment_decoder_rejects_missing_nodes_and_foreign_receipts() -> 
 
 #[tokio::test]
 async fn native_conversation_creation_confirms_only_correlated_owned_content() -> Result<()> {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::comment::{CommentKind, CommentResult, ConversationCommentCreation};
     use forge_github::service::GithubService;
     for fault in [
@@ -1395,6 +1420,7 @@ async fn native_conversation_creation_confirms_only_correlated_owned_content() -
 #[tokio::test]
 async fn native_issue_assignee_deltas_preserve_unrelated_members_and_partial_results() -> Result<()>
 {
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
     use forge_github::recovery::{RecoveryPhase, RecoveryResource, RecoveryResourceKind};
     use forge_github::review_mutation::{ReviewMutation, ReviewMutationRequest};
     use forge_github::service::GithubService;
@@ -1486,5 +1512,110 @@ async fn native_issue_assignee_deltas_preserve_unrelated_members_and_partial_res
         service.shutdown(Duration::from_secs(2)).await;
         client.shutdown(Duration::from_secs(2)).await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_review_routes_preserve_long_thread_identity_and_complete_pagination() -> Result<()>
+{
+    let _native_test = NATIVE_TEST_LOCK.lock().await;
+    use forge_github::review_api::{GithubReviewRemote, ReviewReadRequest, ReviewSection};
+    let (root, client) = fixture("review_read")?;
+    let repository = request().repository;
+    let response = root.path().join("response.json");
+    let endpoint = root.path().join("review-endpoint");
+    let records = (0..100)
+        .map(|index| json!({"sha":format!("{index:040}")}))
+        .collect::<Vec<_>>();
+    fs::write(
+        &endpoint,
+        "repos/owner/repo/pulls/7/commits?per_page=100&page=100002",
+    )?;
+    fs::write(&response, serde_json::to_vec(&records)?)?;
+    let page = client
+        .read_review(ReviewReadRequest {
+            repository: repository.clone(),
+            number: 7,
+            view: ReviewSection::Commits,
+            cursor: Some("100002".into()),
+        })
+        .await?;
+    assert_eq!(page.records, records);
+    assert_eq!(page.next_cursor.as_deref(), Some("100003"));
+    assert!(!page.complete);
+    fs::write(
+        &endpoint,
+        "repos/owner/repo/pulls/7/commits?per_page=100&page=100003",
+    )?;
+    fs::write(&response, br#"[{"sha":"complete tail"}]"#)?;
+    let page = client
+        .read_review(ReviewReadRequest {
+            repository: repository.clone(),
+            number: 7,
+            view: ReviewSection::Commits,
+            cursor: page.next_cursor,
+        })
+        .await?;
+    assert_eq!(page.records, vec![json!({"sha":"complete tail"})]);
+    assert!(page.complete && page.next_cursor.is_none());
+
+    let thread_node_id = format!("THREAD_{}", "x".repeat(513));
+    fs::write(
+        &response,
+        serde_json::to_vec(&json!({"data":{"node":{
+            "pullRequest":{"number":7,"repository":{"nameWithOwner":"owner/repo"}},
+            "comments":{"nodes":[{"id":"comment","body":"complete λ tail"}],
+                "pageInfo":{"hasNextPage":false,"endCursor":null}}
+        }}}))?,
+    )?;
+    let page = client
+        .read_review(ReviewReadRequest {
+            repository: repository.clone(),
+            number: 7,
+            view: ReviewSection::ThreadComments {
+                thread_node_id: thread_node_id.clone(),
+            },
+            cursor: None,
+        })
+        .await?;
+    assert_eq!(page.records[0]["body"], "complete λ tail");
+    assert!(page.complete && page.next_cursor.is_none());
+    let encoded: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("review-request.json"))?)?;
+    assert_eq!(encoded["variables"]["thread"], thread_node_id);
+    assert_eq!(encoded["variables"]["owner"], "owner");
+    assert_eq!(encoded["variables"]["name"], "repo");
+
+    fs::write(&endpoint, "repos/owner/repo/pulls/7")?;
+    let diff =
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+complete λ tail\n";
+    fs::write(&response, diff)?;
+    let page = client
+        .read_review(ReviewReadRequest {
+            repository: repository.clone(),
+            number: 7,
+            view: ReviewSection::Diff,
+            cursor: None,
+        })
+        .await?;
+    assert_eq!(page.records, vec![json!({"diff":diff})]);
+    assert!(page.complete && page.next_cursor.is_none());
+
+    fs::write(&endpoint, "repos/owner/repo/issues/7")?;
+    fs::write(&response, br#"{"number":7,"title":"complete object"}"#)?;
+    let page = client
+        .read_review(ReviewReadRequest {
+            repository,
+            number: 7,
+            view: ReviewSection::Issue,
+            cursor: None,
+        })
+        .await?;
+    assert_eq!(
+        page.records,
+        vec![json!({"number":7,"title":"complete object"})]
+    );
+    assert!(page.complete && page.next_cursor.is_none());
+    client.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }

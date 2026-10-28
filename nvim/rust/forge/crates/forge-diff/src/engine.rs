@@ -12,7 +12,7 @@ use crate::cache::{
     CacheLimits, CacheUsage,
 };
 use crate::raw::{RawDiff, RawHunk, compute_hunks};
-use crate::source::{SourceError, SourcePair};
+use crate::source::SourcePair;
 use crate::workers::{
     AnalysisPool, PoolError, PoolLimits, PoolUsage, WorkBudget, WorkPriority, WorkStop, WorkTicket,
 };
@@ -36,7 +36,6 @@ pub enum EngineError {
     WorkerFailed,
     Pool(PoolError),
     Cache(CacheError),
-    Source(SourceError),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,7 +56,7 @@ pub struct DiffEngine {
     completed: Notify,
     max_jobs: usize,
     pool: Arc<AnalysisPool>,
-    compute: Arc<dyn Fn(SourcePair) -> Result<RawDiff, SourceError> + Send + Sync>,
+    compute: Arc<dyn Fn(SourcePair) -> RawDiff + Send + Sync>,
 }
 
 struct EngineState {
@@ -328,7 +327,7 @@ impl AnalysisWork {
             drop(self.source);
             Err(EngineError::Cancelled)
         } else {
-            (self.completion.engine.compute)(self.source).map_err(EngineError::Source)
+            Ok((self.completion.engine.compute)(self.source))
         };
         let outcome = match self.completion.budget.check() {
             Ok(()) => outcome,
@@ -865,7 +864,7 @@ mod tests {
         completion.publish(if failed {
             Err(EngineError::WorkerFailed)
         } else {
-            compute_hunks(source).map_err(EngineError::Source)
+            Ok(compute_hunks(source))
         });
         assert_eq!(engine.usage().active_jobs, 0);
         assert_eq!(engine.usage().pool.admitted_jobs, 1);

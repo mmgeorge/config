@@ -322,10 +322,13 @@ pub(crate) fn project(
             closed: false,
         });
     }
-    for (source_start, source_end) in task_ranges(
+    for range in task_ranges(
         &source.rendered.navigation.anchor,
         source.rendered.markdown.lines().count() + 1,
     ) {
+        let anchor = range.anchor;
+        let source_start = anchor.line as usize;
+        let source_end = range.end;
         let start = source_output[&source_start].start;
         let end = source_output
             .get(&source_end)
@@ -343,13 +346,6 @@ pub(crate) fn project(
                 column: 0,
             },
         };
-        let anchor = source
-            .rendered
-            .navigation
-            .anchor
-            .iter()
-            .find(|anchor| anchor.line as usize == source_start)
-            .expect("fold owner");
         let heading_end = source
             .rendered
             .navigation
@@ -367,7 +363,7 @@ pub(crate) fn project(
                     source
                         .document
                         .task_at(&anchor.json_path)
-                        .expect("canonical task")
+                        .context("task navigation does not belong to the reviewed plan")?
                         .id
                 ),
                 true,
@@ -421,7 +417,7 @@ pub(crate) fn project(
             closed: true,
         });
     }
-    if source.historical {
+    if source.is_historical() {
         for block in &mut block {
             block.metadata.editable_region.clear();
         }
@@ -805,8 +801,13 @@ fn file_tree_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(usize, 
     ranges
 }
 
-fn task_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(usize, usize)> {
-    let mut active: Vec<(usize, &str, usize, bool)> = Vec::new();
+struct TaskRange<'anchor> {
+    anchor: &'anchor PlanNavigationAnchor,
+    end: usize,
+}
+
+fn task_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<TaskRange<'_>> {
+    let mut active: Vec<(usize, &PlanNavigationAnchor, bool)> = Vec::new();
     let mut ranges = Vec::new();
     for anchor in anchor {
         let depth = match &anchor.target {
@@ -818,20 +819,22 @@ fn task_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(usize, usize
             PlanReviewTarget::Test { .. } if anchor.json_path.starts_with("/stages/") => 4,
             _ => continue,
         };
-        if let Some((_, _, start, _)) = active
-            .last_mut()
-            .filter(|(_, path, _, _)| *path == anchor.json_path)
+        if active
+            .last()
+            .is_some_and(|(_, previous, _)| previous.json_path == anchor.json_path)
         {
-            let _ = start;
             continue;
         }
-        while active
-            .last()
-            .is_some_and(|(current, _, _, _)| *current >= depth)
-        {
-            let (_, _, start, fold) = active.pop().expect("active task range");
+        while let Some((current, previous, fold)) = active.pop() {
+            if current < depth {
+                active.push((current, previous, fold));
+                break;
+            }
             if fold {
-                ranges.push((start, anchor.line as usize));
+                ranges.push(TaskRange {
+                    anchor: previous,
+                    end: anchor.line as usize,
+                });
             }
         }
         if depth > 0 {
@@ -841,12 +844,12 @@ fn task_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(usize, usize
                     | PlanReviewTarget::Task { .. }
                     | PlanReviewTarget::Subtask { .. }
             );
-            active.push((depth, &anchor.json_path, anchor.line as usize, fold));
+            active.push((depth, anchor, fold));
         }
     }
-    for (_, _, start, fold) in active {
+    for (_, anchor, fold) in active {
         if fold {
-            ranges.push((start, end));
+            ranges.push(TaskRange { anchor, end });
         }
     }
     ranges
@@ -1391,7 +1394,10 @@ mod tests {
                 ),
             ],
             10,
-        );
+        )
+        .into_iter()
+        .map(|range| (range.anchor.line as usize, range.end))
+        .collect::<Vec<_>>();
         assert_eq!(ranges, [(3, 7), (1, 7), (7, 10)]);
     }
     use super::*;

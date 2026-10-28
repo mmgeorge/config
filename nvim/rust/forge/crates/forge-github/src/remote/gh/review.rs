@@ -102,6 +102,119 @@ impl GithubReviewRemote for GhDirectory {
     }
 }
 
+enum ReviewOperation {
+    Graph(GraphReview),
+    Rest { path: String, kind: RestReview },
+}
+
+enum GraphReview {
+    EditableFields,
+    Threads,
+    ThreadComments { thread_node_id: String },
+    Checks,
+}
+
+enum RestReview {
+    Object,
+    Collection { filter: &'static str },
+    Diff,
+}
+
+#[derive(Clone, Copy)]
+struct RestPage(std::num::NonZeroU32);
+
+enum ReviewResponse {
+    Graph(GraphReview),
+    Object,
+    Collection(RestPage),
+    Diff,
+}
+
+impl ReviewOperation {
+    fn from_section(view: &ReviewSection, number: u64) -> Self {
+        let (path, kind) = match view {
+            ReviewSection::EditableFields => return Self::Graph(GraphReview::EditableFields),
+            ReviewSection::Threads => return Self::Graph(GraphReview::Threads),
+            ReviewSection::ThreadComments { thread_node_id } => {
+                return Self::Graph(GraphReview::ThreadComments {
+                    thread_node_id: thread_node_id.clone(),
+                });
+            }
+            ReviewSection::Checks => return Self::Graph(GraphReview::Checks),
+            ReviewSection::Overview => (format!("pulls/{number}"), RestReview::Object),
+            ReviewSection::Issue => (format!("issues/{number}"), RestReview::Object),
+            ReviewSection::RequestedReviewers => (
+                format!("pulls/{number}/requested_reviewers"),
+                RestReview::Object,
+            ),
+            ReviewSection::Diff => (format!("pulls/{number}"), RestReview::Diff),
+            ReviewSection::Commits => (
+                format!("pulls/{number}/commits"),
+                RestReview::Collection { filter: "" },
+            ),
+            ReviewSection::Files => (
+                format!("pulls/{number}/files"),
+                RestReview::Collection { filter: "" },
+            ),
+            ReviewSection::Reviews => (
+                format!("pulls/{number}/reviews"),
+                RestReview::Collection { filter: "" },
+            ),
+            ReviewSection::ReviewComments => (
+                format!("pulls/{number}/comments"),
+                RestReview::Collection { filter: "" },
+            ),
+            ReviewSection::Conversation => (
+                format!("issues/{number}/comments"),
+                RestReview::Collection { filter: "" },
+            ),
+            ReviewSection::Milestones => (
+                "milestones".into(),
+                RestReview::Collection {
+                    filter: "&state=all",
+                },
+            ),
+            ReviewSection::Notifications => (
+                "notifications".into(),
+                RestReview::Collection {
+                    filter: "&all=true",
+                },
+            ),
+        };
+        Self::Rest { path, kind }
+    }
+}
+
+impl GraphReview {
+    fn query(&self) -> &'static str {
+        match self {
+            Self::EditableFields => {
+                "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id number state isDraft title body}}}"
+            }
+            Self::Threads => THREAD_QUERY,
+            Self::ThreadComments { .. } => THREAD_COMMENT_QUERY,
+            Self::Checks => CHECK_QUERY,
+        }
+    }
+}
+
+impl RestPage {
+    fn parse(cursor: Option<&str>) -> Result<Self, RemoteFailure> {
+        cursor
+            .unwrap_or("1")
+            .parse::<std::num::NonZeroU32>()
+            .map(Self)
+            .map_err(|_| invalid("invalid REST page cursor"))
+    }
+
+    fn next(self) -> Result<Self, RemoteFailure> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or_else(|| invalid("REST page number overflow"))
+    }
+}
+
 impl GhClient {
     async fn read_review_at(
         &self,
@@ -111,72 +224,48 @@ impl GhClient {
         request
             .validate()
             .map_err(|error| invalid(error.to_string()))?;
-        let graph = matches!(
-            request.view,
-            ReviewSection::Threads
-                | ReviewSection::ThreadComments { .. }
-                | ReviewSection::Checks
-                | ReviewSection::EditableFields
-        );
-        let number = request.number;
-        let repository = request.repository.repository_name();
         let mut argument = vec![
             "api".into(),
             "--hostname".into(),
             request.repository.hostname().into(),
         ];
-        let mut encoded = None;
-        let mut collection = false;
-        let mut page = 1u32;
-        if graph {
-            let (owner, name) = repository
-                .split_once('/')
-                .ok_or_else(|| invalid("repository omits owner"))?;
-            let (query, thread) = match &request.view {
-                ReviewSection::EditableFields => (
-                    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id number state isDraft title body}}}",
-                    Value::Null,
-                ),
-                ReviewSection::Threads => (THREAD_QUERY, Value::Null),
-                ReviewSection::ThreadComments { thread_node_id } => {
-                    (THREAD_COMMENT_QUERY, json!(thread_node_id))
-                }
-                _ => (CHECK_QUERY, Value::Null),
-            };
-            encoded = Some(serde_json::to_vec(&json!({"query":query,"variables":{"owner":owner,"name":name,"number":number,"cursor":request.cursor,"thread":thread}})).map_err(|error| invalid(error.to_string()))?);
-            argument.push("graphql".into());
-        } else {
-            page = request
-                .cursor
-                .as_deref()
-                .unwrap_or("1")
-                .parse::<u32>()
-                .ok()
-                .filter(|page| *page > 0 && *page <= 100_001)
-                .ok_or_else(|| invalid("invalid REST page cursor"))?;
-            let prefix = format!("repos/{repository}");
-            let endpoint = match request.view {
-                ReviewSection::Overview => format!("{prefix}/pulls/{number}"),
-                ReviewSection::Issue => format!("{prefix}/issues/{number}"),
-                ReviewSection::RequestedReviewers => {
-                    format!("{prefix}/pulls/{number}/requested_reviewers")
-                }
-                ReviewSection::Diff => {
-                    argument.extend([
-                        "--header".into(),
-                        "Accept: application/vnd.github.diff".into(),
-                    ]);
-                    format!("{prefix}/pulls/{number}")
-                }
-                ref view => {
-                    collection = true;
-                    let (path, filter) = rest_collection(view, number)
-                        .expect("non-collection review section reached collection branch");
-                    format!("{prefix}/{path}?per_page=100&page={page}{filter}")
-                }
-            };
-            argument.push(endpoint.into());
-        }
+        let (encoded, response) = match ReviewOperation::from_section(&request.view, request.number)
+        {
+            ReviewOperation::Graph(view) => {
+                let thread = match &view {
+                    GraphReview::ThreadComments { thread_node_id } => json!(thread_node_id),
+                    _ => Value::Null,
+                };
+                let encoded = json!({"query":view.query(),"variables":{
+                    "owner":request.repository.owner(), "name":request.repository.name(),
+                    "number":request.number, "cursor":request.cursor, "thread":thread
+                }})
+                .to_string()
+                .into_bytes();
+                argument.push("graphql".into());
+                (Some(encoded), ReviewResponse::Graph(view))
+            }
+            ReviewOperation::Rest { path, kind } => {
+                let page = RestPage::parse(request.cursor.as_deref())?;
+                let prefix = format!("repos/{}/{path}", request.repository.repository_name());
+                let (endpoint, response) = match kind {
+                    RestReview::Object => (prefix, ReviewResponse::Object),
+                    RestReview::Collection { filter } => (
+                        format!("{prefix}?per_page=100&page={}{filter}", page.0),
+                        ReviewResponse::Collection(page),
+                    ),
+                    RestReview::Diff => {
+                        argument.extend([
+                            "--header".into(),
+                            "Accept: application/vnd.github.diff".into(),
+                        ]);
+                        (prefix, ReviewResponse::Diff)
+                    }
+                };
+                argument.push(endpoint.into());
+                (None, response)
+            }
+        };
         remote_result(
             self.run_native(directory, argument, encoded, 4096, move |output| {
                 if !output.status.success() {
@@ -188,55 +277,49 @@ impl GhClient {
                         },
                     ))));
                 }
-                if matches!(request.view, ReviewSection::Diff) {
-                    let diff = String::from_utf8(output.stdout)
-                        .map_err(|error| invalid(error.to_string()))?;
-                    return Ok(ReviewPage {
-                        records: vec![json!({"diff":diff})],
-                        next_cursor: None,
-                        complete: true,
-                    });
+                match response {
+                    ReviewResponse::Diff => {
+                        let diff = String::from_utf8(output.stdout)
+                            .map_err(|error| invalid(error.to_string()))?;
+                        Ok(ReviewPage {
+                            records: vec![json!({"diff":diff})],
+                            next_cursor: None,
+                            complete: true,
+                        })
+                    }
+                    ReviewResponse::Object => {
+                        let value: Value = serde_json::from_slice(&output.stdout)
+                            .map_err(|error| invalid(error.to_string()))?;
+                        Ok(ReviewPage {
+                            records: vec![value],
+                            next_cursor: None,
+                            complete: true,
+                        })
+                    }
+                    ReviewResponse::Collection(page) => {
+                        let value: Value = serde_json::from_slice(&output.stdout)
+                            .map_err(|error| invalid(error.to_string()))?;
+                        decode_collection(value, page)
+                    }
+                    ReviewResponse::Graph(view) => {
+                        let value: Value = serde_json::from_slice(&output.stdout)
+                            .map_err(|error| invalid(error.to_string()))?;
+                        decode_graph(value, &request, view)
+                    }
                 }
-                let value: Value = serde_json::from_slice(&output.stdout)
-                    .map_err(|error| invalid(error.to_string()))?;
-                if graph {
-                    return decode_graph(value, &request);
-                }
-                decode_rest(value, collection, page)
             })
             .await,
         )
     }
 }
 
-fn rest_collection(view: &ReviewSection, number: u64) -> Option<(String, &'static str)> {
-    match view {
-        ReviewSection::Commits => Some((format!("pulls/{number}/commits"), "")),
-        ReviewSection::Files => Some((format!("pulls/{number}/files"), "")),
-        ReviewSection::Reviews => Some((format!("pulls/{number}/reviews"), "")),
-        ReviewSection::ReviewComments => Some((format!("pulls/{number}/comments"), "")),
-        ReviewSection::Conversation => Some((format!("issues/{number}/comments"), "")),
-        ReviewSection::Milestones => Some(("milestones".into(), "&state=all")),
-        ReviewSection::Notifications => Some(("notifications".into(), "&all=true")),
-        _ => None,
-    }
-}
-
-fn decode_rest(value: Value, collection: bool, page: u32) -> Result<ReviewPage, RemoteFailure> {
-    let records = if collection {
-        value
-            .as_array()
-            .cloned()
-            .ok_or_else(|| invalid("REST collection is not an array"))?
-    } else {
-        vec![value]
-    };
-    let next_cursor = if collection && records.len() >= 100 {
-        Some(
-            page.checked_add(1)
-                .ok_or_else(|| invalid("REST page number overflow"))?
-                .to_string(),
-        )
+fn decode_collection(value: Value, page: RestPage) -> Result<ReviewPage, RemoteFailure> {
+    let records = value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| invalid("REST collection is not an array"))?;
+    let next_cursor = if records.len() >= crate::review_api::REVIEW_PAGE_SIZE {
+        Some(page.next()?.0.to_string())
     } else {
         None
     };
@@ -247,7 +330,11 @@ fn decode_rest(value: Value, collection: bool, page: u32) -> Result<ReviewPage, 
     })
 }
 
-fn decode_graph(value: Value, request: &ReviewReadRequest) -> Result<ReviewPage, RemoteFailure> {
+fn decode_graph(
+    value: Value,
+    request: &ReviewReadRequest,
+    view: GraphReview,
+) -> Result<ReviewPage, RemoteFailure> {
     if value
         .get("errors")
         .and_then(Value::as_array)
@@ -255,19 +342,8 @@ fn decode_graph(value: Value, request: &ReviewReadRequest) -> Result<ReviewPage,
     {
         return Err(invalid("GitHub GraphQL returned errors"));
     }
-    if matches!(request.view, ReviewSection::EditableFields) {
-        let record = value
-            .pointer("/data/repository/pullRequest")
-            .filter(|record| record.is_object())
-            .ok_or_else(|| invalid("GitHub pull request is missing"))?;
-        return Ok(ReviewPage {
-            records: vec![record.clone()],
-            next_cursor: None,
-            complete: true,
-        });
-    }
-    let connection = match request.view {
-        ReviewSection::ThreadComments { .. } => {
+    let connection = match view {
+        GraphReview::ThreadComments { .. } => {
             let thread = value
                 .pointer("/data/node")
                 .ok_or_else(|| invalid("review thread is missing"))?;
@@ -286,8 +362,8 @@ fn decode_graph(value: Value, request: &ReviewReadRequest) -> Result<ReviewPage,
             }
             thread.get("comments")
         }
-        ReviewSection::Threads => value.pointer("/data/repository/pullRequest/reviewThreads"),
-        ReviewSection::Checks => {
+        GraphReview::Threads => value.pointer("/data/repository/pullRequest/reviewThreads"),
+        GraphReview::Checks => {
             let rollup = value
                 .pointer("/data/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup");
             if rollup == Some(&Value::Null) {
@@ -299,7 +375,17 @@ fn decode_graph(value: Value, request: &ReviewReadRequest) -> Result<ReviewPage,
             }
             rollup.and_then(|rollup| rollup.get("contexts"))
         }
-        _ => None,
+        GraphReview::EditableFields => {
+            return value
+                .pointer("/data/repository/pullRequest")
+                .filter(|record| record.is_object())
+                .map(|record| ReviewPage {
+                    records: vec![record.clone()],
+                    next_cursor: None,
+                    complete: true,
+                })
+                .ok_or_else(|| invalid("GitHub pull request is missing"));
+        }
     }
     .ok_or_else(|| invalid("GitHub review connection is missing"))?;
     let records = connection
@@ -337,6 +423,10 @@ fn invalid(message: impl Into<String>) -> RemoteFailure {
     }
 }
 
+const THREAD_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve path line startLine originalLine originalStartLine diffSide startDiffSide comments(first:1){totalCount pageInfo{hasNextPage endCursor} nodes{id databaseId body viewerDidAuthor path line originalLine startLine originalStartLine diffHunk commit{oid} originalCommit{oid} position createdAt updatedAt url author{login} pullRequestReview{id databaseId state}}}}}}}}";
+const THREAD_COMMENT_QUERY: &str = "query($thread:ID!,$cursor:String){node(id:$thread){... on PullRequestReviewThread{pullRequest{number repository{nameWithOwner}} comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id databaseId body viewerDidAuthor path line originalLine startLine originalStartLine diffHunk commit{oid} originalCommit{oid} position createdAt updatedAt url author{login} pullRequestReview{id databaseId state}}}}}}";
+const CHECK_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{id name status conclusion detailsUrl startedAt completedAt checkSuite{workflowRun{workflow{name}}}} ... on StatusContext{id context state targetUrl description}}}}}}}}}}";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +450,7 @@ mod tests {
         let page = decode_graph(
             json!({"data":{"repository":{"pullRequest":record}}}),
             &request,
+            GraphReview::EditableFields,
         )
         .unwrap();
         assert_eq!(page.records, vec![record]);
@@ -367,11 +458,19 @@ mod tests {
         assert!(
             decode_graph(
                 json!({"data":{"repository":{"pullRequest":null}}}),
-                &request
+                &request,
+                GraphReview::EditableFields
             )
             .is_err()
         );
-        assert!(decode_graph(json!({"errors":[{"message":"denied"}]}), &request).is_err());
+        assert!(
+            decode_graph(
+                json!({"errors":[{"message":"denied"}]}),
+                &request,
+                GraphReview::EditableFields
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -384,18 +483,19 @@ mod tests {
             cursor: None,
         };
         let response = serde_json::json!({"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}}}});
-        let page = decode_graph(response.clone(), &request).unwrap();
+        let page = decode_graph(response.clone(), &request, GraphReview::Checks).unwrap();
         assert!(page.complete && page.records.is_empty() && page.next_cursor.is_none());
         assert!(
             decode_graph(
                 serde_json::json!({"data":{"repository":{"pullRequest":null}}}),
-                &request
+                &request,
+                GraphReview::Checks
             )
             .is_err()
         );
         let mut denied = response;
         denied["errors"] = serde_json::json!([{"message":"permission denied"}]);
-        assert!(decode_graph(denied, &request).is_err());
+        assert!(decode_graph(denied, &request, GraphReview::Checks).is_err());
     }
 
     #[test]
@@ -411,12 +511,20 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let page = decode_rest(Value::Array(records.clone()), true, 4).unwrap();
+        let page = decode_collection(
+            Value::Array(records.clone()),
+            RestPage::parse(Some("4")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(page.records, records);
         assert_eq!(page.next_cursor.as_deref(), Some("5"));
         assert!(!page.complete);
 
-        let final_page = decode_rest(Value::Array(vec![json!({"sha":"head"})]), true, 5).unwrap();
+        let final_page = decode_collection(
+            Value::Array(vec![json!({"sha":"head"})]),
+            RestPage::parse(Some("5")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(final_page.records, vec![json!({"sha":"head"})]);
         assert!(final_page.next_cursor.is_none() && final_page.complete);
     }
@@ -427,13 +535,14 @@ mod tests {
             serde_json::to_value(ReviewSection::Commits).unwrap(),
             json!({"section":"commits"})
         );
-        assert_eq!(
-            rest_collection(&ReviewSection::Commits, 37),
-            Some(("pulls/37/commits".into(), ""))
-        );
+        let ReviewOperation::Rest {
+            path,
+            kind: RestReview::Collection { filter },
+        } = ReviewOperation::from_section(&ReviewSection::Commits, 37)
+        else {
+            panic!("commits must use a REST collection")
+        };
+        assert_eq!(path, "pulls/37/commits");
+        assert_eq!(filter, "");
     }
 }
-
-const THREAD_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve path line startLine originalLine originalStartLine diffSide startDiffSide comments(first:1){totalCount pageInfo{hasNextPage endCursor} nodes{id databaseId body viewerDidAuthor path line originalLine startLine originalStartLine diffHunk commit{oid} originalCommit{oid} position createdAt updatedAt url author{login} pullRequestReview{id databaseId state}}}}}}}}";
-const THREAD_COMMENT_QUERY: &str = "query($thread:ID!,$cursor:String){node(id:$thread){... on PullRequestReviewThread{pullRequest{number repository{nameWithOwner}} comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id databaseId body viewerDidAuthor path line originalLine startLine originalStartLine diffHunk commit{oid} originalCommit{oid} position createdAt updatedAt url author{login} pullRequestReview{id databaseId state}}}}}}";
-const CHECK_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{id name status conclusion detailsUrl startedAt completedAt checkSuite{workflowRun{workflow{name}}}} ... on StatusContext{id context state targetUrl description}}}}}}}}}}";

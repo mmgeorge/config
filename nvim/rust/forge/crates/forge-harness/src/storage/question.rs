@@ -15,7 +15,7 @@ pub(super) fn preserve_answers(
     let mut incoming: Value = serde_json::from_str(&encoded)?;
     for (pointer, path) in [
         ("/elicitation", "$.elicitation"),
-        ("/acceptance/elicitation", "$.acceptance.elicitation"),
+        ("/acceptance/elicitation", "$.acceptance.elicitation()"),
     ] {
         let Some(proposed) = incoming
             .pointer_mut(pointer)
@@ -59,11 +59,11 @@ mod tests {
             "prompt":"question","kind":"chat","state":"complete","turn":[],"node_list":[],
             "created_at_ms":1,"attributed_matches_checkpoint":false,"awaiting_input":true
         }))?;
-        exchange.elicitation = Some(PlanElicitation::new(serde_json::from_value(json!({
+        exchange.set_elicitation(Some(PlanElicitation::new(serde_json::from_value(json!({
             "id":"set","questions":[{"id":"question","header":"Choice","question":"Which?",
                 "options":[{"label":"First","description":"First choice","recommended":true}],
                 "allow_freeform":true}]
-        }))?));
+        }))?)));
         store.save_exchange(&exchange)?;
         let request = json!({"operation_id":"answer","target":{"owner":"interaction","id":"exchange",
             "set_id":"set","revision":1},"question_id":"question","response":{"kind":"selected","option":"First"}});
@@ -73,7 +73,7 @@ mod tests {
             store
                 .load_exchange("exchange")?
                 .unwrap()
-                .elicitation
+                .elicitation()
                 .unwrap()
                 .answer
                 .is_empty()
@@ -100,7 +100,7 @@ mod tests {
             store
                 .load_exchange("exchange")?
                 .unwrap()
-                .elicitation
+                .elicitation()
                 .unwrap()
                 .answer
                 .len(),
@@ -118,8 +118,8 @@ mod tests {
                 .answer_question_command("session", &changed)
                 .is_err()
         );
-        exchange.elicitation = None;
-        exchange.awaiting_input = false;
+        exchange.set_elicitation(None);
+        exchange.set_awaiting_input(false);
         store.save_exchange(&exchange)?;
         assert_eq!(
             reopened.answer_question_command("session", &request)?,
@@ -196,7 +196,7 @@ impl SqliteStore {
             ),
             QuestionOwner::PlanAcceptance => (
                 "plan_record",
-                "$.acceptance.elicitation",
+                "$.acceptance.elicitation()",
                 "json_extract(payload,'$.state')='awaiting_review'",
                 "plan_acceptance",
             ),

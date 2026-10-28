@@ -53,6 +53,7 @@ impl AcpSessionState {
     pub(super) async fn begin(
         &self,
         request: &BackendRequest,
+        owner: crate::backend::ExecutionOwner,
         session_id: &str,
         sink: Option<BackendEventSink>,
     ) {
@@ -66,7 +67,7 @@ impl AcpSessionState {
                 .unwrap_or_else(|| ControlTurnContext::inactive(request.mode)),
         )));
         *self.active.write().await = Some(ActiveTurn {
-            owner: request.owner().expect("validated ACP request owner"),
+            owner,
             mode: request.approval_mode,
             sink,
         });
@@ -514,13 +515,6 @@ impl AcpHandler for AcpSessionState {
                 let name = invocation.name.clone();
                 let outcome = executor.execute(invocation.clone()).await?;
                 let result = outcome.result;
-                let failure = result.as_ref().err().map(|error| {
-                    crate::control_tools::control_tool_failure_json(
-                        &invocation,
-                        error,
-                        outcome.plan_document.as_ref(),
-                    )
-                });
                 let control = self.control.lock().await;
                 ensure!(
                     control
@@ -530,10 +524,13 @@ impl AcpHandler for AcpSessionState {
                 );
                 let result = match result {
                     Ok(result) => result,
-                    Err(_) => {
+                    Err(error) => {
                         drop(control);
-                        let failure =
-                            failure.expect("failed control invocation retains diagnostics");
+                        let failure = crate::control_tools::control_tool_failure_json(
+                            &invocation,
+                            &error,
+                            outcome.plan_document.as_ref(),
+                        );
                         self.emit(event(
                             "error",
                             Some(format!("Harness tool {name} failed: {failure}")),
@@ -783,6 +780,11 @@ mod test {
     async fn child_callbacks_preserve_approval_ownership_and_root_metadata() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let permission = PermissionCoordinator::transient(fixture.path())?;
+        permission
+            .store()
+            .write()
+            .unwrap()
+            .save(r#"{"permission":{"edit":{"*":"ask"}}}"#)?;
         let state = Arc::new(AcpSessionState::new(
             BackendKind::Claude,
             permission.clone(),
@@ -863,13 +865,19 @@ mod test {
     async fn permission_callbacks_preserve_native_target_namespaces() {
         let fixture = tempfile::tempdir().unwrap();
         let permission = PermissionCoordinator::transient(fixture.path()).unwrap();
+        permission
+            .store()
+            .write()
+            .unwrap()
+            .save(r#"{"permission":{"edit":{"*":"ask"},"mcp":{"*":"ask"},"webfetch":{"*":"ask"}}}"#)
+            .unwrap();
         let state = Arc::new(AcpSessionState::new(
             BackendKind::Claude,
             permission.clone(),
         ));
         *state.active.write().await = Some(ActiveTurn {
             owner: crate::backend::ExecutionOwner::root("test"),
-            mode: ApprovalMode::Allow,
+            mode: ApprovalMode::Ask,
             sink: None,
         });
         for (tool, expected) in [

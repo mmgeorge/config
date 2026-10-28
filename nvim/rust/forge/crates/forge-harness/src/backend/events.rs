@@ -15,11 +15,15 @@ pub struct BackendEventSink {
 }
 
 pub struct BackendEventStream {
-    receiver: MessageReceiver,
-    transfer: Option<(usize, usize, usize, String)>,
+    input: EventReceiver,
     pending: Option<BackendEvent>,
     queued: Option<BackendEvent>,
     deadline: tokio::time::Instant,
+}
+
+struct EventReceiver {
+    receiver: MessageReceiver,
+    transfer: Option<(usize, usize, usize, String)>,
 }
 
 #[derive(Debug)]
@@ -47,8 +51,10 @@ pub fn channel() -> (BackendEventSink, BackendEventStream) {
             skill: None,
         },
         BackendEventStream {
-            receiver,
-            transfer: None,
+            input: EventReceiver {
+                receiver,
+                transfer: None,
+            },
             pending: None,
             queued: None,
             deadline: tokio::time::Instant::now(),
@@ -143,7 +149,7 @@ impl BackendEventSink {
     }
 }
 
-impl BackendEventStream {
+impl EventReceiver {
     fn accept(&mut self, bytes: &[u8]) -> Result<Option<BackendEvent>, EventDeliveryFailure> {
         let value: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|error| EventDeliveryFailure(io::Error::other(error)))?;
@@ -198,7 +204,9 @@ impl BackendEventStream {
         if transfer.0 != transfer.1 {
             return Ok(None);
         }
-        let (_, _, length, payload) = self.transfer.take().expect("active transfer");
+        let length = transfer.2;
+        let payload = std::mem::take(&mut transfer.3);
+        self.transfer = None;
         if payload.len() != length {
             return Err(EventDeliveryFailure(io::Error::other(format!(
                 "provider event transfer completed with {} bytes, expected {length}",
@@ -216,14 +224,15 @@ impl BackendEventStream {
                         return Ok(Some(event));
                     }
                 }
-                None if self.transfer.is_some() => {
-                    let (sequence, count, bytes, payload) = self.transfer.as_ref().unwrap();
-                    return Err(EventDeliveryFailure(io::Error::other(format!(
-                        "provider event stream closed after {sequence}/{count} transfer parts and {}/{bytes} bytes",
-                        payload.len()
-                    ))));
+                None => {
+                    if let Some((sequence, count, bytes, payload)) = &self.transfer {
+                        return Err(EventDeliveryFailure(io::Error::other(format!(
+                            "provider event stream closed after {sequence}/{count} transfer parts and {}/{bytes} bytes",
+                            payload.len()
+                        ))));
+                    }
+                    return Ok(None);
                 }
-                None => return Ok(None),
             }
         }
     }
@@ -236,30 +245,32 @@ impl BackendEventStream {
             }
         }
     }
+}
 
+impl BackendEventStream {
     pub fn check(&self) -> Result<(), EventDeliveryFailure> {
-        self.receiver.check().map_err(EventDeliveryFailure)
+        self.input.receiver.check().map_err(EventDeliveryFailure)
     }
 
     pub async fn recv(&mut self) -> Result<Option<BackendEvent>, EventDeliveryFailure> {
         if self.pending.is_none() {
             self.pending = match self.queued.take() {
                 Some(event) => Some(event),
-                None => self.receive().await?,
+                None => self.input.receive().await?,
             };
             self.deadline = tokio::time::Instant::now() + Duration::from_millis(16);
         }
-        while self.pending.as_ref().is_some_and(batchable) {
-            if output_bytes(self.pending.as_ref().unwrap()) >= 64 * 1024 {
+        while let Some(pending) = self.pending.as_mut() {
+            if !batchable(pending) || output_bytes(pending) >= 64 * 1024 {
                 break;
             }
-            let received = tokio::time::timeout_at(self.deadline, self.receive()).await;
+            let received = tokio::time::timeout_at(self.deadline, self.input.receive()).await;
             let event = match received {
                 Err(_) | Ok(Ok(None)) => break,
                 Ok(Err(error)) => return Err(error),
                 Ok(Ok(Some(event))) => event,
             };
-            if !merge_output(self.pending.as_mut().unwrap(), &event) {
+            if !merge_output(pending, &event) {
                 self.queued = Some(event);
                 break;
             }
@@ -271,10 +282,10 @@ impl BackendEventStream {
         self.check()?;
         let mut event = match self.pending.take().or_else(|| self.queued.take()) {
             Some(event) => event,
-            None => self.try_receive()?,
+            None => self.input.try_receive()?,
         };
         while batchable(&event) && output_bytes(&event) < 64 * 1024 {
-            let next = match self.try_receive() {
+            let next = match self.input.try_receive() {
                 Ok(event) => event,
                 Err(EventDeliveryFailure(error))
                     if matches!(
@@ -330,18 +341,18 @@ fn merge_output(pending: &mut BackendEvent, event: &BackendEvent) -> bool {
         {
             return false;
         }
-        pending
-            .text
-            .as_mut()
-            .unwrap()
-            .push_str(event.text.as_ref().expect("same message kind"));
+        let (Some(previous), Some(next)) = (pending.text.as_mut(), event.text.as_ref()) else {
+            return false;
+        };
+        previous.push_str(next);
         if let Some(delta) = pending.data.pointer_mut("/params/delta") {
-            *delta = serde_json::Value::String(pending.text.as_ref().unwrap().clone());
+            *delta = serde_json::Value::String(previous.clone());
         }
         return true;
     }
-    let previous = pending.activity.as_mut().unwrap();
-    let next = event.activity.as_ref().unwrap();
+    let (Some(previous), Some(next)) = (pending.activity.as_mut(), event.activity.as_ref()) else {
+        return false;
+    };
     if previous.id != next.id
         || previous.kind != next.kind
         || previous.title != next.title
@@ -349,13 +360,14 @@ fn merge_output(pending: &mut BackendEvent, event: &BackendEvent) -> bool {
     {
         return false;
     }
-    previous
-        .output
-        .as_mut()
-        .unwrap()
-        .push_str(next.output.as_ref().unwrap());
+    let (Some(previous_output), Some(next_output)) =
+        (previous.output.as_mut(), next.output.as_ref())
+    else {
+        return false;
+    };
+    previous_output.push_str(next_output);
     if let Some(delta) = pending.data.pointer_mut("/params/delta") {
-        *delta = serde_json::Value::String(previous.output.as_ref().unwrap().clone());
+        *delta = serde_json::Value::String(previous_output.clone());
     }
     true
 }

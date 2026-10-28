@@ -424,8 +424,7 @@ async fn patch_stages_one_raw_hunk_and_unstages_it() {
     let analysis = compute_hunks(SourcePair {
         old: SourceVersion::new(old.to_vec(), Representation::GitCanonical).unwrap(),
         new: SourceVersion::new(new.to_vec(), Representation::GitCanonical).unwrap(),
-    })
-    .unwrap();
+    });
     assert_eq!(analysis.hunks().len(), 2);
     let selected = vec![analysis.hunks()[0].id];
     let outcome = run(
@@ -451,8 +450,7 @@ async fn patch_stages_one_raw_hunk_and_unstages_it() {
     let analysis = compute_hunks(SourcePair {
         old: SourceVersion::new(old.to_vec(), Representation::GitCanonical).unwrap(),
         new: SourceVersion::new(staged, Representation::GitCanonical).unwrap(),
-    })
-    .unwrap();
+    });
     let selected = vec![analysis.hunks()[0].id];
     let outcome = run(
         &service,
@@ -511,8 +509,7 @@ async fn patch_groups_batch_distinct_files_and_preserve_unselected_hunks() {
                     old: SourceVersion::new(original.to_vec(), Representation::GitCanonical)
                         .unwrap(),
                     new: SourceVersion::new(new.to_vec(), Representation::GitCanonical).unwrap(),
-                })
-                .unwrap();
+                });
                 let selected = vec![analysis.hunks()[0].id];
                 GitWriteAction::Patch {
                     direction,
@@ -578,8 +575,7 @@ async fn staged_hunk_discard_preserves_other_staged_and_unstaged_changes() {
     let analysis = compute_hunks(SourcePair {
         old: SourceVersion::new(original.to_vec(), Representation::GitCanonical).unwrap(),
         new: SourceVersion::new(staged.to_vec(), Representation::GitCanonical).unwrap(),
-    })
-    .unwrap();
+    });
     let selected = vec![analysis.hunks()[0].id];
     let outcome = run(
         &service,
@@ -626,8 +622,7 @@ async fn staged_hunk_conflict_fails_preflight_without_modifying_index() {
     let analysis = compute_hunks(SourcePair {
         old: SourceVersion::new(b"original\n".to_vec(), Representation::GitCanonical).unwrap(),
         new: SourceVersion::new(b"staged\n".to_vec(), Representation::GitCanonical).unwrap(),
-    })
-    .unwrap();
+    });
     let selected = vec![analysis.hunks()[0].id];
     let outcome = run(
         &service,
@@ -1231,8 +1226,7 @@ async fn patch_addition_uses_missing_source_and_round_trips() {
     let analysis = compute_hunks(SourcePair {
         old: SourceVersion::new(Vec::new(), Representation::GitCanonical).unwrap(),
         new: SourceVersion::new(b"added\n".to_vec(), Representation::GitCanonical).unwrap(),
-    })
-    .unwrap();
+    });
     let selected = vec![analysis.hunks()[0].id];
     let target = PatchTarget {
         path: path("added.txt"),
@@ -1405,8 +1399,7 @@ async fn compound_discard_reverses_overlap_and_preserves_unselected_changes() {
         let analysis = compute_hunks(SourcePair {
             old: SourceVersion::new(old.to_vec(), Representation::GitCanonical).unwrap(),
             new: SourceVersion::new(new.to_vec(), Representation::GitCanonical).unwrap(),
-        })
-        .unwrap();
+        });
         let selected = vec![analysis.hunks()[0].id];
         PatchTarget {
             path: path("sample.txt"),
@@ -1464,8 +1457,7 @@ async fn compound_discard_reports_completed_unstaged_step_before_staged_conflict
         let analysis = compute_hunks(SourcePair {
             old: SourceVersion::new(old.to_vec(), Representation::GitCanonical).unwrap(),
             new: SourceVersion::new(new.to_vec(), Representation::GitCanonical).unwrap(),
-        })
-        .unwrap();
+        });
         let selected = vec![analysis.hunks()[0].id];
         PatchTarget {
             path: path("sample.txt"),

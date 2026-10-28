@@ -29,7 +29,7 @@ async fn speculative_admission_preserves_existing_results_and_shares_display_own
     };
     let reservation = cache.try_reserve(reservation_bytes(&pair)).unwrap();
     let retained = cache
-        .insert(key, reservation, compute_hunks(pair.clone()).unwrap())
+        .insert(key, reservation, compute_hunks(pair.clone()))
         .unwrap();
     assert!(matches!(
         cache.try_reserve(reservation_bytes(&source(b"second\n"))),

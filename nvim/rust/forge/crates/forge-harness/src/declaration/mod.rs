@@ -894,8 +894,8 @@ impl DeclarationResolver {
                 conditional: false,
             };
             let resolution = self.resolve_reference(&file, &reference, true);
-            if let DeclarationResolution::Resolved { destination } = &resolution {
-                if self
+            if let DeclarationResolution::Resolved { destination } = &resolution
+                && self
                     .file
                     .get(Path::new(&destination.path))
                     .is_some_and(|file| {
@@ -905,9 +905,8 @@ impl DeclarationResolver {
                                 && symbol.position.column == destination.column
                         })
                     })
-                {
-                    return resolution;
-                }
+            {
+                return resolution;
             }
         }
         let DeclarationResolution::Resolved { destination } =
@@ -1295,20 +1294,19 @@ impl DeclarationResolver {
         result: DeclarationResolution,
         visibility: SymbolVisibility,
     ) -> DeclarationResolution {
-        if visibility == SymbolVisibility::Public {
-            if let DeclarationResolution::Resolved { destination } = &result {
-                if let Some(file) = self.file.get(Path::new(&destination.path)) {
-                    let index = file.original.as_deref().unwrap_or(&file.index);
-                    if index.symbol.iter().any(|symbol| {
-                        symbol.position.line == destination.line
-                            && symbol.position.column == destination.column
-                            && symbol.visibility != SymbolVisibility::Public
-                    }) {
-                        return invalid(
-                            "public re-export refers to a declaration with restricted visibility",
-                        );
-                    }
-                }
+        if visibility == SymbolVisibility::Public
+            && let DeclarationResolution::Resolved { destination } = &result
+            && let Some(file) = self.file.get(Path::new(&destination.path))
+        {
+            let index = file.original.as_deref().unwrap_or(&file.index);
+            if index.symbol.iter().any(|symbol| {
+                symbol.position.line == destination.line
+                    && symbol.position.column == destination.column
+                    && symbol.visibility != SymbolVisibility::Public
+            }) {
+                return invalid(
+                    "public re-export refers to a declaration with restricted visibility",
+                );
             }
         }
         result

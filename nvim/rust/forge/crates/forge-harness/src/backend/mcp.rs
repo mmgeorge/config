@@ -83,7 +83,7 @@ impl McpDiscovery {
                             && observed.name == server.name
                             && observed.enabled == server.enabled
                     }) {
-                        server.status = observed.status.clone();
+                        server.status = observed.status;
                         server.status_detail.clone_from(&observed.status_detail);
                         server.tools.clone_from(&observed.tools);
                         server.tool_error.clone_from(&observed.tool_error);

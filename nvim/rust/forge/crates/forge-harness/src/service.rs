@@ -26,6 +26,30 @@ use crate::storage::SqliteStore;
 #[path = "service/input.rs"]
 mod input_delivery;
 
+#[derive(Clone, Copy)]
+enum CheckOperation {
+    List,
+    Status,
+    Cancel,
+    Override,
+    Run,
+    SaveDefaults,
+}
+
+impl CheckOperation {
+    fn from_method(method: HarnessMethod) -> Option<Self> {
+        Some(match method {
+            HarnessMethod::ChecksList => Self::List,
+            HarnessMethod::ChecksStatus => Self::Status,
+            HarnessMethod::ChecksCancel => Self::Cancel,
+            HarnessMethod::ChecksOverride => Self::Override,
+            HarnessMethod::ChecksRun => Self::Run,
+            HarnessMethod::ChecksSaveDefaults => Self::SaveDefaults,
+            _ => return None,
+        })
+    }
+}
+
 /// Defines provider settings for one-shot generation without a conversation lease.
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,12 +97,12 @@ impl HarnessService {
     ) -> Result<String> {
         let _activity = self.admit().await?;
         let mut model = config.model;
-        if model == "default" && config.data_root.join("harness.sqlite3").is_file() {
-            if let Some(preference) = SqliteStore::open(&config.data_root)?
+        if model == "default"
+            && config.data_root.join("harness.sqlite3").is_file()
+            && let Some(preference) = SqliteStore::open(&config.data_root)?
                 .load_preference(workspace, &config.backend.kind)?
-            {
-                model = preference.model;
-            }
+        {
+            model = preference.model;
         }
         ensure!(
             !model.is_empty() && model.len() <= 256,
@@ -287,7 +311,7 @@ impl HarnessService {
                     );
                 }
                 admission.check()?;
-                let document = crate::plan::review_document::PlanReviewDocument::new(
+                let document = crate::plan::review_document::ReadOnlyPlanReview::new(
                     document.clone(),
                     view.clone(),
                     source,
@@ -1594,12 +1618,12 @@ async fn generate_isolated_text(
 }
 
 async fn analyze_plan_source(
-    source: &mut crate::plan::review_source::PlanReviewSource,
+    source: &mut crate::plan::review_source::ReviewSourceData,
     syntax: &Arc<SyntaxEngine>,
     check: impl Fn() -> Result<()> + Send + Sync,
     trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
 ) -> Result<()> {
-    if let Some(design) = &source.document.design {
+    if let Some(design) = &source.revision.document.design {
         for path in design.changed_paths() {
             for (side, text) in [
                 (
@@ -2309,15 +2333,12 @@ async fn route_request(
                             requested_id.map_or(candidate == name, |requested| requested == id)
                         })
                         .collect();
-                    ensure!(
-                        matching.len() == 1,
-                        "Resource selection requires one canonical source. Import native configuration explicitly or select a resource ID"
-                    );
-                    let id = matching
-                        .into_iter()
-                        .next()
-                        .expect("one matching resource")
-                        .0;
+                    let [(id, _)] = matching.as_slice() else {
+                        anyhow::bail!(
+                            "Resource selection requires one canonical source. Import native configuration explicitly or select a resource ID"
+                        );
+                    };
+                    let id = id.clone();
                     let mut desired =
                         settings.layer_settings(scope, &catalog.workspace, &session_id)?;
                     if method == HarnessMethod::BackendSkillsSetEnabled {
@@ -2432,15 +2453,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if matches!(
-        method,
-        HarnessMethod::ChecksList
-            | HarnessMethod::ChecksStatus
-            | HarnessMethod::ChecksCancel
-            | HarnessMethod::ChecksOverride
-            | HarnessMethod::ChecksRun
-            | HarnessMethod::ChecksSaveDefaults
-    ) {
+    if let Some(operation) = CheckOperation::from_method(method) {
         if matches!(
             method,
             HarnessMethod::ChecksList | HarnessMethod::ChecksRun | HarnessMethod::ChecksOverride
@@ -2455,8 +2468,8 @@ async fn route_request(
             Some(&task.id) == session.current_task_id.as_ref() && !task.status.terminal()
         });
         let task_id = task.as_ref().map(|task| task.id.as_str());
-        let result = match method {
-            HarnessMethod::ChecksList => {
+        let result = match operation {
+            CheckOperation::List => {
                 let settings = crate::settings::SettingsStore::open(
                     PathBuf::from(&registry.initialize.data_root).as_path(),
                 )?
@@ -2467,7 +2480,7 @@ async fn route_request(
                     .catalog_preview(task_id, session.shell, &settings)
                     .await?
             }
-            HarnessMethod::ChecksStatus => {
+            CheckOperation::Status => {
                 let wait_for_completion = request.params["wait_for_completion"]
                     .as_bool()
                     .unwrap_or(false);
@@ -2487,7 +2500,7 @@ async fn route_request(
                         .await?,
                 )?
             }
-            HarnessMethod::ChecksCancel => {
+            CheckOperation::Cancel => {
                 let id = request.params["run_id"]
                     .as_str()
                     .context("run_id required")?;
@@ -2503,10 +2516,10 @@ async fn route_request(
                 }
                 json!({"run_id":id,"cancellation_requested":true})
             }
-            HarnessMethod::ChecksOverride => controller
+            CheckOperation::Override => controller
                 .checks
                 .set_overrides(task_id, serde_json::from_value(request.params.clone())?)?,
-            HarnessMethod::ChecksRun => {
+            CheckOperation::Run => {
                 ensure!(
                     task.as_ref()
                         .is_none_or(|task| task.kind != crate::task::TaskKind::Plan)
@@ -2530,14 +2543,13 @@ async fn route_request(
                 let sink = checks_event_sink(message_sink.clone(), session_id.clone());
                 json!({"run_id":controller.checks.start(run,Some(sink),None,Some(admission)).await?})
             }
-            HarnessMethod::ChecksSaveDefaults => {
+            CheckOperation::SaveDefaults => {
                 let sink = checks_event_sink(message_sink.clone(), session_id.clone());
                 controller
                     .checks
                     .save_defaults(task_id, Some(&sink))
                     .await?
             }
-            _ => unreachable!(),
         };
         message_sink
             .send_response(Response::success(request.id, result)?)
@@ -2870,7 +2882,7 @@ fn admit_task_intent(
         );
         ensure!(
             exchanges.iter().any(|exchange| exchange.id == selected
-                && exchange.disposition == crate::exchange::HistoryDisposition::Current),
+                && exchange.disposition() == crate::exchange::HistoryDisposition::Current),
             "selected interaction is unavailable for rollback"
         );
     }
@@ -2897,10 +2909,10 @@ fn admit_task_intent(
         .context("session is missing")?;
     let selected = session.current_task_id;
     let task = store
-        .list_task(&session_id)?
+        .list_task(session_id)?
         .into_iter()
         .find(|task| Some(&task.id) == selected.as_ref());
-    let prior = store.latest_task_operation(&session_id)?;
+    let prior = store.latest_task_operation(session_id)?;
     let pending = prior.as_ref().filter(|operation| {
         matches!(
             operation.state.as_str(),
@@ -3031,9 +3043,9 @@ async fn route_task_transition(
         }
         let exchange_list = store.list_exchange(&session_id)?;
         let mut active = exchange_list.iter().filter(|exchange| {
-            exchange.completed_at_ms.is_none()
-                && exchange.state != crate::exchange::ExchangeState::Queued
-                && exchange.disposition == crate::exchange::HistoryDisposition::Current
+            !exchange.is_finished()
+                && exchange.state() != crate::exchange::ExchangeState::Queued
+                && exchange.disposition() == crate::exchange::HistoryDisposition::Current
         });
         operation.exchange_id = active.next().map(|exchange| exchange.id.clone());
         ensure!(
@@ -3873,7 +3885,7 @@ async fn route_control_request(
                 let plan_id = value["plan"]["id"].as_str().context("updated plan identity is missing")?;
                 let digest = value["plan"]["review_digest"].as_str().context("updated plan digest is missing")?;
                 let capture = trace.map(|trace| trace.stage("service.recapture_review"));
-                let mut source = if let Some(source) = controller.revision_review.capture(plan_id, digest, None).await? {
+                let source = if let Some(source) = controller.revision_review.capture(plan_id, digest, None).await? {
                     source
                 } else {
                     let wait = trace.map(|trace| trace.stage("service.recapture_lock_wait"));
@@ -3881,6 +3893,7 @@ async fn route_control_request(
                     controller.observer.capture_plan_review(plan_id, digest)?
                 };
                 if let Some(stage) = capture { stage.complete(json!({"count":source.document.design.as_ref().map_or(0, |design|design.proposed.len())})); }
+                let mut source = crate::plan::review_source::EditableReviewSource::try_from(source)?;
                 let expected_version = crate::plan::edit_trace::measure(trace, "service.reuse_review_caches", || controller.plan_review.prepare_update(&document, &mut source))?;
                 let syntax_stage = trace.map(|trace| trace.stage("service.syntax"));
                 analyze_plan_source(&mut source, syntax, || Ok(()), trace).await?;
@@ -3906,44 +3919,37 @@ async fn route_control_request(
         }
         return Ok(true);
     }
-    if matches!(
-        method,
-        HarnessMethod::AgentStart
-            | HarnessMethod::AgentMessage
-            | HarnessMethod::AgentFollowup
-            | HarnessMethod::AgentInterrupt
-            | HarnessMethod::AgentInterruptAll
-    ) {
-        use crate::agent::AgentOperation;
-        let text = |field: &str| {
-            request.params[field]
-                .as_str()
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-                .with_context(|| format!("{} requires {field}", request.method))
-        };
-        let operation = match method {
-            HarnessMethod::AgentStart => {
-                let mut arguments = request.params.clone();
-                if let Some(arguments) = arguments.as_object_mut() {
-                    arguments.remove("operation_id");
-                }
-                AgentOperation::Spawn(serde_json::from_value(arguments)?)
+    use crate::agent::AgentOperation;
+    let text = |field: &str| {
+        request.params[field]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .with_context(|| format!("{} requires {field}", request.method))
+    };
+    let operation = match method {
+        HarnessMethod::AgentStart => {
+            let mut arguments = request.params.clone();
+            if let Some(arguments) = arguments.as_object_mut() {
+                arguments.remove("operation_id");
             }
-            HarnessMethod::AgentMessage => AgentOperation::Message {
-                target: text("target")?,
-                message: text("message")?,
-            },
-            HarnessMethod::AgentFollowup => AgentOperation::Followup {
-                target: text("target")?,
-                message: text("message")?,
-            },
-            HarnessMethod::AgentInterrupt => AgentOperation::Interrupt {
-                target: text("target")?,
-            },
-            HarnessMethod::AgentInterruptAll => AgentOperation::InterruptAll,
-            _ => unreachable!(),
-        };
+            Some(AgentOperation::Spawn(serde_json::from_value(arguments)?))
+        }
+        HarnessMethod::AgentMessage => Some(AgentOperation::Message {
+            target: text("target")?,
+            message: text("message")?,
+        }),
+        HarnessMethod::AgentFollowup => Some(AgentOperation::Followup {
+            target: text("target")?,
+            message: text("message")?,
+        }),
+        HarnessMethod::AgentInterrupt => Some(AgentOperation::Interrupt {
+            target: text("target")?,
+        }),
+        HarnessMethod::AgentInterruptAll => Some(AgentOperation::InterruptAll),
+        _ => None,
+    };
+    if let Some(operation) = operation {
         let result = controller
             .agent_coordinator
             .sender()
@@ -5139,12 +5145,12 @@ mod tests {
             "ordinal":1,"prompt":"question","kind":"chat","state":"complete","turn":[],"node_list":[],
             "created_at_ms":1,"attributed_matches_checkpoint":false,"awaiting_input":true
         }))?;
-        exchange.elicitation = Some(crate::plan::PlanElicitation::new(serde_json::from_value(
+        exchange.set_elicitation(Some(crate::plan::PlanElicitation::new(serde_json::from_value(
             json!({
                 "id":"set","questions":[{"id":"choice","header":"Choice","question":"Which?",
                     "options":[{"label":"Yes","description":"Proceed","recommended":true}],"allow_freeform":true}]
             }),
-        )?));
+        )?)));
         store.save_exchange(&exchange)?;
         let _busy = controller.broker.lock().await;
         let _execution = controller.coordinator.execution.acquire().await?;
@@ -5161,7 +5167,7 @@ mod tests {
             store
                 .load_exchange("question-exchange")?
                 .unwrap()
-                .elicitation
+                .elicitation()
                 .unwrap()
                 .answer
                 .len(),
@@ -6284,8 +6290,8 @@ mod tests {
         let agent_id = admitted["agent"]["id"].as_str().unwrap().to_owned();
         let task_id = admitted["task"]["id"].as_str().unwrap().to_owned();
         let owner = crate::backend::ExecutionOwner {
-            session_id: session_id.clone(),
-            agent_id: agent_id.clone(),
+            session_id: (session_id.clone()).into(),
+            agent_id: (agent_id.clone()).into(),
         };
         let permission = controller.permission.clone();
         let (event_sink, mut events) = crate::backend::events::channel();
@@ -6371,8 +6377,8 @@ mod tests {
             .sender()
             .send(crate::agent::AgentCommand::Event {
                 owner: crate::backend::ExecutionOwner {
-                    session_id: session_id.clone(),
-                    agent_id: agent_id.clone(),
+                    session_id: (session_id.clone()).into(),
+                    agent_id: (agent_id.clone()).into(),
                 },
                 task_id: task_id.clone(),
                 event: resolved,
@@ -6463,7 +6469,7 @@ mod tests {
             .context("resumed provider output remained blocked by transition quiescence")??;
             assert!(!controller.agent_coordinator.is_quiescing());
             let exchanges = store.list_exchange(&session_id)?;
-            assert!(exchanges.last().unwrap().completed_at_ms.is_some());
+            assert!(exchanges.last().unwrap().completed_at_ms().is_some());
             let session = crate::session::SessionStore::load_session(&store, &session_id)?.unwrap();
             assert_eq!(
                 session.approval_mode,
@@ -6582,7 +6588,7 @@ mod tests {
         drop(execution);
         tokio::time::timeout(Duration::from_secs(2), transition).await??;
         assert_eq!(
-            store.list_exchange(&session_id)?[0].disposition,
+            store.list_exchange(&session_id)?[0].disposition(),
             crate::exchange::HistoryDisposition::RolledBack
         );
         assert_eq!(std::fs::read_to_string(file)?, "unchanged");
@@ -6662,7 +6668,7 @@ mod tests {
             "completed"
         );
         assert_eq!(
-            store.list_exchange(&session_id)?.last().unwrap().state,
+            store.list_exchange(&session_id)?.last().unwrap().state(),
             crate::exchange::ExchangeState::Cancelled
         );
         service.shutdown(Duration::from_secs(1)).await?;
@@ -7032,13 +7038,13 @@ mod tests {
             "Await an answer".into(),
             0,
         );
-        exchange.awaiting_input = true;
+        exchange.set_awaiting_input(true);
         exchange.pause(0);
         let mut elicitation = crate::plan::PlanElicitation::new(
             crate::plan::PlanQuestionSet::freeform("Which option?".into()).normalize()?,
         );
         elicitation.deadline = Some(serde_json::from_value(json!({"expires_at_ms":-1}))?);
-        exchange.elicitation = Some(elicitation);
+        exchange.set_elicitation(Some(elicitation));
         store.save_exchange(&exchange)?;
         controller.broker.lock().await.refresh_input_schedule()?;
         let (sink, mut output) = forge_protocol::outbound::channel();
@@ -7070,7 +7076,7 @@ mod tests {
         })
         .await??;
         let resolved = store.list_exchange(&registry.initial_session_id)?;
-        assert!(resolved.iter().all(|exchange| !exchange.awaiting_input));
+        assert!(resolved.iter().all(|exchange| !exchange.awaiting_input()));
         let count = resolved.len();
         controller.broker.lock().await.refresh_input_schedule()?;
         tokio::task::yield_now().await;

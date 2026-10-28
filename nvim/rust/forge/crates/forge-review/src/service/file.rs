@@ -585,17 +585,19 @@ fn inline_anchor(
     display: &forge_diff::display::DisplayRow,
 ) -> Option<crate::comments::CommentAnchor> {
     use crate::comments::CommentSide;
-    use forge_diff::display::RowKind;
-    let (coordinate, side) = match display.kind {
-        RowKind::Added => (display.new?, CommentSide::Right),
-        RowKind::Removed => (display.old?, CommentSide::Left),
-        RowKind::Context => return None,
+    use forge_diff::display::{DisplaySource, RowCoordinates};
+    let (line, side) = match display.source {
+        DisplaySource::Diff(RowCoordinates::Added { new_line }) => (new_line, CommentSide::Right),
+        DisplaySource::Diff(RowCoordinates::Removed { old_line }) => (old_line, CommentSide::Left),
+        DisplaySource::Diff(RowCoordinates::Context { .. })
+        | DisplaySource::Context(_)
+        | DisplaySource::Gap => return None,
     };
     Some(crate::comments::CommentAnchor {
         revision: revision.to_owned(),
         path: path.to_owned(),
         side,
-        first_line: (coordinate.line + 1) as u64,
-        last_line: (coordinate.line + 1) as u64,
+        first_line: (line + 1) as u64,
+        last_line: (line + 1) as u64,
     })
 }

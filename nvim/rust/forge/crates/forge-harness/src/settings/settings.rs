@@ -705,10 +705,10 @@ impl SettingsStore {
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        if let Some((operation, request)) = receipt {
-            if let Some(mutation) = self.operation(session, operation, request)? {
-                return Ok(mutation);
-            }
+        if let Some((operation, request)) = receipt
+            && let Some(mutation) = self.operation(session, operation, request)?
+        {
+            return Ok(mutation);
         }
         let revision = u64::try_from(transaction.query_row(
             "SELECT revision FROM setting_revision WHERE id=1",
@@ -1228,10 +1228,7 @@ mod test {
         assert_eq!(fork.desired.mcp, session.mcp);
         session.mcp.insert("mcp-id".into(), false);
         store.update(4, SettingScope::Session, "workspace", "source", &session)?;
-        assert_eq!(
-            store.get("workspace", "fork", "claude")?.desired.mcp["mcp-id"],
-            true
-        );
+        assert!(store.get("workspace", "fork", "claude")?.desired.mcp["mcp-id"]);
         assert!(
             store
                 .layer_settings(SettingScope::Session, "workspace", "new")?

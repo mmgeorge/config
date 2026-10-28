@@ -2,20 +2,79 @@ use serde::{Deserialize, Serialize};
 
 use crate::turn::TurnOutcome;
 
+macro_rules! execution_identity {
+    ($name:ident) => {
+        #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+        impl $name {
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_owned())
+            }
+        }
+        impl std::ops::Deref for $name {
+            type Target = str;
+            fn deref(&self) -> &str {
+                &self.0
+            }
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                self.0 == *other
+            }
+        }
+        impl PartialEq<$name> for String {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+    };
+}
+
+execution_identity!(SessionId);
+execution_identity!(AgentId);
+execution_identity!(ExchangeId);
+execution_identity!(TaskId);
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 /// Identifies the root session and the single agent that owns a provider runtime.
 pub struct ExecutionOwner {
     /// Identifies the visible Harness session shared by the root and children.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// Identifies the independent conversation owner within that session.
-    pub agent_id: String,
+    pub agent_id: AgentId,
 }
 
 impl ExecutionOwner {
     /// Derive an adapter lookup key while preserving legacy root-session controls.
     pub fn runtime_key(&self) -> String {
         if self.is_root() {
-            self.session_id.clone()
+            self.session_id.to_string()
         } else {
             format!("{}:agent:{}", self.session_id, self.agent_id)
         }
@@ -24,8 +83,8 @@ impl ExecutionOwner {
     pub fn root(session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
         Self {
-            agent_id: crate::session::HarnessSession::primary_agent_id(&session_id),
-            session_id,
+            agent_id: crate::session::HarnessSession::primary_agent_id(&session_id).into(),
+            session_id: session_id.into(),
         }
     }
 

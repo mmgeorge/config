@@ -10,7 +10,8 @@ use crate::ContractError;
 use crate::block::BufferBlock;
 use crate::identity::{BlockId, FoldId, RegionId};
 
-type NodeIndex = usize;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NodeIndex(usize);
 type NodeLink = Option<NodeIndex>;
 
 #[derive(Debug, Clone)]
@@ -238,15 +239,14 @@ impl BlockSequence {
                     return Err(ContractError("duplicate document fold identity"));
                 }
             }
-            if let Some(node) = &block.metadata.node {
-                if !incoming_node.insert(&node.id)
+            if let Some(node) = &block.metadata.node
+                && (!incoming_node.insert(&node.id)
                     || self
                         .node_owner
                         .get(&node.id)
-                        .is_some_and(|owner| !removed.contains(owner))
-                {
-                    return Err(ContractError("duplicate document node identity"));
-                }
+                        .is_some_and(|owner| !removed.contains(owner)))
+            {
+                return Err(ContractError("duplicate document node identity"));
             }
             next_rows = next_rows
                 .checked_add(block.text.row_count())
@@ -312,18 +312,18 @@ impl BlockSequence {
             if let Some(owners) = self.fold_endpoint.get(*endpoint) {
                 affected.extend(owners.iter().filter(|owner| !removed.contains(owner)));
             }
-            if let Some(node) = &self.entry(self.locator[*endpoint]).block.metadata.node {
-                if let Some(children) = self.node_child.get(&node.id) {
-                    affected.extend(children.iter().filter(|owner| !removed.contains(owner)));
-                }
+            if let Some(node) = &self.entry(self.locator[*endpoint]).block.metadata.node
+                && let Some(children) = self.node_child.get(&node.id)
+            {
+                affected.extend(children.iter().filter(|owner| !removed.contains(owner)));
             }
         }
         // A retained parent can shrink when only its endpoint changes.
         for owner in affected.clone() {
-            if let Some(node) = resolve(owner).and_then(|block| block.metadata.node.as_ref()) {
-                if let Some(children) = self.node_child.get(&node.id) {
-                    affected.extend(children.iter().filter(|owner| !removed.contains(owner)));
-                }
+            if let Some(node) = resolve(owner).and_then(|block| block.metadata.node.as_ref())
+                && let Some(children) = self.node_child.get(&node.id)
+            {
+                affected.extend(children.iter().filter(|owner| !removed.contains(owner)));
             }
         }
         let incoming_node: HashMap<_, _> = incoming
@@ -433,11 +433,11 @@ impl BlockSequence {
     }
 
     fn entry(&self, index: NodeIndex) -> &SequenceNode {
-        self.node[index].as_ref().expect("live sequence node")
+        self.node[index.0].as_ref().expect("live sequence node")
     }
 
     fn entry_mut(&mut self, index: NodeIndex) -> &mut SequenceNode {
-        self.node[index].as_mut().expect("live sequence node")
+        self.node[index.0].as_mut().expect("live sequence node")
     }
 
     fn height(&self, node: NodeLink) -> usize {
@@ -481,8 +481,7 @@ impl BlockSequence {
         self.refresh(index);
     }
 
-    fn rotate_left(&mut self, root: NodeIndex) -> NodeIndex {
-        let pivot = self.entry(root).right.expect("right-heavy root");
+    fn rotate_left(&mut self, root: NodeIndex, pivot: NodeIndex) -> NodeIndex {
         let before = self.entry(root).left;
         let middle = self.entry(pivot).left;
         let after = self.entry(pivot).right;
@@ -493,8 +492,7 @@ impl BlockSequence {
         pivot
     }
 
-    fn rotate_right(&mut self, root: NodeIndex) -> NodeIndex {
-        let pivot = self.entry(root).left.expect("left-heavy root");
+    fn rotate_right(&mut self, root: NodeIndex, pivot: NodeIndex) -> NodeIndex {
         let before = self.entry(pivot).left;
         let middle = self.entry(pivot).right;
         let after = self.entry(root).right;
@@ -509,34 +507,42 @@ impl BlockSequence {
         self.refresh(root);
         let left = self.entry(root).left;
         let right = self.entry(root).right;
-        if self.height(left) > self.height(right) + 1 {
-            let child = left.expect("left-heavy root");
-            if self.height(self.entry(child).right) > self.height(self.entry(child).left) {
-                let child = self.rotate_left(child);
+        if let Some(mut child) = left
+            && self.entry(child).height > self.height(right) + 1
+        {
+            if let Some(pivot) = self.entry(child).right
+                && self.entry(pivot).height > self.height(self.entry(child).left)
+            {
+                child = self.rotate_left(child, pivot);
                 self.attach(root, Some(child), right);
             }
-            self.rotate_right(root)
-        } else if self.height(right) > self.height(left) + 1 {
-            let child = right.expect("right-heavy root");
-            if self.height(self.entry(child).left) > self.height(self.entry(child).right) {
-                let child = self.rotate_right(child);
+            self.rotate_right(root, child)
+        } else if let Some(mut child) = right
+            && self.entry(child).height > self.height(left) + 1
+        {
+            if let Some(pivot) = self.entry(child).left
+                && self.entry(pivot).height > self.height(self.entry(child).right)
+            {
+                child = self.rotate_right(child, pivot);
                 self.attach(root, left, Some(child));
             }
-            self.rotate_left(root)
+            self.rotate_left(root, child)
         } else {
             root
         }
     }
 
     fn join(&mut self, left: NodeLink, pivot: NodeIndex, right: NodeLink) -> NodeIndex {
-        if self.height(left) > self.height(right) + 1 {
-            let root = left.expect("taller left tree");
+        if let Some(root) = left
+            && self.entry(root).height > self.height(right) + 1
+        {
             let before = self.entry(root).left;
             let middle = self.join(self.entry(root).right, pivot, right);
             self.attach(root, before, Some(middle));
             self.balance(root)
-        } else if self.height(right) > self.height(left) + 1 {
-            let root = right.expect("taller right tree");
+        } else if let Some(root) = right
+            && self.entry(root).height > self.height(left) + 1
+        {
             let after = self.entry(root).right;
             let middle = self.join(left, pivot, self.entry(root).left);
             self.attach(root, Some(middle), after);
@@ -572,8 +578,24 @@ impl BlockSequence {
         match (left, right) {
             (None, tree) | (tree, None) => tree,
             (Some(left), Some(right)) => {
-                let (before, pivot) = self.split(Some(left), self.count(Some(left)) - 1);
-                Some(self.join(before, pivot.expect("last block"), Some(right)))
+                let (before, pivot) = self.remove_last(left);
+                Some(self.join(before, pivot, Some(right)))
+            }
+        }
+    }
+
+    fn remove_last(&mut self, root: NodeIndex) -> (NodeLink, NodeIndex) {
+        let left = self.entry(root).left;
+        match self.entry(root).right {
+            Some(right) => {
+                let (remaining, last) = self.remove_last(right);
+                self.attach(root, left, remaining);
+                (Some(self.balance(root)), last)
+            }
+            None => {
+                self.set_parent(left, None);
+                self.attach(root, None, None);
+                (left, root)
             }
         }
     }
@@ -588,7 +610,7 @@ impl BlockSequence {
             index
         } else {
             self.node.push(None);
-            self.node.len() - 1
+            NodeIndex(self.node.len() - 1)
         };
         self.locator.insert(block.id.clone(), index);
         if let Some(node) = &block.metadata.node {
@@ -617,7 +639,7 @@ impl BlockSequence {
                 .or_default()
                 .insert(block.id.clone());
         }
-        self.node[index] = Some(SequenceNode {
+        self.node[index.0] = Some(SequenceNode {
             block,
             parent: None,
             left: None,
@@ -634,18 +656,18 @@ impl BlockSequence {
 
     fn release(&mut self, root: NodeLink) {
         if let Some(index) = root {
-            let node = self.node[index].take().expect("removed live node");
+            let node = self.node[index.0].take().expect("removed live node");
             self.release(node.left);
             self.release(node.right);
             self.locator.remove(&node.block.id);
             if let Some(state) = &node.block.metadata.node {
                 self.node_owner.remove(&state.id);
-                if let Some(parent) = &state.parent {
-                    if let Some(children) = self.node_child.get_mut(parent) {
-                        children.remove(&node.block.id);
-                        if children.is_empty() {
-                            self.node_child.remove(parent);
-                        }
+                if let Some(parent) = &state.parent
+                    && let Some(children) = self.node_child.get_mut(parent)
+                {
+                    children.remove(&node.block.id);
+                    if children.is_empty() {
+                        self.node_child.remove(parent);
                     }
                 }
             }
@@ -654,12 +676,12 @@ impl BlockSequence {
             }
             for fold in node.block.metadata.fold {
                 self.fold_owner.remove(&fold.id);
-                if let Some(heading) = &fold.heading_start {
-                    if let Some(owners) = self.fold_endpoint.get_mut(&heading.block) {
-                        owners.remove(&node.block.id);
-                        if owners.is_empty() {
-                            self.fold_endpoint.remove(&heading.block);
-                        }
+                if let Some(heading) = &fold.heading_start
+                    && let Some(owners) = self.fold_endpoint.get_mut(&heading.block)
+                {
+                    owners.remove(&node.block.id);
+                    if owners.is_empty() {
+                        self.fold_endpoint.remove(&heading.block);
                     }
                 }
                 if let Some(owners) = self.fold_endpoint.get_mut(&fold.end.block) {

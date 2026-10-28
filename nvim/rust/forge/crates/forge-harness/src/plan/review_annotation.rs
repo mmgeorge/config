@@ -67,7 +67,27 @@ pub(crate) struct ReviewAnnotationStore {
     source_path: PathBuf,
     source_digest: String,
     saved: Option<Vec<u8>>,
-    annotation: Vec<ReviewAnnotation>,
+    annotation: AnnotationSet,
+}
+
+struct AnnotationSet {
+    values: Vec<ReviewAnnotation>,
+    root: Vec<String>,
+}
+
+impl AnnotationSet {
+    fn new(values: Vec<ReviewAnnotation>) -> Result<Self> {
+        let root = validate(&values)?;
+        Ok(Self { values, root })
+    }
+}
+
+impl std::ops::Deref for AnnotationSet {
+    type Target = [ReviewAnnotation];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
 }
 
 impl ReviewAnnotationStore {
@@ -87,7 +107,6 @@ impl ReviewAnnotationStore {
                 decoded.source_digest == source_digest,
                 "saved plan annotation identity changed"
             );
-            validate(&decoded.annotation)?;
             decoded.annotation
         } else {
             Vec::new()
@@ -97,7 +116,7 @@ impl ReviewAnnotationStore {
             source_path,
             source_digest,
             saved,
-            annotation,
+            annotation: AnnotationSet::new(annotation)?,
         })
     }
 
@@ -107,7 +126,8 @@ impl ReviewAnnotationStore {
 
     /// Rebuild display ranges without collapsing repeated semantic targets.
     pub(crate) fn reanchor(&mut self, current: &super::PlanNavigationIndex) -> Result<()> {
-        for annotation in &mut self.annotation {
+        let mut updated = self.annotation.to_vec();
+        for annotation in &mut updated {
             let anchor = annotation
                 .anchor
                 .as_ref()
@@ -119,11 +139,12 @@ impl ReviewAnnotationStore {
             annotation.source.start_line = start.min(end);
             annotation.source.end_line = start.max(end);
         }
+        self.annotation = AnnotationSet::new(updated)?;
         Ok(())
     }
 
     pub(crate) fn replace(&mut self, annotation: Vec<ReviewAnnotation>) -> Result<()> {
-        validate(&annotation)?;
+        let annotation = AnnotationSet::new(annotation)?;
         let source = super::review_source::read_source(&self.source_path)?;
         ensure!(
             digest(&source) == self.source_digest,
@@ -135,12 +156,38 @@ impl ReviewAnnotationStore {
         );
         let replacement = serde_json::to_vec(&SavedAnnotation {
             source_digest: self.source_digest.clone(),
-            annotation: annotation.clone(),
+            annotation: annotation.to_vec(),
         })?;
         write_bytes_atomically(&self.path, &replacement)?;
         self.saved = Some(replacement);
         self.annotation = annotation;
         Ok(())
+    }
+
+    pub(crate) fn thread_context(&self, selected: &ReviewAnnotation) -> Result<String> {
+        let selected_root = self
+            .annotation
+            .iter()
+            .zip(&self.annotation.root)
+            .find(|(item, _)| item.id == selected.id)
+            .map(|(_, root)| root)
+            .context("selected annotation is no longer present")?;
+        let mut context = String::new();
+        for (item, root) in self.annotation.iter().zip(&self.annotation.root) {
+            if root != selected_root {
+                continue;
+            }
+            let heading = if item.kind == ReviewAnnotationKind::Question {
+                "Plan question"
+            } else {
+                "Plan comment"
+            };
+            context.push_str(&format!("{heading}:\n{}\n\n", item.source.body));
+            if let Some(reply) = &item.reply {
+                context.push_str(&format!("Plan answer:\n{}\n\n", reply.body));
+            }
+        }
+        Ok(context)
     }
 }
 
@@ -199,13 +246,13 @@ fn read_optional(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {
-    let mut identities = std::collections::HashSet::new();
+fn validate(annotation: &[ReviewAnnotation]) -> Result<Vec<String>> {
+    let mut identities: std::collections::HashMap<&str, (&ReviewAnnotation, String)> =
+        std::collections::HashMap::new();
+    let mut roots = Vec::with_capacity(annotation.len());
     for annotation in annotation {
         ensure!(
-            !annotation.id.is_empty()
-                && annotation.id.len() <= 128
-                && identities.insert(&annotation.id),
+            !annotation.id.is_empty() && !identities.contains_key(annotation.id.as_str()),
             "invalid or duplicate plan annotation identity"
         );
         ensure!(
@@ -217,12 +264,19 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {
             !annotation.source.body.contains('\0'),
             "plan annotation contains NUL"
         );
-        if let Some(parent_id) = &annotation.parent_id {
+        let root = if let Some(parent_id) = &annotation.parent_id {
+            let (parent, root) = identities
+                .get(parent_id.as_str())
+                .context("annotation parent must precede its follow-up")?;
             ensure!(
-                identities.contains(parent_id) && parent_id != &annotation.id,
-                "annotation parent must precede its follow-up"
+                parent.source.start_line == annotation.source.start_line
+                    && parent.source.end_line == annotation.source.end_line,
+                "follow-up must retain its parent's source range"
             );
-        }
+            root.clone()
+        } else {
+            annotation.id.clone()
+        };
         if let Some(reply) = &annotation.reply {
             ensure!(
                 annotation.kind == ReviewAnnotationKind::Question
@@ -232,57 +286,10 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {
                 "invalid plan question reply"
             );
         }
+        identities.insert(&annotation.id, (annotation, root.clone()));
+        roots.push(root);
     }
-    for item in annotation {
-        if let Some(parent_id) = &item.parent_id {
-            let parent = annotation
-                .iter()
-                .find(|parent| &parent.id == parent_id)
-                .expect("validated parent");
-            ensure!(
-                parent.source.start_line == item.source.start_line
-                    && parent.source.end_line == item.source.end_line,
-                "follow-up must retain its parent's source range"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Render only this conversation in saved order, including authoritative model replies.
-pub(crate) fn thread_context(
-    annotation: &[ReviewAnnotation],
-    selected: &ReviewAnnotation,
-) -> String {
-    fn root<'annotation>(
-        annotation: &'annotation [ReviewAnnotation],
-        mut item: &'annotation ReviewAnnotation,
-    ) -> &'annotation str {
-        while let Some(parent_id) = &item.parent_id {
-            item = annotation
-                .iter()
-                .find(|parent| &parent.id == parent_id)
-                .expect("validated parent");
-        }
-        &item.id
-    }
-    let selected_root = root(annotation, selected);
-    let mut context = String::new();
-    for item in annotation
-        .iter()
-        .filter(|item| root(annotation, item) == selected_root)
-    {
-        let heading = if item.kind == ReviewAnnotationKind::Question {
-            "Plan question"
-        } else {
-            "Plan comment"
-        };
-        context.push_str(&format!("{heading}:\n{}\n\n", item.source.body));
-        if let Some(reply) = &item.reply {
-            context.push_str(&format!("Plan answer:\n{}\n\n", reply.body));
-        }
-    }
-    context
+    Ok(roots)
 }
 
 #[cfg(test)]
@@ -365,6 +372,20 @@ mod tests {
         assert_eq!(reopened.annotation()[0].source.end_line, 12);
         assert_eq!(reopened.annotation()[0].source.body, "Review second");
         reopened.replace(reopened.annotation().to_vec()).unwrap();
+        let mut missing_anchor = reopened.annotation()[0].clone();
+        missing_anchor.id = "missing-anchor".into();
+        missing_anchor.anchor = None;
+        reopened
+            .replace(vec![reopened.annotation()[0].clone(), missing_anchor])
+            .unwrap();
+        index.anchor[0].line = 20;
+        assert!(reopened.reanchor(&index).is_err());
+        assert!(
+            reopened
+                .annotation()
+                .iter()
+                .all(|annotation| annotation.source.end_line == 12)
+        );
         assert_eq!(std::fs::read(source_path).unwrap(), b"saved design");
     }
 
@@ -408,7 +429,7 @@ mod tests {
         let reply = "answer".repeat(4096);
         let mut annotations = (0..65)
             .map(|index| ReviewAnnotation {
-                id: format!("comment-{index}"),
+                id: format!("{}-{index}", "comment".repeat(100)),
                 parent_id: None,
                 source: PlanAnnotationInput {
                     start_line: 1,
@@ -474,19 +495,19 @@ pub(crate) fn resolve_annotations(
                     path: anchor.path.clone(),
                 })
                 .collect::<Vec<_>>();
-            anyhow::ensure!(
-                !subject.is_empty(),
-                "plan annotation lines {}-{} have no semantic render anchors",
-                input.start_line,
-                input.end_line
-            );
-            let label = if subject.len() == 1 {
-                subject[0].label.clone()
+            let (first, remaining) = subject.split_first().with_context(|| {
+                format!(
+                    "plan annotation lines {}-{} have no semantic render anchors",
+                    input.start_line, input.end_line
+                )
+            })?;
+            let label = if remaining.is_empty() {
+                first.label.clone()
             } else {
                 format!(
                     "{} through {}",
-                    subject.first().expect("nonempty subjects").label,
-                    subject.last().expect("nonempty subjects").label
+                    first.label,
+                    remaining.last().unwrap_or(first).label
                 )
             };
             Ok(super::PlanAnnotation {

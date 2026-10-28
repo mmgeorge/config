@@ -38,23 +38,100 @@ pub enum RowKind {
     Added,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Coordinates carry the source lines required by each change kind.
+pub enum RowCoordinates {
+    Added { new_line: usize },
+    Removed { old_line: usize },
+    Context { old_line: usize, new_line: usize },
+}
+
+impl RowCoordinates {
+    pub fn kind(self) -> RowKind {
+        match self {
+            Self::Added { .. } => RowKind::Added,
+            Self::Removed { .. } => RowKind::Removed,
+            Self::Context { .. } => RowKind::Context,
+        }
+    }
+
+    pub fn old_line(self) -> Option<usize> {
+        match self {
+            Self::Added { .. } => None,
+            Self::Removed { old_line } | Self::Context { old_line, .. } => Some(old_line),
+        }
+    }
+
+    pub fn new_line(self) -> Option<usize> {
+        match self {
+            Self::Removed { .. } => None,
+            Self::Added { new_line } | Self::Context { new_line, .. } => Some(new_line),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Distinguishes paired diff rows, unchanged context from one source, and omission markers.
+pub enum DisplaySource {
+    Diff(RowCoordinates),
+    Context(SourceCoordinate),
+    Gap,
+}
+
 /// Text excludes diff gutters and source line terminators. Coordinates remain source-relative.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisplayRow {
     pub group_index: usize,
     pub text: String,
-    pub kind: RowKind,
-    pub old: Option<SourceCoordinate>,
-    pub new: Option<SourceCoordinate>,
+    pub source: DisplaySource,
     pub raw_id: Option<RawHunkId>,
     pub emphasis: Vec<Range<usize>>,
     pub emphasis_fallback: Option<FallbackReason>,
 }
 
 impl DisplayRow {
+    pub fn kind(&self) -> RowKind {
+        match self.source {
+            DisplaySource::Diff(coordinates) => coordinates.kind(),
+            DisplaySource::Context(_) | DisplaySource::Gap => RowKind::Context,
+        }
+    }
+
+    pub fn old_coordinate(&self) -> Option<SourceCoordinate> {
+        match self.source {
+            DisplaySource::Diff(coordinates) => {
+                coordinates.old_line().map(|line| SourceCoordinate {
+                    side: SourceSide::Old,
+                    line,
+                    byte_column: 0,
+                })
+            }
+            DisplaySource::Context(coordinate) if coordinate.side == SourceSide::Old => {
+                Some(coordinate)
+            }
+            DisplaySource::Context(_) | DisplaySource::Gap => None,
+        }
+    }
+
+    pub fn new_coordinate(&self) -> Option<SourceCoordinate> {
+        match self.source {
+            DisplaySource::Diff(coordinates) => {
+                coordinates.new_line().map(|line| SourceCoordinate {
+                    side: SourceSide::New,
+                    line,
+                    byte_column: 0,
+                })
+            }
+            DisplaySource::Context(coordinate) if coordinate.side == SourceSide::New => {
+                Some(coordinate)
+            }
+            DisplaySource::Context(_) | DisplaySource::Gap => None,
+        }
+    }
+
     /// Identifies an omission marker without source, navigation, or edit coordinates.
     pub fn is_gap(&self) -> bool {
-        self.old.is_none() && self.new.is_none()
+        matches!(self.source, DisplaySource::Gap)
     }
 }
 
@@ -194,9 +271,7 @@ struct SourcePosition {
 
 #[derive(Clone)]
 struct Candidate {
-    kind: RowKind,
-    old: Option<SourceCoordinate>,
-    new: Option<SourceCoordinate>,
+    coordinates: RowCoordinates,
     raw_id: Option<RawHunkId>,
     bytes: Range<usize>,
     advance_old: usize,
@@ -241,31 +316,26 @@ impl DisplayCursor {
     ) -> Self {
         let old_offset = source_offsets(self.diff.source().old.bytes());
         let new_offset = source_offsets(self.diff.source().new.bytes());
-        let mut group: Vec<DisplayHunk> = Vec::new();
-        let mut plan: Vec<ContextPlan> = Vec::new();
+        let mut grouped: Vec<(DisplayHunk, ContextPlan)> = Vec::new();
         for next in std::mem::take(&mut self.group) {
             let context = ContextPlan::collect(&self.diff, &next, &context_at);
-            if let Some(previous) = group.last_mut()
+            if let Some((previous, previous_context)) = grouped.last_mut()
                 && next.old_lines.start.saturating_sub(previous.old_lines.end)
                     <= self.context.saturating_mul(2)
                 && next.new_lines.start.saturating_sub(previous.new_lines.end)
                     <= self.context.saturating_mul(2)
-                && plan
-                    .last()
-                    .is_some_and(|previous| previous.related(&context))
+                && previous_context.related(&context)
             {
                 previous.old_lines.end = previous.old_lines.end.max(next.old_lines.end);
                 previous.new_lines.end = previous.new_lines.end.max(next.new_lines.end);
                 previous.raw_range.end = next.raw_range.end;
                 previous.raw_ids.extend(next.raw_ids);
-                plan.last_mut()
-                    .expect("merged group context")
-                    .extend(context);
+                previous_context.extend(context);
             } else {
-                group.push(next);
-                plan.push(context);
+                grouped.push((next, context));
             }
         }
+        let (group, mut plan): (Vec<_>, Vec<_>) = grouped.into_iter().unzip();
         self.group = group;
         let visible: Vec<_> = self
             .group
@@ -320,17 +390,10 @@ impl DisplayCursor {
                     let (bytes, advance_old) = line_range(self.diff.source().old.bytes(), old_byte);
                     let (_, advance_new) = line_range(self.diff.source().new.bytes(), new_byte);
                     let candidate = Candidate {
-                        kind: RowKind::Context,
-                        old: Some(SourceCoordinate {
-                            side: SourceSide::Old,
-                            line: old,
-                            byte_column: 0,
-                        }),
-                        new: Some(SourceCoordinate {
-                            side: SourceSide::New,
-                            line: new,
-                            byte_column: 0,
-                        }),
+                        coordinates: RowCoordinates::Context {
+                            old_line: old,
+                            new_line: new,
+                        },
                         raw_id: None,
                         bytes,
                         advance_old,
@@ -426,7 +489,7 @@ impl DisplayCursor {
                 chunk.state = DisplayState::Complete;
                 return chunk;
             };
-            if let Some(gap) = self.gap_row(&candidate) {
+            if let Some((gap, continuation)) = self.gap_row(&candidate) {
                 let charge = gap.text.len() + 1;
                 if !chunk.rows.is_empty() && charge > byte_limit.saturating_sub(chunk.text_bytes) {
                     break;
@@ -434,27 +497,9 @@ impl DisplayCursor {
                 if chunk.decorations == decoration_limit {
                     break;
                 }
-                if let Some(old) = gap.old {
-                    let byte = line_range(
-                        self.diff.source().old.bytes(),
-                        self.previous_old.unwrap().byte,
-                    )
-                    .1;
-                    self.previous_old = Some(SourcePosition {
-                        line: old.line,
-                        byte,
-                    });
-                }
-                if let Some(new) = gap.new {
-                    let byte = line_range(
-                        self.diff.source().new.bytes(),
-                        self.previous_new.unwrap().byte,
-                    )
-                    .1;
-                    self.previous_new = Some(SourcePosition {
-                        line: new.line,
-                        byte,
-                    });
+                if let Some((old, new)) = continuation {
+                    self.previous_old = Some(old);
+                    self.previous_new = Some(new);
                 }
                 self.gap_emitted = true;
                 chunk.text_bytes += charge;
@@ -462,10 +507,10 @@ impl DisplayCursor {
                 chunk.rows.push(gap);
                 continue;
             }
-            let source = if candidate.kind == RowKind::Added {
-                self.diff.source().new.bytes()
+            let source = if candidate.coordinates.kind() == RowKind::Added {
+                self.diff.source().new.text()
             } else {
-                self.diff.source().old.bytes()
+                self.diff.source().old.text()
             };
             let text = &source[candidate.bytes.clone()];
             let charge = text.len() + 1;
@@ -481,19 +526,15 @@ impl DisplayCursor {
             if decoration_charge > decoration_limit - chunk.decorations {
                 break;
             }
-            let source = if candidate.kind == RowKind::Added {
-                self.diff.source().new.bytes()
+            let source = if candidate.coordinates.kind() == RowKind::Added {
+                self.diff.source().new.text()
             } else {
-                self.diff.source().old.bytes()
+                self.diff.source().old.text()
             };
             chunk.rows.push(DisplayRow {
                 group_index: self.group_index,
-                text: std::str::from_utf8(&source[candidate.bytes.clone()])
-                    .expect("validated source line")
-                    .to_owned(),
-                kind: candidate.kind,
-                old: candidate.old,
-                new: candidate.new,
+                text: source[candidate.bytes.clone()].to_owned(),
+                source: DisplaySource::Diff(candidate.coordinates),
                 raw_id: candidate.raw_id,
                 emphasis,
                 emphasis_fallback,
@@ -505,15 +546,15 @@ impl DisplayCursor {
                 self.previous_new = None;
             }
             self.previous_group = Some(self.group_index);
-            if let Some(old) = candidate.old {
+            if let Some(old) = candidate.coordinates.old_line() {
                 self.previous_old = Some(SourcePosition {
-                    line: old.line,
+                    line: old,
                     byte: candidate.advance_old,
                 });
             }
-            if let Some(new) = candidate.new {
+            if let Some(new) = candidate.coordinates.new_line() {
                 self.previous_new = Some(SourcePosition {
-                    line: new.line,
+                    line: new,
                     byte: candidate.advance_new,
                 });
             }
@@ -526,11 +567,11 @@ impl DisplayCursor {
                 }
                 continue;
             }
-            if candidate.old.is_some() {
+            if candidate.coordinates.old_line().is_some() {
                 self.old.line += 1;
                 self.old.byte = candidate.advance_old;
             }
-            if candidate.new.is_some() {
+            if candidate.coordinates.new_line().is_some() {
                 self.new.line += 1;
                 self.new.byte = candidate.advance_new;
             }
@@ -538,56 +579,67 @@ impl DisplayCursor {
         chunk
     }
 
-    fn gap_row(&self, next: &Candidate) -> Option<DisplayRow> {
+    fn gap_row(
+        &self,
+        next: &Candidate,
+    ) -> Option<(DisplayRow, Option<(SourcePosition, SourcePosition)>)> {
         if self.gap_emitted || self.previous_group != Some(self.group_index) {
             return None;
         }
-        let distance = |previous: Option<SourcePosition>, next: Option<SourceCoordinate>| {
+        let distance = |previous: Option<SourcePosition>, next: Option<usize>| {
             previous
                 .zip(next)
-                .map(|(previous, next)| next.line.saturating_sub(previous.line + 1))
+                .map(|(previous, next)| next.saturating_sub(previous.line + 1))
         };
-        let old_gap = distance(self.previous_old, next.old);
-        let new_gap = distance(self.previous_new, next.new);
-        if !old_gap.is_some_and(|gap| gap > 0) && !new_gap.is_some_and(|gap| gap > 0) {
+        let old_gap = distance(self.previous_old, next.coordinates.old_line());
+        let new_gap = distance(self.previous_new, next.coordinates.new_line());
+        if old_gap.is_none_or(|gap| gap == 0) && new_gap.is_none_or(|gap| gap == 0) {
             return None;
         }
-        let (text, old, new) = if old_gap == Some(1) && new_gap == Some(1) {
-            let previous = self.previous_old.unwrap();
-            let range = line_range(self.diff.source().old.bytes(), previous.byte).0;
-            (
-                self.diff.source().old.text()[range].to_owned(),
-                Some(SourceCoordinate {
-                    side: SourceSide::Old,
-                    line: previous.line + 1,
-                    byte_column: 0,
-                }),
-                Some(SourceCoordinate {
-                    side: SourceSide::New,
-                    line: self.previous_new.unwrap().line + 1,
-                    byte_column: 0,
-                }),
-            )
-        } else {
-            let source = if next.kind == RowKind::Added {
-                self.diff.source().new.text()
-            } else {
-                self.diff.source().old.text()
+        let (text, source, continuation) =
+            match (old_gap, new_gap, self.previous_old, self.previous_new) {
+                (Some(1), Some(1), Some(old), Some(new)) => {
+                    let (range, old_byte) = line_range(self.diff.source().old.bytes(), old.byte);
+                    let new_byte = line_range(self.diff.source().new.bytes(), new.byte).1;
+                    let old = SourcePosition {
+                        line: old.line + 1,
+                        byte: old_byte,
+                    };
+                    let new = SourcePosition {
+                        line: new.line + 1,
+                        byte: new_byte,
+                    };
+                    (
+                        self.diff.source().old.text()[range].to_owned(),
+                        DisplaySource::Diff(RowCoordinates::Context {
+                            old_line: old.line,
+                            new_line: new.line,
+                        }),
+                        Some((old, new)),
+                    )
+                }
+                _ => {
+                    let source = if next.coordinates.kind() == RowKind::Added {
+                        self.diff.source().new.text()
+                    } else {
+                        self.diff.source().old.text()
+                    };
+                    let text = &source[next.bytes.clone()];
+                    let indent = &text[..text.len() - text.trim_start().len()];
+                    (format!("{indent}..."), DisplaySource::Gap, None)
+                }
             };
-            let text = &source[next.bytes.clone()];
-            let indent = &text[..text.len() - text.trim_start().len()];
-            (format!("{indent}..."), None, None)
-        };
-        Some(DisplayRow {
-            group_index: self.group_index,
-            text,
-            kind: RowKind::Context,
-            old,
-            new,
-            raw_id: None,
-            emphasis: Vec::new(),
-            emphasis_fallback: None,
-        })
+        Some((
+            DisplayRow {
+                group_index: self.group_index,
+                text,
+                source,
+                raw_id: None,
+                emphasis: Vec::new(),
+                emphasis_fallback: None,
+            },
+            continuation,
+        ))
     }
 
     fn row_emphasis(
@@ -601,8 +653,11 @@ impl DisplayCursor {
         if self
             .emphasis
             .as_ref()
-            .is_none_or(|(cached, _)| *cached != identity)
+            .is_some_and(|(cached, _)| *cached != identity)
         {
+            self.emphasis = None;
+        }
+        let (_, result) = self.emphasis.get_or_insert_with(|| {
             let policy = IntralinePolicy::default();
             let result = if hunk.old_lines.len() != hunk.new_lines.len() {
                 IntralineResult::LineStyle(FallbackReason::UnpairedLines)
@@ -611,28 +666,23 @@ impl DisplayCursor {
             } else if hunk.old_bytes.len() + hunk.new_bytes.len() > policy.input_bytes {
                 IntralineResult::LineStyle(FallbackReason::ByteLimit)
             } else {
-                let old = display_lines(&self.diff.source().old.bytes()[hunk.old_bytes.clone()]);
-                let new = display_lines(&self.diff.source().new.bytes()[hunk.new_bytes.clone()]);
+                let old = display_lines(&self.diff.source().old.text()[hunk.old_bytes.clone()]);
+                let new = display_lines(&self.diff.source().new.text()[hunk.new_bytes.clone()]);
                 compare_replacement(policy, &old, &new)
             };
-            self.emphasis = Some((identity, result));
-        }
-        match &self
-            .emphasis
-            .as_ref()
-            .expect("current hunk emphasis is initialized")
-            .1
-        {
+            (identity, result)
+        });
+        match result {
             IntralineResult::LineStyle(reason) => (Vec::new(), Some(*reason)),
             IntralineResult::Emphasis(line) => {
-                let spans = if candidate.kind == RowKind::Removed {
-                    &line[candidate.old.expect("removed source coordinate").line
-                        - hunk.old_lines.start]
-                        .old
-                } else {
-                    &line[candidate.new.expect("added source coordinate").line
-                        - hunk.new_lines.start]
-                        .new
+                let spans = match candidate.coordinates {
+                    RowCoordinates::Removed { old_line } => {
+                        &line[old_line - hunk.old_lines.start].old
+                    }
+                    RowCoordinates::Added { new_line } => {
+                        &line[new_line - hunk.new_lines.start].new
+                    }
+                    RowCoordinates::Context { .. } => return (Vec::new(), None),
                 };
                 (spans.clone(), None)
             }
@@ -684,30 +734,30 @@ impl DisplayCursor {
                 self.after_index = 0;
                 continue;
             };
-            let old = (kind != RowKind::Added).then_some(SourceCoordinate {
-                side: SourceSide::Old,
-                line: self.old.line,
-                byte_column: 0,
-            });
-            let new = (kind != RowKind::Removed).then_some(SourceCoordinate {
-                side: SourceSide::New,
-                line: self.new.line,
-                byte_column: 0,
-            });
-            let (old_bytes, advance_old) = if old.is_some() {
+            let coordinates = match kind {
+                RowKind::Added => RowCoordinates::Added {
+                    new_line: self.new.line,
+                },
+                RowKind::Removed => RowCoordinates::Removed {
+                    old_line: self.old.line,
+                },
+                RowKind::Context => RowCoordinates::Context {
+                    old_line: self.old.line,
+                    new_line: self.new.line,
+                },
+            };
+            let (old_bytes, advance_old) = if coordinates.old_line().is_some() {
                 line_range(self.diff.source().old.bytes(), self.old.byte)
             } else {
                 (0..0, self.old.byte)
             };
-            let (new_bytes, advance_new) = if new.is_some() {
+            let (new_bytes, advance_new) = if coordinates.new_line().is_some() {
                 line_range(self.diff.source().new.bytes(), self.new.byte)
             } else {
                 (0..0, self.new.byte)
             };
             return Some(Candidate {
-                kind,
-                old,
-                new,
+                coordinates,
                 raw_id,
                 bytes: if kind == RowKind::Added {
                     new_bytes
@@ -748,96 +798,6 @@ fn unchanged_coordinates(diff: &RawDiff, side: SourceSide, line: usize) -> Optio
         SourceSide::Old => (line, other),
         SourceSide::New => (other, line),
     })
-}
-
-#[cfg(test)]
-mod selected_group_tests {
-    use super::*;
-    use crate::{
-        engine::{DiffEngine, DiffRequest},
-        source::{Representation, SourcePair, SourceVersion},
-        workers::WorkPriority,
-    };
-
-    #[tokio::test]
-    async fn selected_group_keeps_absolute_coordinates_and_bounded_delivery() {
-        let old = (0..100)
-            .map(|line| format!("line {line}\n"))
-            .collect::<String>();
-        let new = old
-            .replace("line 2\n", "first change\n")
-            .replace("line 80\n", "selected change\n");
-        let engine = DiffEngine::new(Default::default(), 1);
-        let analysis = engine
-            .compare(DiffRequest {
-                source: SourcePair {
-                    old: SourceVersion::new(old.into_bytes(), Representation::Raw).unwrap(),
-                    new: SourceVersion::new(new.into_bytes(), Representation::Raw).unwrap(),
-                },
-                priority: WorkPriority::Visible,
-            })
-            .await
-            .unwrap();
-        let mut cursor = DisplayCursor::at_source_line(analysis, 3, SourceSide::New, 80);
-        assert_eq!(cursor.group(0).unwrap().new_lines, 77..84);
-        assert!(cursor.group(1).is_none());
-        let chunk = cursor.next_rows(ChunkLimits {
-            rows: 3,
-            ..Default::default()
-        });
-        assert_eq!(chunk.rows.len(), 2);
-        assert_eq!(chunk.rows[0].old.unwrap().line, 80);
-        assert!(
-            chunk
-                .rows
-                .iter()
-                .any(|row| row.text == "selected change" && row.new.unwrap().line == 80)
-        );
-        let chunk = cursor.next_rows(ChunkLimits::default());
-        assert!(chunk.rows.is_empty());
-        assert!(!chunk.rows.iter().any(|row| row.text == "first change"));
-        assert_eq!(chunk.state, DisplayState::Complete);
-    }
-
-    #[tokio::test]
-    async fn compact_cursor_keeps_inter_hunk_context_and_omits_group_edges() {
-        let old = (0..20)
-            .map(|line| format!("line {line}\n"))
-            .collect::<String>();
-        let new = old
-            .replace("line 1\n", "first change\n")
-            .replace("line 5\n", "nearby change\n")
-            .replace("line 18\n", "separate change\n");
-        let engine = DiffEngine::new(Default::default(), 1);
-        let analysis = engine
-            .compare(DiffRequest {
-                source: SourcePair {
-                    old: SourceVersion::new(old.into_bytes(), Representation::Raw).unwrap(),
-                    new: SourceVersion::new(new.into_bytes(), Representation::Raw).unwrap(),
-                },
-                priority: WorkPriority::Visible,
-            })
-            .await
-            .unwrap();
-        let mut cursor = DisplayCursor::new(analysis, 3);
-        let chunk = cursor.next_rows(ChunkLimits::default());
-        let rows: Vec<_> = chunk.rows.iter().map(|row| row.text.as_str()).collect();
-        assert_eq!(
-            rows,
-            [
-                "line 1",
-                "first change",
-                "line 2",
-                "line 3",
-                "line 4",
-                "line 5",
-                "nearby change",
-                "line 18",
-                "separate change",
-            ]
-        );
-        assert_eq!(chunk.state, DisplayState::Complete);
-    }
 }
 
 impl SourcePosition {
@@ -900,13 +860,102 @@ fn line_range(content: &[u8], start: usize) -> (Range<usize>, usize) {
     (start..text_end, end)
 }
 
-fn display_lines(content: &[u8]) -> Vec<&str> {
+fn display_lines(content: &str) -> Vec<&str> {
     let mut line = Vec::new();
     let mut position = 0;
     while position < content.len() {
-        let (range, next) = line_range(content, position);
-        line.push(std::str::from_utf8(&content[range]).expect("validated source line"));
+        let (range, next) = line_range(content.as_bytes(), position);
+        line.push(&content[range]);
         position = next;
     }
     line
+}
+
+#[cfg(test)]
+mod selected_group_tests {
+    use super::*;
+    use crate::{
+        engine::{DiffEngine, DiffRequest},
+        source::{Representation, SourcePair, SourceVersion},
+        workers::WorkPriority,
+    };
+
+    #[tokio::test]
+    async fn selected_group_keeps_absolute_coordinates_and_bounded_delivery() {
+        let old = (0..100)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let new = old
+            .replace("line 2\n", "first change\n")
+            .replace("line 80\n", "selected change\n");
+        let engine = DiffEngine::new(Default::default(), 1);
+        let analysis = engine
+            .compare(DiffRequest {
+                source: SourcePair {
+                    old: SourceVersion::new(old.into_bytes(), Representation::Raw).unwrap(),
+                    new: SourceVersion::new(new.into_bytes(), Representation::Raw).unwrap(),
+                },
+                priority: WorkPriority::Visible,
+            })
+            .await
+            .unwrap();
+        let mut cursor = DisplayCursor::at_source_line(analysis, 3, SourceSide::New, 80);
+        assert_eq!(cursor.group(0).unwrap().new_lines, 77..84);
+        assert!(cursor.group(1).is_none());
+        let chunk = cursor.next_rows(ChunkLimits {
+            rows: 3,
+            ..Default::default()
+        });
+        assert_eq!(chunk.rows.len(), 2);
+        assert_eq!(chunk.rows[0].old_coordinate().unwrap().line, 80);
+        assert!(
+            chunk.rows.iter().any(
+                |row| row.text == "selected change" && row.new_coordinate().unwrap().line == 80
+            )
+        );
+        let chunk = cursor.next_rows(ChunkLimits::default());
+        assert!(chunk.rows.is_empty());
+        assert!(!chunk.rows.iter().any(|row| row.text == "first change"));
+        assert_eq!(chunk.state, DisplayState::Complete);
+    }
+
+    #[tokio::test]
+    async fn compact_cursor_keeps_inter_hunk_context_and_omits_group_edges() {
+        let old = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let new = old
+            .replace("line 1\n", "first change\n")
+            .replace("line 5\n", "nearby change\n")
+            .replace("line 18\n", "separate change\n");
+        let engine = DiffEngine::new(Default::default(), 1);
+        let analysis = engine
+            .compare(DiffRequest {
+                source: SourcePair {
+                    old: SourceVersion::new(old.into_bytes(), Representation::Raw).unwrap(),
+                    new: SourceVersion::new(new.into_bytes(), Representation::Raw).unwrap(),
+                },
+                priority: WorkPriority::Visible,
+            })
+            .await
+            .unwrap();
+        let mut cursor = DisplayCursor::new(analysis, 3);
+        let chunk = cursor.next_rows(ChunkLimits::default());
+        let rows: Vec<_> = chunk.rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(
+            rows,
+            [
+                "line 1",
+                "first change",
+                "line 2",
+                "line 3",
+                "line 4",
+                "line 5",
+                "nearby change",
+                "line 18",
+                "separate change",
+            ]
+        );
+        assert_eq!(chunk.state, DisplayState::Complete);
+    }
 }

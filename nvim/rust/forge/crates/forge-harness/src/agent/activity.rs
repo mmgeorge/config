@@ -135,7 +135,7 @@ impl AgentActivity {
                 .last_activity_at_ms
                 .map(|observed| now_ms.saturating_sub(observed).max(0) as u64),
             awaiting_approval,
-            awaiting_input: exchange.awaiting_input,
+            awaiting_input: exchange.awaiting_input(),
             entries,
             has_more,
         })

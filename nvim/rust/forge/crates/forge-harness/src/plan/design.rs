@@ -76,29 +76,40 @@ impl Default for DeclarationDesign {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ValidatedDesign {
+    design: DeclarationDesign,
+    report: crate::declaration::DeclarationValidation,
+}
+
+impl ValidatedDesign {
+    pub(crate) fn warnings(&self) -> Vec<super::PlanViolation> {
+        self.report.warnings()
+    }
+
+    pub(crate) fn into_design(mut self) -> DeclarationDesign {
+        self.design.validation = Some(self.report);
+        self.design
+    }
+}
+
 impl DeclarationDesign {
     /// Format and validate one submission using only captured declaration evidence.
-    pub(crate) async fn validated(&self, workspace: &Path) -> Result<Self> {
+    pub(crate) async fn validated(&self, workspace: &Path) -> Result<ValidatedDesign> {
         self.check_workspace(workspace)?;
         self.validated_revision(workspace).await
     }
 
     /// Validate a new target without replacing the immutable pre-execution baseline.
-    pub(crate) async fn validated_revision(&self, workspace: &Path) -> Result<Self> {
+    pub(crate) async fn validated_revision(&self, workspace: &Path) -> Result<ValidatedDesign> {
         let mut design = self.formatted()?;
-        design.check_configuration = Some(crate::checks::ConfigSnapshot::load(workspace)?);
-        design
-            .check_configuration
-            .as_ref()
-            .unwrap()
+        let configuration = crate::checks::ConfigSnapshot::load(workspace)?;
+        configuration
             .config
             .validate_selection(&design.document.checks)?;
         for id in &design.document.disabled_checks {
             anyhow::ensure!(
-                design
-                    .check_configuration
-                    .as_ref()
-                    .unwrap()
+                configuration
                     .config
                     .definitions
                     .iter()
@@ -106,6 +117,7 @@ impl DeclarationDesign {
                 "unknown disabled planned check: {id}"
             );
         }
+        design.check_configuration = Some(configuration);
         super::comment_lint::validate(self)?;
         super::usage::validate(&design, workspace)?;
         super::calls::validate_behaviors(&design)?;
@@ -135,10 +147,9 @@ impl DeclarationDesign {
             crate::declaration::DeclarationResolver::planned(workspace, &design, false)?;
         let report = resolver.validate(&design);
         report.ensure_valid()?;
-        design.validation = Some(report);
         design.check_preview = crate::checks::preview_plan(workspace, &design).await?;
         design.check_preview_source = design.check_preview_fingerprint()?;
-        Ok(design)
+        Ok(ValidatedDesign { design, report })
     }
 
     /// Identifies only the planned inputs that determine check selection.
@@ -1380,8 +1391,11 @@ mod tests {
                 .requirements
                 .is_empty()
         );
-        let delta =
-            crate::plan::revision::DeclarationDelta::between(Some(&original), &current).unwrap();
+        let delta = crate::plan::revision::DeclarationDelta::between(
+            Some(&original),
+            current.design.as_ref().unwrap(),
+        )
+        .unwrap();
         assert!(delta.files.is_empty());
         assert!(
             delta.document.contains("a/Usage b/Usage")

@@ -1,81 +1,53 @@
 //! Shared event vocabulary and payload requirements for host and editor.
 
-use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
-#[derive(Deserialize)]
 struct Event {
-    route: String,
-    required: BTreeMap<String, String>,
+    name: &'static str,
+    required: &'static [RequiredField],
 }
 
-#[derive(Deserialize)]
-struct Contract {
-    version: u32,
-    session: BTreeMap<String, Event>,
-    backend: BTreeMap<String, Event>,
-    request: BTreeMap<String, Event>,
-    document: BTreeMap<String, Event>,
+struct RequiredField {
+    path: &'static [&'static str],
+    label: &'static str,
+    accepts: fn(&Value) -> bool,
+    description: &'static str,
 }
 
-fn contract() -> &'static Contract {
-    static CONTRACT: OnceLock<Contract> = OnceLock::new();
-    CONTRACT.get_or_init(|| {
-        let contract: Contract = serde_json::from_str(include_str!(
-            "../../../../../lua/forge/protocol_contract.json"
-        ))
-        .expect("compiled event contract");
-        assert_eq!(contract.version, crate::WIRE_VERSION);
-        contract
-    })
-}
+include!(concat!(env!("OUT_DIR"), "/event_contract.rs"));
+const _: () = assert!(CONTRACT_VERSION == crate::WIRE_VERSION);
 
 /// Selects only normalized backend events consumed by the editor.
 pub fn backend_visible(kind: &str) -> bool {
-    contract().backend.contains_key(kind)
+    BACKEND.iter().any(|event| event.name == kind)
 }
 
 /// Rejects unknown event variants and missing fields before serialization.
 pub fn validate(channel: &str, name: &str, payload: &Value) -> Result<(), String> {
-    let contract = contract();
     let events = match channel {
-        "session" => &contract.session,
-        "backend" => &contract.backend,
-        "request" => &contract.request,
-        "document" => &contract.document,
+        "session" => SESSION,
+        "backend" => BACKEND,
+        "request" => REQUEST,
+        "document" => DOCUMENT,
         _ => return Err(format!("unknown event channel: {channel}")),
     };
     let event = events
-        .get(name)
+        .iter()
+        .find(|event| event.name == name)
         .ok_or_else(|| format!("unknown {channel} event: {name}"))?;
-    if !matches!(
-        event.route.as_str(),
-        "handle" | "refresh" | "ignore" | "transport" | "progress"
-    ) {
-        return Err(format!("invalid event route: {}", event.route));
-    }
     if !payload.is_object() {
         return Err(format!("{channel} event {name} requires an object payload"));
     }
-    for (path, expected) in &event.required {
-        let value = path
-            .split('.')
-            .try_fold(payload, |value, key| value.get(key));
-        let valid = value.is_some_and(|value| match expected.as_str() {
-            "string" => value.as_str().is_some_and(|text| !text.is_empty()),
-            "nullable_string" => {
-                value.is_null() || value.as_str().is_some_and(|text| !text.is_empty())
-            }
-            "integer" => value.as_u64().is_some_and(|number| number <= (1 << 53) - 1),
-            "object" => value.is_object(),
-            "boolean" => value.is_boolean(),
-            _ => false,
-        });
+    for field in event.required {
+        let value = field
+            .path
+            .iter()
+            .try_fold(payload, |value, key| value.get(*key));
+        let valid = value.is_some_and(field.accepts);
         if !valid {
             return Err(format!(
-                "{channel} event {name}: {path} requires {expected}"
+                "{channel} event {name}: {} requires {}",
+                field.label, field.description
             ));
         }
     }

@@ -66,54 +66,51 @@ impl SyntaxHandle {
                 }
                 continue;
             }
-            if let Some(body) = node.child_by_field_name("body") {
-                if let Some((declaration_node, name)) = declaration(node, source) {
-                    let prefix = declaration_prefix(declaration_node, source);
-                    let extent = prefix.start_position().row..extent(declaration_node).end;
-                    let mut signature_byte_end = body.start_byte();
-                    let mut cursor = node.walk();
-                    let children: Vec<_> = node.children(&mut cursor).collect();
-                    for child in children.into_iter().rev() {
-                        if child.start_byte() >= body.start_byte() {
-                            continue;
-                        }
-                        if child.kind().contains("comment") {
-                            signature_byte_end = child.start_byte();
-                        } else {
-                            break;
-                        }
+            if let Some(body) = node.child_by_field_name("body")
+                && let Some((declaration_node, name)) = declaration(node, source)
+            {
+                let prefix = declaration_prefix(declaration_node, source);
+                let extent = prefix.start_position().row..extent(declaration_node).end;
+                let mut signature_byte_end = body.start_byte();
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.children(&mut cursor).collect();
+                for child in children.into_iter().rev() {
+                    if child.start_byte() >= body.start_byte() {
+                        continue;
                     }
-                    if source.as_bytes().get(body.start_byte()) == Some(&b'{') {
-                        signature_byte_end = body.start_byte() + 1;
+                    if child.kind().contains("comment") {
+                        signature_byte_end = child.start_byte();
+                    } else {
+                        break;
                     }
-                    let header = source[prefix.start_byte()..signature_byte_end].trim_end();
-                    let signature_end =
-                        extent.start + header.bytes().filter(|byte| *byte == b'\n').count() + 1;
-                    let last = extent.end - 1;
-                    let closing = source_lines.get(last).and_then(|line| {
-                        (line.trim() == "end"
-                            || (source.as_bytes().get(body.start_byte()) == Some(&b'{')
-                                && matches!(line.trim(), "}" | "};" | ");" | "];")))
-                        .then_some(last)
-                    });
-                    outline.scope.push(SourceScope {
-                        identity: lexical_identity(declaration_node, kind, name, source),
-                        signature: extent.start..signature_end.max(extent.start + 1),
-                        signature_end_column: source[..prefix.start_byte() + header.len()]
-                            .rsplit('\n')
-                            .next()
-                            .unwrap_or_default()
-                            .len(),
-                        is_callable: node.child_by_field_name("parameters").is_some()
-                            || node.child_by_field_name("parameter").is_some()
-                            || matches!(
-                                kind,
-                                "lambda" | "lambda_expression" | "function_definition"
-                            ),
-                        extent,
-                        closing,
-                    });
                 }
+                if source.as_bytes().get(body.start_byte()) == Some(&b'{') {
+                    signature_byte_end = body.start_byte() + 1;
+                }
+                let header = source[prefix.start_byte()..signature_byte_end].trim_end();
+                let signature_end =
+                    extent.start + header.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let last = extent.end - 1;
+                let closing = source_lines.get(last).and_then(|line| {
+                    (line.trim() == "end"
+                        || (source.as_bytes().get(body.start_byte()) == Some(&b'{')
+                            && matches!(line.trim(), "}" | "};" | ");" | "];")))
+                    .then_some(last)
+                });
+                outline.scope.push(SourceScope {
+                    identity: lexical_identity(declaration_node, kind, name, source),
+                    signature: extent.start..signature_end.max(extent.start + 1),
+                    signature_end_column: source[..prefix.start_byte() + header.len()]
+                        .rsplit('\n')
+                        .next()
+                        .unwrap_or_default()
+                        .len(),
+                    is_callable: node.child_by_field_name("parameters").is_some()
+                        || node.child_by_field_name("parameter").is_some()
+                        || matches!(kind, "lambda" | "lambda_expression" | "function_definition"),
+                    extent,
+                    closing,
+                });
             }
             let mut cursor = node.walk();
             let children: Vec<_> = node.named_children(&mut cursor).collect();
@@ -193,14 +190,12 @@ fn binding(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
             | "public_field_definition"
             | "field_definition"
     ) && parent.child_by_field_name("value") == Some(value)
-    {
-        if let Some(name) = parent
+        && let Some(name) = parent
             .child_by_field_name("name")
             .or_else(|| parent.child_by_field_name("pattern"))
             .or_else(|| parent.child_by_field_name("key"))
-        {
-            return Some((container(parent), name));
-        }
+    {
+        return Some((container(parent), name));
     }
     if parent.kind() != "expression_list" || parent.named_child_count() != 1 {
         return None;
@@ -227,11 +222,11 @@ fn declaration<'tree, 'source>(
         return None;
     }
     let kind = node.kind();
-    if kind == "function_definition" {
-        if let Some(name) = declarator_name(node) {
-            let owner = container(node);
-            return (!owner.has_error()).then_some((owner, source.get(name.byte_range())?));
-        }
+    if kind == "function_definition"
+        && let Some(name) = declarator_name(node)
+    {
+        let owner = container(node);
+        return (!owner.has_error()).then_some((owner, source.get(name.byte_range())?));
     }
     let expression = matches!(
         kind,
@@ -281,14 +276,14 @@ fn lexical_identity(node: Node<'_>, kind: &str, name: &str, source: &str) -> Str
                     .flatten()
             }) {
                 path.push(format!("{}:{}", parent.kind(), &source[name.byte_range()]));
-            } else if parent.kind() == "impl_item" {
-                if let Some(owner) = parent.child_by_field_name("type") {
-                    let contract = parent
-                        .child_by_field_name("trait")
-                        .map(|contract| &source[contract.byte_range()])
-                        .unwrap_or("");
-                    path.push(format!("impl:{contract}:{}", &source[owner.byte_range()]));
-                }
+            } else if parent.kind() == "impl_item"
+                && let Some(owner) = parent.child_by_field_name("type")
+            {
+                let contract = parent
+                    .child_by_field_name("trait")
+                    .map(|contract| &source[contract.byte_range()])
+                    .unwrap_or("");
+                path.push(format!("impl:{contract}:{}", &source[owner.byte_range()]));
             }
         }
         ancestor = parent.parent();
@@ -322,9 +317,9 @@ fn require_import<'tree>(
             | SyntaxLanguage::Typescript
             | SyntaxLanguage::Tsx
     ) || !matches!(node.kind(), "function_call" | "call_expression")
-        || !node
+        || node
             .named_child(0)
-            .is_some_and(|name| source.get(name.byte_range()) == Some("require"))
+            .is_none_or(|name| source.get(name.byte_range()) != Some("require"))
     {
         return None;
     }

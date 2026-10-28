@@ -45,10 +45,8 @@ impl GhClient {
                 message: failure.to_string(),
             });
         }
-        let repository = target.repository.repository_name();
-        let (owner, name) = repository
-            .split_once('/')
-            .expect("validated GitHub repository");
+        let owner = target.repository.owner();
+        let name = target.repository.name();
         let encoded = serde_json::to_vec(&serde_json::json!({
             "query": STATE_QUERY, "variables": { "owner": owner, "name": name, "number": target.number, "includeText": include_text }
         })).expect("serialize bounded PR query");

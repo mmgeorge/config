@@ -435,8 +435,8 @@ fn optional_timestamp(record: &Value, key: &str) -> Result<Option<String>> {
         .as_str()
         .context("thread comment timestamp is invalid")?;
     ensure!(
-        value.len() <= 128 && !value.contains('\0'),
-        "thread comment timestamp exceeds limits"
+        !value.contains('\0'),
+        "thread comment timestamp contains NUL"
     );
     Ok(Some(value.into()))
 }

@@ -181,41 +181,40 @@ pub(crate) fn symbols(workspace: &Path, design: &DeclarationDesign) -> Result<BT
                         .unwrap_or_else(|| import.path.last().map(String::as_str).unwrap_or("")),
                 );
             }
-            if let DeclarationResolution::Resolved { destination } = resolution {
-                if let Some(target) = resolver.file.get(Path::new(&destination.path)) {
-                    if let Some(symbol) = target.index.symbol.iter().find(|symbol| {
-                        symbol.position.line == destination.line
-                            && symbol.position.column == destination.column
-                    }) {
-                        if !target.package.is_empty()
-                            && symbol.visibility != SymbolVisibility::Public
-                            && !(import.glob && symbol.role == DeclarationRole::Module)
-                        {
-                            continue;
-                        }
-                        public.insert(location(
-                            workspace,
-                            target,
-                            symbol.position.line,
-                            symbol.position.column,
-                        ));
-                        let root = if target.package.is_empty() {
-                            target.path.to_string_lossy().into_owned()
-                        } else {
-                            target.package.clone()
-                        };
-                        let mut owner = target.module.clone();
-                        owner.extend(
-                            symbol
-                                .scope
-                                .iter()
-                                .filter(|scope| !scope.starts_with("@impl:"))
-                                .cloned(),
-                        );
-                        owner.push(symbol.name.clone());
-                        queue.push_back((root, owner));
-                    }
+            if let DeclarationResolution::Resolved { destination } = resolution
+                && let Some(target) = resolver.file.get(Path::new(&destination.path))
+                && let Some(symbol) = target.index.symbol.iter().find(|symbol| {
+                    symbol.position.line == destination.line
+                        && symbol.position.column == destination.column
+                })
+            {
+                if !target.package.is_empty()
+                    && symbol.visibility != SymbolVisibility::Public
+                    && !(import.glob && symbol.role == DeclarationRole::Module)
+                {
+                    continue;
                 }
+                public.insert(location(
+                    workspace,
+                    target,
+                    symbol.position.line,
+                    symbol.position.column,
+                ));
+                let root = if target.package.is_empty() {
+                    target.path.to_string_lossy().into_owned()
+                } else {
+                    target.package.clone()
+                };
+                let mut owner = target.module.clone();
+                owner.extend(
+                    symbol
+                        .scope
+                        .iter()
+                        .filter(|scope| !scope.starts_with("@impl:"))
+                        .cloned(),
+                );
+                owner.push(symbol.name.clone());
+                queue.push_back((root, owner));
             }
         }
     }
@@ -267,26 +266,6 @@ fn location(workspace: &Path, file: &IndexedFile, line: u32, column: u32) -> Pos
         line,
         column,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn complete_exposure_inventory_keeps_loading_owning_metadata() {
-        let workspace = tempfile::tempdir().unwrap();
-        let source = "[package]\nname = 'example'\nversion = '0.1.0'\n";
-        std::fs::write(workspace.path().join("Cargo.toml"), source).unwrap();
-        let mut design = DeclarationDesign::default();
-        design.proposed = (0..16385)
-            .map(|index| (format!("src/file_{index}.rs"), String::new()))
-            .collect();
-        let mut inspected = (0..257).map(|index| format!("metadata_{index}")).collect();
-        assert!(read(workspace.path(), "Cargo.toml", &mut design, &mut inspected).unwrap());
-        assert_eq!(design.proposed.len(), 16386);
-        assert_eq!(design.proposed["Cargo.toml"], source);
-    }
 }
 
 fn library_root(resolver: &DeclarationResolver, file: &IndexedFile) -> bool {
@@ -353,4 +332,24 @@ fn binary_root(resolver: &DeclarationResolver, file: &IndexedFile) -> bool {
                         .is_some_and(|target| path.parent().unwrap().join(target) == file.path)
                 })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_exposure_inventory_keeps_loading_owning_metadata() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = "[package]\nname = 'example'\nversion = '0.1.0'\n";
+        std::fs::write(workspace.path().join("Cargo.toml"), source).unwrap();
+        let mut design = DeclarationDesign::default();
+        design.proposed = (0..16385)
+            .map(|index| (format!("src/file_{index}.rs"), String::new()))
+            .collect();
+        let mut inspected = (0..257).map(|index| format!("metadata_{index}")).collect();
+        assert!(read(workspace.path(), "Cargo.toml", &mut design, &mut inspected).unwrap());
+        assert_eq!(design.proposed.len(), 16386);
+        assert_eq!(design.proposed["Cargo.toml"], source);
+    }
 }

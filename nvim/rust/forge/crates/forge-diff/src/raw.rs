@@ -6,7 +6,7 @@ use std::ops::Range;
 use imara_diff::{Algorithm, Diff, InternedInput};
 use sha2::{Digest, Sha256};
 
-use crate::source::{Representation, SourceError, SourcePair, validate_source_pair};
+use crate::source::{Representation, SourceError, SourcePair};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RawHunkId([u8; 32]);
@@ -103,16 +103,15 @@ impl RawDiff {
 }
 
 /// Computes one pinned histogram result. Empty-side changes bypass tokenization and comparison.
-pub fn compute_hunks(source: SourcePair) -> Result<RawDiff, SourceError> {
-    validate_source_pair(&source)?;
+pub fn compute_hunks(source: SourcePair) -> RawDiff {
     if source.old.identity() == source.new.identity() {
-        return Ok(RawDiff {
+        return RawDiff {
             source,
             hunk: Vec::new(),
-        });
+        };
     }
     if let Some(result) = synthetic_hunk(source.clone()) {
-        return Ok(result);
+        return result;
     }
     let old_offset = line_offsets(source.old.bytes());
     let new_offset = line_offsets(source.new.bytes());
@@ -131,7 +130,7 @@ pub fn compute_hunks(source: SourcePair) -> Result<RawDiff, SourceError> {
             )
         })
         .collect();
-    Ok(RawDiff { source, hunk })
+    RawDiff { source, hunk }
 }
 
 /// Run the pinned histogram matcher between ordered semantic boundaries.
@@ -140,7 +139,6 @@ pub fn compute_anchored_hunks(
     source: SourcePair,
     anchors: &[LineAnchor],
 ) -> Result<RawDiff, SourceError> {
-    validate_source_pair(&source)?;
     let old_offset = line_offsets(source.old.bytes());
     let new_offset = line_offsets(source.new.bytes());
     let end = LineAnchor {

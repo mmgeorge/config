@@ -28,60 +28,84 @@ pub(super) enum Operation {
     Status,
 }
 
-/// Declaration name or exact source occurrence selected by one tool endpoint.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Target {
-    /// Optional source file limiting name lookup.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    /// Exact short or qualified declaration name, or spelling on a source line.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<String>,
-    /// One-based source line for occurrence lookup.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
-    /// One-based Unicode column identifying an exact occurrence.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub column: Option<u32>,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged, try_from = "TargetWire")]
+pub(super) enum Target {
+    Symbol {
+        symbol: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    Position {
+        path: String,
+        line: std::num::NonZeroU32,
+        column: std::num::NonZeroU32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        symbol: Option<String>,
+    },
+    LineSymbol {
+        path: String,
+        line: std::num::NonZeroU32,
+        symbol: String,
+    },
 }
 
-impl Target {
-    fn validate(&self) -> Result<()> {
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetWire {
+    path: Option<String>,
+    symbol: Option<String>,
+    line: Option<u32>,
+    column: Option<u32>,
+}
+
+impl TryFrom<TargetWire> for Target {
+    type Error = anyhow::Error;
+
+    fn try_from(target: TargetWire) -> Result<Self> {
         ensure!(
-            self.symbol
+            target
+                .symbol
                 .as_ref()
-                .is_none_or(|name| !name.trim().is_empty()),
+                .is_none_or(|symbol| !symbol.trim().is_empty()),
             "symbol must be nonempty"
         );
         ensure!(
-            self.path.as_ref().is_none_or(|path| !path.is_empty()),
+            target.path.as_ref().is_none_or(|path| !path.is_empty()),
             "path must be nonempty"
         );
-        ensure!(
-            self.line.is_none_or(|line| line > 0) && self.column.is_none_or(|column| column > 0),
-            "positions are one-based"
-        );
-        ensure!(
-            self.column.is_none() || self.line.is_some(),
-            "column requires line"
-        );
-        ensure!(
-            self.line.is_none() || self.path.is_some(),
-            "line requires a file path"
-        );
-        ensure!(
-            if self.line.is_some() {
-                self.column.is_some() || self.symbol.is_some()
-            } else {
-                self.symbol.is_some()
-            },
-            "target requires a symbol or path, line, and column"
-        );
-        Ok(())
+        let position = |value| {
+            std::num::NonZeroU32::new(value)
+                .ok_or_else(|| anyhow::anyhow!("positions are one-based"))
+        };
+        match (target.path, target.symbol, target.line, target.column) {
+            (path, Some(symbol), None, None) => Ok(Self::Symbol { path, symbol }),
+            (Some(path), symbol, Some(line), Some(column)) => Ok(Self::Position {
+                path,
+                symbol,
+                line: position(line)?,
+                column: position(column)?,
+            }),
+            (Some(path), Some(symbol), Some(line), None) => Ok(Self::LineSymbol {
+                path,
+                symbol,
+                line: position(line)?,
+            }),
+            (_, _, None, Some(_)) => anyhow::bail!("column requires line"),
+            (None, _, Some(_), _) => anyhow::bail!("line requires a file path"),
+            _ => anyhow::bail!("target requires a symbol or path, line, and column"),
+        }
     }
 }
 
+impl Target {
+    pub(super) fn path_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Symbol { path, .. } => path.as_mut(),
+            Self::Position { path, .. } | Self::LineSymbol { path, .. } => Some(path),
+        }
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Arguments {
@@ -165,13 +189,12 @@ impl Arguments {
             Operation::Definition | Operation::Context | Operation::References | Operation::Calls
         );
         if position {
-            Target {
+            Target::try_from(TargetWire {
                 path: self.path.clone(),
                 symbol: self.symbol.clone(),
                 line: self.line,
                 column: self.column,
-            }
-            .validate()?;
+            })?;
         } else {
             ensure!(
                 self.symbol.is_none() && self.line.is_none() && self.column.is_none(),
@@ -179,14 +202,8 @@ impl Arguments {
             );
         }
         if self.operation == Operation::Paths {
-            self.from
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("paths requires from"))?
-                .validate()?;
-            self.to
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("paths requires to"))?
-                .validate()?;
+            ensure!(self.from.is_some(), "paths requires from");
+            ensure!(self.to.is_some(), "paths requires to");
             ensure!(
                 self.path.is_none() && self.limit.is_none() && self.offset.is_none(),
                 "paths uses endpoint targets without list pagination"
@@ -334,8 +351,8 @@ pub(crate) fn definitions() -> Vec<super::super::ControlToolDefinition> {
     NAMES.iter().map(|&name| {
         let operation = name.trim_start_matches("lsp_");
         let position = matches!(operation, "definition" | "context" | "references" | "calls");
-        let mut properties = json!({"path":{"type":"string","minLength":1,"description":"Workspace-relative or authorized absolute path."}});
-        let fields = properties.as_object_mut().unwrap();
+        let mut properties = serde_json::Map::from_iter([("path".into(), json!({"type":"string","minLength":1,"description":"Workspace-relative or authorized absolute path."}))]);
+        let fields = &mut properties;
         let mut required = Vec::new();
         if position {
             fields.insert("line".into(), json!({"type":"integer","minimum":1,"description":"One-based source line from a tool result."}));

@@ -25,7 +25,10 @@ impl HarnessBroker {
         let mut document = self
             .plan_file
             .capture_revision_source(&source.session_id, &source.id, revision)?
-            .document;
+            .into_data()
+            .revision
+            .into_parts()
+            .0;
         let request = format!(
             "Replan {} from revision {revision}. Reassess this plan against the current workspace, preserve useful decisions, and ask about necessary changes. Original request: {}",
             source.title, source.request

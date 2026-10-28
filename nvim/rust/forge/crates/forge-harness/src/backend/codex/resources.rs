@@ -102,7 +102,10 @@ impl CodexResources {
                 !server.contains_key(alias),
                 "Native MCP name collides with a Forge resource binding"
             );
-            server.insert(alias.clone(), native_server(launch)?);
+            server.insert(
+                alias.clone(),
+                native_server(&Value::Object(launch.clone()))?,
+            );
         }
         let plugin: Map<_, _> = native
             .pointer("/config/plugins")

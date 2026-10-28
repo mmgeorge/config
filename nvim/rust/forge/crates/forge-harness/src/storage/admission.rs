@@ -402,20 +402,20 @@ mod tests {
             "prompt":"question","kind":"chat","state":"complete","turn":[],"node_list":[],
             "created_at_ms":1,"attributed_matches_checkpoint":false,"awaiting_input":true
         }))?;
-        exchange.elicitation = Some(crate::plan::PlanElicitation::new(serde_json::from_value(
+        exchange.set_elicitation(Some(crate::plan::PlanElicitation::new(serde_json::from_value(
             serde_json::json!({
                 "id":"set","questions":[{"id":"question","header":"Choice","question":"Which?",
                     "options":[{"label":"First","description":"First choice","recommended":true}],"allow_freeform":true}]
             }),
-        )?));
+        )?)));
         let mut writer = SqliteStore::open(root.path())?;
         writer.save_exchange(&exchange)?;
         assert!(admission.snapshot()?.has_elicitation);
         assert!(admission.owns_exchange("exchange")?);
         assert!(!other.owns_exchange("exchange")?);
         assert!(Arc::ptr_eq(&unchanged, &other.snapshot()?));
-        exchange.elicitation = None;
-        exchange.awaiting_input = false;
+        exchange.set_elicitation(None);
+        exchange.set_awaiting_input(false);
         writer.save_exchange(&exchange)?;
         assert!(!admission.snapshot()?.has_elicitation);
         writer.delete_exchange("exchange")?;

@@ -125,10 +125,11 @@ impl ControlToolRuntime {
                     && invocation.arguments["expected_version"].as_u64() == Some(document.version),
                 "plan identity or version changed"
             );
-            let mut design = document
+            let original_design = document
                 .design
-                .clone()
+                .as_ref()
                 .context("plan has no declaration design")?;
+            let mut design = original_design.clone();
             let ids: Vec<String> =
                 serde_json::from_value(invocation.arguments["check_ids"].clone())?;
             let workspace = self
@@ -142,13 +143,13 @@ impl ControlToolRuntime {
                 &snapshot.config,
                 &ids.into_iter().map(|id| (id, true)).collect(),
             )?;
-            if design.document == document.design.as_ref().unwrap().document {
+            if design.document == original_design.document {
                 return Ok(ControlToolResult {
                     invocation: None,
                     message: self.plan_version_message("Checks already selected"),
                 });
             }
-            let before = serde_json::to_string_pretty(&document.design.as_ref().unwrap().document)?;
+            let before = serde_json::to_string_pretty(&original_design.document)?;
             let after = serde_json::to_string_pretty(&design.document)?;
             let patch = format!(
                 "*** Begin Patch\n*** Update File: plan.json\n@@\n{}\n{}\n*** End Patch",
@@ -321,14 +322,16 @@ impl ControlToolRuntime {
                         .or_insert_with(|| digest.clone());
                 }
                 let updated = document.patch_design(workspace, request.clone())?;
-                for (path, file) in &updated.design.as_ref().unwrap().baseline {
-                    if !document
-                        .design
-                        .as_ref()
-                        .unwrap()
-                        .baseline
-                        .contains_key(path)
-                    {
+                let updated_design = updated
+                    .design
+                    .as_ref()
+                    .context("patched plan has no declaration design")?;
+                let previous_design = document
+                    .design
+                    .as_ref()
+                    .context("source plan has no declaration design")?;
+                for (path, file) in &updated_design.baseline {
+                    if !previous_design.baseline.contains_key(path) {
                         request
                             .source_digests
                             .insert(path.clone(), file.source_digest.clone());
@@ -338,8 +341,10 @@ impl ControlToolRuntime {
                     .insert(request.expected_version, request.source_digests.clone());
                 invocation.arguments["source_digests"] =
                     serde_json::to_value(&request.source_digests)?;
-                let delta =
-                    crate::plan::revision::DeclarationDelta::between(Some(document), &updated)?;
+                let delta = crate::plan::revision::DeclarationDelta::between(
+                    Some(document),
+                    updated_design,
+                )?;
                 let mut confirmation = format!("{}{}", delta.document, delta.files);
                 if confirmation.is_empty() {
                     confirmation.push_str("No declaration changes.\n");
@@ -483,7 +488,7 @@ impl ControlToolRuntime {
                         design.validated(workspace).await?
                     };
                     let mut submitted = document.clone();
-                    submitted.design = Some(design);
+                    submitted.design = Some(design.into_design());
                     if let Some(execution) = &self.context.execution {
                         let reason = invocation
                             .arguments

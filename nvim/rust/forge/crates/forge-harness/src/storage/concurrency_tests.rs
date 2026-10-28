@@ -74,12 +74,11 @@ impl ProcessOwner {
     }
 
     fn release(&mut self) -> Result<()> {
-        if let Some(mut input) = self.child.stdin.take() {
-            if let Err(error) = input.write_all(b"x") {
-                if error.kind() != std::io::ErrorKind::BrokenPipe {
-                    return Err(error.into());
-                }
-            }
+        if let Some(mut input) = self.child.stdin.take()
+            && let Err(error) = input.write_all(b"x")
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(error.into());
         }
         Ok(())
     }

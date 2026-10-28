@@ -131,10 +131,10 @@ impl SqliteStore {
             let result = self.delete_session_with(&session_id, || {
                 crate::plan::PlanFileStore::new(&root, "").delete_session(&session_id)
             });
-            if let Err(error) = result {
-                if !error.is::<crate::session::SessionLeaseConflict>() {
-                    return Err(error);
-                }
+            if let Err(error) = result
+                && !error.is::<crate::session::SessionLeaseConflict>()
+            {
+                return Err(error);
             }
         }
         Ok(())

@@ -6,7 +6,8 @@ use std::ops::Range;
 use crate::ContractError;
 use crate::block::BufferBlock;
 use crate::editable::{
-    EditAcknowledgement, LocalEdit, LocalEditResult, rebase_fold_endpoint, replace_region,
+    AcceptedLocalEdit, EditAcknowledgement, LocalEdit, LocalEditRejection, LocalEditResult,
+    rebase_fold_endpoint, replace_region,
 };
 use crate::identity::{BlockId, DocumentId, DocumentRevision, EditSequence, RegionId};
 use crate::patch::{BlockOrderEdit, BufferPatch, BufferSnapshot, MetadataEdit, TextEdit};
@@ -19,6 +20,15 @@ pub struct BufferDocument {
     revision: DocumentRevision,
     sequence: BlockSequence,
     accepted_edit: HashMap<RegionId, EditSequence>,
+}
+
+impl<'document> IntoIterator for &'document BufferDocument {
+    type Item = &'document BufferBlock;
+    type IntoIter = crate::sequence::BlockIter<'document>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.sequence.blocks()
+    }
 }
 
 /// A validated edit retains its body and affected fold owners and exclusively borrows its document.
@@ -53,20 +63,20 @@ impl PreparedDocumentEdit<'_> {
 
 pub enum LocalEditPreparation<'document> {
     Prepared(Box<PreparedLocalEdit<'document>>),
-    Rejected(LocalEditResult),
+    Rejected(LocalEditRejection),
 }
 
 impl PreparedLocalEdit<'_> {
     /// Publishes the validated replacement after the caller admits its canonical edit.
     /// The exclusive borrow prevents the document from changing between validation and commit.
-    pub fn commit(self) -> LocalEditResult {
+    pub fn commit(self) -> AcceptedLocalEdit {
         self.replacement.document.accepted_edit.insert(
             self.acknowledgement.region.clone(),
             self.acknowledgement.sequence,
         );
-        LocalEditResult::Accepted {
+        AcceptedLocalEdit {
             acknowledgement: self.acknowledgement,
-            patch: Box::new(self.replacement.commit()),
+            patch: self.replacement.commit(),
         }
     }
 }
@@ -250,8 +260,8 @@ impl BufferDocument {
     /// Conflicts and stale sequences leave text, metadata, and both revisions unchanged.
     pub fn accept_local_edit(&mut self, edit: LocalEdit) -> Result<LocalEditResult, ContractError> {
         Ok(match self.prepare_local_edit(edit)? {
-            LocalEditPreparation::Prepared(prepared) => prepared.commit(),
-            LocalEditPreparation::Rejected(result) => result,
+            LocalEditPreparation::Prepared(prepared) => prepared.commit().into(),
+            LocalEditPreparation::Rejected(result) => result.into(),
         })
     }
 
@@ -270,7 +280,7 @@ impl BufferDocument {
         }
         let Some(block) = self.sequence.region_block(&edit.region) else {
             return Ok(LocalEditPreparation::Rejected(
-                LocalEditResult::UnknownRegion,
+                LocalEditRejection::UnknownRegion,
             ));
         };
         if self
@@ -279,7 +289,7 @@ impl BufferDocument {
             .is_some_and(|accepted| edit.sequence <= *accepted)
         {
             return Ok(LocalEditPreparation::Rejected(
-                LocalEditResult::StaleSequence,
+                LocalEditRejection::StaleSequence,
             ));
         }
         let region_index = block
@@ -291,13 +301,15 @@ impl BufferDocument {
         let region = &block.metadata.editable_region[region_index];
         if edit.sequence <= region.sequence {
             return Ok(LocalEditPreparation::Rejected(
-                LocalEditResult::StaleSequence,
+                LocalEditRejection::StaleSequence,
             ));
         }
         if edit.base != region.revision {
-            return Ok(LocalEditPreparation::Rejected(LocalEditResult::Conflict {
-                current: region.revision,
-            }));
+            return Ok(LocalEditPreparation::Rejected(
+                LocalEditRejection::Conflict {
+                    current: region.revision,
+                },
+            ));
         }
         let acknowledgement = EditAcknowledgement {
             document: self.id.clone(),

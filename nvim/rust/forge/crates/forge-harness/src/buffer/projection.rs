@@ -30,7 +30,7 @@ pub enum TranscriptAction {
         question_set_id: String,
     },
     Tool {
-        call_id: String,
+        call_id: super::identity::DisplayId,
     },
     Diff {
         text: String,
@@ -65,21 +65,30 @@ pub enum TranscriptAction {
 }
 
 pub struct ProjectedEntry {
+    #[cfg(test)]
+    display: crate::buffer::identity::DisplayRegistry,
     pub entry: TranscriptEntry,
     pub prompt: Vec<BlockId>,
     pub action: HashMap<TargetId, TranscriptAction>,
-    pub tool: HashMap<String, ToolOutputView>,
+    pub tool: HashMap<super::identity::DisplayId, ToolOutputView>,
     pub(crate) syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
 }
 
+pub(super) struct ProjectedMessage {
+    pub block: BufferBlock,
+    pub action: HashMap<TargetId, TranscriptAction>,
+    pub syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
+}
+
 struct TimelineRenderer<'profile> {
+    display: super::identity::DisplayProjection<'profile>,
     width: &'profile WidthProfile,
-    margin: usize,
+    margin: RenderMargin,
     now_ms: i64,
-    block: Vec<BufferBlock>,
+    block: Vec<RenderBlock>,
     prompt: Vec<BlockId>,
     action: HashMap<TargetId, TranscriptAction>,
-    tool: HashMap<String, ToolOutputView>,
+    tool: HashMap<super::identity::DisplayId, ToolOutputView>,
     syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
     leading_separator: bool,
     expansion: &'profile HashMap<String, bool>,
@@ -98,8 +107,68 @@ enum MarkdownRole {
 #[must_use]
 struct Section {
     start: usize,
-    margin: usize,
+    margin: RenderMarginScope,
     child_indent: usize,
+}
+
+#[derive(Default)]
+struct RenderMargin(std::rc::Rc<std::cell::Cell<usize>>);
+
+struct RenderMarginScope {
+    margin: std::rc::Rc<std::cell::Cell<usize>>,
+    previous: usize,
+}
+
+impl RenderMargin {
+    fn enter(&self, indent: usize) -> RenderMarginScope {
+        let previous = self.0.get();
+        self.0.set(previous + indent);
+        RenderMarginScope {
+            margin: self.0.clone(),
+            previous,
+        }
+    }
+}
+
+impl Drop for RenderMarginScope {
+    fn drop(&mut self) {
+        self.margin.set(self.previous);
+    }
+}
+
+struct RenderBlock {
+    content: BufferBlock,
+    layout: ContentLayout,
+}
+
+impl RenderBlock {
+    fn new(mut content: BufferBlock) -> Self {
+        let layout = content.metadata.layout.take().unwrap_or(ContentLayout {
+            indent: 2,
+            marker: None,
+            source_indent: 0,
+        });
+        Self { content, layout }
+    }
+
+    fn into_block(mut self) -> BufferBlock {
+        self.content.metadata.layout = Some(self.layout);
+        self.content
+    }
+}
+
+impl std::ops::Deref for RenderBlock {
+    type Target = BufferBlock;
+
+    fn deref(&self) -> &Self::Target {
+        &self.content
+    }
+}
+
+impl std::ops::DerefMut for RenderBlock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.content
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +198,7 @@ pub fn project<'source>(
     leading_separator: bool,
     expansion: &HashMap<String, bool>,
     tool_limit: &HashMap<String, usize>,
+    display: &mut crate::buffer::identity::DisplayRegistry,
 ) -> Result<ProjectedEntry> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -142,6 +212,7 @@ pub fn project<'source>(
         leading_separator,
         expansion,
         tool_limit,
+        display,
     )
 }
 
@@ -186,7 +257,8 @@ pub(super) fn timing_blocks(
     width: &WidthProfile,
     document: &forge_buffer::document::BufferDocument,
     expanded: &HashMap<String, bool>,
-    tools: &HashMap<String, ToolOutputView>,
+    tools: &HashMap<super::identity::DisplayId, ToolOutputView>,
+    display: &crate::buffer::identity::DisplayRegistry,
 ) -> Result<Vec<BufferBlock>> {
     fn exchanges<'source>(
         entry: &'source TimelineEntry,
@@ -266,6 +338,7 @@ pub(super) fn timing_blocks(
             false,
             expanded,
             &HashMap::new(),
+            &mut crate::buffer::identity::DisplayRegistry::default(),
         )?
         .entry
         .block);
@@ -312,10 +385,10 @@ pub(super) fn timing_blocks(
         blocks.push(block);
     }
     for exchange in source {
-        if exchange.completed_at_ms.is_some() || exchange.state != ExchangeState::Running {
+        if exchange.is_finished() || exchange.state() != ExchangeState::Running {
             continue;
         }
-        if exchange.execution_started_at_ms.is_some()
+        if exchange.execution_started_at_ms().is_some()
             && let Some(previous) = document.block(&BlockId(format!("{}:summary", exchange.id)))
         {
             let mut profile = width.clone();
@@ -346,7 +419,13 @@ pub(super) fn timing_blocks(
         let mut groups: BTreeMap<&str, Vec<_>> = BTreeMap::new();
         for turn in &exchange.turn {
             for tool in turn.tools() {
-                let call_id = format!("{}:{}", turn.id(), tool.id);
+                let Some(call_id) = display.tool(
+                    &entry.id(),
+                    &crate::turn::ToolAddress::new(turn.id(), &tool.id),
+                ) else {
+                    continue;
+                };
+
                 if let Some(output) = tools.get(&call_id) {
                     if output.group.is_empty() {
                         if tool.state() != crate::turn::ToolState::Running {
@@ -388,7 +467,13 @@ pub(super) fn timing_blocks(
                 continue;
             }
             for (turn, tool) in &calls {
-                let call_id = format!("{}:{}", turn.id(), tool.id);
+                let Some(call_id) = display.tool(
+                    &entry.id(),
+                    &crate::turn::ToolAddress::new(turn.id(), &tool.id),
+                ) else {
+                    continue;
+                };
+
                 let Some(previous) = document.block(&BlockId(format!("{call_id}:tool"))) else {
                     continue;
                 };
@@ -453,7 +538,7 @@ pub(super) fn message_block(
     previous: &BufferBlock,
     message: &crate::turn::Message,
     width: &WidthProfile,
-) -> Result<ProjectedEntry> {
+) -> Result<ProjectedMessage> {
     let indent = previous
         .metadata
         .layout
@@ -464,9 +549,11 @@ pub(super) fn message_block(
         .columns
         .saturating_sub(indent.saturating_sub(2))
         .max(1);
+    let mut display = crate::buffer::identity::DisplayRegistry::default();
     let mut renderer = TimelineRenderer {
+        display: display.project(previous.id.0.clone()),
         width: &content_width,
-        margin: 0,
+        margin: RenderMargin::default(),
         now_ms: 0,
         block: Vec::new(),
         prompt: Vec::new(),
@@ -477,7 +564,7 @@ pub(super) fn message_block(
         expansion: &HashMap::new(),
         tool_limit: &HashMap::new(),
     };
-    renderer.markdown(
+    let mut block = renderer.markdown_block(
         &previous.id.0,
         message.text(),
         if message.delivery() == crate::turn::MessageDelivery::Final {
@@ -495,12 +582,11 @@ pub(super) fn message_block(
             MarkdownRole::Commentary
         },
     )?;
-    let block = &mut renderer.block[0];
     block.metadata.layout = previous.metadata.layout.clone();
     if let Some(layout) = &mut block.metadata.layout {
         layout.source_indent = 0;
     }
-    super::layout::materialize(block)?;
+    super::layout::materialize(&mut block)?;
     block.metadata.node = previous.metadata.node.clone();
     block.metadata.content_node = previous.metadata.content_node.clone();
     if previous
@@ -531,15 +617,10 @@ pub(super) fn message_block(
         node.lifecycle = NodeLifecycle::Live;
         node.default_display = NodeDisplay::Full;
     }
-    super::message::prepare(block, width)?;
-    Ok(ProjectedEntry {
-        entry: TranscriptEntry {
-            id: previous.id.0.clone(),
-            block: renderer.block,
-        },
-        prompt: renderer.prompt,
+    super::message::prepare(&mut block, width)?;
+    Ok(ProjectedMessage {
+        block,
         action: renderer.action,
-        tool: renderer.tool,
         syntax: renderer.syntax,
     })
 }
@@ -553,6 +634,7 @@ fn project_at(entry: &TimelineEntry, width: &WidthProfile, now_ms: i64) -> Resul
         false,
         &HashMap::new(),
         &HashMap::new(),
+        &mut crate::buffer::identity::DisplayRegistry::default(),
     )
 }
 
@@ -563,10 +645,12 @@ fn project_at_with_separator(
     leading_separator: bool,
     expansion: &HashMap<String, bool>,
     tool_limit: &HashMap<String, usize>,
+    display: &mut crate::buffer::identity::DisplayRegistry,
 ) -> Result<ProjectedEntry> {
     let mut projection = TimelineRenderer {
+        display: display.project(entry.id()),
         width,
-        margin: 0,
+        margin: RenderMargin::default(),
         now_ms,
         block: Vec::new(),
         prompt: Vec::new(),
@@ -583,20 +667,26 @@ fn project_at_with_separator(
             projection.interaction(exchange, &HashMap::new(), 0)?
         }
     }
-    super::nodes::link(&mut projection.block);
-    for block in &mut projection.block {
+    if projection.block.is_empty() {
+        projection.literal(&format!("{}:empty", entry.id()), "", None)?;
+    }
+    let mut blocks: Vec<_> = projection
+        .block
+        .into_iter()
+        .map(RenderBlock::into_block)
+        .collect();
+    super::nodes::link(&mut blocks);
+    for block in &mut blocks {
         TranscriptRenderer::resolve_marker(block)?;
         super::layout::materialize(block)?;
         super::message::prepare(block, width)?;
     }
-    ensure!(projection.margin == 0, "timeline section was not finished");
-    if projection.block.is_empty() {
-        projection.literal(&format!("{}:empty", entry.id()), "", None)?;
-    }
     Ok(ProjectedEntry {
+        #[cfg(test)]
+        display: projection.display.snapshot(),
         entry: TranscriptEntry {
             id: entry.id(),
-            block: projection.block,
+            block: blocks,
         },
         action: projection.action,
         prompt: projection.prompt,
@@ -775,10 +865,10 @@ impl TimelineRenderer<'_> {
         use crate::plan::{PlanEventContent, PlanExecutionLifecycleEvent, PlanLifecycleKind};
         match &event.content {
             PlanEventContent::Lifecycle { title, lifecycle } => {
-                if lifecycle.kind == PlanLifecycleKind::QuestionAsked {
-                    if let Some(question) = &lifecycle.question {
-                        return self.question(&event.id, question, lifecycle.answer.as_deref());
-                    }
+                if lifecycle.kind == PlanLifecycleKind::QuestionAsked
+                    && let Some(question) = &lifecycle.question
+                {
+                    return self.question(&event.id, question, lifecycle.answer.as_deref());
                 }
                 let label = match lifecycle.kind {
                     PlanLifecycleKind::QuestionAsked => "Clarification requested",
@@ -939,7 +1029,7 @@ impl TimelineRenderer<'_> {
             }),
         )?;
         let section = self.begin_section(2);
-        let completed = exchange.is_some_and(|exchange| exchange.completed_at_ms.is_some());
+        let completed = exchange.is_some_and(|exchange| exchange.is_finished());
         if let Some(exchange) = exchange {
             if completed {
                 let agents = agent
@@ -970,7 +1060,12 @@ impl TimelineRenderer<'_> {
                     .rev()
                     .find_map(|turn| turn.tools().last().map(|tool| (turn, tool)))
                 {
-                    self.tool(turn.id(), tool, "", false, exchange)?;
+                    let call = crate::exchange::ThoughtCall {
+                        id: &tool.id,
+                        turn,
+                        tool,
+                    };
+                    self.tool(&call, None, "", false, exchange)?;
                 }
             }
         }
@@ -1152,7 +1247,7 @@ impl TimelineRenderer<'_> {
                     ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
                 ) {
                 "ForgeHarnessRead".into()
-            } else if interaction.completed_at_ms.is_some() {
+            } else if interaction.is_finished() {
                 "ForgeHarnessThought".into()
             } else {
                 "ForgeHarnessThinking".into()
@@ -1175,11 +1270,11 @@ impl TimelineRenderer<'_> {
         self.finish_section(
             section,
             &format!("{}:exchange", interaction.id),
-            interaction.completed_at_ms.is_some(),
+            interaction.is_finished(),
         );
         if let Some(node) = &mut self.block[exchange_start].metadata.node {
             node.kind = NodeKind::Exchange;
-            node.lifecycle = if interaction.completed_at_ms.is_some() {
+            node.lifecycle = if interaction.is_finished() {
                 NodeLifecycle::Settled
             } else {
                 NodeLifecycle::Live
@@ -1215,7 +1310,7 @@ impl TimelineRenderer<'_> {
             let (content, remaining) = continuation.split_at(count);
             let start = self.block.len();
             let indent = if response { 0 } else { 2 };
-            self.margin += indent;
+            let margin = self.margin.enter(indent);
             self.content(
                 interaction,
                 agents,
@@ -1224,7 +1319,7 @@ impl TimelineRenderer<'_> {
                 Some(&layout.questions),
                 MarkdownRole::Response,
             )?;
-            self.margin -= indent;
+            drop(margin);
             self.offset_layout(start, indent / 2);
             continuation = remaining;
         }
@@ -1238,7 +1333,7 @@ impl TimelineRenderer<'_> {
         let writes = content
             .thought
             .iter()
-            .flat_map(|thought| thought.writes.call.iter().map(|call| call.tool))
+            .flat_map(|thought| thought.writes.call.iter())
             .collect::<Vec<_>>();
         let identity = format!("{}:results", interaction.id);
         if !writes.is_empty() {
@@ -1429,15 +1524,19 @@ impl TimelineRenderer<'_> {
                     MarkdownRole::Detail,
                 )?;
                 for (evidence_index, evidence) in check.evidence.iter().enumerate() {
-                    let call_id = phase
+                    let source_id = phase
                         .verification_tools
                         .get(evidence)
                         .cloned()
                         .unwrap_or_else(|| format!("{}:{evidence}", interaction.id));
+                    let action = self
+                        .display
+                        .legacy_tool(&source_id)
+                        .map(|call_id| TranscriptAction::Tool { call_id });
                     self.literal(
                         &format!("{check_id}:evidence:{evidence_index}"),
                         "Command output",
-                        Some(TranscriptAction::Tool { call_id }),
+                        action,
                     )?;
                 }
                 self.finish_section(check_section, &check_id, true);
@@ -1531,15 +1630,16 @@ impl TimelineRenderer<'_> {
             }
             self.finish_section(finding_section, &finding_id, true);
         }
-        if checks.is_empty() && findings.is_empty() && phase.declaration_findings.is_empty() {
-            if let Some(reason) = phase
+        if checks.is_empty()
+            && findings.is_empty()
+            && phase.declaration_findings.is_empty()
+            && let Some(reason) = phase
                 .verification
                 .as_ref()
                 .and_then(|report| report.reason.as_deref())
                 .or(phase.summary.as_deref())
-            {
-                self.markdown(&format!("{identity}:reason"), reason, MarkdownRole::Detail)?;
-            }
+        {
+            self.markdown(&format!("{identity}:reason"), reason, MarkdownRole::Detail)?;
         }
         self.finish_section(section, &identity, true);
         Ok(())
@@ -1598,23 +1698,11 @@ impl TimelineRenderer<'_> {
         self.content_nodes(interaction, agents, depth, &thought.events, questions)?;
         self.tool_group(&thought.tools, interaction)?;
         if let Some(first) = thought.writes.call.first() {
-            let calls = thought
-                .writes
-                .call
-                .iter()
-                .map(|call| call.tool)
-                .collect::<Vec<_>>();
+            let calls = thought.writes.call.iter().collect::<Vec<_>>();
             self.file_change_group(first.id, &calls, interaction)?;
         }
         if let Some(section) = section {
-            let start = section.start;
-            self.finish_section(section, thought.id, true);
-            self.block[start]
-                .metadata
-                .node
-                .as_mut()
-                .expect("thought node")
-                .kind = NodeKind::Thought;
+            self.finish_section(section, thought.id, true).kind = NodeKind::Thought;
         }
         Ok(())
     }
@@ -1643,54 +1731,43 @@ impl TimelineRenderer<'_> {
         self.literal(&group_id, &label, None)?;
         for (index, call) in group.call.iter().enumerate() {
             let tool_start = self.block.len();
-            self.tool(
-                call.turn.id(),
-                call.tool,
+            let (call_id, more) = self.tool(
+                call,
+                None,
                 &group_id,
                 !settled && index + 1 == group.call.len(),
                 exchange,
             )?;
-            let node_id = format!("{}:{}:tool", call.turn.id(), call.tool.id);
-            self.fold(
+            let node_id = format!("{call_id}:tool");
+            let expansion = self.expansion.get(&node_id).copied();
+            let node = self.fold(
                 tool_start,
                 &node_id,
                 settled || index + 1 < group.call.len(),
                 NodeKind::Tool,
             );
-            if let Some(node) = &mut self.block[tool_start].metadata.node {
-                node.lifecycle = if call.tool.state() == crate::turn::ToolState::Running {
-                    NodeLifecycle::Live
-                } else {
-                    NodeLifecycle::Settled
-                };
-                if !settled && index + 1 == group.call.len() {
-                    node.default_display = NodeDisplay::Preview;
-                }
-                if self.expansion.get(&node_id) == Some(&true) {
-                    let output = &self.tool[&format!("{}:{}", call.turn.id(), call.tool.id)];
-                    let limit = self
-                        .tool_limit
-                        .get(&node_id)
-                        .copied()
-                        .unwrap_or(super::tool::INITIAL_INLINE_BYTES);
-                    node.more = output.inline_prefix_chunks(limit)? < output.inline_chunks()?;
-                }
-                node.resolve(self.expansion.get(&node_id).copied());
+            node.lifecycle = if call.tool.state() == crate::turn::ToolState::Running {
+                NodeLifecycle::Live
+            } else {
+                NodeLifecycle::Settled
+            };
+            if !settled && index + 1 == group.call.len() {
+                node.default_display = NodeDisplay::Preview;
             }
+            if expansion == Some(true) {
+                node.more = more;
+            }
+            node.resolve(expansion);
         }
-        self.fold(start, &group_id, settled, NodeKind::ToolGroup);
-        let node = self.block[start]
-            .metadata
-            .node
-            .as_mut()
-            .expect("tool group node");
+        let expansion = self.expansion.get(&group_id).copied();
+        let node = self.fold(start, &group_id, settled, NodeKind::ToolGroup);
         node.lifecycle = lifecycle;
         node.default_display = if settled {
             NodeDisplay::Heading
         } else {
             NodeDisplay::Preview
         };
-        node.resolve(self.expansion.get(&group_id).copied());
+        node.resolve(expansion);
         Ok(())
     }
 
@@ -2191,7 +2268,7 @@ impl TimelineRenderer<'_> {
         depth: usize,
     ) -> Result<()> {
         let cancelled =
-            exchange.state == crate::exchange::ExchangeState::Cancelled && !group.resolved;
+            exchange.state() == crate::exchange::ExchangeState::Cancelled && !group.resolved;
         let settled = group.resolved || cancelled;
         let answered = group
             .branch
@@ -2327,31 +2404,33 @@ impl TimelineRenderer<'_> {
     fn file_change_group(
         &mut self,
         id: &str,
-        calls: &[&crate::exchange::ToolCall],
+        calls: &[&crate::exchange::ThoughtCall<'_>],
         exchange: &Exchange,
     ) -> Result<()> {
         use crate::turn::ToolState;
         let identity = format!("{id}:changes");
         let start = self.block.len();
-        let (diff, warning) = crate::exchange::ProviderDiffBuilder::build_group(calls);
+        let tools = calls.iter().map(|call| call.tool).collect::<Vec<_>>();
+        let (diff, warning) = crate::exchange::ProviderDiffBuilder::build_group(&tools);
         let pending: std::collections::HashSet<_> = calls
             .iter()
+            .map(|call| call.tool)
             .filter(|tool| tool.state() == crate::turn::ToolState::Running)
             .flat_map(|tool| tool.change.file.iter())
             .map(|file| file.move_path.as_ref().unwrap_or(&file.path))
             .collect();
         let running = calls
             .iter()
-            .any(|tool| tool.state() == crate::turn::ToolState::Running);
+            .any(|call| call.tool.state() == crate::turn::ToolState::Running);
         let unsuccessful: Vec<_> = calls
             .iter()
             .enumerate()
-            .filter(|(_, tool)| {
-                tool.state() != ToolState::Running
-                    && (tool.failed || tool.state() != ToolState::Completed)
+            .filter(|(_, call)| {
+                call.tool.state() != ToolState::Running
+                    && (call.tool.failed || call.tool.state() != ToolState::Completed)
             })
             .collect();
-        let unavailable = calls.iter().any(|tool| {
+        let unavailable = calls.iter().map(|call| call.tool).any(|tool| {
             tool.state() == ToolState::Completed && !tool.failed && tool.change.file.is_empty()
         });
         let mut outcome = String::new();
@@ -2409,7 +2488,7 @@ impl TimelineRenderer<'_> {
             self.literal(&identity, &format!("◇ {label}{outcome}"), None)?;
         }
         let details_start = self.block.len();
-        self.margin += 2;
+        let margin = self.margin.enter(2);
         if let Some(warning) = warning {
             self.literal(
                 &format!("{identity}:warning"),
@@ -2417,19 +2496,14 @@ impl TimelineRenderer<'_> {
                 None,
             )?;
         }
-        for (index, tool) in unsuccessful {
+        for (index, call) in unsuccessful {
             if exchange.output_store.is_some() {
-                let turn = exchange
-                    .turn
-                    .iter()
-                    .find(|turn| turn.tools().any(|candidate| candidate.id == tool.id))
-                    .context("stored failed write has no owning turn")?;
-                self.tool(turn.id(), tool, "", false, exchange)?;
+                self.tool(call, Some(&identity), "", false, exchange)?;
             } else {
-                self.file_change(&format!("{id}:write:{index}"), tool)?;
+                self.file_change(&format!("{id}:write:{index}"), call.tool)?;
             }
         }
-        self.margin -= 2;
+        drop(margin);
         if self.block.len() > details_start {
             self.offset_layout(details_start, 1);
             self.block[start].metadata.fold.clear();
@@ -2502,17 +2576,18 @@ impl TimelineRenderer<'_> {
 
     fn tool(
         &mut self,
-        interaction: &str,
-        tool: &crate::exchange::ToolCall,
+        call: &crate::exchange::ThoughtCall<'_>,
+        scope: Option<&str>,
         group: &str,
         preview: bool,
         exchange: &Exchange,
-    ) -> Result<()> {
-        let call_id = format!("{interaction}:{}", tool.id);
-        ensure!(
-            !self.tool.contains_key(&call_id),
-            "duplicate tool identity in interaction"
-        );
+    ) -> Result<(super::identity::DisplayId, bool)> {
+        let interaction = call.turn.id();
+        let tool = call.tool;
+        let display = self
+            .display
+            .tool(crate::turn::ToolAddress::new(interaction, &tool.id), scope);
+        let call_id = display;
         let mut output = if let Some((root, object)) = exchange.output_store.as_ref().zip(
             exchange
                 .archived_output
@@ -2521,11 +2596,11 @@ impl TimelineRenderer<'_> {
             let objects = crate::storage::objects::ObjectStore::open(root)?;
             let path = objects.path(object)?;
             let bytes = std::fs::metadata(&path)?.len();
-            ToolOutputView::file(call_id.clone(), path, bytes)?
+            ToolOutputView::file(call_id, path, bytes)
         } else if let Some(root) = &exchange.output_store {
-            ToolOutputView::stored(call_id.clone(), root, &exchange.id, interaction, &tool.id)?
+            ToolOutputView::stored(call_id, root, &exchange.id, interaction, &tool.id)
         } else {
-            ToolOutputView::new(call_id.clone(), &tool.output)?
+            ToolOutputView::new(call_id, &tool.output)
         };
         output.heading(tool);
         output.group = group.to_owned();
@@ -2547,12 +2622,8 @@ impl TimelineRenderer<'_> {
             &label,
             expanded,
         )?;
-        self.action.insert(
-            target,
-            TranscriptAction::Tool {
-                call_id: call_id.clone(),
-            },
-        );
+        self.action
+            .insert(target, TranscriptAction::Tool { call_id });
         self.push(block)?;
         if expanded || preview {
             let limit = self
@@ -2568,23 +2639,15 @@ impl TimelineRenderer<'_> {
             } {
                 let block = renderer.tool_body(&call_id, &output, expanded, chunk)?;
                 for target in &block.metadata.target {
-                    self.action.insert(
-                        target.id.clone(),
-                        TranscriptAction::Tool {
-                            call_id: call_id.clone(),
-                        },
-                    );
+                    self.action
+                        .insert(target.id.clone(), TranscriptAction::Tool { call_id });
                 }
                 self.push(block)?;
             }
             let hidden = renderer.tool_hidden(&call_id, &output, expanded)?;
             for target in &hidden.metadata.target {
-                self.action.insert(
-                    target.id.clone(),
-                    TranscriptAction::Tool {
-                        call_id: call_id.clone(),
-                    },
-                );
+                self.action
+                    .insert(target.id.clone(), TranscriptAction::Tool { call_id });
             }
             self.push(hidden)?;
         } else {
@@ -2596,8 +2659,18 @@ impl TimelineRenderer<'_> {
                 })?;
             }
         }
+        let limit = self
+            .tool_limit
+            .get(&format!("{call_id}:tool"))
+            .copied()
+            .unwrap_or(super::tool::INITIAL_INLINE_BYTES);
+        let more = if choice == Some(true) {
+            output.inline_prefix_chunks(limit)? < output.inline_chunks()?
+        } else {
+            false
+        };
         self.tool.insert(call_id, output);
-        Ok(())
+        Ok((call_id, more))
     }
 
     fn diff(
@@ -2629,6 +2702,11 @@ impl TimelineRenderer<'_> {
     }
 
     fn markdown(&mut self, id: &str, text: &str, role: MarkdownRole) -> Result<()> {
+        let block = self.markdown_block(id, text, role)?;
+        self.push(block)
+    }
+
+    fn markdown_block(&mut self, id: &str, text: &str, role: MarkdownRole) -> Result<BufferBlock> {
         let mut width = self.content_width();
         let comment = matches!(role, MarkdownRole::Comment);
         if comment {
@@ -2682,7 +2760,7 @@ impl TimelineRenderer<'_> {
                 },
             );
         }
-        rendered.block.metadata.node = Some(NodeState::new(
+        let mut node = NodeState::new(
             FoldId(id.into()),
             if matches!(role, MarkdownRole::Commentary) {
                 NodeKind::Thought
@@ -2690,16 +2768,11 @@ impl TimelineRenderer<'_> {
                 NodeKind::Message
             },
             NodeDisplay::Full,
-        ));
+        );
         if matches!(role, MarkdownRole::Response) {
-            rendered
-                .block
-                .metadata
-                .node
-                .as_mut()
-                .expect("message node")
-                .lifecycle = NodeLifecycle::Live;
+            node.lifecycle = NodeLifecycle::Live;
         }
+        rendered.block.metadata.node = Some(node);
         for link in rendered.link {
             self.action.insert(
                 link.target,
@@ -2708,7 +2781,7 @@ impl TimelineRenderer<'_> {
                 },
             );
         }
-        self.push(rendered.block)
+        Ok(rendered.block)
     }
 
     fn literal(&mut self, id: &str, text: &str, action: Option<TranscriptAction>) -> Result<()> {
@@ -2732,51 +2805,45 @@ impl TimelineRenderer<'_> {
         self.push(block)
     }
 
-    fn push(&mut self, mut block: BufferBlock) -> Result<()> {
-        block.metadata.layout.get_or_insert(ContentLayout {
-            indent: 2,
-            marker: None,
-            source_indent: 0,
-        });
-        self.block.push(block);
+    fn push(&mut self, block: BufferBlock) -> Result<()> {
+        self.block.push(RenderBlock::new(block));
         Ok(())
     }
 
     fn offset_layout(&mut self, start: usize, depth: usize) {
         for block in &mut self.block[start..] {
-            block
-                .metadata
-                .layout
-                .as_mut()
-                .expect("projected block layout")
-                .indent += depth * 2;
+            block.layout.indent += depth * 2;
         }
     }
 
     fn content_width(&self) -> WidthProfile {
         let mut width = self.width.clone();
-        width.columns = width.columns.saturating_sub(self.margin).max(1);
+        width.columns = width.columns.saturating_sub(self.margin.0.get()).max(1);
         width
     }
 
     fn begin_section(&mut self, child_indent: usize) -> Section {
-        let section = Section {
+        Section {
             start: self.block.len() - 1,
-            margin: self.margin,
+            margin: self.margin.enter(child_indent),
             child_indent,
-        };
-        self.margin += child_indent;
-        section
+        }
     }
 
-    fn finish_section(&mut self, section: Section, identity: &str, closed: bool) {
-        self.margin = section.margin;
+    fn finish_section(&mut self, section: Section, identity: &str, closed: bool) -> &mut NodeState {
+        drop(section.margin);
         self.offset_layout(section.start + 1, section.child_indent / 2);
-        self.fold(section.start, identity, closed, NodeKind::Group);
+        self.fold(section.start, identity, closed, NodeKind::Group)
     }
 
-    fn fold(&mut self, start: usize, identity: &str, closed: bool, kind: NodeKind) {
-        self.block[start].metadata.node = Some(NodeState::new(
+    fn fold(
+        &mut self,
+        start: usize,
+        identity: &str,
+        closed: bool,
+        kind: NodeKind,
+    ) -> &mut NodeState {
+        let node = NodeState::new(
             FoldId(identity.into()),
             kind,
             if closed {
@@ -2784,7 +2851,7 @@ impl TimelineRenderer<'_> {
             } else {
                 NodeDisplay::Full
             },
-        ));
+        );
         let selected = &self.block[start..];
         if selected
             .iter()
@@ -2793,9 +2860,10 @@ impl TimelineRenderer<'_> {
             < 2
             && kind != NodeKind::Tool
         {
-            return;
+            return self.block[start].metadata.node.insert(node);
         }
-        let end = selected.last().expect("nonempty folded block range");
+        let heading = &self.block[start];
+        let end = self.block[start + 1..].last().unwrap_or(heading);
         let anchor = BlockAnchor {
             block: end.id.clone(),
             position: TextPosition {
@@ -2813,7 +2881,9 @@ impl TimelineRenderer<'_> {
             end: anchor,
             closed,
         });
-        TranscriptRenderer::fold_marker(&mut self.block[start]);
+        let heading = &mut self.block[start];
+        TranscriptRenderer::fold_layout_marker(&heading.content.text, &mut heading.layout);
+        heading.metadata.node.insert(node)
     }
 }
 
@@ -2822,7 +2892,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
         let lifecycle = if run.state == crate::agent::AgentState::Closing {
             "Closing"
         } else {
-            match exchange.state {
+            match exchange.state() {
                 ExchangeState::Queued => "Starting",
                 ExchangeState::Running
                     if exchange.activity() == ExchangeActivity::AwaitingApproval =>
@@ -2848,7 +2918,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
                     "Compacting"
                 }
                 ExchangeState::Running => "Running",
-                ExchangeState::Finalizing => finalization_label(exchange.finalization_outcome),
+                ExchangeState::Finalizing => finalization_label(exchange.finalization_outcome()),
                 ExchangeState::Complete => "Ran",
                 ExchangeState::Failed => "Failed",
                 ExchangeState::Cancelled => "Cancelled",
@@ -2947,8 +3017,8 @@ fn token_display(tokens: u64) -> String {
     }
 }
 
-fn finalization_label(outcome: Option<ExchangeState>) -> &'static str {
-    if outcome == Some(ExchangeState::Cancelled) {
+fn finalization_label(outcome: Option<crate::exchange::ExchangeOutcome>) -> &'static str {
+    if outcome == Some(crate::exchange::ExchangeOutcome::Cancelled) {
         "Stopping"
     } else {
         "Saving exchange"
@@ -2956,19 +3026,19 @@ fn finalization_label(outcome: Option<ExchangeState>) -> &'static str {
 }
 
 fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
-    let complete = interaction.completed_at_ms.is_some();
+    let complete = interaction.is_finished();
     let status = interaction.activity();
     let paused = status == ExchangeActivity::Paused;
     let duration = interaction.elapsed(now_ms) / 1000;
-    let activity = if interaction.state == ExchangeState::Cancelled {
+    let activity = if interaction.state() == ExchangeState::Cancelled {
         "Cancelled"
-    } else if interaction.state == ExchangeState::Finalizing {
-        finalization_label(interaction.finalization_outcome)
-    } else if interaction.state == ExchangeState::Interrupted {
+    } else if interaction.state() == ExchangeState::Finalizing {
+        finalization_label(interaction.finalization_outcome())
+    } else if interaction.state() == ExchangeState::Interrupted {
         "Interrupted"
-    } else if interaction.state == ExchangeState::Failed {
+    } else if interaction.state() == ExchangeState::Failed {
         "Failed"
-    } else if interaction.state == ExchangeState::Queued {
+    } else if interaction.state() == ExchangeState::Queued {
         "Starting"
     } else if status == ExchangeActivity::AwaitingApproval {
         "Waiting for your approval"
@@ -3018,7 +3088,7 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     };
     let summary = format!(
         "● {}{activity} {duration}s",
-        history_prefix(interaction.disposition)
+        history_prefix(interaction.disposition())
     );
     exchange_metrics_summary(interaction, now_ms, summary)
 }
@@ -3208,7 +3278,7 @@ mod tests {
                 event: crate::timeline::SessionEventRecord {
                     id: "compact".into(),
                     session_id: "session".into(),
-                    owner: crate::timeline::TimelineOwner::session(&"session"),
+                    owner: crate::timeline::TimelineOwner::session("session"),
                     created_at_ms: 1,
                     detail: SessionEventKind::Compaction {
                         compaction: Compaction {
@@ -3255,7 +3325,7 @@ mod tests {
                     event: crate::timeline::SessionEventRecord {
                         id: "compaction".into(),
                         session_id: "session".into(),
-                        owner: crate::timeline::TimelineOwner::session(&"session"),
+                        owner: crate::timeline::TimelineOwner::session("session"),
                         created_at_ms: 1_000,
                         detail: SessionEventKind::Compaction {
                             compaction: Compaction {
@@ -3440,15 +3510,24 @@ mod tests {
             }
         }))?;
         let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
-        let projection = project_at(
-            &TimelineEntry::Exchange {
+        let mut display = crate::buffer::identity::DisplayRegistry::default();
+        let evidence_id = display.project("earlier-exchange".into()).tool(
+            crate::turn::ToolAddress::new("earlier-exchange", "test-tool"),
+            None,
+        );
+        let projection = project_at_with_separator(
+            ProjectionSource::Entry(&TimelineEntry::Exchange {
                 id: "verify".into(),
                 created_at_ms: 0,
                 exchange,
                 agent_by_id: HashMap::new(),
-            },
+            }),
             &WidthProfile::default(),
             1000,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut display,
         )?;
         let blocks = &projection.entry.block;
         let rows = blocks
@@ -3476,7 +3555,7 @@ mod tests {
             assert!(block.metadata.fold[0].closed);
         }
         assert!(projection.action.values().any(|action| matches!(action,
-            TranscriptAction::Tool { call_id } if call_id == "earlier-exchange:test-tool")));
+            TranscriptAction::Tool { call_id } if *call_id == evidence_id)));
         assert!(
             !projection
                 .action
@@ -3666,6 +3745,7 @@ mod tests {
             &document,
             &Default::default(),
             &projected.tool,
+            &projected.display,
         )?;
         assert_eq!(refreshed.len(), 1);
         assert_eq!(refreshed[0].id.0, "worker-heading");
@@ -3839,9 +3919,7 @@ mod tests {
         use crate::backend::{
             BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
         };
-        use crate::exchange::{
-            ExchangeKind, ExchangeNode, ExchangeState, InputIntent, QuestionInput,
-        };
+        use crate::exchange::{ExchangeKind, ExchangeNode, InputIntent, QuestionInput};
 
         for planning_question in [None, Some(false), Some(true)] {
             let mut exchange: Exchange = serde_json::from_value(json!({
@@ -4053,7 +4131,9 @@ mod tests {
                 outcome: crate::turn::TurnOutcome::Completed,
             });
             exchange.observe_turn(&event, 11).unwrap();
-            exchange.finish(ExchangeState::Complete, 11).unwrap();
+            exchange
+                .finish(crate::exchange::ExchangeOutcome::Complete, 11)
+                .unwrap();
             let completed = render(&exchange);
             let restored: Exchange =
                 serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
@@ -4099,8 +4179,8 @@ mod tests {
             question: question.clone(),
             answer: None,
         });
-        exchange.elicitation = Some(crate::plan::PlanElicitation::new(question));
-        exchange.awaiting_input = true;
+        exchange.set_elicitation(Some(crate::plan::PlanElicitation::new(question)));
+        exchange.set_awaiting_input(true);
         let source = TimelineEntry::Exchange {
             id: exchange.id.clone(),
             created_at_ms: 0,
@@ -4154,9 +4234,7 @@ mod tests {
     #[test]
     fn question_branches_keep_targets_responses_and_folds_across_reload() {
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
-        use crate::exchange::{
-            ExchangeKind, ExchangeNode, ExchangeState, InputIntent, QuestionInput,
-        };
+        use crate::exchange::{ExchangeKind, ExchangeNode, InputIntent, QuestionInput};
         use forge_buffer::block::BufferBlock;
         for planning in [false, true] {
             let mut exchange: Exchange = serde_json::from_value(json!({
@@ -4253,8 +4331,8 @@ mod tests {
             };
             let mut elicitation = crate::plan::PlanElicitation::new(set);
             elicitation.answer.push(selected.clone());
-            exchange.elicitation = Some(elicitation);
-            exchange.awaiting_input = true;
+            exchange.set_elicitation(Some(elicitation));
+            exchange.set_awaiting_input(true);
             exchange.pause(3);
             let render = |exchange: Exchange| {
                 project_at(
@@ -4330,7 +4408,9 @@ mod tests {
                     4,
                 )
                 .unwrap();
-            exchange.finish(ExchangeState::Cancelled, 5).unwrap();
+            exchange
+                .finish(crate::exchange::ExchangeOutcome::Cancelled, 5)
+                .unwrap();
             let cancelled = render(exchange);
             assert!(
                 cancelled
@@ -4367,7 +4447,7 @@ mod tests {
         use crate::backend::{
             BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
         };
-        use crate::exchange::{ExchangeNode, ExchangeState};
+        use crate::exchange::ExchangeNode;
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"question-flow", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Plan out a new one", "kind":"chat", "state":"running",
@@ -4444,8 +4524,8 @@ mod tests {
             question: question.clone(),
             answer: None,
         });
-        exchange.elicitation = Some(crate::plan::PlanElicitation::new(question));
-        exchange.awaiting_input = true;
+        exchange.set_elicitation(Some(crate::plan::PlanElicitation::new(question)));
+        exchange.set_awaiting_input(true);
         exchange
             .append_input(
                 crate::exchange::InputIntent::Clarification,
@@ -4613,16 +4693,10 @@ mod tests {
             .iter()
             .find(|block| block.id == answer.id)
             .unwrap();
-        assert_eq!(incremental.entry.block[0].text, rebuilt.text);
-        assert_eq!(
-            incremental.entry.block[0].metadata.conceal,
-            rebuilt.metadata.conceal
-        );
-        assert_eq!(
-            incremental.entry.block[0].metadata.node,
-            rebuilt.metadata.node
-        );
-        assert!(exchange.completed_at_ms.is_none() && exchange.checkpoint_after.is_none());
+        assert_eq!(incremental.block.text, rebuilt.text);
+        assert_eq!(incremental.block.metadata.conceal, rebuilt.metadata.conceal);
+        assert_eq!(incremental.block.metadata.node, rebuilt.metadata.node);
+        assert!(!exchange.is_finished() && exchange.checkpoint_after.is_none());
         println!(
             "QUESTION_FIXTURE:{}",
             serde_json::to_string(&projected.entry.block).unwrap()
@@ -4635,7 +4709,9 @@ mod tests {
             )
             .unwrap();
         let mut cancelled = exchange.clone();
-        cancelled.finish(ExchangeState::Cancelled, 7).unwrap();
+        cancelled
+            .finish(crate::exchange::ExchangeOutcome::Cancelled, 7)
+            .unwrap();
         let cancelled = project_at(
             &TimelineEntry::Exchange {
                 id: cancelled.id.clone(),
@@ -4670,7 +4746,9 @@ mod tests {
             outcome: crate::turn::TurnOutcome::Completed,
         });
         exchange.observe_turn(&event, 9).unwrap();
-        exchange.finish(ExchangeState::Complete, 9).unwrap();
+        exchange
+            .finish(crate::exchange::ExchangeOutcome::Complete, 9)
+            .unwrap();
         let completed = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
@@ -4706,6 +4784,7 @@ mod tests {
             ProviderFileChange, ToolActivity, ToolActivityKind,
         };
         for boundary in ["commentary", "failed", "cancelled", "denied", "interrupted"] {
+            let repeated_id = format!("{boundary}:output:{}:hidden", "identity".repeat(40));
             let mut exchange: Exchange = serde_json::from_value(json!({
                 "id":"edits", "session_id":"session", "agent_id":"primary", "ordinal":1,
                 "prompt":"Write", "kind":"chat", "state":"running", "created_at_ms":0,
@@ -4740,7 +4819,11 @@ mod tests {
                     event.text = None;
                     event.data = serde_json::Value::Null;
                     event.activity = Some(ToolActivity {
-                        id: name.into(),
+                        id: if ordinal == 1 {
+                            repeated_id.clone()
+                        } else {
+                            name.into()
+                        },
                         title: name.into(),
                         output: Some(format!("{name} details")),
                         output_delta: false,
@@ -4768,6 +4851,70 @@ mod tests {
                     });
                 }
                 exchange.observe_turn(&event, ordinal as i64 + 1)?;
+            }
+            let directory = tempfile::tempdir()?;
+            let mut stored = exchange.clone();
+            if boundary != "commentary" {
+                event.activity = None;
+                event.turn_boundary = Some(crate::backend::TurnBoundary::Finished {
+                    outcome: crate::turn::TurnOutcome::Completed,
+                });
+                stored.observe_turn(&event, 4)?;
+                event.address.as_mut().unwrap().turn_id = "next-turn".into();
+                event.turn_boundary = Some(crate::backend::TurnBoundary::Started);
+                stored.observe_turn(&event, 5)?;
+                event.turn_boundary = None;
+                event.activity = Some(ToolActivity {
+                    id: repeated_id.clone(),
+                    title: boundary.into(),
+                    output: Some(format!("second turn {boundary} details")),
+                    output_delta: false,
+                    kind: ToolActivityKind::FileChange,
+                    status: Some(boundary.into()),
+                    change: ProviderChangeSet::default(),
+                });
+                stored.observe_turn(&event, 6)?;
+            }
+            stored.output_store = Some(directory.path().to_owned());
+            let objects = crate::storage::objects::ObjectStore::open(directory.path())?;
+            for turn in &stored.turn {
+                for tool in turn.tools() {
+                    let object = objects.put(tool.output.as_bytes())?;
+                    stored
+                        .archived_output
+                        .insert(format!("{}:{}", turn.id(), tool.id), object);
+                }
+            }
+            let stored = project_at(
+                &TimelineEntry::Exchange {
+                    id: "edits".into(),
+                    created_at_ms: 0,
+                    exchange: stored,
+                    agent_by_id: HashMap::new(),
+                },
+                &WidthProfile::default(),
+                10,
+            )?;
+            if boundary != "commentary" {
+                assert_eq!(stored.tool.len(), 4, "{boundary}");
+                let mut captured = Vec::new();
+                for (identity, output) in &stored.tool {
+                    let mut snapshot = output.complete_snapshot()?;
+                    let mut export = snapshot.export_saved_output(
+                        directory.path(),
+                        std::sync::Arc::new(crate::trace::TraceStore::open(directory.path())?),
+                        "session",
+                    )?;
+                    let actual = std::fs::read_to_string(export.path().unwrap())?;
+                    assert!(!identity.to_string().contains(&repeated_id));
+                    captured.push(actual);
+                    export.close()?;
+                }
+                captured.sort();
+                let mut expected = vec![format!("{boundary} details"); 2];
+                expected.extend(vec![format!("second turn {boundary} details"); 2]);
+                expected.sort();
+                assert_eq!(captured, expected);
             }
             let rendered = project_at(
                 &TimelineEntry::Exchange {
@@ -4933,7 +5080,7 @@ mod tests {
             outcome: crate::turn::TurnOutcome::Completed,
         });
         exchange.observe_turn(&event, 70)?;
-        exchange.finish(crate::exchange::ExchangeState::Complete, 70)?;
+        exchange.finish(crate::exchange::ExchangeOutcome::Complete, 70)?;
         let restored = serde_json::from_value(serde_json::to_value(&exchange)?)?;
         let projected = project_at(
             &TimelineEntry::Exchange {
@@ -5131,6 +5278,7 @@ mod tests {
                 &document,
                 &Default::default(),
                 &projected.tool,
+                &projected.display,
             )
             .unwrap();
             let refreshed_group = refreshed.iter().find(|block| block.id == group.id).unwrap();
@@ -5222,7 +5370,6 @@ mod tests {
         use crate::backend::{
             BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
         };
-        use crate::exchange::ExchangeState;
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"cross-turn", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Inspect the repository", "kind":"chat", "state":"running",
@@ -5310,10 +5457,16 @@ mod tests {
             );
             for owner in 1..=ordinal {
                 assert!(
-                    projected.tool.contains_key(&format!(
-                        "{}:shared-call",
-                        exchange.turn[owner as usize - 1].id()
-                    )),
+                    projected
+                        .display
+                        .tool(
+                            &projected.entry.id,
+                            &crate::turn::ToolAddress::new(
+                                exchange.turn[owner as usize - 1].id(),
+                                "shared-call"
+                            )
+                        )
+                        .is_some_and(|id| projected.tool.contains_key(&id)),
                     "grouping replaced a tool's provider-turn identity"
                 );
             }
@@ -5332,6 +5485,7 @@ mod tests {
                 &document,
                 &Default::default(),
                 &projected.tool,
+                &projected.display,
             )?;
             let refreshed_group = refreshed
                 .iter()
@@ -5454,10 +5608,10 @@ mod tests {
         });
         exchange.observe_turn(&event, 43)?;
         for outcome in [
-            ExchangeState::Complete,
-            ExchangeState::Cancelled,
-            ExchangeState::Interrupted,
-            ExchangeState::Failed,
+            crate::exchange::ExchangeOutcome::Complete,
+            crate::exchange::ExchangeOutcome::Cancelled,
+            crate::exchange::ExchangeOutcome::Interrupted,
+            crate::exchange::ExchangeOutcome::Failed,
         ] {
             let mut finished = exchange.clone();
             finished.finish(outcome, 50)?;
@@ -6041,6 +6195,7 @@ mod tests {
             &document,
             &Default::default(),
             &projected.tool,
+            &projected.display,
         )
         .unwrap();
         let refreshed_heading = refreshed
@@ -6099,9 +6254,16 @@ mod tests {
                         access: Default::default(),
                         approval_mode: crate::session::ApprovalMode::Ask,
                     });
-                    exchange[0].state = state;
-                    exchange[0].completed_at_ms =
-                        (state == ExchangeState::Complete).then_some(7000);
+                    exchange[0].phase = crate::exchange::ExchangePhase::fixture(
+                        state,
+                        exchange[0].completed_at_ms(),
+                        exchange[0].finalization_outcome(),
+                    );
+                    exchange[0].phase = crate::exchange::ExchangePhase::fixture(
+                        exchange[0].state(),
+                        (state == ExchangeState::Complete).then_some(7000),
+                        exchange[0].finalization_outcome(),
+                    );
                 }
                 let selected = project_at(&selected_entry, &WidthProfile::default(), 7000).unwrap();
                 let expected = format!("s · Nested · codex · gpt-6.1-sol{suffix}");
@@ -6183,6 +6345,7 @@ mod tests {
                     &document,
                     &Default::default(),
                     &selected.tool,
+                    &selected.display,
                 )
                 .unwrap();
                 let heading = refreshed
@@ -6503,7 +6666,7 @@ mod tests {
         });
         exchange.observe_turn(&event, 5).unwrap();
         exchange
-            .finish(crate::exchange::ExchangeState::Complete, 5)
+            .finish(crate::exchange::ExchangeOutcome::Complete, 5)
             .unwrap();
         let projected = project_at(
             &TimelineEntry::Exchange {
@@ -6797,7 +6960,7 @@ mod tests {
             (
                 SessionPhase::Finalizing {
                     exchange_id: "exchange".into(),
-                    outcome: Some(crate::exchange::ExchangeState::Complete),
+                    outcome: Some(crate::exchange::ExchangeOutcome::Complete),
                     error: None,
                 },
                 "Saving exchange",
@@ -6807,7 +6970,7 @@ mod tests {
             (
                 SessionPhase::Finalizing {
                     exchange_id: "exchange".into(),
-                    outcome: Some(crate::exchange::ExchangeState::Complete),
+                    outcome: Some(crate::exchange::ExchangeOutcome::Complete),
                     error: Some("locked".into()),
                 },
                 "Saving exchange failed · locked",
@@ -7143,14 +7306,6 @@ mod tests {
         let target = &block.metadata.target[0];
         assert_eq!(target.range.start.row, 1);
         assert_eq!(target.range.start.column, 0);
-        assert!(
-            block
-                .metadata
-                .decoration
-                .iter()
-                .any(|decoration| decoration.capture == "ForgeHarnessRead"
-                    && decoration.range.start.row == 1)
-        );
         assert!(matches!(projected.action.get(&target.id),
             Some(super::TranscriptAction::Plan { plan_id, .. }) if plan_id == "pending-plan"));
         assert!(block.metadata.fold.is_empty());
@@ -7227,6 +7382,7 @@ mod tests {
             true,
             &HashMap::new(),
             &HashMap::new(),
+            &mut crate::buffer::identity::DisplayRegistry::default(),
         )
         .unwrap();
 
@@ -7240,9 +7396,9 @@ mod tests {
     #[test]
     fn unsuccessful_exchange_summaries_preserve_outcome_and_frozen_duration() {
         for (state, label) in [
-            (crate::exchange::ExchangeState::Interrupted, "Interrupted"),
-            (crate::exchange::ExchangeState::Failed, "Failed"),
-            (crate::exchange::ExchangeState::Cancelled, "Cancelled"),
+            (crate::exchange::ExchangeOutcome::Interrupted, "Interrupted"),
+            (crate::exchange::ExchangeOutcome::Failed, "Failed"),
+            (crate::exchange::ExchangeOutcome::Cancelled, "Cancelled"),
         ] {
             for kind in ["chat", "plan_draft", "plan_execution"] {
                 let mut exchange: Exchange = serde_json::from_value(json!({
@@ -7319,7 +7475,7 @@ mod tests {
             );
             exchange.observe_blocker("approval:command".into(), false, 90_000);
             assert_working(&exchange, 92_000, 6)?;
-            exchange.awaiting_input = true;
+            exchange.set_awaiting_input(true);
             exchange.pause(93_000);
             assert!(matches!(
                 SessionPhase::resolve(None, None, Some(&exchange)),
@@ -7471,7 +7627,7 @@ mod tests {
                 .find(|message| message.kind() == crate::turn::MessageKind::Assistant)
                 .unwrap();
             let streamed = super::message_block(heading, message, &width)?;
-            let replacement = &streamed.entry.block[0];
+            let replacement = &streamed.block;
             assert_eq!(
                 replacement.metadata.fold, heading.metadata.fold,
                 "a streamed thought update must retain its activity fold endpoints"
@@ -7557,7 +7713,7 @@ mod tests {
                         .last_mut()
                         .unwrap()
                         .finish(crate::turn::TurnOutcome::Completed, 49)?;
-                    exchange.finish(crate::exchange::ExchangeState::Complete, 50)?;
+                    exchange.finish(crate::exchange::ExchangeOutcome::Complete, 50)?;
                 }
                 let restored = serde_json::from_value(serde_json::to_value(&exchange)?)?;
                 let projected = project_at(
@@ -7787,7 +7943,7 @@ mod tests {
         for completed in [false, true] {
             let mut exchange = exchange.clone();
             if completed {
-                exchange.finish(crate::exchange::ExchangeState::Complete, 20)?;
+                exchange.finish(crate::exchange::ExchangeOutcome::Complete, 20)?;
             }
             let entry = TimelineEntry::Exchange {
                 id: exchange.id.clone(),
@@ -7878,7 +8034,7 @@ mod tests {
             rows.iter()
                 .any(|row| row.contains("Independent provider work"))
         );
-        assert!(rows.iter().any(|row| *row == "    Compiling forge-harness"));
+        assert!(rows.contains(&"    Compiling forge-harness"));
         assert!(!rows.iter().any(|row| row.contains("cargo test pending")
             || row.contains("older output")
             || row.contains("Previous check")
@@ -7890,10 +8046,15 @@ mod tests {
         let finished = project_at(&history[0], &WidthProfile::default(), 2000)?;
         assert_eq!(finished.tool.len(), 4);
         for id in ["passed", "running", "failed", "configuration_error"] {
-            assert!(finished.tool.contains_key(id));
+            assert!(
+                finished
+                    .display
+                    .check_id(id, None)
+                    .is_some_and(|id| finished.tool.contains_key(&id))
+            );
         }
         for id in ["pending", "skipped"] {
-            assert!(!finished.tool.contains_key(id));
+            assert!(finished.display.check_id(id, None).is_none());
             assert!(
                 finished
                     .entry
@@ -7960,6 +8121,7 @@ mod tests {
             &document,
             &Default::default(),
             &projected.tool,
+            &projected.display,
         )?;
         assert_eq!(refreshed.len(), 1);
         assert_eq!(refreshed[0].id.0, "status");
@@ -8004,7 +8166,8 @@ mod tests {
                 &profile,
                 &document,
                 &Default::default(),
-                &projected.tool
+                &projected.tool,
+                &projected.display
             )?
             .is_empty()
         );
@@ -8109,7 +8272,9 @@ mod tests {
             }))
             .unwrap();
             exchange.resume(1000).unwrap();
-            exchange.finish(ExchangeState::Failed, 4000).unwrap();
+            exchange
+                .finish(crate::exchange::ExchangeOutcome::Failed, 4000)
+                .unwrap();
             exchange.set_disposition(disposition).unwrap();
             let entry = TimelineEntry::Exchange {
                 id: exchange.id.clone(),
@@ -8134,7 +8299,7 @@ mod tests {
                     .join(" "),
                 format!("● {marker} · Failed 3s")
             );
-            assert_eq!(exchange.state, ExchangeState::Failed);
+            assert_eq!(exchange.state(), ExchangeState::Failed);
             assert_eq!(exchange.elapsed(90_000), 3000);
         }
     }
@@ -8186,8 +8351,14 @@ mod tests {
             forge_buffer::identity::DocumentId("summary-document".into()),
             projected.entry.block.clone(),
         )?;
-        let refreshed =
-            super::timing_blocks(&entry, &width, &document, &HashMap::new(), &projected.tool)?;
+        let refreshed = super::timing_blocks(
+            &entry,
+            &width,
+            &document,
+            &HashMap::new(),
+            &projected.tool,
+            &projected.display,
+        )?;
         let heading = refreshed
             .iter()
             .find(|block| block.id.0 == "summary:summary")
@@ -8355,7 +8526,7 @@ mod tests {
         });
         exchange.observe_turn(&event, 7000).unwrap();
         exchange
-            .finish(crate::exchange::ExchangeState::Complete, 7000)
+            .finish(crate::exchange::ExchangeOutcome::Complete, 7000)
             .unwrap();
         event.kind = "usage".into();
         event.turn_boundary = None;
@@ -8381,7 +8552,10 @@ mod tests {
         assert!(!exchange.observe_turn(&event, 90_000).unwrap());
         assert_eq!(exchange.usage().input, Some(76000));
         for duration_ms in [6500, 3500, 3000] {
-            exchange.duration_ms = duration_ms;
+            exchange.clock = crate::exchange::ExchangeClock::fixture(
+                duration_ms,
+                exchange.execution_started_at_ms(),
+            );
             assert_eq!(
                 super::exchange_activity_summary(&exchange, 90_000),
                 format!(
@@ -8539,14 +8713,14 @@ mod tests {
             .unwrap()
             .finish(crate::turn::TurnOutcome::Completed, 5500)
             .unwrap();
-        interaction.awaiting_input = true;
+        interaction.set_awaiting_input(true);
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
             "● Waiting for your answer 4s │ 1.0k (90%) -> 280"
         );
         interaction.kind = ExchangeKind::Chat;
         interaction
-            .finish(crate::exchange::ExchangeState::Complete, 5500)
+            .finish(crate::exchange::ExchangeOutcome::Complete, 5500)
             .unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),

@@ -328,7 +328,7 @@ impl NativeValues {
 
     fn value(&mut self, source: &Path, pointer: &str) -> Result<&Value> {
         if !self.source.contains_key(source) {
-            let value = document(&source, &std::fs::read(source)?)?;
+            let value = document(source, &std::fs::read(source)?)?;
             self.source.insert(source.to_owned(), value);
         }
         self.source[source]
@@ -360,7 +360,6 @@ fn path_identity(source: &str) -> String {
 fn sanitize_server(name: &str, source: &Value, file: &Path, pointer: &str) -> Result<Value> {
     ensure!(
         !name.is_empty()
-            && name.len() <= 128
             && name
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character)),

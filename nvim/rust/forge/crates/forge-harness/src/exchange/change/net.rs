@@ -101,7 +101,7 @@ impl FileContent {
                 text: row.text.to_owned(),
                 no_newline: row.no_newline,
             };
-            if row.kind == RowKind::Added {
+            if row.kind() == RowKind::Added {
                 replacement.push(Piece::Inserted(line));
                 continue;
             }
@@ -125,7 +125,7 @@ impl FileContent {
                     "sequential edit does not match preceding write"
                 ),
             }
-            if row.kind == RowKind::Context {
+            if row.kind() == RowKind::Context {
                 replacement.push(piece);
             }
         }

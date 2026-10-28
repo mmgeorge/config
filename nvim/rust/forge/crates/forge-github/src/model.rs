@@ -82,6 +82,16 @@ impl GithubRepositoryId {
         &self.hostname
     }
 
+    /// Returns the validated owner component without reparsing a repository path.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Returns the validated repository component independently of its owner.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Returns owner/name in the existing persisted issue-record format.
     pub fn repository_name(&self) -> String {
         format!("{}/{}", self.owner, self.name)

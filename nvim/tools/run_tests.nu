@@ -1,15 +1,30 @@
 const repository_root = path self | path dirname | path dirname | path dirname
 const runner_path = path self
 
+def publish_record [value: record, target_path: path] {
+  let pending_path = $"($target_path).pending"
+  $value | to json --raw | save --force $pending_path
+  mv --force $pending_path $target_path
+}
+
 def worker [spec_path: path, result_path: path, pid_path: path] {
-  {pid: $nu.pid} | to json --raw | save --force $pid_path
+  publish_record {pid: $nu.pid} $pid_path
   let spec = open $spec_path
   let result = try {
     run-external $spec.program ...$spec.arguments | complete
   } catch {|failure|
     {exit_code: 127, stdout: "", stderr: $failure.msg}
   }
-  $result | to json --raw | save --force $result_path
+  publish_record $result $result_path
+}
+
+def wait_for_result [result_path: path, timeout: duration] {
+  let started = date now
+  while (date now) - $started < $timeout {
+    if ($result_path | path exists) { return true }
+    sleep 50ms
+  }
+  $result_path | path exists
 }
 
 def descendant_pid [pid: int] {
@@ -61,18 +76,10 @@ def run_test [script_path: path, test: path, startup: list<string>, timeout: dur
     }
     $result | ignore
   }
-  let started = date now
-  mut result = null
-  while $result == null and (date now) - $started < $timeout {
-    if ($result_path | path exists) {
-      $result = try { open $result_path } catch {|failure|
-        {exit_code: 127, stdout: "", stderr: $"Worker result is unreadable: ($failure.msg)"}
-      }
-    } else {
-      sleep 50ms
+  let result = if (wait_for_result $result_path $timeout) {
+    let result = try { open $result_path } catch {|failure|
+      {exit_code: 127, stdout: "", stderr: $"Worker result is unreadable: ($failure.msg)"}
     }
-  }
-  let result = if $result != null {
     try { job kill $worker } catch { null }
     $result
   } else {

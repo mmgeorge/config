@@ -160,7 +160,7 @@ impl SkillAccess {
         if let Some(command) = command {
             let shell = string_at(&input, &["/shell"])
                 .map(CommandShell::from_executable)
-                .unwrap_or_else(CommandShell::default);
+                .unwrap_or_default();
             let parsed = normalize_command_in(command, shell);
             if parsed.failure.is_none() {
                 for invocation in &parsed.invocation_list {
@@ -698,6 +698,7 @@ mod tests {
             false,
             &HashMap::new(),
             &HashMap::new(),
+            &mut crate::buffer::identity::DisplayRegistry::default(),
         )?;
         let diamonds: Vec<_> = rendered
             .entry

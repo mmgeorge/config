@@ -27,7 +27,9 @@ pub use catalog::{
     BackendCatalogRequest, BackendInput, CatalogCapability, CatalogMutation, McpDefinition,
     McpStatus, McpToolDefinition, ResourceScope, SkillDefinition,
 };
-pub use execution::{ExecutionOwner, ProviderAddress, TurnBoundary};
+pub use execution::{
+    AgentId, ExchangeId, ExecutionOwner, ProviderAddress, SessionId, TaskId, TurnBoundary,
+};
 pub(crate) use steering::{ActiveSteering, SteerCommand, SteeringLane};
 pub use steering::{SteerTarget, SteeringInput};
 

@@ -800,9 +800,12 @@ impl PermissionCoordinator {
                 .pending_map
                 .lock()
                 .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
-            let pending = pending_map
-                .get(approval_id)
-                .with_context(|| format!("approval request is no longer pending: {approval_id}"))?;
+            let std::collections::btree_map::Entry::Occupied(entry) =
+                pending_map.entry(approval_id.to_owned())
+            else {
+                anyhow::bail!("approval request is no longer pending: {approval_id}");
+            };
+            let pending = entry.get();
             anyhow::ensure!(
                 !pending
                     .view
@@ -837,10 +840,10 @@ impl PermissionCoordinator {
                     .iter()
                     .find(|choice| &choice.id == *choice_id)
                     .with_context(|| format!("unknown approval choice: {choice_id}"))?;
-                if let Some(directory) = &choice.directory {
-                    if !directory_list.contains(directory) {
-                        directory_list.push(directory.clone());
-                    }
+                if let Some(directory) = &choice.directory
+                    && !directory_list.contains(directory)
+                {
+                    directory_list.push(directory.clone());
                 }
                 match choice.resolution {
                     ApprovalResolution::Cancel => resolution = ApprovalResolution::Cancel,
@@ -888,9 +891,7 @@ impl PermissionCoordinator {
                 !pending.response.is_closed(),
                 "provider no longer waits for approval {approval_id}"
             );
-            let pending = pending_map
-                .remove(approval_id)
-                .expect("validated approval must remain pending while locked");
+            let pending = entry.remove();
             if resolution != ApprovalResolution::AllowOnce {
                 directory_list.clear();
             }
@@ -918,21 +919,21 @@ impl PermissionCoordinator {
             return Err(error);
         }
         // Queue the terminal event before the provider can resume and finish its turn.
-        if !directory_list.is_empty() {
-            if let Some(sink) = event_sink {
-                sink.send_wait(BackendEvent {
-                    address: None,
-                    turn_boundary: None,
-                    received_at_ms: None,
-                    kind: "directory_access_granted".into(),
-                    text: None,
-                    activity: None,
-                    summary: None,
-                    task_update: None,
-                    data: serde_json::to_value(&directory_list)?,
-                })
-                .await?;
-            }
+        if !directory_list.is_empty()
+            && let Some(sink) = event_sink
+        {
+            sink.send_wait(BackendEvent {
+                address: None,
+                turn_boundary: None,
+                received_at_ms: None,
+                kind: "directory_access_granted".into(),
+                text: None,
+                activity: None,
+                summary: None,
+                task_update: None,
+                data: serde_json::to_value(&directory_list)?,
+            })
+            .await?;
         }
         Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
         if pending.response.send(resolution).is_err() {
@@ -2822,7 +2823,7 @@ mod test {
                     shell: Some(shell)
                 }]
             );
-            assert!(!normalize_command_in(script, shell).failure.is_some());
+            assert!(normalize_command_in(script, shell).failure.is_none());
             let request = permission_from_copilot(
                 "id".into(),
                 "shell",

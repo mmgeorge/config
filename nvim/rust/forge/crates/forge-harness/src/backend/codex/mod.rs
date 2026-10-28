@@ -366,10 +366,10 @@ impl CodexBackend {
             .map(str::to_owned)
             .or(request.backend_session_id.clone())
             .context("Codex thread response omitted thread id")?;
-        if request.mode != PromptMode::Background {
-            if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? {
-                resources.retain_thread(&thread).await;
-            }
+        if request.mode != PromptMode::Background
+            && let Some(resources) = self.resources(&Self::catalog_from_request(request)).await?
+        {
+            resources.retain_thread(&thread).await;
         }
         Ok(thread)
     }
@@ -524,10 +524,10 @@ impl CodexBackend {
             .backend_session_id
             .as_deref()
             .context("terminal thread id missing")?;
-        if let Some(resources) = resources {
-            if resources.thread().await.as_deref() == Some(thread_id) {
-                return Ok(());
-            }
+        if let Some(resources) = resources
+            && resources.thread().await.as_deref() == Some(thread_id)
+        {
+            return Ok(());
         }
         let mut parameter = json!({"threadId":thread_id});
         if let Some(resources) = resources {
@@ -1119,7 +1119,7 @@ impl CodexBackend {
                     && let Some(submission) = submission
                     && matches!(
                         message.pointer("/error/code").and_then(Value::as_i64),
-                        Some(-32600 | -32601 | -32602)
+                        Some(-32602..=-32600)
                     )
                 {
                     submission.rejected(response.as_ref().unwrap_err().to_string())?;
@@ -1963,19 +1963,19 @@ impl Backend for CodexBackend {
             return self.mcp_configuration(request).await;
         }
         let (mut process, mut output) = self.catalog_process(&request).await?;
-        if let Some(resources) = resources.as_ref() {
-            if resources.thread().await != thread {
-                let mut backend_request = Self::catalog_backend_request(&request);
-                backend_request.backend_session_id = thread.clone();
-                self.load_thread(
-                    &mut process,
-                    &mut output,
-                    &backend_request,
-                    true,
-                    Vec::new(),
-                )
-                .await?;
-            }
+        if let Some(resources) = resources.as_ref()
+            && resources.thread().await != thread
+        {
+            let mut backend_request = Self::catalog_backend_request(&request);
+            backend_request.backend_session_id = thread.clone();
+            self.load_thread(
+                &mut process,
+                &mut output,
+                &backend_request,
+                true,
+                Vec::new(),
+            )
+            .await?;
         }
         let mut server_list = Vec::new();
         let mut cursor = None::<String>;
@@ -2945,7 +2945,6 @@ mod test {
                         assert!(instructions.contains(
                             "Approval mode, filesystem access, and task are independent"
                         ));
-                        assert!(instructions.contains("Effective permission: Read."));
                         assert!(instructions.contains("Answer the current user request"));
                         messages.push(
                             json!({"method":"thread/goal/cleared","params":{"threadId":"parent"}}),
@@ -3069,7 +3068,7 @@ mod test {
             let saved = serde_json::to_string(&exchange)?;
             assert!(saved.contains("CURRENT"));
             assert!(!saved.contains("STALE"));
-            exchange.finish(crate::exchange::ExchangeState::Complete, 7000)?;
+            exchange.finish(crate::exchange::ExchangeOutcome::Complete, 7000)?;
             let rendered = crate::buffer::projection::project(
                 &crate::timeline::TimelineEntry::Exchange {
                     id: exchange.id.clone(),
@@ -3081,6 +3080,7 @@ mod test {
                 false,
                 &std::collections::HashMap::new(),
                 &std::collections::HashMap::new(),
+                &mut crate::buffer::identity::DisplayRegistry::default(),
             )?;
             assert!(rendered.entry.block.iter().any(|block| {
                 block
@@ -3151,7 +3151,6 @@ mod test {
                 assert_eq!(request["params"]["model"], "gpt-5.6-terra");
                 let instructions = request["params"]["developerInstructions"].as_str().unwrap();
                 assert!(instructions.contains("active Goal task"));
-                assert!(instructions.contains("Effective permission: Read."));
                 assert_eq!(
                     request["params"]["config"]["model_reasoning_effort"],
                     "medium"

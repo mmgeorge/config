@@ -40,7 +40,7 @@ function M.apply(session, view, effect)
     and not vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), view.cursor)
   then return "Discarded" end
   local ok, failure = pcall(function()
-    assert(type(effect.id) == "string" and #effect.id > 0 and #effect.id <= 256 and not effect.id:find("%c"), "invalid effect identity")
+    assert(type(effect.id) == "string" and #effect.id > 0 and not effect.id:find("%c"), "invalid effect identity")
     assert(vim.tbl_count(view.effect) < 64, "input effect limit exceeded")
     assert(not vim.in_fast_event(), "effects require the main loop")
     if effect.kind == "cursor" then

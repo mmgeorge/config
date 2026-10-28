@@ -1633,8 +1633,8 @@ pub(super) fn control_invocation(
 }
 
 fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
-    if let Some(compaction) = event.compaction().ok().flatten() {
-        if let Some(previous) = output.event.iter_mut().find(|previous| {
+    if let Some(compaction) = event.compaction().ok().flatten()
+        && let Some(previous) = output.event.iter_mut().find(|previous| {
             previous
                 .compaction()
                 .ok()
@@ -1642,17 +1642,17 @@ fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
                 .is_some_and(|existing| {
                     existing.id == compaction.id && existing.thread_id == compaction.thread_id
                 })
-        }) {
-            if previous
-                .compaction()
-                .ok()
-                .flatten()
-                .is_some_and(|existing| existing.state == crate::backend::CompactionState::Running)
-            {
-                *previous = event;
-            }
-            return;
+        })
+    {
+        if previous
+            .compaction()
+            .ok()
+            .flatten()
+            .is_some_and(|existing| existing.state == crate::backend::CompactionState::Running)
+        {
+            *previous = event;
         }
+        return;
     }
     if matches!(
         event.kind.as_str(),
@@ -2046,18 +2046,18 @@ fn tool_title(value: &Value) -> Option<String> {
                 .collect::<Option<Vec<_>>>()?;
             let interpreter =
                 crate::permissions::shell::CommandShell::from_executable(arguments.first()?);
-            if interpreter != crate::permissions::shell::CommandShell::Unknown {
-                if let Some(marker) = arguments.iter().position(|argument| {
+            if interpreter != crate::permissions::shell::CommandShell::Unknown
+                && let Some(marker) = arguments.iter().position(|argument| {
                     matches!(
                         argument.to_ascii_lowercase().as_str(),
                         "-command" | "--commands" | "-c" | "-lc" | "-ic" | "-lic"
                     )
-                }) && let Some(script) = arguments.get(marker + 1)
-                    && marker + 2 == arguments.len()
-                {
-                    let display = crate::permissions::command::display_command(script, interpreter);
-                    return compact_tool_title(&display.source);
-                }
+                })
+                && let Some(script) = arguments.get(marker + 1)
+                && marker + 2 == arguments.len()
+            {
+                let display = crate::permissions::command::display_command(script, interpreter);
+                return compact_tool_title(&display.source);
             }
             let title = part_list
                 .iter()
@@ -3615,7 +3615,7 @@ mod test {
                 let event = event_stream.try_recv()?;
                 assert_eq!(event.kind, "tool");
                 assert_eq!(event.address.as_ref(), Some(&address));
-                turn.record_tool_event(&event, now_ms)?;
+                turn.record_tool_event(event.tool_event().unwrap(), now_ms)?;
                 let tool = turn.tools().find(|tool| tool.id == id).unwrap();
                 if method == "item/started" {
                     assert_eq!(tool.title, "Web Search");

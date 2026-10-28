@@ -1,6 +1,7 @@
 mod changes;
 pub mod document;
 mod duration;
+pub mod identity;
 mod layout;
 mod markdown_math;
 mod message;

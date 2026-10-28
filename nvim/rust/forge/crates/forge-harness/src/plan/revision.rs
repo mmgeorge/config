@@ -14,11 +14,10 @@ pub(crate) struct DeclarationDelta {
 
 impl DeclarationDelta {
     /// Use the previous proposal as the baseline, or source declarations for the first submission.
-    pub(crate) fn between(previous: Option<&PlanDocument>, current: &PlanDocument) -> Result<Self> {
-        let design = current
-            .design
-            .as_ref()
-            .expect("declaration delta requires a design");
+    pub(crate) fn between(
+        previous: Option<&PlanDocument>,
+        design: &DeclarationDesign,
+    ) -> Result<Self> {
         let previous = previous.and_then(|document| document.design.as_ref());
         let mut baseline = previous
             .map(|design| design.proposed.clone())
@@ -157,7 +156,7 @@ pub(crate) fn write_file(
             after.unwrap_or_default().as_bytes().to_vec(),
             Representation::DisplayOnly,
         )?,
-    })?;
+    });
     let before_name = format!("a/{before_path}");
     let after_name = format!("b/{after_path}");
     forge_diff::unified::write_file_header(&before_name, &after_name, patch)?;
@@ -222,7 +221,8 @@ mod tests {
             .behavior = Some(crate::plan::FunctionBehavior::Change(
             "Limit transient retries to three attempts.".into(),
         ));
-        let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
+        let delta =
+            DeclarationDelta::between(Some(&previous), current.design.as_ref().unwrap()).unwrap();
         assert!(
             delta
                 .files
@@ -270,7 +270,8 @@ mod tests {
             .as_mut()
             .unwrap()[0]
             .name = "after".into();
-        let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
+        let delta =
+            DeclarationDelta::between(Some(&previous), current.design.as_ref().unwrap()).unwrap();
         assert!(delta.files.contains("-  before") && delta.files.contains("+  after"));
     }
 
@@ -298,7 +299,8 @@ mod tests {
         design
             .proposed
             .insert("Foo.rs".into(), "pub struct After;\n".into());
-        let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
+        let delta =
+            DeclarationDelta::between(Some(&previous), current.design.as_ref().unwrap()).unwrap();
         assert!(
             delta.files.contains("-pub struct Before;")
                 && delta.files.contains("+pub struct After;")
@@ -368,7 +370,8 @@ mod tests {
             .proposed
             .insert("src/added.rs".into(), "pub struct Added;\n".into());
         design.document.design = "Revised description".into();
-        let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
+        let delta =
+            DeclarationDelta::between(Some(&previous), current.design.as_ref().unwrap()).unwrap();
         let patch = UnifiedPatch::parse(&delta.files).unwrap();
         assert_eq!(patch.file.len(), 4);
         assert!(!delta.files.contains("unchanged.rs") && !delta.files.contains("Design:"));
@@ -393,7 +396,8 @@ mod tests {
         assert!(
             !delta.document.contains("plan.json") && !delta.document.contains("\"description\"")
         );
-        let unchanged = DeclarationDelta::between(Some(&current), &current).unwrap();
+        let unchanged =
+            DeclarationDelta::between(Some(&current), current.design.as_ref().unwrap()).unwrap();
         assert!(unchanged.files.is_empty() && unchanged.document.is_empty());
     }
 
@@ -412,7 +416,8 @@ mod tests {
         design.document.background = "The fixture contains the declarations under review.".into();
         design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
         design.document.design = "First paragraph.\n\nRevised `State` paragraph.".into();
-        let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
+        let delta =
+            DeclarationDelta::between(Some(&previous), current.design.as_ref().unwrap()).unwrap();
         let patch = UnifiedPatch::parse(&delta.document).unwrap();
         assert_eq!(patch.file.len(), 2);
         assert_eq!(patch.file[0].new_path.as_deref(), Some("Objective"));
@@ -440,7 +445,7 @@ mod tests {
             .insert("renamed.rs".into(), "pub struct Existing;\n".into());
         design.moved.insert("lib.rs".into(), "renamed.rs".into());
         current.design = Some(design);
-        let delta = DeclarationDelta::between(None, &current).unwrap();
+        let delta = DeclarationDelta::between(None, current.design.as_ref().unwrap()).unwrap();
         assert!(delta.files.contains("a/lib.rs b/renamed.rs"));
         let mut reverted = current.clone();
         let design = reverted.design.as_mut().unwrap();
@@ -449,7 +454,8 @@ mod tests {
         design
             .proposed
             .insert("lib.rs".into(), "pub struct Existing;\n".into());
-        let delta = DeclarationDelta::between(Some(&current), &reverted).unwrap();
+        let delta =
+            DeclarationDelta::between(Some(&current), reverted.design.as_ref().unwrap()).unwrap();
         assert!(delta.files.contains("a/renamed.rs b/lib.rs"));
     }
 }

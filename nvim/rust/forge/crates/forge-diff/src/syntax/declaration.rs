@@ -127,10 +127,9 @@ impl DeclarationOverview {
                 if position.line == display_row
                     && position.column as usize <= column
                     && column < position.column as usize + token.len()
+                    && let Some((source, _)) = saved_tokens.get(&identity)
                 {
-                    if let Some((source, _)) = saved_tokens.get(&identity) {
-                        return Ok(*source);
-                    }
+                    return Ok(*source);
                 }
             }
         }
@@ -911,10 +910,10 @@ fn format_group(
             output.push_str(&text);
             output.push('\n');
         }
-        if let Some(separator) = separator {
-            if !text.ends_with(separator) {
-                text.push(separator);
-            }
+        if let Some(separator) = separator
+            && !text.ends_with(separator)
+        {
+            text.push(separator);
         }
         output.push_str(&text);
         previous = group;
@@ -1136,18 +1135,19 @@ fn project_node(
                             return text.into();
                         }
                         let name = prefix.trim_start_matches("local ").trim();
-                        if value.kind() == "function_definition" && !name.contains(',') {
-                            if let Some(parameters) = value.child_by_field_name("parameters") {
-                                return format!(
-                                    "{}function {name}{}",
-                                    if prefix.starts_with("local ") {
-                                        "local "
-                                    } else {
-                                        ""
-                                    },
-                                    &source[parameters.byte_range()]
-                                );
-                            }
+                        if value.kind() == "function_definition"
+                            && !name.contains(',')
+                            && let Some(parameters) = value.child_by_field_name("parameters")
+                        {
+                            return format!(
+                                "{}function {name}{}",
+                                if prefix.starts_with("local ") {
+                                    "local "
+                                } else {
+                                    ""
+                                },
+                                &source[parameters.byte_range()]
+                            );
                         }
                         if value.kind() == "table_constructor" && !name.contains(',') {
                             let mut output = prefix.to_owned();
@@ -1189,12 +1189,12 @@ fn project_node(
                 return prefix.trim_end().to_owned();
             }
         } else if let Some(value) = node.child_by_field_name("value") {
-            if matches!(value.kind(), "arrow_function" | "function_expression") {
-                if let Some(body) = value.child_by_field_name("body") {
-                    return source[node.start_byte()..body.start_byte()]
-                        .trim()
-                        .to_owned();
-                }
+            if matches!(value.kind(), "arrow_function" | "function_expression")
+                && let Some(body) = value.child_by_field_name("body")
+            {
+                return source[node.start_byte()..body.start_byte()]
+                    .trim()
+                    .to_owned();
             }
             let prefix = source[node.start_byte()..value.start_byte()]
                 .trim_end()

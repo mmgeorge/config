@@ -925,7 +925,7 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
 }
 
 #[test]
-fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() {
+fn restarts_a_running_turn_with_updated_permissions_without_creating_another_interaction() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
@@ -977,9 +977,9 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
         "id": 3,
         "method": "task.transition",
         "params": {
-            "operation_id": "restart-in-write-mode",
+            "operation_id": "restart-with-updated-permissions",
             "action": "permission",
-            "change":{"kind":"set_approval","mode":"ask"}
+            "change":{"kind":"set_approval","mode":"allow"}
         }
     }));
     let restart = broker.read_response(3);
@@ -1004,8 +1004,11 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
     loop {
         let message = broker.read_message();
         if message["event"] == "task_operation"
-            && message["payload"]["id"] == "restart-in-write-mode"
-            && message["payload"]["state"] != "running"
+            && message["payload"]["id"] == "restart-with-updated-permissions"
+            && matches!(
+                message["payload"]["state"].as_str(),
+                Some("completed" | "failed")
+            )
         {
             assert_eq!(message["payload"]["state"], "completed", "{message}");
             assert!(message["payload"]["error"].is_null(), "{message}");
@@ -1027,7 +1030,7 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
             .unwrap()
             .pointer("/result/session/approval_mode")
             .and_then(Value::as_str),
-        Some("write")
+        Some("allow")
     );
 }
 
@@ -1075,16 +1078,32 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
 
     broker.request(json!({
         "id": 2,
-        "method": "session.permission",
-        "params": { "change":{"kind":"set_approval","mode":"ask"} }
+        "method": "task.transition",
+        "params": { "operation_id":"retract-permission-setup", "action":"permission", "change":{"kind":"set_approval","mode":"ask"} }
     }));
     broker.read_response(2);
+    loop {
+        let message = broker.read_message();
+        if message["event"] == "task_operation"
+            && message["payload"]["id"] == "retract-permission-setup"
+            && matches!(
+                message["payload"]["state"].as_str(),
+                Some("completed" | "failed")
+            )
+        {
+            assert_eq!(message["payload"]["state"], "completed", "{message}");
+            break;
+        }
+    }
     let prompt = "/plan reconsider this\nbefore doing anything";
     broker.request(json!({
         "id": 3,
         "method": "prompt.submit",
         "params": { "text": prompt }
     }));
+    broker.wait_for_exchanges(3, None, |snapshot| {
+        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
+    });
     broker.request(json!({
         "id": 4,
         "method": "turn.cancel",
@@ -1141,7 +1160,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
             .unwrap()
             .pointer("/result/session/approval_mode")
             .and_then(Value::as_str),
-        Some("write")
+        Some("ask")
     );
     assert_eq!(
         snapshot

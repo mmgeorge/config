@@ -1055,7 +1055,7 @@ impl Backend for CopilotBackend {
             .permission_coordinator
             .directories(self.settings_root.as_deref(), &request)?;
         let event_sink = skills.sink(event_sink);
-        let _turn_event_guard = turn_event.activate(
+        let turn_event_guard = turn_event.activate(
             event_sink.clone(),
             request
                 .control_context
@@ -1143,10 +1143,9 @@ impl Backend for CopilotBackend {
             .tail()
             .await
             .context("capture Copilot pre-submit history boundary")?;
-        turn_event.set_history_cursor(history.cursor.clone())?;
         let message = crate::attachment::copilot_input(&prompt, &request.input_attachments())?;
-        turn_event
-            .send(async {
+        turn_event_guard
+            .send(history.cursor.clone(), async {
                 self.trace.record(
                     &request.harness_session_id,
                     "copilot.session.send",
@@ -1273,11 +1272,10 @@ impl Backend for CopilotBackend {
                     }
                 }
                 invocation = control_stream.receive() => {
-                    if let Some(invocation) = invocation {
-                        if let Err(error) = apply_invocation(&invocation, &mut output) {
+                    if let Some(invocation) = invocation
+                        && let Err(error) = apply_invocation(&invocation, &mut output) {
                             output.control_error = Some(format!("{error:#}"));
                         }
-                    }
                 }
             }
         }
@@ -1806,7 +1804,7 @@ impl Backend for CopilotBackend {
             .context("Copilot session has not started")?;
         self.turn_event(session_id)
             .await
-            .send(async {
+            .steer(async {
                 let submission = match &input {
                     super::SteeringInput::User { submission, .. } => submission.as_ref(),
                     _ => None,
@@ -2216,10 +2214,10 @@ impl Drop for ControlToolStream {
     fn drop(&mut self) {
         if let Ok(mut sender) = self.router.sender.lock() {
             *sender = None;
-            if let Ok(mut runtime) = self.router.runtime.lock() {
-                if let Some(runtime) = runtime.take() {
-                    runtime.cancel();
-                }
+            if let Ok(mut runtime) = self.router.runtime.lock()
+                && let Some(runtime) = runtime.take()
+            {
+                runtime.cancel();
             }
         }
     }

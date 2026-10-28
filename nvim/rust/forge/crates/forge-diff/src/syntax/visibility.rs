@@ -203,11 +203,10 @@ impl Visibility<'_> {
         if matches!(
             node.kind(),
             "struct_item" | "enum_item" | "trait_item" | "type_item"
-        ) {
-            if let Some(name) = node.child_by_field_name("name") {
-                self.types
-                    .insert(self.text[name.byte_range()].into(), self.public(node));
-            }
+        ) && let Some(name) = node.child_by_field_name("name")
+        {
+            self.types
+                .insert(self.text[name.byte_range()].into(), self.public(node));
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -574,14 +573,13 @@ mod tests {
         text.lines()
             .zip(visibility.rows)
             .enumerate()
-            .filter_map(|(row, (line, public))| {
-                public.then(|| {
-                    visibility
-                        .replacement
-                        .get(&row)
-                        .map(String::as_str)
-                        .unwrap_or(line)
-                })
+            .filter(|&(_, (_, public))| public)
+            .map(|(row, (line, _))| {
+                visibility
+                    .replacement
+                    .get(&row)
+                    .map(String::as_str)
+                    .unwrap_or(line)
             })
             .collect::<Vec<_>>()
             .join("\n")

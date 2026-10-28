@@ -72,10 +72,10 @@ impl ReviewService {
             .lock()
             .expect("review document poisoned")
             .capture_input(&input)?;
-        if input.action == "open" {
-            if let ReviewTarget::FileDiff { path } = &target {
-                target = ReviewTarget::WorkspaceFile { path: path.clone() };
-            }
+        if input.action == "open"
+            && let ReviewTarget::FileDiff { path } = &target
+        {
+            target = ReviewTarget::WorkspaceFile { path: path.clone() };
         }
         let mut delivery = ReviewActionDelivery {
             patch: Vec::new(),

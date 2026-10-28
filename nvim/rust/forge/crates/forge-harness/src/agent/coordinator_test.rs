@@ -34,13 +34,15 @@ fn request(operation_id: &str, task_name: &str) -> (AgentRequest, SpawnAgentRequ
     )
 }
 
-fn admit(coordinator: &AgentCoordinator, operation_id: &str, task_name: &str) -> AgentAdmission {
+fn admit(coordinator: &AgentCoordinator, operation_id: &str, task_name: &str) -> AgentWork {
     let (request, spawn) = request(operation_id, task_name);
     let admission = coordinator
         .reserve_spawn(&request, &spawn, selection(BackendKind::Mock), "parent", 1)
         .unwrap();
-    assert!(coordinator.commit(&admission).unwrap());
-    admission
+    match admission.commit().unwrap() {
+        AgentCommit::Admitted(work) => work,
+        AgentCommit::Existing(_) => panic!("new request reused an admission"),
+    }
 }
 
 #[test]
@@ -62,9 +64,13 @@ fn capacity_counts_uncommitted_and_cleanup_ownership_without_orphaning_ninth() {
             .is_err()
     );
     assert!(coordinator.snapshot(None).is_empty());
-    for admission in &admitted {
-        coordinator.commit(admission).unwrap();
-    }
+    let admitted = admitted
+        .into_iter()
+        .map(|admission| match admission.commit().unwrap() {
+            AgentCommit::Admitted(work) => work,
+            AgentCommit::Existing(_) => panic!("new request reused an admission"),
+        })
+        .collect::<Vec<_>>();
     assert_eq!(coordinator.active_count(), 8);
     let first = &admitted[0];
     coordinator
@@ -110,8 +116,8 @@ fn retries_resolve_one_identity_and_rejected_persistence_releases_reservation() 
         .unwrap();
     assert_eq!(first.agent.id, replay.agent.id);
     assert_eq!(first.task.id, replay.task.id);
-    coordinator.commit(&first).unwrap();
-    assert!(!coordinator.commit(&replay).unwrap());
+    assert!(matches!(first.commit().unwrap(), AgentCommit::Admitted(_)));
+    assert!(matches!(replay.commit().unwrap(), AgentCommit::Existing(_)));
     let mut conflict = spawn.clone();
     conflict.text = "different work".into();
     assert!(
@@ -137,16 +143,16 @@ fn retries_resolve_one_identity_and_rejected_persistence_releases_reservation() 
             )
             .is_ok()
     );
-    coordinator.reject("another-operation");
     let (failed, spawn) = super::coordinator_test::request("failed", "failed");
-    coordinator
-        .reserve_spawn(&failed, &spawn, selection(BackendKind::Claude), "parent", 3)
-        .unwrap();
-    coordinator.reject("failed");
+    drop(
+        coordinator
+            .reserve_spawn(&failed, &spawn, selection(BackendKind::Claude), "parent", 3)
+            .unwrap(),
+    );
     let retried = coordinator
         .reserve_spawn(&failed, &spawn, selection(BackendKind::Claude), "parent", 4)
         .unwrap();
-    coordinator.commit(&retried).unwrap();
+    retried.commit().unwrap();
     assert_eq!(coordinator.snapshot(None).len(), 2);
 }
 
@@ -187,7 +193,7 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
             .reserve_followup(&request, &first.agent.id, "next task", "parent", 2)
             .unwrap();
         assert!(!admission.launch);
-        coordinator.commit(&admission).unwrap();
+        admission.commit().unwrap();
     }
     let overflow = AgentRequest {
         operation_id: "overflow".into(),
@@ -222,7 +228,10 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
         .reserve_followup(&overflow, &first.agent.id, "next task", "parent", 3)
         .unwrap();
     assert!(explicit.launch);
-    coordinator.commit(&explicit).unwrap();
+    let explicit = match explicit.commit().unwrap() {
+        AgentCommit::Admitted(work) => work,
+        AgentCommit::Existing(_) => panic!("new follow-up reused an admission"),
+    };
     assert!(
         !*coordinator
             .cancellation(&explicit.agent.id, &explicit.task.id)
@@ -251,7 +260,10 @@ fn settled_task_selects_only_the_next_queued_task_and_retains_selection() {
     let second = coordinator
         .reserve_followup(&request, "worker-1", "next", "parent", 2)
         .unwrap();
-    coordinator.commit(&second).unwrap();
+    let second = match second.commit().unwrap() {
+        AgentCommit::Admitted(work) => work,
+        AgentCommit::Existing(_) => panic!("new follow-up reused an admission"),
+    };
     let next = coordinator
         .settled(&first.agent.id, &first.task.id, false)
         .unwrap()
@@ -265,6 +277,41 @@ fn settled_task_selects_only_the_next_queued_task_and_retains_selection() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn reservation_drop_releases_capacity_and_cancel_revokes_replay() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let (request, spawn) = request("operation", "worker");
+    let original = coordinator
+        .reserve_spawn(&request, &spawn, selection(BackendKind::Mock), "parent", 1)
+        .unwrap();
+    let replay = coordinator
+        .reserve_spawn(&request, &spawn, selection(BackendKind::Mock), "parent", 2)
+        .unwrap();
+    let original_id = original.task.id.clone();
+    drop(original);
+    let committed = replay.commit().unwrap();
+    assert!(matches!(committed, AgentCommit::Admitted(ref work) if work.task.id == original_id));
+
+    let (request, spawn) = super::coordinator_test::request("cancelled", "worker");
+    let original = coordinator
+        .reserve_spawn(&request, &spawn, selection(BackendKind::Mock), "parent", 3)
+        .unwrap();
+    let replay = coordinator
+        .reserve_spawn(&request, &spawn, selection(BackendKind::Mock), "parent", 4)
+        .unwrap();
+    original.cancel().unwrap();
+    assert!(replay.commit().is_err());
+    let retried = coordinator
+        .reserve_spawn(&request, &spawn, selection(BackendKind::Mock), "parent", 5)
+        .unwrap();
+    let retried_id = retried.task.id.clone();
+    drop(retried);
+    let fresh = coordinator
+        .reserve_spawn(&request, &spawn, selection(BackendKind::Mock), "parent", 6)
+        .unwrap();
+    assert_ne!(fresh.task.id, retried_id);
 }
 
 #[tokio::test]

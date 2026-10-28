@@ -144,13 +144,14 @@ impl SavedDiffSyntax {
                         metadata: BlockMetadata::default(),
                     };
                     for (index, row) in rows.iter().enumerate() {
-                        let (syntax, source_row) = if let Some(line) = row.new_line {
-                            (&new, line - hunk.new_lines.start)
-                        } else {
-                            (
-                                &old,
-                                row.old_line.expect("removed source line") - hunk.old_lines.start,
-                            )
+                        let (syntax, source_row) = match row.coordinates() {
+                            forge_diff::display::RowCoordinates::Added { new_line }
+                            | forge_diff::display::RowCoordinates::Context { new_line, .. } => {
+                                (&new, new_line - hunk.new_lines.start)
+                            }
+                            forge_diff::display::RowCoordinates::Removed { old_line } => {
+                                (&old, old_line - hunk.old_lines.start)
+                            }
                         };
                         forge_diff::projection::append_syntax_row(
                             &mut result.metadata,
@@ -172,7 +173,7 @@ impl SavedDiffSyntax {
 fn fragment(hunk: &PatchHunk<'_>, old: bool) -> Result<SourceVersion> {
     let mut text = Vec::new();
     for row in &hunk.row {
-        if (old && row.old_line.is_some()) || (!old && row.new_line.is_some()) {
+        if (old && row.old_line().is_some()) || (!old && row.new_line().is_some()) {
             text.extend_from_slice(row.text.as_bytes());
             if !row.no_newline {
                 text.push(b'\n');

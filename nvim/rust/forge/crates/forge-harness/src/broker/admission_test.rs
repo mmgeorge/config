@@ -12,7 +12,7 @@ async fn admission_skips_completed_transcript_but_settles_running_exchange() -> 
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let (mut previous, _, _) = broker.interaction_for_turn("previous", true, 10).await?;
         if completed {
-            previous.finish(ExchangeState::Complete, 20)?;
+            previous.finish(crate::exchange::ExchangeOutcome::Complete, 20)?;
         }
         broker.store.save_exchange(&previous)?;
         if completed {
@@ -26,7 +26,10 @@ async fn admission_skips_completed_transcript_but_settles_running_exchange() -> 
         if completed {
             assert!(events.is_empty(), "completed exchange was republished");
         } else {
-            assert_eq!(broker.store.load_exchange(&previous.id)?.unwrap().state, ExchangeState::Complete);
+            assert_eq!(
+                broker.store.load_exchange(&previous.id)?.unwrap().state(),
+                ExchangeState::Complete
+            );
             assert!(!events.is_empty(), "required completion was not published");
         }
     }
@@ -34,7 +37,8 @@ async fn admission_skips_completed_transcript_but_settles_running_exchange() -> 
 }
 
 #[tokio::test]
-async fn admission_precedes_preparation_and_settles_success_failure_and_cancellation() -> Result<()> {
+async fn admission_precedes_preparation_and_settles_success_failure_and_cancellation() -> Result<()>
+{
     for outcome in ["complete", "fail", "cancel"] {
         let repository = repository();
         let data = tempfile::tempdir()?;
@@ -66,7 +70,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             let store = SqliteStore::read_only(data.path())?;
             let exchange = store.list_exchange(&session_id)?;
             assert_eq!(exchange.len(), 1);
-            assert_eq!(exchange[0].state, ExchangeState::Running);
+            assert_eq!(exchange[0].state(), ExchangeState::Running);
             assert_eq!(exchange[0].prompt, "Visible before provider preparation");
             assert!(!tool_ran.load(Ordering::SeqCst));
             if outcome == "cancel" {
@@ -77,27 +81,44 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             Ok::<_, anyhow::Error>(())
         };
         let (result, observed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(broker.run_interaction(
-                "Visible before provider preparation".into(),
-                PromptMode::Chat,
-                Some(ExchangeAdmission::chat("Visible before provider preparation".into())),
-            ), observe)
-        }).await?;
+            tokio::join!(
+                broker.run_interaction(
+                    "Visible before provider preparation".into(),
+                    PromptMode::Chat,
+                    Some(ExchangeAdmission::chat(
+                        "Visible before provider preparation".into()
+                    )),
+                ),
+                observe
+            )
+        })
+        .await?;
         observed?;
         match outcome {
-            "complete" => { result?; }
-            "fail" => assert!(format!("{:#}", result.unwrap_err()).contains("fixture preparation failed")),
+            "complete" => {
+                result?;
+            }
+            "fail" => {
+                assert!(format!("{:#}", result.unwrap_err()).contains("fixture preparation failed"))
+            }
             "cancel" => assert!(result.unwrap_err().is::<TurnCancelled>()),
             _ => unreachable!(),
         }
         assert_eq!(tool_ran.load(Ordering::SeqCst), outcome == "complete");
         let exchange = broker.store.list_exchange(&session_id)?;
-        assert_eq!(exchange.len(), 1, "preparation created a duplicate exchange");
-        assert_eq!(exchange[0].state, match outcome {
-            "complete" => ExchangeState::Complete,
-            "fail" => ExchangeState::Failed,
-            _ => ExchangeState::Cancelled,
-        });
+        assert_eq!(
+            exchange.len(),
+            1,
+            "preparation created a duplicate exchange"
+        );
+        assert_eq!(
+            exchange[0].state(),
+            match outcome {
+                "complete" => ExchangeState::Complete,
+                "fail" => ExchangeState::Failed,
+                _ => ExchangeState::Cancelled,
+            }
+        );
         assert!(broker.exchange_runtime.is_none());
     }
     Ok(())
@@ -109,16 +130,26 @@ async fn input_readiness_matches_pending_question_without_loading_history() -> R
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), true);
     assert!(!broker.observer().input_readiness()?.has_elicitation);
-    let result = broker.dispatch(Request {
-        id: 1, method: "prompt.submit".into(),
-        params: json!({"text":"prompt me with a multiple-choice question"}),
-    }).await;
-    assert!(result.response.error().is_none(), "{:?}", result.response.error());
+    let result = broker
+        .dispatch(Request {
+            id: 1,
+            method: "prompt.submit".into(),
+            params: json!({"text":"prompt me with a multiple-choice question"}),
+        })
+        .await;
+    assert!(
+        result.response.error().is_none(),
+        "{:?}",
+        result.response.error()
+    );
     let snapshot = broker.snapshot()?;
     let ready = broker.observer().input_readiness()?;
     assert!(snapshot.active_elicitation.is_some());
     assert!(ready.has_elicitation);
-    assert_eq!(ready.session.current_task_id, snapshot.session.current_task_id);
+    assert_eq!(
+        ready.session.current_task_id,
+        snapshot.session.current_task_id
+    );
     assert_eq!(ready.checks_running, snapshot.checks_running);
     assert_eq!(ready.has_approval, !snapshot.approval.is_empty());
     assert_eq!(ready.native_steer, snapshot.capability.native_steer);

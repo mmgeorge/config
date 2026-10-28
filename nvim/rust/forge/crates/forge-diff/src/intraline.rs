@@ -56,16 +56,16 @@ pub fn patch_emphasis(
     let mut result = vec![Vec::new(); rows.len()];
     let mut position = 0;
     while position < rows.len() {
-        if rows[position].kind != RowKind::Removed {
+        if rows[position].kind() != RowKind::Removed {
             position += 1;
             continue;
         }
         let removed_start = position;
-        while position < rows.len() && rows[position].kind == RowKind::Removed {
+        while position < rows.len() && rows[position].kind() == RowKind::Removed {
             position += 1;
         }
         let added_start = position;
-        while position < rows.len() && rows[position].kind == RowKind::Added {
+        while position < rows.len() && rows[position].kind() == RowKind::Added {
             position += 1;
         }
         let removed_count = added_start - removed_start;

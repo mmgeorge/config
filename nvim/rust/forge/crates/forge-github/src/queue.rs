@@ -53,9 +53,7 @@ impl RemoteScope {
             Self::PullRequest => Ok(0),
             Self::Comment(identity) | Self::Creation(identity) => {
                 ensure!(
-                    !identity.is_empty()
-                        && identity.len() <= 256
-                        && identity.bytes().all(|byte| byte.is_ascii_graphic()),
+                    !identity.is_empty() && identity.bytes().all(|byte| byte.is_ascii_graphic()),
                     "invalid GitHub reconciliation scope"
                 );
                 Ok(identity.len())
@@ -84,19 +82,10 @@ pub enum RemoteCompletion {
 ///
 /// Clones share admission and uncertainty state. Uncertain resources retain a slot until a
 /// successful reconciliation. This queue does not exclude other processes or external writers.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RemoteQueue {
     state: Arc<Mutex<QueueState>>,
     input_bytes: Arc<AtomicUsize>,
-}
-
-impl Default for RemoteQueue {
-    fn default() -> Self {
-        Self {
-            state: Arc::default(),
-            input_bytes: Arc::default(),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -120,20 +109,35 @@ struct PendingOperation {
     sender: oneshot::Sender<Result<()>>,
 }
 
-/// Retains admission until completion or drop, including while waiting for its FIFO turn.
+/// Retains queued admission until FIFO ownership is granted or the waiter drops.
 ///
-/// Dropping before a write removes admission. Dropping after begin_mutation marks the resource
-/// uncertain. The service must retain this owner independently of a request receiver.
+/// Mutation and completion methods require the active owner returned by `ready`.
+///
+/// ```compile_fail
+/// use forge_github::queue::{QueuedRemoteOperation, RemoteCompletion};
+/// fn complete_queued(operation: QueuedRemoteOperation) {
+///     operation.complete(RemoteCompletion::Confirmed);
+/// }
+/// ```
+pub struct QueuedRemoteOperation {
+    lease: RemoteLease,
+    receiver: oneshot::Receiver<Result<()>>,
+}
+
+/// Owns an admitted remote resource until completion or drop.
+/// Dropping after `begin_mutation` preserves uncertainty until reconciliation.
 pub struct RemoteOperation {
-    pub(crate) mutation_started: Arc<AtomicBool>,
+    lease: RemoteLease,
+}
+
+struct RemoteLease {
+    mutation_started: Arc<AtomicBool>,
     retained_bytes: usize,
     queue: RemoteQueue,
     resource: RemoteResource,
     scope: RemoteScope,
     id: u64,
     intent: RemoteIntent,
-    receiver: Option<oneshot::Receiver<Result<()>>>,
-    ready: bool,
     completion: RemoteCompletion,
 }
 
@@ -148,19 +152,19 @@ impl RemoteQueue {
         resource: RemoteResource,
         intent: RemoteIntent,
         retained_bytes: usize,
-    ) -> Result<RemoteOperation> {
+    ) -> Result<QueuedRemoteOperation> {
         self.enqueue_scoped(resource, RemoteScope::PullRequest, intent, retained_bytes)
     }
 
     /// Serializes all scopes on one resource while restricting which observation clears uncertainty.
-    /// Scope text is bounded to 256 ASCII bytes and charged alongside retained request input.
+    /// Scope text uses printable ASCII and is charged alongside retained request input.
     pub fn enqueue_scoped(
         &self,
         resource: RemoteResource,
         scope: RemoteScope,
         intent: RemoteIntent,
         retained_bytes: usize,
-    ) -> Result<RemoteOperation> {
+    ) -> Result<QueuedRemoteOperation> {
         let retained_bytes = retained_bytes
             .checked_add(scope.retained_bytes()?)
             .ok_or_else(|| anyhow::anyhow!("GitHub mutation input size overflow"))?;
@@ -202,17 +206,18 @@ impl RemoteQueue {
                 .pending
                 .push_back(PendingOperation { id, intent, sender });
         }
-        Ok(RemoteOperation {
-            mutation_started: Arc::new(AtomicBool::new(false)),
-            retained_bytes,
-            queue: self.clone(),
-            resource,
-            scope,
-            id,
-            intent,
-            receiver: Some(receiver),
-            ready: false,
-            completion: RemoteCompletion::Unchanged,
+        Ok(QueuedRemoteOperation {
+            receiver,
+            lease: RemoteLease {
+                mutation_started: Arc::new(AtomicBool::new(false)),
+                retained_bytes,
+                queue: self.clone(),
+                resource,
+                scope,
+                id,
+                intent,
+                completion: RemoteCompletion::Unchanged,
+            },
         })
     }
 
@@ -284,48 +289,51 @@ impl RemoteQueue {
     }
 }
 
-impl RemoteOperation {
-    /// Waits for exclusive resource ownership in admission order.
-    pub async fn ready(mut self) -> Result<Self> {
-        self.receiver
-            .take()
-            .expect("GitHub queue receiver missing")
-            .await
-            .map_err(|_| anyhow::anyhow!("GitHub mutation queue ended without admission"))??;
-        self.ready = true;
-        Ok(self)
+impl QueuedRemoteOperation {
+    pub(crate) fn mutation_observer(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.lease.mutation_started)
     }
 
+    /// Transfers the resource lease only after FIFO ownership has been granted.
+    pub async fn ready(self) -> Result<RemoteOperation> {
+        let Self { lease, receiver } = self;
+        receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("GitHub mutation queue ended without admission"))??;
+        Ok(RemoteOperation { lease })
+    }
+}
+
+impl RemoteOperation {
     /// Records possible remote effects before invoking a mutation implementation.
     pub fn begin_mutation(&mut self) -> Result<()> {
         ensure!(
-            self.ready && self.intent == RemoteIntent::Mutation,
+            self.lease.intent == RemoteIntent::Mutation,
             "GitHub mutation has no active write admission"
         );
-        self.mutation_started.store(true, Ordering::Release);
-        self.completion = RemoteCompletion::Uncertain;
+        self.lease.mutation_started.store(true, Ordering::Release);
+        self.lease.completion = RemoteCompletion::Uncertain;
         Ok(())
     }
 
     /// Releases ownership using observed evidence, rejecting reconciliation from a write owner.
     pub fn complete(mut self, completion: RemoteCompletion) -> Result<()> {
-        ensure!(
-            self.ready,
-            "GitHub operation has not acquired resource ownership"
-        );
-        if completion == RemoteCompletion::Reconciled && self.intent != RemoteIntent::Reconcile {
+        if completion == RemoteCompletion::Reconciled
+            && self.lease.intent != RemoteIntent::Reconcile
+        {
             bail!("GitHub mutation cannot clear an uncertain resource");
         }
         ensure!(
-            completion != RemoteCompletion::Uncertain || self.intent == RemoteIntent::Mutation,
+            completion != RemoteCompletion::Uncertain
+                || self.lease.intent == RemoteIntent::Mutation,
             "read-only reconciliation cannot create mutation uncertainty"
         );
-        self.completion = completion;
+        self.lease.completion = completion;
         Ok(())
     }
 }
 
-impl Drop for RemoteOperation {
+impl Drop for RemoteLease {
     fn drop(&mut self) {
         self.queue
             .input_bytes

@@ -47,8 +47,8 @@ pub(crate) fn project(
     for (index, _) in &ranges {
         if !file.group.contains_key(index) {
             let display = file
-                .cursor
-                .as_ref()
+                .projection
+                .cursor()
                 .and_then(|cursor| cursor.group(*index))
                 .context("display group missing")?;
             retained = retained
@@ -69,8 +69,8 @@ pub(crate) fn project(
             BlockId(document.next_id("body")?)
         };
         let display = file
-            .cursor
-            .as_ref()
+            .projection
+            .cursor()
             .and_then(|cursor| cursor.group(index))
             .context("display group missing")?;
         let mut header = if let Some(header) = file.group.get(&index).and_then(|group| {
@@ -96,8 +96,8 @@ pub(crate) fn project(
                 },
             );
             let (added, deleted) = file
-                .analysis
-                .as_ref()
+                .projection
+                .analysis()
                 .context("hunk analysis missing")?
                 .hunks()
                 .iter()
@@ -221,8 +221,7 @@ pub(crate) fn project(
         if let Some(position) = file
             .body
             .as_ref()
-            .expect("initialized status body")
-            .block_index(&header.id)
+            .and_then(|body| body.block_index(&header.id))
         {
             projection.edit.push(SequenceEdit {
                 range: position..position + 1,

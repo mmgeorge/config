@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -47,10 +47,6 @@ impl TerminalSnapshot {
                 .get("command")
                 .and_then(Value::as_str)
                 .context("background terminal command is missing")?;
-            ensure!(
-                id.len() <= 256,
-                "background terminal identity exceeds its limit"
-            );
             if !terminal
                 .iter()
                 .any(|item: &BackgroundTerminal| item.id == id)

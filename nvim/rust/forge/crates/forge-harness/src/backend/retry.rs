@@ -83,7 +83,7 @@ pub(crate) async fn prompt(
     let mut progress = RetryProgress {
         trace,
         session_id: request.harness_session_id.clone(),
-        agent_id: request.owner()?.agent_id,
+        agent_id: request.owner()?.agent_id.to_string(),
         attempt: 0,
         pending: false,
     };

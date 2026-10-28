@@ -41,7 +41,7 @@ impl FileDiff {
         let alignment =
             super::review_alignment::ReviewAlignment::new(path, destination, before, after)?;
         let diff = if alignment.anchors.is_empty() {
-            forge_diff::raw::compute_hunks(source)?
+            forge_diff::raw::compute_hunks(source)
         } else {
             forge_diff::raw::compute_anchored_hunks(source, &alignment.anchors)?
         };
@@ -125,11 +125,11 @@ impl FileDiff {
                 .flat_map(|hunk| &hunk.row)
                 .filter_map(|row| {
                     let coordinate = if side == SourceSide::Old {
-                        (row.kind == RowKind::Removed || row.new.is_none())
-                            .then_some(row.old)
+                        (row.kind() == RowKind::Removed || row.new_coordinate().is_none())
+                            .then_some(row.old_coordinate())
                             .flatten()
                     } else {
-                        row.new
+                        row.new_coordinate()
                     };
                     coordinate.map(|coordinate| coordinate.line)
                 })
@@ -145,9 +145,7 @@ impl FileDiff {
                     rows.push(DisplayRow {
                         group_index: result.hunk.len(),
                         text: "...".into(),
-                        kind: RowKind::Context,
-                        old: None,
-                        new: None,
+                        source: forge_diff::display::DisplaySource::Gap,
                         raw_id: None,
                         emphasis: Vec::new(),
                         emphasis_fallback: None,
@@ -161,9 +159,7 @@ impl FileDiff {
                 rows.push(DisplayRow {
                     group_index: result.hunk.len(),
                     text: lines[line].into(),
-                    kind: RowKind::Context,
-                    old: (side == SourceSide::Old).then_some(coordinate),
-                    new: (side == SourceSide::New).then_some(coordinate),
+                    source: forge_diff::display::DisplaySource::Context(coordinate),
                     raw_id: None,
                     emphasis: Vec::new(),
                     emphasis_fallback: None,
@@ -316,22 +312,22 @@ mod tests {
             .filter(|row| row.text.starts_with("fn main"))
             .collect::<Vec<_>>();
         assert_eq!(main.len(), 1, "main must remain one matched declaration");
-        assert!(main[0].old.is_some() && main[0].new.is_some());
+        assert!(main[0].old_coordinate().is_some() && main[0].new_coordinate().is_some());
         assert!(diff.alignment.modified(main[0]));
         assert!(
             rows.iter()
                 .filter(|row| row.text.starts_with("fn system_"))
-                .all(|row| row.kind == RowKind::Added
-                    && row.old.is_none()
+                .all(|row| row.kind() == RowKind::Added
+                    && row.old_coordinate().is_none()
                     && !diff.alignment.modified(row))
         );
         let first = before.declaration.text.lines().collect::<Vec<_>>();
         let second = after.declaration.text.lines().collect::<Vec<_>>();
         for row in rows {
-            if let Some(old) = row.old {
+            if let Some(old) = row.old_coordinate() {
                 assert_eq!(row.text, first[old.line]);
             }
-            if let Some(new) = row.new {
+            if let Some(new) = row.new_coordinate() {
                 assert_eq!(row.text, second[new.line]);
             }
         }
@@ -428,8 +424,8 @@ mod tests {
             let positions = rows
                 .iter()
                 .filter_map(|row| match side {
-                    SourceSide::Old => row.old,
-                    SourceSide::New => row.new,
+                    SourceSide::Old => row.old_coordinate(),
+                    SourceSide::New => row.new_coordinate(),
                 })
                 .map(|coordinate| coordinate.line)
                 .collect::<Vec<_>>();

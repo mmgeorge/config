@@ -195,8 +195,16 @@ pub struct RenderedPlan {
 }
 
 struct PlanRenderer {
-    line: Vec<String>,
+    line: Vec<PlanLine>,
     navigation: PlanNavigationIndex,
+}
+
+enum PlanLine {
+    Blank,
+    Content {
+        text: String,
+        anchor: PlanNavigationAnchor,
+    },
 }
 
 const PLAN_LINE_WIDTH: usize = 100;
@@ -246,16 +254,20 @@ impl PlanRenderer {
             label: label.into(),
         };
         for row in value.split('\n') {
-            if !row.is_empty() {
+            if row.is_empty() {
+                self.line.push(PlanLine::Blank);
+            } else {
                 anchor.line = self.line.len() as u32 + 1;
-                self.navigation.anchor.push(anchor.clone());
+                self.line.push(PlanLine::Content {
+                    text: row.to_owned(),
+                    anchor: anchor.clone(),
+                });
             }
-            self.line.push(row.to_owned());
         }
     }
 
     fn blank(&mut self) {
-        self.line.push(String::new());
+        self.line.push(PlanLine::Blank);
     }
 
     fn push_wrapped(
@@ -286,13 +298,21 @@ impl PlanRenderer {
     }
 
     fn finish(self) -> Result<RenderedPlan> {
-        debug_assert_eq!(
-            self.line.iter().filter(|line| !line.is_empty()).count(),
-            self.navigation.anchor.len()
-        );
+        let mut markdown = String::new();
+        let mut navigation = self.navigation;
+        for line in self.line {
+            if let PlanLine::Content { text, anchor } = line {
+                markdown.push_str(&text);
+                navigation.anchor.push(anchor);
+            }
+            markdown.push('\n');
+        }
+        if markdown.is_empty() {
+            markdown.push('\n');
+        }
         Ok(RenderedPlan {
-            markdown: self.line.join("\n") + "\n",
-            navigation: self.navigation,
+            markdown,
+            navigation,
         })
     }
 }
@@ -318,16 +338,15 @@ fn wrap_prefixed<'source>(
         first = false;
         let mut columns = line.chars().count();
         let mut has_content = false;
-        while let Some(word) = words.peek() {
+        while let Some(word) =
+            words.next_if(|word| !has_content || columns + 1 + word.chars().count() <= width)
+        {
             let word_columns = word.chars().count();
             let separator = usize::from(has_content);
-            if has_content && columns + separator + word_columns > width {
-                break;
-            }
             if has_content {
                 line.push(' ');
             }
-            line.push_str(words.next().expect("peeked plan word"));
+            line.push_str(word);
             columns += separator + word_columns;
             has_content = true;
         }
@@ -397,7 +416,8 @@ fn render_files(
     renderer.blank();
 
     let mut file_list = Vec::<RenderedFileEntry>::new();
-    for (task_index, task) in document.tasks().enumerate() {
+    for task_entry in document.task_entries() {
+        let task = task_entry.task();
         for (file_index, file) in task.files.iter().enumerate() {
             let path = file.change.path().to_owned();
             if !file_list.iter().any(|entry| entry.path == path) {
@@ -419,7 +439,7 @@ fn render_files(
                 file_list.push(RenderedFileEntry {
                     label,
                     path: path.clone(),
-                    json_path: format!("{}/files/{file_index}", document.task_path(task_index)),
+                    json_path: format!("{}/files/{file_index}", task_entry.path()),
                     symbol_list: Vec::new(),
                 });
             }
@@ -473,7 +493,8 @@ fn render_files(
             json_path: entity_json_path(document, &entity.name),
         });
     }
-    for (task_index, task) in document.tasks().enumerate() {
+    for task_entry in document.task_entries() {
+        let task = task_entry.task();
         for (file_index, file) in task.files.iter().enumerate() {
             let path = file.change.path();
             let Some(entry) = file_list.iter_mut().find(|entry| entry.path == path) else {
@@ -493,7 +514,7 @@ fn render_files(
                     },
                     json_path: format!(
                         "{}/files/{file_index}/subtasks/{subtask_index}",
-                        document.task_path(task_index)
+                        task_entry.path()
                     ),
                 });
             }
@@ -591,15 +612,23 @@ fn render_file_tree(
     directory_path: &str,
     omit_root_connector: bool,
 ) {
+    enum Child<'tree> {
+        Directory(&'tree RenderedFileTree),
+        File(&'tree RenderedFileEntry),
+    }
     let mut child_list = tree
         .directory
-        .keys()
-        .map(|name| (name.as_str(), true))
-        .chain(tree.file.keys().map(|name| (name.as_str(), false)))
+        .iter()
+        .map(|(name, child)| (name.as_str(), Child::Directory(child)))
+        .chain(
+            tree.file
+                .iter()
+                .map(|(name, child)| (name.as_str(), Child::File(child))),
+        )
         .collect::<Vec<_>>();
     child_list.sort_by(|left, right| left.0.cmp(right.0));
 
-    for (index, (name, is_directory)) in child_list.iter().enumerate() {
+    for (index, (name, child)) in child_list.iter().enumerate() {
         let is_last = index + 1 == child_list.len();
         let branch = if omit_root_connector && prefix.is_empty() && child_list.len() == 1 {
             ""
@@ -609,60 +638,56 @@ fn render_file_tree(
             "├─ "
         };
         let content = format!("{prefix}{branch}{name}");
-        if *is_directory {
-            let path = if directory_path.is_empty() {
-                (*name).to_owned()
-            } else {
-                format!("{directory_path}/{name}")
-            };
-            renderer.push(
-                content,
-                PlanReviewTarget::FileDirectory { path: path.clone() },
-                "/tasks",
-                None,
-                format!("File directory: {path}"),
-            );
-            let child_prefix = if branch.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix}{}", if is_last { "   " } else { "│  " })
-            };
-            render_file_tree(
-                renderer,
-                tree.directory.get(*name).expect("directory child"),
-                &child_prefix,
-                &path,
-                false,
-            );
-        } else {
-            let entry = tree.file.get(*name).expect("file child");
-            renderer.push(
-                format!("{prefix}{branch}{}", entry.label),
-                PlanReviewTarget::FileTreeFile {
-                    path: entry.path.clone(),
-                },
-                &entry.json_path,
-                Some(&entry.path),
-                entry.path.clone(),
-            );
-            let symbol_prefix = if branch.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix}{}", if is_last { "   " } else { "│  " })
-            };
-            for (symbol_index, symbol) in entry.symbol_list.iter().enumerate() {
-                let symbol_is_last = symbol_index + 1 == entry.symbol_list.len();
+        match child {
+            Child::Directory(directory) => {
+                let path = if directory_path.is_empty() {
+                    (*name).to_owned()
+                } else {
+                    format!("{directory_path}/{name}")
+                };
                 renderer.push(
-                    format!(
-                        "{symbol_prefix}{}{}",
-                        if symbol_is_last { "└─ " } else { "├─ " },
-                        symbol.label
-                    ),
-                    symbol.target.clone(),
-                    &symbol.json_path,
-                    Some(&entry.path),
-                    symbol.label.clone(),
+                    content,
+                    PlanReviewTarget::FileDirectory { path: path.clone() },
+                    "/tasks",
+                    None,
+                    format!("File directory: {path}"),
                 );
+                let child_prefix = if branch.is_empty() {
+                    String::new()
+                } else {
+                    format!("{prefix}{}", if is_last { "   " } else { "│  " })
+                };
+                render_file_tree(renderer, directory, &child_prefix, &path, false);
+            }
+            Child::File(entry) => {
+                renderer.push(
+                    format!("{prefix}{branch}{}", entry.label),
+                    PlanReviewTarget::FileTreeFile {
+                        path: entry.path.clone(),
+                    },
+                    &entry.json_path,
+                    Some(&entry.path),
+                    entry.path.clone(),
+                );
+                let symbol_prefix = if branch.is_empty() {
+                    String::new()
+                } else {
+                    format!("{prefix}{}", if is_last { "   " } else { "│  " })
+                };
+                for (symbol_index, symbol) in entry.symbol_list.iter().enumerate() {
+                    let symbol_is_last = symbol_index + 1 == entry.symbol_list.len();
+                    renderer.push(
+                        format!(
+                            "{symbol_prefix}{}{}",
+                            if symbol_is_last { "└─ " } else { "├─ " },
+                            symbol.label
+                        ),
+                        symbol.target.clone(),
+                        &symbol.json_path,
+                        Some(&entry.path),
+                        symbol.label.clone(),
+                    );
+                }
             }
         }
     }
@@ -844,8 +869,8 @@ fn collect_flow_edge_rows(
                     ),
                     path: flow_target_path(graph, &edge.target),
                     target: PlanReviewTarget::FlowEdge {
-                        callable_kind: edge.callable.as_ref().map(|callable| callable.kind),
-                        callable_name: edge.callable.as_ref().map(|callable| callable.name.clone()),
+                        callable_kind: edge.callable().map(|callable| callable.kind),
+                        callable_name: edge.callable().map(|callable| callable.name.clone()),
                         reference_kind: entity_reference_kind(&edge.target),
                         target_name: entity_reference_label(graph, &edge.target),
                         target_is_type: entity_reference_is_type(graph, &edge.target),
@@ -853,7 +878,7 @@ fn collect_flow_edge_rows(
                         workspace_line: entity_reference_workspace_line(&edge.target),
                     },
                     json_path: entry_path.clone(),
-                    label: format!("Flow edge: {}", flow_relation_label(&edge.relation)),
+                    label: format!("Flow edge: {}", flow_relation_label(&edge.relation())),
                 });
 
                 let child_count = edge.expansion.len() + edge.branches.len();
@@ -916,30 +941,16 @@ fn flow_tree_content(ancestor_last_list: &[bool], is_last: Option<bool>, content
 
 fn flow_edge_content(graph: &PlanGraph<'_>, edge: &PlanFlowEdge) -> String {
     let target = entity_reference_label(graph, &edge.target);
-    let content = match edge.relation {
-        PlanFlowRelation::Construct => format!("Construct {target}"),
-        PlanFlowRelation::Call => {
-            let callable = edge.callable.as_ref().expect("validated callable");
-            format!("Call {target}.{}()", callable.name)
-        }
-        PlanFlowRelation::Read => {
-            let callable = edge.callable.as_ref().expect("validated callable");
-            format!("Read {target}.{}()", callable.name)
-        }
-        PlanFlowRelation::Write => {
-            let callable = edge.callable.as_ref().expect("validated callable");
-            format!("Write {target}.{}()", callable.name)
-        }
-        PlanFlowRelation::Send => format!(
-            "Send {} to {target}",
-            edge.payload_type
-                .as_deref()
-                .expect("validated payload type")
-        ),
-        PlanFlowRelation::Emit => format!("Emit to {target}"),
-        PlanFlowRelation::Return => format!("Return to {target}"),
+    let content = match &edge.operation {
+        super::PlanFlowOperation::Construct => format!("Construct {target}"),
+        super::PlanFlowOperation::Call(call) => format!("Call {target}.{}()", call.callable.name),
+        super::PlanFlowOperation::Read(call) => format!("Read {target}.{}()", call.callable.name),
+        super::PlanFlowOperation::Write(call) => format!("Write {target}.{}()", call.callable.name),
+        super::PlanFlowOperation::Send(payload) => format!("Send {payload} to {target}"),
+        super::PlanFlowOperation::Emit(_) => format!("Emit to {target}"),
+        super::PlanFlowOperation::Return(_) => format!("Return to {target}"),
     };
-    if let Some(return_type) = &edge.return_type {
+    if let Some(return_type) = edge.return_type() {
         format!("{content} → {}", return_type.value_type)
     } else {
         content
@@ -1328,12 +1339,10 @@ fn append_diagram_text(
     anchor: DiagramAnchor,
 ) {
     cell_list.extend(
-        wrap_prefixed(content, first_prefix, continuation_prefix, width)
-            .into_iter()
-            .map(|text| DiagramCell {
-                text,
-                anchor: anchor.clone(),
-            }),
+        wrap_prefixed(content, first_prefix, continuation_prefix, width).map(|text| DiagramCell {
+            text,
+            anchor: anchor.clone(),
+        }),
     );
 }
 
@@ -1589,7 +1598,8 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
     renderer.section("# Tests", PlanSection::Tests, "/tasks");
     renderer.blank();
     let mut file_group_list = Vec::new();
-    for (task_index, task) in document.tasks().enumerate() {
+    for task_entry in document.task_entries() {
+        let task = task_entry.task();
         for (file_index, file) in task.files.iter().enumerate() {
             let test_list = file
                 .subtasks
@@ -1600,7 +1610,7 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
                 })
                 .collect::<Vec<_>>();
             if !test_list.is_empty() {
-                file_group_list.push((task_index, file_index, file, test_list));
+                file_group_list.push((task_entry.path().to_owned(), file_index, file, test_list));
             }
         }
     }
@@ -1610,7 +1620,7 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
         return;
     }
     let file_group_count = file_group_list.len();
-    for (group_index, (task_index, file_index, file, test_list)) in
+    for (group_index, (task_path, file_index, file, test_list)) in
         file_group_list.into_iter().enumerate()
     {
         let path = file.change.path();
@@ -1619,7 +1629,7 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
             PlanReviewTarget::File {
                 path: path.to_owned(),
             },
-            format!("{}/files/{file_index}", document.task_path(task_index)),
+            format!("{task_path}/files/{file_index}"),
             Some(path),
             path,
         );
@@ -1639,10 +1649,7 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
                 PlanReviewTarget::Test {
                     category: test.category,
                 },
-                format!(
-                    "{}/files/{file_index}/subtasks/{subtask_index}",
-                    document.task_path(task_index)
-                ),
+                format!("{}/files/{file_index}/subtasks/{subtask_index}", task_path),
                 Some(path),
                 test.name.clone(),
             );
@@ -2533,16 +2540,13 @@ mod test {
         render_object_model(&mut renderer, &document, &graph);
         let mut nested = None;
         for index in (0..160).rev() {
-            let mut edge = PlanFlowEdge {
-                relation: PlanFlowRelation::Emit,
+            let mut edge = crate::plan::PlanFlowEdge {
+                operation: crate::plan::PlanFlowOperation::Emit("()".into()),
                 target: EntityReference::ExternalEntity {
                     entity_kind: ReferencedEntityKind::Endpoint,
                     name: format!("destination{index}"),
                     dependency: None,
                 },
-                callable: None,
-                payload_type: None,
-                return_type: None,
                 expansion: Vec::new(),
                 branches: Vec::new(),
             };
@@ -2595,30 +2599,28 @@ mod test {
         document.flows[0].source = EntityReference::PlannedEntity {
             entity: "PlanDocument".into(),
         };
-        document.flows[0].edges = vec![PlanFlowEdge {
-            relation: PlanFlowRelation::Call,
+        document.flows[0].edges = vec![crate::plan::PlanFlowEdge {
+            operation: crate::plan::PlanFlowOperation::Call(crate::plan::PlanFlowCall {
+                callable: PlanCallable {
+                    kind: PlanCallableKind::Method,
+                    name: "validate".into(),
+                },
+                payload_type: None,
+                return_type: Some(PlanFlowReturnType {
+                    value_type: "ValidatedPlan".into(),
+                    error_type: Some("PlanError".into()),
+                }),
+            }),
             target: EntityReference::PlannedEntity {
                 entity: "PlanDocument".into(),
             },
-            callable: Some(PlanCallable {
-                kind: PlanCallableKind::Method,
-                name: "validate".into(),
-            }),
-            payload_type: None,
-            return_type: Some(PlanFlowReturnType {
-                value_type: "ValidatedPlan".into(),
-                error_type: Some("PlanError".into()),
-            }),
-            expansion: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Send,
+            expansion: vec![crate::plan::PlanFlowEdge {
+                operation: crate::plan::PlanFlowOperation::Send("ValidatedPlan".into()),
                 target: EntityReference::ExternalEntity {
                     entity_kind: ReferencedEntityKind::Endpoint,
                     name: "execution scheduler".into(),
                     dependency: None,
                 },
-                callable: None,
-                payload_type: Some("ValidatedPlan".into()),
-                return_type: None,
                 expansion: Vec::new(),
                 branches: Vec::new(),
             }],

@@ -2,7 +2,7 @@ use super::{CheckConfig, RunRequest};
 use anyhow::{Result, ensure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -101,13 +101,6 @@ pub(super) fn resolve(
     files: Option<&[String]>,
     has_scope: bool,
 ) -> Result<Vec<CheckApplicability>> {
-    ensure!(
-        !request.all
-            || (request.ids.is_empty()
-                && request.include.is_empty()
-                && request.selections.is_empty()),
-        "choose all checks or explicit selections, not both"
-    );
     let known: BTreeSet<_> = config
         .definitions
         .iter()
@@ -136,7 +129,7 @@ pub(super) fn resolve(
                 && !request.selections.contains_key(&check.id))),
         "selected check is disabled; re-enable it in /checks"
     );
-    let mut result: BTreeMap<_, _> = config
+    let mut result: Vec<_> = config
         .definitions
         .iter()
         .map(|check| {
@@ -148,7 +141,7 @@ pub(super) fn resolve(
                 .collect();
             let (selected, reason) = if !check.enabled {
                 (false, "Disabled for this task".into())
-            } else if request.all
+            } else if request.is_all()
                 || request.ids.contains(&check.id)
                 || request.include.contains(&check.id)
                 || request.selections.contains_key(&check.id)
@@ -186,26 +179,24 @@ pub(super) fn resolve(
                 };
                 (true, format!("Changed: {summary}{suffix}"))
             };
-            (
-                check.id.clone(),
-                CheckApplicability {
-                    id: check.id.clone(),
-                    selected,
-                    reason,
-                    matched_files,
-                },
-            )
+            CheckApplicability {
+                id: check.id.clone(),
+                selected,
+                reason,
+                matched_files,
+            }
         })
         .collect();
     loop {
         let mut added = false;
-        for check in &config.definitions {
-            if !result[&check.id].selected {
+        for (index, check) in config.definitions.iter().enumerate() {
+            if !result[index].selected {
                 continue;
             }
             for dependency in &check.depends_on {
                 let prerequisite = result
-                    .get_mut(dependency)
+                    .iter_mut()
+                    .find(|result| &result.id == dependency)
                     .ok_or_else(|| anyhow::anyhow!("missing prerequisite {dependency}"))?;
                 if !prerequisite.selected {
                     prerequisite.selected = true;
@@ -218,11 +209,7 @@ pub(super) fn resolve(
             break;
         }
     }
-    Ok(config
-        .definitions
-        .iter()
-        .map(|check| result.remove(&check.id).unwrap())
-        .collect())
+    Ok(result)
 }
 
 pub(super) fn path_matches(pattern: &str, path: &str) -> bool {

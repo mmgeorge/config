@@ -18,6 +18,31 @@ fn main() {
         return;
     }
     let id = std::process::id();
+    if fs::read_to_string("mode").is_ok_and(|mode| mode == "review_read") {
+        assert_eq!(argument[1], "api");
+        assert_eq!(argument[2], "--hostname");
+        assert_eq!(argument[3], "enterprise.example");
+        if argument[4] == "graphql" {
+            assert_eq!(argument.len(), 7);
+            assert_eq!(argument[5], "--input");
+            fs::copy(&argument[6], "review-request.json").unwrap();
+        } else {
+            if argument.len() == 7 {
+                assert_eq!(argument[4], "--header");
+                assert_eq!(argument[5], "Accept: application/vnd.github.diff");
+            } else {
+                assert_eq!(argument.len(), 5);
+            }
+            assert_eq!(
+                argument.last().unwrap().to_str().unwrap(),
+                fs::read_to_string("review-endpoint").unwrap()
+            );
+        }
+        std::io::stdout()
+            .write_all(&fs::read("response.json").unwrap())
+            .unwrap();
+        return;
+    }
     if std::path::Path::new("issue-edit-current.json").exists()
         && argument.get(1).is_some_and(|value| value == "api")
         && argument.get(4).is_some_and(|value| value != "user")

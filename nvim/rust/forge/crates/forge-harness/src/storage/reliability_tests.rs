@@ -88,7 +88,7 @@ fn schema_upgrade_rolls_back_and_newer_databases_are_preserved() -> Result<()> {
         .err()
         .expect("newer schema must fail");
     assert!(format!("{error:#}").contains("newer than supported"));
-    assert_eq!(
+    assert!(
         store
             .connection
             .query_row(
@@ -96,8 +96,7 @@ fn schema_upgrade_rolls_back_and_newer_databases_are_preserved() -> Result<()> {
                 [],
                 |row| row.get::<_, String>(0)
             )?
-            .contains("tool_output_format"),
-        true
+            .contains("tool_output_format")
     );
     Ok(())
 }
@@ -219,12 +218,12 @@ fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
     );
     let turn = metadata[0].turn[0].id();
     let view = crate::buffer::tool::ToolOutputView::stored(
-        "output".into(),
+        crate::buffer::identity::DisplayId::test(),
         root.path(),
         "exchange",
         turn,
         "call",
-    )?;
+    );
     let snapshot = view.complete_snapshot()?;
     assert_eq!(
         snapshot.retained_bytes(),

@@ -329,13 +329,12 @@ mod tests {
                 + complete.values.iter().map(Vec::capacity).sum::<usize>()
         );
         let bytes = (0..20_001)
-            .map(|index| {
+            .flat_map(|index| {
                 record(
                     format!("refs/heads/branch-{index:05}").as_bytes(),
                     format!("branch-{index:05}").as_bytes(),
                 )
             })
-            .flatten()
             .collect::<Vec<_>>();
         let complete = build_candidates(&bytes, gix::hash::Kind::Sha1).unwrap();
         assert_eq!(complete.values.len(), 20_001);

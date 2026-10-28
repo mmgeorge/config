@@ -98,7 +98,6 @@ pub(super) fn validate(design: &DeclarationDesign, workspace: &Path) -> Result<(
             if !index.introduced.contains(&position)
                 || external.contains(&position)
                 || used.contains(&position)
-                || symbol.role == DeclarationRole::Binding
             {
                 continue;
             }
@@ -114,28 +113,32 @@ pub(super) fn validate(design: &DeclarationDesign, workspace: &Path) -> Result<(
                 continue;
             }
             let owner = normalized(&scope.join("::"));
-            let repair = match symbol.role {
-                DeclarationRole::Callable => {
-                    "Add its invocation or callback registration to the caller's Calls section."
-                }
-                DeclarationRole::Property => {
-                    "Add its read, write, construction, or destructuring use to the user's Accesses section."
-                }
-                DeclarationRole::Type => {
-                    "Add its signature reference or construction to the caller's Constructs section."
-                }
-                _ => {
-                    "Add a resolved type reference or a named use in Calls, Constructs, or Accesses."
-                }
-            };
-            let role = match symbol.role {
-                DeclarationRole::Callable => "function",
-                DeclarationRole::Type => "type",
-                DeclarationRole::Property => "property",
-                DeclarationRole::Value => "value",
-                DeclarationRole::Module => "module",
-                DeclarationRole::Variant => "variant",
-                DeclarationRole::Binding => unreachable!(),
+            let (role, repair) = match symbol.role {
+                DeclarationRole::Callable => (
+                    "function",
+                    "Add its invocation or callback registration to the caller's Calls section.",
+                ),
+                DeclarationRole::Property => (
+                    "property",
+                    "Add its read, write, construction, or destructuring use to the user's Accesses section.",
+                ),
+                DeclarationRole::Type => (
+                    "type",
+                    "Add its signature reference or construction to the caller's Constructs section.",
+                ),
+                DeclarationRole::Value => (
+                    "value",
+                    "Add a resolved type reference or a named use in Calls, Constructs, or Accesses.",
+                ),
+                DeclarationRole::Module => (
+                    "module",
+                    "Add a resolved type reference or a named use in Calls, Constructs, or Accesses.",
+                ),
+                DeclarationRole::Variant => (
+                    "variant",
+                    "Add a resolved type reference or a named use in Calls, Constructs, or Accesses.",
+                ),
+                DeclarationRole::Binding => continue,
             };
             diagnostic.push(DeclarationDiagnostic {
                 path: path.clone(),

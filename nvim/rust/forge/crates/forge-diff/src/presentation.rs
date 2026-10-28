@@ -10,7 +10,7 @@ use forge_buffer::text::BufferText;
 use crate::display::{DisplayHunk, DisplayRow, RowKind};
 use crate::file_header::FileChange;
 use crate::patch::PatchHunk;
-use crate::source::{SourceCoordinate, SourceSide};
+
 use crate::syntax::SyntaxHandle;
 
 /// Hunk heading content, independent of the consumer's navigation actions.
@@ -321,17 +321,7 @@ pub fn patch_rows(hunk: &PatchHunk<'_>) -> (DisplayHunk, Vec<DisplayRow>) {
         .map(|(row, emphasis)| DisplayRow {
             group_index: 0,
             text: row.text.trim_end_matches('\r').into(),
-            kind: row.kind,
-            old: row.old_line.map(|line| SourceCoordinate {
-                side: SourceSide::Old,
-                line,
-                byte_column: 0,
-            }),
-            new: row.new_line.map(|line| SourceCoordinate {
-                side: SourceSide::New,
-                line,
-                byte_column: 0,
-            }),
+            source: crate::display::DisplaySource::Diff(row.coordinates()),
             raw_id: None,
             emphasis,
             emphasis_fallback: None,
@@ -351,7 +341,7 @@ pub fn patch_rows(hunk: &PatchHunk<'_>) -> (DisplayHunk, Vec<DisplayRow>) {
 /// Counts changed rows without counting unchanged context or structural omissions.
 pub fn counts<'row>(rows: impl IntoIterator<Item = &'row DisplayRow>) -> (u64, u64) {
     rows.into_iter()
-        .fold((0, 0), |(added, removed), row| match row.kind {
+        .fold((0, 0), |(added, removed), row| match row.kind() {
             RowKind::Added => (added + 1, removed),
             RowKind::Removed => (added, removed + 1),
             RowKind::Context => (added, removed),
@@ -446,9 +436,9 @@ mod tests {
                 );
                 assert_eq!(single.metadata.layout, whole.metadata.layout);
             }
-            assert_eq!(rows[0].old.unwrap().line, 9);
-            assert_eq!(rows[1].new.unwrap().line, 19);
-            assert_eq!(rows[2].new.unwrap().line, 20);
+            assert_eq!(rows[0].old_coordinate().unwrap().line, 9);
+            assert_eq!(rows[1].new_coordinate().unwrap().line, 19);
+            assert_eq!(rows[2].new_coordinate().unwrap().line, 20);
             assert_eq!(counts(&rows), (1, 1));
         }
     }

@@ -1,3 +1,4 @@
+use super::review_cache::PlanReviewRevision;
 use super::{PlanDocument, PlanFileStore, RenderedPlan, digest};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -11,7 +12,12 @@ pub(crate) struct ReviewSyntax {
     pub algorithm: Option<forge_diff::syntax::SyntaxHandle>,
 }
 
-pub(crate) struct PlanReviewSource {
+pub(crate) enum PlanReviewSource {
+    Working(EditableReviewSource),
+    Historical(ReviewSourceData),
+}
+
+pub(crate) struct ReviewSourceData {
     pub execution_review: Option<String>,
     pub trace: Option<ReviewTrace>,
     pub resolver: std::sync::Arc<
@@ -22,19 +28,105 @@ pub(crate) struct PlanReviewSource {
             )>,
         >,
     >,
-    pub historical: bool,
     pub public_only: bool,
     /// Keeps selected reference context visible without changing the public filter.
     pub revealed: std::collections::HashSet<(String, String, u32)>,
     pub collapse: std::collections::HashMap<forge_buffer::identity::FoldId, bool>,
     pub path: std::path::PathBuf,
     pub workspace: std::path::PathBuf,
-    pub document: PlanDocument,
-    pub rendered: RenderedPlan,
+    pub(crate) revision: PlanReviewRevision,
     pub saved_navigation: Option<super::PlanNavigationIndex>,
-    pub saved_digest: String,
     pub syntax: Option<forge_diff::syntax::SyntaxHandle>,
     pub declaration_syntax: std::collections::HashMap<(String, String), ReviewSyntax>,
+}
+
+impl std::ops::Deref for ReviewSourceData {
+    type Target = PlanReviewRevision;
+
+    fn deref(&self) -> &Self::Target {
+        &self.revision
+    }
+}
+
+impl ReviewSourceData {
+    #[cfg(test)]
+    pub(super) fn replace_revision(
+        &mut self,
+        document: PlanDocument,
+        rendered: RenderedPlan,
+    ) -> Result<()> {
+        self.revision = PlanReviewRevision::new(&self.document.plan_id, document, rendered)?;
+        Ok(())
+    }
+}
+
+/// Owns a working review source whose access mode cannot change during analysis.
+pub(crate) struct EditableReviewSource(ReviewSourceData);
+
+impl TryFrom<PlanReviewSource> for EditableReviewSource {
+    type Error = anyhow::Error;
+
+    fn try_from(source: PlanReviewSource) -> Result<Self> {
+        match source {
+            PlanReviewSource::Working(source) => Ok(source),
+            PlanReviewSource::Historical(_) => {
+                anyhow::bail!("historical plan revisions are read-only")
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for EditableReviewSource {
+    type Target = ReviewSourceData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for EditableReviewSource {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl EditableReviewSource {
+    pub(super) fn into_source(self) -> PlanReviewSource {
+        PlanReviewSource::Working(self)
+    }
+}
+
+impl PlanReviewSource {
+    pub(crate) fn into_data(self) -> ReviewSourceData {
+        match self {
+            Self::Working(source) => source.0,
+            Self::Historical(source) => source,
+        }
+    }
+
+    pub(crate) fn is_historical(&self) -> bool {
+        matches!(self, Self::Historical(_))
+    }
+}
+
+impl std::ops::Deref for PlanReviewSource {
+    type Target = ReviewSourceData;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Working(source) => &source.0,
+            Self::Historical(source) => source,
+        }
+    }
+}
+
+impl std::ops::DerefMut for PlanReviewSource {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Working(source) => &mut source.0,
+            Self::Historical(source) => source,
+        }
+    }
 }
 
 pub(crate) struct ReviewTrace {
@@ -86,23 +178,20 @@ impl PlanFileStore {
         } else {
             (saved, None)
         };
-        Ok(PlanReviewSource {
+        Ok(PlanReviewSource::Historical(ReviewSourceData {
             trace: None,
             execution_review: None,
             resolver: Default::default(),
             public_only: true,
             collapse: Default::default(),
             revealed: Default::default(),
-            historical: true,
             path: path.with_extension("md"),
             workspace: self.workspace.clone(),
-            document,
-            rendered,
+            revision: PlanReviewRevision::from_saved(document, rendered, digest(&submitted))?,
             saved_navigation,
-            saved_digest: digest(&submitted),
             syntax: None,
             declaration_syntax: Default::default(),
-        })
+        }))
     }
 
     /// Capture the checked working review, using a submitted baseline or the current draft when absent.
@@ -170,23 +259,22 @@ impl PlanFileStore {
                 document.design.is_some().then_some(navigation)
             }
         };
-        Ok(PlanReviewSource {
-            trace: None,
-            execution_review: None,
-            resolver: Default::default(),
-            public_only: true,
-            collapse: Default::default(),
-            revealed: Default::default(),
-            historical: false,
-            path: directory.join("working.md"),
-            workspace: self.workspace.clone(),
-            document,
-            rendered,
-            saved_navigation,
-            saved_digest: digest(&working),
-            syntax: None,
-            declaration_syntax: Default::default(),
-        })
+        Ok(PlanReviewSource::Working(EditableReviewSource(
+            ReviewSourceData {
+                trace: None,
+                execution_review: None,
+                resolver: Default::default(),
+                public_only: true,
+                collapse: Default::default(),
+                revealed: Default::default(),
+                path: directory.join("working.md"),
+                workspace: self.workspace.clone(),
+                revision: PlanReviewRevision::from_saved(document, rendered, digest(&working))?,
+                saved_navigation,
+                syntax: None,
+                declaration_syntax: Default::default(),
+            },
+        )))
     }
 }
 

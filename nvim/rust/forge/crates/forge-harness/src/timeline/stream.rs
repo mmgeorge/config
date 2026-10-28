@@ -25,7 +25,7 @@ pub enum TimelineOperation {
         index: usize,
         entry_id: String,
         exchange_id: String,
-        call_id: String,
+        call: crate::turn::ToolAddress,
         delta: String,
     },
     Message {
@@ -207,9 +207,10 @@ impl TimelineStream {
         let Some(address) = event.address.as_ref() else {
             return Ok(None);
         };
-        let Some(activity) = event.activity.as_ref() else {
+        let Some(tool_event) = event.tool_event() else {
             return Ok(None);
         };
+        let activity = tool_event.activity();
         if activity.kind == crate::backend::ToolActivityKind::FileChange {
             return Ok(None);
         }
@@ -227,8 +228,8 @@ impl TimelineStream {
         if !turn.tools().any(|tool| tool.id == activity.id) {
             return Ok(None);
         }
-        let call_id = format!("{}:{}", turn.id(), activity.id);
-        turn.record_tool_event(event, exchange.created_at_ms)?;
+        let call = crate::turn::ToolAddress::new(turn.id(), &activity.id);
+        turn.record_tool_event(tool_event, exchange.created_at_ms)?;
         target.metrics = exchange.metrics.clone();
         let base_revision = self.revision;
         ensure!(
@@ -245,7 +246,7 @@ impl TimelineStream {
                 index,
                 entry_id,
                 exchange_id: exchange.id.clone(),
-                call_id,
+                call,
                 delta: activity.output.clone().unwrap_or_default(),
             }],
         }))
@@ -696,8 +697,8 @@ fn ticking(entry: &TimelineEntry) -> bool {
             agent_by_id,
             ..
         } => {
-            exchange.completed_at_ms.is_none()
-                && (exchange.execution_started_at_ms.is_some()
+            !exchange.is_finished()
+                && (exchange.execution_started_at_ms().is_some()
                     || exchange.turn.iter().any(|turn| {
                         turn.tools()
                             .any(|tool| tool.state() == crate::turn::ToolState::Running)
@@ -714,8 +715,8 @@ fn ticking(entry: &TimelineEntry) -> bool {
                 run.state,
                 crate::agent::AgentState::Starting | crate::agent::AgentState::Closing
             ) || exchange.iter().any(|exchange| {
-                exchange.completed_at_ms.is_none()
-                    && (exchange.execution_started_at_ms.is_some()
+                !exchange.is_finished()
+                    && (exchange.execution_started_at_ms().is_some()
                         || exchange.turn.iter().any(|turn| {
                             turn.tools()
                                 .any(|tool| tool.state() == crate::turn::ToolState::Running)
@@ -948,7 +949,7 @@ mod test {
         );
         assert_eq!(live, ["first", "second"]);
         let retained = crate::codec::to_value(stream.entry_list())?;
-        first.owner = Box::new(crate::timeline::TimelineOwner::session("other-session"));
+        *first.owner = crate::timeline::TimelineOwner::session("other-session");
         assert!(stream.update_checks(&first).is_err());
         assert_eq!(crate::codec::to_value(stream.entry_list())?, retained);
         Ok(())
@@ -1206,7 +1207,7 @@ mod test {
             event: crate::timeline::SessionEventRecord {
                 id: id.into(),
                 session_id: "session".into(),
-                owner: crate::timeline::TimelineOwner::session(&"session"),
+                owner: crate::timeline::TimelineOwner::session("session"),
                 created_at_ms: 0,
                 detail: crate::timeline::SessionEventKind::Renamed { name: name.into() },
             },
@@ -1288,7 +1289,7 @@ mod test {
                 event: crate::timeline::SessionEventRecord {
                     id: format!("event-{ordinal}"),
                     session_id: "session".into(),
-                    owner: crate::timeline::TimelineOwner::session(&"session"),
+                    owner: crate::timeline::TimelineOwner::session("session"),
                     created_at_ms: ordinal,
                     detail: crate::timeline::SessionEventKind::Renamed {
                         name: "settled".repeat(100),

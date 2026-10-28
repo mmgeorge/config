@@ -821,7 +821,7 @@ end
 function M.present_plan_question(force)
   local state = harness_state()
   local elicitation = state.active_elicitation and state.active_elicitation.elicitation
-  if (state.busy and not force) or state.plan_question_open or not elicitation then return end
+  if state.question_clarification or (state.busy and not force) or state.plan_question_open or not elicitation then return end
   local owner = state.active_elicitation.owner
   local owner_id = state.active_elicitation.exchange_id or state.active_elicitation.plan_id
   local session_id = state.session.id
@@ -875,10 +875,16 @@ function M.present_plan_question(force)
       local pending_draft = { owner_id = owner_id, question_set_id = elicitation.question_set.id,
         question_id = params.question_id, text = params.text }
       state.question_draft = pending_draft
+      state.question_clarification = pending_draft
       input_state.submit(state, params.text, {}, "auto", nil, function(failure)
         if not failure and state.question_draft == pending_draft then state.question_draft = nil end
         question_presentation.reset(state)
-        synchronize_state()
+        synchronize_state(function(_, sync_failure)
+          if not sync_failure and state.question_clarification == pending_draft then
+            state.question_clarification = nil
+            M.present_plan_question(false)
+          end
+        end)
       end)
     end,
     pending = function()

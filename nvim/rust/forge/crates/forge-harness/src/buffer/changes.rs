@@ -128,14 +128,14 @@ impl ChangeTree {
             .iter()
             .flat_map(|file| &file.hunk)
             .flat_map(|hunk| &hunk.row)
-            .filter(|row| row.kind == RowKind::Added)
+            .filter(|row| row.kind() == RowKind::Added)
             .count();
         let removed = patch
             .file
             .iter()
             .flat_map(|file| &file.hunk)
             .flat_map(|hunk| &hunk.row)
-            .filter(|row| row.kind == RowKind::Removed)
+            .filter(|row| row.kind() == RowKind::Removed)
             .count();
         let count = patch.file.len();
         let unit = if declaration.is_some_and(|(_, document)| document) {
@@ -191,13 +191,13 @@ impl ChangeTree {
                 .hunk
                 .iter()
                 .flat_map(|hunk| &hunk.row)
-                .filter(|row| row.kind == RowKind::Added)
+                .filter(|row| row.kind() == RowKind::Added)
                 .count();
             let removed = file
                 .hunk
                 .iter()
                 .flat_map(|hunk| &hunk.row)
-                .filter(|row| row.kind == RowKind::Removed)
+                .filter(|row| row.kind() == RowKind::Removed)
                 .count();
             let status = if file.old_path.is_none() {
                 FileChange::Added
@@ -273,14 +273,15 @@ impl ChangeTree {
                         None,
                     )?;
                     for (row_index, row) in rows.iter().enumerate() {
-                        let location = if let (Some(path), Some(line)) =
-                            (&file.new_path, row.new.map(|coordinate| coordinate.line))
-                        {
+                        let location = if let (Some(path), Some(line)) = (
+                            &file.new_path,
+                            row.new_coordinate().map(|coordinate| coordinate.line),
+                        ) {
                             Some((path, line, false))
                         } else if declaration.is_some() {
                             file.old_path
                                 .as_ref()
-                                .zip(row.old.map(|coordinate| coordinate.line))
+                                .zip(row.old_coordinate().map(|coordinate| coordinate.line))
                                 .map(|(path, line)| (path, line, true))
                         } else {
                             None

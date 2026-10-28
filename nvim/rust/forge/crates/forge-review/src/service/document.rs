@@ -4,7 +4,7 @@ use forge_buffer::block::{
     TextChunk, TextPosition, TextRange,
 };
 use forge_buffer::document::{BufferDocument, LocalEditPreparation};
-use forge_buffer::editable::{EditAcknowledgement, LocalEdit, LocalEditResult};
+use forge_buffer::editable::{EditAcknowledgement, LocalEdit};
 use forge_buffer::identity::{
     BlockId, DocumentId, EditSequence, FoldId, RegionId, RegionRevision, TargetId,
 };
@@ -573,7 +573,7 @@ impl ReviewService {
                         if let Some(body) = &item.body {
                             block.push(render_markdown(
                                 BlockId(format!("{identity}:body")),
-                                &body,
+                                body,
                                 &width,
                                 &mut link,
                             )?);
@@ -854,10 +854,7 @@ impl ReviewDocument {
                 None
             };
             let acknowledgement = self.region_edit(edit)?;
-            let patch = prepared.map(|prepared| match prepared.commit() {
-                LocalEditResult::Accepted { patch, .. } => *patch,
-                _ => unreachable!("validated local edit commit"),
-            });
+            let patch = prepared.map(|prepared| prepared.commit().patch);
             Ok(ReviewEditResult {
                 acknowledgement,
                 patch,
@@ -1675,11 +1672,11 @@ fn overview_blocks(
             block.push(reviewer.clone());
             continue;
         }
-        if name == "Head" {
-            if let Some(commit) = head_commit {
-                block.push(head_overview_block(commit, detail("Head"))?);
-                continue;
-            }
+        if name == "Head"
+            && let Some(commit) = head_commit
+        {
+            block.push(head_overview_block(commit, detail("Head"))?);
+            continue;
         }
         let text = format!("{name}: {value}");
         let mut row = metadata_block(format!("overview:{name}"), &text)?;

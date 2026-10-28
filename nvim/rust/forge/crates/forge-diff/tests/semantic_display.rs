@@ -40,7 +40,7 @@ async fn analysis(
     }
     let new = syntax.pop().unwrap();
     let old = syntax.pop().unwrap();
-    (support::retain(compute_hunks(source).unwrap()), old, new)
+    (support::retain(compute_hunks(source)), old, new)
 }
 
 fn drain(cursor: &mut DisplayCursor, rows: usize) -> Vec<DisplayRow> {
@@ -115,7 +115,10 @@ async fn semantic_windows_merge_and_shared_boundaries_render_once_in_typescript_
             assert_eq!(rows, drain(&mut make_cursor(), 256));
             assert_eq!(rows.iter().filter(|row| row.text == header).count(), 1);
             assert_eq!(rows.iter().filter(|row| row.text == "}").count(), 1);
-            for select in [|row: &DisplayRow| row.old, |row: &DisplayRow| row.new] {
+            for select in [
+                |row: &DisplayRow| row.old_coordinate(),
+                |row: &DisplayRow| row.new_coordinate(),
+            ] {
                 let coordinate: Vec<_> = rows
                     .iter()
                     .filter_map(|row| select(row).map(|coordinate| coordinate.line))
@@ -138,14 +141,17 @@ async fn semantic_windows_merge_and_shared_boundaries_render_once_in_typescript_
             }
             let bridge = rows
                 .iter()
-                .find(|row| row.new.is_some_and(|coordinate| coordinate.line == 18))
+                .find(|row| {
+                    row.new_coordinate()
+                        .is_some_and(|coordinate| coordinate.line == 18)
+                })
                 .unwrap();
-            assert_eq!(bridge.kind, RowKind::Context);
+            assert_eq!(bridge.kind(), RowKind::Context);
             assert_eq!(bridge.group_index, 0);
-            assert!(
-                rows.iter()
-                    .all(|row| row.new.is_none_or(|coordinate| coordinate.line != 29))
-            );
+            assert!(rows.iter().all(|row| {
+                row.new_coordinate()
+                    .is_none_or(|coordinate| coordinate.line != 29)
+            }));
             assert_eq!(diff.hunks(), raw);
         }
     }
@@ -240,7 +246,7 @@ async fn nested_rust_methods_share_ancestor_boundaries_without_merging_sibling_s
     assert_eq!(rows.iter().filter(|row| row.text == "}").count(), 1);
     let coordinate: Vec<_> = rows
         .iter()
-        .filter_map(|row| row.new.map(|coordinate| coordinate.line))
+        .filter_map(|row| row.new_coordinate().map(|coordinate| coordinate.line))
         .collect();
     assert_eq!(
         coordinate.len(),
@@ -271,10 +277,10 @@ async fn deletion_only_context_uses_the_old_declaration_and_preserves_line_mappi
     assert!(cursor.group(1).is_none());
     assert_eq!(cursor.context_label(0), Some("pub fn foo() -> i32 {"));
     for row in drain(&mut cursor, 1) {
-        if let Some(coordinate) = row.old {
+        if let Some(coordinate) = row.old_coordinate() {
             assert_eq!(row.text, original[coordinate.line]);
         }
-        if let Some(coordinate) = row.new {
+        if let Some(coordinate) = row.new_coordinate() {
             assert_eq!(row.text, modified[coordinate.line]);
         }
     }
@@ -337,10 +343,10 @@ async fn structural_gaps_preserve_syntax_and_source_coordinates_across_delivery_
                                 .all(|capture| !capture.capture.ends_with(language.name()))
                         );
                     } else {
-                        if let Some(coordinate) = row.old {
+                        if let Some(coordinate) = row.old_coordinate() {
                             assert_eq!(row.text, original[coordinate.line]);
                         }
-                        if let Some(coordinate) = row.new {
+                        if let Some(coordinate) = row.new_coordinate() {
                             assert_eq!(row.text, proposed[coordinate.line]);
                         }
                         if row.text == opening || row.text == method {
@@ -372,11 +378,11 @@ async fn structural_gaps_preserve_syntax_and_source_coordinates_across_delivery_
                 assert_eq!(
                     actual
                         .iter()
-                        .map(|row| (&row.text, row.old, row.new))
+                        .map(|row| (&row.text, row.old_coordinate(), row.new_coordinate()))
                         .collect::<Vec<_>>(),
                     expected
                         .iter()
-                        .map(|row| (&row.text, row.old, row.new))
+                        .map(|row| (&row.text, row.old_coordinate(), row.new_coordinate()))
                         .collect::<Vec<_>>()
                 );
             }
@@ -401,11 +407,14 @@ async fn one_omitted_source_line_is_shown_instead_of_an_ellipsis() {
     let rows = drain(&mut cursor, 1);
     let hidden = rows
         .iter()
-        .find(|row| row.new.is_some_and(|coordinate| coordinate.line == 2))
+        .find(|row| {
+            row.new_coordinate()
+                .is_some_and(|coordinate| coordinate.line == 2)
+        })
         .unwrap();
     assert_eq!(hidden.text, original[2]);
     assert!(!hidden.is_gap());
-    assert_eq!(hidden.old.unwrap().line, 2);
+    assert_eq!(hidden.old_coordinate().unwrap().line, 2);
 }
 
 #[tokio::test]
@@ -434,6 +443,6 @@ async fn an_omitted_method_separates_the_impl_header_from_the_changed_method() {
     );
     assert!(
         rows.iter()
-            .any(|row| row.kind == RowKind::Added && row.text.contains("changed_12 = 999"))
+            .any(|row| row.kind() == RowKind::Added && row.text.contains("changed_12 = 999"))
     );
 }

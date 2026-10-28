@@ -475,43 +475,23 @@ impl<'a> PlanValidator<'a> {
 
     fn validate_flow_edge(&mut self, edge: &PlanFlowEdge, edge_path: &str) {
         self.validate_reference(&format!("{edge_path}.target"), &edge.target);
-        match edge.relation {
-            PlanFlowRelation::Call | PlanFlowRelation::Read | PlanFlowRelation::Write => {
-                if let Some(callable) = &edge.callable {
-                    self.callable(&format!("{edge_path}.callable"), callable);
-                } else {
-                    self.push(
-                        &format!("{edge_path}.callable"),
-                        "is required for callable relations",
-                    );
-                }
+        match &edge.operation {
+            super::PlanFlowOperation::Call(call)
+            | super::PlanFlowOperation::Read(call)
+            | super::PlanFlowOperation::Write(call) => {
+                self.callable(&format!("{edge_path}.callable"), &call.callable);
                 self.validate_type_reference(&format!("{edge_path}.target"), &edge.target);
             }
-            PlanFlowRelation::Send | PlanFlowRelation::Emit | PlanFlowRelation::Return => {
-                if let Some(payload_type) = &edge.payload_type {
-                    self.required(&format!("{edge_path}.payload_type"), payload_type);
-                } else {
-                    self.push(
-                        &format!("{edge_path}.payload_type"),
-                        "is required for payload relations",
-                    );
-                }
+            super::PlanFlowOperation::Send(payload)
+            | super::PlanFlowOperation::Emit(payload)
+            | super::PlanFlowOperation::Return(payload) => {
+                self.required(&format!("{edge_path}.payload_type"), payload);
             }
-            PlanFlowRelation::Construct => {
+            super::PlanFlowOperation::Construct => {
                 self.validate_type_reference(&format!("{edge_path}.target"), &edge.target);
             }
         }
-        if !matches!(
-            edge.relation,
-            PlanFlowRelation::Call | PlanFlowRelation::Read | PlanFlowRelation::Write
-        ) && edge.return_type.is_some()
-        {
-            self.push(
-                &format!("{edge_path}.return_type"),
-                "belongs only to callable relations",
-            );
-        }
-        if let Some(return_type) = &edge.return_type {
+        if let Some(return_type) = edge.return_type() {
             self.required(
                 &format!("{edge_path}.return_type.value_type"),
                 &return_type.value_type,
@@ -549,20 +529,20 @@ impl<'a> PlanValidator<'a> {
             .collect::<HashMap<_, _>>();
         for (stage_index, stage) in self.document.stages.iter().enumerate() {
             let stage_path = format!("/stages/{stage_index}");
-            if stage.id.len() > 128 || stage.id.chars().any(char::is_control) {
+            if stage.id.chars().any(char::is_control) {
                 self.push(
                     &format!("{stage_path}/id"),
-                    "must contain at most 128 bytes without control characters",
+                    "must not contain control characters",
                 );
             }
             self.required(&format!("{stage_path}/title"), &stage.title);
             let mut file_owner = HashMap::new();
             for (task_index, task) in stage.tasks.iter().enumerate() {
                 let task_path = format!("{stage_path}/tasks/{task_index}");
-                if task.id.len() > 128 || task.id.chars().any(char::is_control) {
+                if task.id.chars().any(char::is_control) {
                     self.push(
                         &format!("{task_path}/id"),
-                        "must contain at most 128 bytes without control characters",
+                        "must not contain control characters",
                     );
                 }
                 let mut prerequisite = HashSet::new();
@@ -599,23 +579,22 @@ impl<'a> PlanValidator<'a> {
                             .collect::<Vec<_>>()
                             .join("/")
                             .to_lowercase();
-                        if let Some(previous) = file_owner.insert(normalized, task.id.as_str()) {
-                            if previous != task.id {
-                                self.push(
-                                    &format!("{task_path}/files"),
-                                    &format!(
-                                        "file {path} is also owned by sibling task {previous}"
-                                    ),
-                                );
-                            }
+                        if let Some(previous) = file_owner.insert(normalized, task.id.as_str())
+                            && previous != task.id
+                        {
+                            self.push(
+                                &format!("{task_path}/files"),
+                                &format!("file {path} is also owned by sibling task {previous}"),
+                            );
                         }
                     }
                 }
             }
         }
         let mut attached_entity = HashMap::<&str, String>::new();
-        for (task_index, task) in self.document.tasks().enumerate() {
-            let path = self.document.task_path(task_index);
+        for task_entry in self.document.task_entries() {
+            let task = task_entry.task();
+            let path = task_entry.path();
             self.required(&format!("{path}.title"), &task.title);
             self.prose(&format!("{path}.description"), &task.description);
             let mut file_path_set = HashSet::new();
@@ -813,8 +792,9 @@ impl<'a> PlanValidator<'a> {
                 );
             }
         }
-        for (task_index, task) in self.document.tasks().enumerate() {
-            let task_path = self.document.task_path(task_index);
+        for task_entry in self.document.task_entries() {
+            let task = task_entry.task();
+            let task_path = task_entry.path();
             if task.files.is_empty() {
                 self.push(&format!("{task_path}/files"), "requires at least one file");
             }
@@ -861,17 +841,17 @@ impl<'a> PlanValidator<'a> {
 
     fn validate_submission_flow_edge(&mut self, edge: &PlanFlowEdge, edge_path: &str) {
         if let (EntityReference::PlannedEntity { entity }, Some(callable)) =
-            (&edge.target, &edge.callable)
+            (&edge.target, edge.callable())
+            && self.graph.entity(entity).is_some()
+            && !self.declares_callable(entity, callable)
         {
-            if self.graph.entity(entity).is_some() && !self.declares_callable(entity, callable) {
-                self.push(
+            self.push(
                     &format!("{edge_path}.callable"),
                     &format!(
                         "planned entity `{entity}` has no surviving {:?} member `{}` declared on itself or its planned parents/contracts",
                         callable.kind, callable.name,
                     ),
                 );
-            }
         }
         if !edge.expansion.is_empty() && !flow_expansion_has_material_work(&edge.expansion) {
             self.push(
@@ -1112,7 +1092,7 @@ impl<'a> PlanValidator<'a> {
 
 fn flow_expansion_has_material_work(edge_list: &[PlanFlowEdge]) -> bool {
     edge_list.iter().any(|edge| {
-        !matches!(edge.relation, PlanFlowRelation::Return)
+        !matches!(edge.relation(), PlanFlowRelation::Return)
             || !edge.branches.is_empty()
             || flow_expansion_has_material_work(&edge.expansion)
     })
@@ -1205,8 +1185,7 @@ mod test {
     }
     use super::super::{
         ChangeAction, EntityChangeAction, MemberKind, PlanCallable, PlanCallableKind,
-        PlanFileChange, PlanFlowRelation, ProgramEntityMemberChange, Visibility,
-        attach_test_fixture, test_fixture,
+        PlanFileChange, ProgramEntityMemberChange, Visibility, attach_test_fixture, test_fixture,
     };
     use super::validate_plan_edit;
 
@@ -1261,8 +1240,7 @@ mod test {
         }
         document.flows[0].edges[0].branches.clear();
         document.flows[0].edges[0].expansion[0]
-            .callable
-            .as_mut()
+            .callable_mut()
             .unwrap()
             .name = "setup_scene".into();
         super::validate_plan_submission(&document).unwrap();
@@ -1395,25 +1373,29 @@ mod test {
     #[test]
     fn flow_edges_require_their_relation_specific_types() {
         let mut document = test_fixture("plan", "Validate edge types.");
-        document.flows[0].edges[0].relation = PlanFlowRelation::Call;
-        document.flows[0].edges[0].payload_type = None;
-        document.flows[0].edges[0].return_type = None;
-        document.flows[0].edges[0].callable = None;
+        let mut invalid = serde_json::to_value(&document).unwrap();
+        invalid["flows"][0]["edges"][0]["relation"] = serde_json::json!("call");
+        invalid["flows"][0]["edges"][0]["payload_type"] = serde_json::Value::Null;
+        let error = serde_json::from_value::<crate::plan::PlanDocument>(invalid)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("callable is required"));
         document.flows[0].edges[0].target = crate::plan::EntityReference::PlannedEntity {
             entity: "PlanDocument".into(),
         };
 
-        let error = validate_plan_edit(&document).unwrap_err().to_string();
-
-        assert!(error.contains("flows[0].edges[0].callable"));
-        document.flows[0].edges[0].callable = Some(PlanCallable {
-            kind: PlanCallableKind::Method,
-            name: "dispatch".into(),
-        });
-        document.flows[0].edges[0].return_type = Some(crate::plan::PlanFlowReturnType {
-            value_type: "ExecutablePlan".into(),
-            error_type: Some("PlanError".into()),
-        });
+        document.flows[0].edges[0].operation =
+            crate::plan::PlanFlowOperation::Call(crate::plan::PlanFlowCall {
+                callable: PlanCallable {
+                    kind: PlanCallableKind::Method,
+                    name: "dispatch".into(),
+                },
+                payload_type: None,
+                return_type: Some(crate::plan::PlanFlowReturnType {
+                    value_type: "ExecutablePlan".into(),
+                    error_type: Some("PlanError".into()),
+                }),
+            });
         validate_plan_edit(&document).unwrap();
     }
 

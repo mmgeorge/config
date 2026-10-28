@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn discard(
-    intent: &GitWriteIntent,
+    intent: &WriteExecution<'_>,
     staged: &PatchTarget,
     unstaged: &PatchTarget,
     check: &mut dyn FnMut() -> Result<()>,
@@ -14,13 +14,22 @@ pub(super) fn discard(
         .precondition()
         .patch_presence(&staged.path, PatchDirection::DiscardStaged);
     let staged_patch = encode_patch(staged, presence.0, presence.1)?;
-    for (patch, cached) in [(&unstaged_patch, false), (&staged_patch, true)] {
-        let output = apply(intent, patch, cached, true, check)?;
+    for (patch, step) in [
+        (&unstaged_patch, ReversePatchStep::CheckWorktree),
+        (&staged_patch, ReversePatchStep::CheckIndex),
+    ] {
+        let output = run_reverse_patch(intent, patch, step, 64 * 1024, check)?;
         if !output.status.success() {
             return Ok(output);
         }
     }
-    let mut collected = apply(intent, &unstaged_patch, false, false, check)?;
+    let mut collected = run_reverse_patch(
+        intent,
+        &unstaged_patch,
+        ReversePatchStep::ApplyWorktree,
+        64 * 1024,
+        check,
+    )?;
     if !collected.status.success() {
         return Ok(collected);
     }
@@ -38,39 +47,4 @@ pub(super) fn discard(
     collected.stdout.truncate(64 * 1024);
     collected.stderr.truncate(64 * 1024);
     Ok(collected)
-}
-
-fn apply(
-    intent: &GitWriteIntent,
-    patch: &[u8],
-    cached: bool,
-    verify: bool,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<std::process::Output> {
-    check()?;
-    let mut command = git_command(&intent.repository)?;
-    command.args([
-        "apply",
-        "--reverse",
-        "--unidiff-zero",
-        "--whitespace=nowarn",
-    ]);
-    if cached {
-        command.arg("--cached");
-    }
-    if verify {
-        command.arg("--check");
-    }
-    command.arg("-");
-    intent.store.writes.command_started(intent.operation());
-    progress_command(
-        &mut command,
-        CommandLimits {
-            stderr_bytes: 64 * 1024,
-            timeout: Duration::from_secs(120),
-        },
-        Some(patch),
-        intent.progress.as_ref(),
-        check,
-    )
 }

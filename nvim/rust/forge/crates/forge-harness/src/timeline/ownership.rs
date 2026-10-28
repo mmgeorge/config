@@ -117,26 +117,44 @@ fn source_node(node: &ExchangeNode) -> bool {
     )
 }
 
+struct AnchoredEvent {
+    event: TimelineEvent,
+    position: usize,
+}
+
+impl AnchoredEvent {
+    fn new(exchange: &Exchange, event: TimelineEvent) -> Result<Self> {
+        event.owner().validate_exchange(exchange)?;
+        let position = match event.owner() {
+            TimelineOwner::Exchange { node_count, .. } => *node_count,
+            TimelineOwner::Session { .. } => {
+                anyhow::bail!("a session event cannot be attached to an exchange")
+            }
+        };
+        Ok(Self { event, position })
+    }
+}
+
 /// Rebuilds event positions from immutable source anchors without moving provider nodes.
 pub(crate) fn insert_event(exchange: &mut Exchange, event: TimelineEvent) -> Result<()> {
-    event.owner().validate_exchange(exchange)?;
+    let event = AnchoredEvent::new(exchange, event)?;
     let mut events: Vec<_> = exchange
         .node_list
         .iter()
         .filter_map(|node| {
             if let ExchangeNode::TimelineEvent { event } = node {
-                Some((**event).clone())
+                Some(AnchoredEvent::new(exchange, (**event).clone()))
             } else {
                 None
             }
         })
-        .collect();
+        .collect::<Result<_>>()?;
     if let Some(existing) = events
         .iter_mut()
-        .find(|existing| existing.id() == event.id())
+        .find(|existing| existing.event.id() == event.event.id())
     {
         ensure!(
-            existing.owner() == event.owner(),
+            existing.event.owner() == event.event.owner(),
             "timeline event ownership cannot change"
         );
         *existing = event;
@@ -147,32 +165,25 @@ pub(crate) fn insert_event(exchange: &mut Exchange, event: TimelineEvent) -> Res
         .node_list
         .retain(|node| !matches!(node, ExchangeNode::TimelineEvent { .. }));
     events.sort_by(|left, right| {
-        let position = |event: &TimelineEvent| match event.owner() {
-            TimelineOwner::Exchange { node_count, .. } => *node_count,
-            TimelineOwner::Session { .. } => unreachable!(),
-        };
-        position(left)
-            .cmp(&position(right))
-            .then_with(|| left.created_at_ms().cmp(&right.created_at_ms()))
-            .then_with(|| left.id().cmp(right.id()))
+        left.position
+            .cmp(&right.position)
+            .then_with(|| left.event.created_at_ms().cmp(&right.event.created_at_ms()))
+            .then_with(|| left.event.id().cmp(right.event.id()))
     });
     let mut events = events.into_iter().peekable();
     let mut result = Vec::with_capacity(exchange.node_list.len() + events.len());
     let mut position = 0;
     for node in std::mem::take(&mut exchange.node_list) {
-        while events.peek().is_some_and(|event| {
-            matches!(event.owner(),
-            TimelineOwner::Exchange { node_count, .. } if *node_count <= position)
-        }) {
+        while let Some(event) = events.next_if(|event| event.position <= position) {
             result.push(ExchangeNode::TimelineEvent {
-                event: Box::new(events.next().unwrap()),
+                event: Box::new(event.event),
             });
         }
         position += usize::from(source_node(&node));
         result.push(node);
     }
     result.extend(events.map(|event| ExchangeNode::TimelineEvent {
-        event: Box::new(event),
+        event: Box::new(event.event),
     }));
     exchange.node_list = result;
     Ok(())
@@ -296,7 +307,10 @@ mod tests {
     fn retired_exchange_history_is_excluded_explicitly() -> Result<()> {
         let mut removed = exchange("removed");
         let run = run(TimelineOwner::exchange(&removed));
-        removed.disposition = crate::exchange::HistoryDisposition::RolledBack;
+        removed.finish(crate::exchange::ExchangeOutcome::Interrupted, 2)?;
+        removed
+            .set_disposition(crate::exchange::HistoryDisposition::RolledBack)
+            .unwrap();
         assert!(TimelineProjector::with_history(Vec::new(), vec![run], &[removed])?.is_empty());
         Ok(())
     }

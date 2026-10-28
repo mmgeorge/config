@@ -15,7 +15,7 @@ local function counter(value)
 end
 
 local function identity(value)
-  assert(type(value) == "string" and #value > 0 and #value <= 256 and not value:find("%c"), "invalid identity")
+  assert(type(value) == "string" and #value > 0 and not value:find("%c"), "invalid identity")
   return value
 end
 
@@ -94,7 +94,7 @@ local function validate_metadata(entry, read_row, region_seen)
   end
   if entry.metadata.layout then
     local layout = entry.metadata.layout
-    assert(counter(layout.indent) >= 2 and layout.indent <= 256, "invalid content indent")
+    assert(counter(layout.indent) >= 2, "invalid content indent")
     assert(counter(layout.source_indent or 0) <= layout.indent - 2, "invalid materialized content indent")
     if layout.marker and layout.marker ~= vim.NIL then
       assert(type(layout.marker.text) == "string" and not layout.marker.text:find("[%c]")

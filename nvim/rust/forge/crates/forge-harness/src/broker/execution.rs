@@ -331,8 +331,13 @@ impl HarnessBroker {
                 plan.review_digest = Some(digest.clone());
                 plan.document_version = document.version;
                 plan.submitted_version = Some(document.version);
-                let delta =
-                    crate::plan::revision::DeclarationDelta::between(Some(&previous), &document)?;
+                let delta = crate::plan::revision::DeclarationDelta::between(
+                    Some(&previous),
+                    document
+                        .design
+                        .as_ref()
+                        .context("accepted execution plan has no declaration design")?,
+                )?;
                 interaction.node_list.push(ExchangeNode::ArtifactChange {
                     change: crate::exchange::ArtifactChange {
                         id: format!("{}:artifact:{}", interaction.id, plan.model_revision),
@@ -896,15 +901,13 @@ impl HarnessBroker {
         if matches!(
             state,
             PlanExecutionState::Cancelled | PlanExecutionState::Stalled
-        ) {
-            if let Some(mut interaction) = self
-                .store
-                .latest_execution_exchange(&self.session.id, &execution.id)?
-            {
-                self.capture_partial_report(&mut execution, &mut interaction)
-                    .await;
-                report_exchange = Some(interaction);
-            }
+        ) && let Some(mut interaction) = self
+            .store
+            .latest_execution_exchange(&self.session.id, &execution.id)?
+        {
+            self.capture_partial_report(&mut execution, &mut interaction)
+                .await;
+            report_exchange = Some(interaction);
         }
         self.store.save_execution_transition(
             &execution,

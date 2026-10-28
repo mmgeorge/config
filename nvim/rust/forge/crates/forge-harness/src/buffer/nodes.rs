@@ -54,7 +54,7 @@ pub(super) struct NodeMap {
     /// Latest accepted explicit transition per node.
     pub intent_sequence: HashMap<String, u64>,
     /// Raw and parsed tool sources retained outside the native buffer.
-    pub tool: HashMap<String, super::tool::ToolOutputView>,
+    pub tool: HashMap<super::identity::DisplayId, super::tool::ToolOutputView>,
     /// Formatted source byte windows retained for explicitly opened tools.
     pub tool_limit: HashMap<String, usize>,
     state: HashMap<String, NodeState>,
@@ -72,10 +72,9 @@ impl NodeMap {
         self.tool_limit.remove(id);
         if let Some(state) = self.state.remove(id)
             && let Some(parent) = state.parent
+            && let Some(children) = self.child.get_mut(&parent.0)
         {
-            if let Some(children) = self.child.get_mut(&parent.0) {
-                children.remove(id);
-            }
+            children.remove(id);
         }
         self.child.remove(id);
         self.text.remove(id);

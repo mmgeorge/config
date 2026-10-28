@@ -17,8 +17,8 @@ mod tool_scope;
 pub(crate) use activity::status as tool_activity_status;
 pub(crate) use activity::{AgentActivity, AgentToolReference};
 pub use coordinator::{
-    AgentAdmission, AgentCommand, AgentCommandSender, AgentCoordinator, AgentOperation,
-    AgentQuiescence, AgentRequest, SpawnAgentRequest,
+    AgentAdmission, AgentCommand, AgentCommandSender, AgentCommit, AgentCoordinator,
+    AgentOperation, AgentQuiescence, AgentRequest, AgentWork, SpawnAgentRequest,
 };
 pub use profile::{AgentProfile, AgentProfileDocument, AgentProfileStore};
 pub use selection::AgentSelection;

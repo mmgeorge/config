@@ -82,7 +82,6 @@ impl ReviewDocument {
         ensure!(
             pending.is_empty()
                 || operation.is_some_and(|operation| !operation.is_empty()
-                    && operation.len() <= 256
                     && operation.bytes().all(|byte| byte.is_ascii_graphic())),
             "stored PR capture has no valid operation identity"
         );
@@ -196,9 +195,7 @@ impl ReviewDocument {
         );
         if let (Some(operation), Some(capture)) = (operation, capture) {
             ensure!(
-                !operation.is_empty()
-                    && operation.len() <= 256
-                    && operation.bytes().all(|byte| byte.is_ascii_graphic()),
+                !operation.is_empty() && operation.bytes().all(|byte| byte.is_ascii_graphic()),
                 "stored review submission operation is invalid"
             );
             let capture: ReviewMutation = serde_json::from_value(capture.clone())?;

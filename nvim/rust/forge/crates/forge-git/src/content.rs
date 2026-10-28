@@ -530,12 +530,31 @@ fn finish_bytes(
     expected: Option<SourceIdentity>,
     identity: Option<&mut Option<SourceIdentity>>,
 ) -> Result<ContentResult> {
-    let bytes = Arc::new(bytes);
+    let bytes = match String::from_utf8(bytes) {
+        Ok(text) => Arc::new(text),
+        Err(failure) => {
+            if let Some(identity) = identity {
+                *identity = Some(SourceIdentity::from_bytes(
+                    failure.as_bytes(),
+                    representation,
+                ));
+                ensure!(
+                    expected.is_none_or(|expected| Some(expected) == *identity),
+                    "content identity differs from the requested source"
+                );
+            }
+            return Ok(if failure.as_bytes().contains(&0) {
+                ContentResult::Binary
+            } else {
+                ContentResult::Unavailable(ContentUnavailable::UnsupportedEncoding)
+            });
+        }
+    };
     let source = SourceVersion::from_shared(Arc::clone(&bytes), representation);
     if let Some(identity) = identity {
         *identity = Some(match &source {
             Ok(source) => source.identity(),
-            Err(_) => SourceIdentity::from_bytes(&bytes, representation),
+            Err(_) => SourceIdentity::from_bytes(bytes.as_bytes(), representation),
         });
         ensure!(
             expected.is_none_or(|expected| Some(expected) == *identity),

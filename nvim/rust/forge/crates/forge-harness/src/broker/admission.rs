@@ -46,7 +46,7 @@ impl HarnessBroker {
                 .context("planning turn has no active plan")?;
             let document = self
                 .plan_file
-                .read_working_document(&self.session.id, &plan_id)?;
+                .read_working_document(&self.session.id, plan_id)?;
             let context = PlanPrompt::with_active_document(String::new(), &document.model_json()?);
             input = match input {
                 BackendInput::Text { text, attachments } => {
@@ -119,7 +119,7 @@ impl HarnessBroker {
             context.lsp = Some(lsp_scope);
             context.repository = Some(repository_scope);
             context.harness = Some(harness_scope);
-            context.has_active_elicitation |= interaction.elicitation.is_some();
+            context.has_active_elicitation |= interaction.elicitation().is_some();
         }
         self.trace.record(
             &self.session.id,

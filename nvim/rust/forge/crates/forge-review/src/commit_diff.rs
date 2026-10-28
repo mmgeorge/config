@@ -191,7 +191,6 @@ impl CommitDiffStore {
 
 fn valid_path(path: &str) -> bool {
     !path.is_empty()
-        && path.len() <= 4096
         && !path.contains('\0')
         && !path.starts_with('/')
         && path.split('/').all(|part| !matches!(part, "" | "." | ".."))

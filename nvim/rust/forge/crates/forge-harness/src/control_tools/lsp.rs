@@ -165,10 +165,6 @@ impl LspService {
         id: &str,
         paths: Vec<String>,
     ) -> Result<Value> {
-        ensure!(
-            paths.len() <= 64,
-            "at most 64 target paths may be authorized per batch"
-        );
         let scope = {
             let pending = self.pending.lock().unwrap();
             let request = pending.get(id).context("LSP request is no longer active")?;
@@ -326,7 +322,11 @@ impl LspService {
         failure: Option<String>,
     ) -> Result<()> {
         let mut pending = self.pending.lock().unwrap();
-        let request = pending.get(id).context("LSP request is no longer active")?;
+        let std::collections::hash_map::Entry::Occupied(entry) = pending.entry(id.to_owned())
+        else {
+            anyhow::bail!("LSP request is no longer active");
+        };
+        let request = entry.get();
         ensure!(
             request.session == session,
             "LSP response belongs to another session"
@@ -336,7 +336,7 @@ impl LspService {
             Some(failure) => Err(anyhow::anyhow!(failure)),
             None => serde_json::from_value(result).context("invalid editor LSP response"),
         };
-        let request = pending.remove(id).unwrap();
+        let request = entry.remove();
         let _ = request.result.send(result);
         Ok(())
     }
@@ -431,14 +431,13 @@ impl LspScope {
             .into_iter()
             .flatten()
         {
-            if let Some(path) = &target.path {
-                target.path = Some(
-                    self.authorize(path)
-                        .await?
-                        .to_string_lossy()
-                        .trim_start_matches("\\\\?\\")
-                        .replace('\\', "/"),
-                );
+            if let Some(path) = target.path_mut() {
+                *path = self
+                    .authorize(path)
+                    .await?
+                    .to_string_lossy()
+                    .trim_start_matches("\\\\?\\")
+                    .replace('\\', "/");
             }
         }
         let _slot = self

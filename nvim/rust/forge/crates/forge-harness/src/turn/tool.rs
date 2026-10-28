@@ -178,10 +178,9 @@ impl ToolStore {
         }
         if tool.state() != ToolState::Running
             && let Some(duration) = duration.filter(|duration| *duration >= 0)
+            && let Some(completed) = tool.completed_at_ms
         {
-            if let Some(completed) = tool.completed_at_ms {
-                tool.started_at_ms = Some(completed.saturating_sub(duration));
-            }
+            tool.started_at_ms = Some(completed.saturating_sub(duration));
         }
     }
 }

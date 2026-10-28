@@ -335,7 +335,7 @@ impl GithubService {
             let operation =
                 self.mutation
                     .enqueue_scoped(resource, scope, intent, retained_bytes)?;
-            mutation_started = Some(Arc::clone(&operation.mutation_started));
+            mutation_started = Some(operation.mutation_observer());
             let (sender, receiver) = oneshot::channel();
             {
                 let mut state = self

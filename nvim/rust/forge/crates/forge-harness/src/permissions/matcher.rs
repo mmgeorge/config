@@ -335,25 +335,11 @@ impl CompiledPermissionDocument {
     ) -> Result<PermissionEvaluation, CommandAnalysisError> {
         let mut result_list = Vec::new();
         for target in &request.target_list {
-            if let PermissionTarget::Command { command, shell } = target {
-                result_list.extend(self.evaluate_command(command, *shell)?);
-                continue;
-            }
-            if matches!(target, PermissionTarget::UnknownFile { .. }) {
-                result_list.push(TargetEvaluation {
-                    target: target.clone(),
-                    decision: PermissionDecision::Ask,
-                    matched_pattern: None,
-                    command: None,
-                });
-                continue;
-            }
             let (decision, matched_pattern) = match target {
-                PermissionTarget::UnknownFile { .. } => {
-                    unreachable!("unknown file targets require explicit approval")
-                }
-                PermissionTarget::Command { .. } => {
-                    unreachable!("commands are parsed before policy evaluation")
+                PermissionTarget::UnknownFile { .. } => (PermissionDecision::Ask, None),
+                PermissionTarget::Command { command, shell } => {
+                    result_list.extend(self.evaluate_command(command, *shell)?);
+                    continue;
                 }
                 PermissionTarget::Read { path } => self.best_rule(CATEGORY_READ, path, None),
                 PermissionTarget::Write { path } => self.best_rule(CATEGORY_EDIT, path, None),

@@ -338,10 +338,6 @@ impl SourceDocumentService {
             "source input column is invalid"
         );
         ensure!(
-            document.input.contains_key(&input.view) || document.input.len() < 64,
-            "source document view admission is full"
-        );
-        ensure!(
             document
                 .input
                 .get(&input.view)

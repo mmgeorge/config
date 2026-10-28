@@ -151,7 +151,11 @@ fn selected_exchange_queries_ignore_unrelated_malformed_history_and_use_indexes(
     store.save_exchange(&exchange)?;
     exchange.id = "latest".into();
     exchange.ordinal = 2;
-    exchange.state = ExchangeState::Finalizing;
+    exchange.phase = crate::exchange::ExchangePhase::fixture(
+        ExchangeState::Finalizing,
+        exchange.completed_at_ms(),
+        exchange.finalization_outcome(),
+    );
     exchange.execution_id = Some("execution".into());
     store.save_exchange(&exchange)?;
     store.connection.execute(

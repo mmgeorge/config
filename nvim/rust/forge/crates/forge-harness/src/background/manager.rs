@@ -158,7 +158,8 @@ impl BackgroundManager {
                     &request.delivery,
                     &session_id,
                     format!("Background compaction subscription failed: {error:#}"),
-                );
+                )
+                .await;
                 None
             }
         };
@@ -218,16 +219,16 @@ impl BackgroundManager {
             .and_then(|text| request.purpose.validate(&text));
         timeout.abort();
         let _ = forward.await;
-        if let Err(error) = &result {
-            if let Err(storage) =
+        if let Err(error) = &result
+            && let Err(storage) =
                 broker.background_failure("background_generation", format!("{error:#}"))
-            {
-                report(
-                    &request.delivery,
-                    &session_id,
-                    format!("Could not retain Background failure: {storage:#}"),
-                );
-            }
+        {
+            report(
+                &request.delivery,
+                &session_id,
+                format!("Could not retain Background failure: {storage:#}"),
+            )
+            .await;
         }
         let succeeded = result.is_ok();
         let _ = sender.send(result.map(|text| BackgroundResult {
@@ -260,7 +261,8 @@ impl BackgroundManager {
                                 &request.delivery,
                                 &session_id,
                                 format!("Background compaction event failed: {error:#}"),
-                            );
+                            )
+                            .await;
                         }
                     }
                     _ => {
@@ -275,7 +277,8 @@ impl BackgroundManager {
                                 &request.delivery,
                                 &session_id,
                                 "Background compaction completion was not confirmed".into(),
-                            );
+                            )
+                            .await;
                         }
                         break;
                     }
@@ -291,7 +294,8 @@ impl BackgroundManager {
                 &request.delivery,
                 &session_id,
                 format!("Background compaction failed: {error:#}"),
-            );
+            )
+            .await;
         }
         if let Err(error) = runtime.backend_handle().shutdown().await {
             let _ = broker.background_failure("provider_cleanup", format!("{error:#}"));
@@ -299,14 +303,16 @@ impl BackgroundManager {
                 &request.delivery,
                 &session_id,
                 format!("Background provider cleanup failed: {error:#}"),
-            );
+            )
+            .await;
         }
         if let Err(error) = broker.release_lease() {
             report(
                 &request.delivery,
                 &session_id,
                 format!("Background ownership cleanup failed: {error:#}"),
-            );
+            )
+            .await;
         }
     }
 
@@ -520,12 +526,34 @@ impl BackgroundManager {
     }
 }
 
-fn report(delivery: &Option<(MessageSender, u64)>, session: &str, error: String) {
+async fn report(delivery: &Option<(MessageSender, u64)>, session: &str, error: String) {
     if let Some((delivery, _)) = delivery {
-        let _ = delivery.send_event(SessionEvent {
-            session_id: session.into(),
-            event: "background_error".into(),
-            payload: json!({"error":error}),
-        });
+        let _ = delivery
+            .send_event(SessionEvent {
+                session_id: session.into(),
+                event: "background_error".into(),
+                payload: json!({"error":error}),
+            })
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_failure_is_delivered_to_the_owner() {
+        let (sender, mut receiver) = forge_protocol::outbound::channel();
+        report(&Some((sender, 1)), "session", "retained failure".into()).await;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_slice(frame.bytes()).unwrap();
+        assert_eq!(event["session_id"], "session");
+        assert_eq!(event["event"], "background_error");
+        assert_eq!(event["payload"]["error"], "retained failure");
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use forge_buffer::block::{BlockAnchor, BufferBlock, FoldRange, TextPosition, TextRange};
 use forge_buffer::node::{NodeDisplay, NodeKind, NodeLifecycle};
 use forge_buffer::text::BufferText;
@@ -15,15 +15,15 @@ pub(super) fn prepare(block: &mut BufferBlock, width: &WidthProfile) -> Result<(
         return Ok(());
     }
     let identity = node.id.clone();
+    let closed = node.default_display == NodeDisplay::Preview;
     block.metadata.fold.retain(|fold| fold.id != identity);
     let mut remaining = 3;
     let mut boundary = None;
-    for row in 0..block.text.row_count() {
+    for (row, text) in block.text.rows().enumerate() {
         if remaining == 0 {
             boundary = Some(TextPosition { row, column: 0 });
             break;
         }
-        let text = block.text.row(row).expect("message row");
         let skip = block
             .metadata
             .conceal
@@ -62,7 +62,7 @@ pub(super) fn prepare(block: &mut BufferBlock, width: &WidthProfile) -> Result<(
                     column: 0,
                 },
             },
-            closed: block.metadata.node.as_ref().unwrap().default_display == NodeDisplay::Preview,
+            closed,
             heading_start: Some(BlockAnchor {
                 block: block.id.clone(),
                 position: TextPosition { row: 0, column: 0 },
@@ -94,11 +94,16 @@ pub(super) fn settle(block: &mut BufferBlock) {
 }
 
 /// Keeps a message's full source in the transcript while projecting its selected preview.
-pub(super) fn project(source: &BufferBlock, expanded: Option<bool>) -> Result<BufferBlock> {
+pub(super) fn project(
+    source: &BufferBlock,
+    node: &forge_buffer::node::NodeState,
+    expanded: Option<bool>,
+) -> Result<BufferBlock> {
     let mut block = source.clone();
-    let node = block.metadata.node.as_mut().expect("message node");
+    let mut node = node.clone();
     node.resolve(expanded);
     let preview = node.display != NodeDisplay::Full;
+    block.metadata.node = Some(node.clone());
     let Some(fold) = block.metadata.fold.first().cloned() else {
         return Ok(block);
     };
@@ -108,7 +113,13 @@ pub(super) fn project(source: &BufferBlock, expanded: Option<bool>) -> Result<Bu
     let end = fold.start;
     let mut rows = source.text.slice(0..end.row)?;
     if end.column > 0 {
-        rows.push(&source.text.row(end.row).expect("preview boundary")[..end.column]);
+        rows.push(
+            source
+                .text
+                .row(end.row)
+                .and_then(|row| row.get(..end.column))
+                .context("message preview boundary is outside its source")?,
+        );
     }
     block.text = BufferText::from_rows(rows)?;
     let clip = |range: &mut TextRange| {
@@ -141,10 +152,10 @@ pub(super) fn project(source: &BufferBlock, expanded: Option<bool>) -> Result<Bu
         column: 0,
     };
     block.metadata.fold[0].closed = true;
-    let node = block.metadata.node.as_mut().expect("message node");
     node.loaded_rows = block.text.row_count();
     node.loaded_bytes = block.text.byte_count();
     node.more = true;
+    block.metadata.node = Some(node);
     Ok(block)
 }
 
@@ -171,7 +182,7 @@ mod tests {
             block.metadata.node = Some(node);
             prepare(&mut block, &width)?;
             assert_eq!(block.metadata.fold.len(), 1);
-            let preview = project(&block, Some(false))?;
+            let preview = project(&block, block.metadata.node.as_ref().unwrap(), Some(false))?;
             assert!(preview.text.byte_count() < block.text.byte_count());
             assert_eq!(
                 preview.metadata.node.as_ref().unwrap().display,
@@ -181,7 +192,10 @@ mod tests {
             assert!(text.starts_with(shown));
             let (retained, rows) = width.wrapped_prefix(shown, 3, 0)?;
             assert_eq!((retained, rows), (shown.len(), 3));
-            assert_eq!(project(&block, Some(true))?.text, block.text);
+            assert_eq!(
+                project(&block, block.metadata.node.as_ref().unwrap(), Some(true))?.text,
+                block.text
+            );
             assert!(!block.text.row(0).unwrap().is_empty());
         }
         Ok(())

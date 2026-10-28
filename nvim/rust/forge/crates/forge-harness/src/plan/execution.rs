@@ -80,7 +80,54 @@ pub struct VerificationCheck {
     pub evidence: Vec<String>,
 }
 
+enum VerificationAssessment<'report> {
+    Passed,
+    Failed,
+    Blocked { reason: &'report str },
+}
 impl VerificationReport {
+    fn assessment(&self) -> Result<VerificationAssessment<'_>> {
+        match self.outcome {
+            VerificationOutcome::Passed => {
+                ensure!(
+                    self.checks
+                        .iter()
+                        .all(|check| check.outcome == VerificationOutcome::Passed),
+                    "a passed assessment cannot contain failed or blocked checks"
+                );
+                ensure!(
+                    self.findings.is_empty(),
+                    "a passed assessment cannot retain unresolved findings"
+                );
+                ensure!(
+                    !self.evidence.is_empty(),
+                    "a passed assessment requires verification evidence"
+                );
+                Ok(VerificationAssessment::Passed)
+            }
+            VerificationOutcome::Failed => {
+                ensure!(
+                    self.findings
+                        .iter()
+                        .any(|finding| !finding.trim().is_empty())
+                        || self
+                            .checks
+                            .iter()
+                            .any(|check| check.outcome == VerificationOutcome::Failed),
+                    "failed verification requires concrete findings"
+                );
+                Ok(VerificationAssessment::Failed)
+            }
+            VerificationOutcome::Blocked => {
+                let reason = self
+                    .reason
+                    .as_deref()
+                    .filter(|reason| !reason.trim().is_empty())
+                    .context("blocked verification requires a reason")?;
+                Ok(VerificationAssessment::Blocked { reason })
+            }
+        }
+    }
     /// Validate check identities and evidence before a phase transition is committed.
     pub(crate) fn validate_checks(&self, actions: &[String]) -> Result<()> {
         ensure!(
@@ -342,23 +389,8 @@ impl PlanExecutionRecord {
             let report = request
                 .verification
                 .context("Verify requires a verification assessment")?;
-            match report.outcome {
-                VerificationOutcome::Passed => {
-                    ensure!(
-                        report
-                            .checks
-                            .iter()
-                            .all(|check| check.outcome == VerificationOutcome::Passed),
-                        "a passed assessment cannot contain failed or blocked checks"
-                    );
-                    ensure!(
-                        report.findings.is_empty(),
-                        "a passed assessment cannot retain unresolved findings"
-                    );
-                    ensure!(
-                        !report.evidence.is_empty(),
-                        "a passed assessment requires verification evidence"
-                    );
+            match report.assessment()? {
+                VerificationAssessment::Passed => {
                     if progress.conforms() {
                         self.state = PlanExecutionState::Complete;
                         self.completed_at_ms = Some(now_ms);
@@ -368,18 +400,7 @@ impl PlanExecutionRecord {
                         self.findings = progress.findings();
                     }
                 }
-                VerificationOutcome::Failed => {
-                    ensure!(
-                        report
-                            .findings
-                            .iter()
-                            .any(|finding| !finding.trim().is_empty())
-                            || report
-                                .checks
-                                .iter()
-                                .any(|check| check.outcome == VerificationOutcome::Failed),
-                        "failed verification requires concrete findings"
-                    );
+                VerificationAssessment::Failed => {
                     self.phase = PlanPhase::Resolve;
                     self.findings = report.findings.clone();
                     self.findings.extend(
@@ -391,16 +412,9 @@ impl PlanExecutionRecord {
                     );
                     self.findings.extend(progress.findings());
                 }
-                VerificationOutcome::Blocked => {
-                    ensure!(
-                        report
-                            .reason
-                            .as_ref()
-                            .is_some_and(|reason| !reason.trim().is_empty()),
-                        "blocked verification requires a reason"
-                    );
+                VerificationAssessment::Blocked { reason } => {
                     self.state = PlanExecutionState::Blocked;
-                    self.findings = vec![report.reason.clone().unwrap()];
+                    self.findings = vec![reason.to_owned()];
                     self.findings.extend(progress.findings());
                 }
             }

@@ -433,11 +433,11 @@ impl CopilotEventDecoder {
         let mut data = serde_json::to_value(provider_event).unwrap_or(Value::Null);
         if kind == "assistant_message" {
             let final_answer = provider_event.event_type == "assistant.message"
-                && !provider_event
+                && provider_event
                     .data
                     .get("toolRequests")
                     .and_then(Value::as_array)
-                    .is_some_and(|requests| !requests.is_empty());
+                    .is_none_or(|requests| requests.is_empty());
             data["phase"] = json!(if final_answer { "final" } else { "commentary" });
         }
         if let Some(id) = provider_event
@@ -557,8 +557,8 @@ async fn publish(
     event_sink: Option<&BackendEventSink>,
 ) {
     address_event(&mut event, output);
-    if let Some(compaction) = event.compaction().ok().flatten() {
-        if let Some(previous) = output.event.iter_mut().find(|previous| {
+    if let Some(compaction) = event.compaction().ok().flatten()
+        && let Some(previous) = output.event.iter_mut().find(|previous| {
             previous
                 .compaction()
                 .ok()
@@ -566,34 +566,34 @@ async fn publish(
                 .is_some_and(|existing| {
                     existing.id == compaction.id && existing.thread_id == compaction.thread_id
                 })
-        }) {
-            if let Some(event_sink) = event_sink {
-                let _ = event_sink.send_wait(event.clone()).await;
-            }
-            if previous
-                .compaction()
-                .ok()
-                .flatten()
-                .is_some_and(|existing| existing.state == crate::backend::CompactionState::Running)
-            {
-                if let Some(existing) = previous.compaction().ok().flatten() {
-                    let provider_event_id = event.data.get("provider_event_id").cloned();
-                    let mut retained = compaction;
-                    retained.result.context_tokens_before = existing
-                        .result
-                        .context_tokens_before
-                        .or(retained.result.context_tokens_before);
-                    retained.result.before_context = existing.result.before_context;
-                    retained.result.model = retained.result.model.or(existing.result.model);
-                    event.data = serde_json::to_value(retained).unwrap_or(event.data.clone());
-                    if let Some(provider_event_id) = provider_event_id {
-                        event.data["provider_event_id"] = provider_event_id;
-                    }
-                }
-                *previous = event;
-            }
-            return;
+        })
+    {
+        if let Some(event_sink) = event_sink {
+            let _ = event_sink.send_wait(event.clone()).await;
         }
+        if previous
+            .compaction()
+            .ok()
+            .flatten()
+            .is_some_and(|existing| existing.state == crate::backend::CompactionState::Running)
+        {
+            if let Some(existing) = previous.compaction().ok().flatten() {
+                let provider_event_id = event.data.get("provider_event_id").cloned();
+                let mut retained = compaction;
+                retained.result.context_tokens_before = existing
+                    .result
+                    .context_tokens_before
+                    .or(retained.result.context_tokens_before);
+                retained.result.before_context = existing.result.before_context;
+                retained.result.model = retained.result.model.or(existing.result.model);
+                event.data = serde_json::to_value(retained).unwrap_or(event.data.clone());
+                if let Some(provider_event_id) = provider_event_id {
+                    event.data["provider_event_id"] = provider_event_id;
+                }
+            }
+            *previous = event;
+        }
+        return;
     }
     if let Some(activity) = event.activity.as_ref()
         && let Some(previous) = output.event.iter_mut().find(|previous| {
@@ -1091,7 +1091,9 @@ mod test {
             exchange.observe_turn(output.event.last().unwrap(), index as i64 + 1)?;
             if kind == "tool.execution_start" {
                 let rendered = project(ProjectionSource::Exchange(&exchange), &Default::default(),
-                    false, &Default::default(), &Default::default())?;
+                    false, &Default::default(), &Default::default(),
+ &mut crate::buffer::identity::DisplayRegistry::default(),
+)?;
                 let text = rendered.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
                 assert!(text.contains("Changing files"));
                 assert!(!text.contains("Ran 1 tool"));
@@ -1106,7 +1108,7 @@ mod test {
         assert_eq!(activity.kind, ToolActivityKind::FileChange);
         assert_eq!(activity.change.file[0].path, "src/lib.rs");
         assert_eq!(activity.change.file[0].diff, "@@ -40 +40 @@\n-old\n+new\n");
-        exchange.finish(crate::exchange::ExchangeState::Complete, 10)?;
+        exchange.finish(crate::exchange::ExchangeOutcome::Complete, 10)?;
         let restored: crate::exchange::Exchange =
             serde_json::from_value(serde_json::to_value(exchange)?)?;
         let rendered = project(
@@ -1115,6 +1117,7 @@ mod test {
             false,
             &Default::default(),
             &Default::default(),
+            &mut crate::buffer::identity::DisplayRegistry::default(),
         )?;
         let text = rendered
             .entry
@@ -1143,9 +1146,9 @@ mod test {
         assert_eq!(hunk.old_lines, 39..40);
         assert_eq!(hunk.new_lines, 39..40);
         assert_eq!(hunk.row.len(), 2);
-        assert_eq!(hunk.row[0].kind, forge_diff::display::RowKind::Removed);
+        assert_eq!(hunk.row[0].kind(), forge_diff::display::RowKind::Removed);
         assert_eq!(hunk.row[0].text, "old");
-        assert_eq!(hunk.row[1].kind, forge_diff::display::RowKind::Added);
+        assert_eq!(hunk.row[1].kind(), forge_diff::display::RowKind::Added);
         assert_eq!(hunk.row[1].text, "new");
         Ok(())
     }

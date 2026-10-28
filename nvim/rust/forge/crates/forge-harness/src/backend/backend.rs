@@ -213,7 +213,34 @@ pub struct BackendEvent {
     pub task_update: Option<ProviderTaskUpdate>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ToolEvent<'event> {
+    event: &'event BackendEvent,
+    activity: &'event ToolActivity,
+}
+
+impl<'event> ToolEvent<'event> {
+    pub(crate) fn activity(self) -> &'event ToolActivity {
+        self.activity
+    }
+
+    pub(crate) fn observed_at_ms(self, fallback: i64) -> i64 {
+        self.event.observed_at_ms(fallback)
+    }
+
+    pub(crate) fn timestamp(self, path: &str) -> Option<i64> {
+        self.event.data.pointer(path).and_then(Value::as_i64)
+    }
+}
+
 impl BackendEvent {
+    pub(crate) fn tool_event(&self) -> Option<ToolEvent<'_>> {
+        self.activity.as_ref().map(|activity| ToolEvent {
+            event: self,
+            activity,
+        })
+    }
+
     /// Decode the provider-neutral compaction lifecycle payload.
     pub(crate) fn compaction(&self) -> Result<Option<Compaction>> {
         if self.kind != "compaction" {
@@ -1394,18 +1421,68 @@ impl Backend for MockBackend {
                 ..Default::default()
             });
         }
-        if request.mode == PromptMode::Plan {
-            if let Some(document) = request
+        if request.mode == PromptMode::Plan
+            && let Some(document) = request
                 .control_context
                 .as_ref()
                 .and_then(|context| context.plan_document.as_ref())
                 .filter(|document| document.design.is_some())
+        {
+            let path = "src/change.rs";
+            let design = document.design.as_ref().unwrap();
+            let mut source_digests = std::collections::BTreeMap::new();
+            let patch = if design.proposed.contains_key(path)
+                || std::path::Path::new(&request.workspace)
+                    .join(path)
+                    .is_file()
             {
-                let path = "src/change.rs";
-                let design = document.design.as_ref().unwrap();
-                let mut source_digests = std::collections::BTreeMap::new();
-                let patch = if design.proposed.contains_key(path)
-                    || std::path::Path::new(&request.workspace)
+                let inspected =
+                    design.inspect(std::path::Path::new(&request.workspace), Some(path), false)?;
+                if let Some(digest) = inspected["source_digest"].as_str() {
+                    source_digests.insert(path.into(), digest.into());
+                }
+                let text = inspected["text"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("mock declaration read has no text"))?;
+                let removed = text
+                    .lines()
+                    .map(|line| format!("-{line}\n"))
+                    .collect::<String>();
+                let original = design
+                    .baseline
+                    .get(path)
+                    .map(|file| file.text.as_str())
+                    .unwrap_or(text);
+                let behavior = if original.contains("pub fn reviewed_change(") {
+                    "Change\n  Preserve the requested behavior."
+                } else {
+                    "Algorithm\n  return"
+                };
+                let behavior = behavior
+                    .lines()
+                    .map(|line| format!("+{line}\n"))
+                    .collect::<String>();
+                format!(
+                    "*** Begin Patch\n*** Update File: {path}\n@@\n{removed}+pub fn reviewed_change();\n{behavior}*** End Patch"
+                )
+            } else {
+                format!(
+                    "*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n+Algorithm\n+  return\n*** End Patch"
+                )
+            };
+            let mut patch = patch;
+            let mut configuration = design.proposed.clone();
+            for path in [
+                "Cargo.toml",
+                "package.json",
+                "tsconfig.json",
+                "ci.yaml",
+                "App.csproj",
+                ".gitignore",
+            ] {
+                if !configuration.contains_key(path)
+                    && !design.baseline.contains_key(path)
+                    && std::path::Path::new(&request.workspace)
                         .join(path)
                         .is_file()
                 {
@@ -1414,130 +1491,75 @@ impl Backend for MockBackend {
                         Some(path),
                         false,
                     )?;
-                    if let Some(digest) = inspected["source_digest"].as_str() {
-                        source_digests.insert(path.into(), digest.into());
-                    }
-                    let text = inspected["text"]
-                        .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("mock declaration read has no text"))?;
-                    let removed = text
+                    configuration.insert(path.into(), inspected["text"].as_str().unwrap().into());
+                    source_digests.insert(
+                        path.into(),
+                        inspected["source_digest"].as_str().unwrap().into(),
+                    );
+                }
+            }
+            for (path, configuration) in &configuration {
+                if forge_diff::syntax::ConfigurationFormat::for_path(path).is_none() {
+                    continue;
+                }
+                let updated = configuration.replacen("\"0.1.0\"", "\"0.2.0\"", 1);
+                if updated != *configuration {
+                    let removed = configuration
                         .lines()
                         .map(|line| format!("-{line}\n"))
                         .collect::<String>();
-                    let original = design
-                        .baseline
-                        .get(path)
-                        .map(|file| file.text.as_str())
-                        .unwrap_or(text);
-                    let behavior = if original.contains("pub fn reviewed_change(") {
-                        "Change\n  Preserve the requested behavior."
-                    } else {
-                        "Algorithm\n  return"
-                    };
-                    let behavior = behavior
+                    let added = updated
                         .lines()
                         .map(|line| format!("+{line}\n"))
                         .collect::<String>();
-                    format!(
-                        "*** Begin Patch\n*** Update File: {path}\n@@\n{removed}+pub fn reviewed_change();\n{behavior}*** End Patch"
-                    )
-                } else {
-                    format!(
-                        "*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n+Algorithm\n+  return\n*** End Patch"
-                    )
-                };
-                let mut patch = patch;
-                let mut configuration = design.proposed.clone();
-                for path in [
-                    "Cargo.toml",
-                    "package.json",
-                    "tsconfig.json",
-                    "ci.yaml",
-                    "App.csproj",
-                    ".gitignore",
-                ] {
-                    if !configuration.contains_key(path)
-                        && !design.baseline.contains_key(path)
-                        && std::path::Path::new(&request.workspace)
-                            .join(path)
-                            .is_file()
-                    {
-                        let inspected = design.inspect(
-                            std::path::Path::new(&request.workspace),
-                            Some(path),
-                            false,
-                        )?;
-                        configuration
-                            .insert(path.into(), inspected["text"].as_str().unwrap().into());
-                        source_digests.insert(
-                            path.into(),
-                            inspected["source_digest"].as_str().unwrap().into(),
-                        );
-                    }
+                    patch = patch.replace(
+                        "*** End Patch",
+                        &format!("*** Update File: {path}\n@@\n{removed}{added}*** End Patch"),
+                    );
                 }
-                for (path, configuration) in &configuration {
-                    if forge_diff::syntax::ConfigurationFormat::for_path(path).is_none() {
-                        continue;
-                    }
-                    let updated = configuration.replacen("\"0.1.0\"", "\"0.2.0\"", 1);
-                    if updated != *configuration {
-                        let removed = configuration
-                            .lines()
-                            .map(|line| format!("-{line}\n"))
-                            .collect::<String>();
-                        let added = updated
-                            .lines()
-                            .map(|line| format!("+{line}\n"))
-                            .collect::<String>();
-                        patch = patch.replace(
-                            "*** End Patch",
-                            &format!("*** Update File: {path}\n@@\n{removed}{added}*** End Patch"),
-                        );
-                    }
-                }
-                let metadata = serde_json::to_string_pretty(&design.document)?
-                    .lines()
-                    .map(|line| format!("-{line}\n"))
-                    .collect::<String>();
-                let mut revised_metadata = design.document.clone();
-                revised_metadata.objective = "Revise the registry interface.".into();
-                revised_metadata.background =
-                    "The registry owns published handles used by its callers.".into();
-                revised_metadata.requirements =
-                    vec!["Preserve the registry ownership boundary.".into()];
-                revised_metadata.design =
-                    "Revise the registry interface while preserving its ownership boundary.".into();
-                revised_metadata.verification =
-                    vec!["Confirm the requested interface behaves as designed.".into()];
-                let added = serde_json::to_string_pretty(&revised_metadata)?
-                    .lines()
-                    .map(|line| format!("+{line}\n"))
-                    .collect::<String>();
-                let patch = patch.replace(
-                    "*** End Patch",
-                    &format!("*** Update File: plan.json\n@@\n{metadata}{added}*** End Patch"),
-                );
-                let change = crate::plan::DesignPatchRequest {
-                    plan_id: document.plan_id.clone(),
-                    expected_version: document.version,
-                    patch,
-                    title: Some("Design the requested change".into()),
-                    source_digests,
-                };
-                let proposed = document
-                    .patch_design(std::path::Path::new(&request.workspace), change.clone())?;
-                return Ok(BackendOutput {
-                    backend_session_id: request.backend_session_id.or(Some("mock-session".into())),
-                    design_patch: vec![change],
-                    plan_submit: Some(PlanSubmitRequest {
-                        plan_id: document.plan_id.clone(),
-                        expected_version: proposed.version,
-                    }),
-                    structured_plan: true,
-                    capability: mock_capability(),
-                    ..Default::default()
-                });
             }
+            let metadata = serde_json::to_string_pretty(&design.document)?
+                .lines()
+                .map(|line| format!("-{line}\n"))
+                .collect::<String>();
+            let mut revised_metadata = design.document.clone();
+            revised_metadata.objective = "Revise the registry interface.".into();
+            revised_metadata.background =
+                "The registry owns published handles used by its callers.".into();
+            revised_metadata.requirements =
+                vec!["Preserve the registry ownership boundary.".into()];
+            revised_metadata.design =
+                "Revise the registry interface while preserving its ownership boundary.".into();
+            revised_metadata.verification =
+                vec!["Confirm the requested interface behaves as designed.".into()];
+            let added = serde_json::to_string_pretty(&revised_metadata)?
+                .lines()
+                .map(|line| format!("+{line}\n"))
+                .collect::<String>();
+            let patch = patch.replace(
+                "*** End Patch",
+                &format!("*** Update File: plan.json\n@@\n{metadata}{added}*** End Patch"),
+            );
+            let change = crate::plan::DesignPatchRequest {
+                plan_id: document.plan_id.clone(),
+                expected_version: document.version,
+                patch,
+                title: Some("Design the requested change".into()),
+                source_digests,
+            };
+            let proposed =
+                document.patch_design(std::path::Path::new(&request.workspace), change.clone())?;
+            return Ok(BackendOutput {
+                backend_session_id: request.backend_session_id.or(Some("mock-session".into())),
+                design_patch: vec![change],
+                plan_submit: Some(PlanSubmitRequest {
+                    plan_id: document.plan_id.clone(),
+                    expected_version: proposed.version,
+                }),
+                structured_plan: true,
+                capability: mock_capability(),
+                ..Default::default()
+            });
         }
         let planning_note = (request.mode == PromptMode::Plan).then(|| {
             let steering = steering_text_list
@@ -1596,18 +1618,15 @@ impl Backend for MockBackend {
                                 entity: "requested_change".into(),
                             },
                             edges: vec![crate::plan::PlanFlowEdge {
-                                    relation: crate::plan::PlanFlowRelation::Emit,
-                                    target: crate::plan::EntityReference::ExternalEntity {
+operation: crate::plan::PlanFlowOperation::Emit("completed change".into()),
+target: crate::plan::EntityReference::ExternalEntity {
                                         entity_kind: crate::plan::ReferencedEntityKind::Endpoint,
                                         name: "requested outcome".into(),
                                         dependency: None,
                                     },
-                                    callable: None,
-                                    payload_type: Some("completed change".into()),
-                                    return_type: None,
-                                    expansion: Vec::new(),
-                                    branches: Vec::new(),
-                            }],
+expansion: Vec::new(),
+branches: Vec::new()
+}],
                     }]),
                     ..Default::default()
                 });
@@ -1682,17 +1701,18 @@ impl Backend for MockBackend {
                     .and_then(|active| {
                         active["task_id"]
                             .as_str()
-                            .and_then(|id| document.task_by_id(id).map(|(_, task)| task))
+                            .and_then(|id| document.task_by_id(id))
                     })
                     .map(|task| (document, task, execution_id))
             })
-            .map(
-                |(document, task, execution_id)| crate::plan::PlanTaskReport {
+            .map(|(document, (task_path, task), execution_id)| {
+                let task_path = task_path.as_str();
+                crate::plan::PlanTaskReport {
                     task_id: task.id.clone(),
                     plan_version: document.version,
                     execution_id,
-                    task_path: document.task_by_id(&task.id).unwrap().0,
-                    state: crate::plan::PlanTaskState::Complete,
+                    task_path: task_path.into(),
+                    state: crate::plan::PlanTaskOutcome::Complete,
                     completed_subtask_paths: task
                         .files
                         .iter()
@@ -1704,7 +1724,7 @@ impl Backend for MockBackend {
                                 .map(move |(subtask_index, _)| {
                                     format!(
                                         "{}/files/{file_index}/subtasks/{subtask_index}",
-                                        document.task_by_id(&task.id).unwrap().0
+                                        task_path
                                     )
                                 })
                         })
@@ -1732,7 +1752,7 @@ impl Backend for MockBackend {
                                     subtask.test().map(|_| crate::plan::PlanTestResult {
                                         test_subtask_path: Some(format!(
                                             "{}/files/{file_index}/subtasks/{subtask_index}",
-                                            document.task_by_id(&task.id).unwrap().0
+                                            task_path
                                         )),
                                         status: crate::plan::PlanTestStatus::Passed,
                                         command: Some("mock test".into()),
@@ -1755,8 +1775,8 @@ impl Backend for MockBackend {
                         .collect(),
                     summary: Some("Completed the mock task.".into()),
                     blocking_reason: None,
-                },
-            );
+                }
+            });
         let execution_complete = plan_task_report.as_ref().is_some_and(|report| {
             execution_document
                 .as_ref()

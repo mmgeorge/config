@@ -38,13 +38,15 @@ pub(crate) fn reconcile(
         }
     }
     let next_revision = document.revision.next()?;
-    for target in &unchanged {
-        let mut previous = document.file.remove(target).expect("retained file");
-        let next = file.get_mut(target).expect("replacement file");
-        previous.record = next.record.clone();
-        previous.stamp = next.stamp.clone();
-        previous.origin_stamp = next.origin_stamp.clone();
-        *next = previous;
+    for (target, mut previous) in document.file.drain() {
+        if let std::collections::hash_map::Entry::Occupied(mut next) = file.entry(target)
+            && unchanged.contains(next.key())
+        {
+            previous.record = next.get().record.clone();
+            previous.stamp = next.get().stamp.clone();
+            previous.origin_stamp = next.get().origin_stamp.clone();
+            next.insert(previous);
+        }
     }
     document.file = file;
     document.order = order;

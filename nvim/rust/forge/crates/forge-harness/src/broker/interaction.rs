@@ -53,9 +53,9 @@ impl HarnessBroker {
                 {
                     interaction.finish(
                         if cancelled {
-                            ExchangeState::Cancelled
+                            crate::exchange::ExchangeOutcome::Cancelled
                         } else {
-                            ExchangeState::Failed
+                            crate::exchange::ExchangeOutcome::Failed
                         },
                         self.clock.now_ms(),
                     )?;
@@ -94,9 +94,9 @@ impl HarnessBroker {
                     return Err(error);
                 }
                 let outcome = if cancelled {
-                    ExchangeState::Cancelled
+                    crate::exchange::ExchangeOutcome::Cancelled
                 } else {
-                    ExchangeState::Failed
+                    crate::exchange::ExchangeOutcome::Failed
                 };
                 if !cancelled {
                     Box::pin(self.record_execution_failure(&mut interaction, format!("{error:#}")))
@@ -169,9 +169,9 @@ impl HarnessBroker {
                     )?;
                 }
                 let outcome = if cancelled {
-                    ExchangeState::Cancelled
+                    crate::exchange::ExchangeOutcome::Cancelled
                 } else {
-                    ExchangeState::Failed
+                    crate::exchange::ExchangeOutcome::Failed
                 };
                 interaction.finish(outcome, self.clock.now_ms())?;
                 self.store
@@ -297,13 +297,13 @@ impl HarnessBroker {
                 lifecycle.anchor = Some(crate::plan::ExchangeAnchor::capture(&interaction));
                 self.store.save_plan_lifecycle(&lifecycle)?;
             }
-            if let Some(execution_id) = interaction.execution_id.as_deref() {
-                if let Some(mut execution) = self.store.load_plan_execution(execution_id)? {
-                    if execution.baseline_checkpoint.is_none() {
-                        execution.baseline_checkpoint = interaction.checkpoint_before.clone();
-                    }
-                    self.store.save_plan_execution(&execution)?;
+            if let Some(execution_id) = interaction.execution_id.as_deref()
+                && let Some(mut execution) = self.store.load_plan_execution(execution_id)?
+            {
+                if execution.baseline_checkpoint.is_none() {
+                    execution.baseline_checkpoint = interaction.checkpoint_before.clone();
                 }
+                self.store.save_plan_execution(&execution)?;
             }
         }
         interaction.resume(self.clock.now_ms())?;
@@ -411,7 +411,7 @@ impl HarnessBroker {
             + usize::from(output.question_answer.is_some())
             + usize::from(output.question_withdrawal.is_some());
         let refresh_elicitation =
-            interaction.elicitation.is_some() && elicitation_control_count > 0;
+            interaction.elicitation().is_some() && elicitation_control_count > 0;
         anyhow::ensure!(
             elicitation_control_count <= 1,
             "backend turn emitted multiple Harness question control actions"
@@ -519,8 +519,10 @@ impl HarnessBroker {
                     "plan version changed before submission validation"
                 );
                 let validation_warning = if let Some(design) = &mut validated_document.design {
-                    *design = design.validated(Path::new(&self.session.workspace)).await?;
-                    design.validation.as_ref().unwrap().warnings()
+                    let validated = design.validated(Path::new(&self.session.workspace)).await?;
+                    let warnings = validated.warnings();
+                    *design = validated.into_design();
+                    warnings
                 } else {
                     Vec::new()
                 };
@@ -584,10 +586,10 @@ impl HarnessBroker {
                             });
                     }
                 }
-                let (diff_text, declaration) = if document.design.is_some() {
+                let (diff_text, declaration) = if let Some(design) = &document.design {
                     let delta = crate::plan::revision::DeclarationDelta::between(
                         previous_document.as_ref(),
-                        &document,
+                        design,
                     )?;
                     (
                         delta.files,
@@ -681,7 +683,7 @@ impl HarnessBroker {
                     )?;
                     self.store.save_plan(&plan)?;
                     self.record_plan_trace("plan_question_asked", plan_trace_fields(&plan));
-                    interaction.awaiting_input = true;
+                    interaction.set_awaiting_input(true);
                     let lifecycle = PlanLifecycleRecord {
                         title: plan.title.clone(),
                         anchor: Some(crate::plan::ExchangeAnchor::capture(&interaction)),
@@ -729,7 +731,7 @@ impl HarnessBroker {
                     });
                 }
                 if !self.replace_active_elicitation(question.clone(), &mut event)? {
-                    interaction.awaiting_input = true;
+                    interaction.set_awaiting_input(true);
                     let mut elicitation = PlanElicitation::new(question.clone());
                     elicitation.start_timeout(
                         self.permission_coordinator
@@ -737,7 +739,7 @@ impl HarnessBroker {
                             .1,
                         self.clock.now_ms(),
                     )?;
-                    interaction.elicitation = Some(elicitation);
+                    interaction.set_elicitation(Some(elicitation));
                     self.store.save_exchange(&interaction)?;
                     event.push(self.event(
                         "question",
@@ -745,7 +747,7 @@ impl HarnessBroker {
                             "owner": "interaction",
                             "plan_id": interaction.plan_id,
                             "exchange_id": interaction.id,
-                            "elicitation": interaction.elicitation,
+                            "elicitation": interaction.elicitation(),
                         }),
                     )?);
                 }
@@ -761,10 +763,10 @@ impl HarnessBroker {
                 .store
                 .load_exchange_metadata(&interaction.id)?
                 .context("question control lost its owning exchange")?;
-            interaction.elicitation = owner.elicitation;
-            interaction.awaiting_input = owner.awaiting_input;
+            interaction.set_elicitation(owner.elicitation().cloned());
+            interaction.set_awaiting_input(owner.awaiting_input());
         }
-        let execution_paused = interaction.awaiting_input;
+        let execution_paused = interaction.awaiting_input();
         if mode == PromptMode::ExecutePlan {
             output.evidence.structured_complete = false;
             output.evidence.tool_called = false;
@@ -816,14 +818,14 @@ impl HarnessBroker {
             .as_ref()
             .is_some_and(|phase| phase.outcome.is_some());
         let remains_open = !phase_finished
-            && (continuing || goal_suspended || interaction.awaiting_input || planning_open);
+            && (continuing || goal_suspended || interaction.awaiting_input() || planning_open);
         if remains_open {
             self.exchange_runtime = Some(runtime);
         } else {
             let outcome = if goal_state == Some(GoalState::Cleared) {
-                ExchangeState::Cancelled
+                crate::exchange::ExchangeOutcome::Cancelled
             } else {
-                ExchangeState::Complete
+                crate::exchange::ExchangeOutcome::Complete
             };
             Box::pin(self.capture_final_checkpoint(&mut interaction, outcome)).await?;
             interaction.finish(outcome, self.clock.now_ms())?;
@@ -834,8 +836,8 @@ impl HarnessBroker {
             && self.current_plan_id()?.is_none()
             && interaction.plan_id.is_none()
             && interaction.execution_id.is_none()
-            && interaction.elicitation.is_none()
-            && !interaction.awaiting_input
+            && interaction.elicitation().is_none()
+            && !interaction.awaiting_input()
             && !self.agent_registry.list().iter().any(|run| {
                 self.agent_registry
                     .execution(&run.id)
@@ -854,10 +856,10 @@ impl HarnessBroker {
             } else {
                 "exchange_complete"
             },
-            json!({"id": interaction.id, "state": interaction.state}),
+            json!({"id": interaction.id, "state": interaction.state()}),
         )?);
         Ok((
-            json!({ "exchange": {"id": interaction.id, "state": interaction.state}, "session": self.session, "capability": self.capability }),
+            json!({ "exchange": {"id": interaction.id, "state": interaction.state()}, "session": self.session, "capability": self.capability }),
             event,
         ))
     }

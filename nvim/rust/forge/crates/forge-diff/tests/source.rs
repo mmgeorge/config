@@ -1,6 +1,4 @@
-use forge_diff::source::{
-    NewlineMetadata, Representation, SourceError, SourcePair, SourceVersion, validate_source_pair,
-};
+use forge_diff::source::{NewlineMetadata, Representation, SourceError, SourcePair, SourceVersion};
 
 #[test]
 fn exact_bytes_and_newline_metadata_survive_source_construction() {
@@ -38,11 +36,11 @@ fn identical_bytes_in_distinct_representations_have_distinct_analysis_identities
             converted.identity().content_hash
         );
         assert_ne!(raw.identity(), converted.identity());
-        validate_source_pair(&SourcePair {
+        let comparison = forge_diff::raw::compute_hunks(SourcePair {
             old: raw.clone(),
             new: converted,
-        })
-        .unwrap();
+        });
+        assert!(comparison.hunks().is_empty());
     }
 }
 

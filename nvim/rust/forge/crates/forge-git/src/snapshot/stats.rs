@@ -143,7 +143,7 @@ pub(crate) fn collect(
                     .filter(|_| retain)
                     .and_then(|cache| cache.try_reserve(reservation_bytes(&source)).ok());
                 if let (Some(cache), Some(reservation)) = (analysis, reservation) {
-                    let diff = compute_hunks(source)?;
+                    let diff = compute_hunks(source);
                     let counts = diff.line_counts();
                     cache
                         .insert(

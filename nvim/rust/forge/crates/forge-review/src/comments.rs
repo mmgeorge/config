@@ -661,7 +661,6 @@ impl CommentStore {
         let identity = &remote.identity;
         ensure!(
             !identity.node_id.is_empty()
-                && identity.node_id.len() <= 256
                 && identity.node_id.bytes().all(|byte| byte.is_ascii_graphic())
                 && identity.database_id > 0
                 && identity.database_id <= MAX_COUNTER,
@@ -674,11 +673,10 @@ impl CommentStore {
             self.target.number
         );
         ensure!(
-            identity.url.len() <= 4096
-                && identity
-                    .url
-                    .to_ascii_lowercase()
-                    .starts_with(&prefix.to_ascii_lowercase())
+            identity
+                .url
+                .to_ascii_lowercase()
+                .starts_with(&prefix.to_ascii_lowercase())
                 && !identity.url.chars().any(char::is_control),
             "comment URL belongs to another resource"
         );

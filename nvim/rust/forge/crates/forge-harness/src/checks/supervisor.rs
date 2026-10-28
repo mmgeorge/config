@@ -1,4 +1,4 @@
-use super::model::{CheckCommand, CheckEventKind, CheckRunContext};
+use super::model::{CheckCommand, CheckEventKind, CheckRunContext, PreparedCheckRun};
 use super::publication::{CheckNotification, CheckPublication};
 use super::{
     CheckCase, CheckDefinition, CheckReceipt, CheckRun, CheckSelection, CheckState, CommandCheck,
@@ -55,7 +55,12 @@ struct CheckStateStore {
 struct ActiveCheck {
     run_id: String,
     cancellation: Arc<CheckCancellation>,
-    _admission: Option<crate::command::ExecutionPermit>,
+}
+
+struct AdmittedCheckRun {
+    run: PreparedCheckRun,
+    cancellation: Arc<CheckCancellation>,
+    _parent_permit: Option<crate::command::ExecutionPermit>,
 }
 
 struct CheckCancellation {
@@ -430,7 +435,7 @@ impl CheckSupervisor {
         &self,
         snapshot: ConfigSnapshot,
         admission: CheckAdmission,
-    ) -> Result<CheckRun> {
+    ) -> Result<PreparedCheckRun> {
         let CheckAdmission {
             owner,
             request,
@@ -460,7 +465,7 @@ impl CheckSupervisor {
             id: id.clone(),
             owner: Box::new(owner),
             revision,
-            context: Some(CheckRunContext {
+            context: CheckRunContext {
                 automatic: false,
                 trigger,
                 task_id,
@@ -468,7 +473,7 @@ impl CheckSupervisor {
                 overrides,
                 changed_files: files.clone().unwrap_or_default(),
                 planned_cases: cases.clone().unwrap_or_default(),
-            }),
+            },
             lifecycle: Vec::new(),
             completed_plan: None,
             shell,
@@ -501,12 +506,13 @@ impl CheckSupervisor {
             .filter(|item| item.selected)
             .map(|item| item.id.clone())
             .collect();
-        let mut effective_request = request.clone();
-        effective_request.all = false;
-        effective_request.ids = requested.iter().cloned().collect();
+        let effective_request = RunRequest::Selected(super::SelectedChecks {
+            ids: requested.iter().cloned().collect(),
+            ..(*request).clone()
+        });
         let selections = if requested.is_empty() {
             BTreeMap::new()
-        } else if request.all {
+        } else if request.is_all() {
             requested
                 .iter()
                 .map(|id| (id.clone(), CheckSelection::All))
@@ -522,10 +528,7 @@ impl CheckSupervisor {
         };
         for index in effective.order_selected(&requested)? {
             let definition = &effective.definitions[index];
-            let applicability = applicability
-                .iter()
-                .find(|item| item.id == definition.id)
-                .unwrap();
+            let applicability = &applicability[index];
             ensure!(
                 definition.enabled
                     || request.ids.is_empty()
@@ -586,7 +589,7 @@ impl CheckSupervisor {
                 reused_from: None,
                 id: format!("{id}:{position}"),
                 command: operation.unwrap_or(&definition.all).display(),
-                context: Some(CheckCommand {
+                context: CheckCommand {
                     operation: operation.cloned(),
                     invocation: None,
                     definition_id: definition.id.clone(),
@@ -600,7 +603,7 @@ impl CheckSupervisor {
                     resolved: None,
                     depends_on: definition.depends_on.clone(),
                     receipt: directory.join(format!("{position}.selection.json")),
-                }),
+                },
                 state,
                 started_at_ms: None,
                 completed_at_ms: None,
@@ -623,26 +626,23 @@ impl CheckSupervisor {
     }
 
     /// Freezes declared inputs before review, authorization, or process admission.
-    pub(crate) async fn resolve(&self, mut run: CheckRun) -> Result<CheckRun> {
+    pub(crate) async fn resolve(&self, mut run: PreparedCheckRun) -> Result<PreparedCheckRun> {
         let mut commands = Vec::new();
-        let planned_cases = run
-            .context
-            .as_ref()
-            .map(|context| context.planned_cases.clone())
-            .unwrap_or_default();
+        let planned_cases = run.context.planned_cases.clone();
         for mut check in std::mem::take(&mut run.commands) {
-            let context = check.context.as_ref().context("check context is missing")?;
-            if check.state != CheckState::Pending
-                || context.invocation.is_some()
-                || context.operation.is_none()
-            {
-                commands.push(check);
+            let context = check.context.clone();
+            if check.state != CheckState::Pending || context.invocation.is_some() {
+                commands.push((check, context));
                 continue;
             }
+            let Some(operation) = &context.operation else {
+                commands.push((check, context));
+                continue;
+            };
             match super::invocation::resolve(
                 &self.workspace,
                 &context.directory,
-                context.operation.as_ref().unwrap(),
+                operation,
                 &context.selection,
                 &context.matched_files,
                 &planned_cases,
@@ -654,14 +654,10 @@ impl CheckSupervisor {
                     );
                     for invocation in invocations {
                         let mut expanded = check.clone();
-                        if context
-                            .operation
-                            .as_ref()
-                            .is_some_and(|operation| operation.args.is_some())
-                        {
+                        if operation.args.is_some() {
                             expanded.command = invocation.display();
                         }
-                        let context = expanded.context.as_mut().unwrap();
+                        let mut context = context.clone();
                         if !invocation.files.is_empty()
                             && matches!(context.selection, CheckSelection::Files { .. })
                         {
@@ -680,33 +676,38 @@ impl CheckSupervisor {
                             );
                         }
                         context.invocation = Some(invocation);
-                        commands.push(expanded);
+                        commands.push((expanded, context));
                     }
                 }
                 Err(error) => {
                     check.state = super::failure::classify(&error, CheckState::ConfigurationError);
                     check.error = Some(format!("{error:#}"));
-                    commands.push(check);
+                    commands.push((check, context));
                 }
             }
         }
-        for (position, check) in commands.iter_mut().enumerate() {
+        for (position, (check, context)) in commands.iter_mut().enumerate() {
             check.id = format!("{}:{position}", run.id);
             let directory = self.root.join(&run.id);
             check.stdout = directory.join(format!("{position}.stdout"));
             check.stderr = directory.join(format!("{position}.stderr"));
             check.output = directory.join(format!("{position}.output"));
-            check.context.as_mut().unwrap().receipt =
-                directory.join(format!("{position}.selection.json"));
+            context.receipt = directory.join(format!("{position}.selection.json"));
         }
-        run.commands = commands;
+        run.commands = commands
+            .into_iter()
+            .map(|(mut check, context)| {
+                check.context = context;
+                check
+            })
+            .collect();
         Ok(run)
     }
 
     /// Runs the same serial dependency-aware lifecycle for automatic gates and on-demand requests.
     pub(crate) async fn run(
         self: &Arc<Self>,
-        run: CheckRun,
+        run: PreparedCheckRun,
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<CheckRun> {
@@ -745,10 +746,10 @@ impl CheckSupervisor {
                 if !matches!(command.state, CheckState::Passed | CheckState::Failed) {
                     continue;
                 }
-                if let Some(evidence) = &command.evidence {
-                    if evidence.covers(run, check, checkpoint)? {
-                        return Ok(Some((previous.id.clone(), command.clone())));
-                    }
+                if let Some(evidence) = &command.evidence
+                    && evidence.covers(run, check, checkpoint)?
+                {
+                    return Ok(Some((previous.id.clone(), command.clone())));
                 }
             }
         }
@@ -757,10 +758,10 @@ impl CheckSupervisor {
 
     fn admit(
         &self,
-        run: &CheckRun,
+        run: PreparedCheckRun,
         admission: Option<crate::command::ExecutionPermit>,
-    ) -> Result<Arc<CheckCancellation>> {
-        self.validate_owner(run)?;
+    ) -> Result<AdmittedCheckRun> {
+        self.validate_owner(&run.clone().into_record())?;
         let mut state = self
             .state
             .lock()
@@ -777,13 +778,18 @@ impl CheckSupervisor {
             requested: Arc::new(AtomicBool::new(false)),
             changed: Default::default(),
         });
-        state.records.insert(run.id.clone(), run.clone());
+        state
+            .records
+            .insert(run.id.clone(), run.clone().into_record());
         state.active = Some(ActiveCheck {
             run_id: run.id.clone(),
             cancellation: Arc::clone(&cancelled),
-            _admission: admission,
         });
-        Ok(cancelled)
+        Ok(AdmittedCheckRun {
+            run,
+            cancellation: cancelled,
+            _parent_permit: admission,
+        })
     }
 
     fn cancelled_attempt(
@@ -858,12 +864,19 @@ impl CheckSupervisor {
 
     async fn run_admitted(
         self: &Arc<Self>,
-        mut run: CheckRun,
+        admitted: AdmittedCheckRun,
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
-        cancelled: Arc<CheckCancellation>,
     ) -> Result<CheckRun> {
-        let publication = CheckPublication::new(self.root.join(&run.id).join("record.json"), &run);
+        let AdmittedCheckRun {
+            mut run,
+            cancellation: cancelled,
+            _parent_permit,
+        } = admitted;
+        let publication = CheckPublication::new(
+            self.root.join(&run.id).join("record.json"),
+            &run.clone().into_record(),
+        );
         use futures_util::FutureExt;
         let result = std::panic::AssertUnwindSafe(self.run_inner(
             &mut run,
@@ -875,6 +888,7 @@ impl CheckSupervisor {
         .catch_unwind()
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("check worker panicked")));
+        drop(_parent_permit);
         if let Err(error) = &result {
             run.state = CheckState::ExecutionError;
             for command in &mut run.commands {
@@ -894,31 +908,31 @@ impl CheckSupervisor {
             run.cancelled_inputs = None;
         }
         run.completed_at_ms = Some(now_ms());
-        self.update(&run, sink.as_ref())?;
-        if let Err(error) = publication.finish(&run).await {
+        self.update(&run.clone().into_record(), sink.as_ref())?;
+        if let Err(error) = publication.finish(&run.clone().into_record()).await {
             run.state = CheckState::ExecutionError;
             run.record(
                 CheckEventKind::ExecutionError,
                 None,
                 format!("Check history could not be saved: {error:#}"),
             );
-            self.update(&run, sink.as_ref())?;
+            self.update(&run.clone().into_record(), sink.as_ref())?;
             return Err(error);
         }
         result?;
-        Ok(run)
+        Ok(run.into_record())
     }
 
     async fn run_inner(
         &self,
-        run: &mut CheckRun,
+        run: &mut PreparedCheckRun,
         sink: Option<&BackendEventSink>,
         publication: &CheckPublication,
         cancelled: &Arc<CheckCancellation>,
         external_cancelled: Option<&Arc<AtomicBool>>,
     ) -> Result<()> {
-        self.update(run, sink)?;
-        publication.update(run);
+        self.update(&run.clone().into_record(), sink)?;
+        publication.update(&run.clone().into_record());
         for index in 0..run.commands.len() {
             if cancelled.requested.load(Ordering::Acquire)
                 || external_cancelled.is_some_and(|value| value.load(Ordering::Acquire))
@@ -926,18 +940,13 @@ impl CheckSupervisor {
                 run.interrupt();
                 return Ok(());
             }
-            let context = run.commands[index].context.as_ref().unwrap().clone();
+            let mut context = run.commands[index].context.clone();
             if run.commands[index].state == CheckState::Pending {
                 for dependency in &context.depends_on {
                     let prerequisites: Vec<_> = run
                         .commands
                         .iter()
-                        .filter(|check| {
-                            check
-                                .context
-                                .as_ref()
-                                .is_some_and(|value| &value.definition_id == dependency)
-                        })
+                        .filter(|check| &check.context.definition_id == dependency)
                         .collect();
                     ensure!(!prerequisites.is_empty(), "missing prerequisite command");
                     if let Some(prerequisite) = prerequisites
@@ -980,8 +989,8 @@ impl CheckSupervisor {
                             run.commands[index].error.as_deref().unwrap_or("")
                         ),
                     );
-                    self.update(run, sink)?;
-                    publication.update(run);
+                    self.update(&run.clone().into_record(), sink)?;
+                    publication.update(&run.clone().into_record());
                     continue;
                 }
                 CheckState::Passed | CheckState::Failed => continue,
@@ -995,12 +1004,12 @@ impl CheckSupervisor {
                 return Ok(());
             };
             run.cancelled_inputs = before.clone();
-            if run
-                .context
-                .as_ref()
-                .is_some_and(|context| context.automatic)
-                && let Some(previous) =
-                    self.cancelled_attempt(run, &run.commands[index], before.as_ref())?
+            if run.context.automatic
+                && let Some(previous) = self.cancelled_attempt(
+                    &run.clone().into_record(),
+                    &run.commands[index].clone().into_record(),
+                    before.as_ref(),
+                )?
             {
                 run.commands[index].state = CheckState::Stopped;
                 run.cancelled_run_id = Some(previous.clone());
@@ -1014,13 +1023,13 @@ impl CheckSupervisor {
                 );
                 continue;
             }
-            if run
-                .context
-                .as_ref()
-                .is_some_and(|context| context.automatic)
+            if run.context.automatic
                 && let Some(checkpoint) = before.as_ref()
-                && let Some((run_id, previous)) =
-                    self.evidence(run, &run.commands[index], checkpoint)?
+                && let Some((run_id, previous)) = self.evidence(
+                    &run.clone().into_record(),
+                    &run.commands[index].clone().into_record(),
+                    checkpoint,
+                )?
             {
                 let command = &mut run.commands[index];
                 command.state = previous.state;
@@ -1034,15 +1043,15 @@ impl CheckSupervisor {
                 command.output_bytes = previous.output_bytes;
                 command.preview = previous.preview;
                 command.report = previous.report;
-                command.context.as_mut().unwrap().resolved =
-                    previous.context.and_then(|context| context.resolved);
+                context.resolved = previous.context.and_then(|context| context.resolved);
+                command.context = context.clone();
                 run.record(
                     CheckEventKind::CheckFinished,
                     Some(context.definition_id),
                     format!("Reused current check evidence from {run_id}"),
                 );
-                self.update(run, sink)?;
-                publication.update(run);
+                self.update(&run.clone().into_record(), sink)?;
+                publication.update(&run.clone().into_record());
                 continue;
             }
             run.commands[index].state = CheckState::Running;
@@ -1052,10 +1061,18 @@ impl CheckSupervisor {
                 Some(context.definition_id.clone()),
                 format!("Check started · {}", context.name),
             );
-            self.update(run, sink)?;
-            publication.update(run);
+            self.update(&run.clone().into_record(), sink)?;
+            publication.update(&run.clone().into_record());
             if let Err(error) = self
-                .execute(run, index, sink, publication, cancelled, external_cancelled)
+                .execute(
+                    run,
+                    index,
+                    context.clone(),
+                    sink,
+                    publication,
+                    cancelled,
+                    external_cancelled,
+                )
                 .await
             {
                 run.commands[index].state = if cancelled.requested.load(Ordering::Acquire)
@@ -1081,8 +1098,8 @@ impl CheckSupervisor {
                 };
                 if let (Some(before), Some(after)) = (before, after) {
                     run.commands[index].evidence = super::evidence::CheckEvidence::capture(
-                        run,
-                        &run.commands[index],
+                        &run.clone().into_record(),
+                        &run.commands[index].clone().into_record(),
                         before,
                         &after,
                     )?;
@@ -1112,8 +1129,8 @@ impl CheckSupervisor {
                     .unwrap_or_default()
             );
             run.record(kind, Some(context.definition_id), text);
-            self.update(run, sink)?;
-            publication.update(run);
+            self.update(&run.clone().into_record(), sink)?;
+            publication.update(&run.clone().into_record());
             if run.commands[index].state == CheckState::Interrupted {
                 run.interrupt();
                 return Ok(());
@@ -1131,7 +1148,11 @@ impl CheckSupervisor {
                 let command = &run.commands[index];
                 if command.state == CheckState::Passed
                     && let Some(evidence) = &command.evidence
-                    && !evidence.covers(run, command, &checkpoint)?
+                    && !evidence.covers(
+                        &run.clone().into_record(),
+                        &command.clone().into_record(),
+                        &checkpoint,
+                    )?
                 {
                     run.commands[index].state = CheckState::Stale;
                     run.commands[index].error = Some("Later source changes superseded this check's evidence. Verify current inputs again.".into());
@@ -1198,14 +1219,14 @@ impl CheckSupervisor {
 
     async fn execute(
         &self,
-        run: &mut CheckRun,
+        run: &mut PreparedCheckRun,
         index: usize,
+        mut context: super::model::CheckCommand,
         sink: Option<&BackendEventSink>,
         publication: &CheckPublication,
         cancelled: &Arc<CheckCancellation>,
         external_cancelled: Option<&Arc<AtomicBool>>,
     ) -> Result<()> {
-        let context = run.commands[index].context.as_ref().unwrap().clone();
         let directory = self
             .workspace
             .join(super::config::relative_path(&context.directory)?)
@@ -1223,8 +1244,6 @@ impl CheckSupervisor {
         });
         let input = super::supervisor::operation(
             run.context
-                .as_ref()
-                .context("check context unavailable")?
                 .snapshot
                 .config
                 .definitions
@@ -1353,8 +1372,8 @@ impl CheckSupervisor {
                 },
                 _ = ticker.tick() => {
                     output.flush().await?;
-                    self.update(run, sink)?;
-                    publication.update(run);
+                    self.update(&run.clone().into_record(), sink)?;
+                    publication.update(&run.clone().into_record());
                 },
             }
         }
@@ -1378,11 +1397,12 @@ impl CheckSupervisor {
                 receipt.validate_request(&context.selection)?;
                 Ok(receipt)
             })().map_err(|error| super::failure::CheckFailure::classified(CheckState::ConfigurationError, error))?;
-            run.commands[index].context.as_mut().unwrap().resolved = Some(receipt.selection);
+            context.resolved = Some(receipt.selection);
         } else if !scoped && !killed && status.success() {
-            run.commands[index].context.as_mut().unwrap().resolved = Some(context.selection.clone());
+            context.resolved = Some(context.selection.clone());
         }
-        let command = run.commands[index].clone();
+        run.commands[index].context = context;
+        let command = run.commands[index].clone().into_record();
         run.commands[index].report = tokio::task::spawn_blocking(move || super::report::collect(&command))
             .await.context("collect check result report")?;
         if let Some(report) = &run.commands[index].report {
@@ -1392,7 +1412,7 @@ impl CheckSupervisor {
                 ));
             }
             if run.commands[index].state == CheckState::Passed
-                && report.result.iter().any(|result| !matches!(result.state, CheckState::Passed | CheckState::Skipped))
+                && report.result.iter().any(|result| !matches!(result.state, super::CheckResultState::Passed | super::CheckResultState::Skipped))
             {
                 return Err(super::failure::CheckFailure::classified(
                     CheckState::Failed, anyhow::anyhow!("callback reported a failed result")
@@ -1503,7 +1523,7 @@ impl CheckSupervisor {
     /// Retains an optional source-work permit until the process is collected.
     pub(crate) async fn start(
         self: &Arc<Self>,
-        run: CheckRun,
+        run: PreparedCheckRun,
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
         admission: Option<crate::command::ExecutionPermit>,
@@ -1516,7 +1536,7 @@ impl CheckSupervisor {
 
     async fn launch(
         self: &Arc<Self>,
-        run: CheckRun,
+        run: PreparedCheckRun,
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
         admission: Option<crate::command::ExecutionPermit>,
@@ -1526,9 +1546,9 @@ impl CheckSupervisor {
     )> {
         let run = self.resolve(run).await?;
         std::fs::create_dir_all(self.root.join(&run.id))?;
-        let cancelled = self.admit(&run, admission)?;
-        let id = run.id.clone();
-        if let Err(error) = self.update(&run, sink.as_ref()) {
+        let admitted = self.admit(run, admission)?;
+        let id = admitted.run.id.clone();
+        if let Err(error) = self.update(&admitted.run.clone().into_record(), sink.as_ref()) {
             self.state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?
@@ -1545,7 +1565,7 @@ impl CheckSupervisor {
         state.task.retain(|_, task| !task.is_finished());
         let task = tokio::spawn(async move {
             let result = supervisor
-                .run_admitted(run, sink, external_cancelled, cancelled)
+                .run_admitted(admitted, sink, external_cancelled)
                 .await
                 .map_err(|error| format!("{error:#}"));
             if let Err(error) = &result {

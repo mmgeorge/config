@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Default)]
 pub(crate) struct PlanReviewStore {
     admission: Arc<DocumentAdmissionStore>,
-    document: Mutex<HashMap<DocumentId, (PlanReviewDocument, DocumentAdmission)>>,
+    document: Mutex<HashMap<DocumentId, (ReadOnlyPlanReview, DocumentAdmission)>>,
 }
 
 /// Captures one unanswered question and the immutable design context used to answer it.
@@ -31,6 +31,26 @@ pub(crate) struct PlanReviewQuestion {
     pub body: String,
     /// Saved declaration design and anchored review excerpt supplied to the model.
     pub prompt: String,
+}
+
+#[derive(Default, serde::Serialize)]
+struct TestChangeCounts {
+    new: usize,
+    modified: usize,
+    removed: usize,
+    reused: usize,
+}
+
+impl TestChangeCounts {
+    fn add(&mut self, change: super::DesignTestChange) {
+        let count = match change {
+            super::DesignTestChange::New => &mut self.new,
+            super::DesignTestChange::Modified => &mut self.modified,
+            super::DesignTestChange::Removed => &mut self.removed,
+            super::DesignTestChange::Reused => &mut self.reused,
+        };
+        *count += 1;
+    }
 }
 
 impl PlanReviewStore {
@@ -48,46 +68,7 @@ impl PlanReviewStore {
             .get_mut(id)
             .context("plan review document is closed")?;
         admission.check()?;
-        ensure!(
-            !document.source.historical,
-            "historical plan revisions are read-only"
-        );
-        ensure!(
-            digest == document.source.saved_digest,
-            "saved plan source changed"
-        );
-        let mut captured = annotation;
-        for annotation in &mut captured {
-            annotation.reply = document
-                .annotation
-                .annotation()
-                .iter()
-                .find(|saved| {
-                    saved.id == annotation.id
-                        && saved.kind == annotation.kind
-                        && saved.source.body == annotation.source.body
-                })
-                .and_then(|saved| saved.reply.clone());
-            let start = document
-                .source
-                .rendered
-                .navigation
-                .resolve_line(annotation.source.start_line)
-                .context("annotation start has no saved target")?;
-            let end = document
-                .source
-                .rendered
-                .navigation
-                .resolve_line(annotation.source.end_line)
-                .context("annotation end has no saved target")?;
-            annotation.anchor = document.source.document.design.as_ref().map(|_| {
-                super::review_annotation::ReviewAnnotationAnchor {
-                    start: start.target.clone(),
-                    end: end.target.clone(),
-                }
-            });
-        }
-        document.annotation.replace(captured)
+        document.editable()?.save_annotations(digest, annotation)
     }
 
     pub(crate) fn submission(&self, input: DocumentInput) -> Result<serde_json::Value> {
@@ -99,25 +80,7 @@ impl PlanReviewStore {
             .get_mut(&input.document)
             .context("plan review document is closed")?;
         admission.check()?;
-        document.validate_input(input)?;
-        ensure!(
-            !document.source.historical,
-            "historical plan revisions are read-only"
-        );
-        Ok(
-            serde_json::json!({"plan_id":document.source.document.plan_id,
-            "digest":super::digest(&crate::plan::codec::to_vec(&document.source.document)?),
-            "saved_source_digest":document.source.saved_digest,
-            "annotations":document.annotation.annotation().iter().filter(|annotation| annotation.kind == ReviewAnnotationKind::Comment && !annotation.source.body.trim().is_empty())
-                .map(|annotation| {
-                    let mut source = annotation.source.clone();
-                    if annotation.parent_id.is_some() {
-                        let thread = super::review_annotation::thread_context(document.annotation.annotation(), annotation);
-                        source.body = format!("Conversation context:\n{thread}Requested change:\n{}", source.body);
-                    }
-                    source
-                }).collect::<Vec<_>>() }),
-        )
+        document.editable()?.submission(input)
     }
 
     /// Capture unanswered questions after validating their native document identity.
@@ -130,52 +93,7 @@ impl PlanReviewStore {
             .get_mut(&input.document)
             .context("plan review document is closed")?;
         admission.check()?;
-        document.validate_input(input)?;
-        ensure!(
-            !document.source.historical,
-            "historical plan revisions are read-only"
-        );
-        let design = document
-            .source
-            .document
-            .design
-            .as_ref()
-            .context("plan questions require a declaration design")?;
-        let mut context = serde_json::json!({"proposed":design.proposed});
-        context["document"] = super::codec::to_value(&design.document)?;
-        let context = super::codec::to_string_pretty(&context)?;
-        let mut question = Vec::new();
-        for annotation in document
-            .annotation
-            .annotation()
-            .iter()
-            .filter(|annotation| {
-                annotation.kind == ReviewAnnotationKind::Question
-                    && annotation.reply.is_none()
-                    && !annotation.source.body.trim().is_empty()
-            })
-        {
-            let resolved = super::resolve_annotations(
-                &document.source.rendered,
-                vec![annotation.source.clone()],
-            )?;
-            let excerpt = super::render_review_feedback(&document.source.document, &resolved)?;
-            let thread = super::review_annotation::thread_context(
-                document.annotation.annotation(),
-                annotation,
-            );
-            let prompt = format!(
-                "Saved declaration design:\n{context}\n\nPlan review question and source context:\n{excerpt}\n\nConversation thread:\n{thread}Answer this question:\n{}",
-                annotation.source.body
-            );
-            question.push(PlanReviewQuestion {
-                plan_id: document.source.document.plan_id.clone(),
-                id: annotation.id.clone(),
-                body: annotation.source.body.clone(),
-                prompt,
-            });
-        }
-        Ok(question)
+        document.editable()?.questions(input)
     }
 
     /// Persist an answer only while its original question and source snapshot remain current.
@@ -194,22 +112,7 @@ impl PlanReviewStore {
             .get_mut(id)
             .context("plan review document is closed")?;
         admission.check()?;
-        let mut annotation = document.annotation.annotation().to_vec();
-        let selected = annotation
-            .iter_mut()
-            .find(|annotation| {
-                annotation.id == question.id
-                    && annotation.kind == ReviewAnnotationKind::Question
-                    && annotation.source.body == question.body
-            })
-            .context("plan question changed before its answer arrived")?;
-        selected.reply = Some(ReviewQuestionReply {
-            question_body: question.body.clone(),
-            body,
-            duration_ms: Some(duration_ms),
-        });
-        document.annotation.replace(annotation.clone())?;
-        Ok(annotation)
+        document.editable()?.answer(question, body, duration_ms)
     }
 
     /// Return persisted comments and answers independently of the visible source filter.
@@ -229,7 +132,7 @@ impl PlanReviewStore {
 
     pub(crate) fn insert(
         &self,
-        mut document: PlanReviewDocument,
+        mut document: ReadOnlyPlanReview,
         admission: DocumentAdmission,
     ) -> Result<serde_json::Value> {
         let mut store = self
@@ -251,68 +154,24 @@ impl PlanReviewStore {
     pub(crate) fn prepare_update(
         &self,
         id: &DocumentId,
-        source: &mut PlanReviewSource,
+        source: &mut super::review_source::EditableReviewSource,
     ) -> Result<u64> {
-        let store = self
+        let mut store = self
             .document
             .lock()
             .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
-        let (document, admission) = store.get(id).context("plan review document is closed")?;
+        let (document, admission) = store
+            .get_mut(id)
+            .context("plan review document is closed")?;
         admission.check()?;
-        ensure!(
-            !document.source.historical && !source.historical,
-            "historical plan revisions are read-only"
-        );
-        ensure!(
-            source.document.plan_id == document.source.document.plan_id
-                && source.document.version > document.source.document.version,
-            "plan revision is stale"
-        );
-        if let (Some(previous), Some(current)) =
-            (&document.source.document.design, &source.document.design)
-        {
-            for ((path, side), handle) in &document.source.declaration_syntax {
-                let (before, after) = if side == "baseline" {
-                    (
-                        previous.baseline.get(path).map(|file| &file.text),
-                        current.baseline.get(path).map(|file| &file.text),
-                    )
-                } else {
-                    (previous.proposed.get(path), current.proposed.get(path))
-                };
-                let (before_calls, after_calls) = if side == "baseline" {
-                    (
-                        previous.baseline_calls.get(path),
-                        current.baseline_calls.get(path),
-                    )
-                } else {
-                    (
-                        previous.proposed_calls.get(path),
-                        current.proposed_calls.get(path),
-                    )
-                };
-                if before.is_some() && before == after && before_calls == after_calls {
-                    source
-                        .declaration_syntax
-                        .insert((path.clone(), side.clone()), handle.clone());
-                }
-            }
-            if previous.proposed == current.proposed
-                && previous.baseline == current.baseline
-                && previous.proposed_calls == current.proposed_calls
-                && previous.baseline_calls == current.baseline_calls
-            {
-                source.resolver = Arc::clone(&document.source.resolver);
-            }
-        }
-        Ok(document.source.document.version)
+        document.editable()?.prepare_update(source)
     }
 
     /// Publish a prepared revision while retaining the document identity and current view choices.
     pub(crate) fn update(
         &self,
         id: &DocumentId,
-        source: PlanReviewSource,
+        source: super::review_source::EditableReviewSource,
         expected_version: u64,
         trace: Option<&super::edit_trace::PlanEditTrace>,
     ) -> Result<serde_json::Value> {
@@ -332,7 +191,7 @@ impl PlanReviewStore {
             document.source.document.version == expected_version,
             "plan changed while preparing its projection"
         );
-        document.update(source, trace)
+        document.editable()?.update(source, trace)
     }
 
     /// Prepare only the saved proposal and baseline declaration indexes.
@@ -417,6 +276,12 @@ impl PlanReviewStore {
             .block(&input.block)
             .and_then(|block| block.text.row(input.position.row))
             .context("definition row is unavailable")?;
+        let design = document
+            .source
+            .document
+            .design
+            .as_ref()
+            .context("definition source has no semantic design")?;
         ensure!(
             document
                 .workspace_definition(&anchor, row, input.position.column)?
@@ -433,7 +298,6 @@ impl PlanReviewStore {
             | super::PlanReviewTarget::Declaration { side, .. } => side.as_str(),
             _ => anyhow::bail!("definition target is unavailable"),
         };
-        let design = document.source.document.design.as_ref().unwrap();
         let absolute =
             dunce::canonicalize(&target.path).context("definition file is unavailable")?;
         ensure!(absolute.is_file(), "definition target is not a file");
@@ -519,7 +383,9 @@ impl PlanReviewStore {
                 .to_owned();
             let anchor = document.action(input)?;
             return if action == "rename_entity" {
-                document.rename(&anchor, &row, column)
+                document
+                    .editable()?
+                    .rename(ProposedReviewTarget::try_from(&anchor)?, &row, column)
             } else {
                 document.references(&anchor, &row, column)
             };
@@ -600,7 +466,7 @@ impl PlanReviewStore {
     }
 }
 
-pub(crate) struct PlanReviewDocument {
+pub(crate) struct ReadOnlyPlanReview {
     reference: Mutex<HashMap<bool, super::references::PlanReferenceIndex>>,
     reference_context: Mutex<HashMap<bool, super::reference_context::ReferenceContext>>,
     focused_annotation: Option<String>,
@@ -622,30 +488,227 @@ pub(crate) struct PlanReviewDocument {
     view: HashMap<ViewId, InputSequence>,
 }
 
-impl PlanReviewDocument {
-    fn update(
-        &mut self,
-        mut source: PlanReviewSource,
-        trace: Option<&super::edit_trace::PlanEditTrace>,
-    ) -> Result<serde_json::Value> {
-        let total = trace.map(|trace| trace.stage("review.update"));
+struct EditablePlanReview<'document>(&'document mut ReadOnlyPlanReview);
+
+struct ProposedReviewTarget<'target>(&'target PlanNavigationAnchor);
+
+impl<'target> TryFrom<&'target PlanNavigationAnchor> for ProposedReviewTarget<'target> {
+    type Error = anyhow::Error;
+    fn try_from(anchor: &'target PlanNavigationAnchor) -> Result<Self> {
+        match &anchor.target {
+            super::PlanReviewTarget::Declaration { side, .. }
+            | super::PlanReviewTarget::Call { side, .. }
+            | super::PlanReviewTarget::Behavior { side, .. }
+                if side == "proposed" =>
+            {
+                Ok(Self(anchor))
+            }
+            _ => anyhow::bail!("rename requires a proposed declaration target"),
+        }
+    }
+}
+
+impl EditablePlanReview<'_> {
+    fn save_annotations(self, digest: &str, annotation: Vec<ReviewAnnotation>) -> Result<()> {
+        let document = self.0;
         ensure!(
-            !self.source.historical && !source.historical,
-            "historical plan revisions are read-only"
+            digest == document.source.saved_digest,
+            "saved plan source changed"
         );
+        let mut captured = annotation;
+        for annotation in &mut captured {
+            annotation.reply = document
+                .annotation
+                .annotation()
+                .iter()
+                .find(|saved| {
+                    saved.id == annotation.id
+                        && saved.kind == annotation.kind
+                        && saved.source.body == annotation.source.body
+                })
+                .and_then(|saved| saved.reply.clone());
+            let start = document
+                .source
+                .rendered
+                .navigation
+                .resolve_line(annotation.source.start_line)
+                .context("annotation start has no saved target")?;
+            let end = document
+                .source
+                .rendered
+                .navigation
+                .resolve_line(annotation.source.end_line)
+                .context("annotation end has no saved target")?;
+            annotation.anchor = document.source.document.design.as_ref().map(|_| {
+                super::review_annotation::ReviewAnnotationAnchor {
+                    start: start.target.clone(),
+                    end: end.target.clone(),
+                }
+            });
+        }
+        document.annotation.replace(captured)
+    }
+
+    fn submission(self, input: DocumentInput) -> Result<serde_json::Value> {
+        let document = self.0;
+        document.validate_input(input)?;
+        Ok(
+            serde_json::json!({"plan_id":document.source.document.plan_id,
+            "digest":super::digest(&crate::plan::codec::to_vec(&document.source.document)?),
+            "saved_source_digest":document.source.saved_digest,
+            "annotations":document.annotation.annotation().iter().filter(|annotation| annotation.kind == ReviewAnnotationKind::Comment && !annotation.source.body.trim().is_empty())
+                .map(|annotation| {
+                    let mut source = annotation.source.clone();
+                    if annotation.parent_id.is_some() {
+                        let thread = document.annotation.thread_context(annotation)?;
+                        source.body = format!("Conversation context:\n{thread}Requested change:\n{}", source.body);
+                    }
+                    Ok::<_, anyhow::Error>(source)
+                }).collect::<Result<Vec<_>>>()? }),
+        )
+    }
+
+    fn questions(self, input: DocumentInput) -> Result<Vec<PlanReviewQuestion>> {
+        let document = self.0;
+        document.validate_input(input)?;
+        let design = document
+            .source
+            .document
+            .design
+            .as_ref()
+            .context("plan questions require a declaration design")?;
+        let mut context = serde_json::json!({"proposed":design.proposed});
+        context["document"] = super::codec::to_value(&design.document)?;
+        let context = super::codec::to_string_pretty(&context)?;
+        let mut question = Vec::new();
+        for annotation in document
+            .annotation
+            .annotation()
+            .iter()
+            .filter(|annotation| {
+                annotation.kind == ReviewAnnotationKind::Question
+                    && annotation.reply.is_none()
+                    && !annotation.source.body.trim().is_empty()
+            })
+        {
+            let resolved = super::resolve_annotations(
+                &document.source.rendered,
+                vec![annotation.source.clone()],
+            )?;
+            let excerpt = super::render_review_feedback(&document.source.document, &resolved)?;
+            let thread = document.annotation.thread_context(annotation)?;
+            let prompt = format!(
+                "Saved declaration design:\n{context}\n\nPlan review question and source context:\n{excerpt}\n\nConversation thread:\n{thread}Answer this question:\n{}",
+                annotation.source.body
+            );
+            question.push(PlanReviewQuestion {
+                plan_id: document.source.document.plan_id.clone(),
+                id: annotation.id.clone(),
+                body: annotation.source.body.clone(),
+                prompt,
+            });
+        }
+        Ok(question)
+    }
+
+    fn answer(
+        self,
+        question: &PlanReviewQuestion,
+        body: String,
+        duration_ms: u64,
+    ) -> Result<Vec<ReviewAnnotation>> {
+        let document = self.0;
+        let mut annotation = document.annotation.annotation().to_vec();
+        let selected = annotation
+            .iter_mut()
+            .find(|annotation| {
+                annotation.id == question.id
+                    && annotation.kind == ReviewAnnotationKind::Question
+                    && annotation.source.body == question.body
+            })
+            .context("plan question changed before its answer arrived")?;
+        selected.reply = Some(ReviewQuestionReply {
+            question_body: question.body.clone(),
+            body,
+            duration_ms: Some(duration_ms),
+        });
+        document.annotation.replace(annotation.clone())?;
+        Ok(annotation)
+    }
+
+    fn prepare_update(
+        self,
+        source: &mut super::review_source::EditableReviewSource,
+    ) -> Result<u64> {
+        let document = self.0;
+        let source: &mut super::review_source::ReviewSourceData = source;
         ensure!(
-            source.document.plan_id == self.source.document.plan_id
-                && source.document.version > self.source.document.version,
+            source.document.plan_id == document.source.document.plan_id
+                && source.document.version > document.source.document.version,
             "plan revision is stale"
         );
-        source.public_only = self.source.public_only;
-        source.revealed = self
+        if let (Some(previous), Some(current)) = (
+            &document.source.document.design,
+            &source.revision.document.design,
+        ) {
+            for ((path, side), handle) in &document.source.declaration_syntax {
+                let (before, after) = if side == "baseline" {
+                    (
+                        previous.baseline.get(path).map(|file| &file.text),
+                        current.baseline.get(path).map(|file| &file.text),
+                    )
+                } else {
+                    (previous.proposed.get(path), current.proposed.get(path))
+                };
+                let (before_calls, after_calls) = if side == "baseline" {
+                    (
+                        previous.baseline_calls.get(path),
+                        current.baseline_calls.get(path),
+                    )
+                } else {
+                    (
+                        previous.proposed_calls.get(path),
+                        current.proposed_calls.get(path),
+                    )
+                };
+                if before.is_some() && before == after && before_calls == after_calls {
+                    source
+                        .declaration_syntax
+                        .insert((path.clone(), side.clone()), handle.clone());
+                }
+            }
+            if previous.proposed == current.proposed
+                && previous.baseline == current.baseline
+                && previous.proposed_calls == current.proposed_calls
+                && previous.baseline_calls == current.baseline_calls
+            {
+                source.resolver = Arc::clone(&document.source.resolver);
+            }
+        }
+        Ok(document.source.document.version)
+    }
+
+    fn update(
+        self,
+        source: super::review_source::EditableReviewSource,
+        trace: Option<&super::edit_trace::PlanEditTrace>,
+    ) -> Result<serde_json::Value> {
+        let document = self.0;
+        let mut source = source.into_source();
+        let total = trace.map(|trace| trace.stage("review.update"));
+        ensure!(
+            source.document.plan_id == document.source.document.plan_id
+                && source.document.version > document.source.document.version,
+            "plan revision is stale"
+        );
+        source.public_only = document.source.public_only;
+        source.revealed = document
             .source
             .revealed
             .iter()
             .filter(|(path, side, _)| {
                 let (Some(previous), Some(current)) =
-                    (&self.source.document.design, &source.document.design)
+                    (&document.source.document.design, &source.document.design)
                 else {
                     return false;
                 };
@@ -659,7 +722,7 @@ impl PlanReviewDocument {
             })
             .cloned()
             .collect();
-        source.collapse = self.source.collapse.clone();
+        source.collapse = document.source.collapse.clone();
         let annotation_stage = trace.map(|trace| trace.stage("review.load_reanchor_annotations"));
         let mut annotation = ReviewAnnotationStore::open(
             source.path.with_extension("json"),
@@ -668,12 +731,12 @@ impl PlanReviewDocument {
         if source.saved_navigation.is_some() {
             annotation.reanchor(&source.rendered.navigation)?;
         }
-        self.retain_annotation_revision();
+        document.retain_annotation_revision();
         if let Some(stage) = annotation_stage {
             stage.complete(serde_json::json!({"count":annotation.annotation().len()}));
         }
         let projection = trace.map(|trace| trace.stage("review.project"));
-        let mut expected = self.source.document.clone();
+        let mut expected = document.source.document.clone();
         expected.version = source.document.version;
         let tests_only = match (&mut expected.design, &source.document.design) {
             (Some(previous), Some(current)) => {
@@ -685,26 +748,26 @@ impl PlanReviewDocument {
         let (block, target) = if tests_only {
             super::review_projection::update_tests(
                 &source,
-                &self.source.rendered,
-                self.document.snapshot().block,
-                self.target.clone(),
+                &document.source.rendered,
+                document.document.snapshot().block,
+                document.target.clone(),
             )?
         } else {
             super::review_projection::project(
                 &source,
-                &self.width,
+                &document.width,
                 &[],
-                &self.annotation_revision,
-                self.focused_annotation.as_deref(),
+                &document.annotation_revision,
+                document.focused_annotation.as_deref(),
             )?
         };
         if let Some(stage) = projection {
             stage.complete(serde_json::json!({"count":block.len(),"cached":tests_only}));
         }
         let reanchor = trace.map(|trace| trace.stage("review.retain_annotations"));
-        let previous = self.document.snapshot();
+        let previous = document.document.snapshot();
         let remap = |line| {
-            let anchor = self.source.rendered.navigation.resolve_line(line)?;
+            let anchor = document.source.rendered.navigation.resolve_line(line)?;
             if let Some(current) = source
                 .rendered
                 .navigation
@@ -716,7 +779,7 @@ impl PlanReviewDocument {
             }
             for previous_block in &previous.block {
                 for previous_range in &previous_block.metadata.target {
-                    if self
+                    if document
                         .target
                         .get(&previous_range.id)
                         .is_none_or(|candidate| candidate.line != line)
@@ -735,7 +798,7 @@ impl PlanReviewDocument {
             None
         };
         let mut retained = annotation.annotation().to_vec();
-        for original in self.annotation.annotation() {
+        for original in document.annotation.annotation() {
             if retained.iter().any(|saved| saved.id == original.id) {
                 continue;
             }
@@ -768,55 +831,49 @@ impl PlanReviewDocument {
             stage.complete(serde_json::json!({"count":annotation.annotation().len()}));
         }
         let edit = trace.map(|trace| trace.stage("review.edit_document"));
-        let patch = super::review_delivery::replace(&mut self.document, block)?;
+        let patch = super::review_delivery::replace(&mut document.document, block)?;
         if let Some(stage) = edit {
             stage.complete(serde_json::json!({}));
         }
-        self.source = source;
+        document.source = source;
         if !tests_only {
-            self.reference = Default::default();
-            self.reference_context = Default::default();
+            document.reference = Default::default();
+            document.reference_context = Default::default();
         }
-        self.target = target;
-        self.annotation = annotation;
+        document.target = target;
+        document.annotation = annotation;
         let response = trace.map(|trace| trace.stage("review.build_delivery"));
-        let source_edit = self.source_edit();
+        let source_edit = document.source_edit();
         let result = serde_json::json!({"patch":patch, "source_edit":source_edit,
-            "annotation":self.annotation.annotation(), "public_only":self.source.public_only,
-            "saved_source_digest":self.saved_digest(), "version":self.source.document.version,
-            "checks":self.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default()});
+            "annotation":document.annotation.annotation(), "public_only":document.source.public_only,
+            "saved_source_digest":document.saved_digest(), "version":document.source.document.version,
+            "checks":document.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default()});
         if let Some(stage) = response {
             stage.complete(serde_json::json!({}));
         }
         if let Some(stage) = total {
-            stage.complete(serde_json::json!({"revision":self.source.document.version}));
+            stage.complete(serde_json::json!({"revision":document.source.document.version}));
         }
         Ok(result)
     }
 
     fn rename(
-        &mut self,
-        anchor: &PlanNavigationAnchor,
+        self,
+        anchor: ProposedReviewTarget<'_>,
         row: &str,
         column: usize,
     ) -> Result<serde_json::Value> {
-        ensure!(
-            !self.source.historical,
-            "historical plan revisions are read-only"
-        );
-        ensure!(
-            !matches!(&anchor.target, super::PlanReviewTarget::Declaration { side, .. } | super::PlanReviewTarget::Call { side, .. } | super::PlanReviewTarget::Behavior { side, .. } if side != "proposed"),
-            "baseline symbols cannot be renamed"
-        );
-        let design = self
+        let document = self.0;
+        let anchor = anchor.0;
+        let design = document
             .source
             .document
             .design
             .as_ref()
             .context("rename requires a declaration plan")?;
         let index = super::references::PlanReferenceIndex::planned(
-            &self.source.document,
-            &self.source.workspace,
+            &document.source.document,
+            &document.source.workspace,
         )?;
         let mut selected_anchor = anchor.clone();
         let saved_column = if let super::PlanReviewTarget::Declaration {
@@ -848,17 +905,17 @@ impl PlanReviewDocument {
             .selected_algorithm(anchor, row, column)
             .or_else(|| index.selected(&selected_anchor, saved_column))
             .context("select a resolved symbol defined in the plan")?;
-        let (_, symbol) = index.rename_definition(&self.source.document, identity)?;
+        let (_, symbol) = index.rename_definition(&document.source.document, identity)?;
         let mut preview = Vec::new();
         let mut resolver = crate::declaration::DeclarationResolver::planned(
-            &self.source.workspace,
+            &document.source.workspace,
             design,
             false,
         )?;
         resolver.discard_snapshot_originals();
-        for block in self.document.snapshot().block {
+        for block in document.document.snapshot().block {
             for target in &block.metadata.target {
-                let Some(anchor) = self.target.get(&target.id) else {
+                let Some(anchor) = document.target.get(&target.id) else {
                     continue;
                 };
                 let Some(row) = block.text.row(0) else {
@@ -940,8 +997,18 @@ impl PlanReviewDocument {
             }
         }
         Ok(
-            serde_json::json!({"rename":{"symbol":identity,"name":symbol.name,"expected_version":self.source.document.version,"preview":preview}}),
+            serde_json::json!({"rename":{"symbol":identity,"name":symbol.name,"expected_version":document.source.document.version,"preview":preview}}),
         )
+    }
+}
+
+impl ReadOnlyPlanReview {
+    fn editable(&mut self) -> Result<EditablePlanReview<'_>> {
+        ensure!(
+            !self.source.is_historical(),
+            "historical plan revisions are read-only"
+        );
+        Ok(EditablePlanReview(self))
     }
 
     fn references(
@@ -955,17 +1022,16 @@ impl PlanReviewDocument {
             .reference
             .lock()
             .map_err(|_| anyhow::anyhow!("plan reference cache lock poisoned"))?;
-        if !reference.contains_key(&baseline) {
-            reference.insert(
-                baseline,
-                super::references::PlanReferenceIndex::build(
+        let index = match reference.entry(baseline) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(super::references::PlanReferenceIndex::build(
                     &self.source.document,
                     &self.source.workspace,
                     baseline,
-                )?,
-            );
-        }
-        let index = reference.get(&baseline).unwrap();
+                )?)
+            }
+        };
         let mut selected_anchor = anchor.clone();
         let saved_column = if let super::PlanReviewTarget::Declaration {
             path,
@@ -1012,14 +1078,12 @@ impl PlanReviewDocument {
                 kind,
                 ..
             } = &anchor.target
-            {
-                if let Some(reason) =
+                && let Some(reason) =
                     index
                         .unresolved
                         .get(&(path.clone(), owner.clone(), name.clone(), *kind))
-                {
-                    return Ok(serde_json::json!({"message":reason}));
-                }
+            {
+                return Ok(serde_json::json!({"message":reason}));
             }
             return Ok(
                 serde_json::json!({"message":"The selected symbol has no resolved plan identity."}),
@@ -1040,13 +1104,12 @@ impl PlanReviewDocument {
             .reference_context
             .lock()
             .map_err(|_| anyhow::anyhow!("plan reference context cache lock poisoned"))?;
-        if !context.contains_key(&baseline) {
-            context.insert(
-                baseline,
+        let context = match context.entry(baseline) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
                 super::reference_context::ReferenceContext::build(&self.source, baseline)?,
-            );
-        }
-        let context = context.get(&baseline).unwrap();
+            ),
+        };
         let entries = occurrences
             .into_iter()
             .map(|reference| context.entry(reference))
@@ -1396,12 +1459,12 @@ impl PlanReviewDocument {
                         .is_some_and(|candidate| candidate.json_path == entity_anchor.json_path)
                 }) {
                     let mut position = target.range.start;
-                    if let Some(name) = entity_name {
-                        if let Some(column) = block.text.row(position.row).and_then(|row| {
+                    if let Some(name) = entity_name
+                        && let Some(column) = block.text.row(position.row).and_then(|row| {
                             row.find(callable.filter(|_| cursor_entity.is_none()).unwrap_or(name))
-                        }) {
-                            position.column = column;
-                        }
+                        })
+                    {
+                        position.column = column;
                     }
                     jump = Some(forge_buffer::block::BlockAnchor {
                         block: block.id,
@@ -1478,17 +1541,16 @@ impl PlanReviewDocument {
                 .reference
                 .lock()
                 .map_err(|_| anyhow::anyhow!("plan reference cache lock poisoned"))?;
-            if !reference.contains_key(&baseline) {
-                reference.insert(
-                    baseline,
-                    super::references::PlanReferenceIndex::build(
+            let index = match reference.entry(baseline) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(super::references::PlanReferenceIndex::build(
                         &self.source.document,
                         &self.source.workspace,
                         baseline,
-                    )?,
-                );
-            }
-            let index = reference.get(&baseline).unwrap();
+                    )?)
+                }
+            };
             if let Some(identity) = index.selected(anchor, column as u32)
                 && let Some(destination) = index.destination(
                     &self.source.document,
@@ -1912,8 +1974,7 @@ impl PlanReviewDocument {
                         continue;
                     };
                     if matches!(&anchor.target, super::PlanReviewTarget::Declaration { path, side: target_side, line, column } if path == &relative && target_side == side && row_anchor.is_some_and(|position| position.line == *line && Some(position.column) == *column))
-                    {
-                        if let Some(column) = block
+                        && let Some(column) = block
                             .text
                             .row(0)
                             .filter(|row| {
@@ -1921,11 +1982,10 @@ impl PlanReviewDocument {
                                     .is_some_and(|rest| rest.starts_with(&destination.name))
                             })
                             .map(|_| display_position.column)
-                        {
-                            return Ok(
-                                serde_json::json!({"jump":{"block":block.id,"position":{"row":0,"column":column}}}),
-                            );
-                        }
+                    {
+                        return Ok(
+                            serde_json::json!({"jump":{"block":block.id,"position":{"row":0,"column":column}}}),
+                        );
                     }
                 }
             }
@@ -1983,7 +2043,7 @@ impl PlanReviewDocument {
         focused_annotation: Option<String>,
     ) -> Result<Self> {
         view.validate()?;
-        let annotation_path = if source.historical {
+        let annotation_path = if source.is_historical() {
             source
                 .path
                 .parent()
@@ -2041,23 +2101,15 @@ impl PlanReviewDocument {
                     .map(move |case| ((file.file.as_str(), case.name.as_str()), case.change))
             })
             .collect::<HashMap<_, _>>();
-        let mut test_summary = serde_json::json!({"new":0,"modified":0,"removed":0,"reused":0});
-        let mut file_summary = HashMap::new();
+        let mut test_summary = TestChangeCounts::default();
+        let mut file_summary = HashMap::<_, TestChangeCounts>::new();
         for ((path, _), change) in &tests {
-            let name = crate::plan::codec::to_value(change).expect("test change");
-            let file = file_summary.entry(*path).or_insert_with(
-                || serde_json::json!({"new":0,"modified":0,"removed":0,"reused":0}),
-            );
+            let file = file_summary.entry(*path).or_default();
             for summary in [&mut test_summary, file] {
-                let count = &mut summary[name.as_str().unwrap()];
-                *count = serde_json::json!(count.as_u64().unwrap() + 1);
+                summary.add(*change);
             }
         }
-        for block in self
-            .document
-            .blocks(self.document.revision(), 0..self.document.block_count())
-            .expect("current document range")
-        {
+        for block in &self.document {
             for position in 0..block.text.row_count() {
                 let target = block.metadata.target.iter().find(|target| {
                     target.range.start.row <= position && position < target.range.end.row
@@ -2358,7 +2410,7 @@ mod tests {
         let historical = store.capture_revision_source("session", "plan", 1).unwrap();
         assert_eq!(historical.rendered.markdown, source.rendered.markdown);
 
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -2447,7 +2499,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &digest)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -2538,7 +2590,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &digest)
             .unwrap();
-        let document = PlanReviewDocument::new(
+        let document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -2680,7 +2732,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &digest)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -2707,10 +2759,16 @@ mod tests {
         let mut source = store
             .capture_review_source("session", "plan", Some(1), &digest)
             .unwrap();
-        source.document.version += 1;
-        source.document.design.as_mut().unwrap().document.objective = "Updated objective.".into();
-        source.rendered = super::super::render_plan_at(&source.document, &store.workspace).unwrap();
-        let updated = document.update(source, None).unwrap();
+        let mut next_document = source.document.clone();
+        next_document.version += 1;
+        next_document.design.as_mut().unwrap().document.objective = "Updated objective.".into();
+        let rendered = super::super::render_plan_at(&next_document, &store.workspace).unwrap();
+        source.replace_revision(next_document, rendered).unwrap();
+        let updated = document
+            .editable()
+            .unwrap()
+            .update(source.try_into().unwrap(), None)
+            .unwrap();
         assert!(updated.get("snapshot").is_none() && updated.get("source_row").is_none());
         let encoded = serde_json::to_string(&updated).unwrap();
         assert!(
@@ -2757,7 +2815,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &digest)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -2798,7 +2856,11 @@ mod tests {
             .capture_review_source("session", "plan", None, &next_digest)
             .unwrap();
         source.resolver = Arc::clone(&resolver);
-        let result = document.update(source, None).unwrap();
+        let result = document
+            .editable()
+            .unwrap()
+            .update(source.try_into().unwrap(), None)
+            .unwrap();
         let rebuilt = super::super::review_projection::project(
             &document.source,
             &document.width,
@@ -2863,7 +2925,9 @@ mod tests {
             .unwrap();
         assert!(
             document
-                .update(stale, None)
+                .editable()
+                .unwrap()
+                .update(stale.try_into().unwrap(), None)
                 .unwrap_err()
                 .to_string()
                 .contains("stale")
@@ -2884,7 +2948,11 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", None, &empty_digest)
             .unwrap();
-        document.update(source, None).unwrap();
+        document
+            .editable()
+            .unwrap()
+            .update(source.try_into().unwrap(), None)
+            .unwrap();
         let rebuilt = super::super::review_projection::project(
             &document.source,
             &document.width,
@@ -2950,7 +3018,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &digest)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -2958,7 +3026,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let find = |document: &PlanReviewDocument, needle: &str| {
+        let find = |document: &ReadOnlyPlanReview, needle: &str| {
             document
                 .snapshot()
                 .block
@@ -3063,7 +3131,7 @@ mod tests {
         let original = std::fs::read(&source_path).unwrap();
         let digest = source.saved_digest.clone();
         let id = DocumentId("questions".into());
-        let document = PlanReviewDocument::new(
+        let document = ReadOnlyPlanReview::new(
             id.clone(),
             ViewId("view".into()),
             source,
@@ -3151,7 +3219,7 @@ mod tests {
         let reopened = file
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let reopened = PlanReviewDocument::new(
+        let reopened = ReadOnlyPlanReview::new(
             DocumentId("reopened".into()),
             ViewId("other".into()),
             reopened,
@@ -3229,7 +3297,7 @@ mod tests {
         let reopened = file
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let reopened = PlanReviewDocument::new(
+        let reopened = ReadOnlyPlanReview::new(
             DocumentId("thread-reopened".into()),
             ViewId("thread-view".into()),
             reopened,
@@ -3290,9 +3358,11 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let mut annotation =
-            ReviewAnnotationStore::open(source.path.with_extension("json"), source.saved_digest)
-                .unwrap();
+        let mut annotation = ReviewAnnotationStore::open(
+            source.path.with_extension("json"),
+            source.saved_digest.clone(),
+        )
+        .unwrap();
         annotation
             .replace(vec![ReviewAnnotation {
                 parent_id: None,
@@ -3321,7 +3391,7 @@ mod tests {
             "historical review did not default to Public"
         );
         assert_eq!(source.document.overview, "Original overview");
-        let historical = PlanReviewDocument::new(
+        let mut historical = ReadOnlyPlanReview::new(
             DocumentId("history".into()),
             ViewId("history-view".into()),
             source,
@@ -3329,6 +3399,7 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(historical.editable().is_err());
         assert_eq!(
             historical.annotation.annotation()[0].source.body,
             "Rename this configuration"
@@ -3380,7 +3451,7 @@ mod tests {
                 .contains("read-only")
         );
         let latest = store.capture_revision_source("session", "plan", 2).unwrap();
-        let latest = PlanReviewDocument::new(
+        let latest = ReadOnlyPlanReview::new(
             DocumentId("latest".into()),
             ViewId("latest-view".into()),
             latest,
@@ -3423,7 +3494,7 @@ mod tests {
             .unwrap();
         assert!(source.public_only);
         source.public_only = false;
-        let document = PlanReviewDocument::new(
+        let document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -3490,7 +3561,7 @@ mod tests {
             .unwrap()
             .remove(&input.document)
             .unwrap();
-        let select = |document: &PlanReviewDocument, needle: &str| {
+        let select = |document: &ReadOnlyPlanReview, needle: &str| {
             let snapshot = document.snapshot();
             let block = snapshot
                 .block
@@ -3600,7 +3671,7 @@ mod tests {
             )))
             .ok()
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -3707,7 +3778,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -3825,7 +3896,7 @@ mod tests {
             .unwrap();
         assert!(source.public_only);
         source.public_only = false;
-        let document = PlanReviewDocument::new(
+        let document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("view".into()),
             source,
@@ -3915,7 +3986,7 @@ mod tests {
         let original = std::fs::read(&source_path).unwrap();
         let digest = source.saved_digest.clone();
         let document_id = DocumentId("review".into());
-        let document = PlanReviewDocument::new(
+        let document = ReadOnlyPlanReview::new(
             document_id.clone(),
             ViewId("view".into()),
             source,
@@ -3964,7 +4035,7 @@ mod tests {
         let reopened = file
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let reopened = PlanReviewDocument::new(
+        let reopened = ReadOnlyPlanReview::new(
             DocumentId("reopened".into()),
             ViewId("other".into()),
             reopened,
@@ -3982,7 +4053,7 @@ mod tests {
         let deleted = file
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let deleted = PlanReviewDocument::new(
+        let deleted = ReadOnlyPlanReview::new(
             DocumentId("deleted".into()),
             ViewId("deleted-view".into()),
             deleted,
@@ -4031,7 +4102,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("review".into()),
             ViewId("first".into()),
             source,
@@ -4108,7 +4179,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("uncaptured".into()),
             ViewId("view".into()),
             source,
@@ -4198,7 +4269,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("constructs".into()),
             ViewId("view".into()),
             source,
@@ -4323,7 +4394,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("properties".into()),
             ViewId("view".into()),
             source,
@@ -4382,7 +4453,13 @@ mod tests {
             .unwrap()
             .clone();
         let renamed = document
-            .rename(&use_anchor, "    Client.count", 12)
+            .editable()
+            .unwrap()
+            .rename(
+                ProposedReviewTarget::try_from(&use_anchor).unwrap(),
+                "    Client.count",
+                12,
+            )
             .unwrap();
         assert_eq!(renamed["rename"]["name"], "count");
         assert!(renamed["rename"]["preview"].as_array().unwrap().len() >= 2);
@@ -4441,7 +4518,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("imports".into()),
             ViewId("view".into()),
             source,
@@ -4576,7 +4653,7 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
-        let mut document = PlanReviewDocument::new(
+        let mut document = ReadOnlyPlanReview::new(
             DocumentId("references".into()),
             ViewId("view".into()),
             source,
