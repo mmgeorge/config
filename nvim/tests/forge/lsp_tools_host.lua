@@ -120,15 +120,28 @@ local success, failure = xpcall(function()
   vim.lsp.enable("fixture-" .. language)
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "Harness did not start")
+  assert(#vim.lsp.get_clients({ name = "fixture-" .. language }) == 0, "opening Harness started a server")
   assert(request("state.get").lsp_tools == false)
   assert(query({ tool = "lsp_status" }):find("disabled", 1, true), "disabled tool call was admitted")
   request("session.configure", { lsp_tools = true })
   assert(request("state.get").lsp_tools == true)
+  assert(query({ tool = "lsp_status" }):find("No project language servers", 1, true), "status started a server")
+  if language == "typescript" then
+    buffer = vim.fn.bufadd(workspace .. "/" .. spec.file)
+    vim.fn.bufload(buffer)
+    vim.bo[buffer].filetype = spec.filetype
+    vim.api.nvim_exec_autocmds("FileType", { buffer = buffer, group = "nvim.lsp.enable" })
+  else
+    query({ tool = "lsp_symbols", query = spec.member })
+  end
   assert(vim.wait(60000, function() local clients = vim.lsp.get_clients({ name = "fixture-" .. language }) return #clients == 1 and clients[1].initialized end, 10))
   local running = vim.lsp.get_clients({ name = "fixture-" .. language })
-  assert(#running == 1 and running[1].initialized, "Harness did not start the configured editor server")
+  assert(#running == 1 and running[1].initialized, "lazy startup did not initialize the configured editor server")
   identity = running[1].id
   assert(query({ tool = "lsp_status" }):find("fixture-" .. language, 1, true))
+  local workspace_diagnostics = query({ tool = "lsp_diagnostics" })
+  assert(workspace_diagnostics:find("coverage:", 1, true), workspace_diagnostics)
+  assert(#vim.lsp.get_clients({ name = "fixture-" .. language }) == 1, "workspace query duplicated the editor server")
   buffer = vim.fn.bufadd(workspace .. "/" .. spec.file)
   vim.fn.bufload(buffer)
   vim.bo[buffer].filetype = spec.filetype

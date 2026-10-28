@@ -168,6 +168,18 @@ function M.belongs(client, workspace)
   return false
 end
 
+---@param client vim.lsp.Client
+---@param path string
+---@return boolean
+function M.covers(client, path)
+  local root = client.root_dir or client.config.root_dir
+  if type(root) == "string" and M.inside(path, root) then return true end
+  for _, folder in ipairs(client.workspace_folders or {}) do
+    if M.inside(path, vim.uri_to_fname(folder.uri)) then return true end
+  end
+  return false
+end
+
 ---@param path string
 ---@param filetype string
 ---@param buffer integer?
@@ -181,7 +193,7 @@ function M.select_client(path, filetype, buffer, method, workspace)
     local config = client.config --[[@as vim.lsp.Config]]
     local language = attached or vim.tbl_contains(config.filetypes or {}, filetype)
     if language and not client:is_stopped()
-      and (not workspace or M.belongs(client, workspace)) then
+      and (attached or not workspace or M.belongs(client, workspace)) then
       local specificity = -1
       for _, folder in ipairs(client.workspace_folders or {}) do
         local root = vim.uri_to_fname(folder.uri)
@@ -189,7 +201,7 @@ function M.select_client(path, filetype, buffer, method, workspace)
       end
       local root = client.root_dir or client.config.root_dir
       if type(root) == "string" and M.inside(path, root) then specificity = math.max(specificity, #M.canonical(root)) end
-      if specificity >= 0 or workspace then
+      if specificity >= 0 or attached then
         if not method or client:supports_method(method, buffer) then
           candidates[#candidates + 1] = { client = client, attached = attached == true, specificity = specificity }
         else unsupported[#unsupported + 1] = client.name end

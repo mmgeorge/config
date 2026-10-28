@@ -215,10 +215,6 @@ impl Arguments {
             );
         }
         ensure!(
-            self.operation != Operation::Diagnostics || self.path.is_some(),
-            "diagnostics requires a file path"
-        );
-        ensure!(
             self.line.is_none_or(|value| value > 0) && self.column.is_none_or(|value| value > 0),
             "positions are one-based"
         );
@@ -377,7 +373,7 @@ pub(crate) fn definitions() -> Vec<super::super::ControlToolDefinition> {
                 required.extend(["from", "to"]);
                 "Find bounded static call paths from one symbol to another. Returns complete aligned symbol trees. Cycles are excluded. Partial searches are explicit. This does not prove runtime reachability."
             },
-            "diagnostics" => { required.push("path"); fields.insert("severity".into(), json!({"type":"string","enum":["all","error","warning","information","hint"],"default":"all"})); "Read file diagnostics and affected lines with explicit freshness. Empty results do not establish a successful project typecheck." },
+            "diagnostics" => { fields.insert("severity".into(), json!({"type":"string","enum":["all","error","warning","information","hint"],"default":"all"})); "Read file diagnostics when path names a file, or aggregate workspace diagnostics when path is omitted or names a directory. Reports server coverage and freshness. Unsupported or failed servers leave explicit gaps. Empty results do not establish a successful project typecheck." },
             _ => "Inspect project language servers, roots, readiness, and supported capabilities. Normal queries already wait for initialization.",
         };
         super::super::ControlToolDefinition { name, description, input_schema: json!({"type":"object","additionalProperties":false,"required":required,"properties":properties}) }
@@ -387,6 +383,34 @@ pub(crate) fn definitions() -> Vec<super::super::ControlToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_accepts_file_and_workspace_requests() {
+        assert!(
+            Arguments::parse("lsp_diagnostics", json!({}))
+                .unwrap()
+                .path
+                .is_none()
+        );
+        assert_eq!(
+            Arguments::parse("lsp_diagnostics", json!({"path":"src/main.rs"}))
+                .unwrap()
+                .path
+                .as_deref(),
+            Some("src/main.rs")
+        );
+        let definition = definitions()
+            .into_iter()
+            .find(|definition| definition.name == "lsp_diagnostics")
+            .unwrap();
+        assert!(
+            !definition.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "path")
+        );
+    }
 
     #[test]
     fn complete_paths_and_symbol_queries_have_no_byte_ceiling() {

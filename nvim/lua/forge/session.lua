@@ -97,6 +97,7 @@ M.empty_diff_rows = {}
 ---@field checks_deferred? boolean
 ---@field configuring? boolean
 ---@field initial_snapshot_pending? boolean Suppresses stale session presentation until startup synchronization.
+---@field startup_trace? ForgeHarnessStartupTrace
 ---@field configuring_config? table
 ---@field configuration_revision? integer
 ---@field configuration_error? string

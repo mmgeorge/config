@@ -24,6 +24,7 @@ local methods = {
 ---@field scope? string
 ---@field severity? string
 ---@field include_declaration? boolean
+---@field startup_issues? table[]
 
 ---@class ForgeLspSemanticRow
 ---@field path string
@@ -42,6 +43,7 @@ local methods = {
 ---@field warnings? string[]
 ---@field hover? string
 ---@field freshness? string
+---@field coverage? table[]
 
 ---@class ForgeLspRawRow
 ---@field path string
@@ -69,10 +71,13 @@ end
 ---@param authorize fun(paths: string[], receive: fun(allowed: table<string, boolean>?, failure: string?))
 ---@param receive fun(result: ForgeLspSemanticResult?, failure: string?)
 ---@return fun() cancel
+---@return fun()? expire
 function M.request(workspace, arguments, authorize, receive, budget)
   local finished, outstanding, attempted, responses, collecting = false, 0, 0, 0, false
   local requests, buffers, versions, clients, raw, warnings = {}, {}, {}, {}, {}, {}
   local result = { rows = {}, source = "workspace" }
+  local workspace_query = not arguments.path and (arguments.operation == "workspace_symbols" or arguments.operation == "diagnostics")
+  if workspace_query then result.coverage = {} end
   local deadline = assert(vim.uv.new_timer())
   local guard = assert(vim.uv.new_timer())
   local cancel_startup
@@ -90,6 +95,12 @@ function M.request(workspace, arguments, authorize, receive, budget)
       source.release(buffer)
     end
     result.warnings = #warnings > 0 and warnings or nil
+    if workspace_query and arguments.operation == "diagnostics" then
+      result.freshness = #result.coverage > 0 and "current" or "unknown"
+      for _, coverage in ipairs(result.coverage) do
+        if coverage.state ~= "complete" then result.freshness = "unknown" end
+      end
+    end
     receive(not failure and result or nil, failure)
   end
   local function valid()
@@ -100,7 +111,7 @@ function M.request(workspace, arguments, authorize, receive, budget)
       end
     end
     for _, client in pairs(clients) do
-      if client:is_stopped() then finish("disconnected: " .. client.name .. " stopped during the request.") return false end
+      if client:is_stopped() and not workspace_query then finish("disconnected: " .. client.name .. " stopped during the request.") return false end
     end
     return true
   end
@@ -113,6 +124,7 @@ function M.request(workspace, arguments, authorize, receive, budget)
       return
     end
     local path = source.canonical(vim.uri_to_fname(uri))
+    if workspace_query and arguments.scope ~= "all" and not source.inside(path, workspace) then return end
     if arguments.search_path and not source.inside(path, arguments.search_path) then return end
     raw[#raw + 1] = { path = path, position = range.start,
       encoding = client.offset_encoding or "utf-16", text = label, call_root = call_root, is_root = is_root }
@@ -144,8 +156,8 @@ function M.request(workspace, arguments, authorize, receive, budget)
   end
   local function collect()
     if outstanding ~= 0 or collecting or not valid() then return end
-    if attempted > 0 and responses == 0 then finish(table.concat(warnings, "\n")) return end
-    if #raw == 0 and #warnings > 0 then finish(table.concat(warnings, "\n")) return end
+    if not workspace_query and attempted > 0 and responses == 0 then finish(table.concat(warnings, "\n")) return end
+    if not workspace_query and #raw == 0 and #warnings > 0 then finish(table.concat(warnings, "\n")) return end
     collecting = true
     if result.hover then finish() return end
     table.sort(raw, function(left, right)
@@ -237,7 +249,7 @@ function M.request(workspace, arguments, authorize, receive, budget)
       enrich(1)
     end)
   end
-  send = function(client, method, params, buffer, callback, retries)
+  send = function(client, method, params, buffer, callback, retries, coverage)
     if finished then return end
     if budget then
       if budget.remaining <= 0 then finish("budget_exhausted: native LSP request limit reached") return end
@@ -246,22 +258,45 @@ function M.request(workspace, arguments, authorize, receive, budget)
     outstanding = outstanding + 1
     attempted = attempted + 1
     clients[client.id] = client
+    local received = false
     local function response(failure, value)
+      if received or finished then return end
+      received = true
       outstanding = outstanding - 1
       if not valid() then return end
       if failure and failure.code == -32801 and (retries or 0) < 2 then
         outstanding = outstanding + 1
-        vim.defer_fn(function()
+        local pending = true
+        requests[#requests + 1] = { cancel = function() pending = false end, expire = function()
+          if not pending then return end
+          pending = false
           outstanding = outstanding - 1
-          if valid() then send(client, method, params, buffer, callback, (retries or 0) + 1) end
+          local message = "timeout: " .. client.name .. " retry exceeded the operation deadline."
+          warnings[#warnings + 1] = message
+          if coverage then coverage.state, coverage.message = "failed", message end
+          collect()
+        end }
+        vim.defer_fn(function()
+          if not pending then return end
+          pending = false
+          outstanding = outstanding - 1
+          if valid() then send(client, method, params, buffer, callback, (retries or 0) + 1, coverage) end
         end, 100)
         return
       end
-      if failure then warnings[#warnings + 1] = "server_error: " .. client.name .. " — " .. shorten(failure.message or "Request failed.", 160)
+      if failure then
+        local message = "server_error: " .. client.name .. " — " .. shorten(failure.message or "Request failed.", 160)
+        warnings[#warnings + 1] = message
+        if coverage then coverage.state, coverage.message = "failed", message end
       else
         responses = responses + 1
         local success, callback_error = pcall(callback, value == vim.NIL and nil or value)
-        if not success then finish("invalid_response: " .. client.name .. " — " .. tostring(callback_error)) return end
+        if not success then
+          local message = "invalid_response: " .. client.name .. " — " .. tostring(callback_error)
+          if not coverage then finish(message) return end
+          coverage.state, coverage.message = "failed", message
+          warnings[#warnings + 1] = message
+        elseif coverage then coverage.state = "complete" end
       end
       collect()
     end
@@ -269,8 +304,9 @@ function M.request(workspace, arguments, authorize, receive, budget)
     if method == methods.diagnostics then
       accepted, cancel = diagnostics.request(client, buffer, params, response)
     else accepted, id = client:request(method, params, response, buffer) end
-    if accepted then requests[#requests + 1] = { client = client, id = id, cancel = cancel }
-    else outstanding = outstanding - 1 warnings[#warnings + 1] = "server_error: " .. client.name .. " rejected the request." end
+    if accepted then requests[#requests + 1] = { client = client, id = id, cancel = cancel,
+      expire = function() response({ message = "Request timed out." }) end }
+    else response({ message = "Request rejected." }) end
   end
   local function run(buffer, client)
     source.retain(buffer, buffers[buffer] == true)
@@ -355,22 +391,53 @@ function M.request(workspace, arguments, authorize, receive, budget)
       if offset + limit < #rows then result.next_offset = offset + limit end
       finish() return
     end
-    if arguments.operation == "workspace_symbols" and not arguments.path then
-      local selected, unsupported = {}, {}
+    if workspace_query then
+      local selected = {}
       for _, client in ipairs(vim.lsp.get_clients()) do
-        if not client:is_stopped() and source.belongs(client, workspace) then
-          if client:supports_method(methods.workspace_symbols) then selected[#selected + 1] = client
-          else unsupported[#unsupported + 1] = client.name end
+        local root = client.root_dir or client.config.root_dir
+        root = type(root) == "string" and root or workspace
+        local startup_failed = false
+        for _, coverage in ipairs(result.coverage) do
+          if coverage.name == client.name and source.canonical(coverage.root) == source.canonical(root) then startup_failed = true break end
+        end
+        if not startup_failed and not client:is_stopped() and source.belongs(client, arguments.search_path or workspace) then
+          local coverage = { name = client.name, root = type(root) == "string" and root or workspace, state = "pending" }
+          result.coverage[#result.coverage + 1] = coverage
+          local provider = client.server_capabilities and client.server_capabilities.diagnosticProvider
+          local supported = arguments.operation == "workspace_symbols" and client:supports_method(methods.workspace_symbols)
+            or arguments.operation == "diagnostics" and type(provider) == "table" and provider.workspaceDiagnostics == true
+          if supported then selected[#selected + 1] = { client = client, coverage = coverage, provider = provider }
+          else
+            coverage.state, coverage.message = "unsupported", "Server does not support workspace " .. (arguments.operation == "diagnostics" and "diagnostics." or "symbols.")
+            warnings[#warnings + 1] = client.name .. ": " .. coverage.message
+          end
         end
       end
       if #selected == 0 then
-        table.sort(unsupported)
-        finish(#unsupported > 0 and ("unsupported: " .. table.concat(unsupported, ", ") .. " does not support workspace symbols.")
-          or "unavailable: No running project language server.") return
+        if #result.coverage == 0 then finish("unavailable: No running project language server.")
+        else collect() end
+        return
       end
       outstanding = outstanding + 1
-      for _, client in ipairs(selected) do
-        send(client, methods.workspace_symbols, symbol_query(client), nil, function(value) symbols(value, client) end)
+      for _, selected in ipairs(selected) do
+        local client = selected.client
+        if arguments.operation == "workspace_symbols" then
+          send(client, methods.workspace_symbols, symbol_query(client), nil, function(value) symbols(value, client) end, nil, selected.coverage)
+        else
+          send(client, "workspace/diagnostic", { identifier = selected.provider.identifier, previousResultIds = {} }, nil, function(value)
+            assert(type(value) == "table" and type(value.items) == "table", "Missing workspace diagnostic report")
+            for _, report in ipairs(value.items) do
+              assert(report.kind == "full" and type(report.items) == "table", "Workspace report omitted diagnostics without a previous result")
+              for _, diagnostic in ipairs(report.items) do
+                local severity = ({ "error", "warning", "information", "hint" })[diagnostic.severity or 1] or "error"
+                if not arguments.severity or arguments.severity == "all" or arguments.severity == severity then
+                  location({ uri = report.uri, range = diagnostic.range }, client,
+                    client.name .. ": " .. severity .. (diagnostic.code and "[" .. tostring(diagnostic.code) .. "]" or "") .. ": " .. diagnostic.message)
+                end
+              end
+            end
+          end, nil, selected.coverage)
+        end
       end
       outstanding = outstanding - 1 collect() return
     end
@@ -398,15 +465,27 @@ function M.request(workspace, arguments, authorize, receive, budget)
       run(opened, client)
     end) end
   end
+  local function expire()
+    if finished then return end
+    if not workspace_query or collecting then finish("timeout: " .. arguments.operation .. " lookup exceeded 10 seconds.") return end
+    for _, request in ipairs(requests) do if request.expire then request.expire() end end
+    if not finished and outstanding == 0 then collect() end
+  end
   if arguments.operation == "status" then start() return function() end end
-  cancel_startup = require("forge.lsp.startup").wait(workspace, arguments.path, function(startup_error)
+  local function ready(startup_error, issues)
     if finished then return end
     if startup_error then finish(startup_error) return end
-    deadline:start(10000, 0, vim.schedule_wrap(function() finish("timeout: " .. arguments.operation .. " lookup exceeded 10 seconds.") end))
+    for _, issue in ipairs(issues or {}) do
+      warnings[#warnings + 1] = issue.message
+      if workspace_query then result.coverage[#result.coverage + 1] = issue end
+    end
+    deadline:start(10000, 0, vim.schedule_wrap(expire))
     local success, failure = pcall(start)
     if not success then finish(tostring(failure)) end
-  end)
-  return function() finish("cancelled: LSP request cancelled.") end
+  end
+  if workspace_query and arguments.startup_issues then ready(nil, arguments.startup_issues)
+  else cancel_startup = require("forge.lsp.startup").wait(workspace, arguments.path or arguments.search_path, ready) end
+  return function() finish("cancelled: LSP request cancelled.") end, expire
 end
 
 return M

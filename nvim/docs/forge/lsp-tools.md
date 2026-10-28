@@ -18,7 +18,7 @@ context or a semantic query. No tool moves the editor cursor.
 | `lsp_references` | Target selector, `include_declaration=false` | Uses grouped by enclosing declaration, with one source line before and after |
 | `lsp_calls` | Target selector, required `direction=incoming` or `outgoing` | One level of callers or callees in an aligned symbol tree |
 | `lsp_paths` | `from` and `to` selectors, `max_depth=5`, `max_paths=3`, `max_requests=64` | Complete static call paths in aligned trees |
-| `lsp_diagnostics` | File `path`, `severity=all` | Diagnostics and affected source lines, with freshness |
+| `lsp_diagnostics` | Optional file/directory `path`, `severity=all` | File diagnostics, or workspace reports with per-server coverage when path is omitted or a directory |
 | `lsp_status` | Optional `path` | Server roots, initialization state, and supported capabilities |
 
 Paths are workspace-relative or authorized absolute paths. Lines and columns start
@@ -229,11 +229,14 @@ source change invalidates the request. Tree-sitter supplies structural context f
 Rust, TypeScript/TSX, JavaScript/JSX/MJS/CJS, and Lua. LSP supplies semantic identity
 and relationships. Missing capabilities, failures, and empty results are distinct.
 
-Opening Harness warms enabled editor LSP configurations against real project
-files. JavaScript and TypeScript startup requires `package.json`, and Rust startup
-requires `Cargo.toml`. Loose `.js`, `.ts`, and `.rs` files do not trigger automatic
-startup. Nested projects are discovered in scheduled batches, excluding build and
-dependency directories. Queries and editor buffers reuse those same clients.
+Opening Harness and applying session snapshots do not start language servers.
+A file request resolves only that file's matching configurations and project root.
+Workspace requests discover distinct project roots in scheduled batches, excluding
+build and dependency directories. Workspace discovery identifies JavaScript and
+TypeScript projects through `package.json`, and Rust projects through `Cargo.toml`.
+Queries reuse editor clients already serving the same root, including clients
+started by opening a source file. A client for an unrelated sibling project does
+not receive a file request.
 A server that declines a project root does not produce an initialization-timeout
 notification. Source queries wait up to 60 seconds for initialization and any work-done progress
 reported by the server, then have a ten-second operation deadline, or 30 seconds for path searches. Status reports
@@ -285,6 +288,14 @@ Diagnostics freshness is `current`, `stale`, or `unknown`. Pull diagnostics desc
 the captured source version. Push diagnostics retain unknown freshness when their
 version cannot be proved. Empty diagnostics do not establish a successful project
 typecheck. Use configured Harness checks for validation.
+
+Omitting `path` from `lsp_diagnostics` requests workspace diagnostics from each
+applicable server supporting `workspace/diagnostic`. Results retain server names
+and project roots. Unsupported, failed, and timed-out servers leave explicit
+coverage gaps, while successful reports remain available. An empty response with
+partial coverage does not establish that the workspace has no diagnostics.
+Servers that only report diagnostics for opened files cannot certify full workspace
+coverage. Workspace-symbol queries use the same project discovery and coverage reporting.
 
 The tools do not create projects, install dependencies, apply edits, or execute
 arbitrary server commands. Existing dependency source remains subject to the read

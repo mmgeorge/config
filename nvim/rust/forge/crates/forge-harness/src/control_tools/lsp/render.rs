@@ -32,6 +32,15 @@ pub(super) struct Row {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct Coverage {
+    pub name: String,
+    pub root: String,
+    pub state: String,
+    pub message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Reply {
     pub rows: Vec<Row>,
     pub source: String,
@@ -41,6 +50,8 @@ pub(super) struct Reply {
     pub hover: Option<String>,
     pub freshness: Option<String>,
     pub message: Option<String>,
+    #[serde(default)]
+    pub coverage: Vec<Coverage>,
     #[serde(default)]
     pub omitted_visibility: Vec<Row>,
     #[serde(default)]
@@ -64,6 +75,38 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
     let mut previous_signature = None;
     let mut next_offset = reply.next_offset;
     let mut next_line = reply.next_line;
+    if !reply.coverage.is_empty() {
+        let complete = reply
+            .coverage
+            .iter()
+            .all(|coverage| coverage.state == "complete");
+        output.push_str(if complete {
+            "coverage: complete\n"
+        } else {
+            "coverage: partial\n"
+        });
+        for coverage in &reply.coverage {
+            ensure!(
+                matches!(
+                    coverage.state.as_str(),
+                    "complete" | "failed" | "unsupported"
+                ),
+                "invalid LSP coverage state"
+            );
+            output.push_str(&format!(
+                "{} [{}]: {}{}\n",
+                coverage.name,
+                super::display_path(&coverage.root, workspace),
+                coverage.state,
+                coverage
+                    .message
+                    .as_ref()
+                    .map(|message| format!(" — {message}"))
+                    .unwrap_or_default()
+            ));
+        }
+        output.push('\n');
+    }
     if let Some(freshness) = &reply.freshness {
         ensure!(
             matches!(freshness.as_str(), "current" | "stale" | "unknown"),
@@ -218,7 +261,11 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
             .warnings
             .as_ref()
             .is_some_and(|warnings| !warnings.is_empty())
-            || reply.omitted_visibility_count > 0;
+            || reply.omitted_visibility_count > 0
+            || reply
+                .coverage
+                .iter()
+                .any(|coverage| coverage.state != "complete");
         let message = if partial {
             "No results returned.\n"
         } else {
@@ -389,6 +436,23 @@ fn location(line: u32, column: Option<u32>, hit: bool, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_diagnostics_preserve_server_coverage_for_empty_results() {
+        let arguments = Arguments::parse("lsp_diagnostics", serde_json::json!({})).unwrap();
+        let reply = serde_json::from_value(serde_json::json!({"source":"workspace","rows":[],"freshness":"unknown",
+            "coverage":[{"name":"rust","root":"/repo/rust","state":"complete"},
+                {"name":"typescript","root":"/repo/typescript","state":"unsupported","message":"No workspace diagnostics"}]})).unwrap();
+        let output = render(reply, &arguments, Path::new("/repo")).unwrap();
+        assert!(
+            output.contains("coverage: partial")
+                && output.contains("typescript [typescript]: unsupported"),
+            "{output}"
+        );
+        assert!(output.contains("freshness: unknown"));
+        assert!(output.contains("No results returned."));
+        assert!(!output.contains("No reported diagnostics."));
+    }
 
     #[test]
     fn visibility_omissions_name_declarations_without_retry_advice() {

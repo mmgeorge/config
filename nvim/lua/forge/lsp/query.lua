@@ -60,7 +60,8 @@ end
 ---@param receive function
 ---@return fun()
 function M.request(workspace, arguments, authorize, analyze, receive)
-  local finished, active_cancel = false, nil
+  local finished, active_cancel, active_expire = false, nil, nil
+  local startup_issues, draining
   local result = { rows = {}, source = "live source", warnings = {}, omitted_visibility = {}, omitted_visibility_count = 0 }
   local captured = snapshots.new(authorize, analyze)
   local budget = arguments.operation == "paths" and { remaining = arguments.max_requests or 64 } or nil
@@ -98,11 +99,13 @@ function M.request(workspace, arguments, authorize, analyze, receive)
   local function active() return not finished end
   local function query(request, callback, optional, controlled)
     if finished then return end
+    local workspace_query = not request.path and (request.operation == "workspace_symbols" or request.operation == "diagnostics")
+    if workspace_query then request.startup_issues = startup_issues end
     local completed = false
-    local cancel = semantic.request(workspace, request, authorize, function(reply, failure)
+    local cancel, expire = semantic.request(workspace, request, authorize, function(reply, failure)
       completed = true
       if finished then return end
-      active_cancel = nil
+      active_cancel, active_expire = nil, nil
       if failure then
         if controlled then callback({ rows = {} }, failure) return end
         if arguments.operation == "paths" and failure:match("^budget_exhausted:") then
@@ -117,7 +120,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
       for _, warning in ipairs(reply.warnings or {}) do result.warnings[#result.warnings + 1] = warning end
       callback(reply)
     end, budget)
-    if not completed then active_cancel = cancel end
+    if not completed then active_cancel, active_expire = cancel, workspace_query and expire or nil end
   end
   local function get(path, callback, optional)
     if finished then return end
@@ -147,6 +150,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
   local function materialize(reply, operation, callback, section)
     if not section then result.next_offset = reply.next_offset end
     result.freshness = reply.freshness or result.freshness
+    result.coverage = reply.coverage or result.coverage
     local index = 1
     local groups = {}
     local function next_row()
@@ -351,7 +355,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
     else
       local request = vim.deepcopy(arguments) --[[@as ForgeLspSemanticArguments]]
       request.limit = arguments.limit or 20
-      if arguments.operation == "symbols" or arguments.operation == "references" or arguments.operation == "calls" then
+      if arguments.operation == "symbols" or arguments.operation == "references" or arguments.operation == "calls" or arguments.operation == "diagnostics" then
         request.scope = arguments.scope or "workspace"
       end
       if arguments.operation == "definition" then request.operation = ({ type = "type_definition", implementation = "implementation" })[arguments.kind] or "definition"
@@ -361,6 +365,9 @@ function M.request(workspace, arguments, authorize, analyze, receive)
         -- Directory paths scope workspace search without pretending to be source files.
         local stat = request.path and vim.uv.fs_stat(request.path)
         if stat and stat.type == "directory" then request.path = nil end
+      elseif arguments.operation == "diagnostics" and request.path then
+        local stat = vim.uv.fs_stat(request.path)
+        if stat and stat.type == "directory" then request.search_path, request.path = request.path, nil end
       end
       query(request, function(reply)
         if arguments.operation == "calls" and not reply.next_offset and not (reply.warnings and #reply.warnings > 0) then
@@ -381,13 +388,17 @@ function M.request(workspace, arguments, authorize, analyze, receive)
             row.text = row.text:match("^[^\n]+") .. "\n  " .. table.concat(mapped, ", ")
           end
           finish()
+        elseif draining then result = reply finish()
         else materialize(reply, arguments.operation, function() finish() end) end
       end)
     end
   end
   local function resolved_start()
     local duration = arguments.operation == "paths" and 30 or 10
-    timer:start(duration * 1000, 0, vim.schedule_wrap(function() finish("timeout: " .. arguments.operation .. " lookup exceeded " .. duration .. " seconds.") end))
+    timer:start(duration * 1000, 0, vim.schedule_wrap(function()
+      if active_expire then draining = true active_expire()
+      else finish("timeout: " .. arguments.operation .. " lookup exceeded " .. duration .. " seconds.") end
+    end))
     if vim.tbl_contains({ "definition", "context", "references", "calls" }, arguments.operation) then
       resolve(arguments, function(resolved)
         arguments.path, arguments.line, arguments.column = resolved.path, resolved.line, resolved.column
@@ -398,10 +409,11 @@ function M.request(workspace, arguments, authorize, analyze, receive)
   if arguments.operation == "status" then start()
   else
     local completed = false
-    local cancel = require("forge.lsp.startup").wait(workspace, arguments.path, function(failure)
+    local cancel = require("forge.lsp.startup").wait(workspace, arguments.path, function(failure, issues)
       completed = true
       if finished then return end
       active_cancel = nil
+      startup_issues = issues or {}
       if failure then finish(failure) else resolved_start() end
     end)
     if not completed then active_cancel = cancel end

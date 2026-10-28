@@ -621,6 +621,7 @@ pub struct HarnessBroker {
     pub(crate) parent_input: crate::backend::SteeringLane,
     timeline_reconciled_after_dispatch: bool,
     turn_cancellation: Arc<TurnCancellation>,
+    pub(crate) startup_timing: std::collections::BTreeMap<&'static str, f64>,
 }
 
 impl HarnessBroker {
@@ -657,9 +658,19 @@ impl HarnessBroker {
         runtime: Arc<BrokerRuntime>,
         clock: Box<dyn Clock>,
     ) -> Result<Self> {
+        let startup_started = std::time::Instant::now();
+        let mut startup_timing = std::collections::BTreeMap::new();
         let data_root = PathBuf::from(&request.data_root);
         let mut store = SqliteStore::open(&data_root)?;
+        startup_timing.insert(
+            "database_open_ms",
+            startup_started.elapsed().as_secs_f64() * 1000.0,
+        );
         store.recover_session_deletions()?;
+        startup_timing.insert(
+            "deletion_recovery_ms",
+            startup_started.elapsed().as_secs_f64() * 1000.0,
+        );
         let workspace_kind = runtime.workspace_kind.clone();
         let workspace = match &workspace_kind {
             WorkspaceKind::Git(path) | WorkspaceKind::Untracked(path) => {
@@ -791,6 +802,10 @@ impl HarnessBroker {
                 }
             }
         };
+        startup_timing.insert(
+            "session_selected_ms",
+            startup_started.elapsed().as_secs_f64() * 1000.0,
+        );
         if session.provider_label.is_empty() {
             session.provider_label = backend_descriptor.label.clone();
         }
@@ -822,6 +837,10 @@ impl HarnessBroker {
             session.approval_timeout,
             session.answer_timeout,
         )?;
+        startup_timing.insert(
+            "settings_applied_ms",
+            startup_started.elapsed().as_secs_f64() * 1000.0,
+        );
         store.lock_session(&session.id)?;
         store.save_session(&session)?;
         if store
@@ -854,6 +873,10 @@ impl HarnessBroker {
             store.save_owned_session(&session, &request.client_id)?;
         }
         let agent_registry = load_agent_registry(&store, &session.id)?;
+        startup_timing.insert(
+            "session_recovered_ms",
+            startup_started.elapsed().as_secs_f64() * 1000.0,
+        );
         let agent_coordinator = crate::agent::AgentCoordinator::new(session.id.clone());
         agent_coordinator.set_enabled(shared.desired.subagent_tools.unwrap_or(false));
         runtime
@@ -924,7 +947,11 @@ impl HarnessBroker {
             check_runner: Arc::clone(&check_runner),
             trace: Arc::clone(&trace),
         });
-        let broker = Self {
+        startup_timing.insert(
+            "services_created_ms",
+            startup_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        let mut broker = Self {
             submission_store: crate::backend::submission::SubmissionStore::open(
                 &data_root,
                 trace.clone(),
@@ -977,15 +1004,24 @@ impl HarnessBroker {
             submitted_attachments: Vec::new(),
             timeline_reconciled_after_dispatch: false,
             turn_cancellation: Arc::new(TurnCancellation::new()),
+            startup_timing,
         };
         broker.store.current_exchange_state(&broker.session.id)?;
         broker.refresh_input_schedule()?;
         let initial_timeline = broker.snapshot()?.timeline;
+        broker.startup_timing.insert(
+            "timeline_loaded_ms",
+            startup_started.elapsed().as_secs_f64() * 1000.0,
+        );
         broker
             .presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
             .initialize(initial_timeline)?;
+        broker.startup_timing.insert(
+            "presentation_initialized_ms",
+            startup_started.elapsed().as_secs_f64() * 1000.0,
+        );
         Ok(broker)
     }
 

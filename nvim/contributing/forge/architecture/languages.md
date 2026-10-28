@@ -77,9 +77,11 @@ contributing buffer and disk source, including semantic destinations.
 The shared Lua LSP source adapter owns client selection, hidden source buffers,
 and reference-counted buffer leases. Agent queries use live editor contents.
 Plan navigation retains its captured digest and rejects changed or unsaved source
-that differs from that capture. Opening Harness warms enabled editor LSP
-configurations against real project files. `forge.lsp.startup` uses Neovim's
-configuration and client reuse, preserving the editor's server ownership. It
+that differs from that capture. `forge.lsp.startup` starts servers only for an
+explicit tool request. File requests resolve matching configurations without
+scanning the workspace. Workspace requests discover applicable project roots.
+Neovim clients already serving the same root are reused, preserving the editor's
+server ownership. The adapter
 dispatches root-resolution callbacks onto Neovim's main loop before client
 startup or buffer cleanup, because server configurations can resolve roots from
 libuv process callbacks. Queued callbacks recheck workspace closure before acting.
@@ -94,9 +96,8 @@ discovery. Manifest buffers retain their actual filetype and are not attached as
 language source documents. Other configurations use one matching source per directory.
 Discovery visits nested directories in scheduled batches, excluding dependency and
 build directories without limiting the total entries, directories, or nesting depth.
-It resolves candidates using the original server root callback,
-preferring a root containing the repository before falling back to the closest
-nested workspace. Deeper independent workspaces are skipped once identified.
+It resolves candidates using the original server root callback and retains each
+distinct root rather than choosing one nested fallback for the entire checkout.
 Discovery and a concurrent first query share pending startup work. Explicit
 queries into separate workspaces retain separate editor-owned clients.
 Root callbacks may decline startup by not selecting a directory. Those attempts
@@ -264,6 +265,11 @@ Source notifications, saves, watched-file changes, configuration changes, and se
 refreshes invalidate reuse. New pulls supply the previous result ID and retain the prior items
 when the server answers `unchanged`. Cancelling one consumer preserves a pull needed by another.
 Push-only servers continue to expose their editor diagnostic namespace with unknown freshness.
+
+Workspace diagnostics query each supporting client through `workspace/diagnostic`.
+They retain per-server root and coverage state. Unsupported and failed clients do
+not erase successful reports, and partial coverage never becomes a clean-workspace
+claim. Workspace symbols use the same discovery, reuse, and coverage contract.
 
 `forge.lsp.source` retains unused, owned hidden buffers for 60 seconds after the last request.
 Reuse refreshes hidden source from disk without rewriting unchanged text or replacing visible or

@@ -94,6 +94,7 @@ struct EntryPresentation {
 pub struct PresentationOpen {
     pub syntax_pending: bool,
     pub transcript: BufferSnapshot,
+    pub startup_timing: std::collections::BTreeMap<&'static str, f64>,
 }
 
 #[derive(Serialize)]
@@ -534,6 +535,8 @@ impl SessionPresentation {
         view: ViewId,
         width: WidthProfile,
     ) -> Result<PresentationOpen> {
+        let started = std::time::Instant::now();
+        let mut startup_timing = std::collections::BTreeMap::new();
         document.validate()?;
         if let Some(open) = self.open.as_mut() {
             ensure!(
@@ -548,6 +551,10 @@ impl SessionPresentation {
             return Ok(PresentationOpen {
                 syntax_pending: syntax_pending(open),
                 transcript: open.sections.document.snapshot()?,
+                startup_timing: std::collections::BTreeMap::from([(
+                    "reuse_ms",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                )]),
             });
         }
         let mut projected = Vec::new();
@@ -570,6 +577,10 @@ impl SessionPresentation {
             }
             projected.push(entry);
         }
+        startup_timing.insert(
+            "entries_projected_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
         let mut entry = HashMap::new();
         let mut action = HashMap::new();
         let mut syntax = HashMap::new();
@@ -592,16 +603,30 @@ impl SessionPresentation {
             block,
         )?;
         transcript.views.open(view.clone(), width.clone())?;
+        startup_timing.insert(
+            "transcript_created_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
         let mut sections =
             super::sections::SectionProjection::new(&mut transcript, document.clone())?;
         sections.register(view.clone());
         sections.nodes.tool = tool;
+        startup_timing.insert(
+            "sections_created_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        let snapshot = sections.document.snapshot()?;
+        startup_timing.insert(
+            "snapshot_created_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
         let opened = PresentationOpen {
             syntax_pending: !syntax.is_empty()
                 || action
                     .values()
                     .any(|action| matches!(action, TranscriptAction::Diff { syntax: true, .. })),
-            transcript: sections.document.snapshot()?,
+            transcript: snapshot,
+            startup_timing,
         };
         self.open = Some(OpenPresentation {
             history_input_id: history_input_ids(self.timeline.entry_list()),

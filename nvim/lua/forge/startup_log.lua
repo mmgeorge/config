@@ -5,6 +5,8 @@ local redraw_namespace
 local logging_us = 0
 local input_namespace
 local input_buffer, input_at
+local host_startup = { ["host.start"] = true, ["host.binary.result"] = true, ["host.spawn"] = true,
+  ["host.spawned"] = true, ["host.lease.finished"] = true, ["host.initialize.finished"] = true }
 
 ---@return nil
 function M.observe_input()
@@ -38,6 +40,7 @@ function M.write(event, fields, captured_at)
     return
   end
   pcall(function()
+    if host_startup[event] then require("forge.harness_startup_log").host(event, fields) end
     local write_started = vim.uv.hrtime()
     local path = M.path()
     vim.fn.mkdir(vim.fs.dirname(path), "p")

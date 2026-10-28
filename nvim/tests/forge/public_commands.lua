@@ -15,6 +15,9 @@ package.loaded.forge = {
 }
 package.loaded["forge.views.permissions"] = { open = record("permissions") }
 package.loaded["forge.client"] = { request = record("request") }
+package.loaded.lazy = { load = record("lazy_load") }
+package.loaded["forge.views.harness.settings"] = { log = record("log") }
+require("forge.session").harness.session = { id = "command-test" }
 
 local ok, failure = xpcall(function()
   local original_notify = vim.notify
@@ -22,15 +25,18 @@ local ok, failure = xpcall(function()
     notifications[#notifications + 1] = { message = message, level = level, options = options }
   end
   local plugin = require("plugins.forge")[1]
+  plugin.init()
   plugin.config(nil, plugin.opts)
   local commands = vim.api.nvim_get_commands({})
   local expected_commands = {
-    "ForgeStatus", "ForgeBranchDiff", "ForgeBranchDiffFile", "ForgeFileRevision", "ForgeDiffCompactPreview",
+    "ForgeBranchDiff", "ForgeBranchDiffFile", "ForgeFileRevision", "ForgeDiffCompactPreview",
     "ForgeHarness", "ForgeHarnessNew", "ForgeHarnessLog", "ForgePermissions", "ForgeStartupLog",
     "ForgeGitConfigCacheReset",
+    "ForgeDebugCommitPromptPreview", "ForgeDebugBackgroundTimeline",
   }
   assert(vim.deep_equal(plugin.cmd, expected_commands), "lazy command inventory changed")
   for _, name in ipairs(expected_commands) do assert(commands[name], name .. " was not registered") end
+  assert(commands.ForgeStatus and commands.ForgeStartupLog.nargs == "?")
   for _, name in ipairs({ "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision",
     "GitDiffCompactPreview", "Harness", "HarnessNew", "HarnessLog", "Permissions", "ForgeBuildLog" }) do
     assert(not commands[name], "Obsolete command registered: " .. name)
@@ -55,12 +61,12 @@ local ok, failure = xpcall(function()
   vim.cmd("ForgeDiffCompactPreview")
   assert(recorded[#recorded].arguments[1].staged == false)
   vim.cmd("ForgeHarnessLog on")
-  assert(recorded[#recorded].arguments[1] == "trace.configure")
-  assert(recorded[#recorded].arguments[2].enabled == true)
+  assert(recorded[#recorded].name == "log" and recorded[#recorded].arguments[1] == "command-test")
+  assert(recorded[#recorded].arguments[2] == "on")
   vim.cmd("ForgeHarnessLog")
-  assert(recorded[#recorded].arguments[1] == "trace.status")
+  assert(recorded[#recorded].arguments[2] == "")
   vim.cmd("ForgeHarnessLog invalid")
-  assert(notifications[#notifications].message == "Usage: ForgeHarnessLog [on|off|toggle|clear]")
+  assert(recorded[#recorded].arguments[2] == "invalid")
   vim.cmd("ForgeBranchDiffFile only-file")
   assert(notifications[#notifications].message == "Usage: ForgeBranchDiffFile <file> <branch>")
   vim.cmd("ForgeFileRevision only-file")

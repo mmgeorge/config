@@ -362,6 +362,7 @@ function M.render()
       and client.host_generation() == opening_generation
   end
   state.presentation = require("forge.views.harness.presentation").open({
+    startup_trace = state.startup_trace,
     session_id = state.session.id, transcript_buffer = state.transcript_buf, composer_buffer = state.composer_buf,
     transcript_window = state.transcript_win,
     is_alive = function() return vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf) end,

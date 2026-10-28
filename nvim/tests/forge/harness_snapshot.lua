@@ -1,13 +1,15 @@
 vim.loader.enable(false)
 local snapshot = require("forge.views.harness.snapshot")
+local original_startup = package.loaded["forge.lsp.startup"]
+package.loaded["forge.lsp.startup"] = { start = function() error("snapshot started LSP discovery") end }
 local state = {
   session = { id = "snapshot-test", context_usage = { used = 12 } },
   goal = { state = "active" },
-  active_elicitation = { elicitation = { id = "old" } },
+  active_elicitation = { elicitation = { question_set = { id = "old" } } },
   selected_agent_run_id = "missing",
 }
 local response = vim.json.decode([[{
-  "session": {"id": "snapshot-test", "context_usage": null, "name": null},
+  "session": {"id": "snapshot-test", "workspace": "/workspace", "context_usage": null, "name": null},
   "goal": null, "goal_execution": null, "active_plan": null,
   "active_elicitation": null, "active_wait": null,
   "capability": null, "artifact": [], "approval": [],
@@ -24,10 +26,10 @@ assert(type(state.capability) == "table" and #state.approval == 0)
 assert(response.goal == vim.NIL and response.session.context_usage == vim.NIL,
   "snapshot projection mutated the transport response")
 response.goal = { state = "paused", completed_at_ms = vim.NIL }
-response.active_elicitation = { elicitation = { id = "new", response = vim.NIL } }
+response.active_elicitation = { elicitation = { question_set = { id = "new" }, response = vim.NIL } }
 snapshot.apply(state, response)
 assert(state.goal.state == "paused" and state.goal.completed_at_ms == nil)
-assert(state.active_elicitation.elicitation.id == "new" and state.active_elicitation.elicitation.response == nil)
+assert(state.active_elicitation.elicitation.question_set.id == "new" and state.active_elicitation.elicitation.response == nil)
 response.runtime_epoch, response.snapshot_revision = "first-runtime", 5
 snapshot.apply(state, response)
 local stale = vim.deepcopy(response)
@@ -51,4 +53,5 @@ response.snapshot_revision = 4
 response.task_operation = nil
 snapshot.apply(state, response)
 assert(state.execution_notice == "Connection lost", "clearing an old operation hid a newer error")
+package.loaded["forge.lsp.startup"] = original_startup
 print("harness_snapshot: passed")

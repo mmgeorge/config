@@ -9,7 +9,7 @@ local nested_path, main_path = nested .. "/tool.lua", project .. "/z-app/main.lu
 vim.fn.writefile({ "return {}" }, nested_path)
 vim.fn.writefile({ "return {}" }, main_path)
 local original = { configs = vim.lsp.get_configs, start = vim.lsp.start,
-  client = vim.lsp.get_client_by_id, clients = vim.lsp.get_clients }
+  client = vim.lsp.get_client_by_id, clients = vim.lsp.get_clients, attached = vim.lsp.buf_is_attached }
 local launched, clients = {}, {}
 local nested_only = false
 local main_root = directory
@@ -34,6 +34,7 @@ vim.lsp.start = function(config)
 end
 vim.lsp.get_client_by_id = function(identity) return clients[identity] end
 vim.lsp.get_clients = function() return vim.tbl_values(clients) end
+vim.lsp.buf_is_attached = function() return false end
 local function await(path)
   local done, failure
   startup.wait(directory, path, function(error) done, failure = true, error end)
@@ -42,11 +43,12 @@ local function await(path)
 end
 local success, failure = xpcall(function()
   await()
-  assert(#launched == 1 and launched[1] == source.canonical(directory), "startup warmed the nested workspace instead of the main project")
+  assert(#launched == 2 and vim.tbl_contains(launched, source.canonical(directory))
+    and vim.tbl_contains(launched, source.canonical(nested)), "workspace startup omitted a distinct root: " .. vim.inspect(launched))
   await(main_path)
-  assert(#launched == 1, "first main-project request launched another server")
+  assert(#launched == 2, "first main-project request launched another server")
   await(nested_path)
-  assert(#launched == 2 and launched[2] == source.canonical(nested), "an explicit independent-workspace request did not start its own server")
+  assert(#launched == 2, "nested request duplicated its workspace client")
   startup.close()
   clients, launched = {}, {}
   await(main_path)
@@ -54,7 +56,7 @@ local success, failure = xpcall(function()
   startup.close()
   clients, launched, main_root = {}, {}, project
   await()
-  assert(#launched == 1 and launched[1] == source.canonical(project), "repository parent selected a deeper independent workspace")
+  assert(#launched == 2 and vim.tbl_contains(launched, source.canonical(project)), "repository request omitted its main project")
   startup.close()
   clients, launched, nested_only = {}, {}, true
   await()
@@ -63,6 +65,7 @@ end, debug.traceback)
 startup.close()
 vim.lsp.get_configs, vim.lsp.start = original.configs, original.start
 vim.lsp.get_client_by_id, vim.lsp.get_clients = original.client, original.clients
+vim.lsp.buf_is_attached = original.attached
 vim.fn.delete(directory, "rf")
 assert(success, failure)
 print("lsp_startup_roots: passed")

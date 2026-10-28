@@ -507,7 +507,7 @@ local function consume_stdout(chunk, generation)
 end
 
 ---@param callback fun(result?: any, error?: string, error_detail?: table)
-local function send_harness_initialize(callback, initialize_options)
+local function send_harness_initialize(callback, initialize_options, startup)
   local client = state()
   local harness_config = config.options.harness
   if not config.harness_backend_explicit and not session.harness.session then
@@ -515,6 +515,9 @@ local function send_harness_initialize(callback, initialize_options)
   end
   local descriptor = backend_descriptor()
   local function initialized(result, request_error, error_detail)
+    if startup then startup.mark("harness.initialize.received", { error = request_error,
+      session_id = result and result.session and result.session.id,
+      rust = result and result.startup_timing }) end
     if request_error then
       client.harness_ready = false
       finish_harness_start(callback, nil, request_error, error_detail)
@@ -526,6 +529,7 @@ local function send_harness_initialize(callback, initialize_options)
     client.harness_ready = true
     session.harness.ready = true
     M.request_host("trace.configure", { enabled = config.options.harness_logging == true, default_only = true }, function(status, failure)
+      if startup then startup.mark("trace.configure.received", { error = failure }) end
       if failure then
         client.harness_ready = false
         session.harness.ready = false
@@ -556,6 +560,7 @@ local function send_harness_initialize(callback, initialize_options)
     session_id = initialize_options and initialize_options.session_id or nil,
     new_session_name = initialize_options and initialize_options.new_session_name or nil,
   }
+  if startup then startup.mark("harness.initialize.requested") end
   M.request_host("harness.initialize", params, initialized)
 
 end
@@ -784,10 +789,12 @@ end
 
 ---@param callback? ForgeCallback
 ---@param initialize_options? table
-function M.start_harness(callback, initialize_options)
+---@param startup? ForgeHarnessStartupTrace
+function M.start_harness(callback, initialize_options, startup)
   callback = protect_consumer(callback or function() end, "Harness startup")
   local client = state()
   if client.harness_ready and client.process then
+    if startup then startup.mark("host.reused") end
     local generation = client.generation
     vim.schedule(function()
       if generation ~= client.generation or not client.harness_ready or not client.process then
@@ -802,9 +809,11 @@ function M.start_harness(callback, initialize_options)
     return
   end
   client.harness_starting = true
+  if startup then startup.mark("host.requested") end
   M.start(function(_, failure, detail)
+    if startup then startup.mark("host.ready", { error = failure }) end
     if failure then finish_harness_start(callback, nil, failure, detail) return end
-    send_harness_initialize(callback, initialize_options)
+    send_harness_initialize(callback, initialize_options, startup)
   end)
 end
 

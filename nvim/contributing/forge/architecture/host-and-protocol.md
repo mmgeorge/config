@@ -260,6 +260,22 @@ executable-fingerprint check selects a build.
 
 Windows hosts launch process-owned copies under the sidecar lease directory so Cargo can replace the build output. Other platforms launch the selected artifact directly. Existing hosts keep their executable until shutdown. See [Building and testing](../building-and-testing.md) for the contributor workflow.
 
+`:ForgeStartupLog harness` opens the current editor's
+`stdpath("cache")/rust-sidecar/forge/harness-startup-<pid>.jsonl`. Each Harness open
+has a correlation identity, monotonic elapsed time, and time since the previous event through
+host readiness, session initialization, snapshot application, native document
+adoption, and the first displayed redraw. Rust initialization reports cumulative
+milestones for repository discovery, provider infrastructure, SQLite opening,
+session recovery, timeline loading, and presentation initialization. Native document
+opening also separates entry projection, transcript construction, section projection,
+and snapshot creation. These are
+observations of existing work, without additional database reads. The dedicated
+file uses asynchronous ordered writes and remains separate from high-frequency
+RPC logs. Executable selection, copying, and process creation records are also
+retained in that file. Startup failures and closure before the first redraw end the trace
+explicitly. These lifecycle diagnostics remain available independently of provider
+logging and exclude prompts and source content.
+
 `:ForgeStartupLog` opens `stdpath("cache")/rust-sidecar/forge/startup.log`. Diagnostics
 record executable selection, copy duration, host spawn and initialization, request
 dispatch, and status response/application timings. Native observation timing splits

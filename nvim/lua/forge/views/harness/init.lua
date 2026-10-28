@@ -34,8 +34,10 @@ function M.lease_conflict_options(conflict)
 end
 
 local function finish_start(state, result, start_error, error_detail, callback)
+  local startup = state.startup_trace
   local conflict = error_detail and error_detail.code == "session_lease_conflict" and error_detail.data or nil
   if conflict then
+    if startup then startup.mark("lease_conflict") end
     local confirmed = false
     local option_list = M.lease_conflict_options(conflict)
     for _, option in ipairs(option_list) do option.detail = option.desc end
@@ -63,6 +65,7 @@ local function finish_start(state, result, start_error, error_detail, callback)
       end,
       on_close = function()
         if not confirmed then
+          if startup then startup.finish("cancelled") end
           state.initial_snapshot_pending = nil
           controller.render()
           if callback and callback.on_error then callback.on_error("Session selection cancelled") end
@@ -72,6 +75,7 @@ local function finish_start(state, result, start_error, error_detail, callback)
     return
   end
   if start_error then
+    if startup then startup.finish("failed", { error = start_error }) end
     state.initial_snapshot_pending = nil
     if callback and callback.on_error then
       callback.on_error(start_error)
@@ -81,17 +85,21 @@ local function finish_start(state, result, start_error, error_detail, callback)
     end
     return
   end
+  if startup then startup.mark("snapshot.apply.begin") end
   apply_snapshot(state, result, callback and callback.open_mode)
+  if startup then startup.mark("snapshot.apply.end") end
   if callback and callback.on_ready then callback.on_ready(result) end
 end
 
 function M.open()
-  require("forge.lsp.startup").start(vim.fn.getcwd())
   local state = session.harness
   if valid_window(state.composer_win) then
     vim.api.nvim_set_current_win(state.composer_win)
     return
   end
+  if state.startup_trace then state.startup_trace.finish("superseded") end
+  local startup = require("forge.harness_startup_log").begin({ workspace = vim.fn.getcwd() })
+  state.startup_trace = startup
   state.initial_snapshot_pending = true
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
     layout.open("initial-pending-" .. tostring(vim.uv.hrtime()))
@@ -99,12 +107,13 @@ function M.open()
   layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
   controller.attach()
   controller.render()
+  startup.mark("layout.ready")
   local transcript_buffer = state.transcript_buf
   client.start_harness(function(result, start_error, error_detail)
     if state.transcript_buf ~= transcript_buffer or not vim.api.nvim_buf_is_valid(transcript_buffer)
-      or not valid_window(state.composer_win) then return end
+      or not valid_window(state.composer_win) then startup.finish("closed_before_ready") return end
     finish_start(state, result, start_error, error_detail)
-  end)
+  end, nil, startup)
   vim.api.nvim_set_current_win(state.composer_win)
 end
 

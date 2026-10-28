@@ -154,13 +154,22 @@ fn selected_exchange_queries_ignore_unrelated_malformed_history_and_use_indexes(
     exchange.state = ExchangeState::Finalizing;
     exchange.execution_id = Some("execution".into());
     store.save_exchange(&exchange)?;
-    store.connection.execute("INSERT INTO agent_run_record VALUES('child','session','{}')",[])?;
+    store.connection.execute(
+        "INSERT INTO agent_run_record VALUES('child','session','{}')",
+        [],
+    )?;
     let mut child = exchange.clone();
     child.id = "child-exchange".into();
     child.agent_id = "child".into();
     child.ordinal = 100;
     store.save_exchange(&child)?;
-    assert_eq!(store.latest_execution_exchange("session","execution")?.unwrap().id,"latest");
+    assert_eq!(
+        store
+            .latest_execution_exchange("session", "execution")?
+            .unwrap()
+            .id,
+        "latest"
+    );
     store.connection.execute("UPDATE exchange_record SET payload=json_set(payload,'$.turn','malformed history') WHERE id='output'",[])?;
     assert!(store.list_exchange("session").is_err());
     assert_eq!(store.latest_exchange("session")?.unwrap().id, "latest");

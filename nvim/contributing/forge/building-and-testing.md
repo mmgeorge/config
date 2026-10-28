@@ -386,6 +386,8 @@ nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_failures
 nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_source_transfer.lua
 nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_startup.lua
 nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_startup_roots.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_lazy_startup.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_workspace.lua
 nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/plan_workspace_definition.lua
 ```
 

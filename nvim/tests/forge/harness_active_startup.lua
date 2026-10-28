@@ -3,7 +3,8 @@ local builder = require("forge.builder")
 local client = require("forge.client")
 local original_ensure = builder.ensure
 local requests = {}
-local snapshot = { session = { id = "active-startup", current_task_id = "restored-task" } }
+local snapshot = { session = { id = "active-startup", current_task_id = "restored-task" },
+  startup_timing = { phases = { controller_ready_ms = 25 }, broker = { database_open_ms = 4 } } }
 local result, failure, completed
 
 local success, error_message = xpcall(function()
@@ -36,13 +37,17 @@ local success, error_message = xpcall(function()
       kill = function() end,
     }
   end)
+  local phases = {}
   client.start_harness(function(value, request_error)
     result, failure, completed = value, request_error, true
-  end)
+  end, nil, { mark = function(phase, fields) phases[#phases + 1] = { phase = phase, fields = fields } end })
   assert(vim.wait(1000, function() return completed end, 5), "Harness startup did not finish")
   assert(not failure, failure)
   assert(result.session.current_task_id == "restored-task", "startup changed the active task")
   assert(client._client.harness_ready, "restored Harness session is not ready")
+  assert(phases[1].phase == "host.requested" and phases[2].phase == "host.ready")
+  assert(phases[3].phase == "harness.initialize.requested" and phases[4].phase == "harness.initialize.received")
+  assert(phases[4].fields.rust.broker.database_open_ms == 4 and phases[5].phase == "trace.configure.received")
   assert(vim.tbl_contains(requests, "trace.configure"), "startup omitted tracing configuration")
   local allowed = { initialize = true, ["harness.initialize"] = true,
     ["trace.configure"] = true, ["transport.consumed"] = true }

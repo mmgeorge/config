@@ -981,16 +981,30 @@ impl HarnessService {
     }
 
     async fn initialize(&self, initialize: InitializeRequest) -> Result<Value> {
+        let startup_started = std::time::Instant::now();
+        let mut startup_timing = serde_json::Map::new();
         let mut harness = self.registry.lock().await;
+        startup_timing.insert(
+            "registry_ready_ms".into(),
+            json!(startup_started.elapsed().as_secs_f64() * 1000.0),
+        );
         ensure!(harness.is_none(), "Harness is already initialized");
         if let Some(root) = &initialize.config_dir {
             crate::settings::SettingsStore::open(PathBuf::from(&initialize.data_root).as_path())?
                 .configure_catalog(PathBuf::from(root).as_path())?;
         }
+        startup_timing.insert(
+            "settings_catalog_ms".into(),
+            json!(startup_started.elapsed().as_secs_f64() * 1000.0),
+        );
         let repository = self
             .repositories
             .open(PathBuf::from(&initialize.workspace))
             .await?;
+        startup_timing.insert(
+            "repository_ready_ms".into(),
+            json!(startup_started.elapsed().as_secs_f64() * 1000.0),
+        );
         let workspace_kind = repository
             .as_ref()
             .and_then(|repository| repository.identity.worktree_root.clone())
@@ -1004,22 +1018,40 @@ impl HarnessService {
             Arc::clone(&self.repositories),
             Arc::clone(&self.diff),
         )?;
+        startup_timing.insert(
+            "runtime_ready_ms".into(),
+            json!(startup_started.elapsed().as_secs_f64() * 1000.0),
+        );
         let startup_request = initialize.clone();
         let startup_runtime = runtime.clone();
-        let (broker, snapshot) = tokio::task::spawn_blocking(move || {
+        let (mut broker, snapshot) = tokio::task::spawn_blocking(move || {
             let broker = HarnessBroker::initialize_with_runtime(startup_request, startup_runtime)?;
             let snapshot = broker.snapshot()?;
             Ok::<_, anyhow::Error>((broker, snapshot))
         })
         .await
         .context("Harness session startup worker failed")??;
-        let result = serde_json::to_value(&snapshot)?;
+        startup_timing.insert(
+            "broker_ready_ms".into(),
+            json!(startup_started.elapsed().as_secs_f64() * 1000.0),
+        );
+        let broker_timing = std::mem::take(&mut broker.startup_timing);
+        let mut result = serde_json::to_value(&snapshot)?;
+        startup_timing.insert(
+            "snapshot_serialized_ms".into(),
+            json!(startup_started.elapsed().as_secs_f64() * 1000.0),
+        );
         *harness = Some(SessionControllerRegistry::new(
             snapshot.session.id.clone(),
             SessionController::new(broker)?,
             runtime,
             initialize,
         ));
+        startup_timing.insert(
+            "controller_ready_ms".into(),
+            json!(startup_started.elapsed().as_secs_f64() * 1000.0),
+        );
+        result["startup_timing"] = json!({"phases":startup_timing,"broker":broker_timing});
         Ok(result)
     }
 }
@@ -8143,6 +8175,54 @@ mod tests {
         let reply: Value = serde_json::from_slice(reply.bytes())?;
         assert_eq!(reply["id"], 3);
         assert!(reply["error"].is_null());
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_reports_session_loading_and_presentation_timings() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let timing = &opened.result().unwrap()["startup_timing"];
+        for (scope, stages) in [
+            (
+                "phases",
+                &[
+                    "registry_ready_ms",
+                    "settings_catalog_ms",
+                    "repository_ready_ms",
+                    "runtime_ready_ms",
+                    "broker_ready_ms",
+                    "snapshot_serialized_ms",
+                    "controller_ready_ms",
+                ][..],
+            ),
+            (
+                "broker",
+                &[
+                    "database_open_ms",
+                    "deletion_recovery_ms",
+                    "session_selected_ms",
+                    "settings_applied_ms",
+                    "session_recovered_ms",
+                    "services_created_ms",
+                    "timeline_loaded_ms",
+                    "presentation_initialized_ms",
+                ][..],
+            ),
+        ] {
+            let mut previous = 0.0;
+            for stage in stages {
+                let elapsed = timing[scope][stage]
+                    .as_f64()
+                    .expect("startup phase missing");
+                assert!(elapsed.is_finite() && elapsed >= previous);
+                previous = elapsed;
+            }
+        }
         service.shutdown(Duration::from_secs(2)).await?;
         Ok(())
     }

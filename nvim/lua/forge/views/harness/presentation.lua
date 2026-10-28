@@ -15,6 +15,8 @@ local transcript_options = {
 }
 
 function M.open(options, callback)
+  local startup = options.startup_trace
+  if startup then startup.mark("document.open.begin") end
   local loading_namespace = vim.api.nvim_create_namespace("ForgeHarnessLoading" .. options.transcript_buffer)
   local loading_mark = {}
   local function clear_loading()
@@ -44,6 +46,7 @@ function M.open(options, callback)
     if pending then pending.timer:stop() pending.timer:close() end
   end
   local function fail(message)
+    if startup then startup.finish("failed", { error = tostring(message) }) end
     local previous = owner.failure
     owner.failure = tostring(message) .. ". Reopen Harness to retry."
     owner.pending, owner.syncing, owner.applying, owner.highlighting, owner.selecting = false, false, false, false, false
@@ -324,6 +327,7 @@ function M.open(options, callback)
 
   request({ operation = "open", document = identity, view = owner.view.id,
     width = require("forge.width").capture(options.transcript_window) }, function(opened, failure)
+    if startup then startup.mark("document.open.received", { error = failure, rust = opened and opened.startup_timing }) end
     if not alive() then
       request({ operation = "close", document = identity }, function() end)
       return
@@ -335,6 +339,7 @@ function M.open(options, callback)
     end
     owner.applying = true
     replica.apply_async(owner.transcript, opened.transcript, alive, guard(function(transcript)
+    if startup then startup.mark("document.apply.end", { result = transcript.kind }) end
     owner.applying = false
     if not alive() then return end
     if transcript.kind ~= "Applied" then
@@ -356,6 +361,7 @@ function M.open(options, callback)
     callback(owner)
     if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
     if opened.syntax_pending then vim.schedule(function() owner.highlight() end) end
+    if startup then startup.mark("document.ready") startup.watch(options.transcript_buffer) end
     dispatch_next()
     end))
   end)
@@ -890,6 +896,7 @@ function M.open(options, callback)
 
   function owner.close(close_options)
     if owner.closed then return true end
+    if startup then startup.finish("closed_before_redraw") end
     cancel_staging_reveal()
     local collected = owner.host_generation ~= client.host_generation()
       or not vim.api.nvim_buf_is_valid(options.composer_buffer) or not vim.api.nvim_buf_is_valid(options.transcript_buffer)
