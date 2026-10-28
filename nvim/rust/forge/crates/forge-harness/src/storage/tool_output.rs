@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::SqliteStore;
 use crate::exchange::Exchange;
@@ -28,6 +29,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         output TEXT NOT NULL, PRIMARY KEY(exchange_id,turn_id,tool_id,byte_offset)
     );",
     )?;
+    initialize_positions(connection)?;
     let transaction = connection;
     let mut cursor: Option<i64> = None;
     loop {
@@ -46,7 +48,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
             )?;
             // Recovery can rewrite metadata with empty inline output while retaining chunks.
             if !output.is_empty() {
-                replace(&transaction, &id, turn, tool, output)?;
+                replace(transaction, &id, turn, tool, &output.into())?;
             }
             Ok(())
         })?;
@@ -57,6 +59,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         )?;
         cursor = Some(row);
     }
+    initialize_positions(connection)?;
     Ok(())
 }
 
@@ -80,51 +83,211 @@ fn visit_output(
     Ok(())
 }
 
+pub(super) fn initialize_positions(connection: &Connection) -> Result<()> {
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS tool_output_summary (
+        exchange_id TEXT NOT NULL,turn_id TEXT NOT NULL,tool_id TEXT NOT NULL,
+        bytes INTEGER NOT NULL,characters INTEGER NOT NULL,digest TEXT NOT NULL,
+        PRIMARY KEY(exchange_id,turn_id,tool_id),
+        FOREIGN KEY(exchange_id,turn_id,tool_id) REFERENCES tool_output_owner(exchange_id,turn_id,tool_id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS tool_output_position (
+        exchange_id TEXT NOT NULL,turn_id TEXT NOT NULL,tool_id TEXT NOT NULL,
+        byte_offset INTEGER NOT NULL,char_offset INTEGER NOT NULL,char_count INTEGER NOT NULL,
+        PRIMARY KEY(exchange_id,turn_id,tool_id,byte_offset),
+        FOREIGN KEY(exchange_id,turn_id,tool_id) REFERENCES tool_output_owner(exchange_id,turn_id,tool_id) ON DELETE CASCADE);
+        CREATE INDEX IF NOT EXISTS tool_output_character_order ON tool_output_position(exchange_id,turn_id,tool_id,char_offset);")?;
+    connection.execute_batch("CREATE TEMP TABLE tool_output_upgrade(byte_offset INTEGER PRIMARY KEY,char_offset INTEGER NOT NULL,char_count INTEGER NOT NULL,output TEXT NOT NULL)")?;
+    let mut cursor = 0i64;
+    loop {
+        let owner: Option<(i64,String,String,String)> = connection.query_row("SELECT rowid,exchange_id,turn_id,tool_id FROM tool_output_owner WHERE rowid>?1 AND NOT EXISTS(SELECT 1 FROM tool_output_summary s WHERE s.exchange_id=tool_output_owner.exchange_id AND s.turn_id=tool_output_owner.turn_id AND s.tool_id=tool_output_owner.tool_id) ORDER BY rowid LIMIT 1",[cursor],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
+        let Some((row, exchange, turn, tool)) = owner else {
+            break;
+        };
+        migrate_output(connection, &exchange, &turn, &tool)?;
+        cursor = row;
+    }
+    connection.execute_batch("DROP TABLE tool_output_upgrade")?;
+    Ok(())
+}
+
+fn migrate_output(connection: &Connection, exchange: &str, turn: &str, tool: &str) -> Result<()> {
+    // Stage validated windows before replacing legacy chunks in the migration transaction.
+    connection.execute("DELETE FROM tool_output_upgrade", [])?;
+    let mut hash = Sha256::new();
+    let mut bytes = 0i64;
+    let mut characters = 0i64;
+    let mut statement = connection.prepare("SELECT byte_offset,length(cast(output AS BLOB)) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 ORDER BY byte_offset")?;
+    let mut rows = statement.query(params![exchange, turn, tool])?;
+    while let Some(row) = rows.next()? {
+        let start: i64 = row.get(0)?;
+        let length: i64 = row.get(1)?;
+        ensure!(
+            start == bytes,
+            "stored tool output has a discontinuous byte offset"
+        );
+        let mut consumed = 0i64;
+        while consumed < length {
+            let window:Vec<u8> = connection.query_row("SELECT substr(cast(output AS BLOB),?5,16384) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 AND byte_offset=?4",params![exchange,turn,tool,start,consumed+1],|row|row.get(0))?;
+            let valid = match std::str::from_utf8(&window) {
+                Ok(text) => text.len(),
+                Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                Err(error) => return Err(error).context("stored tool output is not UTF-8"),
+            };
+            ensure!(
+                valid > 0,
+                "stored tool output ended inside a UTF-8 character"
+            );
+            let text = std::str::from_utf8(&window[..valid])?;
+            let count = text.chars().count() as i64;
+            connection.execute(
+                "INSERT INTO tool_output_upgrade VALUES(?1,?2,?3,?4)",
+                params![bytes, characters, count, text],
+            )?;
+            hash.update(text.as_bytes());
+            bytes += valid as i64;
+            characters += count;
+            consumed += valid as i64;
+        }
+    }
+    drop(rows);
+    drop(statement);
+    // Publish indexed chunks and their summary together with the schema version.
+    connection.execute(
+        "DELETE FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",
+        params![exchange, turn, tool],
+    )?;
+    connection.execute(
+        "INSERT INTO tool_output_chunk SELECT ?1,?2,?3,byte_offset,output FROM tool_output_upgrade",
+        params![exchange, turn, tool],
+    )?;
+    connection.execute("INSERT INTO tool_output_position SELECT ?1,?2,?3,byte_offset,char_offset,char_count FROM tool_output_upgrade",params![exchange,turn,tool])?;
+    connection.execute(
+        "INSERT INTO tool_output_summary VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            exchange,
+            turn,
+            tool,
+            bytes,
+            characters,
+            hex::encode(hash.finalize())
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_chunks(
+    connection: &Connection,
+    exchange: &str,
+    turn: &str,
+    tool: &str,
+    text: &str,
+    mut bytes: usize,
+    mut characters: usize,
+) -> Result<()> {
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let mut end = remaining.len().min(16384);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        let chunk = &remaining[..end];
+        let count = chunk.chars().count();
+        connection.execute(
+            "INSERT INTO tool_output_chunk VALUES(?1,?2,?3,?4,?5)",
+            params![exchange, turn, tool, bytes as i64, chunk],
+        )?;
+        connection.execute(
+            "INSERT INTO tool_output_position VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                exchange,
+                turn,
+                tool,
+                bytes as i64,
+                characters as i64,
+                count as i64
+            ],
+        )?;
+        bytes += end;
+        characters += count;
+        remaining = &remaining[end..];
+    }
+    Ok(())
+}
+
+fn save_summary(
+    connection: &Connection,
+    exchange: &str,
+    turn: &str,
+    tool: &str,
+    output: &crate::turn::ToolOutputText,
+) -> Result<()> {
+    connection.execute("INSERT INTO tool_output_summary VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(exchange_id,turn_id,tool_id) DO UPDATE SET bytes=excluded.bytes,characters=excluded.characters,digest=excluded.digest",params![exchange,turn,tool,output.len() as i64,output.characters() as i64,output.digest()])?;
+    Ok(())
+}
+
 fn replace(
     connection: &Connection,
     exchange: &str,
     turn: &str,
     tool: &str,
-    output: &str,
+    output: &crate::turn::ToolOutputText,
 ) -> Result<()> {
     connection.execute(
         "DELETE FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",
         params![exchange, turn, tool],
     )?;
-    if !output.is_empty() {
-        connection.execute(
-            "INSERT INTO tool_output_chunk VALUES(?1,?2,?3,0,?4)",
-            params![exchange, turn, tool, output],
-        )?;
-    }
+    connection.execute(
+        "DELETE FROM tool_output_position WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",
+        params![exchange, turn, tool],
+    )?;
+    append_chunks(connection, exchange, turn, tool, output, 0, 0)?;
+    save_summary(connection, exchange, turn, tool, output)?;
     Ok(())
 }
 
 pub(super) fn encode(exchange: &Exchange) -> Result<String> {
-    let mut value = serde_json::to_value(exchange)?;
-    visit_output(&mut value, |_, _, _| Ok(()))?;
+    let mut metadata = exchange.clone();
+    for turn in &mut metadata.turn {
+        turn.omit_tool_output();
+    }
+    let mut value = serde_json::to_value(&metadata)?;
     value["tool_output_format"] = Value::from(2);
     Ok(serde_json::to_string(&value)?)
 }
 
 pub(super) fn synchronize(connection: &Connection, exchange: &Exchange) -> Result<()> {
-    connection.execute(
-        "DELETE FROM tool_output_owner WHERE exchange_id=?1",
-        [&exchange.id],
-    )?;
+    let mut statement = connection.prepare("SELECT o.turn_id,o.tool_id,s.digest FROM tool_output_owner o LEFT JOIN tool_output_summary s USING(exchange_id,turn_id,tool_id) WHERE o.exchange_id=?1")?;
+    let mut previous = statement
+        .query_map([&exchange.id], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
     for turn in &exchange.turn {
         for tool in turn.tools() {
-            connection.execute(
-                "INSERT INTO tool_output_owner VALUES(?1,?2,?3)",
-                params![exchange.id, turn.id(), tool.id],
-            )?;
-            let previous = read(connection, &exchange.id, turn.id(), &tool.id)?;
-            if previous != tool.output {
+            let stored = previous.remove(&(turn.id().to_owned(), tool.id.clone()));
+            if stored.is_none() {
+                connection.execute(
+                    "INSERT INTO tool_output_owner VALUES(?1,?2,?3)",
+                    params![exchange.id, turn.id(), tool.id],
+                )?;
+            }
+            if stored.flatten().as_deref() != Some(tool.output.digest()) {
                 replace(connection, &exchange.id, turn.id(), &tool.id, &tool.output)?;
             }
         }
     }
-    connection.execute("DELETE FROM tool_output_chunk WHERE exchange_id=?1 AND NOT EXISTS(SELECT 1 FROM tool_output_owner AS owner WHERE owner.exchange_id=tool_output_chunk.exchange_id AND owner.turn_id=tool_output_chunk.turn_id AND owner.tool_id=tool_output_chunk.tool_id)",[&exchange.id])?;
+    for ((turn, tool), _) in previous {
+        connection.execute(
+            "DELETE FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",
+            params![exchange.id, turn, tool],
+        )?;
+        connection.execute(
+            "DELETE FROM tool_output_owner WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",
+            params![exchange.id, turn, tool],
+        )?;
+    }
     Ok(())
 }
 
@@ -145,23 +308,25 @@ fn read(connection: &Connection, exchange: &str, turn: &str, tool: &str) -> Resu
 }
 
 impl SqliteStore {
-    /// Loads display metadata while leaving every tool-output chunk in SQLite.
-    pub(crate) fn list_exchange_metadata(&self, session: &str) -> Result<Vec<Exchange>> {
+    pub(crate) fn list_session_agent_exchange_metadata(
+        &self,
+        session: &str,
+        agents: &[crate::agent::Agent],
+    ) -> Result<Vec<Exchange>> {
         let mut exchange: Vec<Exchange> = self.list_payload(
-            "SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal",
-            params![session, crate::session::HarnessSession::primary_agent_id(session)],
+            "SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id IN (SELECT value FROM json_each(?2)) ORDER BY agent_id,ordinal",
+            params![session,serde_json::to_string(&agents.iter().map(|agent|agent.id.as_str()).collect::<Vec<_>>())?],
         )?;
         for item in &mut exchange {
             item.output_store = Some(self.data_root.clone());
         }
         Ok(exchange)
     }
-
-    /// Loads child timeline metadata without reading historical tool output.
-    pub(crate) fn list_agent_exchange_metadata(&self, agent: &str) -> Result<Vec<Exchange>> {
+    /// Loads display metadata while leaving every tool-output chunk in SQLite.
+    pub(crate) fn list_exchange_metadata(&self, session: &str) -> Result<Vec<Exchange>> {
         let mut exchange: Vec<Exchange> = self.list_payload(
-            "SELECT payload FROM exchange_record WHERE agent_id=?1 ORDER BY ordinal",
-            [agent],
+            "SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal",
+            params![session, crate::session::HarnessSession::primary_agent_id(session)],
         )?;
         for item in &mut exchange {
             item.output_store = Some(self.data_root.clone());
@@ -187,7 +352,7 @@ impl SqliteStore {
             let total = total as u64;
             if offset >= total { return Ok((Vec::new(), total)); }
             let mut statement = self.connection.prepare(
-                "SELECT byte_offset,substr(cast(output AS BLOB),max(0,?4-byte_offset)+1,min(length(cast(output AS BLOB)),?5-byte_offset)-max(0,?4-byte_offset)) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 AND byte_offset<?5 AND byte_offset+length(cast(output AS BLOB))>?4 ORDER BY byte_offset")?;
+                "SELECT byte_offset,substr(cast(output AS BLOB),max(0,?4-byte_offset)+1,min(length(cast(output AS BLOB)),?5-byte_offset)-max(0,?4-byte_offset)) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 AND byte_offset >= (SELECT byte_offset FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 AND byte_offset<=?4 ORDER BY byte_offset DESC LIMIT 1) AND byte_offset<?5 ORDER BY byte_offset")?;
             let mut output = Vec::new();
             let end = offset.saturating_add(limit).min(total);
             for row in statement.query_map(params![exchange,turn,tool,offset as i64,end as i64], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?)))? {
@@ -207,7 +372,7 @@ impl SqliteStore {
             .pop())
     }
 
-    /// Reads at most 32000 characters while preserving UTF-8 across stored chunks.
+    /// Seeks a character page through indexed chunk offsets on one committed snapshot.
     pub(crate) fn tool_output_page(
         &self,
         exchange: &str,
@@ -216,63 +381,29 @@ impl SqliteStore {
         offset: usize,
         limit: usize,
     ) -> Result<ToolOutputPage> {
-        ensure!(
-            (1..=32000).contains(&limit),
-            "output limit must be from 1 to 32000 characters"
-        );
-        let mut statement = self.connection.prepare(
-            "SELECT byte_offset,length(cast(output AS BLOB)) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 ORDER BY byte_offset")?;
-        let mut rows = statement.query(params![exchange, turn, tool])?;
-        let mut output = String::new();
-        let mut total_chars = 0usize;
-        let mut total_bytes = 0i64;
-        let page_end = offset
-            .checked_add(limit)
-            .context("output offset exceeds supported range")?;
-        while let Some(row) = rows.next()? {
-            let byte_offset: i64 = row.get(0)?;
-            let bytes: i64 = row.get(1)?;
-            ensure!(
-                byte_offset == total_bytes,
-                "stored tool output has a discontinuous byte offset"
-            );
-            total_bytes = total_bytes
-                .checked_add(bytes)
-                .context("tool output byte count overflow")?;
-            let mut consumed = 0i64;
-            while consumed < bytes {
-                let window: Vec<u8> = self.connection.query_row(
-                    "SELECT substr(cast(output AS BLOB),?5,65539) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 AND byte_offset=?4",
-                    params![exchange,turn,tool,byte_offset,consumed + 1], |row|row.get(0))?;
-                let valid = match std::str::from_utf8(&window) {
-                    Ok(text) => text.len(),
-                    Err(error) if error.error_len().is_none() => error.valid_up_to(),
-                    Err(error) => return Err(error).context("stored tool output is not UTF-8"),
-                };
-                ensure!(
-                    valid > 0,
-                    "stored tool output has an incomplete UTF-8 character"
-                );
-                for character in std::str::from_utf8(&window[..valid])?.chars() {
-                    if (offset..page_end).contains(&total_chars) {
-                        output.push(character);
-                    }
-                    total_chars = total_chars
-                        .checked_add(1)
-                        .context("tool output character count overflow")?;
+        ensure!(limit > 0, "output page must contain at least one character");
+        self.read_snapshot(|| {
+            let total: i64 = self.connection.query_row("SELECT coalesce((SELECT characters FROM tool_output_summary WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3),0)",params![exchange,turn,tool],|row|row.get(0))?;
+            let total_chars = usize::try_from(total).context("invalid stored character count")?;
+            ensure!(offset <= total_chars,"output offset exceeds currently recorded text");
+            let next = offset.saturating_add(limit).min(total_chars);
+            let mut output = String::new();
+            if next > offset {
+                let mut statement = self.connection.prepare("SELECT p.char_offset,p.char_count,c.output FROM tool_output_position p JOIN tool_output_chunk c USING(exchange_id,turn_id,tool_id,byte_offset) WHERE p.exchange_id=?1 AND p.turn_id=?2 AND p.tool_id=?3 AND p.char_offset >= (SELECT char_offset FROM tool_output_position WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 AND char_offset<=?4 ORDER BY char_offset DESC LIMIT 1) AND p.char_offset<?5 ORDER BY p.char_offset")?;
+                let mut observed = offset;
+                for row in statement.query_map(params![exchange,turn,tool,offset as i64,next as i64],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))? {
+                    let (start,count,text) = row?;
+                    let start = usize::try_from(start).context("invalid stored character offset")?;
+                    let count = usize::try_from(count).context("invalid stored character count")?;
+                    ensure!(start.max(offset)==observed,"stored tool output has a discontinuous character offset");
+                    let selected: String = text.chars().skip(offset.saturating_sub(start)).take(next-start.max(offset)).collect();
+                    ensure!(text.chars().count()==count,"stored tool output has an invalid character count");
+                    observed += selected.chars().count();
+                    output.push_str(&selected);
                 }
-                consumed += valid as i64;
+                ensure!(observed==next,"stored tool output ended before its committed character count");
             }
-        }
-        ensure!(
-            offset <= total_chars,
-            "output offset exceeds currently recorded text"
-        );
-        let next = page_end.min(total_chars);
-        Ok(ToolOutputPage {
-            output,
-            next_offset: (next < total_chars).then_some(next),
-            total_chars,
+            Ok(ToolOutputPage { output, next_offset:(next<total_chars).then_some(next), total_chars })
         })
     }
 
@@ -313,17 +444,29 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let persisted: i64 = transaction.query_row("SELECT coalesce((SELECT byte_offset+length(cast(output AS BLOB)) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 ORDER BY byte_offset DESC LIMIT 1),0)", params![exchange.id,turn.id(),tool.id], |row| row.get(0))?;
+        let (persisted,characters): (i64,i64) = transaction.query_row("SELECT bytes,characters FROM tool_output_summary WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",params![exchange.id,turn.id(),tool.id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        let persisted = usize::try_from(persisted).context("invalid stored byte count")?;
+        let characters = usize::try_from(characters).context("invalid stored character count")?;
         ensure!(
-            persisted >= 0 && persisted as usize == offset,
+            persisted == offset,
             "tool output append does not follow the committed byte offset"
         );
-        if !delta.is_empty() {
-            transaction.execute(
-                "INSERT INTO tool_output_chunk VALUES(?1,?2,?3,?4,?5)",
-                params![exchange.id, turn.id(), tool.id, offset as i64, delta],
-            )?;
-        }
+        append_chunks(
+            &transaction,
+            &exchange.id,
+            turn.id(),
+            &tool.id,
+            delta,
+            offset,
+            characters,
+        )?;
+        save_summary(
+            &transaction,
+            &exchange.id,
+            turn.id(),
+            &tool.id,
+            &tool.output,
+        )?;
         transaction.commit()?;
         Ok(())
     }

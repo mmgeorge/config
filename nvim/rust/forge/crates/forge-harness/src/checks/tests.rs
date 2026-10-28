@@ -57,7 +57,7 @@ fn definition_list_groups_categories_before_names() -> Result<()> {
         .iter()
         .map(|definition| definition["check_id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, ["d-format", "c-check", "b-test", "a-build"]);
+    assert_eq!(ids, ["c-check", "b-test", "d-format", "a-build"]);
     Ok(())
 }
 
@@ -215,7 +215,7 @@ fn check_order_prioritizes_categories_and_preserves_ties() -> Result<()> {
         version: 2,
         definitions,
     };
-    assert_eq!(config.order()?, vec![4, 2, 3, 1, 5, 0]);
+    assert_eq!(config.order()?, vec![2, 1, 5, 4, 3, 0]);
     assert!(
         CheckConfig {
             version: 2,
@@ -850,7 +850,7 @@ async fn check_order_matches_preview_and_execution_without_success_dependencies(
             .iter()
             .map(|check| check.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["prepare", "format", "unit", "build", "integration"],
+        vec!["prepare", "unit", "format", "build", "integration"],
     );
     let runner = make_runner(workspace.path(), data.path());
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
@@ -869,7 +869,7 @@ async fn check_order_matches_preview_and_execution_without_success_dependencies(
             .iter()
             .map(|command| { command.context.as_ref().unwrap().definition_id.as_str() })
             .collect::<Vec<_>>(),
-        vec!["prepare", "format", "unit", "build", "integration"],
+        vec!["prepare", "unit", "format", "build", "integration"],
     );
     let run = runner.run(run, None, None).await?;
     assert_eq!(run.state, CheckState::Failed, "{:?}", run.commands);
@@ -880,8 +880,8 @@ async fn check_order_matches_preview_and_execution_without_success_dependencies(
             .collect::<Vec<_>>(),
         vec![
             CheckState::Passed,
-            CheckState::Passed,
             CheckState::Failed,
+            CheckState::Passed,
             CheckState::Passed,
             CheckState::Passed
         ],

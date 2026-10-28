@@ -36,6 +36,12 @@ conversation-level setting until you disable it.
 
 ## Automatic and explicit checks
 
+Compiler/type checks run before tests, followed by read-only formatting, linting,
+and build. Configure `cargo check` and TypeScript's project type-check command in
+category `check`. Source-changing preparation and explicit prerequisites run
+before checks that require their results. Formatting validation does not modify
+the source that was tested.
+
 In `/config`, select **Checks → Automatic → Enabled** and press Space to disable
 or enable completion checks. Tab switches between Enabled and Timing. The setting
 applies immediately, including during active work. Disabling completion checks
@@ -126,8 +132,9 @@ resolution, agents finish the phase and let Harness Checking run validation.
 
 Harness runs selected source preparation and its transitive prerequisites before
 unrelated verification. Among checks whose prerequisites have been ordered, the
-default priority is **format → lint/check → test → build**. Lint and check share
-one priority. Definition order breaks ties.
+default priority is **check → test → format → lint → build**. Compiler/type
+checks belong to `check`, and formatting validation is read-only. Definition
+order breaks ties within each category.
 
 Explicit `action.after` prerequisites take precedence over category priority.
 A host integration test remains a `test` check and depends on the `build` check
@@ -304,7 +311,7 @@ Their manual `rulesync-local-update` and `rulesync-global-update` counterparts
 write generated files and declare source preparation. Each update requires its
 matching preview to pass. Updates never run automatically.
 
-Definition lists group format, lint/check, test, and build categories, with IDs
+Definition lists group check, test, format, lint, and build categories, with IDs
 breaking ties. Execution retains prerequisite ordering and runs selected source
 preparation before unrelated verification. A required build can therefore run
 before its host-integration test.

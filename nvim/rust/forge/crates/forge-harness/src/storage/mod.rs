@@ -15,6 +15,8 @@ mod tool_output;
 #[cfg(test)]
 mod concurrency_tests;
 #[cfg(test)]
+mod efficiency_tests;
+#[cfg(test)]
 mod reliability_tests;
 
 use crate::agent::Agent;
@@ -779,6 +781,18 @@ impl SqliteStore {
             .pop())
     }
 
+    /// Loads a compaction owner across agents without hydrating unrelated exchanges.
+    pub(crate) fn load_compaction_exchange(
+        &self,
+        session_id: &str,
+        compaction: &crate::backend::Compaction,
+    ) -> Result<Option<Exchange>> {
+        Ok(self.list_exchange_payload(
+            "SELECT payload FROM exchange_record WHERE session_id=?1 AND EXISTS(SELECT 1 FROM json_each(exchange_record.payload,'$.node_list') AS node WHERE json_extract(node.value,'$.kind')='compaction' AND json_extract(node.value,'$.compaction.id')=?2 AND json_extract(node.value,'$.compaction.thread_id')=?3) ORDER BY (agent_id=?4) DESC,ordinal LIMIT 1",
+            params![session_id,compaction.id,compaction.thread_id,HarnessSession::primary_agent_id(session_id)],
+        )?.pop())
+    }
+
     /// Load only the last exchange owned by an execution, leaving unrelated output unloaded.
     pub(crate) fn latest_execution_exchange(
         &self,
@@ -786,8 +800,8 @@ impl SqliteStore {
         execution_id: &str,
     ) -> Result<Option<Exchange>> {
         Ok(self.list_exchange_payload(
-            "SELECT payload FROM exchange_record WHERE session_id=?1 AND json_extract(payload, '$.execution_id')=?2 ORDER BY ordinal DESC LIMIT 1",
-            params![session_id, execution_id],
+            "SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id=?3 AND json_extract(payload, '$.execution_id')=?2 ORDER BY ordinal DESC LIMIT 1",
+            params![session_id, execution_id, HarnessSession::primary_agent_id(session_id)],
         )?.pop())
     }
 
@@ -880,10 +894,9 @@ impl SqliteStore {
                 &execution.session_id,
                 &exchange.id,
                 Some(exchange.awaiting_input && exchange.elicitation.is_some()),
-            )
-        } else {
-            self.publish_admission(&execution.session_id)
+            )?;
         }
+        self.publish_admission(&execution.session_id)
     }
 
     /// Commit an approved scope change and its reconciled scheduler together.
@@ -908,7 +921,7 @@ impl SqliteStore {
                 params![id, execution.session_id, encode(&payload)?])?;
         }
         transaction.commit()?;
-        Ok(())
+        self.publish_admission(&execution.session_id)
     }
 
     fn save_plan_payload<T: Serialize>(
@@ -1365,7 +1378,10 @@ impl SqliteStore {
         );
         self.connection
             .execute(&sql, params![id, session_id, encode(value)?])?;
-        if matches!(table, "task_record" | "plan_record") {
+        if matches!(
+            table,
+            "task_record" | "plan_record" | "plan_execution_record"
+        ) {
             self.publish_admission(session_id)?;
         }
         Ok(())

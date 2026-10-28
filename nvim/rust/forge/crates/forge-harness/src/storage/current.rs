@@ -76,12 +76,22 @@ impl SqliteStore {
 
     pub(crate) fn latest_exchange(&self, session_id: &str) -> Result<Option<Exchange>> {
         let read = || {
-            self.current_exchange_state(session_id)?
-                .latest
-                .as_ref()
-                .map(|exchange| self.load_exchange(&exchange.id))
-                .transpose()
-                .map(Option::flatten)
+            Ok(self.list_exchange_payload("SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal DESC LIMIT 1",params![session_id,HarnessSession::primary_agent_id(session_id)])?.pop())
+        };
+        if self.connection.is_autocommit() {
+            self.read_snapshot(read)
+        } else {
+            read()
+        }
+    }
+
+    pub(crate) fn exchange_in_state(
+        &self,
+        session_id: &str,
+        state: crate::exchange::ExchangeState,
+    ) -> Result<Option<Exchange>> {
+        let read = || {
+            Ok(self.list_exchange_payload("SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id=?2 AND json_extract(payload,'$.state')=?3 ORDER BY ordinal LIMIT 1",params![session_id,HarnessSession::primary_agent_id(session_id),serde_json::to_value(state)?.as_str()])?.pop())
         };
         if self.connection.is_autocommit() {
             self.read_snapshot(read)

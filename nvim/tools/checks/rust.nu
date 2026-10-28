@@ -1,7 +1,7 @@
 def main [action: string] {
   let request = $in | from json
   if $request.version != 1 { error make {msg: "Unsupported check request version"} }
-  if $action not-in ["test" "format" "clippy"] { error make {msg: "Unsupported Rust check action"} }
+  if $action not-in ["check" "test" "format" "format-fix" "clippy"] { error make {msg: "Unsupported Rust check action"} }
   let root = $request.workspace | path join "nvim" "rust" "forge"
   cd $root
   let inputs = $request.inputs
@@ -32,7 +32,13 @@ def main [action: string] {
     }
     let metadata = $metadata.stdout | from json
     let members = $metadata.packages | where {|member| $member.id in $metadata.workspace_members }
-    $files | each {|file|
+    let root_parts = $root | path expand | path split
+    let rust_files = $files | where {|file|
+      let parts = $request.workspace | path join $file | path expand | path split
+      (($parts | length) >= ($root_parts | length)) and (($parts | take ($root_parts | length)) == $root_parts)
+    }
+    if ($rust_files | is-empty) { error make {msg: "No Rust workspace paths selected; specify a package or full:true"} }
+    $rust_files | each {|file|
       let absolute = $request.workspace | path join $file | path expand
       let owners = $members | where {|member|
         let directory = $member.manifest_path | path dirname | path expand
@@ -49,7 +55,9 @@ def main [action: string] {
   mut reports = []
   for selected in $coverage {
     let scope = if $full { ["--workspace"] } else { ["--package" $selected] }
-    let target = if $full {
+    let target = if $executable == "all" {
+      ["--all-targets"]
+    } else if $full {
       ["--lib" "--bins"]
     } else if $selected == "forge" and $test == "" and $executable == "lib" {
       ["--bin" "forge"]
@@ -60,10 +68,12 @@ def main [action: string] {
     } else if ($executable | str starts-with "bin:") {
       ["--bin" ($executable | str substring 4..)]
     } else {
-      error make {msg: "executable must be lib, test:<name>, or bin:<name>"}
+      error make {msg: "executable must be all, lib, test:<name>, or bin:<name>"}
     }
-    let arguments = if $action == "format" {
-      ["fmt"] | append (if $full { ["--all"] } else { $scope })
+    let arguments = if $action in ["format" "format-fix"] {
+      ["fmt"] | append (if $full { ["--all"] } else { $scope }) | append (if $action == "format" { ["--" "--check"] } else { [] })
+    } else if $action == "check" {
+      ["check" "--profile" "dev" "--locked"] | append $scope | append $target
     } else if $action == "clippy" {
       ["clippy" "--profile" "dev" "--locked"] | append $scope | append $target | append ["--" "-D" "warnings"]
     } else {

@@ -303,9 +303,9 @@ impl BrokerObserver {
             .map(|id| store.load_goal(id))
             .transpose()?
             .flatten();
-        let task = store
-            .list_task(&source_session.id)?
-            .into_iter()
+        let task_list = store.list_task(&source_session.id)?;
+        let task = task_list
+            .iter()
             .find(|task| Some(&task.id) == source_session.current_task_id.as_ref());
         let active_plan = task
             .as_ref()
@@ -419,10 +419,8 @@ impl BrokerObserver {
             json!({ "session_id": source_session.id, "status": status }),
         );
 
-        let mut agent_exchange_list = Vec::new();
-        for run in &agent_run_list {
-            agent_exchange_list.extend(store.list_agent_exchange_metadata(&run.id)?);
-        }
+        let agent_exchange_list =
+            store.list_session_agent_exchange_metadata(&source_session.id, &agent_run_list)?;
         let timeline = TimelineProjector::build(TimelineProjection {
             interaction_list: interaction.clone(),
             plan_list: &plan_list,
@@ -476,15 +474,7 @@ impl BrokerObserver {
             access_abbreviation: session.access.abbreviation().into(),
             subagent_tools: self.agent_coordinator.enabled(),
             lsp_tools: self.lsp.enabled(&source_session.id),
-            session_tools: crate::settings::SettingsStore::read_only(&self.data_root)?
-                .get(
-                    &source_session.workspace,
-                    &source_session.id,
-                    &source_session.backend,
-                )?
-                .desired
-                .session_tools
-                .unwrap_or(true),
+            session_tools: settings.session_tools.unwrap_or(true),
             status_thoughts,
             check_editing: self.check_editing.load(Ordering::Acquire),
             runtime_epoch: self.runtime_epoch.clone(),
@@ -505,7 +495,7 @@ impl BrokerObserver {
                 })
                 .map(|operation| operation.view()),
             session,
-            task: store.list_task(&source_session.id)?,
+            task: task_list,
             exchange: interaction,
             capability: metadata.capability.clone(),
             no_checkpoint: metadata.no_checkpoint,
@@ -550,7 +540,19 @@ impl BrokerObserver {
             HarnessMethod::TaskList => serde_json::to_value(
                 SqliteStore::read_only(&self.data_root)?.list_task(&self.session_id)?,
             )?,
-            HarnessMethod::AgentList => serde_json::to_value(self.snapshot()?.agent)?,
+            HarnessMethod::AgentList => {
+                let store = SqliteStore::read_only(&self.data_root)?;
+                store.read_snapshot(|| {
+                    let run = load_agent_registry(&store, &self.session_id)?.list();
+                    let exchange =
+                        store.list_session_agent_exchange_metadata(&self.session_id, &run)?;
+                    Ok(serde_json::to_value(AgentSnapshot {
+                        summary: agent_summaries(&run, &exchange),
+                        run,
+                        exchange,
+                    })?)
+                })?
+            }
             HarnessMethod::SessionList => self.list_session(params)?.0,
             HarnessMethod::SessionPreview => self.preview_session(params)?.0,
             HarnessMethod::SessionRename => self.rename_session(params)?.0,
@@ -663,10 +665,8 @@ impl BrokerObserver {
             .into_iter()
             .filter(|agent| !agent.is_primary())
             .collect::<Vec<_>>();
-        let mut agent_exchange_list = Vec::new();
-        for run in &agent_run_list {
-            agent_exchange_list.extend(store.list_agent_exchange_metadata(&run.id)?);
-        }
+        let agent_exchange_list =
+            store.list_session_agent_exchange_metadata(&session_id, &agent_run_list)?;
         let timeline = TimelineProjector::build(TimelineProjection {
             interaction_list: interaction.clone(),
             plan_list: &plan_list,

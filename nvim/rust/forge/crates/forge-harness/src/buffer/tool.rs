@@ -289,7 +289,7 @@ impl ToolOutputView {
             id: call.id.clone(),
             kind: call.kind.clone(),
             title: call.title.clone(),
-            output: String::new(),
+            output: Default::default(),
             status: call.status.clone(),
             failed: call.failed,
             change: Default::default(),

@@ -1118,7 +1118,12 @@ impl HarnessBroker {
         );
         service_tier.validate(&self.capability)?;
         if let Some(previous) = &self.session.background {
-            if !previous.reason.is_empty() && self.store.list_exchange(&self.session.id)?.is_empty()
+            if !previous.reason.is_empty()
+                && self
+                    .store
+                    .current_exchange_state(&self.session.id)?
+                    .latest
+                    .is_none()
             {
                 self.store
                     .save_session_event(&crate::timeline::SessionEventRecord {
@@ -1158,8 +1163,7 @@ impl HarnessBroker {
         self.save_session()?;
         let exchange = self
             .store
-            .list_exchange(&self.session.id)?
-            .pop()
+            .latest_exchange(&self.session.id)?
             .context("Background exchange is missing")?;
         let text = exchange
             .turn
@@ -1222,7 +1226,7 @@ impl HarnessBroker {
         ) {
             return Ok(());
         }
-        let latest_exchange = self.store.list_exchange(&self.session.id)?.pop();
+        let latest_exchange = self.store.latest_exchange(&self.session.id)?;
         let latest = latest_exchange
             .as_ref()
             .and_then(|exchange| exchange.turn.last())
@@ -1864,9 +1868,10 @@ impl HarnessBroker {
     fn current_task(&self) -> Result<Option<crate::task::TaskRecord>> {
         Ok(self
             .store
-            .list_task(&self.session.id)?
-            .into_iter()
-            .find(|task| Some(&task.id) == self.session.current_task_id.as_ref()))
+            .session_admission(&self.session.id)?
+            .runtime()?
+            .task
+            .clone())
     }
 
     fn current_task_is_plan(&self) -> Result<bool> {
@@ -2263,8 +2268,7 @@ impl HarnessBroker {
             self.configuration_progress("resuming").await?;
             let previous = self
                 .store
-                .list_exchange(&self.session.id)?
-                .pop()
+                .latest_exchange(&self.session.id)?
                 .context("interrupted exchange is missing")?;
             let notice = permission_notice.as_deref().unwrap_or("Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions.");
             let prompt = if previous.elicitation.is_some() {
@@ -2578,9 +2582,7 @@ impl HarnessBroker {
         let text = required_text(&params, "text")?;
         let interaction = self
             .store
-            .list_exchange(&self.session.id)?
-            .into_iter()
-            .last()
+            .latest_exchange(&self.session.id)?
             .context("no Harness interaction is available to resume")?;
         anyhow::ensure!(
             interaction.state == ExchangeState::Running
@@ -4364,7 +4366,7 @@ impl HarnessBroker {
     fn plan_exchange_anchor(&self, plan_id: &str) -> Result<crate::plan::ExchangeAnchor> {
         let exchange = self
             .store
-            .list_exchange(&self.session.id)?
+            .list_exchange_metadata(&self.session.id)?
             .into_iter()
             .rev()
             .find(|exchange| exchange.plan_id.as_deref() == Some(plan_id))
@@ -4382,8 +4384,7 @@ impl HarnessBroker {
     ) -> Result<()> {
         let mut exchange = self
             .store
-            .list_exchange(&self.session.id)?
-            .pop()
+            .latest_exchange(&self.session.id)?
             .context("planning feedback has no owning exchange")?;
         anyhow::ensure!(
             exchange.plan_id.as_deref() == Some(plan_id)
@@ -4732,7 +4733,7 @@ impl HarnessBroker {
 
     async fn continue_after_approval_timeout(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let owner = crate::backend::ExecutionOwner::root(&self.session.id);
-        let latest = self.store.list_exchange(&self.session.id)?.pop();
+        let latest = self.store.latest_exchange(&self.session.id)?;
         if let Some(goal) = self.current_goal()?
             && latest
                 .as_ref()
@@ -5120,7 +5121,7 @@ Planning continuation: turn {} of {}.",
         {
             return Ok(result);
         }
-        let Some(interaction) = self.store.list_exchange(&self.session.id)?.pop() else {
+        let Some(interaction) = self.store.latest_exchange(&self.session.id)? else {
             return Ok(result);
         };
         if interaction.state != ExchangeState::Complete
@@ -5369,8 +5370,7 @@ Planning continuation: turn {} of {}.",
             result.1.extend(repaired.1);
             let latest = self
                 .store
-                .list_exchange(&self.session.id)?
-                .pop()
+                .latest_exchange(&self.session.id)?
                 .context("repair exchange disappeared")?;
             automatic.repair_exchange = Some(latest.id.clone());
             automatic.save()?;
@@ -5390,9 +5390,7 @@ Planning continuation: turn {} of {}.",
         };
         let mut interaction = self
             .store
-            .list_exchange(&self.session.id)?
-            .into_iter()
-            .find(|interaction| interaction.id == runtime.exchange_id)
+            .load_exchange(&runtime.exchange_id)?
             .context("failed interaction runtime has no durable interaction")?;
         if interaction.state != ExchangeState::Running {
             return Ok(());
@@ -6448,9 +6446,7 @@ Planning continuation: turn {} of {}.",
         }
         if let Some(mut exchange) = self
             .store
-            .list_exchange(&self.session.id)?
-            .into_iter()
-            .find(|exchange| exchange.state == ExchangeState::Running)
+            .exchange_in_state(&self.session.id, ExchangeState::Running)?
         {
             anyhow::ensure!(
                 exchange.execution_started_at_ms.is_none()
@@ -6471,9 +6467,7 @@ Planning continuation: turn {} of {}.",
     async fn retry_finalization(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let Some(mut exchange) = self
             .store
-            .list_exchange(&self.session.id)?
-            .into_iter()
-            .find(|exchange| exchange.state == ExchangeState::Finalizing)
+            .exchange_in_state(&self.session.id, ExchangeState::Finalizing)?
         else {
             return Ok((json!({"cancel_requested": true}), Vec::new()));
         };
@@ -7112,7 +7106,7 @@ Planning continuation: turn {} of {}.",
                     && compaction.state == crate::backend::CompactionState::Completed
                     && compaction.result.context_tokens_before.is_some()
                     && compaction.result.context_tokens_after.is_none()
-                    && !self.store.list_exchange(&self.session.id)?.iter().any(|exchange|
+                    && !self.store.list_exchange_metadata(&self.session.id)?.iter().any(|exchange|
                         exchange.node_list.iter().any(|node| matches!(node,
                             ExchangeNode::Compaction { compaction, .. }
                                 if compaction.thread_id == thread_id
@@ -7608,14 +7602,9 @@ Planning continuation: turn {} of {}.",
         &self,
         interaction: Option<&Exchange>,
     ) -> Result<crate::session::state_machine::SessionPhase> {
-        let active_plan = self
-            .current_plan_id()?
-            .as_deref()
-            .map(|id| self.store.load_plan(id))
-            .transpose()?
-            .flatten();
-        let mut status = crate::session::state_machine::SessionPhase::resolve(
-            active_plan.as_ref(),
+        let runtime = self.store.session_admission(&self.session.id)?.runtime()?;
+        let mut status = crate::session::state_machine::SessionPhase::resolve_status(
+            runtime.plan.as_ref(),
             self.active_wait_projection.as_ref(),
             interaction,
         );
@@ -7628,9 +7617,12 @@ Planning continuation: turn {} of {}.",
         }
         if let Some(execution_id) =
             interaction.and_then(|exchange| exchange.execution_id.as_deref())
-            && let Some(execution) = self.store.load_plan_execution(execution_id)?
+            && let Some(execution) = runtime
+                .execution
+                .as_ref()
+                .filter(|execution| execution.id == execution_id)
         {
-            Self::execution_status(&mut status, &execution);
+            execution.apply(&mut status);
         }
         Ok(status)
     }
@@ -9195,8 +9187,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         {
             let previous_phase = self
                 .store
-                .list_exchange(&self.session.id)?
-                .last()
+                .latest_exchange(&self.session.id)?
+                .as_ref()
                 .and_then(|exchange| exchange.execution_phase.as_ref().map(|phase| phase.phase));
             let activity = WorkflowActivity::from(execution.phase);
             let action = if previous_phase == Some(execution.phase) {
@@ -9217,7 +9209,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             admission.lifecycle = Some(WorkflowActivity::Goal.event(LifecycleAction::Continued));
             admission
         };
-        if let Some(mut previous) = self.store.list_exchange(&self.session.id)?.pop()
+        if let Some(mut previous) = self.store.latest_exchange(&self.session.id)?
             && previous.state == ExchangeState::Running
         {
             self.capture_final_checkpoint(&mut previous, ExchangeState::Complete)
@@ -9317,9 +9309,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let exchange_id = required_text(&params, "exchange_id")?;
         let interaction = self
             .store
-            .list_exchange(&self.session.id)?
-            .into_iter()
-            .find(|item| item.id == exchange_id)
+            .load_exchange(&exchange_id)?
+            .filter(|item| item.session_id == self.session.id)
             .context("interaction not found")?;
         let comment = self.store.list_exchange_comment(&interaction.id)?;
         let prompt = format!(
@@ -9582,9 +9573,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         self.context_usage_fresh = false;
         let exchange = self
             .store
-            .list_exchange(&self.session.id)?
-            .into_iter()
-            .find(|exchange| &exchange.id == first)
+            .load_exchange(first)?
+            .filter(|exchange| exchange.session_id == self.session.id)
             .context("rolled-back interaction disappeared")?;
         Ok(vec![self.event(
             "interaction_rolled_back",
@@ -10277,17 +10267,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         &self,
         compaction: &crate::backend::Compaction,
     ) -> Result<Option<Exchange>> {
-        let mut exchange_list = self.store.list_exchange(&self.session.id)?;
-        for agent in self.store.list_agent_run(&self.session.id)? {
-            exchange_list.extend(self.store.list_agent_exchange(&agent.id)?);
-        }
-        Ok(exchange_list.into_iter().find(|exchange| {
-            exchange.node_list.iter().any(|node| {
-                matches!(node,
-                ExchangeNode::Compaction { compaction: existing, .. }
-                    if existing.id == compaction.id && existing.thread_id == compaction.thread_id)
-            })
-        }))
+        self.store
+            .load_compaction_exchange(&self.session.id, compaction)
     }
 
     /// Merge active and background notifications into their persisted timeline owner.
@@ -10800,6 +10781,47 @@ fn default_goal_max_turns() -> u32 {
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn live_status_and_agent_queries_do_not_reload_unrelated_history() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let task = crate::task::TaskRecord::new(
+            broker.session.id.clone(),
+            "active".into(),
+            crate::task::TaskKind::Plan,
+            broker.session.access.clone(),
+            broker.session.approval_mode,
+            1,
+        );
+        broker.store.save_task(&task)?;
+        broker.session.current_task_id = Some(task.id.clone());
+        broker.save_session()?;
+        let connection = rusqlite::Connection::open(data.path().join("harness.sqlite3"))?;
+        connection.execute(
+            "INSERT INTO task_record VALUES('unrelated',?1,'{}')",
+            [&broker.session.id],
+        )?;
+        connection.execute("INSERT INTO exchange_record(id,session_id,agent_id,ordinal,payload) VALUES('old',?1,?2,1,?3)",rusqlite::params![broker.session.id,HarnessSession::primary_agent_id(&broker.session.id),serde_json::json!({"state":"complete","turn":"malformed history"}).to_string()])?;
+        assert_eq!(broker.current_task()?.unwrap().id, task.id);
+        assert_eq!(
+            broker.live_interaction_status(None)?,
+            crate::session::state_machine::SessionPhase::Idle
+        );
+        assert!(broker.retry_finalization().await?.0["finalized_exchange_id"].is_null());
+        connection.execute("DELETE FROM exchange_record WHERE id='old'", [])?;
+        connection
+            .execute_batch("ALTER TABLE prompt_history_record RENAME TO unavailable_history")?;
+        let observer = broker.observer.clone();
+        assert!(
+            observer
+                .query(HarnessMethod::AgentList, serde_json::json!({}))?
+                .is_some()
+        );
+        assert!(observer.snapshot().is_err());
+        Ok(())
+    }
+
     struct AutomaticCheckBackend {
         turns: Arc<std::sync::atomic::AtomicUsize>,
         repair: bool,

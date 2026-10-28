@@ -124,10 +124,16 @@ impl SubmissionStore {
         }
         let connection = Connection::open(root.join("provider-submissions.sqlite3"))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let _bootstrap = crate::storage::bootstrap_lock(root, "provider-submissions")?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS submission (
                 id TEXT PRIMARY KEY, runtime TEXT NOT NULL, provider TEXT NOT NULL, payload TEXT NOT NULL
-            );")?;
+            );
+            CREATE INDEX IF NOT EXISTS submission_runtime_provider ON submission(runtime,provider);
+            CREATE INDEX IF NOT EXISTS submission_unfinished ON submission(runtime,provider)
+                WHERE json_extract(payload,'$.delivery.state') IN ('prepared','sending');
+            CREATE INDEX IF NOT EXISTS submission_sending ON submission(runtime,provider)
+                WHERE json_extract(payload,'$.delivery.state')='sending';")?;
         let created = Arc::new(Self {
             connection: Mutex::new(connection),
             live: Mutex::new(HashMap::new()),
@@ -234,7 +240,7 @@ impl SubmissionStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
         let mut statement = connection.prepare(
-            "SELECT payload FROM submission WHERE runtime=?1 AND provider=?2 AND (?3 IS NULL OR rowid < (SELECT rowid FROM submission WHERE id=?3)) ORDER BY rowid",
+            "SELECT payload FROM submission WHERE runtime=?1 AND provider=?2 AND json_extract(payload,'$.delivery.state') IN ('prepared','sending') AND (?3 IS NULL OR rowid < (SELECT rowid FROM submission WHERE id=?3)) ORDER BY rowid",
         )?;
         let rows = statement.query_map(
             params![
@@ -245,14 +251,6 @@ impl SubmissionStore {
             |row| row.get::<_, String>(0),
         )?;
         rows.map(|row| Ok(serde_json::from_str::<SubmissionRecord>(&row?)?))
-            .filter(|record| {
-                record.as_ref().map_or(true, |record| {
-                    matches!(
-                        record.delivery,
-                        SubmissionState::Prepared | SubmissionState::Sending { .. }
-                    )
-                })
-            })
             .collect()
     }
 
@@ -588,6 +586,49 @@ mod tests {
         BackendDescriptor, BackendEventSink, BackendInput, BackendKind, BackendOutput, PromptMode,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn pending_uses_unfinished_index_and_does_not_decode_completed_history() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let request = request("pending");
+        let pending = store.prepare(&request, BackendKind::Codex)?;
+        let connection = store.connection.lock().unwrap();
+        let runtime = request.runtime_key()?;
+        let provider = serde_json::to_string(&BackendKind::Codex)?;
+        for state in ["accepted", "cancelled"] {
+            connection.execute(
+                "INSERT INTO submission VALUES(?1,?2,?3,?4)",
+                params![
+                    state,
+                    runtime,
+                    provider,
+                    serde_json::json!({"delivery":{"state":state},"request":"not a request"})
+                        .to_string()
+                ],
+            )?;
+        }
+        connection.execute(
+            "INSERT INTO submission VALUES('foreign','other',?1,?2)",
+            params![
+                provider,
+                serde_json::json!({"delivery":{"state":"prepared"},"request":"not a request"})
+                    .to_string()
+            ],
+        )?;
+        let mut plan = connection.prepare("EXPLAIN QUERY PLAN SELECT payload FROM submission WHERE runtime=?1 AND provider=?2 AND json_extract(payload,'$.delivery.state') IN ('prepared','sending') ORDER BY rowid")?;
+        let details = plan
+            .query_map(params![runtime, provider], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .join("\n");
+        assert!(details.contains("submission_unfinished"), "{details}");
+        drop(plan);
+        drop(connection);
+        let result = store.pending(&request, BackendKind::Codex, None)?;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, pending.id());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn live_submission_handles_share_committed_state_without_reopening_storage() -> Result<()>

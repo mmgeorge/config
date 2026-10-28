@@ -20,10 +20,11 @@ pub enum CheckCategory {
 impl CheckCategory {
     pub(crate) fn priority(self) -> u8 {
         match self {
-            Self::Format => 0,
-            Self::Lint | Self::Check => 1,
-            Self::Test => 2,
-            Self::Build => 3,
+            Self::Check => 0,
+            Self::Test => 1,
+            Self::Format => 2,
+            Self::Lint => 3,
+            Self::Build => 4,
         }
     }
 }

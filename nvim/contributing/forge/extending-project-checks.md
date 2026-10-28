@@ -46,7 +46,9 @@ Keep selection and execution in the same repository-owned boundary.
 
 Categories determine default priority, not dependencies. Selected preparation
 and its prerequisites run before unrelated verification. Other runnable checks
-follow format, lint/check, test, and build priority. Declare `after` only when a
+follow check, test, read-only format, lint, and build priority. Configure Rust
+compiler checks and TypeScript type-check scripts as category `check`. Keep
+source-changing formatting in a separate preparation action. Declare `after` only when a
 consumer requires a successful prerequisite, such as a built host executable.
 
 ## Source ownership

@@ -12,12 +12,16 @@ Treat this repository as operational infrastructure rather than a single applica
 
 # Targeted Verification
 
-- Start with the smallest existing test that exercises the changed behavior. Use
+- Start validation with the affected compiler/type check. Use `cargo check` for
+  Rust and the existing package type-check command for TypeScript. Fix compiler
+  errors before running tests. Then select the smallest existing test that exercises
+  the changed behavior. Use
   an exact test name or an individual fixture when available. A changed source
   file selects its package, not a single test, so do not substitute file selection
   for exact-test selection when only one regression needs verification.
-- After a compilation failure, fix the compiler error and retry one targeted
-  test. Do not queue other tests that compile the same failing target.
+- After a compilation failure, fix the compiler error and repeat the affected
+  compiler/type check before retrying one targeted test. Do not queue other tests
+  that compile the same failing target.
 - Broaden to related tests after the targeted test passes. Package-wide and
   project-wide suites are exceptional. Run them only for an explicit user request,
   a mandatory repository gate, or an identified cross-module risk that narrower

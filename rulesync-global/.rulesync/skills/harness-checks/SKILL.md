@@ -100,6 +100,23 @@ their inspected `expected_digest`, or null for a new file. Harness does not sele
 an interpreter from an extension or secretly run syntax validation. Configure
 language-specific validation explicitly as another check.
 
+## Authoring validation stages
+
+When creating or revising project checks, configure compiler/type validation as
+the first verification stage, in category `check`. Inspect the repository's
+manifests, compiler configuration, and existing scripts before choosing the
+command. Rust projects use `cargo check` for the affected package and targets.
+TypeScript projects use their existing package type-check script or configured
+`tsc --noEmit` command, with their existing package manager and local toolchain.
+Do not invent a TypeScript project, compiler configuration, or global compiler
+dependency when the repository has none.
+
+Follow with tests, read-only formatting, linting, and build. Test compilation and
+linting do not replace the first compiler/type-check stage. Keep source-changing
+formatting in a separate preparation action before validation, and restart
+compiler/type validation if a later fix changes source. Preserve the project's
+target, feature, profile, and artifact-directory choices across these stages.
+
 ## Triggers and execution
 
 `trigger.auto` defaults to false. Paths are repository-relative globs, with `*`,

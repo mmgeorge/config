@@ -287,10 +287,7 @@ impl HarnessBroker {
         ) {
             if let Some(mut exchange) = self
                 .store
-                .list_exchange(&self.session.id)?
-                .into_iter()
-                .rev()
-                .find(|exchange| exchange.execution_id.as_deref() == Some(&execution.id))
+                .latest_execution_exchange(&self.session.id, &execution.id)?
             {
                 self.capture_implementation_report(
                     &mut execution,

@@ -61,19 +61,27 @@ skill to configure checks through `check_definition_edit`. Each submission follo
 The build commands below define the required artifact and flags. Harness agents
 must execute them as configured checks when working inside Harness.
 
-Harness prioritizes runnable checks as **format, lint/check, test, build** and runs
+Harness prioritizes runnable checks as **check, test, format, lint, build** and runs
 selected source preparation and its prerequisites before unrelated verification.
 Explicit dependencies take precedence. Reserve dependencies for checks that
 require a successful prerequisite, not merely to reproduce category ordering.
 Do not make formatters or unit tests depend on the final executable build.
+Run `rust-check` before Rust tests, with the affected package and executable.
+Use `executable: "all"` only when all target types require compiler validation.
+Shared Rust workspace configuration selects `rust-check-workspace`.
+TypeScript projects need their existing type-check command configured as category
+`check`, before test execution. Do not substitute linting for compiler/type checks.
+Fix compiler errors and repeat this first stage before running tests.
 Rust coverage uses `rust-test` for individual tests or affected packages
 and `rust-test-workspace` for workspace coverage. The global testing policy
 governs coverage selection. After the generic-input host cutover, use declared
 `inputs` such as `{"package":"forge-harness","test":"checks::tests::case"}`.
 The host never discovers tests or rewrites Cargo commands. Repository callbacks
 own runner arguments, file ownership, and exact-case coverage validation.
-Package formatting uses `rust-format`, while shared configuration uses
-`rust-format-workspace`. Supply explicit formatter files when there are
+Read-only formatting uses `rust-format` (`cargo fmt --check`), while shared
+configuration uses `rust-format-workspace`. Apply necessary source formatting
+through `rust-format-fix` before validation, then restart with `rust-check`.
+Supply explicit formatter files when there are
 no task-relative Rust changes. Category ordering does not select additional checks.
 Run `rust-build` after the source changes stabilize and before runtime verification.
 Do not rebuild the executable after every unit-test attempt.

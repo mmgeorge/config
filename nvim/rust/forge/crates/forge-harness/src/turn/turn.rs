@@ -48,6 +48,9 @@ pub struct Turn {
 }
 
 impl Turn {
+    pub(crate) fn omit_tool_output(&mut self) {
+        self.tool.omit_output();
+    }
     /// Admit one provider start event into the owning exchange.
     pub(crate) fn new(id: String, provider: ProviderAddress, now_ms: i64) -> Self {
         Self {

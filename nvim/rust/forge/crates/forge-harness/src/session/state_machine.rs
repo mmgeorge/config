@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     broker::ElicitationOwner,
@@ -192,10 +192,103 @@ impl ExecutionStatus {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct PlanStatus {
+    pub id: String,
+    pub state: PlanState,
+    pub model_revision: u32,
+    pub acceptance: bool,
+    pub elicitation: bool,
+    pub generation: crate::plan::PlanGeneration,
+}
+
+impl From<&PlanRecord> for PlanStatus {
+    fn from(plan: &PlanRecord) -> Self {
+        Self {
+            id: plan.id.clone(),
+            state: plan.state,
+            model_revision: plan.model_revision,
+            acceptance: plan.acceptance.is_some(),
+            elicitation: plan.elicitation.is_some(),
+            generation: plan.generation.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ExecutionStatusSnapshot {
+    pub id: String,
+    pub state: crate::plan::PlanExecutionState,
+    pub phase: PlanPhase,
+    pub progress: SemanticProgress,
+    pub check_run: Option<crate::checks::CheckRun>,
+}
+
+impl From<&crate::plan::PlanExecutionRecord> for ExecutionStatusSnapshot {
+    fn from(execution: &crate::plan::PlanExecutionRecord) -> Self {
+        Self {
+            id: execution.id.clone(),
+            state: execution.state,
+            phase: execution.phase,
+            progress: execution.progress.clone(),
+            check_run: execution.check_runs.last().cloned(),
+        }
+    }
+}
+
+impl ExecutionStatusSnapshot {
+    pub(crate) fn apply(&self, status: &mut SessionPhase) {
+        if matches!(status, SessionPhase::Idle)
+            && self.state == crate::plan::PlanExecutionState::Paused
+        {
+            *status = SessionPhase::Paused;
+            return;
+        }
+        if !matches!(status, SessionPhase::Working { .. } | SessionPhase::Idle) {
+            return;
+        }
+        if matches!(status, SessionPhase::Idle)
+            && self.phase == PlanPhase::Checking
+            && self.state == crate::plan::PlanExecutionState::Active
+            && let Some(activity) = self
+                .check_run
+                .as_ref()
+                .and_then(crate::checks::CheckActivity::from_run)
+        {
+            *status = SessionPhase::Working {
+                duration_ms: activity.duration_ms,
+                started_at_ms: activity.started_at_ms,
+                activity: WorkflowActivity::Checking,
+                reasoning_summary: None,
+                execution: None,
+            };
+        }
+        if let SessionPhase::Working { execution, .. } = status {
+            *execution = Some(ExecutionStatus {
+                id: self.id.clone(),
+                phase: self.phase,
+                progress: self.progress.clone(),
+            });
+        }
+    }
+}
+
 impl SessionPhase {
     /// Resolve one deterministic workflow phase from the session's durable owners.
     pub fn resolve(
         active_plan: Option<&PlanRecord>,
+        active_wait: Option<&ActiveWait>,
+        exchange: Option<&Exchange>,
+    ) -> Self {
+        Self::resolve_status(
+            active_plan.map(PlanStatus::from).as_ref(),
+            active_wait,
+            exchange,
+        )
+    }
+
+    pub(crate) fn resolve_status(
+        active_plan: Option<&PlanStatus>,
         active_wait: Option<&ActiveWait>,
         exchange: Option<&Exchange>,
     ) -> Self {
@@ -258,11 +351,11 @@ impl SessionPhase {
                 .into(),
             };
         }
-        if let Some(plan) = active_plan
-            .filter(|plan| !executing && (plan.acceptance.is_some() || plan.elicitation.is_some()))
+        if let Some(plan) =
+            active_plan.filter(|plan| !executing && (plan.acceptance || plan.elicitation))
         {
             return Self::AwaitingInput {
-                owner: if plan.acceptance.is_some() {
+                owner: if plan.acceptance {
                     ElicitationOwner::PlanAcceptance
                 } else {
                     ElicitationOwner::Plan

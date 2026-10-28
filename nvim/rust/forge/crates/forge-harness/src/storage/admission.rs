@@ -3,6 +3,9 @@
 //! Bind once while opening a session. Admission reads this projection without SQLite I/O.
 //! Writers publish after committing and before returning. Publication failure invalidates the
 //! projection, so input never proceeds using a silently stale task or question state.
+//! The same commit boundary owns active task, plan status, execution status, and configuration
+//! state. Rendering and dispatch read these values without reopening storage. Historical content
+//! remains in SQLite and is loaded only by explicit history queries.
 
 use std::{
     collections::HashMap,
@@ -33,12 +36,24 @@ pub(crate) struct AdmissionSnapshot {
     pub session: AdmissionSession,
     pub task: Option<AdmissionTask>,
     pub operation_state: Option<String>,
+    pub operation_id: Option<String>,
+    pub operation_action: Option<String>,
     pub has_elicitation: bool,
 }
 
 struct PublishedAdmission {
     snapshot: Result<Arc<AdmissionSnapshot>, String>,
     exchange: HashMap<String, bool>,
+    runtime: Arc<RuntimeSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+/// Active lifecycle values published atomically with admission, excluding historical output.
+pub(crate) struct RuntimeSnapshot {
+    pub task: Option<crate::task::TaskRecord>,
+    pub plan: Option<crate::session::state_machine::PlanStatus>,
+    pub execution: Option<crate::session::state_machine::ExecutionStatusSnapshot>,
+    pub configuring: bool,
 }
 
 /// Read capability for a committed session projection. It cannot mutate session state.
@@ -48,6 +63,17 @@ pub(crate) struct SessionAdmission {
 }
 
 impl SessionAdmission {
+    pub(crate) fn runtime(&self) -> Result<Arc<RuntimeSnapshot>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admission state lock poisoned"))?;
+        state
+            .snapshot
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("session admission unavailable: {error}"))?;
+        Ok(state.runtime.clone())
+    }
     pub(crate) fn snapshot(&self) -> Result<Arc<AdmissionSnapshot>> {
         let state = self
             .state
@@ -103,16 +129,16 @@ impl AdmissionRegistry {
         if let Some(existing) = session.get(session_id).and_then(Weak::upgrade) {
             return Ok(existing);
         }
-        let (snapshot, exchange) = store.read_snapshot(|| {
-            Ok((
-                store.read_admission(session_id)?,
-                store.admission_exchange_ids(session_id)?,
-            ))
+        let (snapshot, exchange, runtime) = store.read_snapshot(|| {
+            let snapshot = store.read_admission(session_id)?;
+            let runtime = store.read_runtime(&snapshot)?;
+            Ok((snapshot, store.admission_exchange_ids(session_id)?, runtime))
         })?;
         let created = Arc::new(SessionAdmission {
             state: Mutex::new(PublishedAdmission {
                 snapshot: Ok(Arc::new(snapshot)),
                 exchange,
+                runtime: Arc::new(runtime),
             }),
             changed: Arc::new(tokio::sync::Notify::new()),
         });
@@ -147,8 +173,10 @@ impl AdmissionRegistry {
             return Ok(());
         }
         let observed = store.read_snapshot(|| {
+            let snapshot = store.read_admission(session_id)?;
+            let runtime = store.read_runtime(&snapshot)?;
             Ok((
-                store.read_admission(session_id)?,
+                snapshot,
                 membership.map(|(id, _)| {
                     store.connection.query_row(
                         "SELECT coalesce(json_extract(payload,'$.awaiting_input')=1 AND json_type(payload,'$.elicitation')='object',0) FROM exchange_record WHERE session_id=?1 AND id=?2",
@@ -158,10 +186,12 @@ impl AdmissionRegistry {
                 refresh_membership
                     .then(|| store.admission_exchange_ids(session_id))
                     .transpose()?,
+                runtime,
             ))
         });
         match observed {
-            Ok((snapshot, committed_membership, refreshed)) => {
+            Ok((snapshot, committed_membership, refreshed, runtime)) => {
+                current.runtime = Arc::new(runtime);
                 let changed = current
                     .snapshot
                     .as_ref()
@@ -194,6 +224,30 @@ impl AdmissionRegistry {
 }
 
 impl SqliteStore {
+    fn read_runtime(&self, snapshot: &AdmissionSnapshot) -> Result<RuntimeSnapshot> {
+        let session_id = &snapshot.session.id;
+        let task: Option<crate::task::TaskRecord> = self.load_payload(
+            "SELECT t.payload FROM task_record t JOIN session_record s ON t.id=json_extract(s.payload,'$.session.current_task_id') WHERE s.id=?1",[session_id])?;
+        let plan = match task.as_ref().and_then(|task|task.plan_id.as_deref()) {
+            Some(id) => self.load_payload("SELECT json_object('id',id,'state',json_extract(payload,'$.state'),'model_revision',json_extract(payload,'$.model_revision'),'acceptance',json(CASE WHEN json_type(payload,'$.acceptance')='object' THEN 'true' ELSE 'false' END),'elicitation',json(CASE WHEN json_type(payload,'$.elicitation')='object' THEN 'true' ELSE 'false' END),'generation',json(coalesce(json_extract(payload,'$.generation'),?3))) FROM plan_record WHERE id=?1 AND json_extract(payload,'$.schema_version')=?2",rusqlite::params![id,crate::plan::PLAN_SCHEMA_VERSION,serde_json::to_string(&crate::plan::PlanGeneration::default())?])?,
+            None => None,
+        };
+        let execution = match task.as_ref().and_then(|task|task.plan_id.as_deref()) {
+            Some(id) => self.load_payload("SELECT json_object('id',id,'state',json_extract(payload,'$.state'),'phase',json_extract(payload,'$.phase'),'progress',json_extract(payload,'$.progress'),'check_run',json_extract(payload,'$.check_runs[#-1]')) FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload,'$.plan_id')=?2 AND json_extract(payload,'$.schema_version')=?3 ORDER BY rowid DESC LIMIT 1",rusqlite::params![session_id,id,crate::plan::PLAN_SCHEMA_VERSION])?,
+            None => None,
+        };
+        let configuring = snapshot.operation_action.as_deref() == Some("configure")
+            && matches!(
+                snapshot.operation_state.as_deref(),
+                Some("admitted" | "accepted" | "stopping" | "running" | "applying" | "verifying")
+            );
+        Ok(RuntimeSnapshot {
+            task,
+            plan,
+            execution,
+            configuring,
+        })
+    }
     pub(crate) fn session_admission(&self, session_id: &str) -> Result<Arc<SessionAdmission>> {
         self.admission.bind(self, session_id)
     }
@@ -223,7 +277,9 @@ impl SqliteStore {
             "SELECT json_object(
                 'session',json_object('id',s.id,'current_task_id',json_extract(s.payload,'$.session.current_task_id')),
                 'task',CASE WHEN t.id IS NULL THEN NULL ELSE json_object('id',t.id,'status',json_extract(t.payload,'$.status')) END,
-                'operation_state',(SELECT json_extract(o.payload,'$.state') FROM task_operation o WHERE o.session_id=s.id ORDER BY o.rowid DESC LIMIT 1),
+                'operation_state',json_extract(o.payload,'$.state'),
+                'operation_id',o.id,
+                'operation_action',json_extract(o.payload,'$.action.action'),
                 'has_elicitation',json(CASE WHEN (
                     (coalesce(json_extract(t.payload,'$.status'),'')!='paused' AND
                      (json_type(p.payload,'$.acceptance')='object' OR json_type(p.payload,'$.elicitation')='object'))
@@ -233,6 +289,7 @@ impl SqliteStore {
              FROM session_record s
              LEFT JOIN task_record t ON t.id=json_extract(s.payload,'$.session.current_task_id')
              LEFT JOIN plan_record p ON p.id=json_extract(t.payload,'$.plan_id') AND json_extract(p.payload,'$.schema_version')=?3
+             LEFT JOIN task_operation o ON o.rowid=(SELECT rowid FROM task_operation WHERE session_id=s.id ORDER BY rowid DESC LIMIT 1)
              WHERE s.id=?1 AND json_extract(s.payload,'$.format_version')=?4",
             rusqlite::params![session_id, crate::session::HarnessSession::primary_agent_id(session_id), crate::plan::PLAN_SCHEMA_VERSION, super::SESSION_FORMAT_VERSION],
             |row| row.get(0),

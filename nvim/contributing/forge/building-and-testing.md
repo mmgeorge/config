@@ -32,20 +32,24 @@ exit status. The observer does not cancel exits or recover native faults.
 
 ## Validation order
 
-Harness prioritizes runnable checks as format, lint/check, test, and build.
+Harness prioritizes runnable checks as compiler/type checks, tests, read-only
+formatting, lint, and build.
 Selected source preparation and its prerequisites run before unrelated verification.
 Explicit dependencies take precedence, and configured order breaks priority ties.
-Formatting after a successful build changes its recorded inputs and makes that
-build stale. `.forge.json` reserves explicit dependencies for host integration
+Source-changing formatting runs before validation. Applying formatting fixes
+after tests requires repeating compiler/type checks and affected tests.
+`.forge.json` reserves explicit dependencies for host integration
 and benchmark checks that require the built executable. Category ordering does
 not require earlier checks to pass. Full workspace coverage remains selected by
 shared-configuration changes rather than every package edit.
 
 Inside Harness, use configured checks rather than executing the commands below
-directly. For a targeted Rust run, select the matching formatter,
-`rust-test`, and `rust-build` together, retaining the exact case or file
-selection on `rust-test`. Use `rust-format` for package changes
-or `rust-format-workspace` for shared configuration. Explicit selection
+directly. Start with `rust-check` for the affected package and target, then run
+`rust-test`, read-only `rust-format`, lint, and `rust-build`, retaining the exact
+case or file selection on `rust-test`. Fix type errors before starting tests.
+Use `rust-check-workspace` for shared Rust configuration and select all target
+types only when needed. Use `rust-format-fix` to apply formatting before restarting
+validation. `rust-format-workspace` validates shared formatting without edits. Explicit selection
 does not add checks through category ordering. If the task has no Rust changes
 and formatting is required, supply concrete formatter files or explicitly select
 its `all` operation. An empty formatter selection does not skip tests or builds.
@@ -96,7 +100,14 @@ fresh test host after rebuilding.
 
 ## Select targeted checks
 
-Run the affected test target first. From the Rust workspace, these examples reuse
+Run the affected compiler target before tests. For example, check the library
+with `cargo check --profile dev --locked -p forge-harness --lib`. Use
+`--all-targets` when changed test or executable targets also require validation.
+TypeScript projects run their existing package type-check command first, such
+as `npm run typecheck`, or their configured `tsc --noEmit` invocation. Preserve
+the project's package manager and configuration.
+
+After type checking passes, these targeted test examples reuse
 the same development target:
 
 ```nu

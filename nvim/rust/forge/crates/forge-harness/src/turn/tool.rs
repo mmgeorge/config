@@ -25,7 +25,7 @@ pub struct ToolCall {
     pub id: String,
     pub kind: String,
     pub title: String,
-    pub output: String,
+    pub output: super::ToolOutputText,
     pub status: String,
     pub failed: bool,
     #[serde(default)]
@@ -63,6 +63,11 @@ pub struct ToolStore {
 }
 
 impl ToolStore {
+    pub(crate) fn omit_output(&mut self) {
+        for tool in self.item.values_mut() {
+            tool.output = super::ToolOutputText::default();
+        }
+    }
     /// Visit calls in first-seen provider order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &ToolCall> {
         self.order.iter().filter_map(|id| self.item.get(id))
@@ -111,7 +116,7 @@ impl ToolStore {
                 id: activity.id.clone(),
                 kind: tool_kind(activity),
                 title: activity.title.clone(),
-                output: String::new(),
+                output: super::ToolOutputText::default(),
                 status: activity
                     .status
                     .clone()
@@ -136,7 +141,7 @@ impl ToolStore {
             if activity.output_delta {
                 tool.output.push_str(output);
             } else {
-                tool.output.clone_from(output);
+                tool.output.replace(output);
             }
         }
         if activity.kind == crate::backend::ToolActivityKind::FileChange {

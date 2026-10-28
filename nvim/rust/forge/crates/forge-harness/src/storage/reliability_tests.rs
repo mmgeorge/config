@@ -20,7 +20,7 @@ fn current_schema_reads_do_not_wait_for_another_writer() -> Result<()> {
         reader
             .connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        2
+        super::schema::VERSION
     );
     Ok(())
 }
@@ -36,7 +36,7 @@ fn receipt_upgrade_does_not_rescan_existing_conversations() -> Result<()> {
         upgraded
             .connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        2
+        super::schema::VERSION
     );
     assert_eq!(
         upgraded
@@ -81,7 +81,9 @@ fn schema_upgrade_rolls_back_and_newer_databases_are_preserved() -> Result<()> {
         migrated.tool_output_bytes("old", "turn", "call", 0, 100)?.0,
         b"retained"
     );
-    store.connection.pragma_update(None, "user_version", 3)?;
+    store
+        .connection
+        .pragma_update(None, "user_version", super::schema::VERSION + 1)?;
     let error = SqliteStore::open(root.path())
         .err()
         .expect("newer schema must fail");
@@ -273,7 +275,7 @@ fn simultaneous_initialization_commits_one_compatible_schema() -> Result<()> {
                     store
                         .connection
                         .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-                    1
+                    super::schema::VERSION
                 );
                 Ok(())
             })

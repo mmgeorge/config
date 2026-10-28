@@ -280,10 +280,7 @@ impl HarnessBroker {
             {
                 interaction.task = self
                     .store
-                    .list_exchange(&self.session.id)?
-                    .into_iter()
-                    .rev()
-                    .find(|previous| previous.execution_id.as_deref() == Some(execution_id))
+                    .latest_execution_exchange(&self.session.id, execution_id)?
                     .and_then(|previous| previous.task);
             }
         }
@@ -762,9 +759,7 @@ impl HarnessBroker {
         if refresh_elicitation {
             let owner = self
                 .store
-                .list_exchange(&self.session.id)?
-                .into_iter()
-                .find(|owner| owner.id == interaction.id)
+                .load_exchange_metadata(&interaction.id)?
                 .context("question control lost its owning exchange")?;
             interaction.elicitation = owner.elicitation;
             interaction.awaiting_input = owner.awaiting_input;

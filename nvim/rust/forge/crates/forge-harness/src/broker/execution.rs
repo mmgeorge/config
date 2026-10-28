@@ -140,46 +140,7 @@ impl HarnessBroker {
         status: &mut crate::session::state_machine::SessionPhase,
         execution: &PlanExecutionRecord,
     ) {
-        if matches!(status, crate::session::state_machine::SessionPhase::Idle)
-            && execution.state == crate::plan::PlanExecutionState::Paused
-        {
-            *status = crate::session::state_machine::SessionPhase::Paused;
-            return;
-        }
-        if !matches!(
-            status,
-            crate::session::state_machine::SessionPhase::Working { .. }
-                | crate::session::state_machine::SessionPhase::Idle
-        ) {
-            return;
-        }
-        if matches!(status, crate::session::state_machine::SessionPhase::Idle)
-            && execution.phase == crate::plan::PlanPhase::Checking
-            && execution.state == crate::plan::PlanExecutionState::Active
-            && let Some(activity) = execution
-                .check_runs
-                .last()
-                .and_then(crate::checks::CheckActivity::from_run)
-        {
-            *status = crate::session::state_machine::SessionPhase::Working {
-                duration_ms: activity.duration_ms,
-                started_at_ms: activity.started_at_ms,
-                activity: crate::session::state_machine::WorkflowActivity::Checking,
-                reasoning_summary: None,
-                execution: None,
-            };
-        }
-        if let crate::session::state_machine::SessionPhase::Working {
-            execution: progress,
-            ..
-        } = status
-        {
-            *progress = Some(crate::session::state_machine::ExecutionStatus {
-                id: execution.id.clone(),
-                phase: execution.phase,
-                progress: execution.progress.clone(),
-            });
-        }
+        crate::session::state_machine::ExecutionStatusSnapshot::from(execution).apply(status);
     }
 
     pub(super) async fn scan_execution(&mut self, execution_id: &str) -> Result<Value> {

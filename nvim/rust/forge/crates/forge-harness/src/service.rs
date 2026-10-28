@@ -1070,22 +1070,7 @@ impl SessionController {
     async fn background_terminals(&self) -> Result<crate::backend::terminal::TerminalSnapshot> {
         let request = self.catalog_request.read().await.clone();
         let revision = self.mcp_revision.load(Ordering::Acquire);
-        let configuring = || -> Result<bool> {
-            Ok(SqliteStore::open(&self.data_root)?
-                .latest_task_operation(&request.harness_session_id)?
-                .is_some_and(|operation| {
-                    operation.action["action"] == "configure"
-                        && matches!(
-                            operation.state.as_str(),
-                            "admitted"
-                                | "accepted"
-                                | "stopping"
-                                | "running"
-                                | "applying"
-                                | "verifying"
-                        )
-                }))
-        };
+        let configuring = || -> Result<bool> { Ok(self.observer.admission.runtime()?.configuring) };
         let pending = || crate::backend::terminal::TerminalSnapshot {
             supported: true,
             starting: true,
