@@ -79,8 +79,10 @@
       "default_tools_approval_mode": "approve"
     },
     "terminal-mcp": {
-      "command": "terminal-mcp",
+      "command": "npx",
       "args": [
+        "-y",
+        "@ellery/terminal-mcp",
         "--headless"
       ],
       "default_tools_approval_mode": "approve"

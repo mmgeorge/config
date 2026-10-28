@@ -61,7 +61,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-/// Defines wall-clock access consumed by leases and durable timelines.
+/// Defines wall-clock access consumed by durable timelines.
 pub trait Clock: Send + Sync {
     /// Resolve the current Unix time in milliseconds.
     fn now_ms(&self) -> i64;
@@ -690,7 +690,7 @@ impl HarnessBroker {
                     selected.backend == request.backend.kind,
                     "session uses a different configured backend"
                 );
-                store.acquire_session_lease(session_id, &request.client_id, now_ms)?
+                store.acquire_session_lease(session_id, &request.client_id)?
             }
             None => {
                 let latest_session = if force_new_session {
@@ -705,7 +705,7 @@ impl HarnessBroker {
                 };
                 match latest_session {
                     Some(session) => {
-                        store.acquire_session_lease(&session.id, &request.client_id, now_ms)?
+                        store.acquire_session_lease(&session.id, &request.client_id)?
                     }
                     None => {
                         created_session = true;
@@ -769,7 +769,6 @@ impl HarnessBroker {
                             updated_at_ms: now_ms,
                             goal_id: None,
                             lease_owner: None,
-                            lease_expires_at_ms: None,
                             native_fork: false,
                             native_compact: backend_descriptor.capability.native_compact,
                             context_usage: None,
@@ -783,7 +782,7 @@ impl HarnessBroker {
                                 .get(&session.model)
                                 .and_then(|setting| setting.context_window.clone())
                         });
-                        acquire_lease(&mut session, &request.client_id, now_ms)?;
+                        session.acquire_lease(&request.client_id)?;
                         session
                     }
                 }
@@ -906,6 +905,7 @@ impl HarnessBroker {
             data_root: data_root.clone(),
             session_id: session.id.clone(),
             runtime_epoch: Uuid::new_v4().to_string(),
+            session_metadata: store.session_metadata_writer(&session.id, &request.client_id)?,
             snapshot_revision: AtomicU64::new(0),
             metadata: RwLock::new(observation::ObservationMetadata {
                 revision: 0,
@@ -1520,7 +1520,7 @@ impl HarnessBroker {
             method,
             HarnessMethod::StateGet | HarnessMethod::SessionList | HarnessMethod::SessionPreview
         ) {
-            self.refresh_lease()?;
+            self.save_session()?;
         }
         match method {
             HarnessMethod::ChecksEditing => Ok((
@@ -1644,7 +1644,7 @@ impl HarnessBroker {
             HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
             HarnessMethod::PlanCancel => self.cancel_plan(params),
             HarnessMethod::PlanGet => Ok((self.observer.plan(params)?, Vec::new())),
-            HarnessMethod::PlanDeclaration => self.read_plan_declaration(params),
+            HarnessMethod::PlanDeclaration => self.observer.read_plan_declaration(params),
             HarnessMethod::PlanList => self.observer.list_replanning_choices(),
             HarnessMethod::PlanDeviationResolve => {
                 anyhow::bail!("task-based deviations are no longer supported")
@@ -1658,30 +1658,24 @@ impl HarnessBroker {
                 serde_json::to_value(self.observer.list_exchange_review()?)?,
                 Vec::new(),
             )),
-            HarnessMethod::ExchangeCommentSave => self.save_exchange_comment(params),
-            HarnessMethod::ExchangeRollbackPreview => {
-                let id = required_text(&params, "preview_id")?;
-                let preview = crate::checkpoint::RestorePreview::load(
-                    &self.store.objects,
-                    &self.session.id,
-                    &id,
-                )?;
-                Ok(
-                    (
-                        preview.summary(
-                            params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize
-                        ),
-                        Vec::new(),
-                    ),
-                )
-            }
+            HarnessMethod::ExchangeCommentSave => self.observer.save_exchange_comment(params),
+            HarnessMethod::ExchangeRollbackPreview => Ok((
+                self.observer
+                    .query(HarnessMethod::ExchangeRollbackPreview, params)?
+                    .context("rollback preview observation is unavailable")?,
+                Vec::new(),
+            )),
             HarnessMethod::SessionNew | HarnessMethod::SessionClear => {
                 self.new_session(params).await
             }
             HarnessMethod::SessionList => self.observer.list_session(params),
             HarnessMethod::SessionPreview => self.observer.preview_session(params),
-            HarnessMethod::SessionRename => self.rename_session(params),
-            HarnessMethod::SessionDelete => self.delete_session(params),
+            HarnessMethod::SessionRename => {
+                let renamed = self.observer.rename_session(params)?;
+                self.session.name = required_text(&renamed.0, "name")?;
+                Ok(renamed)
+            }
+            HarnessMethod::SessionDelete => self.observer.delete_session(params),
             HarnessMethod::SessionFork => anyhow::bail!(
                 "session.fork must route through the process-wide session coordinator"
             ),
@@ -7647,7 +7641,14 @@ Planning continuation: turn {} of {}.",
                 words.join(" ")
             };
             if !title.is_empty() {
-                self.session.name = title.chars().take(30).collect();
+                self.session.name = self
+                    .store
+                    .initialize_session_name(
+                        &self.session.id,
+                        &self.client_id,
+                        &title.chars().take(30).collect::<String>(),
+                    )?
+                    .name;
                 self.save_session()?;
             }
         }
@@ -8851,81 +8852,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
 
     /// Read a submitted revision after validating its owning session and revision range.
 
-    fn read_plan_declaration(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = required_text(&params, "plan_id")?;
-        let path = required_text(&params, "path")?;
-        let revision: u32 =
-            serde_json::from_value(params.get("revision").context("missing revision")?.clone())?;
-        let baseline = params
-            .get("baseline")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("plan artifact not found")?;
-        anyhow::ensure!(
-            plan.session_id == self.session.id,
-            "plan belongs to another session"
-        );
-        let document =
-            self.plan_file
-                .read_submitted_document(&self.session.id, &plan_id, revision)?;
-        let design = document
-            .design
-            .context("plan has no declaration snapshot")?;
-        let text = if params
-            .get("document")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            design
-                .document
-                .sections()
-                .into_iter()
-                .find(|section| section.title == path)
-                .context("unknown plan overview section")?
-                .text
-        } else if baseline {
-            crate::plan::calls::present(
-                &path,
-                &design
-                    .baseline
-                    .get(&path)
-                    .context("declaration baseline not found")?
-                    .text,
-                design
-                    .baseline_calls
-                    .get(&path)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-            )?
-            .declaration
-            .text
-            .clone()
-        } else {
-            crate::plan::calls::present(
-                &path,
-                design
-                    .proposed
-                    .get(&path)
-                    .context("proposed declaration not found")?,
-                design
-                    .proposed_calls
-                    .get(&path)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-            )?
-            .declaration
-            .text
-            .clone()
-        };
-        Ok((
-            json!({ "text": text, "path": path, "revision": revision, "baseline": baseline }),
-            Vec::new(),
-        ))
-    }
-
     async fn set_goal(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let objective = required_text(&params, "objective")?;
         self.pause_task(false).await?;
@@ -9361,20 +9287,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .await
     }
 
-    fn save_exchange_comment(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut comment: ExchangeComment = serde_json::from_value(params)?;
-        anyhow::ensure!(
-            self.store
-                .list_exchange(&self.session.id)?
-                .iter()
-                .any(|interaction| interaction.id == comment.exchange_id),
-            "interaction comment does not belong to the active session"
-        );
-        comment.created_at_ms = self.clock.now_ms();
-        self.store.save_exchange_comment(&comment)?;
-        Ok((serde_json::to_value(comment)?, Vec::new()))
-    }
-
     async fn request_exchange_changes(
         &mut self,
         params: Value,
@@ -9640,7 +9552,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         session.provider_fork_state = ProviderForkState::Ready;
         session.context_usage = None;
         session.last_compaction_turn = None;
-        session.acquire_lease(&self.client_id, self.clock.now_ms())?;
+        session.acquire_lease(&self.client_id)?;
         session.updated_at_ms = self.clock.now_ms();
         self.store.record_rollback(&session, exchange_ids)?;
         self.session = session;
@@ -9813,9 +9725,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
         }
         self.pause_current_goal().await?;
-        session =
-            self.store
-                .acquire_session_lease(&session.id, &self.client_id, self.clock.now_ms())?;
+        session = self
+            .store
+            .acquire_session_lease(&session.id, &self.client_id)?;
         self.release_lease()?;
         if session.provider_label.is_empty() {
             session.provider_label = self.backend.descriptor().label;
@@ -9854,39 +9766,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         self.store.save_goal(&goal)
     }
 
-    fn rename_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let session_id = required_text(&params, "session_id")?;
-        let name = required_text(&params, "name")?.trim().to_owned();
-        let mut session = self
-            .store
-            .load_session(&session_id)?
-            .context("session not found")?;
-        if let Some(expected) = params.get("expected_name").and_then(Value::as_str) {
-            anyhow::ensure!(
-                session.name == expected,
-                "Session name changed during generation"
-            );
-        }
-        session.name = name;
-        let created_at_ms = self.clock.now_ms();
-        session.updated_at_ms = created_at_ms;
-        self.store.save_session(&session)?;
-        let timeline_event = SessionEventRecord {
-            id: Uuid::new_v4().to_string(),
-            session_id: session.id.clone(),
-            owner: crate::timeline::TimelineOwner::session(&session.id),
-            created_at_ms,
-            detail: SessionEventKind::Renamed {
-                name: session.name.clone(),
-            },
-        };
-        self.store.save_session_event(&timeline_event)?;
-        if self.session.id == session.id {
-            self.session = session.clone();
-        }
-        Ok((serde_json::to_value(session)?, Vec::new()))
-    }
-
     async fn configuration_progress(&mut self, state: &str) -> Result<()> {
         let Some(operation_id) = self.active_operation_id.clone() else {
             return Ok(());
@@ -9911,8 +9790,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     async fn configure_session(&mut self, mut params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let mut resource_selection = None;
         if params.get("settings_revision").is_some() {
-            let (root, _, _) = self.lease_identity();
-            let settings = crate::settings::SettingsStore::open(&root)?.get(
+            let settings = crate::settings::SettingsStore::open(&self.data_root)?.get(
                 &self.session.workspace,
                 &self.session.id,
                 &self.session.backend,
@@ -10371,24 +10249,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         Ok(())
     }
 
-    fn delete_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let session_id = required_text(&params, "session_id")?;
-        anyhow::ensure!(
-            session_id != self.session.id,
-            "cannot delete the active session"
-        );
-        let session = self
-            .store
-            .load_session(&session_id)?
-            .context("session not found")?;
-        self.plan_file.delete_session(&session.id)?;
-        self.store.delete_session(&session_id)?;
-        Ok((
-            json!({ "deleted": session_id, "provider_session_preserved": true }),
-            Vec::new(),
-        ))
-    }
-
     /// Resolve persisted ownership across primary and child-agent exchanges.
     fn compaction_exchange_owner(
         &self,
@@ -10656,10 +10516,16 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .permission_coordinator
             .input_timeouts(&self.session.id)?;
         let now_ms = self.clock.now_ms();
-        self.session.acquire_lease(&self.client_id, now_ms)?;
+        self.session.acquire_lease(&self.client_id)?;
         self.session.updated_at_ms = now_ms;
         self.store
-            .save_owned_session(&self.session, &self.client_id)
+            .save_owned_session(&self.session, &self.client_id)?;
+        self.session.name = self
+            .store
+            .load_session(&self.session.id)?
+            .context("owned session is missing")?
+            .name;
+        Ok(())
     }
 
     fn save_preference(&mut self, update_model_preference: bool) -> Result<()> {
@@ -10679,16 +10545,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         self.store
             .save_preference(&self.session.workspace, &self.session.backend, &preference)
-    }
-
-    fn refresh_lease(&mut self) -> Result<()> {
-        let now_ms = self.clock.now_ms();
-        let persisted =
-            self.store
-                .acquire_session_lease(&self.session.id, &self.client_id, now_ms)?;
-        self.session.lease_owner = persisted.lease_owner;
-        self.session.lease_expires_at_ms = persisted.lease_expires_at_ms;
-        self.save_session()
     }
 
     pub(crate) fn release_lease(&mut self) -> Result<()> {
@@ -10723,25 +10579,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             Vec::new(),
         ))
     }
-
-    /// Resolve durable lease identity for the broker heartbeat.
-    pub fn lease_identity(&self) -> (PathBuf, String, String) {
-        (
-            self.data_root.clone(),
-            self.session.id.clone(),
-            self.client_id.clone(),
-        )
-    }
 }
 
 impl Drop for HarnessBroker {
     fn drop(&mut self) {
         let _ = self.release_lease();
     }
-}
-
-fn acquire_lease(session: &mut HarnessSession, client_id: &str, now_ms: i64) -> Result<()> {
-    session.acquire_lease(client_id, now_ms)
 }
 
 /// Attribute a native tool once to the single active task in its owning exchange.
@@ -14406,7 +14249,10 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.session.name.clear();
+        broker.session = broker
+            .store
+            .rename_owned_session(&broker.session.id, &broker.client_id, "", None, 100)
+            .unwrap();
         broker
             .interaction_for_turn("  Explain\n this repository  ", true, 100)
             .await
@@ -14439,7 +14285,10 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.session.name.clear();
+        broker.session = broker
+            .store
+            .rename_owned_session(&broker.session.id, &broker.client_id, "", None, 100)
+            .unwrap();
         broker
             .interaction_for_turn("/plan convert to rust", true, 100)
             .await
@@ -16432,7 +16281,6 @@ mod test {
             updated_at_ms: 0,
             goal_id: None,
             lease_owner: Some("one".into()),
-            lease_expires_at_ms: Some(20),
             native_fork: false,
             native_compact: false,
             context_usage: None,
@@ -16440,8 +16288,10 @@ mod test {
             auto_compaction: Default::default(),
             last_compaction_turn: None,
         };
-        assert!(acquire_lease(&mut session, "two", 10).is_err());
-        assert!(acquire_lease(&mut session, "two", 21).is_ok());
+        assert!(session.acquire_lease("two").is_err());
+        assert!(session.acquire_lease("one").is_ok());
+        session.lease_owner = None;
+        assert!(session.acquire_lease("two").is_ok());
         assert_eq!(FixedClock(5).now_ms(), 5);
 
         let mut model_setting = std::collections::BTreeMap::new();
@@ -16545,6 +16395,70 @@ mod test {
             fail_withdrawal_continuation: false,
         });
         broker
+    }
+
+    #[tokio::test]
+    async fn session_mutations_enforce_target_ownership() -> Result<()> {
+        use std::fs;
+
+        let source_workspace = tempfile::tempdir()?;
+        let target_workspace = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let mut source = mutable_question_broker(source_workspace.path(), data.path());
+        let target = mutable_question_broker(target_workspace.path(), data.path());
+        let target_id = target.session.id.clone();
+        let target_name = target.session.name.clone();
+        let plan_directory = data.path().join("plans").join(&target_id);
+        fs::create_dir_all(&plan_directory)?;
+        let plan = plan_directory.join("preserved.md");
+        fs::write(&plan, "preserve active plan")?;
+        for (id, method, params) in [
+            (
+                1,
+                "session.rename",
+                json!({"session_id":target_id,"name":"invalid"}),
+            ),
+            (2, "session.delete", json!({"session_id":target_id})),
+        ] {
+            let response = source
+                .dispatch(Request {
+                    id,
+                    method: method.into(),
+                    params,
+                })
+                .await;
+            assert!(
+                response.response.error().is_some(),
+                "{method} accepted a foreign owner"
+            );
+            assert_eq!(
+                source.store.load_session(&target_id)?.unwrap().name,
+                target_name
+            );
+            assert_eq!(fs::read_to_string(&plan)?, "preserve active plan");
+        }
+        let source_id = source.session.id.clone();
+        let rename = source
+            .dispatch(Request {
+                id: 3,
+                method: "session.rename".into(),
+                params: json!({"session_id":source_id,"name":"owned rename"}),
+            })
+            .await;
+        assert!(rename.response.error().is_none());
+        assert_eq!(source.session.name, "owned rename");
+        drop(target);
+        let deletion = source
+            .dispatch(Request {
+                id: 4,
+                method: "session.delete".into(),
+                params: json!({"session_id":target_id}),
+            })
+            .await;
+        assert!(deletion.response.error().is_none());
+        assert!(source.store.load_session(&target_id)?.is_none());
+        assert!(!plan_directory.exists());
+        Ok(())
     }
 
     #[tokio::test]
@@ -18558,7 +18472,9 @@ mod test {
                 && event.payload["kind"] == "timeline_session_event"
                 && event.payload["data"]["event"]["name"] == "Architecture review"
         }));
-        let stale = broker.rename_session(json!({ "session_id": session["id"],
+        let stale = broker
+            .observer
+            .rename_session(json!({ "session_id": session["id"],
             "name": "Generated name", "expected_name": "Previous name" }));
         assert!(
             stale
@@ -18817,7 +18733,6 @@ mod test {
             .unwrap()
             .expect("source session");
         source_session.lease_owner = Some("foreign-client".into());
-        source_session.lease_expires_at_ms = Some(500);
         broker.store.save_session(&source_session).unwrap();
 
         let preview = broker
@@ -18844,7 +18759,6 @@ mod test {
             .unwrap()
             .expect("persisted source session");
         assert_eq!(persisted.lease_owner.as_deref(), Some("foreign-client"));
-        assert_eq!(persisted.lease_expires_at_ms, Some(500));
     }
 
     #[tokio::test]
@@ -18875,8 +18789,16 @@ mod test {
         )
         .unwrap();
         let session_id = broker.session.id.clone();
-        broker.session.name = "Persistent analysis".into();
-        broker.store.save_session(&broker.session).unwrap();
+        broker.session = broker
+            .store
+            .rename_owned_session(
+                &broker.session.id,
+                &broker.client_id,
+                "Persistent analysis",
+                None,
+                100,
+            )
+            .unwrap();
         let (mut exchange, _, _) = broker
             .interaction_for_turn("interrupted request", true, 100)
             .await
@@ -20666,7 +20588,6 @@ mod test {
         incompatible.primary_agent_id = HarnessSession::primary_agent_id(&incompatible.id);
         incompatible.backend = "copilot".into();
         incompatible.lease_owner = None;
-        incompatible.lease_expires_at_ms = None;
         broker.store.save_session(&incompatible).unwrap();
         let result = broker
             .dispatch(Request {

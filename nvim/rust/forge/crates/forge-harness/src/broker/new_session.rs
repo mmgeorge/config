@@ -85,7 +85,6 @@ pub fn prepare_new_session(
         updated_at_ms: now_ms,
         goal_id: None,
         lease_owner: Some(client_id.to_owned()),
-        lease_expires_at_ms: Some(now_ms + 30_000),
         native_fork: false,
         native_compact,
         context_usage: None,

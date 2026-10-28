@@ -62,6 +62,101 @@ local success, failure = xpcall(function()
     end
   end
   assert(response_marker, "final response omitted its large dot marker")
+  local function compose_and_press(text, key)
+    vim.api.nvim_set_current_win(state.composer_win)
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
+    local binding = vim.fn.maparg(key, "n", false, true)
+    assert(binding.buffer == 1 and type(binding.callback) == "function", "missing composer binding " .. key)
+    binding.callback()
+  end
+  local function pending_message(text)
+    for _, message in ipairs(state.input.confirmed) do
+      if message.text == text then return message end
+    end
+  end
+  local function input_settled()
+    return state.input.sending == nil and #state.input.pending == 0
+  end
+  local function request(method, params, expected_error)
+    local done, value, failure = false
+    client.request_for(state.session.id, method, params, function(result, error)
+      value, failure, done = result, error, true
+    end)
+    assert(vim.wait(3000, function() return done end, 10), method .. " waited for execution")
+    if expected_error then
+      assert(failure and tostring(failure):find(expected_error, 1, true), tostring(failure))
+    else
+      assert(not failure, tostring(failure))
+    end
+    return value
+  end
+  local active_prompt = "Keep this response active while sending follow-ups"
+  local first_queued = "First explicitly queued follow-up"
+  local second_queued = "Second explicitly queued follow-up"
+  local first_steering = "Immediate steering behind one queued follow-up"
+  local second_steering = "Immediate steering behind two queued follow-ups"
+  local active_response = mock.hold(state.session.id, "chat")
+  compose_and_press(active_prompt, "<C-s>")
+  assert(active_response:wait().prompt == active_prompt)
+  local renamed = "Renamed while the provider is active"
+  compose_and_press("/rename " .. renamed, "<C-s>")
+  assert(vim.wait(3000, function()
+    return #errors > 0 or state.session.name == renamed
+  end, 10), "active session rename did not finish")
+  assert(#errors == 0, table.concat(errors, "\n"))
+  assert(active_response:wait().prompt == active_prompt, "rename interrupted the provider response")
+  request("session.rename", { session_id = state.session.id, name = "stale generated name",
+    expected_name = "old name" }, "changed during generation")
+  request("session.delete", { session_id = state.session.id }, "cannot delete the active session")
+  local exchanges = request("exchange.list", {})
+  local reviewed = assert(exchanges[1], "no exchange available for comment regression")
+  local comment = request("exchange.comment.save", { id = "active-review-comment",
+    exchange_id = reviewed.id, file_path = "example.rs", new_line = 1,
+    body = "Comment while the provider is active", created_at_ms = 0 })
+  assert(comment.body == "Comment while the provider is active")
+  request("exchange.comment.save", { id = "foreign-comment", exchange_id = "missing-exchange",
+    file_path = "example.rs", new_line = 1, body = "invalid", created_at_ms = 0 },
+    "does not belong to the active session")
+  request("plan.declaration", { plan_id = "missing-plan", path = "plan.json", revision = 1 },
+    "plan artifact not found")
+  request("exchange.rollback.preview", {}, "preview_id is required")
+  local snapshot = request("state.get", {})
+  assert(snapshot.session.name == renamed, "durable snapshot lost active rename")
+  compose_and_press(first_queued, "<C-q>")
+  assert(vim.wait(5000, function()
+    local queued = pending_message(first_queued)
+    return input_settled() and queued and queued.intent == "queue" and queued.delivery == "queued"
+  end, 10), "Ctrl-Q did not retain the explicit follow-up")
+  compose_and_press(first_steering, "<C-s>")
+  assert(vim.wait(5000, function()
+    return #errors > 0 or (input_settled() and not pending_message(first_steering))
+  end, 10), "Ctrl-S waited behind an explicitly queued message instead of steering")
+  assert(#errors == 0, table.concat(errors, "\n"))
+  assert(active_response:wait().prompt == active_prompt, "steering completed the active response")
+  assert(pending_message(first_queued).delivery == "queued", "steering consumed the queued follow-up")
+  compose_and_press(second_queued, "<C-q>")
+  assert(vim.wait(5000, function() return input_settled() and pending_message(second_queued) end, 10))
+  compose_and_press(second_steering, "<C-s>")
+  assert(vim.wait(5000, function()
+    return #errors > 0 or (input_settled() and not pending_message(second_steering))
+  end, 10), "Ctrl-S waited behind multiple explicit follow-ups")
+  assert(#errors == 0, table.concat(errors, "\n"))
+  for _, text in ipairs({ first_queued, second_queued }) do
+    local queued = pending_message(text)
+    assert(queued and queued.intent == "queue" and queued.delivery == "queued", "Ctrl-S changed the explicit queue")
+  end
+  local first_queued_response = mock.hold(state.session.id, "chat")
+  local second_queued_response = mock.hold(state.session.id, "chat")
+  active_response:release()
+  assert(first_queued_response:wait().prompt == first_queued, "steering changed queued FIFO delivery")
+  first_queued_response:release()
+  assert(second_queued_response:wait().prompt == second_queued, "explicit follow-ups were reordered")
+  second_queued_response:release()
+  assert(vim.wait(10000, function()
+    return #errors > 0 or (not state.busy and input_settled() and #state.input.confirmed == 0)
+  end, 10), "queued follow-ups did not finish after the active response")
+  assert(#errors == 0, table.concat(errors, "\n"))
+  assert(state.session.name == renamed, "provider completion overwrote the active rename")
   local log_status
   client.request("trace.status", {}, function(result, error)
     assert(not error, error)
@@ -147,6 +242,7 @@ local success, failure = xpcall(function()
   end)
   assert(vim.wait(10000, function() return #errors > 0 or (restarted and state.presentation and state.presentation.ready and state.presentation.host_generation ~= old_generation) end, 10))
   assert(#errors == 0, table.concat(errors, "\n"))
+  assert(state.session.name == renamed, "active rename did not survive host restart")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "draft survives collected host")
   assert(require("forge.infra.perf").enabled("harness"), "saved logging preference lost on restart")
   local compaction_count = 0

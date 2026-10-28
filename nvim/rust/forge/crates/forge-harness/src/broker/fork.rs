@@ -86,7 +86,6 @@ pub fn prepare_provider_fork(
     child.created_at_ms = now_ms;
     child.updated_at_ms = now_ms;
     child.lease_owner = Some(client_id.to_owned());
-    child.lease_expires_at_ms = Some(now_ms + 30_000);
     crate::settings::SettingsStore::open(data_root)?.fork_session(&source.id, &child.id)?;
     let plan_file = crate::plan::PlanFileStore::new(data_root, &source.workspace);
     let history = store.read_snapshot(|| {

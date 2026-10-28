@@ -172,7 +172,6 @@ pub struct HarnessSession {
     pub updated_at_ms: i64,
     pub goal_id: Option<String>,
     pub lease_owner: Option<String>,
-    pub lease_expires_at_ms: Option<i64>,
     #[serde(default)]
     pub native_fork: bool,
     #[serde(default)]
@@ -233,14 +232,13 @@ impl HarnessSession {
         format!("{session_id}:agent:primary")
     }
 
-    /// Acquire or renew this session lease for one Neovim client.
-    pub fn acquire_lease(&mut self, client_id: &str, now_ms: i64) -> Result<()> {
-        let lease_active = self.lease_expires_at_ms.unwrap_or(0) > now_ms;
+    /// Claims an unowned session or confirms its existing owner without clock-based expiry.
+    pub fn acquire_lease(&mut self, client_id: &str) -> Result<()> {
         let owned_elsewhere = self
             .lease_owner
             .as_deref()
             .is_some_and(|owner| owner != client_id);
-        if lease_active && owned_elsewhere {
+        if owned_elsewhere {
             return Err(SessionLeaseConflict {
                 session_id: self.id.clone(),
                 native_fork: self.native_fork,
@@ -248,7 +246,6 @@ impl HarnessSession {
             .into());
         }
         self.lease_owner = Some(client_id.into());
-        self.lease_expires_at_ms = Some(now_ms + 30_000);
         Ok(())
     }
 }

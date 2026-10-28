@@ -9,6 +9,7 @@ pub(crate) struct BrokerObserver {
     pub(crate) completion_queue: crate::checks::CompletionQueue,
     pub(super) data_root: PathBuf,
     pub(super) session_id: String,
+    pub(super) session_metadata: crate::storage::lifecycle::SessionMetadataWriter,
     pub(super) runtime_epoch: String,
     pub(super) snapshot_revision: AtomicU64,
     pub(super) metadata: RwLock<ObservationMetadata>,
@@ -29,6 +30,137 @@ pub(super) struct ObservationMetadata {
 }
 
 impl BrokerObserver {
+    /// Renames the owning session without waiting for the provider turn.
+    pub(super) fn rename_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let session_id = required_text(&params, "session_id")?;
+        anyhow::ensure!(
+            session_id == self.session_id,
+            "session rename must target the owning broker"
+        );
+        let name = required_text(&params, "name")?.trim().to_owned();
+        let session = self.session_metadata.rename(
+            &name,
+            params.get("expected_name").and_then(Value::as_str),
+            SystemClock.now_ms(),
+        )?;
+        Ok((serde_json::to_value(session)?, Vec::new()))
+    }
+
+    /// Deletes an inactive session while retaining its ownership lock through cleanup.
+    pub(super) fn delete_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let session_id = required_text(&params, "session_id")?;
+        anyhow::ensure!(
+            session_id != self.session_id,
+            "cannot delete the active session"
+        );
+        let mut store = SqliteStore::open(&self.data_root)?;
+        let session = store
+            .load_session(&session_id)?
+            .context("session not found")?;
+        store.delete_session_with(&session_id, || self.plan_file.delete_session(&session.id))?;
+        Ok((
+            json!({ "deleted": session_id, "provider_session_preserved": true }),
+            Vec::new(),
+        ))
+    }
+
+    /// Persists an annotation independently of provider execution after checking its session.
+    pub(super) fn save_exchange_comment(
+        &self,
+        params: Value,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
+        let mut store = SqliteStore::open(&self.data_root)?;
+        let mut comment: ExchangeComment = serde_json::from_value(params)?;
+        anyhow::ensure!(
+            store
+                .load_exchange(&comment.exchange_id)?
+                .is_some_and(|interaction| interaction.session_id == self.session_id),
+            "interaction comment does not belong to the active session"
+        );
+        comment.created_at_ms = SystemClock.now_ms();
+        store.save_exchange_comment(&comment)?;
+        Ok((serde_json::to_value(comment)?, Vec::new()))
+    }
+
+    /// Reads an immutable submitted declaration without acquiring execution ownership.
+    pub(super) fn read_plan_declaration(
+        &self,
+        params: Value,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
+        let plan_id = required_text(&params, "plan_id")?;
+        let path = required_text(&params, "path")?;
+        let revision: u32 =
+            serde_json::from_value(params.get("revision").context("missing revision")?.clone())?;
+        let baseline = params
+            .get("baseline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let store = SqliteStore::open(&self.data_root)?;
+        let plan = store
+            .load_plan(&plan_id)?
+            .context("plan artifact not found")?;
+        anyhow::ensure!(
+            plan.session_id == self.session_id,
+            "plan belongs to another session"
+        );
+        let document =
+            self.plan_file
+                .read_submitted_document(&self.session_id, &plan_id, revision)?;
+        let design = document
+            .design
+            .context("plan has no declaration snapshot")?;
+        let text = if params
+            .get("document")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            design
+                .document
+                .sections()
+                .into_iter()
+                .find(|section| section.title == path)
+                .context("unknown plan overview section")?
+                .text
+        } else if baseline {
+            crate::plan::calls::present(
+                &path,
+                &design
+                    .baseline
+                    .get(&path)
+                    .context("declaration baseline not found")?
+                    .text,
+                design
+                    .baseline_calls
+                    .get(&path)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )?
+            .declaration
+            .text
+            .clone()
+        } else {
+            crate::plan::calls::present(
+                &path,
+                design
+                    .proposed
+                    .get(&path)
+                    .context("proposed declaration not found")?,
+                design
+                    .proposed_calls
+                    .get(&path)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )?
+            .declaration
+            .text
+            .clone()
+        };
+        Ok((
+            json!({ "text": text, "path": path, "revision": revision, "baseline": baseline }),
+            Vec::new(),
+        ))
+    }
+
     /// Persists conversation-scoped check editing without starting or interrupting a turn.
     pub(super) fn set_check_editing(&self, enabled: bool) -> Result<Value> {
         let session = SqliteStore::open(&self.data_root)?
@@ -79,9 +211,15 @@ impl BrokerObserver {
             active_wait: broker.active_wait_projection.clone(),
             no_checkpoint: matches!(broker.workspace_kind, WorkspaceKind::Untracked(_)),
         };
+        let mut session = broker.session.clone();
+        session.name = broker
+            .store
+            .load_session(&session.id)?
+            .context("observed session is missing")?
+            .name;
         let result = self.build(
             &broker.store,
-            &broker.session,
+            &session,
             &metadata,
             broker.agent_registry.list(),
             revision,
@@ -370,6 +508,16 @@ impl BrokerObserver {
             HarnessMethod::AgentList => serde_json::to_value(self.snapshot()?.agent)?,
             HarnessMethod::SessionList => self.list_session(params)?.0,
             HarnessMethod::SessionPreview => self.preview_session(params)?.0,
+            HarnessMethod::SessionRename => self.rename_session(params)?.0,
+            HarnessMethod::SessionDelete => self.delete_session(params)?.0,
+            HarnessMethod::ExchangeCommentSave => self.save_exchange_comment(params)?.0,
+            HarnessMethod::ExchangeRollbackPreview => {
+                let store = SqliteStore::open(&self.data_root)?;
+                let id = required_text(&params, "preview_id")?;
+                crate::checkpoint::RestorePreview::load(&store.objects, &self.session_id, &id)?
+                    .summary(params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize)
+            }
+            HarnessMethod::PlanDeclaration => self.read_plan_declaration(params)?.0,
             HarnessMethod::PlanList => self.list_replanning_choices()?.0,
             HarnessMethod::PlanGet => self.plan(params)?,
             HarnessMethod::ExchangeList => serde_json::to_value(self.list_exchange_review()?)?,

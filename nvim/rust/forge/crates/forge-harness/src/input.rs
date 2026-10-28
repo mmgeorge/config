@@ -15,6 +15,13 @@ pub enum InputIntent {
     Queue,
 }
 
+/// Selects whether admission starts a queued turn or adds input to the active turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputRoute {
+    Turn,
+    Steering,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputDelivery {
@@ -350,7 +357,12 @@ impl SessionInputQueue {
         Ok(())
     }
 
-    pub fn claim(&self, id: &str, revision: u64) -> Result<Option<InputMessage>> {
+    pub fn claim(
+        &self,
+        id: &str,
+        revision: u64,
+        route: InputRoute,
+    ) -> Result<Option<InputMessage>> {
         let mut state = self
             .state
             .lock()
@@ -368,11 +380,16 @@ impl SessionInputQueue {
             || message.revision != revision
             || message.reservation.is_some()
             || message.delivery != InputDelivery::Queued
+            || (route == InputRoute::Steering
+                && (message.intent != InputIntent::Auto || message.config.is_some()))
         {
             return Ok(None);
         }
         if snapshot.messages[..index].iter().any(|previous| {
             previous.task_id == message.task_id
+                && !(route == InputRoute::Steering
+                    && previous.intent == InputIntent::Queue
+                    && previous.delivery == InputDelivery::Queued)
                 && !matches!(
                     previous.delivery,
                     InputDelivery::Delivering | InputDelivery::Accepted | InputDelivery::Failed

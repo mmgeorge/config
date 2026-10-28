@@ -51,13 +51,18 @@ operation outcomes for that controller's lifetime. `input.apply`, `input.get`, a
 without acquiring the provider execution lock. The input worker reuses execution
 admission, provider steering, task controls, and the submission journal.
 
+Ctrl-S sends ordinary input into an active steerable turn even when Ctrl-Q has
+already queued follow-ups. Explicit follow-ups retain FIFO order for later turns.
+Steering preserves the order of immediate messages and does not bypass uncertain
+delivery, pending configuration, or the session's pause barrier.
+
 Neovim retains confirmed input state, pending optimistic operations, and editor
 drafts separately. Submitting or editing changes the display before an
 acknowledgement arrives. Typing stays local. Replies retire their matching
 operation and reapply later pending operations over confirmed state. A rejected
 submission cannot replace newer composer text.
 
-Edit reservations prevent delivery of the reserved message and following queue
+Edit reservations prevent next-turn delivery of the reserved message and following queue
 entries. Saving commits the reserved revisions together. Removing or unqueueing
 does not send the captured text. A delivery that wins before reservation leaves
 the edited draft available rather than changing a message already sent.
@@ -87,6 +92,15 @@ The existing five-second SQLite busy timeout waits for another writer rather tha
 failing a read-to-write transaction upgrade. Read-only snapshots retain deferred
 transactions so they do not exclude writers. Real storage failures and exhausted
 write waits remain explicit.
+
+Session renaming, exchange comments, submitted declaration reads, and rollback
+preview reads use the observer connection while a provider turn runs. Deleting
+another session also uses this path, but must acquire that target's operating-system
+ownership lock. The current session and sessions owned by another host remain protected.
+Rename writers hold a revocable reference to the current runtime lock and commit
+the name with its timeline event. Runtime saves preserve the committed name, and
+published snapshots read it from storage. An expected-name check prevents a late
+generated title from replacing a newer user rename.
 
 ## Timeline storage and incremental projection
 
@@ -1054,10 +1068,13 @@ therefore reads only the current ordered interaction model.
 
 SQLite uses WAL mode under
 `stdpath("data")/forge/harness/harness.sqlite3`. File content lives in a SHA-256
-object store, while plans retain canonical JSON and generated Markdown projections under `plans/`. A session
-lease grants one live Neovim write control and leaves other instances free to browse.
-Immediate SQLite transactions arbitrate acquisition, a ten-second heartbeat protects long
-turns, and owner-checked saves prevent a stale broker from overwriting a replacement owner.
+object store, while plans retain canonical JSON and generated Markdown projections under `plans/`.
+Each live session owner holds an operating-system file lock for the entire controller lifetime,
+including idle periods and long turns. Process exit releases the lock, so recovery requires no
+heartbeat or clock-based expiry. Immediate SQLite transactions record ownership after lock
+acquisition, and owner-checked saves prevent a stale broker from overwriting a replacement owner.
+Deletion acquires the target session's lock before removing its files or database records.
+Rename requires the owning broker and commits the new name and timeline event in one transaction.
 An initialization collision returns structured lease metadata instead of a terminal string
 failure. Neovim offers Retry and Start New Session for every collision, and adds Fork Session
 only when the persisted backend capability advertises native fork. Fork recovery initializes

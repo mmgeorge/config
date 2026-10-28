@@ -375,7 +375,7 @@ records, operation receipts, and complete cross-language shape validation remain
 
 `ForgeRuntime` constructs a lazy `HarnessService` alongside the shared repository store and diff
 engine. Construction opens no provider, repository, or durable store. The service owns initialization,
-session controllers, provider-fork gates, lease heartbeats, and independent control routing. The root
+session controllers, provider-fork gates, session ownership, and independent control routing. The root
 router delegates Harness work through the service and keeps host handshake and repository routing.
 The executable no longer contains session-controller or provider-operation implementations.
 

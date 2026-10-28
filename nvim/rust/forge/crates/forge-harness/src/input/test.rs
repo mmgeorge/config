@@ -38,8 +38,8 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
         },
     })?;
     assert!(reserved.error.is_none());
-    assert!(input.claim("first", 1)?.is_none());
-    assert!(input.claim("second", 1)?.is_none());
+    assert!(input.claim("first", 1, InputRoute::Turn)?.is_none());
+    assert!(input.claim("second", 1, InputRoute::Turn)?.is_none());
     let rejected = input.apply(InputOperation {
         id: "stale-edit".into(),
         control_revision: 0,
@@ -72,9 +72,9 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
     })?;
     assert!(committed.error.is_none());
     input.suspend(true)?;
-    assert!(input.claim("first", 3)?.is_none());
+    assert!(input.claim("first", 3, InputRoute::Turn)?.is_none());
     input.suspend(false)?;
-    assert!(input.claim("first", 3)?.is_some());
+    assert!(input.claim("first", 3, InputRoute::Turn)?.is_some());
     let missed_edit = input.apply(InputOperation {
         id: "late-edit".into(),
         control_revision: 0,
@@ -86,7 +86,7 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
     })?;
     assert!(missed_edit.error.is_some());
     input.delivery("first", None, None, None)?;
-    assert!(input.claim("second", 1)?.is_some());
+    assert!(input.claim("second", 1, InputRoute::Turn)?.is_some());
     input.delivery(
         "second",
         Some(InputDelivery::Unknown),
@@ -98,7 +98,7 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
         restored.snapshot()?.messages[0].delivery,
         InputDelivery::Unknown
     );
-    assert!(restored.claim("second", 3)?.is_none());
+    assert!(restored.claim("second", 3, InputRoute::Turn)?.is_none());
     assert_eq!(
         restored.operation("submit-first")?.unwrap().revision,
         first.revision
@@ -126,7 +126,9 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
     }
     restored.apply(independent)?;
     assert!(
-        restored.claim("different-task", 1)?.is_some(),
+        restored
+            .claim("different-task", 1, InputRoute::Turn)?
+            .is_some(),
         "an old task's queue blocked a different task"
     );
     std::thread::scope(|scope| {
@@ -161,8 +163,95 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
         Some("pre-delivery failure".into()),
     )?;
     assert!(
-        failed.claim("following", 1)?.is_some(),
+        failed.claim("following", 1, InputRoute::Turn)?.is_some(),
         "failed input blocked the runnable queue"
+    );
+    Ok(())
+}
+
+#[test]
+fn steering_bypasses_only_explicit_queued_messages() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("first-queued"))?;
+    input.apply(submit("second-queued"))?;
+    for id in ["first-steering", "second-steering"] {
+        let mut operation = submit(id);
+        if let InputAction::Submit { message } = &mut operation.action {
+            message.intent = InputIntent::Auto;
+        }
+        input.apply(operation)?;
+    }
+    assert!(
+        input
+            .claim("first-steering", 1, InputRoute::Turn)?
+            .is_none()
+    );
+    assert!(
+        input
+            .claim("first-queued", 1, InputRoute::Steering)?
+            .is_none()
+    );
+    assert!(
+        input
+            .claim("second-steering", 1, InputRoute::Steering)?
+            .is_none()
+    );
+    input.suspend(true)?;
+    assert!(
+        input
+            .claim("first-steering", 1, InputRoute::Steering)?
+            .is_none()
+    );
+    input.suspend(false)?;
+    assert!(
+        input
+            .claim("first-steering", 1, InputRoute::Steering)?
+            .is_some()
+    );
+    input.delivery("first-steering", None, None, None)?;
+    assert!(
+        input
+            .claim("second-steering", 1, InputRoute::Steering)?
+            .is_some()
+    );
+    input.delivery("second-steering", None, None, None)?;
+    assert!(input.claim("second-queued", 1, InputRoute::Turn)?.is_none());
+    assert!(input.claim("first-queued", 1, InputRoute::Turn)?.is_some());
+    input.delivery("first-queued", None, None, None)?;
+    assert!(input.claim("second-queued", 1, InputRoute::Turn)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn steering_respects_uncertain_delivery_and_configuration_barriers() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("uncertain"))?;
+    input.delivery("uncertain", Some(InputDelivery::Unknown), None, None)?;
+    let mut steering = submit("steering");
+    if let InputAction::Submit { message } = &mut steering.action {
+        message.intent = InputIntent::Auto;
+    }
+    input.apply(steering.clone())?;
+    assert!(input.claim("steering", 1, InputRoute::Steering)?.is_none());
+    input.delivery("uncertain", None, None, None)?;
+    assert!(input.claim("steering", 1, InputRoute::Steering)?.is_some());
+    let mut configuration = submit("configuration");
+    if let InputAction::Submit { message } = &mut configuration.action {
+        message.intent = InputIntent::Auto;
+        message.config = Some(serde_json::json!({"model":"next-model"}));
+    }
+    let configured = SessionInputQueue::default();
+    configured.apply(configuration)?;
+    configured.apply(steering)?;
+    assert!(
+        configured
+            .claim("configuration", 1, InputRoute::Steering)?
+            .is_none()
+    );
+    assert!(
+        configured
+            .claim("steering", 1, InputRoute::Steering)?
+            .is_none()
     );
     Ok(())
 }

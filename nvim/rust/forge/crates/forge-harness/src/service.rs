@@ -1218,10 +1218,6 @@ impl SessionController {
                                 })
                                 .await?;
                         }
-                        let (root, owner, client_id) = broker.lease_identity();
-                        let (stop, stopped) = tokio::sync::oneshot::channel();
-                        let heartbeat =
-                            tokio::spawn(run_lease_heartbeat(root, owner, client_id, stopped));
                         let dispatch = async {
                             let mut continuing = dispatch_task_attempt(
                                 &mut broker,
@@ -1248,8 +1244,6 @@ impl SessionController {
                             Ok::<(), anyhow::Error>(())
                         }
                         .await;
-                        let _ = stop.send(());
-                        heartbeat.await.context("input timeout lease task failed")?;
                         dispatch?;
                     }
                     Ok::<(), anyhow::Error>(())
@@ -1767,7 +1761,10 @@ async fn route_request(
     if method == HarnessMethod::SessionFork {
         return route_session_fork(registry, session_id, request, message_sink).await;
     }
-    if method == HarnessMethod::SessionNew {
+    if matches!(
+        method,
+        HarnessMethod::SessionNew | HarnessMethod::SessionClear
+    ) {
         return route_new_session(registry, session_id, request, message_sink).await;
     }
     let controller = registry.resolve(&session_id).await?;
@@ -2534,14 +2531,6 @@ async fn route_request(
         None
     };
     let (mut broker, _admission) = acquire_request_broker(&controller, method).await?;
-    let (data_root, lease_session_id, client_id) = broker.lease_identity();
-    let (heartbeat_stop, heartbeat_stopped) = tokio::sync::oneshot::channel();
-    let heartbeat = tokio::spawn(run_lease_heartbeat(
-        data_root,
-        lease_session_id,
-        client_id,
-        heartbeat_stopped,
-    ));
     let message_sink_for_event = message_sink.clone();
     let routed_session_id = session_id.clone();
     let event_forwarder = tokio::spawn(async move {
@@ -2615,8 +2604,6 @@ async fn route_request(
     let catalog_request = broker.backend_catalog_request();
     drop(broker);
     *controller.catalog_request.write().await = catalog_request;
-    let _ = heartbeat_stop.send(());
-    let _ = heartbeat.await;
 
     if let Some(child_session_id) = result
         .response
@@ -3192,9 +3179,6 @@ async fn execute_task_transition(
     })
     .await?;
     let mut broker = controller.broker.lock().await;
-    let (root, session_id, client_id) = broker.lease_identity();
-    let (stop, stopped) = tokio::sync::oneshot::channel();
-    let heartbeat = tokio::spawn(run_lease_heartbeat(root, session_id, client_id, stopped));
     let mut request = Request {
         id: 0,
         method: "task.transition".into(),
@@ -3229,8 +3213,6 @@ async fn execute_task_transition(
     };
     *controller.catalog_request.write().await = broker.backend_catalog_request();
     drop(broker);
-    let _ = stop.send(());
-    heartbeat.await?;
     operation.exchange_id = store
         .list_exchange(&operation.session_id)?
         .last()
@@ -3940,30 +3922,6 @@ fn validate_root_control(value: Option<&Value>) -> Result<()> {
         "Root turn controls cannot address provider child threads. Use agent.message or agent.interrupt with a Harness child identity"
     );
     Ok(())
-}
-
-async fn run_lease_heartbeat(
-    data_root: PathBuf,
-    session_id: String,
-    client_id: String,
-    mut stopped: tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
-    interval.tick().await;
-    loop {
-        tokio::select! {
-            _ = &mut stopped => return,
-            _ = interval.tick() => {
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                if let Ok(mut store) = SqliteStore::open(&data_root) {
-                    let _ = store.renew_session_lease(&session_id, &client_id, now_ms);
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -5300,6 +5258,16 @@ mod tests {
             .to_owned();
         let registry = service.registry().await.unwrap();
         let controller = registry.resolve(&session_id).await.unwrap();
+        let inactive = prepare_new_session(
+            std::path::Path::new(&registry.initialize.data_root),
+            &registry.initialize.client_id,
+            "mock",
+            false,
+            &session_id,
+            &json!({"name":"inactive deletion target"}),
+            0,
+        )
+        .unwrap();
         let _execution = Arc::clone(&controller.execution_admission)
             .try_acquire_owned()
             .unwrap();
@@ -5310,6 +5278,11 @@ mod tests {
                 "history.record",
                 json!({"text":"prompt recorded during execution"}),
             ),
+            (
+                "session.rename",
+                json!({"session_id":session_id,"name":"active rename"}),
+            ),
+            ("session.delete", json!({"session_id":inactive.id})),
             ("state.get", json!({})),
             ("task.list", json!({})),
             ("plan.list", json!({})),
@@ -5339,6 +5312,7 @@ mod tests {
             assert_eq!(value["id"], 2, "{method}: {value}");
             assert!(value["error"].is_null(), "{method}: {value}");
             if method == "state.get" {
+                assert_eq!(value["result"]["session"]["name"], "active rename");
                 assert_eq!(
                     value["result"]["prompt_history"][0]["text"],
                     "prompt recorded during execution"
@@ -5368,6 +5342,35 @@ mod tests {
             error.to_string().contains("requires a settled session"),
             "{error:#}"
         );
+        assert_eq!(broker.snapshot().unwrap().session.name, "active rename");
+        for (offset, method) in ["session.new", "session.clear"].into_iter().enumerate() {
+            let request_id = 10 + offset as u64;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                service.dispatch(
+                    Some(session_id.clone()),
+                    Request {
+                        id: request_id,
+                        method: method.into(),
+                        params: json!({}),
+                    },
+                    &sink,
+                ),
+            )
+            .await
+            .expect("new sessions must not wait for source execution")
+            .unwrap();
+            loop {
+                let frame = output.recv().await.unwrap().unwrap();
+                let response: Value = serde_json::from_slice(frame.bytes()).unwrap();
+                if response["id"] != request_id {
+                    continue;
+                }
+                assert!(response["error"].is_null(), "{response}");
+                assert_ne!(response["result"]["session"]["id"], session_id);
+                break;
+            }
+        }
         drop(broker);
         drop(_execution);
         service.shutdown(Duration::from_secs(1)).await.unwrap();

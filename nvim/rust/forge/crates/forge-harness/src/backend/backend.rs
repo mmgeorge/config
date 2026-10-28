@@ -1007,8 +1007,13 @@ impl Backend for MockBackend {
         Ok(())
     }
 
-    async fn has_active_turn(&self, _session_id: &str) -> bool {
-        false
+    async fn has_active_turn(&self, session_id: &str) -> bool {
+        self.steering_by_session
+            .lock()
+            .expect("mock steering map poisoned")
+            .get(session_id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|lane| lane.is_active())
     }
 
     async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
@@ -2056,6 +2061,8 @@ mod test {
             )
             .await
             .unwrap();
+        assert!(backend.has_active_turn("harness-session").await);
+        assert!(!backend.has_active_turn("other-session").await);
         backend
             .steer_session("harness-session", input)
             .await
@@ -2070,6 +2077,7 @@ mod test {
             .await
             .unwrap();
         let output = prompt.await.unwrap().unwrap();
+        assert!(!backend.has_active_turn("harness-session").await);
         assert!(matches!(
             submission.record().unwrap().delivery,
             crate::backend::submission::SubmissionState::Accepted { .. }

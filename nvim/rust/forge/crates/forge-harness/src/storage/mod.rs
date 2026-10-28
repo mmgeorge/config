@@ -1,9 +1,13 @@
 pub(crate) mod inspection;
+pub(crate) mod lifecycle;
 pub(crate) mod model_pin;
 pub mod objects;
 mod ownership;
 mod recovery;
 mod tool_output;
+
+#[cfg(test)]
+mod concurrency_tests;
 
 use crate::agent::Agent;
 use crate::checkpoint::CheckpointRecord;
@@ -33,7 +37,7 @@ struct SessionEnvelope {
 /// Owns SQLite metadata and content-addressed objects for the Harness broker.
 pub struct SqliteStore {
     connection: Connection,
-    session_lock: std::collections::HashMap<String, fs::File>,
+    session_lock: std::collections::HashMap<String, std::sync::Arc<fs::File>>,
     data_root: std::path::PathBuf,
     pub objects: objects::ObjectStore,
 }
@@ -72,11 +76,19 @@ impl SqliteStore {
         Ok(value)
     }
 
-    /// Holds an operating-system lock so lease expiry cannot admit a second live runtime.
+    /// Holds an operating-system lock for the lifetime of one session owner.
     pub(crate) fn lock_session(&mut self, session_id: &str) -> Result<()> {
         if self.session_lock.contains_key(session_id) {
             return Ok(());
         }
+        let owner = self.acquire_runtime_lock(session_id)?;
+        self.session_lock
+            .insert(session_id.to_owned(), std::sync::Arc::new(owner));
+        Ok(())
+    }
+
+    /// Acquires an independent lock handle for runtime ownership or session deletion.
+    fn acquire_runtime_lock(&self, session_id: &str) -> Result<fs::File> {
         let directory = self.data_root.join("session-owner");
         fs::create_dir_all(&directory)?;
         let path = directory.join(format!(
@@ -106,8 +118,7 @@ impl SqliteStore {
                 ));
             }
         }
-        self.session_lock.insert(session_id.to_owned(), owner);
-        Ok(())
+        Ok(owner)
     }
     /// Loads workflow history for a single conversation.
     pub fn list_task(&self, session_id: &str) -> Result<Vec<crate::task::TaskRecord>> {
@@ -165,7 +176,7 @@ impl SqliteStore {
             transaction.execute("INSERT INTO plan_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![plan.id, session.id, encode(&payload)?])?;
         }
         transaction.execute(
-            "UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1",
+            "UPDATE session_record SET payload=json_set(?2,'$.session.name',json_extract(payload,'$.session.name')),updated_at_ms=?3 WHERE id=?1",
             params![session.id, encode_session(session)?, session.updated_at_ms],
         )?;
         transaction.commit()?;
@@ -234,7 +245,7 @@ impl SqliteStore {
             transaction.execute(&format!("INSERT INTO {table}(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload"), params![id, session.id, encode(&payload)?])?;
         }
         transaction.execute(
-            "UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1",
+            "UPDATE session_record SET payload=json_set(?2,'$.session.name',json_extract(payload,'$.session.name')),updated_at_ms=?3 WHERE id=?1",
             params![session.id, encode_session(session)?, session.updated_at_ms],
         )?;
         transaction.commit()?;
@@ -499,12 +510,11 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Acquire one session lease inside an immediate SQLite transaction.
+    /// Acquires durable session ownership while holding its process lock.
     pub fn acquire_session_lease(
         &mut self,
         session_id: &str,
         client_id: &str,
-        now_ms: i64,
     ) -> Result<HarnessSession> {
         self.lock_session(session_id)?;
         let transaction = self
@@ -521,8 +531,7 @@ impl SqliteStore {
             .with_context(|| format!("Harness session {session_id} uses an outdated format"))?;
         discard_incompatible_plan_state(&transaction, &mut session)?;
         session.lease_owner = None;
-        session.lease_expires_at_ms = None;
-        session.acquire_lease(client_id, now_ms)?;
+        session.acquire_lease(client_id)?;
         transaction.execute(
             "UPDATE session_record SET payload=?2 WHERE id=?1",
             params![session_id, encode_session(&session)?],
@@ -548,7 +557,6 @@ impl SqliteStore {
             && session.lease_owner.as_deref() == Some(client_id)
         {
             session.lease_owner = None;
-            session.lease_expires_at_ms = None;
             transaction.execute(
                 "UPDATE session_record SET payload=?2 WHERE id=?1",
                 params![session_id, encode_session(&session)?],
@@ -556,36 +564,6 @@ impl SqliteStore {
         }
         transaction.commit()?;
         self.session_lock.remove(session_id);
-        Ok(())
-    }
-
-    /// Renew one lease only while the requesting client remains its owner.
-    pub fn renew_session_lease(
-        &mut self,
-        session_id: &str,
-        client_id: &str,
-        now_ms: i64,
-    ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let payload: String = transaction.query_row(
-            "SELECT payload FROM session_record WHERE id=?1",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        let mut session = decode_current_session(&payload)?
-            .with_context(|| format!("Harness session {session_id} uses an outdated format"))?;
-        anyhow::ensure!(
-            session.lease_owner.as_deref() == Some(client_id),
-            "Harness session lease ownership changed"
-        );
-        session.lease_expires_at_ms = Some(now_ms + 30_000);
-        transaction.execute(
-            "UPDATE session_record SET payload=?2 WHERE id=?1",
-            params![session_id, encode_session(&session)?],
-        )?;
-        transaction.commit()?;
         Ok(())
     }
 
@@ -613,7 +591,7 @@ impl SqliteStore {
             "Harness session lease ownership changed"
         );
         transaction.execute(
-            "UPDATE session_record SET workspace=?2, updated_at_ms=?3, payload=?4 WHERE id=?1",
+            "UPDATE session_record SET workspace=?2, updated_at_ms=?3, payload=json_set(?4,'$.session.name',json_extract(payload,'$.session.name')) WHERE id=?1",
             params![
                 session.id,
                 session.workspace,
@@ -1425,7 +1403,7 @@ impl SessionStore for SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES(?1, ?2, ?3, ?4)\
-             ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, updated_at_ms=excluded.updated_at_ms, payload=excluded.payload",
+             ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, updated_at_ms=excluded.updated_at_ms, payload=json_set(excluded.payload,'$.session.name',json_extract(session_record.payload,'$.session.name'))",
             params![
                 session.id,
                 session.workspace,
@@ -1474,9 +1452,7 @@ impl SessionStore for SqliteStore {
     }
 
     fn delete_session(&mut self, session_id: &str) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM session_record WHERE id=?1", [session_id])?;
-        Ok(())
+        self.delete_session_with(session_id, || Ok(()))
     }
 }
 
@@ -1892,9 +1868,7 @@ mod test {
         let reopened = store.load_session("current").unwrap().unwrap();
         assert!(reopened.current_task_id.is_none() && reopened.goal_id.is_none());
         assert_eq!(reopened.name, "current");
-        let leased = store
-            .acquire_session_lease("current", "client", 10)
-            .unwrap();
+        let leased = store.acquire_session_lease("current", "client").unwrap();
         assert!(leased.current_task_id.is_none() && leased.goal_id.is_none());
     }
 
@@ -1953,7 +1927,7 @@ mod test {
         Ok(())
     }
 
-    fn session(id: &str, workspace: &str) -> HarnessSession {
+    pub(super) fn session(id: &str, workspace: &str) -> HarnessSession {
         HarnessSession {
             id: id.into(),
             primary_agent_id: HarnessSession::primary_agent_id(id),
@@ -1984,7 +1958,6 @@ mod test {
             updated_at_ms: 1,
             goal_id: None,
             lease_owner: None,
-            lease_expires_at_ms: None,
             native_fork: false,
             native_compact: false,
             context_usage: None,
@@ -2214,28 +2187,25 @@ mod test {
         let mut first = SqliteStore::open(temporary.path()).unwrap();
         first.save_session(&session("session", "D:/work")).unwrap();
         let owned = first
-            .acquire_session_lease("session", "client-one", 10)
+            .acquire_session_lease("session", "client-one")
             .unwrap();
         let mut second = SqliteStore::open(temporary.path()).unwrap();
         assert!(
             second
-                .acquire_session_lease("session", "client-two", 20)
+                .acquire_session_lease("session", "client-two")
                 .is_err()
         );
-        first
-            .renew_session_lease("session", "client-one", 25)
-            .unwrap();
         assert!(
             second
-                .acquire_session_lease("session", "client-two", 30_026)
+                .acquire_session_lease("session", "client-two")
                 .is_err(),
-            "lease expiry must not replace a live runtime owner"
+            "a live runtime owner must not be replaced"
         );
         first
             .release_session_lease("session", "client-one")
             .unwrap();
         let replacement = second
-            .acquire_session_lease("session", "client-two", 30_026)
+            .acquire_session_lease("session", "client-two")
             .unwrap();
         assert_eq!(replacement.lease_owner.as_deref(), Some("client-two"));
         assert!(first.save_owned_session(&owned, "client-one").is_err());

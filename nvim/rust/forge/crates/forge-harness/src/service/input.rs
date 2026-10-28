@@ -1,7 +1,7 @@
 use super::*;
 use crate::backend::submission::{Submission, SubmissionState, SubmissionStore};
 use crate::input::{
-    InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputUpdate,
+    InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputRoute, InputUpdate,
 };
 
 impl SessionController {
@@ -195,15 +195,36 @@ impl SessionController {
             return Ok(InputProgress::Waiting);
         }
         let snapshot = self.observer.snapshot()?;
-        let Some(message) = input.messages.into_iter().find(|message| {
+        let mut pending = input.messages.into_iter().filter(|message| {
             message.task_id == snapshot.session.current_task_id
                 && !matches!(
                     message.delivery,
                     InputDelivery::Delivering | InputDelivery::Accepted | InputDelivery::Failed
                 )
-        }) else {
+        });
+        let Some(mut message) = pending.next() else {
             return self.complete_input_checks(sink, jobs).await;
         };
+        let Ok(control) = self.control_admission.clone().try_acquire_owned() else {
+            return Ok(InputProgress::Waiting);
+        };
+        let admission = self.execution_admission.clone().try_acquire_owned().ok();
+        let steering_available = admission.is_none()
+            && !*steering
+            && (self.parent_input.is_active()
+                || snapshot.capability.native_steer
+                    && self.backend.has_active_turn(&snapshot.session.id).await);
+        if steering_available
+            && message.intent == InputIntent::Queue
+            && message.delivery == InputDelivery::Queued
+        {
+            let Some(immediate) = pending.find(|message| {
+                message.intent != InputIntent::Queue || message.delivery != InputDelivery::Queued
+            }) else {
+                return Ok(InputProgress::WaitExecution);
+            };
+            message = immediate;
+        }
         if message.delivery != InputDelivery::Queued || message.reservation.is_some() {
             return Ok(InputProgress::Waiting);
         }
@@ -242,21 +263,17 @@ impl SessionController {
         {
             return Ok(InputProgress::Waiting);
         }
-        let Ok(control) = self.control_admission.clone().try_acquire_owned() else {
-            return Ok(InputProgress::Waiting);
-        };
-        let admission = self.execution_admission.clone().try_acquire_owned().ok();
-        let steer = admission.is_none()
-            && message.intent == InputIntent::Auto
-            && message.config.is_none()
-            && !*steering
-            && (self.parent_input.is_active()
-                || snapshot.capability.native_steer
-                    && self.backend.has_active_turn(&snapshot.session.id).await);
+        let steer =
+            steering_available && message.intent == InputIntent::Auto && message.config.is_none();
         if admission.is_none() && !steer {
             return Ok(InputProgress::WaitExecution);
         }
-        let Some(message) = self.input.claim(&message.id, message.revision)? else {
+        let route = if steer {
+            InputRoute::Steering
+        } else {
+            InputRoute::Turn
+        };
+        let Some(message) = self.input.claim(&message.id, message.revision, route)? else {
             return Ok(InputProgress::Waiting);
         };
         if admission.is_some() {
@@ -455,9 +472,6 @@ impl SessionController {
                 }
                 Ok::<(), anyhow::Error>(())
             });
-            let (root, owner, client_id) = broker.lease_identity();
-            let (stop, stopped) = tokio::sync::oneshot::channel();
-            let heartbeat = tokio::spawn(run_lease_heartbeat(root, owner, client_id, stopped));
             let mut acceptance = submission.acceptance();
             let mut response = {
                 let mut dispatch = Box::pin(
@@ -541,8 +555,6 @@ impl SessionController {
             );
             *self.catalog_request.write().await = broker.backend_catalog_request();
             drop(broker);
-            let _ = stop.send(());
-            heartbeat.await.context("input lease heartbeat failed")?;
             self.trace.record(
                 &catalog.harness_session_id,
                 "input.forwarder_pending",
