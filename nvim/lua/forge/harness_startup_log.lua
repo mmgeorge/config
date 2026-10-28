@@ -1,6 +1,5 @@
 local M = {}
 local sequence = 0
-local pending, writing, directory_ready = {}, false, false
 local watched = {}
 local active = {}
 local redraw_namespace
@@ -21,48 +20,7 @@ local function report(failure)
   vim.schedule(function() vim.notify("Harness startup log: " .. tostring(failure), vim.log.levels.ERROR) end)
 end
 
-local function flush()
-  if writing or #pending == 0 then return end
-  writing = true
-  local path = M.path()
-  if not directory_ready then
-    local success, failure = pcall(vim.fn.mkdir, vim.fs.dirname(path), "p")
-    if not success then writing = false report(failure) return end
-    directory_ready = true
-  end
-  local contents = table.concat(pending)
-  pending = {}
-  vim.uv.fs_open(path, "a", 384, function(failure, descriptor)
-    if failure then writing = false report(failure) return end
-    local offset = 0
-    local function write_next()
-      vim.uv.fs_write(descriptor, contents:sub(offset + 1), -1, function(write_error, count)
-        if write_error or not count or count == 0 then
-          vim.uv.fs_close(descriptor, function() end)
-          writing = false
-          report(write_error or "No progress writing startup record")
-          vim.schedule(flush)
-          return
-        end
-        offset = offset + count
-        if offset < #contents then write_next() return end
-        vim.uv.fs_close(descriptor, function(close_error)
-          writing = false
-          if close_error then report(close_error) end
-          vim.schedule(flush)
-        end)
-      end)
-    end
-    write_next()
-  end)
-end
-
-local function record(value)
-  local success, encoded = pcall(vim.json.encode, value)
-  if not success then report(encoded) return end
-  pending[#pending + 1] = encoded .. "\n"
-  vim.schedule(flush)
-end
+local writer = require("forge.infra.jsonl_log").new(function() return M.path() end, report)
 
 ---@param phase string
 ---@param fields? table
@@ -81,7 +39,7 @@ function M.begin(fields)
   function trace.mark(phase, metadata)
     if trace.finished then return end
     local now = vim.uv.hrtime()
-    record({ time = os.date("!%Y-%m-%dT%H:%M:%SZ"), pid = vim.fn.getpid(), startup_id = trace.id,
+    writer.append({ time = os.date("!%Y-%m-%dT%H:%M:%SZ"), pid = vim.fn.getpid(), startup_id = trace.id,
       phase = phase, elapsed_ms = (now - started) / 1e6, since_previous_ms = (now - previous) / 1e6, fields = metadata })
     previous = now
   end

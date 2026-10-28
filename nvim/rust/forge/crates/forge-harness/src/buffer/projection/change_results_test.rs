@@ -53,6 +53,34 @@ fn capture(exchange: &mut Exchange, patch: String) {
 }
 
 #[test]
+fn empty_workspace_comparisons_have_no_result_row() {
+    let mut exchange = exchange();
+    capture(&mut exchange, String::new());
+    for phase in [
+        exchange.phase.clone(),
+        crate::exchange::ExchangePhase::Running,
+    ] {
+        exchange.phase = phase;
+        let reopened: Exchange =
+            serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+        let projected = render(&reopened);
+        assert!(
+            !projected
+                .entry
+                .block
+                .iter()
+                .any(|block| block.id.0 == "workspace:results:changes")
+        );
+        assert!(!text(&projected).contains("No workspace changes"));
+        assert!(
+            !projected
+                .action
+                .contains_key(&TargetId("workspace:results:changes".into()))
+        );
+    }
+}
+
+#[test]
 fn workspace_results_ignore_incomplete_provider_reports() {
     let mut exchange = exchange();
     capture(

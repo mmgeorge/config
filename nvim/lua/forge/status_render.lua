@@ -727,9 +727,16 @@ function M.present_context(session, presentation)
       if not context then return end
       local leading = context_entries(session, context)
       local count = 0
+      local changed = false
       while count < session.root:count() and session.root:at(count).entry.kind == "context" do
+        local previous = session.root:at(count)
+        local candidate = leading[count + 1]
+        if not candidate or candidate.id ~= previous.id or not vim.deep_equal(candidate.entry, previous.entry) then
+          changed = true
+        end
         count = count + 1
       end
+      if not changed and count == #leading then return end
       session.root:splice(0, count, leading)
       adopt(session, { root = session.root, file = session.file, body_owner = session.body_owner,
         inventory = session.inventory, fold = session.source_fold })

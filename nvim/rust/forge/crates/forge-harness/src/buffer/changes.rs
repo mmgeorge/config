@@ -146,25 +146,8 @@ impl ChangeTree {
         } else {
             "file"
         };
-        let line_ending_files = patch
-            .file
-            .iter()
-            .filter(|file| file.line_ending_changes > 0)
-            .count();
-        let line_ending_summary = if line_ending_files > 0 {
-            format!(
-                " · line endings changed in {line_ending_files} {}",
-                if line_ending_files == 1 {
-                    "file"
-                } else {
-                    "files"
-                }
-            )
-        } else {
-            String::new()
-        };
         let summary = format!(
-            "▸ {label} {count} {} +{added} -{removed}{line_ending_summary}{suffix}",
+            "▸ {label} {count} {} +{added} -{removed}{suffix}",
             if count == 1 {
                 unit.into()
             } else {
@@ -232,16 +215,6 @@ impl ChangeTree {
                 tree.push_action(heading, file_action(path, 1, true, declaration))?;
             } else {
                 tree.block.push(heading);
-            }
-            if file.line_ending_changes > 0 {
-                tree.block.push(forge_diff::projection::header(
-                    BlockId(format!("{file_id}:line-endings")),
-                    vec![TextChunk {
-                        text: format!("Line endings changed on {} lines", file.line_ending_changes),
-                        capture: "Comment".into(),
-                    }],
-                    0,
-                )?);
             }
             if file.hunk.is_empty() && file.line_ending_changes == 0 {
                 let label = if file.binary {
@@ -755,19 +728,18 @@ fn large_diff_retains_source_and_navigation_without_byte_admission() -> Result<(
 }
 
 #[test]
-fn line_ending_changes_have_separate_counts_and_preserve_raw_actions() -> Result<()> {
+fn line_ending_changes_preserve_counts_and_raw_actions_without_notices() -> Result<()> {
     let width = forge_buffer::width::WidthProfile::default();
     let renderer = TranscriptRenderer::new(&width)?;
     let source = "--- a/file.rs\n+++ b/file.rs\n@@ -1,3 +1,3 @@\n-first\n-old\n-last\n+first\r\n+new\r\n+last\r\n";
     let tree = ChangeTree::render(&renderer, "endings", "Changed", "", source, None, None)?;
-    assert_eq!(
-        tree.block[0].text.row(0),
-        Some("▸ Changed 1 file +1 -1 · line endings changed in 1 file")
-    );
+    assert_eq!(tree.block[0].text.row(0), Some("▸ Changed 1 file +1 -1"));
     assert!(
-        tree.block
+        !tree
+            .block
             .iter()
-            .any(|block| block.text.row(0) == Some("Line endings changed on 2 lines"))
+            .flat_map(|block| block.text.wire_rows())
+            .any(|row| row.to_lowercase().contains("line endings"))
     );
     assert!(
         tree.action

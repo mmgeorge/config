@@ -767,14 +767,15 @@ local function start_process(callback)
   builder.ensure(function(executable_result)
     require("forge.startup_log").write("host.binary.result", { ok = executable_result.ok, path = executable_result.path,
       error = executable_result.message, elapsed_ms = math.floor((vim.uv.hrtime() - host_started) / 1e6) })
-    vim.schedule(function()
+    local function launch_ready()
       if M._client ~= client or client.launch_token ~= launch_token or client.start_callback ~= callback then return end
       if not executable_result.ok or not executable_result.path then
         finish_start(callback, nil, executable_result.message or "Forge executable is unavailable")
         return
       end
       launch(executable_result.path, callback, launch_token)
-    end)
+    end
+    if vim.in_fast_event() then vim.schedule(launch_ready) else launch_ready() end
   end)
 end
 

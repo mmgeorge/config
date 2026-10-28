@@ -697,19 +697,9 @@ function M.open(options)
   vim.b[state.replica.buffer].forge_native_document = true
   vim.b[state.replica.buffer].forge_workspace = options.workspace
     or (options.filename and vim.fs.dirname(options.filename)) or vim.fn.getcwd()
-  local loading_namespace = vim.api.nvim_create_namespace("ForgeStatusLoading")
-  vim.api.nvim_buf_set_extmark(state.replica.buffer, loading_namespace, 0, 0, {
-    virt_text = { { "Loading Forge status…", "Comment" } },
-    virt_text_pos = "overlay",
-  })
   local name = options.name or ("ForgeStatus://" .. document)
   if not pcall(vim.api.nvim_buf_set_name, state.replica.buffer, name) then
     vim.api.nvim_buf_set_name(state.replica.buffer, name .. "#" .. state.replica.buffer)
-  end
-  if options.bind ~= false then
-    vim.api.nvim_win_set_buf(options.window or vim.api.nvim_get_current_win(), state.replica.buffer)
-    require("forge.startup_log").write("status.loading.presented", { document = document,
-      elapsed_ms = math.floor((vim.uv.hrtime() - open_started) / 1e6) })
   end
   state.group = vim.api.nvim_create_augroup("ForgeNativeStatus" .. next_document, { clear = true })
   if not runner_for_test then
@@ -832,9 +822,6 @@ function M.open(options)
   require("forge.startup_log").write("status.open.dispatch", { document = document })
   if not state.active then return end
   request(state, opening, function(result, failure)
-    if vim.api.nvim_buf_is_valid(state.replica.buffer) then
-      vim.api.nvim_buf_clear_namespace(state.replica.buffer, loading_namespace, 0, -1)
-    end
     if failure or not result then
       state.finish_open(failure or "Missing status document")
       state.opening_failed = true
@@ -856,6 +843,11 @@ function M.open(options)
       files = #result.file, rows = state.replica.row_count,
       elapsed_ms = math.floor((vim.uv.hrtime() - snapshot_apply_started) / 1e6) })
     local post_apply_started = vim.uv.hrtime()
+    if options.bind ~= false and vim.api.nvim_win_is_valid(opening_window)
+      and vim.api.nvim_win_get_buf(opening_window) == opening_buffer then
+      vim.api.nvim_win_set_buf(opening_window, state.replica.buffer)
+    end
+    require("forge.startup_log").write("status.window.bound", { document = document, elapsed_us = math.floor((vim.uv.hrtime() - post_apply_started) / 1000) })
     if result.context and result.context ~= vim.NIL then
       state.native_context = true
       local displayed_window = vim.fn.win_findbuf(state.replica.buffer)
@@ -929,6 +921,7 @@ function M.open(options)
           end
         end,
       })
+      require("forge.startup_log").write("status.context.bound", { document = document, elapsed_us = math.floor((vim.uv.hrtime() - post_apply_started) / 1000) })
       require("forge.views.status.issues_editor").attach(state.replica, function(text, callback)
         local window = vim.api.nvim_get_current_win()
         local captured, failure = buffer.capture(state.replica, view_for(state, window), "context",
@@ -947,9 +940,9 @@ function M.open(options)
         require("forge.walkthrough").open({ workspace = options.workspace or vim.fn.getcwd(), window = vim.api.nvim_get_current_win() })
       end
       bind_commands()
-      state.context.refresh()
     end
     M.demand(state)
+    require("forge.startup_log").write("status.demand.sent", { document = document, elapsed_us = math.floor((vim.uv.hrtime() - post_apply_started) / 1000) })
     require("forge.startup_log").write("status.ready", { document = document,
       post_apply_ms = math.floor((vim.uv.hrtime() - post_apply_started) / 1e6),
       elapsed_ms = math.floor((vim.uv.hrtime() - open_started) / 1e6) })
@@ -957,8 +950,18 @@ function M.open(options)
     state.ready = true
     if options.bind ~= false then
       require("forge.startup_log").watch_redraw(state.replica.buffer, document, open_started)
+      vim.cmd.redraw()
     end
     if options.on_ready then options.on_ready(state) end
+    if state.context then
+      vim.schedule(function()
+        if not state.active or not host_current(state) then return end
+        local context_started = vim.uv.hrtime()
+        state.context.refresh()
+        require("forge.startup_log").write("status.context.ready", { document = document,
+          elapsed_us = math.floor((vim.uv.hrtime() - context_started) / 1000) })
+      end)
+    end
     end)
   end)
   end

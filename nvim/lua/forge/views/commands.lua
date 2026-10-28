@@ -254,11 +254,13 @@ end
 function M.open(started_at)
   local command_started = started_at or vim.uv.hrtime()
   require("forge.startup_log").write("status.command.enter")
+  require("forge.client").start()
   local native = require("forge.status")
   local workspace, window = vim.fn.getcwd(), vim.api.nvim_get_current_win()
   if native_main_status and native_main_status.workspace == workspace and native_main_status.state.active
     and vim.api.nvim_buf_is_valid(native_main_status.state.replica.buffer)
   then
+    if not native_main_status.state.ready then return native_main_status.state end
     vim.api.nvim_win_set_buf(window, native_main_status.state.replica.buffer)
     require("forge.startup_log").write("status.buffer.reused", {
       elapsed_ms = math.floor((vim.uv.hrtime() - command_started) / 1e6),

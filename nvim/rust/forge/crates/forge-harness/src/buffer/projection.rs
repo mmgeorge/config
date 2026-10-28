@@ -2471,7 +2471,7 @@ impl TimelineRenderer<'_> {
         suffix: &str,
     ) -> Result<()> {
         if comparison.text().is_empty() {
-            return self.literal(identity, &format!("◇ No workspace changes{suffix}"), None);
+            return Ok(());
         }
         let tree = super::changes::ChangeTree::render(
             &TranscriptRenderer::new(&self.content_width())?,
@@ -7804,15 +7804,23 @@ mod tests {
                 }));
                 let summary = blocks
                     .iter()
-                    .find(|block| block.id.0 == "transient:results:changes")
-                    .unwrap();
-                assert!(summary.text.wire_rows().join("").contains(if !complete {
-                    "Workspace changes pending"
-                } else if persistent {
-                    "Workspace changes 1 file"
+                    .find(|block| block.id.0 == "transient:results:changes");
+                if complete && !persistent {
+                    assert!(summary.is_none());
                 } else {
-                    "No workspace changes"
-                }));
+                    assert!(
+                        summary
+                            .unwrap()
+                            .text
+                            .wire_rows()
+                            .join("")
+                            .contains(if complete {
+                                "Workspace changes 1 file"
+                            } else {
+                                "Workspace changes pending"
+                            })
+                    );
+                }
                 assert_eq!(
                     blocks
                         .iter()

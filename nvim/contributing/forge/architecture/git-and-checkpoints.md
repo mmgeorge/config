@@ -758,9 +758,9 @@ Expected binary and encoding unavailability remain distinct. Shared-engine error
 through the existing broker failure path without a fallback comparison engine.
 
 The exchange result selector borrows complete saved evidence through CheckpointComparison.
-An empty committed patch means **No workspace changes**. Missing checkpoint evidence means
-**Workspace changes unavailable**. Running work retains its **previous capture** with a
-pending indication. Failed recapture retains that evidence with the failure reason.
+An empty committed patch produces no workspace-change row. Missing checkpoint evidence means
+**Workspace changes unavailable**. Running work retains a nonempty **previous capture**
+with a pending indication. Failed recapture retains that evidence with the failure reason.
 Non-Git workspaces retain reported operations but have no checkpoint-derived workspace result.
 Thought-local **Reported edits** retain provider operations in order, including failed and
 unavailable-detail operations. They do not reconstruct final contents by replaying patches.

@@ -87,6 +87,9 @@ replica.width = 22
 snapshot = vim.deepcopy(snapshot)
 snapshot.document, snapshot.context = replica.document, context
 assert(render.apply_snapshot(replica, snapshot).kind == "Applied")
+local initial_context_entry = replica.root:at(0)
+render.present_context(replica, { pr = { state = "fetching", text = "" }, about = { state = "none", text = "" } })
+assert(replica.root:at(0) == initial_context_entry, "unchanged context rebuilt the document")
 local root_sequence, file_header = replica.root, replica.file[1].header
 local original_revision = replica.revision
 render.present_context(replica, { pr = { state = "ready", text = "日本語を含む長い題名 é é é" }, about = { state = "ready", text = "summary\nbody" } })

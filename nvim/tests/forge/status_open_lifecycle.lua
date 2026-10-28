@@ -8,12 +8,17 @@ local startup_log_path = vim.fn.tempname()
 local original_startup_log_path = startup_log.path
 startup_log.path = function() return startup_log_path end
 local original_context = package.loaded["forge.views.status.status_context"]
+local client = require("forge.client")
+local original_start = client.start
+client.start = function() end
 local context_attachment = {}
 local refocus_checks = 0
+local context_refresh = {}
 package.loaded["forge.views.status.status_context"] = {
   attach = function(options)
     context_attachment[#context_attachment + 1] = options
-    return { refresh = function() end, refocus = function() refocus_checks = refocus_checks + 1 end, close = function() end }
+    return { refresh = function() context_refresh[options.document_id] = true end,
+      refocus = function() refocus_checks = refocus_checks + 1 end, close = function() end }
   end,
   producer_handlers = function() return {} end,
 }
@@ -46,24 +51,28 @@ local succeeded, failure = xpcall(function()
   local source_window = vim.api.nvim_get_current_win()
   vim.wo[source_window].number = true
   local ready = false
-  local hidden = status.open({ workspace = workspace, on_ready = function() ready = true end })
+  local hidden = status.open({ workspace = workspace, bind = false, on_ready = function() ready = true end })
   local loading_namespace = vim.api.nvim_create_namespace("ForgeStatusLoading")
-  local function loading_text()
-    local marks = vim.api.nvim_buf_get_extmarks(hidden.replica.buffer, loading_namespace, 0, -1, { details = true })
-    assert(#marks == 1, "startup message was duplicated")
-    return marks[1][4].virt_text[1][1]
-  end
-  assert(loading_text() == "Loading Forge status…")
-  vim.api.nvim_win_set_buf(source_window, source)
+  assert(#vim.api.nvim_buf_get_extmarks(hidden.replica.buffer, loading_namespace, 0, -1, {}) == 0,
+    "startup created a loading placeholder")
+  assert(vim.api.nvim_get_current_buf() == source, "pending opening replaced usable content")
   pending_open[hidden.document]()
   await(function() return ready end, "hidden opening did not complete initialization")
+  await(function()
+    if vim.fn.filereadable(startup_log_path) == 0 then return false end
+    for _, row in ipairs(vim.fn.readfile(startup_log_path)) do
+      local ok, record = pcall(vim.json.decode, row)
+      if ok and record.event == "status.ready" then return true end
+    end
+    return false
+  end, "startup timing did not flush")
   local timing_event = {}
   for _, row in ipairs(vim.fn.readfile(startup_log_path)) do
     local record = vim.json.decode(row)
     timing_event[record.event] = record.fields
   end
   assert(timing_event["status.buffer.opened"], "buffer creation timing was not logged")
-  assert(timing_event["status.loading.presented"], "loading presentation timing was not logged")
+  assert(not timing_event["status.loading.presented"], "loading placeholder was presented")
   assert(timing_event["status.buffer.prepared"], "buffer preparation timing was not logged")
   assert(timing_event["status.snapshot.applied"].files == 1, "snapshot application size was not logged")
   assert(timing_event["status.snapshot.applied"].rows == 7, "snapshot application row count was not logged")
@@ -86,6 +95,7 @@ local succeeded, failure = xpcall(function()
   vim.api.nvim_win_set_buf(source_window, source)
   ready = false
   local visible = status.open({ workspace = workspace, on_ready = function() ready = true end })
+  assert(vim.api.nvim_get_current_buf() == source, "pending status replaced the current buffer")
   vim.cmd("vsplit")
   local unrelated_window = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(unrelated_window, source)
@@ -107,9 +117,28 @@ local succeeded, failure = xpcall(function()
   await(function() return closed_document[closed.document] end, "pending close did not collect host document")
   assert(not closed.active and not vim.api.nvim_buf_is_valid(closed.replica.buffer))
   assert(#context_attachment == attached_before_close, "late response attached context to a closed document")
+
+  local closed_ready = status.open({ workspace = workspace, bind = false, on_ready = function(state)
+    assert(not context_refresh[state.document], "background context delayed document readiness")
+    status.close(state)
+  end })
+  pending_open[closed_ready.document]()
+  await(function() return closed_document[closed_ready.document] end, "ready document close did not settle")
+  assert(not context_refresh[closed_ready.document], "closed document started deferred background work")
+
+  vim.api.nvim_win_set_buf(unrelated_window, source)
+  vim.api.nvim_set_current_win(unrelated_window)
+  local commands = require("forge.views.commands")
+  local pending_command = commands.open()
+  assert(commands.open() == pending_command, "repeated command opened a second pending document")
+  assert(vim.api.nvim_get_current_buf() == source, "repeated command displayed an empty pending document")
+  status.close(pending_command)
+  pending_open[pending_command.document]()
+  await(function() return closed_document[pending_command.document] end, "pending command close did not settle")
 end, debug.traceback)
 
 status._set_runner_for_test(nil)
+client.start = original_start
 startup_log.path = original_startup_log_path
 vim.fn.delete(startup_log_path)
 package.loaded["forge.views.status.status_context"] = original_context

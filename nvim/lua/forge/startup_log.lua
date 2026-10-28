@@ -1,5 +1,5 @@
 local M = {}
-local maximum_bytes = 2 * 1024 * 1024
+local rotation_bytes = 2 * 1024 * 1024
 local redraw_watch = {}
 local redraw_namespace
 local logging_us = 0
@@ -27,8 +27,12 @@ end
 
 ---@return string
 function M.path()
-  return vim.fs.joinpath(vim.fn.stdpath("cache"), "rust-sidecar", "forge", "startup.log")
+  return vim.fs.joinpath(vim.fn.stdpath("cache"), "rust-sidecar", "forge", "startup-" .. vim.fn.getpid() .. ".jsonl")
 end
+
+local writer = require("forge.infra.jsonl_log").new(function() return M.path() end, function(failure)
+  vim.schedule(function() vim.notify("Forge startup log: " .. failure, vim.log.levels.ERROR) end)
+end, rotation_bytes)
 
 ---@param event string
 ---@param fields? table<string, any> Diagnostic metadata, excluding request bodies and credentials.
@@ -39,22 +43,11 @@ function M.write(event, fields, captured_at)
     vim.schedule(function() M.write(event, fields, captured_at) end)
     return
   end
-  pcall(function()
-    if host_startup[event] then require("forge.harness_startup_log").host(event, fields) end
-    local write_started = vim.uv.hrtime()
-    local path = M.path()
-    vim.fn.mkdir(vim.fs.dirname(path), "p")
-    local record = { time = os.date("!%Y-%m-%dT%H:%M:%SZ"), pid = vim.fn.getpid(), event = event, fields = fields,
-      monotonic_us = math.floor(captured_at / 1000), logging_total_us = logging_us }
-    local encoded = vim.json.encode(record)
-    if #encoded > 16384 then
-      record.fields = { truncated = encoded:sub(-8192) }
-      encoded = vim.json.encode(record)
-    end
-    local stat = vim.uv.fs_stat(path)
-    vim.fn.writefile({ encoded }, path, stat and stat.size >= maximum_bytes and "S" or "aS")
-    logging_us = logging_us + math.floor((vim.uv.hrtime() - write_started) / 1000)
-  end)
+  local started = vim.uv.hrtime()
+  if host_startup[event] then require("forge.harness_startup_log").host(event, fields) end
+  writer.append({ time = os.date("!%Y-%m-%dT%H:%M:%SZ"), pid = vim.fn.getpid(), event = event, fields = fields,
+    monotonic_us = math.floor(captured_at / 1000), logging_total_us = logging_us })
+  logging_us = logging_us + math.floor((vim.uv.hrtime() - started) / 1000)
 end
 
 ---@param event string

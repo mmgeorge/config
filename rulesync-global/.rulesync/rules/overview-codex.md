@@ -64,6 +64,7 @@ globs:
 
 # Programming
 
+- Write text files with LF line endings, including on Windows.
 - **No arbitrary content-size caps.** Never reject, truncate, disable, or crash
   on valid files, documents, plans, metadata, diffs, or editable content because
   of hardcoded byte, KB, KiB, MB, MiB, line-count, or occurrence-count thresholds.

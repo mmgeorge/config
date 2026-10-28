@@ -11,20 +11,27 @@ local success, failure = xpcall(function()
   finish("test failure")
   deferred[2]()
   finish("duplicate")
+  assert(vim.wait(1000, function()
+    if vim.fn.filereadable(path) == 0 then return false end
+    local rows = vim.fn.readfile(path)
+    return #rows == 3 and rows[3]:sub(-1) == "}"
+  end, 5), "asynchronous span records did not finish")
   local rows = vim.fn.readfile(path)
   assert(#rows == 3, "completed span kept logging or finished twice")
   assert(vim.json.decode(rows[1]).event == "fixture.begin")
   assert(vim.json.decode(rows[2]).event == "fixture.waiting")
   assert(vim.json.decode(rows[3]).fields.error == "test failure")
   vim.fn.writefile({ string.rep("x", 2 * 1024 * 1024) }, path)
-  log.write("bounded", { text = string.rep("y", 40000) })
-  assert(vim.uv.fs_stat(path).size < 20000, "log size was not bounded")
-  assert(vim.json.decode(vim.fn.readfile(path)[1]).event == "bounded")
-  local original_write = vim.fn.writefile
-  vim.fn.writefile = function() error("unwritable log") end
-  local wrote = pcall(log.write, "failure")
-  vim.fn.writefile = original_write
-  assert(wrote, "logging failure escaped into startup")
+  local complete_text = string.rep("y", 40000)
+  log.write("rotated", { text = complete_text })
+  assert(vim.wait(1000, function()
+    if vim.fn.filereadable(path) == 0 then return false end
+    local rows = vim.fn.readfile(path)
+    local ok, record = pcall(vim.json.decode, rows[1] or "")
+    return ok and record.event == "rotated"
+  end, 5))
+  assert(vim.json.decode(vim.fn.readfile(path)[1]).fields.text == complete_text, "large diagnostic record was truncated")
+  assert(vim.fn.filereadable(path .. ".1") == 1, "rotation lost the preceding log")
   local original_provider = vim.api.nvim_set_decoration_provider
   local provider
   vim.api.nvim_set_decoration_provider = function(_, callbacks) provider = callbacks end
@@ -49,6 +56,7 @@ local success, failure = xpcall(function()
 end, debug.traceback)
 vim.defer_fn = original_defer
 vim.fn.delete(path)
+vim.fn.delete(path .. ".1")
 if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
 print("startup_log OK")
 vim.cmd("qa!")

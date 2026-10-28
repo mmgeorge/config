@@ -290,7 +290,7 @@ launch return from protocol responsiveness. Startup failures and closure before 
 explicitly. These lifecycle diagnostics remain available independently of provider
 logging and exclude prompts and source content.
 
-`:ForgeStartupLog` opens `stdpath("cache")/rust-sidecar/forge/startup.log`. Diagnostics
+`:ForgeStartupLog` opens `stdpath("cache")/rust-sidecar/forge/startup-<pid>.jsonl`. Diagnostics
 record executable selection, copy duration, host spawn and initialization, request
 dispatch, and status response/application timings. Native observation timing splits
 line-statistics source acquisition into staged and worktree microseconds. It also
@@ -301,8 +301,9 @@ total input bytes. Unchanged sides perform no source acquisition or comparison.
 These are aggregate counters with no per-file log writes.
 Every entry records a monotonic microsecond timestamp and cumulative synchronous
 logging time. Document identifiers connect command/open, request dispatch, native
-timing, snapshot application, and readiness. Diagnostic writes disable per-entry
-`fsync` so tracing does not force a disk flush on the startup path. Request identifiers connect outbound
+timing, snapshot application, and readiness. Both startup logs use one asynchronous
+writer implementation that batches ordered records without blocking editor callbacks
+on filesystem operations. Request identifiers connect outbound
 requests to frame reception and assembled JSON decoding. Receive summaries report
 bytes, frames, total frame decoding time, and maximum frame queue wait. Queue waits
 overlap across frames and must not be summed as elapsed startup time.
@@ -317,6 +318,12 @@ Hidden test buffers produce no redraw marker. The eagerly registered `ForgeStatu
 command captures entry before explicitly loading the lazy plugin. Its timestamp
 passes into the open handler, so the total includes first-use plugin loading.
 Direct Lua `require("forge").open()` calls begin timing in the open handler.
+The command starts host initialization before preparing the status view. A cached
+executable launches immediately on the main loop while buffer preparation proceeds.
+Once the populated view and its controls are ready, the owner redraws it before
+starting PR lookup and About generation on the next scheduled callback. Those
+background results update the existing view and retain their lifecycle checks.
+Unchanged context rows do not rebuild the document.
 
 For diagnostic comparisons, set `vim.g.forge_skip_line_stats = true` before the
 host starts. The client passes `--diagnostic-skip-line-stats` to the executable.
@@ -328,9 +335,12 @@ Changing this flag requires a fresh host. Close Forge views and stop the client,
 or restart Neovim, before comparing modes.
 An unresolved status open emits
 a waiting entry every five seconds until completion or closure. Entries identify
-the Neovim process and exclude request bodies. The log resets at 2 MiB, bounds
-individual entries, and cannot fail startup if writing fails. Opening status buffers
-display `Loading Forge status…` until their initial request settles.
+the Neovim process and exclude request bodies. The log rotates between batches
+after 2 MiB and preserves complete records. Write failures are reported and retained
+records retry on the next append without failing startup. An opening keeps the
+existing buffer visible until a populated status snapshot is ready, then replaces
+it only if the requested window still displays the original buffer. No loading
+placeholder replaces usable content.
 
 ## MCP process framing
 

@@ -248,10 +248,11 @@ The raw diff opens in a separate read-only tab when the transcript window is
 protected. Press `q` in that diff to return to the transcript.
 
 A file created and deleted within the captured interval is absent from the workspace result
-but remains in Reported edits. An empty saved comparison displays **No workspace changes**.
+but remains in Reported edits. An empty saved comparison produces no workspace-change row.
 Missing checkpoint evidence displays **Workspace changes unavailable**, including non-Git
-workspaces. An active exchange displays a pending indication. During recapture, the previous
-comparison remains visible as **previous capture**. Failed recapture retains it with the
+workspaces. An active exchange without a saved comparison displays a pending indication.
+During recapture, a nonempty previous comparison remains visible as **previous capture**.
+Failed recapture retains that comparison with the
 failure reason. Checkpoints remain available through `/undo`.
 
 `/fork [name]` opens a child timeline with a snapshot of the source's visible history
