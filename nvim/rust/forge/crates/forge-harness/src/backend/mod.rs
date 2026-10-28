@@ -1,6 +1,7 @@
 mod acp;
 pub mod approval;
 mod catalog;
+mod permission_input;
 pub(crate) use catalog::select_model_settings;
 mod compaction;
 pub use compaction::{

@@ -1,3 +1,5 @@
+pub(crate) mod approval;
+use self::approval::permission_from_copilot;
 mod compaction;
 mod event_decoder;
 mod event_stream;
@@ -12,9 +14,7 @@ mod turn;
 mod turn_test;
 
 use crate::agent::AgentCapability;
-use crate::backend::approval::{
-    ApprovalResolution, PermissionCoordinator, permission_from_copilot, protected_target,
-};
+use crate::backend::approval::{ApprovalResolution, PermissionCoordinator, protected_target};
 use crate::backend::{
     Backend, BackendCapability, BackendCatalogRequest, BackendContextWindow, BackendDescriptor,
     BackendEvent, BackendEventSink, BackendForkRequest, BackendInput, BackendKind, BackendModel,

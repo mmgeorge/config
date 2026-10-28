@@ -2,7 +2,7 @@ use super::transport::AcpHandler;
 use crate::backend::approval::{ApprovalResolution, PermissionCoordinator};
 use crate::backend::*;
 use crate::control_tools::{ControlToolExecutor, ControlToolInvocation, ControlTurnContext};
-use crate::permissions::matcher::{PermissionRequest, PermissionTarget};
+use crate::permissions::matcher::PermissionTarget;
 use crate::session::ApprovalMode;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ pub(super) struct AcpSessionState {
     pub(super) control: Mutex<Option<Arc<ControlToolExecutor>>>,
     pub(super) catalog: RwLock<Value>,
     pub(super) tool_definition: RwLock<Vec<crate::control_tools::ControlToolDefinition>>,
-    tool: Mutex<HashMap<String, Value>>,
+    tool: Mutex<HashMap<(String, String), Value>>,
     compaction: Mutex<HashMap<String, Compaction>>,
     children: Mutex<super::children::AcpChildren>,
 }
@@ -102,6 +102,7 @@ impl AcpSessionState {
         .await;
         self.close_control().await;
         *self.active.write().await = None;
+        self.tool.lock().await.clear();
         result
     }
 
@@ -153,101 +154,27 @@ impl AcpSessionState {
                 turn_id: String::new(),
             });
         }
-        let tool = &parameter["toolCall"];
-        let input = &tool["rawInput"];
-        let mut target_list = Vec::new();
-        let native_tool = tool
-            .pointer("/_meta/claudeCode/toolName")
-            .and_then(Value::as_str);
-        let mcp = tool.pointer("/_meta/mcp");
-        let mcp_target = mcp
-            .and_then(|metadata| {
-                let name = metadata["tool"].as_str()?;
-                Some(
-                    metadata["server"]
-                        .as_str()
-                        .map_or_else(|| name.to_owned(), |server| format!("{server}/{name}")),
-                )
-            })
-            .or_else(|| {
-                native_tool.and_then(|name| {
-                    let (server, name) = name.strip_prefix("mcp__")?.split_once("__")?;
-                    Some(format!("{server}/{name}"))
-                })
-            });
-        if let Some(target) = mcp_target {
-            target_list.push(PermissionTarget::Mcp { target });
-        } else if tool["kind"] == "fetch" {
-            target_list.push(PermissionTarget::Network {
-                target: input["url"].as_str().unwrap_or("*").into(),
-            });
-        }
-        if target_list.is_empty()
-            && let Some(command) = input
-                .get("command")
-                .or_else(|| input.get("commandLine"))
-                .or_else(|| input.get("CommandLine"))
-                .and_then(Value::as_str)
-        {
-            target_list.push(PermissionTarget::Command {
-                command: command.into(),
-                shell: None,
-            });
-        }
-        if target_list.is_empty()
-            && let Some(location_list) = tool["locations"].as_array()
-        {
-            for location in location_list {
-                if let Some(path) = location["path"].as_str() {
-                    target_list.push(
-                        if matches!(tool["kind"].as_str(), Some("edit" | "delete" | "move")) {
-                            PermissionTarget::Write { path: path.into() }
-                        } else {
-                            PermissionTarget::Read { path: path.into() }
-                        },
-                    );
+        let supplied = &parameter["toolCall"];
+        let item_id = supplied["toolCallId"].as_str();
+        let session_id = parameter["sessionId"].as_str().unwrap_or_default();
+        let observed_tool = if let Some(item_id) = item_id {
+            self.tool
+                .lock()
+                .await
+                .get(&(session_id.to_owned(), item_id.to_owned()))
+                .cloned()
+        } else {
+            None
+        };
+        let mut tool = observed_tool.clone().unwrap_or_else(|| json!({}));
+        if let Some(fields) = supplied.as_object() {
+            for (field, value) in fields {
+                if !value.is_null() {
+                    tool[field] = value.clone();
                 }
             }
         }
-        if target_list.is_empty() {
-            if let Some(path) = input
-                .get("file_path")
-                .or_else(|| input.get("path"))
-                .or_else(|| input.get("TargetFile"))
-                .or_else(|| input.get("AbsolutePath"))
-                .and_then(Value::as_str)
-            {
-                target_list.push(
-                    if matches!(tool["kind"].as_str(), Some("edit" | "delete" | "move")) {
-                        PermissionTarget::Write { path: path.into() }
-                    } else {
-                        PermissionTarget::Read { path: path.into() }
-                    },
-                );
-            } else {
-                target_list.push(match tool["kind"].as_str() {
-                    Some("read" | "search") => PermissionTarget::UnknownFile {
-                        operation: crate::permissions::directory::DirectoryOperation::Read,
-                    },
-                    Some("edit" | "delete" | "move") => PermissionTarget::UnknownFile {
-                        operation: crate::permissions::directory::DirectoryOperation::Write,
-                    },
-                    _ => PermissionTarget::Tool {
-                        target: tool["title"].as_str().unwrap_or("ACP tool").into(),
-                    },
-                });
-            }
-        }
-        let request = PermissionRequest {
-            id: format!("acp-{}", uuid::Uuid::new_v4()),
-            provider: match self.kind {
-                BackendKind::Claude => "claude",
-                _ => "antigravity",
-            }
-            .into(),
-            reason: tool["title"].as_str().map(str::to_owned),
-            target_list,
-        };
+        let request = super::approval::permission_request(self.kind, &tool)?;
         let protected = {
             let store = self.permission.store();
             let store = store
@@ -277,6 +204,21 @@ impl AcpSessionState {
                 .authorize(active.mode, request, approval.address, active.sink.as_ref())
                 .await?
         };
+        if matches!(
+            resolution,
+            ApprovalResolution::AllowOnce
+                | ApprovalResolution::AllowExact
+                | ApprovalResolution::AllowBroad
+        ) && let (Some(item_id), Some(observed)) = (item_id, &observed_tool)
+        {
+            let current = self.tool.lock().await;
+            ensure!(
+                current
+                    .get(&(session_id.to_owned(), item_id.to_owned()))
+                    .is_some_and(|current| current == observed),
+                "ACP tool changed while approval was pending"
+            );
+        }
         if resolution == ApprovalResolution::Cancel {
             return Ok(json!({"outcome":{"outcome":"cancelled"}}));
         }
@@ -396,7 +338,7 @@ impl AcpHandler for AcpSessionState {
                 };
                 let mut tool_map = self.tool.lock().await;
                 let snapshot = tool_map
-                    .entry(format!("{session_id}\0{id}"))
+                    .entry((session_id.to_owned(), id.to_owned()))
                     .or_insert_with(|| json!({}));
                 if let Some(field_map) = update.as_object() {
                     for (field, value) in field_map {
@@ -1130,5 +1072,42 @@ mod test {
             output.event[4].activity.as_ref().unwrap().output.as_deref(),
             Some("RENDERED_TEXT")
         );
+    }
+
+    #[tokio::test]
+    async fn sparse_permission_uses_tool_snapshot_and_isolated_session_identity() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let permission = PermissionCoordinator::transient(fixture.path())?;
+        permission.store().write().unwrap().set_rule_list(&[(
+            crate::permissions::document::CATEGORY_EDIT.into(),
+            "one.rs".into(),
+            crate::permissions::document::PermissionDecision::Allow,
+        )])?;
+        let state = AcpSessionState::new(BackendKind::Claude, permission.clone());
+        *state.active.write().await = Some(ActiveTurn {
+            owner: crate::backend::ExecutionOwner::root("session"),
+            mode: ApprovalMode::Ask,
+            sink: None,
+        });
+        state.notification("session/update",json!({"sessionId":"native","update":{
+            "sessionUpdate":"tool_call","toolCallId":"edit","kind":"edit","locations":[{"path":"one.rs"}]
+        }})).await?;
+        let approval = json!({"sessionId":"native","toolCall":{"toolCallId":"edit"},
+            "options":[{"kind":"allow_once","optionId":"allow"},{"kind":"reject_once","optionId":"deny"}]});
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), state.authorize(approval))
+                .await??;
+        assert_eq!(result["outcome"]["optionId"], "allow");
+        assert!(permission.pending_list()?.is_empty());
+        assert!(
+            !state
+                .tool
+                .lock()
+                .await
+                .contains_key(&("other".into(), "edit".into()))
+        );
+        state.finish().await?;
+        assert!(state.tool.lock().await.is_empty());
+        Ok(())
     }
 }

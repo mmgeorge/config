@@ -1,3 +1,4 @@
+mod approval;
 mod backend;
 mod children;
 mod control_server;

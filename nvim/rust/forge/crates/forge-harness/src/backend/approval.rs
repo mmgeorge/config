@@ -8,14 +8,14 @@ use crate::permissions::document::{
     CATEGORY_WEBFETCH, PermissionDecision,
 };
 use crate::permissions::matcher::{
-    CommandAnalysisError, PendingCommand, PermissionEvaluation, PermissionRequest, PermissionTarget,
+    PendingCommand, PermissionEvaluation, PermissionRequest, PermissionTarget,
 };
-use crate::permissions::shell::{self, CommandAnalysisFailure, CommandHighlight, CommandShell};
+use crate::permissions::shell::{self, CommandHighlight, CommandShell};
 use crate::permissions::store::PermissionStore;
 use crate::session::{ApprovalMode, InputDeadline, InputTimeout, ResolutionSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::Path;
@@ -739,7 +739,7 @@ impl PermissionCoordinator {
                     pending.view.resolution_source = ResolutionSource::Timeout;
                     if let Some(owner) = &pending.view.execution_owner {
                         self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
-                            .insert(owner.clone(), format!("Approval {} was automatically rejected because its timeout expired. The user may be unavailable. Continue conservatively within existing permissions, avoid repeating the denied request, and request additional permissions only when essential.", pending.view.id));
+                            .insert(owner.clone(), format!("Approval {} was automatically rejected because its timeout expired. This was not an explicit user rejection. The existing user instruction and permissions remain in effect. Continue authorized work, avoid repeating the expired request, and do not ask whether to continue work the user already requested.", pending.view.id));
                         self.publish_timeout_feedback(owner)?;
                     }
                     Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
@@ -1285,307 +1285,6 @@ fn command_context(
     result
 }
 
-fn provider_shell(params: &Value) -> Option<CommandShell> {
-    params
-        .get("shell")
-        .or_else(|| params.get("shellPath"))
-        .and_then(Value::as_str)
-        .map(CommandShell::from_executable)
-}
-
-pub fn permission_from_provider(
-    method: &str,
-    message: &Value,
-    _workspace: &str,
-) -> Result<PermissionRequest> {
-    let params = message.get("params").unwrap_or(&Value::Null);
-    let id = format!("approval-{}", Uuid::new_v4());
-    let provider = "Codex CLI";
-    let reason = params
-        .get("reason")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let encoded = params.to_string();
-    let target_list = if method == "mcpServer/elicitation/request" {
-        let server = params
-            .get("serverName")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let tool = params
-            .pointer("/meta/toolName")
-            .or_else(|| params.pointer("/meta/tool_name"))
-            .and_then(Value::as_str)
-            .unwrap_or("*");
-        vec![PermissionTarget::Mcp {
-            target: format!("{server}/{tool}"),
-        }]
-    } else if method.contains("commandExecution") || method == "terminal/create" {
-        let (command, shell) = provider_command(params, method.contains("commandExecution"))?;
-        vec![PermissionTarget::Command { command, shell }]
-    } else if method.contains("fileChange") || method == "fs/write_text_file" {
-        vec![provider_path(params).map_or(
-            PermissionTarget::UnknownFile {
-                operation: DirectoryOperation::Write,
-            },
-            |path| PermissionTarget::Write { path },
-        )]
-    } else if method == "fs/read_text_file" {
-        vec![provider_path(params).map_or(
-            PermissionTarget::UnknownFile {
-                operation: DirectoryOperation::Read,
-            },
-            |path| PermissionTarget::Read { path },
-        )]
-    } else if method.contains("permission") || method.contains("permissions") {
-        normalize_permission_payload(params, &encoded)
-    } else {
-        vec![PermissionTarget::Tool {
-            target: method.into(),
-        }]
-    };
-    Ok(PermissionRequest {
-        id,
-        provider: provider.into(),
-        reason,
-        target_list,
-    })
-}
-
-/// Recovers provider arguments before applying the selected shell's quoting rules.
-fn provider_command(
-    params: &Value,
-    uses_argv_serialization: bool,
-) -> Result<(String, Option<CommandShell>)> {
-    let parse_error = || CommandAnalysisError {
-        shell: provider_shell(params).unwrap_or(CommandShell::Unknown),
-        failure: CommandAnalysisFailure::MalformedTransport,
-    };
-    let command = params.get("command");
-    let arguments = if let Some(arguments) = params
-        .get("args")
-        .filter(|arguments| arguments.is_array())
-        .or_else(|| command.filter(|command| command.is_array()))
-        .and_then(Value::as_array)
-    {
-        let mut arguments = arguments
-            .iter()
-            .map(|argument| argument.as_str().map(str::to_owned))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(parse_error)?;
-        if let Some(executable) = command.and_then(Value::as_str) {
-            arguments.insert(0, executable.to_owned());
-        }
-        arguments
-    } else if let Some(command) = command.and_then(Value::as_str) {
-        if !uses_argv_serialization {
-            return Ok((command.to_owned(), provider_shell(params)));
-        }
-        shlex::split(command).ok_or_else(parse_error)?
-    } else {
-        return Err(parse_error().into());
-    };
-    if arguments.is_empty() || arguments[0].is_empty() {
-        return Err(parse_error().into());
-    }
-    if let Some((marker, shell)) = crate::permissions::command::shell_script_argument(&arguments) {
-        return Ok((arguments[marker + 1].clone(), Some(shell)));
-    }
-    let command =
-        shlex::try_join(arguments.iter().map(String::as_str)).map_err(|_| parse_error())?;
-    Ok((command, Some(CommandShell::Bash)))
-}
-
-/// Normalize one Copilot SDK permission callback into the Harness permission model.
-pub fn permission_from_copilot(
-    id: String,
-    kind: &str,
-    params: Value,
-    _workspace: &str,
-) -> PermissionRequest {
-    // Notifications wrap the same request that older RPC calls sent directly.
-    let params = params.get("permissionRequest").cloned().unwrap_or(params);
-    let kind = params.get("kind").and_then(Value::as_str).unwrap_or(kind);
-    let encoded = params.to_string();
-    let target_list = match kind {
-        "shell" => vec![PermissionTarget::Command {
-            command: params
-                .get("fullCommandText")
-                .or_else(|| params.get("command"))
-                .or_else(|| params.get("fullCommand"))
-                .or_else(|| params.get("full_command"))
-                .and_then(Value::as_str)
-                .unwrap_or(&encoded)
-                .to_owned(),
-            shell: provider_shell(&params),
-        }],
-        "write" => vec![provider_path(&params).map_or(
-            PermissionTarget::UnknownFile {
-                operation: DirectoryOperation::Write,
-            },
-            |path| PermissionTarget::Write { path },
-        )],
-        "read" => vec![provider_path(&params).map_or(
-            PermissionTarget::UnknownFile {
-                operation: DirectoryOperation::Read,
-            },
-            |path| PermissionTarget::Read { path },
-        )],
-        "url" => vec![PermissionTarget::Network {
-            target: params
-                .get("url")
-                .or_else(|| params.get("target"))
-                .and_then(Value::as_str)
-                .unwrap_or("*")
-                .to_owned(),
-        }],
-        "mcp" => vec![PermissionTarget::Mcp {
-            target: {
-                let tool = params
-                    .get("toolName")
-                    .or_else(|| params.get("tool_name"))
-                    .or_else(|| params.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("*");
-                params
-                    .get("serverName")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| tool.to_owned(), |server| format!("{server}/{tool}"))
-            },
-        }],
-        "custom-tool" | "hook" => vec![PermissionTarget::Tool {
-            target: params
-                .get("toolName")
-                .and_then(Value::as_str)
-                .unwrap_or(kind)
-                .to_owned(),
-        }],
-        _ => normalize_permission_payload(&params, &encoded),
-    };
-    PermissionRequest {
-        id,
-        provider: "Copilot CLI".into(),
-        reason: params
-            .get("reason")
-            .or_else(|| params.get("intention"))
-            .or_else(|| params.get("warning"))
-            .or_else(|| params.get("hookMessage"))
-            .or_else(|| params.get("toolDescription"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        target_list,
-    }
-}
-
-fn provider_path(params: &Value) -> Option<String> {
-    params
-        .get("path")
-        .and_then(Value::as_str)
-        .or_else(|| params.get("fileName").and_then(Value::as_str))
-        .or_else(|| params.get("file_name").and_then(Value::as_str))
-        .or_else(|| params.get("filePath").and_then(Value::as_str))
-        .or_else(|| params.get("file_path").and_then(Value::as_str))
-        .or_else(|| params.get("grantRoot").and_then(Value::as_str))
-        .or_else(|| params.pointer("/file/path").and_then(Value::as_str))
-        .map(str::to_owned)
-}
-
-fn normalize_permission_payload(params: &Value, encoded: &str) -> Vec<PermissionTarget> {
-    if let Some(tool_call) = params.get("toolCall") {
-        let kind = tool_call
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
-        let title = tool_call
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or(kind);
-        return match kind {
-            "read" | "search" => vec![PermissionTarget::UnknownFile {
-                operation: DirectoryOperation::Read,
-            }],
-            "edit" | "delete" | "move" => vec![PermissionTarget::UnknownFile {
-                operation: DirectoryOperation::Write,
-            }],
-            "execute" => vec![PermissionTarget::Command {
-                command: tool_call
-                    .get("rawInput")
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| title.into()),
-                shell: provider_shell(params),
-            }],
-            "fetch" => vec![PermissionTarget::Network {
-                target: title.into(),
-            }],
-            "mcp" => vec![PermissionTarget::Mcp {
-                target: title.into(),
-            }],
-            _ => vec![PermissionTarget::Tool {
-                target: format!("{kind}/{title}"),
-            }],
-        };
-    }
-    let mut target_list = Vec::new();
-    for (namespace, pointer) in [
-        ("read", "/permissions/fileSystem/read"),
-        ("write", "/permissions/fileSystem/write"),
-    ] {
-        if let Some(path_list) = params.pointer(pointer).and_then(Value::as_array) {
-            for path in path_list.iter().filter_map(Value::as_str) {
-                target_list.push(if namespace == "read" {
-                    PermissionTarget::Read { path: path.into() }
-                } else {
-                    PermissionTarget::Write { path: path.into() }
-                });
-            }
-        }
-    }
-    let network = params.pointer("/permissions/network");
-    if network.is_some_and(|value| !value.is_null())
-        || encoded.to_ascii_lowercase().contains("network")
-    {
-        target_list.push(PermissionTarget::Network {
-            target: network
-                .and_then(|value| value.get("host"))
-                .and_then(Value::as_str)
-                .unwrap_or("*")
-                .into(),
-        });
-    }
-    if target_list.is_empty() {
-        target_list.push(PermissionTarget::Tool {
-            target: "provider/permission".into(),
-        });
-    }
-    target_list
-}
-
-pub fn codex_response(message: &Value, resolution: ApprovalResolution) -> Value {
-    let allow = matches!(
-        resolution,
-        ApprovalResolution::AllowOnce
-            | ApprovalResolution::AllowExact
-            | ApprovalResolution::AllowBroad
-    );
-    if message.get("method").and_then(Value::as_str) == Some("mcpServer/elicitation/request") {
-        return json!({
-            "action": if allow { "accept" } else if resolution == ApprovalResolution::Cancel { "cancel" } else { "decline" },
-            "content": if allow { json!({}) } else { Value::Null },
-        });
-    }
-    if message.get("method").and_then(Value::as_str) == Some("item/permissions/requestApproval") {
-        return if allow {
-            json!({ "permissions": message.pointer("/params/permissions").cloned().unwrap_or(Value::Null), "scope": "turn" })
-        } else {
-            json!({ "permissions": {}, "scope": "turn" })
-        };
-    }
-    json!({ "decision": match resolution {
-        ApprovalResolution::AllowOnce | ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad => "accept",
-        ApprovalResolution::DenyOnce | ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad | ApprovalResolution::DenyPolicy | ApprovalResolution::DenyMode | ApprovalResolution::TimedOut => "decline",
-        ApprovalResolution::Cancel => "cancel",
-    }})
-}
-
 pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) -> bool {
     request.target_list.iter().any(|target| match target {
         PermissionTarget::Write { path } => store.protects(Path::new(path)),
@@ -1598,6 +1297,9 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 
 #[cfg(test)]
 mod test {
+    use crate::backend::codex::approval::{codex_response, permission_from_provider};
+    use crate::backend::copilot::approval::permission_from_copilot;
+    use crate::permissions::matcher::CommandAnalysisError;
     #[tokio::test]
     async fn approval_modes_resolve_rules_without_persisting_automatic_decisions() -> Result<()> {
         for mode in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {

@@ -1,8 +1,9 @@
+use super::approval::ApprovalContext;
+#[cfg(test)]
+use super::approval::permission_from_provider;
 use super::request_execution::{ExecutedRequest, RequestExecutor};
 use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
 use crate::backend::approval::PermissionCoordinator;
-#[cfg(test)]
-use crate::backend::approval::permission_from_provider;
 use crate::backend::{
     BackendEvent, BackendEventSink, BackendOutput, ProviderChangeKind, ProviderChangeSet,
     ProviderFileChange, ProviderTaskEntry, ProviderTaskUpdate, TaskStatus, ToolActivity,
@@ -265,6 +266,7 @@ pub struct CodexJsonRpc {
     control_completion: Option<tokio::sync::oneshot::Receiver<()>>,
     accepted_control_invocation_key_set: HashSet<String>,
     mcp: McpContext,
+    approval: ApprovalContext,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
     activity_publication: bool,
@@ -308,6 +310,7 @@ impl CodexJsonRpc {
             control_completion: None,
             accepted_control_invocation_key_set: HashSet::new(),
             mcp: McpContext::default(),
+            approval: ApprovalContext::default(),
             permission_coordinator,
             event_sink,
             activity_publication: true,
@@ -324,6 +327,9 @@ impl CodexJsonRpc {
             .lock()
             .await
             .set_owner(Some(owner.clone()));
+        if self.execution_owner.as_ref() != Some(&owner) {
+            self.approval.clear();
+        }
         self.execution_owner = Some(owner);
     }
 
@@ -341,6 +347,7 @@ impl CodexJsonRpc {
         self.control_executor = None;
         self.accepted_control_invocation_key_set.clear();
         self.mcp.call.clear();
+        self.approval.clear();
         self.request_executor.lock().await.reset(
             workspace.to_owned(),
             approval_mode,
@@ -460,6 +467,7 @@ impl CodexJsonRpc {
     /// Revokes local tool authority without delaying the native interrupt message.
     pub(super) fn cancel_request_work(&mut self) {
         self.requests_cancelled = true;
+        self.approval.clear();
         if let Some(executor) = &self.control_executor {
             executor.cancel();
         }
@@ -500,6 +508,7 @@ impl CodexJsonRpc {
         output: &mut BackendOutput,
     ) -> Result<Value> {
         self.mcp.normalize(&mut message);
+        self.approval.observe(&message);
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -514,6 +523,19 @@ impl CodexJsonRpc {
                 self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
                     "error":{"code":-32001,"message":"Provider execution was cancelled"}}))
                     .await?;
+                return Ok(message);
+            }
+            if self
+                .pending_requests
+                .values()
+                .any(|pending| pending["id"] == message["id"])
+            {
+                anyhow::ensure!(
+                    self.pending_requests
+                        .values()
+                        .any(|pending| pending == &message),
+                    "provider reused a pending request ID with different arguments"
+                );
                 return Ok(message);
             }
             let executor = self.request_executor.clone();
@@ -535,6 +557,9 @@ impl CodexJsonRpc {
                 self.session_id.clone(),
             );
             independent.set_owner(self.execution_owner.clone());
+            if approval {
+                independent.set_approval(self.approval.prepare(&message));
+            }
             let received_at = Instant::now();
             let task = self.request_tasks.spawn(async move {
                 if let Some((previous, completed)) = ordered {
@@ -613,7 +638,8 @@ impl CodexJsonRpc {
     ) -> Result<bool> {
         let ExecutedRequest {
             message,
-            response,
+            mut response,
+            approval,
             trace_context,
             invocation,
             source_digests,
@@ -621,6 +647,13 @@ impl CodexJsonRpc {
             execution_finished,
             control_completion,
         } = completed;
+        if response.pointer("/result/decision").and_then(Value::as_str) == Some("accept")
+            && let Some(approval) = approval
+            && let Err(error) = approval.validate()
+        {
+            response = json!({"jsonrpc":"2.0","id":message["id"],
+                "error":{"code":-32001,"message":format!("{error:#}")}});
+        }
         let serialization_started_at = Instant::now();
         let encoded_response = match serde_json::to_string(&response) {
             Ok(encoded) => encoded,
@@ -4432,5 +4465,184 @@ mod test {
         .await;
 
         assert!(output.event.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use crate::backend::{BackendInput, BackendRequest, PromptMode, ServiceTier};
+    use crate::permissions::document::{CATEGORY_EDIT, PermissionDecision};
+    use crate::session::{AccessPolicy, DirectoryScope, WriteScope};
+
+    #[tokio::test]
+    async fn file_approvals_use_started_paths_and_existing_access_without_prompting() -> Result<()>
+    {
+        for (scope, external, grant, deny, mode, expected) in [
+            (
+                WriteScope::Full,
+                false,
+                false,
+                false,
+                ApprovalMode::Ask,
+                "accept",
+            ),
+            (
+                WriteScope::Workspace,
+                false,
+                false,
+                false,
+                ApprovalMode::Ask,
+                "accept",
+            ),
+            (
+                WriteScope::Off,
+                false,
+                false,
+                false,
+                ApprovalMode::Allow,
+                "decline",
+            ),
+            (
+                WriteScope::Full,
+                false,
+                false,
+                true,
+                ApprovalMode::Allow,
+                "decline",
+            ),
+            (
+                WriteScope::Workspace,
+                true,
+                true,
+                false,
+                ApprovalMode::Ask,
+                "accept",
+            ),
+            (
+                WriteScope::Workspace,
+                true,
+                false,
+                false,
+                ApprovalMode::Deny,
+                "decline",
+            ),
+        ] {
+            let fixture = tempfile::tempdir()?;
+            let workspace = fixture.path().join("workspace");
+            let outside = fixture.path().join("outside");
+            std::fs::create_dir_all(&workspace)?;
+            std::fs::create_dir_all(&outside)?;
+            let changed = if external {
+                outside.join("file.rs")
+            } else {
+                workspace.join("file.rs")
+            };
+            let coordinator = PermissionCoordinator::transient(&workspace)?;
+            if deny {
+                coordinator.store().write().unwrap().set_rule_list(&[(
+                    CATEGORY_EDIT.into(),
+                    changed.to_string_lossy().into_owned(),
+                    PermissionDecision::Deny,
+                )])?;
+            }
+            let request = BackendRequest {
+                execution_owner: None,
+                harness_session_id: "session".into(),
+                workspace: workspace.to_string_lossy().into_owned(),
+                input: BackendInput::from_text("edit"),
+                mode: PromptMode::Chat,
+                model: "default".into(),
+                effort: "default".into(),
+                context_window: None,
+                service_tier: ServiceTier::Standard,
+                access: AccessPolicy {
+                    sandbox: false,
+                    read_access: DirectoryScope::Full,
+                    write_access: scope,
+                    writable_directory: if grant {
+                        vec![outside.to_string_lossy().into_owned()]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                },
+                approval_mode: mode,
+                backend_session_id: None,
+                submission: None,
+                recovered_input: Vec::new(),
+                control_context: None,
+            };
+            let _policy = coordinator.directories(None, &request)?;
+            let before = coordinator.store().read().unwrap().open().1;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("ws://{}", listener.local_addr()?);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await?;
+                tokio_tungstenite::accept_async(stream).await
+            });
+            let mut process = CodexJsonRpc::connect(
+                &endpoint,
+                &request.workspace,
+                mode,
+                coordinator.clone(),
+                None,
+                Arc::new(TraceStore::open(fixture.path())?),
+                "session".into(),
+            )
+            .await?;
+            process.set_execution_owner(request.owner()?).await;
+            let mut socket = server.await??;
+            let mut output = BackendOutput::default();
+            process.publish_message(json!({"method":"item/started","params":{
+                "threadId":"thread","turnId":"turn","item":{"id":"edit","type":"fileChange",
+                "changes":[{"path":changed,"kind":{"type":"update","move_path":null},"diff":"new"}]}
+            }}), &mut output).await?;
+            let approval = json!({"id":10,"method":"item/fileChange/requestApproval","params":{
+                "threadId":"thread","turnId":"turn","itemId":"edit","grantRoot":null
+            }});
+            process
+                .publish_message(approval.clone(), &mut output)
+                .await?;
+            process.publish_message(approval, &mut output).await?;
+            assert_eq!(process.pending_requests.len(), 1);
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                process.collect_requests(&mut output),
+            )
+            .await??;
+            let response = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                .await?
+                .context("approval socket closed")??;
+            let response: Value = serde_json::from_str(response.to_text()?)?;
+            assert_eq!(response["result"]["decision"], expected, "{response}");
+            assert!(coordinator.pending_list()?.is_empty());
+            if expected == "accept" {
+                let next = json!({"id":11,"method":"item/fileChange/requestApproval","params":{
+                    "threadId":"thread","turnId":"turn","itemId":"edit","grantRoot":null
+                }});
+                process.publish_message(next, &mut output).await?;
+                let completed =
+                    tokio::time::timeout(Duration::from_secs(3), process.receive_message())
+                        .await??;
+                assert!(matches!(completed, ReceivedMessage::Request(_)));
+                process.publish_message(json!({"method":"item/started","params":{
+                    "threadId":"thread","turnId":"turn","item":{"id":"edit","type":"fileChange",
+                    "changes":[{"path":changed,"kind":{"type":"update"},"diff":"different proposal"}]}
+                }}), &mut output).await?;
+                process.publish_received(completed, &mut output).await?;
+                let rejected = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                    .await?
+                    .context("approval socket closed")??;
+                let rejected: Value = serde_json::from_str(rejected.to_text()?)?;
+                assert!(
+                    rejected["error"]["message"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("changed or retired"))
+                );
+            }
+            assert_eq!(coordinator.store().read().unwrap().open().1, before);
+        }
+        Ok(())
     }
 }

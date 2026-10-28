@@ -1,8 +1,6 @@
+use super::approval::{PreparedApproval, codex_response, permission_from_provider};
 use super::json_rpc::{DynamicToolTraceContext, control_invocation, rejects_question_resolution};
-use crate::backend::approval::{
-    ApprovalResolution, PermissionCoordinator, codex_response, permission_from_provider,
-    protected_target,
-};
+use crate::backend::approval::{ApprovalResolution, PermissionCoordinator, protected_target};
 use crate::backend::{BackendEventSink, BackendOutput, ExecutionOwner};
 use crate::control_tools::{
     ControlToolExecutor, ControlToolInvocation, ControlTurnContext, apply_invocation,
@@ -33,6 +31,7 @@ pub(super) struct RequestExecutor {
     trace: Arc<TraceStore>,
     session_id: String,
     execution_owner: Option<ExecutionOwner>,
+    approval: Option<Result<PreparedApproval>>,
 }
 
 impl RequestExecutor {
@@ -59,12 +58,17 @@ impl RequestExecutor {
             trace,
             session_id,
             execution_owner: None,
+            approval: None,
         }
     }
 
     /// Associates permission callbacks with the execution that owns this connection.
     pub(super) fn set_owner(&mut self, owner: Option<ExecutionOwner>) {
         self.execution_owner = owner;
+    }
+
+    pub(super) fn set_approval(&mut self, approval: Result<PreparedApproval>) {
+        self.approval = Some(approval);
     }
 
     /// Resets turn-local tool state before a settled connection is reused.
@@ -80,6 +84,7 @@ impl RequestExecutor {
         self.control_runtime = None;
         self.plan_document = None;
         self.planning_feedback = false;
+        self.approval = None;
     }
 
     /// Installs the canonical plan and tool services for the next turn.
@@ -137,6 +142,7 @@ impl RequestExecutor {
             message,
             response,
             trace_context,
+            approval: self.approval.take().and_then(Result::ok),
             invocation: self.replay_invocation.take(),
             source_digests: self.source_digests.take(),
             has_runtime: self.control_runtime.is_some(),
@@ -404,7 +410,11 @@ impl RequestExecutor {
         method: &str,
         message: &Value,
     ) -> Result<ApprovalResolution> {
-        let request = permission_from_provider(method, message, &self.workspace)?;
+        let prepared = self.approval.take().unwrap_or_else(|| {
+            permission_from_provider(method, message, &self.workspace).map(PreparedApproval::direct)
+        })?;
+        prepared.validate()?;
+        let request = prepared.request.clone();
         let protected = {
             let store = self.permission_coordinator.store();
             let store = store
@@ -436,6 +446,20 @@ impl RequestExecutor {
                 self.event_sink.as_ref(),
             )
             .await?;
+        if matches!(
+            resolution,
+            ApprovalResolution::AllowOnce
+                | ApprovalResolution::AllowExact
+                | ApprovalResolution::AllowBroad
+        ) {
+            prepared.validate()?;
+        }
+        self.trace.record(&self.session_id, "permission_decision", json!({
+            "provider":"codex", "thread_id":message.pointer("/params/threadId"),
+            "turn_id":message.pointer("/params/turnId"), "item_id":message.pointer("/params/itemId"),
+            "target_count":prepared.request.target_list.len(), "resolution":resolution
+        }));
+        self.approval = Some(Ok(prepared));
         Ok(resolution)
     }
 }
@@ -448,6 +472,8 @@ pub(super) struct ExecutedRequest {
     pub message: Value,
     /// Contains the JSON-RPC success or failure response.
     pub response: Value,
+    /// Proposal snapshot revalidated immediately before approval publication.
+    pub approval: Option<PreparedApproval>,
     /// Correlates execution and transport timing for a dynamic tool.
     pub trace_context: Option<DynamicToolTraceContext>,
     /// Replays accepted canonical state into the turn output after delivery.
@@ -469,6 +495,7 @@ impl ExecutedRequest {
             message,
             control_completion: None,
             trace_context: None,
+            approval: None,
             invocation: None,
             source_digests: None,
             has_runtime: false,

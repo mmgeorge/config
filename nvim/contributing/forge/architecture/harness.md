@@ -1371,6 +1371,22 @@ The Rust `PermissionStore` loads one validated Rulesync-shaped document from
 `stdpath("config")/forge/permissions.json`, compiles command and resource matchers once, and
 gives every surfaced provider request to one `PermissionCoordinator`. `allow` proceeds immediately,
 `deny` rejects immediately, and `ask` blocks the provider response on the Harness approval float.
+Provider adapters own permission-message reconstruction. Codex retains active file
+proposals by provider thread, turn, and item identity within the execution's connection.
+An item-only approval resolves every changed path and rename destination from the
+matching proposal before entering the shared coordinator. Replayed item events preserve
+the proposal revision. Changed proposals, completion, cancellation, and connection reuse
+invalidate pending snapshots, which are checked again before acceptance reaches the
+provider. A grant root is not a substitute for the actual affected paths.
+
+ACP combines partial permission callbacks with its matching session/tool snapshot,
+including reported locations, diff paths, and file-input paths. Copilot normalizes its
+permission callbacks directly. Shared payload codecs do not select approval policy.
+The coordinator remains authoritative for access scopes, explicit grants and denials,
+and ask/allow/deny handling. Missing targets remain unresolved, while malformed target
+lists fail as a whole without authorizing a valid subset. Adapter metadata is transient
+and does not add a database schema or durable implicit grants.
+
 Reported writes are rejected while writing is off, including requests without a
 path. Enabling writes requires an explicit `/write` or `/write full` command.
 Child requests retain the root's filesystem policy and a no-less-restrictive

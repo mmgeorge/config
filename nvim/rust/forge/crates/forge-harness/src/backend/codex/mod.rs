@@ -1,3 +1,4 @@
+pub(crate) mod approval;
 use crate::backend::approval::PermissionCoordinator;
 use crate::backend::steering::{ActiveSteering, SteeringLane};
 use crate::backend::{
