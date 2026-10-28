@@ -8,6 +8,9 @@ local builder = require("rust_sidecar").new({ crate_name = "fixture", binary_tar
 local original_system, original_hash = vim.system, vim.fn.sha256
 local original_executable, original_notify = vim.fn.executable, vim.notify
 local original_has, original_copyfile = vim.fn.has, vim.uv.fs_copyfile
+local image = require("rust_sidecar.windows_image")
+local original_pin = image.pin
+if original_has("win32") ~= 1 then image.pin = function() return function() end end end
 ---@type RustSidecarLease?
 local lease
 local succeeded, failure = xpcall(function()
@@ -33,7 +36,7 @@ local succeeded, failure = xpcall(function()
     callback({ code = 0, signal = 0, stdout = ('"nvim.exe","%s","Console","1","1 K"\n')
       :format(vim.fn.getpid()), stderr = "" })
   end
-  vim.fn.sha256 = function() error("startup hashed contents") end
+  vim.fn.sha256 = function(value) assert(value:sub(1,1) == "[" or value == vim.uv.fs_realpath(builder.binary_path()), "startup hashed file contents") return original_hash(value) end
   vim.fn.mkdir(vim.fs.dirname(builder.binary_path()), "p")
   vim.fn.writefile({ "manually built executable" }, builder.binary_path())
   local leases_root = vim.fs.joinpath(root, "leases")
@@ -55,15 +58,15 @@ local succeeded, failure = xpcall(function()
     lease = result
   end)
   assert(vim.wait(1000, function() return lease ~= nil end, 5), "copy did not finish")
-  assert(vim.wait(1000, function() return not vim.uv.fs_stat(stale_root) end, 5), "stale lease was retained")
-  assert(vim.wait(1000, function() return not vim.uv.fs_stat(reused_root) end, 5), "reused PID lease was retained")
+  assert(vim.wait(3000, function() return not vim.uv.fs_stat(stale_root) end, 5), "stale lease was retained")
+  assert(vim.wait(3000, function() return not vim.uv.fs_stat(reused_root) end, 5), "reused PID lease was retained")
   assert(vim.uv.fs_stat(live_root), "live editor lease was removed")
   assert(lease.path ~= available.path)
   vim.fn.writefile({ "rebuilt executable" }, builder.binary_path())
   assert(vim.fn.readfile(lease.path)[1] == "manually built executable", "rebuild changed a running host's copy")
   lease.release()
   lease.release()
-  assert(not vim.uv.fs_stat(lease.path), "process exit retained its copy")
+  assert(vim.uv.fs_stat(lease.path), "process exit discarded the reusable image")
   local copy_failure
   builder.acquire(root .. "/missing", function(result, copy_error)
     assert(not result)
@@ -159,7 +162,7 @@ local succeeded, failure = xpcall(function()
 end, debug.traceback)
 vim.system, vim.fn.sha256 = original_system, original_hash
 vim.fn.executable, vim.notify = original_executable, original_notify
-vim.fn.has, vim.uv.fs_copyfile = original_has, original_copyfile
+vim.fn.has, vim.uv.fs_copyfile, image.pin = original_has, original_copyfile, original_pin
 if lease then pcall(lease.release) end
 vim.fn.delete(root, "rf")
 if not succeeded then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end

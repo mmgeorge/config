@@ -615,10 +615,19 @@ local function spawn(binary, callback, launch_token, lease)
   require("forge.startup_log").write("host.spawn", { binary = binary, generation = generation,
     line_stats_skipped = skip_line_stats })
   local process
+  local spawn_started
+  local first_stdout = false
   local options = {
     text = true,
     stdin = true,
-    stdout = function(_, data) consume_stdout(data, generation) end,
+    stdout = function(_, data)
+      if data and not first_stdout then
+        first_stdout = true
+        require("forge.startup_log").write("host.first_stdout", {
+          generation = generation, elapsed_ms = (vim.uv.hrtime() - spawn_started) / 1e6, bytes = #data })
+      end
+      consume_stdout(data, generation)
+    end,
     stderr = function(_, data)
       if data then require("forge.startup_log").write("host.stderr", { text = data:sub(-8192), generation = generation }) end
       if data and generation == state().generation then client.stderr = (client.stderr .. data:sub(-65536)):sub(-65536) end
@@ -704,7 +713,7 @@ local function spawn(binary, callback, launch_token, lease)
       end)
     end
   end
-  local spawn_started = vim.uv.hrtime()
+  spawn_started = vim.uv.hrtime()
   local ok, process_or_error = pcall(process_launcher, command, options, on_exit)
   if not ok then
     if lease then pcall(lease.release) end
@@ -728,7 +737,11 @@ local function launch(binary, callback, launch_token)
   local lease_started = vim.uv.hrtime()
   builder.acquire(binary, function(lease, failure)
     require("forge.startup_log").write("host.lease.finished", { error = failure,
-      elapsed_ms = math.floor((vim.uv.hrtime() - lease_started) / 1e6) })
+      elapsed_ms = math.floor((vim.uv.hrtime() - lease_started) / 1e6),
+      source = lease and lease.source_path, binary = lease and lease.path,
+      cache_hit = lease and lease.cache_hit, cache_key = lease and lease.cache_key,
+      file_bytes = lease and lease.file_bytes, copy_ms = lease and lease.copy_ms,
+      pin_ms = lease and lease.pin_ms, lookup_ms = lease and lease.lookup_ms })
     if M._client ~= client or client.launch_token ~= launch_token or client.start_callback ~= callback then
       if lease then
         local released, release_error = pcall(lease.release)

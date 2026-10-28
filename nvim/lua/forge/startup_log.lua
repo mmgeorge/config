@@ -6,7 +6,7 @@ local logging_us = 0
 local input_namespace
 local input_buffer, input_at
 local host_startup = { ["host.start"] = true, ["host.binary.result"] = true, ["host.spawn"] = true,
-  ["host.spawned"] = true, ["host.lease.finished"] = true, ["host.initialize.finished"] = true }
+  ["host.spawned"] = true, ["host.first_stdout"] = true, ["host.lease.finished"] = true, ["host.initialize.finished"] = true }
 
 ---@return nil
 function M.observe_input()

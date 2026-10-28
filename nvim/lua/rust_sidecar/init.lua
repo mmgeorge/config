@@ -5,7 +5,15 @@
 
 ---@class RustSidecarLease
 ---@field path string
----@field release fun() Removes a Windows process-owned copy after exit. Leaves the shared Unix executable intact.
+---@field release fun() Releases a Windows image pin after exit. Cached images remain reusable.
+---@field cache_hit? boolean
+---@field cache_key? string
+---@field source_path? string
+---@field file_bytes? integer
+---@field pin_ms? number
+---@field lookup_ms? number
+---@field copy_ms? number
+---@field acquire_ms? number
 
 ---@class RustSidecarSpec
 ---@field crate_name string
@@ -24,7 +32,7 @@
 ---@field build_command fun(): string[]
 ---@field build fun(callback: fun(result: RustSidecarExecutableResult)) Runs Cargo asynchronously even when the executable exists. Concurrent build and ensure callers share one result.
 ---@field ensure fun(callback: fun(result: RustSidecarExecutableResult)) Builds a missing executable asynchronously and shares the result with pending callers.
----@field acquire fun(path: string, callback: fun(lease?: RustSidecarLease, failure?: string)) Copies the executable on Windows. Reuses the build output on Unix.
+---@field acquire fun(path: string, callback: fun(lease?: RustSidecarLease, failure?: string)) Acquires an immutable cached image on Windows. Reuses the build output on Unix.
 ---@field _set_crate_dir_for_test fun(crate_dir: string?)
 ---@field _set_artifact_root_for_test fun(artifact_root: string?)
 ---@field _reset_for_test fun()
@@ -54,7 +62,6 @@ function M.new(spec)
   ---@type (fun(result: RustSidecarExecutableResult))[]?
   local build_callback = nil
   local lease_cleanup_started = false
-  ---@type RustSidecarBuilder
   local builder = {}
   local function executable_name()
     local name = spec.executable_name or spec.crate_name
@@ -245,32 +252,12 @@ function M.new(spec)
   end
 
   function builder.acquire(path, callback)
-    start_lease_cleanup()
+    if not lease_cleanup_started then vim.defer_fn(start_lease_cleanup, 1000) end
     if vim.fn.has("win32") ~= 1 then
       callback({ path = path, release = function() end })
       return
     end
-    local lease_root = vim.fs.joinpath(builder.artifact_root(), "leases", ("%s-%s"):format(vim.fn.getpid(), vim.uv.hrtime()))
-    local created, failure = pcall(vim.fn.mkdir, lease_root, "p")
-    if not created then callback(nil, tostring(failure)) return end
-    local leased_path = vim.fs.joinpath(lease_root, executable_name())
-    vim.uv.fs_copyfile(path, leased_path, vim.schedule_wrap(function(copy_error)
-      if copy_error then
-        vim.uv.fs_unlink(leased_path)
-        vim.uv.fs_rmdir(lease_root)
-        callback(nil, "Failed to copy Rust sidecar executable: " .. tostring(copy_error))
-        return
-      end
-      local released = false
-      callback({ path = leased_path, release = function()
-        if released then return end
-        local removed, remove_error = vim.uv.fs_unlink(leased_path)
-        if not removed then error("Failed to release executable copy: " .. tostring(remove_error)) end
-        local removed_root, root_error = vim.uv.fs_rmdir(lease_root)
-        if not removed_root then error("Failed to remove executable lease directory: " .. tostring(root_error)) end
-        released = true
-      end })
-    end))
+    require("rust_sidecar.executable_cache").acquire(path, builder.artifact_root(), executable_name(), callback)
   end
 
   function builder._set_crate_dir_for_test(crate_dir) crate_dir_for_test = crate_dir end
@@ -280,6 +267,7 @@ function M.new(spec)
     lease_cleanup_started = false
   end
 
+  ---@cast builder RustSidecarBuilder
   return builder
 end
 

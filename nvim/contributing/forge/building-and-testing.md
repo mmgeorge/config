@@ -95,7 +95,7 @@ directory. Release profile checks remain explicit.
 
 The builder's current `ensure()` path can build a missing executable, but it does
 not detect stale source. Runtime verification must use the explicit build above.
-Existing hosts retain their process-owned executable. Restart Neovim or create a
+Existing hosts retain their pinned executable image. Restart Neovim or create a
 fresh test host after rebuilding.
 
 ## Select targeted checks

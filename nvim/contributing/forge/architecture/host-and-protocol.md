@@ -15,8 +15,8 @@ LTO disabled. Workspace code remains unoptimized. External packages use optimiza
 level 3 without debug information, and routine tests inherit the development profile.
 Release compilation is an explicit build and verification choice.
 
-Executable acquisition depends on the host OS. Windows launches a process-owned copy
-so Cargo can replace the build output while an editor runs. macOS and Linux launch
+Executable acquisition depends on the host OS. Windows launches an immutable cached copy
+for each build identity so Cargo can replace the build output while an editor runs. macOS and Linux launch
 the cached build output directly, retaining the old executable for running processes
 when Cargo replaces its path. Unix release leaves that shared file intact. Reusing
 the executable avoids the first-execution delay measured for each fresh copy on macOS.
@@ -258,7 +258,19 @@ verification. The current `ensure()` implementation reuses an existing artifact
 and invokes `build()` when it is absent. No source-freshness or
 executable-fingerprint check selects a build.
 
-Windows hosts launch process-owned copies under the sidecar lease directory so Cargo can replace the build output. Other platforms launch the selected artifact directly. Existing hosts keep their executable until shutdown. See [Building and testing](../building-and-testing.md) for the contributor workflow.
+Windows hosts share immutable images under `executables/<source>/<identity>/` in the sidecar cache.
+The identity hashes the canonical source path and file metadata, without reading the executable
+contents. Cache misses copy to a temporary file and publish atomically after checking that the
+source did not change. Concurrent callers share publication. Each host pins the image with a
+Windows read handle that denies writes and deletion until process exit. Releasing a host keeps
+the current image available for the next editor. Deferred cleanup removes older images only
+when Windows permits deletion, preserving running hosts and acquisitions holding a pin.
+Other platforms launch the selected artifact directly. See
+[Building and testing](../building-and-testing.md) for the contributor workflow.
+
+Reusing the image avoids the repeated first-launch cost of per-process copies. A newly built
+image can still incur Windows first-execution overhead. Cache-hit startup and first use of a
+new build are measured separately.
 
 `:ForgeStartupLog harness` opens the current editor's
 `stdpath("cache")/rust-sidecar/forge/harness-startup-<pid>.jsonl`. Each Harness open
@@ -272,7 +284,9 @@ and snapshot creation. These are
 observations of existing work, without additional database reads. The dedicated
 file uses asynchronous ordered writes and remains separate from high-frequency
 RPC logs. Executable selection, copying, and process creation records are also
-retained in that file. Startup failures and closure before the first redraw end the trace
+retained in that file. Acquisition records include cache hit, build identity, image size,
+metadata lookup, copy, and image-pin times. The first host stdout event distinguishes process
+launch return from protocol responsiveness. Startup failures and closure before the first redraw end the trace
 explicitly. These lifecycle diagnostics remain available independently of provider
 logging and exclude prompts and source content.
 
