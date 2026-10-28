@@ -745,11 +745,27 @@ session controller. Checkpoint previews submit exact raw source pairs at foregro
 Checkpoint and provider-attributed previews reuse cached analysis for equal source identities.
 They no longer run a separate `similar::TextDiff` comparison.
 
-Interaction finalization awaits shared comparison through checkpoint population and turn setup.
-Captured checkpoint records are saved before the analysis await, preserving durable checkpoint
-identity across cancellation or comparison failure. Expected binary and encoding
-unavailability remain distinct. Shared-engine admission and execution errors propagate to the
-existing broker failure path without a fallback comparison engine.
+The full saved checkpoint comparison supplies the exchange's **Workspace changes** result.
+Provider-attributed comparisons remain internal evidence. They do not establish exclusive
+authorship and do not supply visible workspace counts or hunks. Commands, formatters,
+child work, and external edits within the captured interval can all appear in that result.
+
+Finalization computes comparison fields on a candidate exchange and commits its terminal
+checkpoint and exchange together. Only a successful commit replaces live comparison state.
+Capture, comparison, and commit failures retain the earlier checkpoint identities and patch
+and record a finalization error. The initial tool barrier still commits its baseline separately.
+Expected binary and encoding unavailability remain distinct. Shared-engine errors propagate
+through the existing broker failure path without a fallback comparison engine.
+
+The exchange result selector borrows complete saved evidence through CheckpointComparison.
+An empty committed patch means **No workspace changes**. Missing checkpoint evidence means
+**Workspace changes unavailable**. Running work retains its **previous capture** with a
+pending indication. Failed recapture retains that evidence with the failure reason.
+Non-Git workspaces retain reported operations but have no checkpoint-derived workspace result.
+Thought-local **Reported edits** retain provider operations in order, including failed and
+unavailable-detail operations. They do not reconstruct final contents by replaying patches.
+Capture exclusions remain unchanged. Acquisition does not promise an atomic snapshot across
+all workspace files. Reopened results use the saved patch, not current workspace files.
 
 The unified writer consumes raw hunks and shared context grouping, writing source lines directly
 to an `io::Write` destination. It preserves CRLF, missing-final-newline markers, empty-side ranges,

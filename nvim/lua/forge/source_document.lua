@@ -88,13 +88,14 @@ end
 local function display_source(state, window, layout)
   local baseline = window_presentation.capture(window)
   local created_tab
-  if layout == "tab" then
+  if layout == "tab" or vim.wo[window].winfixbuf then
     vim.api.nvim_win_call(window, function()
       vim.cmd("tabnew")
       window = vim.api.nvim_get_current_win()
       created_tab = vim.api.nvim_get_current_tabpage()
     end)
     vim.api.nvim_set_current_win(window)
+    vim.wo[window].winfixbuf = false
     state.window = window
   end
   local origin = vim.api.nvim_win_get_buf(window)

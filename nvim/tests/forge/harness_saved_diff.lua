@@ -16,12 +16,30 @@ source._set_runner_for_test(function(method, params, callback)
 end)
 local owner
 local success, failure = xpcall(function()
-  owner = source.open_harness_diff({ session_id = "session", input = captured,
-    window = vim.api.nvim_get_current_win(), is_current = function() return true end, on_error = error })
-  assert(vim.wait(1000, function() return vim.api.nvim_get_current_buf() == owner.replica.buffer end))
-  assert(vim.api.nvim_buf_get_lines(owner.replica.buffer, 0, -1, false)[2] == "+++ b/path")
-  source.close(owner)
-  assert(vim.wait(1000, function() return closed end))
+  for _, protected in ipairs({ false, true }) do
+    local original_window = vim.api.nvim_get_current_win()
+    local original_buffer = vim.api.nvim_get_current_buf()
+    local original_tab = vim.api.nvim_get_current_tabpage()
+    local original_protection = vim.wo[original_window].winfixbuf
+    vim.wo[original_window].winfixbuf = protected
+    closed = false
+    owner = source.open_harness_diff({ session_id = "session", input = captured,
+      window = original_window, is_current = function() return true end, on_error = error })
+    assert(vim.wait(1000, function() return vim.api.nvim_get_current_buf() == owner.replica.buffer end))
+    assert(vim.api.nvim_buf_get_lines(owner.replica.buffer, 0, -1, false)[2] == "+++ b/path")
+    assert((vim.api.nvim_get_current_tabpage() ~= original_tab) == protected,
+      "protected source windows must open saved diffs in a separate tab")
+    if protected then
+      assert(vim.api.nvim_win_get_buf(original_window) == original_buffer, "raw diff replaced protected transcript")
+      assert(vim.wo[original_window].winfixbuf, "raw diff cleared transcript protection")
+    end
+    source.close(owner)
+    assert(vim.wait(1000, function() return closed end))
+    assert(vim.api.nvim_get_current_tabpage() == original_tab, "closing raw diff lost source tab")
+    assert(vim.api.nvim_win_get_buf(original_window) == original_buffer, "closing raw diff lost source buffer")
+    assert(vim.wo[original_window].winfixbuf == protected)
+    vim.wo[original_window].winfixbuf = original_protection
+  end
 end, debug.traceback)
 if owner and owner.active then source.close(owner) end
 source._set_runner_for_test(nil)

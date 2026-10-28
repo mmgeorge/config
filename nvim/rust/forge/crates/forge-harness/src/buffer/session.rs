@@ -1558,6 +1558,9 @@ fn reflow(
             &open.sections.nodes.tool_limit,
             &mut open.display,
         )?;
+        if open.entry.contains_key(&entry.entry.id) {
+            entry.require_workspace_preview()?;
+        }
         if !unsettled.contains(&entry.entry.id) {
             settle_responses(&mut entry);
         }
@@ -1852,6 +1855,9 @@ fn apply_projection<'operation>(
                     &open.sections.nodes.tool_limit,
                     &mut open.display,
                 )?;
+                if open.entry.contains_key(&entry.entry.id) {
+                    entry.require_workspace_preview()?;
+                }
                 if !unsettled.contains(&entry.entry.id) {
                     settle_responses(&mut entry);
                 }
@@ -3861,7 +3867,6 @@ mod tests {
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         let mut group_id = None;
         let mut group_position = None;
-        let mut first_file_id = None;
         let mut thought_id = None;
         let mut event = BackendEvent {
             received_at_ms: None,
@@ -3874,7 +3879,7 @@ mod tests {
             task_update: None,
             activity: None,
         };
-        for (batch, (range, count)) in [(0..2, 2), (2..5, 5), (5..6, 6), (0..1, 6)]
+        for (batch, (range, _count)) in [(0..2, 2), (2..5, 5), (5..6, 6), (0..1, 6)]
             .into_iter()
             .enumerate()
         {
@@ -3975,7 +3980,7 @@ mod tests {
                     .iter()
                     .find(|block| Some(&block.id) == group_id.as_ref())
                     .unwrap();
-                assert!(group.text.wire_rows().join("").contains("changing"));
+                assert!(group.text.wire_rows().join("").contains("running"));
             }
             event.activity.as_mut().unwrap().status = Some("completed".into());
             exchange.observe_turn(&event, batch as i64 * 10 + 3)?;
@@ -4074,13 +4079,19 @@ mod tests {
                 .iter()
                 .find(|block| block.id.0 == "writes:results:changes")
                 .unwrap();
-            assert!(summary.metadata.node.as_ref().unwrap().parent.is_none());
+            assert!(
+                summary
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_none_or(|node| node.parent.is_none())
+            );
             assert!(
                 summary
                     .text
                     .wire_rows()
                     .join("")
-                    .contains(&format!("Changed {count} files"))
+                    .contains("Workspace changes pending")
             );
             let (position, group) = groups[0];
             assert!(
@@ -4088,7 +4099,7 @@ mod tests {
                     .text
                     .wire_rows()
                     .join("")
-                    .contains(&format!("Changed {count} files +{count} -0"))
+                    .contains(&format!("Reported edits · {} operation", batch + 1))
             );
             if let Some(identity) = &group_id {
                 assert_eq!(&group.id, identity);
@@ -4096,12 +4107,6 @@ mod tests {
                 assert_eq!(
                     group.metadata.node.as_ref().unwrap().display,
                     NodeDisplay::Full
-                );
-                assert!(
-                    snapshot
-                        .block
-                        .iter()
-                        .any(|block| Some(&block.id) == first_file_id.as_ref())
                 );
             } else {
                 group_id = Some(group.id.clone());
@@ -4119,33 +4124,24 @@ mod tests {
                         width: WidthProfile::default(),
                     },
                 })?;
-                first_file_id = owner
-                    .snapshot(&document)?
-                    .block
-                    .iter()
-                    .find(|block| {
-                        block
-                            .metadata
-                            .node
-                            .as_ref()
-                            .is_some_and(|node| node.kind == NodeKind::File)
-                    })
-                    .map(|block| block.id.clone());
-                assert!(first_file_id.is_some());
             }
         }
         let open = owner.open.as_ref().unwrap();
         let identity = &group_id.unwrap().0;
-        let action = open
+        let operation_diffs = open
             .action
-            .get(&forge_buffer::identity::TargetId(identity.clone()))
-            .unwrap();
-        let super::super::projection::TranscriptAction::Diff { text, .. } = action else {
-            panic!("missing grouped diff")
-        };
-        assert!(text.contains("+final"));
-        assert!(!text.contains("-initial"));
-        assert_eq!(text.matches("diff --git").count(), 6);
+            .values()
+            .filter_map(|action| match action {
+                super::super::projection::TranscriptAction::Diff { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(operation_diffs.len(), 4);
+        assert!(
+            operation_diffs
+                .iter()
+                .any(|text| text.contains("+final") && text.contains("-initial"))
+        );
         let snapshot = owner.snapshot(&document)?;
         let thought_position = snapshot
             .block
@@ -4206,6 +4202,135 @@ mod tests {
                 .join("")
                 .contains("Running 4 tools")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_result_replacement_preserves_expansion_and_navigation() -> Result<()> {
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use forge_buffer::node::{NodeDisplay, NodeKind};
+        for columns in [160, 100] {
+            let mut entry = interaction_entry("workspace-result");
+            let set_evidence =
+                |entry: &mut TimelineEntry, patch: &str, pending: bool, error: Option<&str>| {
+                    let TimelineEntry::Exchange { exchange, .. } = entry else {
+                        unreachable!()
+                    };
+                    exchange.phase = crate::exchange::ExchangePhase::fixture(
+                        if pending {
+                            crate::exchange::ExchangeState::Running
+                        } else {
+                            crate::exchange::ExchangeState::Complete
+                        },
+                        if pending { None } else { Some(10) },
+                        None,
+                    );
+                    exchange.checkpoint_before = Some("before".into());
+                    exchange.checkpoint_after = Some("after".into());
+                    exchange.checkpoint_diff_text = Some(patch.into());
+                    exchange.finalization_error = error.map(str::to_owned);
+                };
+            let patch = "--- a/z.txt\n+++ b/z.txt\n@@ -1 +1 @@\n-before\n+captured\n";
+            set_evidence(&mut entry, patch, false, None);
+            let mut owner = SessionPresentation::new("session".into());
+            owner.initialize(vec![entry.clone()])?;
+            let document = DocumentId(format!("result-{columns}"));
+            let view = ViewId(format!("view-{columns}"));
+            let width = WidthProfile {
+                columns,
+                ..Default::default()
+            };
+            owner.open(document.clone(), view.clone(), width.clone())?;
+            let snapshot = owner.snapshot(&document)?;
+            let root = snapshot
+                .block
+                .iter()
+                .find(|block| block.id.0 == "workspace-result:results:changes")
+                .unwrap()
+                .metadata
+                .node
+                .as_ref()
+                .unwrap();
+            owner.dispatch(PresentationRequest::Node {
+                request: NodeRequest {
+                    document: document.clone(),
+                    view: view.clone(),
+                    sequence: 1,
+                    node: root.id.0.clone(),
+                    generation: root.generation,
+                    action: NodeAction::SetExpansion { expanded: true },
+                    rows: 48,
+                    width: width.clone(),
+                },
+            })?;
+            let snapshot = owner.snapshot(&document)?;
+            let file = snapshot
+                .block
+                .iter()
+                .find(|block| {
+                    block
+                        .metadata
+                        .node
+                        .as_ref()
+                        .is_some_and(|node| node.kind == NodeKind::File)
+                })
+                .unwrap();
+            let file_id = file.id.clone();
+            let node = file.metadata.node.as_ref().unwrap();
+            owner.dispatch(PresentationRequest::Node {
+                request: NodeRequest {
+                    document: document.clone(),
+                    view: view.clone(),
+                    sequence: 2,
+                    node: node.id.0.clone(),
+                    generation: node.generation,
+                    action: NodeAction::SetExpansion { expanded: true },
+                    rows: 48,
+                    width: width.clone(),
+                },
+            })?;
+            let replacement =
+                format!("--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+earlier\n{patch}");
+            for (patch, pending, error) in [
+                (patch, true, None),
+                (patch, true, Some("recapture failed")),
+                (replacement.as_str(), false, None),
+            ] {
+                set_evidence(&mut entry, patch, pending, error);
+                owner.reconcile(vec![entry.clone()])?;
+                let snapshot = owner.snapshot(&document)?;
+                let file = snapshot
+                    .block
+                    .iter()
+                    .find(|block| block.id == file_id)
+                    .unwrap();
+                assert_eq!(
+                    file.metadata.node.as_ref().unwrap().display,
+                    NodeDisplay::Full
+                );
+                let open = owner.open.as_ref().unwrap();
+                assert!(open.action.values().any(|action| matches!(action, TranscriptAction::File { path, line: 1 } if path == "z.txt")));
+                assert!(open.action.values().any(
+                    |action| matches!(action, TranscriptAction::Diff { text, .. } if text == patch)
+                ));
+            }
+            let previous = owner.snapshot(&document)?;
+            set_evidence(&mut entry, "invalid saved comparison", false, None);
+            let revision = owner.timeline.revision();
+            assert!(reflow(owner.open.as_mut().unwrap(), &[entry.clone()], revision).is_err());
+            assert_eq!(owner.snapshot(&document)?.block, previous.block);
+            owner.reconcile(vec![entry.clone()])?;
+            assert!(
+                owner
+                    .open
+                    .as_ref()
+                    .unwrap()
+                    .failure
+                    .as_deref()
+                    .is_some_and(|error| error.contains("retaining the previous document"))
+            );
+            assert_eq!(owner.snapshot(&document)?.block, previous.block);
+        }
         Ok(())
     }
 

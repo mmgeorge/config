@@ -1,4 +1,6 @@
 mod admission;
+#[cfg(test)]
+mod change_results_test;
 mod checks;
 mod execution;
 mod fork;
@@ -6614,7 +6616,8 @@ Planning continuation: turn {} of {}.",
                     self.clock.now_ms(),
                 )
                 .await?;
-            let before = if let Some(identity) = interaction.checkpoint_before.as_deref() {
+            let mut settled = interaction.clone();
+            let before = if let Some(identity) = settled.checkpoint_before.as_deref() {
                 self.store
                     .load_checkpoint(identity)?
                     .context("interaction before checkpoint is missing")?
@@ -6624,12 +6627,11 @@ Planning continuation: turn {} of {}.",
                     "completed interaction has no initial checkpoint"
                 );
                 // A failed initial barrier never released tools. Recovery preserves the current workspace.
-                interaction.checkpoint_before = Some(checkpoint.id.clone());
+                settled.checkpoint_before = Some(checkpoint.id.clone());
                 checkpoint.clone()
             };
-            self.populate_interaction_change_diffs(interaction, &before, &checkpoint)
+            self.populate_interaction_change_diffs(&mut settled, &before, &checkpoint)
                 .await?;
-            let mut settled = interaction.clone();
             settled.checkpoint_after = Some(checkpoint.id.clone());
             settled.finalization_error = None;
             settled.finish(outcome, self.clock.now_ms())?;
@@ -13493,7 +13495,11 @@ mod test {
         assert_eq!(resolve_fork_name(&json!({}), "", &HashSet::new()), "fork-0");
     }
 
-    fn completed_interaction(id: &str, session_id: &str, node_list: Vec<ExchangeNode>) -> Exchange {
+    pub(super) fn completed_interaction(
+        id: &str,
+        session_id: &str,
+        node_list: Vec<ExchangeNode>,
+    ) -> Exchange {
         Exchange {
             lifecycle: None,
             approval_mode: None,
@@ -16495,7 +16501,7 @@ mod test {
         assert!(status.success());
     }
 
-    fn repository() -> tempfile::TempDir {
+    pub(super) fn repository() -> tempfile::TempDir {
         let temporary = tempfile::tempdir().unwrap();
         git(temporary.path(), &["init", "-q"]);
         git(
@@ -16509,7 +16515,7 @@ mod test {
         temporary
     }
 
-    fn planning_question_broker(
+    pub(super) fn planning_question_broker(
         repository: &Path,
         data_root: &Path,
         structured: bool,

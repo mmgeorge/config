@@ -2,8 +2,6 @@ use crate::backend::{ProviderChangeKind, ProviderFileChange};
 use crate::exchange::{Exchange, ToolCall};
 use std::collections::BTreeSet;
 
-mod net;
-
 /// Stores normalized paths from successful provider-owned file changes.
 #[derive(Default)]
 pub struct ProviderChangeIndex {
@@ -64,34 +62,6 @@ impl ProviderDiffBuilder {
         let mut builder = Self::default();
         builder.record_tools(tool_list.iter());
         builder.finish()
-    }
-
-    /// Compose adjacent successful writes into one diff per file.
-    /// Inconsistent reports retain all operation hunks and include an explicit diagnostic.
-    pub fn build_group(tool_list: &[&ToolCall]) -> (Option<String>, Option<String>) {
-        let mut builder = Self::default();
-        builder.record_tools(tool_list.iter().copied());
-        let mut warning = Vec::new();
-        for projection in &mut builder.projection {
-            match net::compose(&projection.hunk_list) {
-                Ok(hunks) => projection.hunk_list = hunks,
-                Err(error) => warning.push(format!(
-                    "{}: {error}",
-                    projection
-                        .new_path
-                        .as_deref()
-                        .or(projection.old_path.as_deref())
-                        .unwrap_or("unknown")
-                )),
-            }
-        }
-        let warning = (!warning.is_empty()).then(|| {
-            format!(
-                "reported edits retained, net diff unavailable: {}",
-                warning.join(", ")
-            )
-        });
-        (builder.finish(), warning)
     }
 
     /// Include successful edits from each provider turn in an exchange.
@@ -448,9 +418,6 @@ mod test {
                 }],
             ));
         }
-        let (diff, warning) = ProviderDiffBuilder::build_group(&tools.iter().collect::<Vec<_>>());
-        assert!(diff.is_none());
-        assert!(warning.is_none());
         assert!(ProviderDiffBuilder::build(&tools).is_none());
 
         tools.push(file_tool(
@@ -463,16 +430,11 @@ mod test {
                 diff: "@@ -1 +1 @@\n-before\n+after".into(),
             }],
         ));
-        for diff in [
-            ProviderDiffBuilder::build(&tools),
-            ProviderDiffBuilder::build_group(&tools.iter().collect::<Vec<_>>()).0,
-        ] {
-            let diff = diff.expect("persistent edit");
-            let patch = forge_diff::patch::UnifiedPatch::parse(&diff).unwrap();
-            assert_eq!(patch.file.len(), 1);
-            assert_eq!(patch.file[0].new_path.as_deref(), Some("existing.lua"));
-            assert_eq!(patch.file[0].hunk[0].row[1].text, "after");
-        }
+        let diff = ProviderDiffBuilder::build(&tools).expect("persistent edit");
+        let patch = forge_diff::patch::UnifiedPatch::parse(&diff).unwrap();
+        assert_eq!(patch.file.len(), 1);
+        assert_eq!(patch.file[0].new_path.as_deref(), Some("existing.lua"));
+        assert_eq!(patch.file[0].hunk[0].row[1].text, "after");
 
         tools.push(file_tool(
             "recreate",
@@ -484,9 +446,7 @@ mod test {
                 diff: "@@ -0,0 +1 @@\n+third".into(),
             }],
         ));
-        let (diff, warning) = ProviderDiffBuilder::build_group(&tools.iter().collect::<Vec<_>>());
-        assert!(warning.is_none());
-        let diff = diff.unwrap();
+        let diff = ProviderDiffBuilder::build(&tools).unwrap();
         let patch = forge_diff::patch::UnifiedPatch::parse(&diff).unwrap();
         assert_eq!(patch.file.len(), 2);
         assert_eq!(patch.file[1].old_path, None);

@@ -16,6 +16,7 @@ use super::transcript::TranscriptRenderer;
 pub(super) struct ChangeTree {
     pub block: Vec<BufferBlock>,
     pub action: HashMap<TargetId, TranscriptAction>,
+    pub preview_error: Option<String>,
 }
 
 fn file_action(
@@ -99,13 +100,15 @@ impl ChangeTree {
         let mut tree = Self {
             block: Vec::new(),
             action: HashMap::new(),
+            preview_error: None,
         };
         let patch = match UnifiedPatch::parse(text) {
             Ok(patch) => patch,
             Err(error) => {
+                tree.preview_error = Some(error.to_string());
                 let mut block = renderer.literal(
                     BlockId(id.into()),
-                    &format!("◇ {label}: preview unavailable ({error})"),
+                    &format!("◇ {label}: preview unavailable ({error}){suffix}"),
                     2,
                 )?;
                 TranscriptRenderer::heading_marker(&mut block, "Normal");
@@ -179,14 +182,14 @@ impl ChangeTree {
             },
         )?;
         let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
-        for (file_index, file) in patch.file.iter().enumerate() {
+        for file in &patch.file {
             let file_start = tree.block.len();
             let path = file
                 .new_path
                 .as_ref()
                 .or(file.old_path.as_ref())
                 .expect("validated patch path");
-            let file_id = format!("{id}:file:{file_index}");
+            let file_id = format!("{id}:file:{}:{path}", path.len());
             let added = file
                 .hunk
                 .iter()

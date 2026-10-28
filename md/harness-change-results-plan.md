@@ -9,8 +9,50 @@ final contents. This separates durable workspace evidence from incomplete provid
 reports and prevents formatting between edits from breaking the final summary.
 
 This is a textual implementation plan, not a JSON plan or an implementation.
-The checkpoint-result refactor is not implemented. The Copilot creation-header
-normalization described below already exists in source.
+The checkpoint-result refactor was not implemented at review time. The Copilot
+creation-header normalization described below already exists in source.
+
+### Current-code review, 2026-10-28
+
+The renderer still calls `ProviderDiffBuilder::build_group`, and finalization
+still mutates comparison fields before committing its candidate. Both changes
+remain required. Commit `227a99b2` replaced independent lifecycle fields with
+`ExchangePhase`, so implementation must use `state()` and `completed_at_ms()`
+and preserve its transition methods and legacy-record handling.
+
+Follow that commit's type-safety pattern with a borrowed `CheckpointComparison`
+whose private construction requires both checkpoint identities and comparison
+text. Carry this evidence in `ExchangeChangeResult` instead of unconstrained
+strings. Keep the existing serialized representation unchanged.
+
+`CheckpointComparison` validates the presence of saved evidence, not patch
+syntax or exclusive authorship. Only `Exchange::change_result` constructs it.
+Use `Pending { previous }`, `Captured(comparison)`, and
+`Unavailable { previous, reason }` so a consumer cannot confuse a missing
+comparison with a successfully captured empty comparison. Do not introduce new
+persisted flags or restore the lifecycle fields removed by commit `227a99b2`.
+
+Retain streamed failed-tool output through the current display-identity registry.
+Successful operation trees use their originating call identities. Preserve
+pending/failure provenance even when the saved patch cannot be parsed. Extend
+session reconciliation coverage to verify the previous document survives a
+rendering error. The existing failure test is now named
+`failed_checkpoint_finalization_persists_failure_and_blocks_provider_execution`.
+
+File identities inside the workspace tree must remain associated with their
+paths when a replacement comparison inserts or removes earlier files. The current
+`ChangeTree` uses file positions in identities, so update that identity boundary
+and its tests. Preserve applicable expansion state without assigning an earlier
+file's expansion to a different path. Operation groups retain their existing
+group identity, and each operation retains its originating call identity.
+
+Native verification also exposed an existing raw-diff navigation failure:
+`source_document.display_source` tries to replace the Harness transcript buffer
+while its window has `winfixbuf` enabled. The captured patch reaches the editor,
+but Neovim rejects display with E1513. Extend this plan to create a separate tab
+when the source window is protected, preserving its buffer and option ownership.
+Verify closing the raw view returns to the original transcript. This changes
+only source-view navigation, not checkpoint or RPC formats.
 
 ### Investigation context
 
@@ -119,7 +161,8 @@ unavailable state without inventing a diff.
 ### Object model and ownership
 
 `Exchange` owns persisted checkpoint identities and comparison text.
-`ExchangeChangeResult` borrows that state and classifies its availability.
+`ExchangeChangeResult` borrows that state through `CheckpointComparison` and
+classifies its availability.
 `HarnessBroker` publishes new evidence only after committing it.
 `TimelineRenderer` selects the evidence, and the existing `ChangeTree` renders it.
 `ProviderDiffBuilder` remains an operation-report adapter, not a workspace owner.
@@ -146,12 +189,17 @@ Contracts                                 Concrete
                                           *enum ExchangeChangeResult
                                             [nvim/rust/forge/crates/forge-harness/src/exchange/change_result.rs]
                                             Pending
-                                              + previous_diff: &str?
+                                              + previous: CheckpointComparison?
                                             Captured
-                                              + diff: &str
+                                              + comparison: CheckpointComparison
                                             Unavailable
-                                              + previous_diff: &str?
+                                              + previous: CheckpointComparison?
                                               + reason: &str
+
+                                          *struct CheckpointComparison
+                                            [nvim/rust/forge/crates/forge-harness/src/exchange/change_result.rs]
+                                            - diff: &str
+                                            + text(): &str
 
                                           *struct HarnessBroker
                                             [nvim/rust/forge/crates/forge-harness/src/broker/mod.rs]
@@ -164,7 +212,7 @@ Contracts                                 Concrete
                                             + file_change_group(id, calls): Result
                                             + file_change(id, tool): Result
 
-                                           struct ChangeTree
+                                          *struct ChangeTree
                                             [nvim/rust/forge/crates/forge-harness/src/buffer/changes.rs]
 
                                           *struct ProviderDiffBuilder
@@ -237,6 +285,8 @@ file `nvim/rust/forge/crates/forge-harness/src/exchange/change_result.rs`
 
 - Create the borrowed result contract.
 - Add enum `ExchangeChangeResult` with `Pending`, `Captured`, and `Unavailable`.
+- Add `CheckpointComparison` with a private borrowed-text field and a text
+  accessor. Construct it only after validating all three saved evidence fields.
 - Add method `Exchange::change_result`.
 - Add tests `change_result_requires_complete_checkpoint_evidence`,
   `change_result_preserves_previous_capture_during_pending_and_failure`, and
@@ -248,6 +298,11 @@ previous evidence if present. Select `Pending` for queued, running, or finalizin
 work, and for an exchange lacking its completion timestamp. Select `Captured`
 only for settled work with complete checkpoint evidence. Otherwise select
 `Unavailable` with a specific explanation.
+
+Read lifecycle state through `Exchange::state()` and
+`Exchange::completed_at_ms()`. Use the existing `ExchangePhase` transitions for
+production state changes. Test fixtures may use `ExchangePhase::fixture` or
+serialized legacy records to exercise absent completion timestamps.
 
 Terminal provider failure does not itself invalidate a successfully committed
 checkpoint comparison. Failed and cancelled exchanges can still have captured
@@ -285,6 +340,11 @@ Preserve existing child-exchange settlement, cancellation admission, and non-Git
 branches. The candidate must contain matching checkpoint identities, comparison
 fields, completion state, and completion timestamp.
 
+Do not add boolean publication flags. Candidate ownership separates unpublished
+state from the live exchange. Keep the initial-checkpoint barrier's existing
+independent commit intact. Recover an absent initial identity only on the final
+candidate so a later failure cannot publish it prematurely.
+
 Exercise both first capture and recapture after automatic check repair. A retry
 must publish the successful new comparison without retaining a failure indication.
 If error persistence itself fails, propagate that storage failure through the
@@ -318,6 +378,11 @@ Retain result identity `<exchange>:results:changes`. Keep the checks summary
 separate, preserve per-tool identities, and count operations at the report-group
 level rather than summing intermediate line changes as a net result.
 
+Use each `ThoughtCall` identity for its operation tree. Where output is deferred,
+preserve the existing `tool` output-view path and display registry for failures
+and unavailable details. Do not force deferred output into an inline string or
+register the same call identity twice.
+
 Replace the existing assertion that checkpoint fields do not affect rendering.
 The new assertion must prove the opposite: checkpoint text controls the workspace
 result even when provider reports disagree or are missing.
@@ -338,6 +403,30 @@ Stable identity must preserve applicable fold state when new evidence replaces
 the previous tree. Navigation continues to use the existing live-file actions.
 A raw diff opens captured evidence, not a fresh working-tree comparison.
 Historical line coordinates do not promise that the live file is unchanged.
+
+file `nvim/lua/forge/source_document.lua`
+
+- Make `display_source` select a new tab when `winfixbuf` protects the source
+  window. Keep ordinary unprotected-window behavior and explicit tab layout.
+- Clear inherited protection only on the newly created target window.
+- Retain existing return-view ownership so closing the raw diff restores the
+  source tab without changing the protected transcript buffer.
+
+file `nvim/tests/forge/harness_saved_diff.lua`
+
+- Exercise both ordinary and protected source windows.
+- Verify raw-diff requests still carry captured input identities, the protected
+  source remains intact, and closing the new tab restores the source view.
+
+file `nvim/rust/forge/crates/forge-harness/src/buffer/changes.rs`
+
+- Replace positional file identities with deterministic path identities scoped
+  to their result or originating operation.
+- Keep hunk and row identities scoped to their owning file.
+- Preserve the raw-diff action and explicit parse-failure display, including
+  pending or previous-capture provenance.
+- Verify insertion of an earlier file does not transfer or discard expansion for
+  an unchanged later file.
 
 ### 4. Remove sequential patch reconstruction from the presentation boundary.
 
@@ -507,7 +596,7 @@ No group may imply net-zero workspace changes from a missing provider patch.
 Reuse broker tests `provider_and_command_changes_use_separate_diff_sources`,
 `matching_provider_and_checkpoint_changes_share_one_canonical_diff`,
 `provider_change_index_includes_referenced_child_turns`, and
-`failed_checkpoint_finalization_persists_the_failure_and_blocks_admission`.
+`failed_checkpoint_finalization_persists_failure_and_blocks_provider_execution`.
 Extend their assertions only where the new publication contract requires it.
 
 Retain existing patch-presentation coverage for CRLF/LF conversion, missing final
@@ -552,5 +641,52 @@ release build, workspace-wide test run, or check-configuration change.
 Completion requires a checkpoint-derived final result that survives formatter
 edits and incomplete provider reports, explicit pending and failure states that
 retain previous evidence, unchanged operation-history diagnostics, and successful
-reopening from persisted data. No passing result for this refactor is claimed by
-this document.
+reopening from persisted data.
+
+## 7. Implementation and verification results, 2026-10-28
+
+The implementation now uses borrowed `CheckpointComparison` evidence and
+`ExchangeChangeResult`, publishes comparison fields only with the committed
+checkpoint candidate, and renders the full saved comparison as **Workspace
+changes**. Ordered **Reported edits** retain operation-local diagnostics and
+output identities. The sequential composer and its private module are removed.
+Result file identities follow paths across replacement. Incremental updates and
+full redraws retain the previous document when a new workspace preview fails.
+
+Native verification exposed and repaired the protected-window raw-diff issue
+described in the review addendum. Saved diffs open in a separate tab from a
+protected transcript, and closing the diff restores the transcript without
+clearing its protection.
+
+Verification used the pinned Rust 1.94.0 toolchain on Windows:
+
+- `cargo check --locked -p forge-harness --lib --tests` passed with exit 0 and a
+  300-second timeout.
+- Thirty-five distinct exact Rust tests passed. Coverage includes all new
+  selector and publication tests, renderer replacement, retained operation
+  diagnostics, Copilot creation and null-marker dialects, complete large diffs,
+  line endings, and saved-source navigation. The one test adjusted for lint was
+  checked and rerun after that adjustment. Rust test commands used 300-second
+  timeouts.
+- `cargo fmt --all -- --check` passed with exit 0 and a 30-second timeout.
+- `cargo clippy --locked -p forge-harness --lib --tests --no-deps
+  --message-format=json -- -D warnings` exited 101 after 69.2 seconds, within its
+  300-second timeout. Its 118 diagnostics have no primary spans on added or
+  changed lines. No lint suppressions were added. The full report is retained at
+  `C:/Users/mattm/AppData/Local/Temp/forge-workspace-clippy-20261028.jsonl`.
+- `cargo build --profile dev --locked --bin forge` passed with exit 0 in 55.8
+  seconds, within its 300-second timeout. The executable is
+  `nvim/rust/forge/target/debug/forge.exe`. Compiler invocations reported Windows
+  incremental-cache finalization warnings but completed successfully.
+- The configured Lua runner passed the exact `harness_checkpoint_host.lua`,
+  `harness_saved_diff.lua`, `harness_change_navigation.lua`, and
+  `source_document_stale.lua` fixtures. Each used a 30-second fixture timeout and
+  exited 0. Lua syntax loading also passed for both changed Lua files.
+- Isolated native editors at 160x48 and 100x30 displayed saved checkpoint
+  results, expanded file hunks, and opened the complete captured raw patch.
+  The captured patch retained `first a` after the live file changed to
+  `later user a`. Live-file navigation opened the later contents. Closing the
+  raw-diff tab restored the protected transcript.
+
+Existing hosts require a restart to load the rebuilt executable. No database
+migration, checkpoint deletion, or historical-record rewrite is required.

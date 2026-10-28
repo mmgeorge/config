@@ -129,14 +129,87 @@ mod test {
             let changes = from_output(&source, "/Users/me/project").unwrap();
             assert_eq!(changes.file.len(), 3);
             assert_eq!(changes.file[0].kind, ProviderChangeKind::Update);
+            assert_eq!(changes.file[0].path, "old.rs");
+            assert!(
+                changes.file[0]
+                    .diff
+                    .replace("\r\n", "\n")
+                    .contains("-before\n+after")
+            );
             assert_eq!(changes.file[1].kind, ProviderChangeKind::Add);
             assert_eq!(changes.file[1].path, "new.rs");
             assert!(changes.file[1].diff.contains("+create file mode 100644"));
             assert_eq!(changes.file[2].kind, ProviderChangeKind::Delete);
+            assert_eq!(changes.file[2].path, "gone.rs");
+            assert!(changes.file[2].diff.contains("-gone"));
+            assert_creation_report_renders(changes);
         }
         assert!(
             UnifiedPatch::parse(output.trim_start()).is_err(),
             "provider dialect normalization must not change ordinary Git parsing"
+        );
+    }
+
+    fn assert_creation_report_renders(changes: ProviderChangeSet) {
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
+            "id":"creation", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Edit", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))
+        .unwrap();
+        let address = ProviderAddress {
+            owner: None,
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        exchange.start_turn(address.clone(), 0).unwrap();
+        exchange
+            .observe_turn(
+                &BackendEvent {
+                    received_at_ms: None,
+                    address: Some(address),
+                    turn_boundary: None,
+                    kind: "tool".into(),
+                    text: None,
+                    data: serde_json::Value::Null,
+                    summary: None,
+                    task_update: None,
+                    activity: Some(ToolActivity {
+                        id: "edit".into(),
+                        kind: ToolActivityKind::FileChange,
+                        title: "edit".into(),
+                        output: None,
+                        output_delta: false,
+                        status: Some("completed".into()),
+                        change: changes,
+                    }),
+                },
+                1,
+            )
+            .unwrap();
+        let projected = crate::buffer::projection::project(
+            crate::buffer::projection::ProjectionSource::Exchange(&exchange),
+            &forge_buffer::width::WidthProfile::default(),
+            false,
+            &Default::default(),
+            &Default::default(),
+            &mut Default::default(),
+        )
+        .unwrap();
+        let rendered = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Reported edits · 1 operation"));
+        for path in ["old.rs", "new.rs", "gone.rs"] {
+            assert!(rendered.contains(path));
+        }
+        assert!(
+            !rendered.contains("details unavailable") && !rendered.contains("preview unavailable")
         );
     }
 

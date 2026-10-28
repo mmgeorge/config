@@ -23,6 +23,10 @@ use super::transcript::TranscriptRenderer;
 #[path = "projection/checks.rs"]
 mod checks;
 
+#[cfg(test)]
+#[path = "projection/change_results_test.rs"]
+mod change_results_test;
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TranscriptAction {
@@ -65,6 +69,7 @@ pub enum TranscriptAction {
 }
 
 pub struct ProjectedEntry {
+    pub(crate) workspace_error: Option<String>,
     #[cfg(test)]
     display: crate::buffer::identity::DisplayRegistry,
     pub entry: TranscriptEntry,
@@ -74,6 +79,17 @@ pub struct ProjectedEntry {
     pub(crate) syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
 }
 
+impl ProjectedEntry {
+    pub(super) fn require_workspace_preview(&self) -> Result<()> {
+        if let Some(error) = &self.workspace_error {
+            anyhow::bail!(
+                "Workspace changes preview failed, retaining the previous document: {error}"
+            );
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct ProjectedMessage {
     pub block: BufferBlock,
     pub action: HashMap<TargetId, TranscriptAction>,
@@ -81,6 +97,7 @@ pub(super) struct ProjectedMessage {
 }
 
 struct TimelineRenderer<'profile> {
+    workspace_error: Option<String>,
     display: super::identity::DisplayProjection<'profile>,
     width: &'profile WidthProfile,
     margin: RenderMargin,
@@ -551,6 +568,7 @@ pub(super) fn message_block(
         .max(1);
     let mut display = crate::buffer::identity::DisplayRegistry::default();
     let mut renderer = TimelineRenderer {
+        workspace_error: None,
         display: display.project(previous.id.0.clone()),
         width: &content_width,
         margin: RenderMargin::default(),
@@ -648,6 +666,7 @@ fn project_at_with_separator(
     display: &mut crate::buffer::identity::DisplayRegistry,
 ) -> Result<ProjectedEntry> {
     let mut projection = TimelineRenderer {
+        workspace_error: None,
         display: display.project(entry.id()),
         width,
         margin: RenderMargin::default(),
@@ -682,6 +701,7 @@ fn project_at_with_separator(
         super::message::prepare(block, width)?;
     }
     Ok(ProjectedEntry {
+        workspace_error: projection.workspace_error,
         #[cfg(test)]
         display: projection.display.snapshot(),
         entry: TranscriptEntry {
@@ -1328,17 +1348,8 @@ impl TimelineRenderer<'_> {
 
     /// Project stable interaction summaries while retaining each thought's original activity.
     fn interaction_results(&mut self, interaction: &Exchange) -> Result<()> {
-        let nodes = interaction.node_list.iter().collect::<Vec<_>>();
-        let content = interaction.thoughts(&nodes)?;
-        let writes = content
-            .thought
-            .iter()
-            .flat_map(|thought| thought.writes.call.iter())
-            .collect::<Vec<_>>();
         let identity = format!("{}:results", interaction.id);
-        if !writes.is_empty() {
-            self.file_change_group(&identity, &writes, interaction)?;
-        }
+        self.workspace_changes(&format!("{identity}:changes"), interaction)?;
         let runs = interaction
             .node_list
             .iter()
@@ -1695,11 +1706,20 @@ impl TimelineRenderer<'_> {
         } else {
             None
         };
-        self.content_nodes(interaction, agents, depth, &thought.events, questions)?;
-        self.tool_group(&thought.tools, interaction)?;
-        if let Some(first) = thought.writes.call.first() {
-            let calls = thought.writes.call.iter().collect::<Vec<_>>();
-            self.file_change_group(first.id, &calls, interaction)?;
+        for part in &thought.body {
+            match part {
+                crate::exchange::ThoughtBody::Steering(node) => {
+                    self.content_nodes(interaction, agents, depth, &[*node], questions)?;
+                }
+                crate::exchange::ThoughtBody::Activity(activity) => {
+                    self.content_nodes(interaction, agents, depth, &activity.events, questions)?;
+                    self.tool_group(&activity.tools, interaction)?;
+                    if let Some(first) = activity.writes.call.first() {
+                        let calls = activity.writes.call.iter().collect::<Vec<_>>();
+                        self.file_change_group(first.id, &calls, interaction)?;
+                    }
+                }
+            }
         }
         if let Some(section) = section {
             self.finish_section(section, thought.id, true).kind = NodeKind::Thought;
@@ -2401,6 +2421,77 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
+    fn workspace_changes(&mut self, identity: &str, exchange: &Exchange) -> Result<()> {
+        use crate::exchange::ExchangeChangeResult;
+        match exchange.change_result() {
+            ExchangeChangeResult::Captured(comparison) => {
+                self.workspace_comparison(identity, comparison, "")
+            }
+            ExchangeChangeResult::Pending {
+                previous: Some(comparison),
+            } => self.workspace_comparison(identity, comparison, " · previous capture · pending"),
+            ExchangeChangeResult::Pending { previous: None } => {
+                self.literal(identity, "◇ Workspace changes pending", None)
+            }
+            ExchangeChangeResult::Unavailable {
+                previous: Some(comparison),
+                reason,
+            } => self.workspace_comparison(
+                identity,
+                comparison,
+                &format!(" · previous capture · unavailable: {reason}"),
+            ),
+            ExchangeChangeResult::Unavailable {
+                previous: None,
+                reason,
+            } => self.literal(
+                identity,
+                &format!("◇ Workspace changes unavailable: {reason}"),
+                None,
+            ),
+        }
+    }
+
+    fn workspace_comparison(
+        &mut self,
+        identity: &str,
+        comparison: crate::exchange::CheckpointComparison<'_>,
+        suffix: &str,
+    ) -> Result<()> {
+        if comparison.text().is_empty() {
+            return self.literal(identity, &format!("◇ No workspace changes{suffix}"), None);
+        }
+        let tree = super::changes::ChangeTree::render(
+            &TranscriptRenderer::new(&self.content_width())?,
+            identity,
+            "Workspace changes",
+            suffix,
+            comparison.text(),
+            None,
+            None,
+        )?;
+        if let Some(error) = tree.preview_error {
+            self.workspace_error.get_or_insert(error);
+        }
+        if tree.block.is_empty() {
+            let error = "saved comparison has no file sections";
+            self.workspace_error.get_or_insert(error.into());
+            return self.literal(
+                identity,
+                &format!("◇ Workspace changes: preview unavailable ({error}){suffix}"),
+                Some(TranscriptAction::Diff {
+                    text: comparison.text().into(),
+                    syntax: false,
+                }),
+            );
+        }
+        self.action.extend(tree.action);
+        for block in tree.block {
+            self.push(block)?;
+        }
+        Ok(())
+    }
+
     fn file_change_group(
         &mut self,
         id: &str,
@@ -2409,106 +2500,49 @@ impl TimelineRenderer<'_> {
     ) -> Result<()> {
         use crate::turn::ToolState;
         let identity = format!("{id}:changes");
-        let start = self.block.len();
-        let tools = calls.iter().map(|call| call.tool).collect::<Vec<_>>();
-        let (diff, warning) = crate::exchange::ProviderDiffBuilder::build_group(&tools);
-        let pending: std::collections::HashSet<_> = calls
-            .iter()
-            .map(|call| call.tool)
-            .filter(|tool| tool.state() == crate::turn::ToolState::Running)
-            .flat_map(|tool| tool.change.file.iter())
-            .map(|file| file.move_path.as_ref().unwrap_or(&file.path))
-            .collect();
         let running = calls
             .iter()
-            .any(|call| call.tool.state() == crate::turn::ToolState::Running);
-        let unsuccessful: Vec<_> = calls
+            .filter(|call| call.tool.state() == ToolState::Running)
+            .count();
+        let unsuccessful = calls
             .iter()
-            .enumerate()
-            .filter(|(_, call)| {
+            .filter(|call| {
                 call.tool.state() != ToolState::Running
                     && (call.tool.failed || call.tool.state() != ToolState::Completed)
             })
-            .collect();
-        let unavailable = calls.iter().map(|call| call.tool).any(|tool| {
-            tool.state() == ToolState::Completed && !tool.failed && tool.change.file.is_empty()
-        });
-        let mut outcome = String::new();
-        if !unsuccessful.is_empty() {
-            outcome.push_str(&format!(
-                " · {} unsuccessful {}",
-                unsuccessful.len(),
-                if unsuccessful.len() == 1 {
-                    "write"
-                } else {
-                    "writes"
-                }
-            ));
-        }
-        if unavailable {
-            outcome.push_str(" · edit details unavailable");
-        }
-        if warning.is_some() {
-            outcome.push_str(" · net diff unavailable");
-        }
-        if let Some(diff) = diff {
-            let mut suffix = if running {
-                if pending.is_empty() {
-                    " · changing files".to_owned()
-                } else {
-                    format!(
-                        " · changing {} {}",
-                        pending.len(),
-                        if pending.len() == 1 { "file" } else { "files" }
-                    )
-                }
+            .count();
+        let mut label = format!(
+            "▸ Reported edits · {} {}",
+            calls.len(),
+            if calls.len() == 1 {
+                "operation"
             } else {
-                String::new()
-            };
-            suffix.push_str(&outcome);
-            self.diff(&identity, "Changed", &diff, &suffix, None, None)?;
-        } else {
-            let label = if running {
-                if pending.is_empty() {
-                    "Changing files".to_owned()
-                } else {
-                    format!(
-                        "Changing {} {}",
-                        pending.len(),
-                        if pending.len() == 1 { "file" } else { "files" }
-                    )
-                }
-            } else if unsuccessful.len() == calls.len() {
-                "File changes".to_owned()
-            } else if !unavailable && warning.is_none() {
-                "No net file changes".to_owned()
-            } else {
-                "Changed files · details unavailable".to_owned()
-            };
-            self.literal(&identity, &format!("◇ {label}{outcome}"), None)?;
+                "operations"
+            }
+        );
+        if running > 0 {
+            label.push_str(&format!(" · {running} running"));
         }
-        let details_start = self.block.len();
-        let margin = self.margin.enter(2);
-        if let Some(warning) = warning {
-            self.literal(
-                &format!("{identity}:warning"),
-                &format!("◇ {warning}"),
-                None,
-            )?;
+        if unsuccessful > 0 {
+            label.push_str(&format!(" · {unsuccessful} unsuccessful"));
         }
-        for (index, call) in unsuccessful {
-            if exchange.output_store.is_some() {
-                self.tool(call, Some(&identity), "", false, exchange)?;
+        self.literal(&identity, &label, None)?;
+        let section = self.begin_section(2);
+        for call in calls {
+            if exchange.output_store.is_some()
+                && call.tool.state() != ToolState::Running
+                && (call.tool.failed
+                    || call.tool.state() != ToolState::Completed
+                    || call.tool.change.file.is_empty())
+            {
+                let tool_start = self.block.len();
+                let (call_id, _) = self.tool(call, Some(&identity), &identity, false, exchange)?;
+                self.fold(tool_start, &format!("{call_id}:tool"), true, NodeKind::Tool);
             } else {
-                self.file_change(&format!("{id}:write:{index}"), call.tool)?;
+                self.file_change(&format!("{}:operation", call.id), call.tool)?;
             }
         }
-        drop(margin);
-        if self.block.len() > details_start {
-            self.offset_layout(details_start, 1);
-            self.block[start].metadata.fold.clear();
-            self.fold(start, &identity, true, NodeKind::Changes);
-        }
+        self.finish_section(section, &identity, true).kind = NodeKind::Changes;
         Ok(())
     }
 
@@ -4109,10 +4143,18 @@ mod tests {
                     .iter()
                     .find(|block| block.id.0 == "ordered:summary")
                     .unwrap();
-                assert_eq!(
-                    summary.metadata.fold[0].end.block,
-                    blocks[response_position - 1].id,
+                let activity_end = blocks
+                    .iter()
+                    .position(|block| block.id == summary.metadata.fold[0].end.block)
+                    .unwrap();
+                assert!(
+                    activity_end < response_position,
                     "activity fold hid an outer response or later turn"
+                );
+                assert!(
+                    blocks[activity_end + 1..response_position]
+                        .iter()
+                        .all(|block| block.id.0 == "ordered:results:changes")
                 );
                 if planning_question == Some(true) && tool_count == 3 {
                     println!(
@@ -4896,7 +4938,7 @@ mod tests {
                 10,
             )?;
             if boundary != "commentary" {
-                assert_eq!(stored.tool.len(), 4, "{boundary}");
+                assert_eq!(stored.tool.len(), 2, "{boundary}");
                 let mut captured = Vec::new();
                 for (identity, output) in &stored.tool {
                     let mut snapshot = output.complete_snapshot()?;
@@ -4911,8 +4953,8 @@ mod tests {
                     export.close()?;
                 }
                 captured.sort();
-                let mut expected = vec![format!("{boundary} details"); 2];
-                expected.extend(vec![format!("second turn {boundary} details"); 2]);
+                let mut expected = vec![format!("{boundary} details")];
+                expected.push(format!("second turn {boundary} details"));
                 expected.sort();
                 assert_eq!(captured, expected);
             }
@@ -4938,13 +4980,9 @@ mod tests {
             assert_eq!(
                 heading
                     .iter()
-                    .filter(|text| text.contains(if boundary == "commentary" {
-                        "Changed 1 file"
-                    } else {
-                        "Changed 2 files"
-                    }))
+                    .filter(|text| text.contains("Changed 1 file"))
                     .count(),
-                if boundary == "commentary" { 2 } else { 1 },
+                2,
                 "{boundary}: {heading:?}"
             );
             if !matches!(boundary, "command" | "commentary") {
@@ -5106,9 +5144,10 @@ mod tests {
             })
             .map(|block| block.text.wire_rows().join(""))
             .collect();
-        assert_eq!(headings.len(), 2);
-        assert!(headings[0].contains("Changed 1 file"));
-        assert!(headings[1].contains("File changes failed"));
+        assert_eq!(headings.len(), 4);
+        assert!(headings[0].contains("Reported edits · 3 operations"));
+        assert!(headings[1].contains("Changed 1 file"));
+        assert!(headings[3].contains("File changes failed"));
         assert_eq!(
             projected.tool.len(),
             3,
@@ -5127,6 +5166,7 @@ mod tests {
         );
         let reported = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n+second\n";
         let checkpoint = "--- a/generated.rs\n+++ b/generated.rs\n@@ -0,0 +1 @@\n+generated\n";
+        exchange.checkpoint_before = Some("initial".into());
         for (checkpoint_after, attributed, total, matches) in [
             (None, Some(reported), None, false),
             (Some("checkpoint"), Some(reported), Some(reported), true),
@@ -5148,7 +5188,32 @@ mod tests {
                 &WidthProfile::default(),
                 100,
             )?;
-            assert_eq!(with_checkpoint.entry.block, *blocks);
+            let summary = with_checkpoint
+                .entry
+                .block
+                .iter()
+                .find(|block| block.id.0 == "edits:results:changes")
+                .unwrap();
+            if let Some(text) = total.filter(|_| checkpoint_after.is_some()) {
+                assert!(
+                    summary
+                        .text
+                        .wire_rows()
+                        .join("")
+                        .contains("Workspace changes 1 file")
+                );
+                assert!(
+                    matches!(&with_checkpoint.action[&super::TargetId("edits:results:changes".into())], super::TranscriptAction::Diff { text: saved, .. } if saved == text)
+                );
+            } else {
+                assert!(
+                    summary
+                        .text
+                        .wire_rows()
+                        .join("")
+                        .contains("Workspace changes unavailable")
+                );
+            }
             assert!(
                 !with_checkpoint
                     .action
@@ -5839,7 +5904,9 @@ mod tests {
                 .entry
                 .block
                 .iter()
-                .find(|block| block.id.0 == format!("artifact-{revision}:file:0"))
+                .find(|block| {
+                    block.id.0 == format!("artifact-{revision}:file:{}:{path}", path.len())
+                })
                 .unwrap();
             assert_eq!(block.text.row(0), Some(format!(
                 "Modified Artifact: Migrate cloud diagnostics to Rust (revision {revision}) +1 -1"
@@ -6718,7 +6785,7 @@ mod tests {
                 );
                 assert_eq!(
                     blocks[position].metadata.layout.as_ref().unwrap().indent,
-                    if label == "Read skill" { 4 } else { 6 },
+                    if label == "Read skill" { 6 } else { 8 },
                     "{label}"
                 );
             }
@@ -7714,6 +7781,14 @@ mod tests {
                         .unwrap()
                         .finish(crate::turn::TurnOutcome::Completed, 49)?;
                     exchange.finish(crate::exchange::ExchangeOutcome::Complete, 50)?;
+                    exchange.checkpoint_before = Some("before".into());
+                    exchange.checkpoint_after = Some("after".into());
+                    exchange.checkpoint_diff_text = Some(if persistent {
+                        "--- a/existing.lua\n+++ b/existing.lua\n@@ -1 +1 @@\n-before\n+after\n"
+                            .into()
+                    } else {
+                        String::new()
+                    });
                 }
                 let restored = serde_json::from_value(serde_json::to_value(&exchange)?)?;
                 let projected = project_at(
@@ -7738,10 +7813,12 @@ mod tests {
                     .iter()
                     .find(|block| block.id.0 == "transient:results:changes")
                     .unwrap();
-                assert!(summary.text.wire_rows().join("").contains(if persistent {
-                    "Changed 1 file"
+                assert!(summary.text.wire_rows().join("").contains(if !complete {
+                    "Workspace changes pending"
+                } else if persistent {
+                    "Workspace changes 1 file"
                 } else {
-                    "No net file changes"
+                    "No workspace changes"
                 }));
                 assert_eq!(
                     blocks
@@ -7751,7 +7828,7 @@ mod tests {
                                 && block.id.0 != "transient:results:changes"
                         })
                         .count(),
-                    4
+                    8
                 );
             }
         }
@@ -7838,6 +7915,10 @@ mod tests {
             exchange.node_list.push(ExchangeNode::TimelineEvent {
                 event: Box::new(crate::timeline::TimelineEvent::Check { run: Box::new(run) }),
             });
+            exchange.checkpoint_before = Some("before".into());
+            exchange.checkpoint_after = Some("after".into());
+            exchange.checkpoint_diff_text =
+                Some("--- /dev/null\n+++ b/result.txt\n@@ -0,0 +1 @@\n+captured\n".into());
             let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
             let projected = project_at(
                 &TimelineEntry::Exchange {
@@ -7898,7 +7979,13 @@ mod tests {
                 .iter()
                 .find(|block| block.id.0 == "combined:results:changes")
                 .unwrap();
-            assert!(changes.text.wire_rows().join("").contains("Changed 1 file"));
+            assert!(
+                changes
+                    .text
+                    .wire_rows()
+                    .join("")
+                    .contains("Workspace changes 1 file")
+            );
         }
         Ok(())
     }

@@ -232,23 +232,27 @@ Thoughts with activity start collapsed and preserve the assistant's text in thei
 Expanding a thought shows its events first, then its tool summary, then its file changes,
 one indentation level deeper. Thoughts without activity keep the `○` marker. Your explicit
 expansion choice survives incoming activity. Tools and file writes accumulate into two entries,
-even when they alternate. Each tool updates the tool group, and each completed write updates `Changed N files`.
-Its file count, diff, and totals update in place while preserving expansion. Repeated writes
-to the same file count once and show the original-to-final diff. A pending write shows
-`Changing N files` or a changing-files suffix. A new thought, user input, or question interaction starts a new section.
-Owned events stay inside the thought, including compaction. Late results stay with their
-original operation. Failed writes retain their diagnostics inside the changes group.
-Inconsistent edit reports retain their reported hunks with a diagnostic.
-Each interaction also shows expandable **Changed files** and **Checks** summaries alongside
-**Thought**. They update in place and remain visible when Thought is collapsed. Changed files
-combines reported edits across thoughts and counts each file once. Checks combines recorded
-command outcomes and elapsed times across completed runs. Individual file modifications and
-check runs remain under their owning subthoughts, with the same expandable detail controls.
-File checkpoints remain available through `/undo`.
+even when they alternate. **Reported edits** counts operations and preserves their order,
+individual patches, pending status, and failure diagnostics. Repeated writes to one file
+remain separate operations. A new assistant thought or question branch starts a new section.
+Steering stays inside the current commentary and divides its activity into ordered groups.
+Subsequent tools and edits remain under that commentary until the assistant starts another
+one. Question answers and clarifications still start separate branches.
 
-A file created and deleted within one changes group does not appear in its net diff.
-If no files remain changed, the summary shows `No net file changes`. Individual writes
-remain available under their original thoughts.
+Each exchange also displays **Workspace changes** and a separate **Checks** summary outside
+its Thought fold. Workspace changes compares the saved starting and final checkpoints,
+including captured formatter, command, child-agent, and external edits. Its file counts,
+line counts, hunks, and raw-diff action all use that saved comparison. Opening a file
+navigates to the live file, whose contents may have changed since capture.
+The raw diff opens in a separate read-only tab when the transcript window is
+protected. Press `q` in that diff to return to the transcript.
+
+A file created and deleted within the captured interval is absent from the workspace result
+but remains in Reported edits. An empty saved comparison displays **No workspace changes**.
+Missing checkpoint evidence displays **Workspace changes unavailable**, including non-Git
+workspaces. An active exchange displays a pending indication. During recapture, the previous
+comparison remains visible as **previous capture**. Failed recapture retains it with the
+failure reason. Checkpoints remain available through `/undo`.
 
 `/fork [name]` opens a child timeline with a snapshot of the source's visible history
 above its fork marker. New child messages append below that marker. Source updates do

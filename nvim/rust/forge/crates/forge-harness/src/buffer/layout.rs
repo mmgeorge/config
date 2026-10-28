@@ -38,7 +38,7 @@ impl<'exchange> ExchangeLayout<'exchange> {
                     .message
                     .is_some_and(|message| message.delivery() != MessageDelivery::Final)
             })
-            .flat_map(|thought| thought.events.iter().map(|node| node.id()))
+            .flat_map(|thought| thought.events().map(|node| node.id()))
             .collect::<std::collections::HashSet<_>>();
         activity.retain(|node| {
             if owned_events.contains(node.id()) {

@@ -605,6 +605,19 @@ do not scan text for paths or references. Generated Background prompts and child
 text have no attachments unless a caller explicitly supplies an attachment object.
 
 Rust projects the semantic timeline and its synthetic bottom status from the same session-scoped durable owners.
+The exchange's **Workspace changes** result uses its full saved checkpoint comparison.
+`Exchange::change_result` returns a borrowed typed result whose `CheckpointComparison`
+requires both checkpoint identities and saved comparison text. Pending work and failed
+recapture retain previous evidence with explicit provenance. Missing evidence and a captured
+empty patch remain distinct, including when reopening legacy sessions.
+Thought-local **Reported edits** renders provider operations in their original order,
+preserving call identity, output access, and diagnostics. It counts operations without
+composing their patches into a second workspace result. Checks retain their own summary.
+File identities within change trees follow paths, so insertion of an earlier file cannot
+transfer an expanded file's state to a different path. The raw-diff action opens the saved
+comparison, while file navigation continues to open live workspace paths.
+`source_document` opens a new tab when the source window has `winfixbuf`, retaining
+the protected transcript and its return-view ownership.
 `ExchangeLayout` keeps provider activity in the summary fold and renders generated artifacts,
 plan submission events, verification results, and checkpoint changes before the outer final response.
 It partitions references to durable nodes without cloning response or diff bodies. Review acceptance
@@ -617,6 +630,12 @@ Legacy activity following an intermediate final
 answer retains its relative order. Streaming, completion, and reload use the same layout and node IDs.
 Thoughts and tool groups nest one two-column level below their exchange summary. Tool calls and output
 retain their additional nesting. Adjacent visible tools share one group across provider-turn boundaries.
+Each `ExchangeThought` owns an ordered body of activity groups and steering messages.
+Steering divides activity groups without clearing their commentary owner. A new assistant
+message or question branch changes that owner. Tool completion updates the original call,
+so a late result cannot move beneath a later commentary. Rendering consumes this owned body
+instead of reconstructing ownership separately for steering and activity. Existing sessions
+gain the same grouping when reopened without rewriting their stored event order.
 Hidden reasoning and empty messages do not split that group. Visible commentary, file changes,
 questions, and other timeline content retain their boundaries. Each grouped tool keeps its original
 turn identity for output lookup, actions, and expansion. Final answers remain outside the activity fold. Tool invocation headings retain one display row in both collapsed and expanded states. The shared width-bounded title formatting preserves the duration column and truncates the displayed command or arguments. Full provider titles remain in durable tool state. Active tool previews display the latest four wrapped rows from the incremental output index. New output replaces only the preview body and earlier-line count at the existing presentation cadence. Explicit expansion still reads the full output from its beginning, and settled exchanges remove the automatic preview.
