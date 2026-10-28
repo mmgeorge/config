@@ -1,7 +1,6 @@
 use std::path::Path;
-use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, params};
 
 /// Persists backend-wide pins independently of session leases and format versions.
@@ -12,18 +11,7 @@ pub(crate) struct ModelPinStore {
 impl ModelPinStore {
     /// Opens the Harness database without loading or resetting session state.
     pub(crate) fn open(data_root: &Path) -> Result<Self> {
-        std::fs::create_dir_all(data_root).context("create model pin data directory")?;
-        let connection = Connection::open(data_root.join("harness.sqlite3"))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS model_pin (
-                backend TEXT NOT NULL,
-                model TEXT NOT NULL,
-                PRIMARY KEY (backend, model)
-            );",
-        )?;
+        let super::SqliteStore { connection, .. } = super::SqliteStore::open(data_root)?;
         Ok(Self { connection })
     }
 

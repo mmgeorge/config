@@ -271,6 +271,51 @@ impl Drop for ActiveSteering {
 }
 
 impl SteerCommand {
+    /// Retain continuation ownership until provider acceptance or a terminal failure.
+    pub(crate) async fn complete_with<Output>(
+        mut self,
+        operation: impl std::future::Future<Output = Result<Output>>,
+        event_sink: BackendEventSink,
+    ) -> Result<Output> {
+        self.event_sink = Some(event_sink);
+        let mut operation = Box::pin(operation);
+        let result = if let Some(submission) = &self.submission {
+            let mut acceptance = submission.acceptance();
+            tokio::select! {
+                biased;
+                accepted = async { acceptance.wait_for(|accepted| *accepted).await.map(drop) } => {
+                    accepted.context("continuation acceptance channel closed")?;
+                    self.complete(Ok(())).await;
+                    return operation.await;
+                }
+                result = &mut operation => result,
+            }
+        } else {
+            operation.await
+        };
+        let accepted = self
+            .submission
+            .as_ref()
+            .map(|submission| submission.record())
+            .transpose()?
+            .is_some_and(|record| {
+                matches!(
+                    record.delivery,
+                    super::submission::SubmissionState::Accepted { .. }
+                )
+            });
+        self.complete(if accepted {
+            Ok(())
+        } else {
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+        })
+        .await;
+        result
+    }
+
     /// Defers only an input that never crossed native dispatch, and settles all other outcomes.
     pub(crate) async fn settle_delivery(self, result: Result<()>) -> Result<Option<Self>> {
         match result {
@@ -305,7 +350,11 @@ impl SteerCommand {
         if let Err(error) = &result
             && let Some(submission) = &self.submission
         {
-            if let Err(persist) = submission.failed(format!("{error:#}")) {
+            let failure = format!("{error:#}");
+            if let Err(persist) = submission
+                .persist(move |submission| submission.failed(failure))
+                .await
+            {
                 result = Err(persist.context(format!("{error:#}")));
             }
         }
@@ -314,9 +363,22 @@ impl SteerCommand {
             && self.operation == ActiveTurnOperation::Steer
             && let Some(event_sink) = self.event_sink.take()
         {
-            let _ = event_sink
-                .send_wait(BackendEvent::steering_input(self.text.clone()))
-                .await;
+            let mut event = BackendEvent::steering_input(self.text.clone());
+            if let Some(submission) = &self.submission {
+                match submission.record() {
+                    Ok(record) => {
+                        event.data = serde_json::json!({"input_message_id":record.input_message_id})
+                    }
+                    Err(error) => {
+                        result = Err(error);
+                    }
+                }
+            }
+            if result.is_ok() {
+                if let Err(error) = event_sink.send_wait(event).await {
+                    result = Err(error.into());
+                }
+            }
         }
         if let Some(completion) = self.completion.take() {
             let _ = completion.send(result.map_err(|error| format!("{error:#}")));

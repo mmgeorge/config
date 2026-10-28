@@ -153,7 +153,6 @@
 ---@field composer_max_height integer
 ---@field goal_max_turns integer
 ---@field non_git_write_confirm boolean
----@field plan { scope_deviation_review: "auto"|"prompt" }
 ---@field backends table<string, ForgeHarnessBackendConfig>
 
 ---@class ForgePickerConfig
@@ -206,9 +205,6 @@ M.defaults = {
     composer_max_height = 12,
     goal_max_turns = 20,
     non_git_write_confirm = true,
-    plan = {
-      scope_deviation_review = "auto",
-    },
     backends = {
       codex = {
         command = { "codex", "app-server" },
@@ -285,6 +281,7 @@ M.defaults = {
       submit = "<C-s>",
       queue = "<C-q>",
       steer = false,
+      retry_input = "<M-r>",
       cancel = "<C-c>",
       edit_queued = "<M-s>",
       next_queued = "<M-t>",

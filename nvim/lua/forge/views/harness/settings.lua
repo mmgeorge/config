@@ -174,7 +174,7 @@ function M.open(state, host)
     local pending = false
     ---@type table<string, any>
     local active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
-      state.pending_config or {}, state.task_config or {})
+      state.task_config or {})
     active.status_thoughts = state.status_thoughts == true
     active.check_timing = state.check_timing or "after_queue"
     active.automatic_checks = state.automatic_checks ~= false
@@ -196,7 +196,7 @@ function M.open(state, host)
         if not state.session or state.session.id ~= session_id then return end
         if revision ~= configuration_revision then return end
         active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
-          state.pending_config or {}, state.task_config or {})
+          state.task_config or {})
         active.status_thoughts = state.status_thoughts == true
         active.check_timing = state.check_timing or "after_queue"
         active.automatic_checks = state.automatic_checks ~= false

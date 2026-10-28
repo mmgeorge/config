@@ -187,7 +187,11 @@ impl CopilotTurnEvent {
     }
 
     /// Publish steering only after the Copilot SDK accepts the immediate message.
-    pub(super) async fn publish_steering(&self, text: String) -> Result<()> {
+    pub(super) async fn publish_steering(
+        &self,
+        text: String,
+        input_message_id: Option<String>,
+    ) -> Result<()> {
         let event_sink = self
             .state
             .lock()
@@ -195,8 +199,10 @@ impl CopilotTurnEvent {
             .event_sink
             .clone();
         if let Some(event_sink) = event_sink {
+            let mut event = BackendEvent::steering_input(text);
+            event.data = serde_json::json!({"input_message_id":input_message_id});
             event_sink
-                .send_wait(BackendEvent::steering_input(text))
+                .send_wait(event)
                 .await
                 .map_err(|_| anyhow::anyhow!("Copilot turn event receiver closed"))?;
         }

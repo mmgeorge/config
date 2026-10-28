@@ -29,6 +29,7 @@ pub struct ToolOutputBatch {
 pub struct ToolOutputView {
     call_id: String,
     file: Option<(PathBuf, u64, u64)>,
+    database: Option<StoredOutput>,
     saved: Arc<String>,
     parsed: OnceLock<std::result::Result<ParsedOutput, String>>,
     heading: Option<crate::turn::ToolCall>,
@@ -36,6 +37,17 @@ pub struct ToolOutputView {
     pub(super) group: String,
     /// Keeps the current tool preview at a fixed height during its exchange.
     pub(super) live_preview: bool,
+}
+
+/// Locates retained output without keeping its bytes in the timeline.
+#[derive(Clone, PartialEq)]
+struct StoredOutput {
+    root: PathBuf,
+    exchange: String,
+    turn: String,
+    tool: String,
+    total: Option<u64>,
+    loaded: u64,
 }
 
 /// Owns one incremental terminal parser and its normalized row index.
@@ -113,6 +125,7 @@ pub struct ToolOutputSnapshot {
     total_rows: usize,
     loaded_rows: usize,
     expanded: bool,
+    deferred: Option<Box<ToolOutputView>>,
 }
 
 struct OutputCollector(Arc<Mutex<Vec<u8>>>);
@@ -131,6 +144,25 @@ impl Write for OutputCollector {
 }
 
 impl ToolOutputView {
+    pub(crate) fn stored(
+        call_id: String,
+        root: &Path,
+        exchange: &str,
+        turn: &str,
+        tool: &str,
+    ) -> Result<Self> {
+        let mut output = Self::new(call_id, "")?;
+        output.database = Some(StoredOutput {
+            root: root.to_owned(),
+            exchange: exchange.into(),
+            turn: turn.into(),
+            tool: tool.into(),
+            total: None,
+            loaded: 0,
+        });
+        Ok(output)
+    }
+
     pub(super) fn file(call_id: String, path: PathBuf, bytes: u64) -> Result<Self> {
         let mut source = Self::new(call_id, "")?;
         source.file = Some((path, bytes, 0));
@@ -138,12 +170,51 @@ impl ToolOutputView {
     }
 
     pub(super) fn has_unloaded_output(&self) -> bool {
-        self.file
+        self.database
             .as_ref()
-            .is_some_and(|(_, total, loaded)| loaded < total)
+            .is_some_and(|source| source.total.is_none_or(|total| source.loaded < total))
+            || self
+                .file
+                .as_ref()
+                .is_some_and(|(_, total, loaded)| loaded < total)
     }
 
     pub(super) fn load_prefix(&mut self, limit: usize) -> Result<()> {
+        if let Some(mut source) = self.database.clone() {
+            let store = crate::storage::SqliteStore::read_only(&source.root)?;
+            let wanted = (limit as u64).saturating_sub(source.loaded);
+            if wanted == 0 {
+                return Ok(());
+            }
+            let (bytes, total) = store
+                .tool_output_bytes(
+                    &source.exchange,
+                    &source.turn,
+                    &source.tool,
+                    source.loaded,
+                    wanted,
+                )
+                .with_context(|| format!("read stored output for tool {}", source.tool))?;
+            let total = source.total.unwrap_or(total);
+            let bytes = &bytes[..bytes
+                .len()
+                .min(total.saturating_sub(source.loaded) as usize)];
+            let length = match std::str::from_utf8(bytes) {
+                Ok(_) => bytes.len(),
+                Err(error)
+                    if error.error_len().is_none()
+                        && source.loaded + (bytes.len() as u64) < total =>
+                {
+                    error.valid_up_to()
+                }
+                Err(error) => return Err(error).context("stored tool output is not UTF-8"),
+            };
+            self.append(std::str::from_utf8(&bytes[..length])?)?;
+            source.total = Some(total);
+            source.loaded += length as u64;
+            self.database = Some(source);
+            return Ok(());
+        }
         let Some((path, total, loaded)) = self.file.clone() else {
             return Ok(());
         };
@@ -183,21 +254,31 @@ impl ToolOutputView {
             total_rows: parsed.total_rows,
             loaded_rows: 0,
             expanded: false,
+            deferred: None,
         })
     }
 
-    /// Captures complete file output for an explicitly opened output document.
-    pub(super) fn complete_snapshot(&self) -> Result<ToolOutputSnapshot> {
+    /// Captures a deferred source for an explicitly opened output document.
+    pub(crate) fn complete_snapshot(&self) -> Result<ToolOutputSnapshot> {
+        if let Some(source) = &self.database {
+            let deferred = Self::stored(
+                self.call_id.clone(),
+                &source.root,
+                &source.exchange,
+                &source.turn,
+                &source.tool,
+            )?;
+            let mut snapshot = deferred.snapshot()?;
+            snapshot.deferred = Some(Box::new(deferred));
+            return Ok(snapshot);
+        }
         let Some((path, total, _)) = &self.file else {
             return self.snapshot();
         };
-        let mut complete = Self::file(self.call_id.clone(), path.clone(), *total)?;
-        complete.load_prefix(usize::MAX)?;
-        ensure!(
-            !complete.has_unloaded_output(),
-            "saved check output ended before its recorded length"
-        );
-        complete.snapshot()
+        let deferred = Self::file(self.call_id.clone(), path.clone(), *total)?;
+        let mut snapshot = deferred.snapshot()?;
+        snapshot.deferred = Some(Box::new(deferred));
+        Ok(snapshot)
     }
     /// Retains source heading fields without copying the saved output or change tree.
     pub(super) fn heading(&mut self, call: &crate::turn::ToolCall) {
@@ -232,6 +313,17 @@ impl ToolOutputView {
 
     /// Keeps the parser and saved bytes while adopting newly projected heading ownership.
     pub(super) fn retain(&mut self, replacement: &Self) -> bool {
+        if let (Some(source), Some(next)) = (&self.database, &replacement.database) {
+            if source.root != next.root
+                || source.exchange != next.exchange
+                || source.turn != next.turn
+                || source.tool != next.tool
+            {
+                return false;
+            }
+        } else if self.database.is_some() != replacement.database.is_some() {
+            return false;
+        }
         if let (Some((path, total, _)), Some((next_path, next_total, _))) =
             (&mut self.file, &replacement.file)
         {
@@ -297,6 +389,7 @@ impl ToolOutputView {
         Ok(Self {
             call_id,
             file: None,
+            database: None,
             saved: Arc::new(saved.to_owned()),
             parsed: OnceLock::new(),
             heading: None,
@@ -342,6 +435,40 @@ impl ToolOutputView {
 }
 
 impl ToolOutputSnapshot {
+    /// Loads only enough source to produce another complete-line delivery batch.
+    pub(super) fn prepare_batch(&mut self) -> Result<()> {
+        let Some(source) = &mut self.deferred else {
+            return Ok(());
+        };
+        loop {
+            let parsed = source.parsed()?;
+            let complete_rows = parsed.total_rows.saturating_sub(usize::from(
+                source.has_unloaded_output() && !parsed.display.ends_with('\n'),
+            ));
+            if complete_rows > self.loaded_rows || !source.has_unloaded_output() {
+                break;
+            }
+            let previous = source.saved.len();
+            // Release this snapshot's old views before extending the shared source.
+            self.saved = Arc::new(String::new());
+            self.display = Arc::new(String::new());
+            self.row = Arc::new(Vec::new());
+            source.load_prefix(previous.saturating_add(65536))?;
+            ensure!(
+                source.saved.len() > previous || !source.has_unloaded_output(),
+                "saved output ended before its recorded length"
+            );
+        }
+        let parsed = source.parsed()?;
+        self.saved = source.saved.clone();
+        self.display = parsed.display.clone();
+        self.row = parsed.row.clone();
+        self.total_rows = parsed.total_rows.saturating_sub(usize::from(
+            source.has_unloaded_output() && !parsed.display.ends_with('\n'),
+        ));
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn retained_bytes(&self) -> usize {
         self.saved.len()
@@ -384,7 +511,11 @@ impl ToolOutputSnapshot {
         Ok(Some(ToolOutputBatch {
             call_id: self.call_id.clone(),
             start_row: self.loaded_rows,
-            complete: self.loaded_rows + row.len() == self.total_rows,
+            complete: self.loaded_rows + row.len() == self.total_rows
+                && !self
+                    .deferred
+                    .as_ref()
+                    .is_some_and(|source| source.has_unloaded_output()),
             byte_limit,
             row,
         }))
@@ -402,11 +533,15 @@ impl ToolOutputSnapshot {
     }
 
     pub fn export_saved_output(
-        &self,
+        &mut self,
         directory: &Path,
         trace: Arc<crate::trace::TraceStore>,
         session_id: &str,
     ) -> Result<OwnedToolExport> {
+        if let Some(source) = &mut self.deferred {
+            source.load_prefix(usize::MAX)?;
+            self.saved = source.saved.clone();
+        }
         OwnedToolExport::create(directory, &self.saved, trace, session_id)
     }
 }
@@ -525,12 +660,26 @@ mod tests {
         let saved = format!("{}last diagnostic λ\n", "output\n".repeat(30_000));
         std::fs::write(&path, &saved)?;
         let source = ToolOutputView::file("check".into(), path.clone(), saved.len() as u64)?;
-        let snapshot = source.complete_snapshot()?;
+        let mut snapshot = source.complete_snapshot()?;
+        assert!(snapshot.saved.is_empty());
+        snapshot.expand();
+        loop {
+            snapshot.prepare_batch()?;
+            let Some(batch) = snapshot.next_batch(256, 65536)? else {
+                break;
+            };
+            let complete = batch.complete;
+            snapshot.accept_batch(&batch)?;
+            if complete {
+                break;
+            }
+        }
         assert_eq!(snapshot.saved.as_str(), saved);
         assert!(source.saved.is_empty());
         assert!(source.has_unloaded_output());
         std::fs::write(&path, "shortened")?;
-        assert!(source.complete_snapshot().is_err());
+        let mut shortened = source.complete_snapshot()?;
+        assert!(shortened.prepare_batch().is_err());
         Ok(())
     }
 

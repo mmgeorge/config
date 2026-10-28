@@ -4,10 +4,16 @@ local original_request = client.request_for
 local original_accepting = client.host_accepting
 local markdown = require("forge.render.harness.markdown")
 local original_markdown_render = markdown.render
+local original_defer = vim.defer_fn
 client.host_accepting = function() return true end
 local requests = {}
+local input_state = require("forge.views.harness.input_state")
+local session_state = { session = { id = "test-session" } }
+local host = dofile("nvim/tests/forge/support/input.lua").new(session_state)
 client.request_for = function(session, method, params, callback)
-  assert(session == "test-session" and (method == "harness.document" or method == "prompt.submit"))
+  assert(session == "test-session")
+  if host.request(method, params, callback) then return end
+  assert(method == "harness.document")
   if params.operation == "background_terminals" then callback({ supported = false }) return end
   requests[#requests + 1] = { method = method, params = params, callback = callback }
 end
@@ -19,13 +25,13 @@ local function snapshot(document, text, editable)
 end
 local owner
 local prompt_submission = require("forge.views.harness.prompt_submission")
-local session_state = { session = { id = "test-session" } }
 local function submit(callback)
   local context, failure = owner.capture_prompt()
   assert(context, failure)
   prompt_submission.start(session_state, { text = "", context = context }, callback)
 end
 local ok, failure = xpcall(function()
+  input_state.attach(session_state, function() end)
   local transcript = vim.api.nvim_create_buf(false, true)
   local composer = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "draft" })
@@ -70,69 +76,69 @@ local ok, failure = xpcall(function()
   vim.api.nvim_win_set_cursor(window, { 1, 0 })
   submit(function() end)
   assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit submission did not resume following the transcript tail")
-  local submission = requests[3]
-  assert(submission.method == "prompt.submit" and submission.params.text == "first typed prompt")
-  assert(submission.params.submission.document == opened.document and not submission.params.composer)
-  local function transition(state, token)
-    return prompt_submission.receive(session_state, { kind = "prompt_submission", data = { document = opened.document,
-      token = token or submission.params.submission.token, state = state } })
+  local submission = host.requests[#host.requests]
+  assert(submission.parameters.action.message.text == "first typed prompt")
+  local function retract(id)
+    host.revision = host.revision + 1
+    input_state.receive(session_state, { revision = host.revision, suspended = true, upsert = {}, removed = {},
+      retracted = id or submission.parameters.action.message.id })
   end
-  assert(not transition("accepted", 99), "stale acceptance cleared a draft")
-  assert(transition("accepted"))
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "")
-  assert(transition("retracted"))
+  host.complete(submission)
+  retract("stale-message")
+  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "", "stale retraction restored a draft")
+  retract()
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "first typed prompt")
-  submission.callback(nil, "turn_retracted")
+  host.flush()
 
   submit(function() end)
-  submission = requests[#requests]
+  submission = host.requests[#host.requests]
   vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "newer draft", "λ" })
-  assert(transition("accepted"))
+  host.complete(submission)
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "newer draft", "acceptance overwrote newer typing")
-  assert(transition("retracted"))
+  retract()
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "newer draft", "retraction overwrote newer typing")
-  submission.callback(nil, "turn_retracted")
+  host.flush()
 
   submit(function() end)
-  submission = requests[#requests]
-  assert(submission.params.text == "newer draft\nλ", "submission lost multiline Unicode text")
-  assert(transition("accepted"))
+  submission = host.requests[#host.requests]
+  assert(submission.parameters.action.message.text == "newer draft\nλ", "submission lost multiline Unicode text")
+  host.complete(submission)
   vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "typed after acceptance" })
-  assert(transition("retracted"))
+  retract()
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance")
-  submission.callback(nil, "turn_retracted")
+  host.flush()
 
   local cancellation
-  submit(function(_, _, detail) cancellation = detail end)
-  submission = requests[#requests]
-  submission.callback(nil, "interrupted", { code = "turn_cancelled" })
-  assert(cancellation and cancellation.code == "turn_cancelled", "composer dropped structured cancellation")
+  submit(function(_, message) cancellation = message end)
+  host.complete(nil, "interrupted")
+  assert(cancellation == "interrupted", "composer dropped submission failure")
+  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance")
   submit(function() end)
-  submission = requests[#requests]
-  submission.callback(nil, "admission failed")
+  host.complete(nil, "admission failed")
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance", "failure lost the draft")
-  local request_count = #requests
+  local request_count = #host.requests
   vim.api.nvim_buf_set_lines(composer, 0, -1, false, { " " })
   local rejected
   submit(function(result, submission_error) rejected = not result and submission_error end)
-  assert(rejected and #requests == request_count, "blank draft reached Rust")
+  assert(rejected and #host.requests == request_count, "blank draft reached Rust")
   for _, source in ipairs({ { string.rep("x", 65537) }, vim.fn["repeat"]({ "row" }, 4097) }) do
     vim.api.nvim_buf_set_lines(composer, 0, -1, false, source)
     submit(function() end)
-    local large_submission = requests[#requests]
-    assert(large_submission.params.text == table.concat(source, "\n"), "valid draft was truncated")
-    large_submission.callback({})
+    local large_submission = host.requests[#host.requests]
+    assert(large_submission.parameters.action.message.text == table.concat(source, "\n"), "valid draft was truncated")
+    host.complete(large_submission)
   end
   vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "draft at close" })
   local completed_after_close = 0
   submit(function() completed_after_close = completed_after_close + 1 end)
-  submission = requests[#requests]
+  submission = host.requests[#host.requests]
   assert(owner.close())
   assert(requests[#requests].params.operation == "close")
-  assert(not transition("accepted"), "closed presentation accepted a late submission event")
-  submission.callback({})
-  submission.callback({})
-  assert(completed_after_close == 1 and not session_state.prompt_submission,
+  host.complete(submission)
+  host.complete(submission)
+  retract()
+  assert(completed_after_close == 1,
     "presentation close discarded or duplicated request completion")
   assert(not vim.api.nvim_buf_is_valid(composer), "closing the workspace retained its owned composer buffer")
 
@@ -329,7 +335,88 @@ local ok, failure = xpcall(function()
     assert(vim.api.nvim_get_current_win() == composer_window, "resize stole composer focus")
   end
   assert(owner.close())
+
+  transcript = vim.api.nvim_create_buf(false, true)
+  composer = vim.api.nvim_create_buf(false, true)
+  window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, transcript)
+  local staged_request, reveal_timer = {}, {}
+  local elapsed = 0
+  vim.defer_fn = function(callback, delay)
+    if delay ~= 100 then return original_defer(callback, delay) end
+    local timer = { callback = callback, deadline = elapsed + delay }
+    function timer:stop() self.stopped = true end
+    function timer:close() self.closed = true end
+    reveal_timer[#reveal_timer + 1] = timer
+    return timer
+  end
+  local function advance(milliseconds)
+    elapsed = elapsed + milliseconds
+    for _, timer in ipairs(reveal_timer) do
+      if not timer.stopped and not timer.closed and timer.deadline <= elapsed then
+        timer:close()
+        timer.callback()
+      end
+    end
+  end
+  owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, read_only = true,
+    request = function(params, callback)
+      if params.operation == "open" then
+        callback({ transcript = snapshot(params.document, "Working") })
+      else
+        if params.operation == "staging" then staged_request[#staged_request + 1] = params end
+        callback({ patch = {} })
+      end
+    end,
+  }, function(value, error_message) assert(value and not error_message) end)
+  owner.sync = function() end
+  local first = { id = "first", text = "first direction" }
+  local second = { id = "second", text = "second direction" }
+  owner.set_staging({}, { first })
+  advance(99)
+  assert(#staged_request == 0, "hidden steering was published before its reveal deadline")
+  owner.set_staging({}, {})
+  local cancelled = reveal_timer[1]
+  assert(cancelled.stopped and cancelled.closed, "accepted steering retained its reveal timer")
+  owner.set_staging({}, { second })
+  cancelled.callback()
+  advance(1)
+  assert(#staged_request == 0, "stale reveal published a newer steering message early")
+  owner.set_staging({}, { second, first })
+  assert(#reveal_timer == 2, "steering updates postponed the original reveal deadline")
+  advance(99)
+  assert(#staged_request == 1 and #staged_request[1].steering == 2,
+    "reveal did not publish the latest steering messages at 100 ms")
+  owner.set_staging({}, { first })
+  assert(#staged_request == 2 and staged_request[2].steering[1].id == first.id,
+    "visible steering updates acquired another delay")
+  owner.set_staging({}, {})
+  assert(#staged_request == 3 and #staged_request[3].steering == 0,
+    "accepted visible steering was not removed immediately")
+  owner.set_staging({}, { second })
+  local before_queue = reveal_timer[#reveal_timer]
+  owner.set_staging({ first }, { second })
+  assert(#staged_request == 4 and before_queue.stopped,
+    "explicit queue did not reveal immediately and cancel the steering delay")
+  owner.set_staging({}, {})
+  owner.set_staging({}, { first })
+  local before_failure = reveal_timer[#reveal_timer]
+  owner.set_staging({}, { { id = first.id, text = "failed direction", failed = true } })
+  assert(#staged_request == 6 and staged_request[6].steering[1].failed and before_failure.stopped,
+    "failure was hidden behind the steering delay")
+  owner.set_staging({}, {})
+  owner.set_staging({}, { second })
+  local before_close = reveal_timer[#reveal_timer]
+  assert(owner.close())
+  assert(before_close.stopped and before_close.closed, "closing retained the steering reveal timer")
+  before_close.callback()
+  owner.set_staging({}, { first })
+  advance(100)
+  assert(#staged_request == 7, "closed presentation published delayed steering")
 end, debug.traceback)
+vim.defer_fn = original_defer
 client.request_for = original_request
 client.host_accepting = original_accepting
 markdown.render = original_markdown_render

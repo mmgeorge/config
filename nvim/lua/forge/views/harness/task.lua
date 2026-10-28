@@ -17,7 +17,7 @@ end
 ---@param state table
 ---@param action table
 ---@param refresh fun()
----@param settled fun(failure: string?)
+---@param settled fun(failure: string?, background: boolean?)
 ---@param admitted? fun()
 ---@param method? string
 function M.transition(state, action, refresh, settled, admitted, method)
@@ -28,8 +28,15 @@ function M.transition(state, action, refresh, settled, admitted, method)
   local identity = ("%s:%s:%s"):format(vim.fn.getpid(), vim.uv.hrtime(), operation_sequence)
   action = vim.deepcopy(action)
   action.operation_id = identity
-  local previous = state.task_operation
-  local operation = { id = identity, action = action.action, config = action.config, state = "submitting" }
+  if action.action == "pause" and state.input then state.input.pause_operation_id = identity end
+  local scope = session_id .. ":" .. tostring(generation)
+  if state.task_operation_scope ~= scope then
+    state.task_operation_by_id = {}
+    state.task_operation_scope = scope
+  end
+  local registry = state.task_operation_by_id
+  local operation = { id = identity, action = action.action, config = action.config, state = "submitting", sequence = operation_sequence }
+  registry[identity] = operation
   if action.action == "configure" and state.configuration_completion then
     operation.configuration_deferred = state.configuration_completion.deferred
   end
@@ -38,30 +45,65 @@ function M.transition(state, action, refresh, settled, admitted, method)
   state.execution_notice_operation = nil
   state.queue_suspended = true
   local function current()
-    return state.session and state.session.id == session_id and state.task_operation == operation
+    return state.session and state.session.id == session_id and registry[identity] == operation
       and client.host_generation() == generation
+  end
+  local function remove()
+    registry[identity] = nil
+    if state.task_operation ~= operation then return end
+    local latest
+    for _, pending in pairs(registry) do
+      if not latest or pending.sequence > latest.sequence then latest = pending end
+    end
+    state.task_operation = latest
   end
   local function receive(result, failure, detail)
     if not current() then return end
-    if failure then
-      if detail and detail.code == "not_admitted" then
+    if result and type(result.revision) == "number" then
+      if operation.server_revision and result.revision < operation.server_revision then return end
+      operation.server_revision = result.revision
+    end
+    if failure and detail and detail.code == "not_admitted" then
+      if state.task_operation == operation then
         diagnostic.set(state, "execution_notice", "Waiting to submit task control: " .. failure,
           { owner = identity, category = "admission", severity = "info" })
-        vim.defer_fn(function()
-          if current() and not operation.admitted then
-            client.request_for(session_id, method or "task.transition", action, receive)
-          end
-        end, 1000)
         refresh()
-        return
       end
+      vim.defer_fn(function()
+        if current() and not operation.admitted then
+          client.request_for(session_id, method or "task.transition", action, receive)
+        end
+      end, 1000)
+      return
+    end
+    if state.task_operation ~= operation then
+      if result then
+        operation.state = result.state
+        if result.state == "completed" or result.state == "cancelled" or result.state == "failed"
+          or result.state == "superseded" or result.state == "outcome_unknown" then
+          remove()
+          local message = result.error ~= vim.NIL and result.error or nil
+          if result.state == "failed" or result.state == "outcome_unknown" then
+            message = message or "Task transition failed"
+            notifications.error(message, "Harness task")
+          end
+          settled(message, true)
+        end
+      elseif detail and detail.code ~= "outcome_unknown" and detail.code ~= "not_admitted" then
+        remove()
+        settled(failure, true)
+      end
+      return
+    end
+    if failure then
       if detail and detail.code ~= "outcome_unknown" then
-        state.task_operation = previous
+        remove()
         diagnostic.set(state, "execution_notice", "Not submitted: " .. failure,
           { owner = identity, category = "admission", severity = "warning", recovery = "resubmit" })
-        if previous then
-          state.task_config = previous.config
-          if previous.poll then previous.poll() end
+        if state.task_operation then
+          state.task_config = state.task_operation.config
+          if state.task_operation.poll then state.task_operation.poll() end
+          settled(state.execution_notice, true)
           refresh()
           return
         end
@@ -82,15 +124,13 @@ function M.transition(state, action, refresh, settled, admitted, method)
       return
     end
     diagnostic.set(state, "execution_notice", nil)
-    local rank = { submitting = 0, accepted = 1, stopping = 2, running = 3, applying = 4, verifying = 5, resuming = 6 }
-    if rank[result.state] and rank[operation.state] and rank[result.state] < rank[operation.state] then return end
     operation.state = result.state
     if not operation.admitted then
       operation.admitted = true
       if admitted then admitted() end
     end
     if result.state == "completed" or result.state == "cancelled" or result.state == "failed" or result.state == "superseded" or result.state == "outcome_unknown" then
-      state.task_operation = nil
+      remove()
       local message = result.error ~= vim.NIL and result.error or nil
       if result.state == "failed" or result.state == "outcome_unknown" then
         message = message or "Task transition failed"
@@ -102,7 +142,8 @@ function M.transition(state, action, refresh, settled, admitted, method)
         diagnostic.set(state, "execution_notice", nil)
         state.execution_notice_operation = nil
       end
-      settled(message)
+      settled(message, state.task_operation ~= nil)
+      if state.task_operation then refresh() end
     else
       refresh()
     end
@@ -148,7 +189,7 @@ end
 ---@param state table
 ---@param payload table
 function M.receive(state, payload)
-  local operation = state.task_operation
+  local operation = state.task_operation_by_id and state.task_operation_by_id[payload.id] or state.task_operation
   if operation and payload.id == operation.id then operation.receive(payload) end
 end
 

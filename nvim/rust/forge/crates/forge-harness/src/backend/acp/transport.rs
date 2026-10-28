@@ -126,7 +126,7 @@ impl AcpTransport {
         &self,
         method: &str,
         parameter: Value,
-        submission: Option<&Submission>,
+        submission: Option<&Arc<Submission>>,
     ) -> Result<Value> {
         let result: Result<Value> = async {
             anyhow::ensure!(
@@ -138,10 +138,13 @@ impl AcpTransport {
                 .context("ACP submission has no session ID")?
                 .to_owned();
             if let Some(submission) = submission {
-                submission.sending(SubmissionTarget::Acp {
+                let target = SubmissionTarget::Acp {
                     session_id: session_id.clone(),
                     method: method.into(),
-                })?;
+                };
+                submission
+                    .persist(move |submission| submission.sending(target))
+                    .await?;
             }
             let response = self.request(method, parameter).await?;
             if method == "session/prompt" {
@@ -164,7 +167,9 @@ impl AcpTransport {
                         // Claude's opted-in idle response guarantees no input was queued.
                         // Other errors and unknown outcomes never authorize another send.
                         if let Some(submission) = submission {
-                            submission.rejected(error.into())?;
+                            submission
+                                .persist(move |submission| submission.rejected(error.into()))
+                                .await?;
                         }
                         anyhow::bail!(error);
                     }
@@ -172,7 +177,10 @@ impl AcpTransport {
                 }
             }
             if let Some(submission) = submission {
-                submission.accepted(format!("{method}:{session_id}"))?;
+                let receipt = format!("{method}:{session_id}");
+                submission
+                    .persist(move |submission| submission.accepted(receipt))
+                    .await?;
             }
             Ok(response)
         }
@@ -180,7 +188,10 @@ impl AcpTransport {
         if let Err(error) = &result
             && let Some(submission) = submission
         {
-            submission.failed(format!("{error:#}"))?;
+            let failure = format!("{error:#}");
+            submission
+                .persist(move |submission| submission.failed(failure))
+                .await?;
         }
         result
     }

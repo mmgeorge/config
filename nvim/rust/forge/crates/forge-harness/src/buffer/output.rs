@@ -51,6 +51,7 @@ impl OutputDocument {
                 more: false,
             });
         }
+        self.output.prepare_batch()?;
         let Some(batch) = self.output.next_batch(256, 65536)? else {
             self.complete = true;
             return Ok(OutputDelivery {

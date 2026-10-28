@@ -13,7 +13,8 @@ impl HarnessBroker {
         {
             return Ok(None);
         }
-        let Some(previous) = self.store.list_exchange(&self.session.id)?.pop() else {
+        let current = self.store.current_exchange_state(&self.session.id)?;
+        let Some(previous) = current.latest.as_ref() else {
             return Ok(None);
         };
         if previous.kind != ExchangeKind::Chat

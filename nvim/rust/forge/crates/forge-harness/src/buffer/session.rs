@@ -28,6 +28,7 @@ pub struct SessionPresentation {
 }
 
 struct OpenPresentation {
+    history_input_id: HashSet<String>,
     unsettled_exchange: Vec<String>,
     syntax_done: HashSet<TargetId>,
     syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
@@ -53,8 +54,32 @@ struct OpenPresentation {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct StagingContent {
-    queue: Vec<String>,
-    steering: Vec<String>,
+    queue: Vec<StagedInput>,
+    steering: Vec<StagedInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum StagedInput {
+    Text(String),
+    Message {
+        id: String,
+        text: String,
+        #[serde(default)]
+        failed: bool,
+    },
+}
+
+impl From<&str> for StagedInput {
+    fn from(text: &str) -> Self {
+        Self::Text(text.into())
+    }
+}
+
+impl From<String> for StagedInput {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
 }
 
 struct EntryPresentation {
@@ -143,9 +168,9 @@ pub enum PresentationRequest {
         document: DocumentId,
         sequence: u64,
         #[serde(default)]
-        queue: Vec<String>,
+        queue: Vec<StagedInput>,
         #[serde(default)]
-        steering: Vec<String>,
+        steering: Vec<StagedInput>,
     },
     Snapshot {
         document: DocumentId,
@@ -579,6 +604,7 @@ impl SessionPresentation {
             transcript: sections.document.snapshot()?,
         };
         self.open = Some(OpenPresentation {
+            history_input_id: history_input_ids(self.timeline.entry_list()),
             unsettled_exchange: unsettled,
             syntax_done: HashSet::new(),
             syntax,
@@ -659,8 +685,8 @@ impl SessionPresentation {
         &mut self,
         document: &DocumentId,
         sequence: u64,
-        queue: Vec<String>,
-        steering: Vec<String>,
+        queue: Vec<StagedInput>,
+        steering: Vec<StagedInput>,
     ) -> Result<()> {
         let open = self
             .open
@@ -1040,6 +1066,14 @@ impl SessionPresentation {
         };
         if open.failure.is_some() {
             return;
+        }
+        for operation in &patch.operation {
+            if let TimelineOperation::Insert { entry, .. }
+            | TimelineOperation::Replace { entry, .. } = operation
+            {
+                open.history_input_id
+                    .extend(history_input_ids(std::slice::from_ref(entry)));
+            }
         }
         let unsettled = if let Some(run_id) = open.agent_scope.as_deref() {
             unsettled_exchanges(
@@ -1843,6 +1877,21 @@ fn apply_projection<'operation>(
     retain_patches(open, patches)
 }
 
+fn history_input_ids(entries: &[TimelineEntry]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for entry in entries {
+        if let TimelineEntry::Exchange { exchange, .. } = entry {
+            ids.extend(exchange.input_message_id.iter().cloned());
+            for node in &exchange.node_list {
+                if let crate::exchange::ExchangeNode::ExchangeInput { prompt } = node {
+                    ids.insert(prompt.id.clone());
+                }
+            }
+        }
+    }
+    ids
+}
+
 fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     use forge_buffer::identity::BlockId;
 
@@ -1853,12 +1902,15 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     if let Some(staging) = &open.staging {
         let width = open.transcript.views.profile().unwrap_or(&open.last_width);
         let mut rows = Vec::new();
+        let mut decoration = Vec::new();
         append_staging_section(
             &mut rows,
             "Steering active turn",
             &staging.steering,
             width,
             false,
+            &open.history_input_id,
+            &mut decoration,
         )?;
         append_staging_section(
             &mut rows,
@@ -1866,6 +1918,8 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
             &staging.queue,
             width,
             true,
+            &open.history_input_id,
+            &mut decoration,
         )?;
         let mut block = forge_buffer::block::BufferBlock {
             id: block_id.clone(),
@@ -1886,6 +1940,7 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
                 capture: "ForgeStatusHint".into(),
                 priority: 100,
             });
+        block.metadata.decoration.extend(decoration);
         let entry = TranscriptEntry {
             id: "harness:staging".into(),
             block: vec![block],
@@ -1926,25 +1981,57 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
 fn append_staging_section(
     rows: &mut Vec<String>,
     label: &str,
-    values: &[String],
+    values: &[StagedInput],
     width: &WidthProfile,
     preview: bool,
+    history_input_id: &HashSet<String>,
+    decoration: &mut Vec<forge_buffer::block::Decoration>,
 ) -> Result<()> {
+    let values: Vec<_> = values
+        .iter()
+        .filter(|value| match value {
+            StagedInput::Text(_) => true,
+            StagedInput::Message { id, .. } => !history_input_id.contains(id),
+        })
+        .collect();
     if values.is_empty() {
         return Ok(());
     }
     rows.push(String::new());
-    rows.extend(width.wrap_plain(label, 0)?);
+    if !label.is_empty() {
+        rows.extend(width.wrap_plain(label, 0)?);
+    }
     for value in values {
+        let (value, failed) = match value {
+            StagedInput::Text(text) => (text, false),
+            StagedInput::Message { text, failed, .. } => (text, *failed),
+        };
+        let start = rows.len();
         if preview {
             let first = value.split(['\r', '\n']).next().unwrap_or_default();
             rows.push(width.clip_plain(&format!("• {first}"))?);
-            continue;
+        } else {
+            rows.extend(width.wrap_plain(
+                &format!("• {value}"),
+                2.min(width.columns.saturating_sub(1)),
+            )?);
         }
-        rows.extend(width.wrap_plain(
-            &format!("• {value}"),
-            2.min(width.columns.saturating_sub(1)),
-        )?);
+        if failed {
+            decoration.push(forge_buffer::block::Decoration {
+                range: forge_buffer::block::TextRange {
+                    start: forge_buffer::block::TextPosition {
+                        row: start,
+                        column: 0,
+                    },
+                    end: forge_buffer::block::TextPosition {
+                        row: rows.len(),
+                        column: 0,
+                    },
+                },
+                capture: "DiagnosticError".into(),
+                priority: 110,
+            });
+        }
     }
     Ok(())
 }
@@ -2454,6 +2541,65 @@ mod tests {
     }
 
     #[test]
+    fn accepted_message_identity_removes_stale_staging_and_failure_is_red() -> Result<()> {
+        let mut entry = interaction_entry("input-acceptance");
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![entry.clone()])?;
+        let document = DocumentId("acceptance-transcript".into());
+        owner.open(
+            document.clone(),
+            ViewId("acceptance-view".into()),
+            WidthProfile::default(),
+        )?;
+        let stage = |sequence| {
+            serde_json::from_value::<PresentationRequest>(serde_json::json!({
+                "operation":"staging", "sequence":sequence, "document":document,
+                "steering":[{"id":"accepted-message","text":"same body"}],
+                "queue":[{"id":"different-message","text":"same body"},
+                    {"id":"failed-message","text":"not sent: retry","failed":true}]
+            }))
+        };
+        owner.dispatch(stage(1)?)?;
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+            unreachable!()
+        };
+        exchange
+            .node_list
+            .push(crate::exchange::ExchangeNode::ExchangeInput {
+                prompt: crate::exchange::ExchangeInput {
+                    id: "accepted-message".into(),
+                    text: "same body".into(),
+                    intent: crate::exchange::InputIntent::Steering,
+                    created_at_ms: 1,
+                    question: None,
+                },
+            });
+        owner.reconcile(vec![entry])?;
+        owner.dispatch(stage(2)?)?;
+        let snapshot = owner.snapshot(&document)?;
+        let staged = snapshot
+            .block
+            .iter()
+            .find(|block| block.id.0 == "harness:staging")
+            .unwrap();
+        let text = staged.text.wire_rows().join("\n");
+        assert_eq!(
+            text.matches("same body").count(),
+            1,
+            "deduplication must use identity, not text"
+        );
+        assert!(!text.contains("Steering active turn"));
+        assert!(
+            staged
+                .metadata
+                .decoration
+                .iter()
+                .any(|decoration| decoration.capture == "DiagnosticError")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn staged_prompts_keep_hanging_indentation_after_resize() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(Vec::new())?;
@@ -2504,7 +2650,7 @@ mod tests {
         }
         assert_eq!(
             owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue,
-            vec![prompt.to_owned()]
+            vec![StagedInput::from(prompt)]
         );
         Ok(())
     }
@@ -2524,8 +2670,8 @@ mod tests {
         owner.dispatch(PresentationRequest::Staging {
             sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
             document: document.clone(),
-            queue: queue.clone(),
-            steering: vec![steering.clone()],
+            queue: queue.iter().cloned().map(StagedInput::from).collect(),
+            steering: vec![steering.clone().into()],
         })?;
         let rows = owner
             .snapshot(&document)?
@@ -2544,6 +2690,10 @@ mod tests {
         assert_eq!(
             owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue,
             queue
+                .iter()
+                .cloned()
+                .map(StagedInput::from)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             rows.lines()
@@ -2576,8 +2726,8 @@ mod tests {
         owner.dispatch(PresentationRequest::Staging {
             sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
             document: document.clone(),
-            queue: vec![last.clone()],
-            steering: vec![steering.clone()],
+            queue: vec![last.clone().into()],
+            steering: vec![steering.clone().into()],
         })?;
         assert_eq!(
             owner.snapshot(&document)?.block.last().unwrap().id.0,
@@ -2618,7 +2768,7 @@ mod tests {
         );
         assert_eq!(
             owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue[0],
-            last
+            StagedInput::from(last)
         );
         Ok(())
     }
@@ -4547,6 +4697,9 @@ mod tests {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            output_store: None,
+            archived_output: Default::default(),
+            input_message_id: None,
             provider_retry: None,
             agent_id: "primary".into(),
             id: identity.into(),

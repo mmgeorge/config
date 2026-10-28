@@ -137,15 +137,18 @@ end
 ---@param state table
 ---@param draft string
 ---@return (string|{text: string})[]
-function M.staging(state, draft)
+function M.staging(state, draft, entries)
   local edit = state.queue_edit
   local staged = {}
-  for _, entry in ipairs(state.queue) do
+  for _, entry in ipairs(entries or state.queue) do
     local text = edit and edit.drafts[entry] or entry.text
     if edit and entry == edit.entry then text = "[editing] " .. draft
-    elseif entry.error then text = "[" .. entry.delivery .. ": " .. entry.error .. "] " .. text
+    elseif entry.error then
+      local keys = require("forge.shared.keymaps").view_keys_for("harness", "retry_input")
+      local retry = keys[1] and (" " .. keys[1] .. " retry") or ""
+      text = "[" .. entry.delivery .. "]" .. retry .. " " .. text .. " — " .. entry.error
     end
-    staged[#staged + 1] = { text = text }
+    staged[#staged + 1] = { id = entry.id, text = text, failed = entry.error ~= nil }
   end
   return staged
 end

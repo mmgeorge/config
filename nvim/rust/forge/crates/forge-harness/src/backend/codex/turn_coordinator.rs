@@ -597,10 +597,12 @@ impl<'a> CodexTurnCoordinator<'a> {
         }
         if let Some(submission) = &command.submission {
             params["clientUserMessageId"] = json!(submission.id());
-            if let Err(error) =
-                submission.sending(super::super::submission::SubmissionTarget::Codex {
-                    thread_id: thread_id.into(),
-                })
+            let target = super::super::submission::SubmissionTarget::Codex {
+                thread_id: thread_id.into(),
+            };
+            if let Err(error) = submission
+                .persist(move |submission| submission.sending(target))
+                .await
             {
                 command.complete(Err(error)).await;
                 return;
@@ -644,12 +646,18 @@ impl<'a> CodexTurnCoordinator<'a> {
             .map(drop);
         if let Some(submission) = &command.submission {
             if result.is_ok() {
-                result = submission.accepted(format!("turn/steer:{message}"));
+                let receipt = format!("turn/steer:{message}");
+                result = submission
+                    .persist(move |submission| submission.accepted(receipt))
+                    .await;
             } else if matches!(
                 message.pointer("/error/code").and_then(Value::as_i64),
                 Some(-32600 | -32601 | -32602)
             ) {
-                submission.rejected(result.as_ref().unwrap_err().to_string())?;
+                let error = result.as_ref().unwrap_err().to_string();
+                submission
+                    .persist(move |submission| submission.rejected(error))
+                    .await?;
             }
         }
         if command.operation == ActiveTurnOperation::Interrupt && result.is_ok() {

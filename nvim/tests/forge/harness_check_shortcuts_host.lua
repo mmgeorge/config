@@ -41,7 +41,8 @@ local function start_check()
 end
 local function settled()
   return not state.checks_running and not state.task_operation and not state.busy
-    and not state.prompt_submission and not state.check_interrupt_pending
+    and #(state.input and state.input.pending or {}) == 0
+    and #state.queue == 0 and #state.pending_steer == 0 and #(state.pending_submit or {}) == 0
 end
 local function compose(text)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
@@ -73,10 +74,14 @@ local succeeded, failure = xpcall(function()
     local text = pause_first and "Replacement during pause" or "Replacement during check"
     compose(text)
     press("<C-s>")
-    assert(state.check_interrupt_pending, "Ctrl-S did not capture the replacement")
+    assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "",
+      "Ctrl-S did not capture the replacement")
     assert(vim.wait(5000, function() return settled() and rows():find(text, 1, true) end, 10),
       "Ctrl-S did not complete its replacement: " .. vim.inspect({ operation = state.task_operation,
-        pending = state.check_interrupt_pending, notice = state.execution_notice, busy = state.busy }))
+        pending = state.input.pending, notice = state.execution_notice, busy = state.busy,
+        pause_first = pause_first, input = request("input.get"), queue = state.queue,
+        steering = state.pending_steer, submitting = state.pending_submit, errors = errors,
+        transcript = rows() }))
     assert(request("checks.status", {run_id = run_id}).state == "interrupted", "Ctrl-S did not interrupt check history")
     assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "Ctrl-S left the submitted draft")
   end

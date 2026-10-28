@@ -22,7 +22,7 @@ local success, failure = xpcall(function()
     routed[#routed + 1] = table.concat(vim.api.nvim_buf_get_lines(composer, 0, -1, false), "\n")
   end
   controller.drain, history.record = function() end, function() end
-  local controls = { "/config", "/effort", "/effort high", "/model", "/model test", "/model test high", "/read", "/write", "/yolo", "/mode",
+  local controls = { "/config", "/effort", "/effort high", "/model", "/model test", "/model test high", "/read", "/write", "/yolo", "/ask", "/deny", "/allow",
     "/fast", "/ultrafast", "/skills", "/mcp", "/checks", "/rename", "/sessions",
     "/task refresh", "/agents on", "/agents edit", "/backend", "/questions" }
   for _, command in ipairs(controls) do
@@ -44,15 +44,15 @@ local success, failure = xpcall(function()
   local options = {}
   for _, option in ipairs(instance.spec.page_list[1].option_list) do options[option.id] = option end
   instance.spec.on_field_action({ field = options["plan-revisions"].fields[1] }, "change", 1)
-  instance.spec.on_field_action({ field = options["execute-permission"].fields[1] }, "change", 1)
+  instance.spec.on_field_action({ field = options["execute-approval"].fields[1] }, "change", 1)
   assert(#configured == 2, "configuration picker blocked a second edit before acknowledgement")
   assert(configured[1].params.plan_auto_approve_revisions == false)
-  assert(configured[2].params.default_approval == "allow")
+  assert(configured[2].params.default_approval == "deny")
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true))
   configured[1].completed(false)
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true),
     "configuration displayed pending status after an older completion")
-  state.session.default_approval = "allow"
+  state.session.default_approval = "deny"
   state.session.plan_auto_approve_revisions = false
   configured[2].completed(true)
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true))
@@ -104,15 +104,13 @@ local success, failure = xpcall(function()
   local first_applied, second_applied
   controller.configure({ default_approval = "ask" }, true, function(result) first_applied = result end)
   controller.configure({ plan_auto_approve_revisions = true }, true, function(result) second_applied = result end)
-  assert(#configuration_request == 1 and second_applied == nil)
+  assert(#configuration_request == 2 and second_applied == nil)
   state.session.default_approval = "ask"
   configuration_request[1].callback(true)
-  controller.drain()
-  assert(vim.wait(1000, function() return #configuration_request == 2 end, 10),
-    "a completed idle edit did not drain the next configuration")
+  assert(#configuration_request == 2, "Lua delayed an explicit configuration")
   state.session.plan_auto_approve_revisions = true
   configuration_request[2].callback(true)
-  assert(first_applied == true and second_applied == true and state.pending_config_completed == nil,
+  assert(first_applied == true and second_applied == true,
     "successive idle configuration edits lost their completion callbacks")
   local resource_picker = require("forge.views.harness.provider_picker")
   local mutations = {}

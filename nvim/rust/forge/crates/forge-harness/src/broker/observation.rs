@@ -1,7 +1,18 @@
 use super::*;
 
+pub(crate) struct InputReadiness {
+    pub session: crate::storage::admission::AdmissionSession,
+    pub task: Option<crate::storage::admission::AdmissionTask>,
+    pub operation_state: Option<String>,
+    pub has_elicitation: bool,
+    pub has_approval: bool,
+    pub checks_running: bool,
+    pub native_steer: bool,
+}
+
 /// Shares durable queries and published transient state without acquiring the execution owner.
 pub(crate) struct BrokerObserver {
+    pub(crate) admission: Arc<crate::storage::admission::SessionAdmission>,
     pub(crate) input_schedule: tokio::sync::watch::Sender<crate::session::InputSchedule>,
     pub(super) lsp: Arc<crate::control_tools::lsp::LspService>,
     pub(crate) status_thoughts: AtomicBool,
@@ -30,6 +41,36 @@ pub(super) struct ObservationMetadata {
 }
 
 impl BrokerObserver {
+    pub(crate) fn input_readiness(&self) -> Result<InputReadiness> {
+        let state = self.admission.snapshot()?;
+        let mut has_approval = false;
+        for approval in self.permission_coordinator.pending_list()? {
+            if let Some(id) = approval.exchange_id {
+                has_approval |= self.admission.owns_exchange(&id)?;
+            }
+        }
+        Ok(InputReadiness {
+            session: state.session.clone(),
+            task: state.task.clone(),
+            has_elicitation: state.has_elicitation,
+            has_approval,
+            operation_state: state.operation_state.clone(),
+            checks_running: self.check_runner.active()?.is_some(),
+            native_steer: self
+                .metadata
+                .read()
+                .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?
+                .capability
+                .native_steer,
+        })
+    }
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    /// Returns the selected task from the same committed projection used by dispatch.
+    pub(crate) fn input_task_id(&self) -> Result<Option<String>> {
+        Ok(self.admission.snapshot()?.session.current_task_id.clone())
+    }
     /// Renames the owning session without waiting for the provider turn.
     pub(super) fn rename_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let session_id = required_text(&params, "session_id")?;
@@ -95,7 +136,7 @@ impl BrokerObserver {
             .get("baseline")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         let plan = store
             .load_plan(&plan_id)?
             .context("plan artifact not found")?;
@@ -163,7 +204,7 @@ impl BrokerObserver {
 
     /// Persists conversation-scoped check editing without starting or interrupting a turn.
     pub(super) fn set_check_editing(&self, enabled: bool) -> Result<Value> {
-        let session = SqliteStore::open(&self.data_root)?
+        let session = SqliteStore::read_only(&self.data_root)?
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
         let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
@@ -188,7 +229,7 @@ impl BrokerObserver {
     /// Reads current durable state together with the last published runtime metadata.
     pub(crate) fn snapshot(&self) -> Result<BrokerSnapshot> {
         let revision = self.snapshot_revision.fetch_add(1, Ordering::Relaxed) + 1;
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         store.read_snapshot(|| {
             let session = store
                 .load_session(&self.session_id)?
@@ -201,6 +242,10 @@ impl BrokerObserver {
             let agents = load_agent_registry(&store, &session.id)?.list();
             self.build(&store, &session, &metadata, agents, revision)
         })
+    }
+
+    pub(crate) fn runtime_epoch(&self) -> &str {
+        &self.runtime_epoch
     }
 
     pub(super) fn publish(&self, broker: &HarnessBroker) -> Result<BrokerSnapshot> {
@@ -245,7 +290,7 @@ impl BrokerObserver {
     ) -> Result<BrokerSnapshot> {
         let status_thoughts = self.status_thoughts.load(Ordering::Relaxed);
         let mut session = source_session.clone();
-        let settings = crate::settings::SettingsStore::open(&self.data_root)?
+        let settings = crate::settings::SettingsStore::read_only(&self.data_root)?
             .get(&session.workspace, &session.id, &session.backend)?
             .desired;
         let check_timing = settings.check_timing.unwrap_or_default();
@@ -275,7 +320,7 @@ impl BrokerObserver {
                 plan_trace_fields(plan),
             );
         }
-        let interaction = store.list_exchange(&source_session.id)?;
+        let interaction = store.list_exchange_metadata(&source_session.id)?;
         let plan_input = active_plan.as_ref().filter(|_| {
             !task
                 .as_ref()
@@ -376,7 +421,7 @@ impl BrokerObserver {
 
         let mut agent_exchange_list = Vec::new();
         for run in &agent_run_list {
-            agent_exchange_list.extend(store.list_agent_exchange(&run.id)?);
+            agent_exchange_list.extend(store.list_agent_exchange_metadata(&run.id)?);
         }
         let timeline = TimelineProjector::build(TimelineProjection {
             interaction_list: interaction.clone(),
@@ -503,7 +548,7 @@ impl BrokerObserver {
             )?,
             HarnessMethod::StateGet => serde_json::to_value(self.snapshot()?)?,
             HarnessMethod::TaskList => serde_json::to_value(
-                SqliteStore::open(&self.data_root)?.list_task(&self.session_id)?,
+                SqliteStore::read_only(&self.data_root)?.list_task(&self.session_id)?,
             )?,
             HarnessMethod::AgentList => serde_json::to_value(self.snapshot()?.agent)?,
             HarnessMethod::SessionList => self.list_session(params)?.0,
@@ -512,7 +557,7 @@ impl BrokerObserver {
             HarnessMethod::SessionDelete => self.delete_session(params)?.0,
             HarnessMethod::ExchangeCommentSave => self.save_exchange_comment(params)?.0,
             HarnessMethod::ExchangeRollbackPreview => {
-                let store = SqliteStore::open(&self.data_root)?;
+                let store = SqliteStore::read_only(&self.data_root)?;
                 let id = required_text(&params, "preview_id")?;
                 crate::checkpoint::RestorePreview::load(&store.objects, &self.session_id, &id)?
                     .summary(params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize)
@@ -534,7 +579,7 @@ impl BrokerObserver {
     /// Reads a submitted plan without selecting or resuming its owning task.
     pub(super) fn plan(&self, params: Value) -> Result<Value> {
         let plan_id = required_text(&params, "plan_id")?;
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         let plan = store
             .load_plan(&plan_id)?
             .context("plan artifact not found")?;
@@ -569,7 +614,7 @@ impl BrokerObserver {
     }
 
     pub(super) fn list_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         let session = store
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
@@ -606,12 +651,12 @@ impl BrokerObserver {
     }
 
     pub(super) fn preview_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         let session_id = required_text(&params, "session_id")?;
         let preview_session = store
             .load_session(&session_id)?
             .context("session not found")?;
-        let interaction = store.list_exchange(&session_id)?;
+        let interaction = store.list_exchange_metadata(&session_id)?;
         let plan_list = store.list_plan(&session_id)?;
         let agent_run_list = store
             .list_agent_run(&session_id)?
@@ -620,7 +665,7 @@ impl BrokerObserver {
             .collect::<Vec<_>>();
         let mut agent_exchange_list = Vec::new();
         for run in &agent_run_list {
-            agent_exchange_list.extend(store.list_agent_exchange(&run.id)?);
+            agent_exchange_list.extend(store.list_agent_exchange_metadata(&run.id)?);
         }
         let timeline = TimelineProjector::build(TimelineProjection {
             interaction_list: interaction.clone(),
@@ -658,11 +703,11 @@ impl BrokerObserver {
     }
 
     pub(super) fn list_exchange_review(&self) -> Result<Vec<Exchange>> {
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         let session = store
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
-        let mut interaction_list = store.list_exchange(&session.id)?;
+        let mut interaction_list = store.list_exchange_metadata(&session.id)?;
         for interaction in &mut interaction_list {
             interaction.comment = store.list_exchange_comment(&interaction.id)?;
         }
@@ -705,7 +750,7 @@ impl BrokerObserver {
     }
 
     pub(super) fn list_replanning_choices(&self) -> Result<(Value, Vec<SessionEvent>)> {
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         let session = store
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
@@ -739,7 +784,7 @@ impl BrokerObserver {
         plan_id: &str,
         expected_digest: &str,
     ) -> Result<crate::plan::review_source::PlanReviewSource> {
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         anyhow::ensure!(
             !plan_id.is_empty() && plan_id.len() <= 256,
             "invalid plan identity"
@@ -776,7 +821,7 @@ impl BrokerObserver {
         plan_id: &str,
         revision: u32,
     ) -> Result<crate::plan::review_source::PlanReviewSource> {
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         let plan = store
             .load_plan(plan_id)?
             .context("plan artifact not found")?;
@@ -796,7 +841,7 @@ impl BrokerObserver {
     }
 
     pub(super) fn execution_review(&self, plan_id: &str) -> Result<Option<String>> {
-        let store = SqliteStore::open(&self.data_root)?;
+        let store = SqliteStore::read_only(&self.data_root)?;
         let Some(execution) = store
             .list_plan_execution(&self.session_id)?
             .into_iter()

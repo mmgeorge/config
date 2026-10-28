@@ -102,6 +102,10 @@ M.view_specs = {
         queue_edit = function(state) if state.queue_edit then return "unqueue" end end } },
     { id = "steer", label = "steer", desc = "Send the composer into the active provider turn", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state) if state.busy and state.capability and state.capability.native_steer then return "steer" end end } },
+    { id = "retry_input", label = "retry input", desc = "Retry the first failed input, or reconcile unconfirmed delivery", modes = { "n", "i" }, pinned = false,
+      hints = { composer = function(state)
+        for _, entry in ipairs(state.queue or {}) do if entry.error then return "retry input" end end
+      end } },
     { id = "cancel", label = "cancel", desc = "Interrupt without sending the composer (restore prompt if output-free)", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state) if state.busy then return "cancel" end end,
         working_status = function() return "interrupt" end,

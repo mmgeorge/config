@@ -41,7 +41,7 @@ state.session = {
   context_usage = { used = 60000, size = 272000, remaining_percent = 78 },
 }
 state.model_list, state.model_backend = nil, nil
-state.configuring_config, state.pending_config, state.task_config = nil, nil, nil
+state.configuring_config, state.task_config = nil, nil
 catalog.clear()
 
 ---@return ForgeHarnessModel[]
@@ -84,15 +84,15 @@ state.session.context_usage.size = 264000
 assert(models()[1].context_window[1].token_limit == 264000, "cache reuse ignored updated live capacity")
 assert(request_count == 1, "usage changes unnecessarily reloaded the model catalog")
 
-state.pending_config = { model = "other-model", context_window = "default" }
+state.task_config = { model = "other-model", context_window = "default" }
 delivered = models()
 assert(delivered[1].context_window[1].token_limit == 264000, "pending selection hid the active model capacity")
 assert(delivered[2].context_window[1].token_limit == 128000, "pending model inherited the active session budget")
-state.pending_config = { model = "gpt-test", context_window = "long_context" }
+state.task_config = { model = "gpt-test", context_window = "long_context" }
 delivered = models()
 assert(delivered[1].selected_context_window == "long_context", "pending context selection was lost")
 assert(delivered[1].context_window[2].token_limit == nil, "pending tier inherited the active default budget")
-state.pending_config = nil
+state.task_config = nil
 
 state.session.context_window = "long_context"
 state.session.context_usage.size = 1000000

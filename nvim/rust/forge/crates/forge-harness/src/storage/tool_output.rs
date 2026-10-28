@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use super::SqliteStore;
@@ -15,7 +15,7 @@ pub(crate) struct ToolOutputPage {
     pub(crate) total_chars: usize,
 }
 
-pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
+pub(super) fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS tool_output_owner (
         exchange_id TEXT NOT NULL REFERENCES exchange_record(id) ON DELETE CASCADE,
@@ -28,16 +28,16 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
         output TEXT NOT NULL, PRIMARY KEY(exchange_id,turn_id,tool_id,byte_offset)
     );",
     )?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let records = {
-        let mut statement = transaction.prepare("SELECT id,payload FROM exchange_record WHERE coalesce(json_extract(payload,'$.tool_output_format'),0)<>2")?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for (id, payload) in records {
+    let transaction = connection;
+    let mut cursor: Option<i64> = None;
+    loop {
+        let record: Option<(i64, String, String)> = transaction.query_row(
+            "SELECT rowid,id,payload FROM exchange_record WHERE (?1 IS NULL OR rowid>?1) AND coalesce(json_extract(payload,'$.tool_output_format'),0)<>2 ORDER BY rowid LIMIT 1",
+            [cursor], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional()?;
+        let Some((row, id, payload)) = record else {
+            break;
+        };
         let mut value: Value = serde_json::from_str(&payload)?;
         visit_output(&mut value, |turn, tool, output| {
             transaction.execute(
@@ -55,8 +55,8 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
             "UPDATE exchange_record SET payload=?2 WHERE id=?1",
             params![id, serde_json::to_string(&value)?],
         )?;
+        cursor = Some(row);
     }
-    transaction.commit()?;
     Ok(())
 }
 
@@ -145,6 +145,61 @@ fn read(connection: &Connection, exchange: &str, turn: &str, tool: &str) -> Resu
 }
 
 impl SqliteStore {
+    /// Loads display metadata while leaving every tool-output chunk in SQLite.
+    pub(crate) fn list_exchange_metadata(&self, session: &str) -> Result<Vec<Exchange>> {
+        let mut exchange: Vec<Exchange> = self.list_payload(
+            "SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal",
+            params![session, crate::session::HarnessSession::primary_agent_id(session)],
+        )?;
+        for item in &mut exchange {
+            item.output_store = Some(self.data_root.clone());
+        }
+        Ok(exchange)
+    }
+
+    /// Loads child timeline metadata without reading historical tool output.
+    pub(crate) fn list_agent_exchange_metadata(&self, agent: &str) -> Result<Vec<Exchange>> {
+        let mut exchange: Vec<Exchange> = self.list_payload(
+            "SELECT payload FROM exchange_record WHERE agent_id=?1 ORDER BY ordinal",
+            [agent],
+        )?;
+        for item in &mut exchange {
+            item.output_store = Some(self.data_root.clone());
+        }
+        Ok(exchange)
+    }
+
+    /// Reads one byte window and its committed source length without loading other output.
+    pub(crate) fn tool_output_bytes(
+        &self,
+        exchange: &str,
+        turn: &str,
+        tool: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<(Vec<u8>, u64)> {
+        self.read_snapshot(|| {
+            let total: i64 = self.connection.query_row(
+                "SELECT coalesce((SELECT byte_offset+length(cast(output AS BLOB)) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 ORDER BY byte_offset DESC LIMIT 1),0)",
+                params![exchange,turn,tool], |row| row.get(0),
+            )?;
+            ensure!(total >= 0, "stored tool output has a negative length");
+            let total = total as u64;
+            if offset >= total { return Ok((Vec::new(), total)); }
+            let mut statement = self.connection.prepare(
+                "SELECT byte_offset,substr(cast(output AS BLOB),max(0,?4-byte_offset)+1,min(length(cast(output AS BLOB)),?5-byte_offset)-max(0,?4-byte_offset)) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 AND byte_offset<?5 AND byte_offset+length(cast(output AS BLOB))>?4 ORDER BY byte_offset")?;
+            let mut output = Vec::new();
+            let end = offset.saturating_add(limit).min(total);
+            for row in statement.query_map(params![exchange,turn,tool,offset as i64,end as i64], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?)))? {
+                let (start, bytes) = row?;
+                ensure!(start >= 0 && (start as u64).max(offset) == offset + output.len() as u64, "stored tool output has a discontinuous byte offset");
+                output.extend(bytes);
+            }
+            ensure!(output.len() as u64 == end.saturating_sub(offset), "stored tool output ended before its committed length");
+            Ok((output,total))
+        })
+    }
+
     /// Reads timeline metadata without hydrating any stored tool output.
     pub(crate) fn load_exchange_metadata(&self, id: &str) -> Result<Option<Exchange>> {
         Ok(self

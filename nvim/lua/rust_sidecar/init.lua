@@ -34,7 +34,7 @@ local M = {}
 ---@param source_path string
 ---@return string
 function M.runtime_root(source_path)
-  local directory = vim.fs.dirname(source_path)
+  local directory = vim.fs.dirname(vim.fn.fnamemodify(source_path, ":p"))
   while directory and vim.fs.dirname(directory) ~= directory do
     if vim.fs.basename(directory) == "lua" then return vim.fs.dirname(directory) end
     directory = vim.fs.dirname(directory)

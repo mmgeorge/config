@@ -59,11 +59,11 @@ client.request_for = function(session_id, method, params, callback)
     local lines = {}
     if #params.steering > 0 then
       lines[#lines + 1] = "Steering active turn"
-      vim.list_extend(lines, params.steering)
+      for _, entry in ipairs(params.steering) do lines[#lines + 1] = type(entry) == "table" and entry.text or entry end
     end
     if #params.queue > 0 then
       lines[#lines + 1] = "Queued follow-up inputs"
-      vim.list_extend(lines, params.queue)
+      for _, entry in ipairs(params.queue) do lines[#lines + 1] = type(entry) == "table" and entry.text or entry end
     end
     if #lines > 0 then
       staged_response.block[#staged_response.block + 1] = { id = "harness:staging", text = lines,
@@ -308,6 +308,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_set_current_win(state.composer_win)
   state.presentation.follow_tail()
   local staging_cursor = vim.api.nvim_win_get_cursor(state.transcript_win)
+  state.execution_busy = true
   state.queue = { { text = "queued follow-up" } }
   for index = 1, vim.api.nvim_win_get_height(state.transcript_win) + 5 do
     state.queue[#state.queue + 1] = { text = "queued extra " .. index }
@@ -439,18 +440,68 @@ local success, failure = xpcall(function()
   assert(vim.wait(1000, function() return state.presentation.views[original_window] == nil end))
   assert(not state.presentation.closed and state.presentation.views[secondary])
   local sync_before_submission = sync_count
+  state.busy, state.execution_busy = false, false
   vim.api.nvim_set_current_win(state.composer_win)
   completion_visible = true
   controller.submit()
   assert(not completion_visible, "native submission retained completion for the consumed draft")
   assert(submitted and submitted.action.kind == "submit" and submitted.action.message.text == "native draft")
+  assert(#state.queue == 0 and #state.pending_steer == 0 and #state.pending_submit == 1,
+    "idle Ctrl-S entered a queue instead of submitting directly")
+  assert(not require("forge.views.harness").backend_switch_available(),
+    "direct submission lost the pending-input backend-switch guard")
   assert(vim.wait(2500, function() return sync_count > sync_before_submission end, 20),
     "optimistic submission did not refresh the native transcript")
+  assert(#staged_request.queue == 0 and #staged_request.steering == 0, "idle submission flashed in the visual queue")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
   submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
     suspended = false, upsert = {}, removed = {}, error = "simulated admission failure" })
   assert(#state.input.rejected == 1, "failed optimistic input was not retained")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "native draft")
+  local input_state = require("forge.views.harness.input_state")
+  local failed_id = state.input.rejected[1].id
+  local retry_key = vim.fn.maparg("<M-r>", "i", false, true)
+  assert(type(retry_key.callback) == "function", "retry input shortcut is missing")
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "newer unsent draft" })
+  retry_key.callback()
+  assert(submitted.action.message.id == failed_id, "retry shortcut changed message identity")
+  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "newer unsent draft",
+    "retry shortcut overwrote newer typing")
+  submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
+    suspended = false, upsert = {}, removed = {}, error = "still rejected" })
+  input_state.discard_rejected(state, state.input.rejected[1].id)
+  state.busy, state.execution_busy = true, true
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "explicit queued followup" })
+  controller.queue_submit()
+  local queued_message = vim.deepcopy(submitted.action.message)
+  queued_message.revision = 1
+  submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
+    suspended = false, execution_busy = true, upsert = { queued_message }, removed = {} })
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "steer the current turn" })
+  controller.steer_submit()
+  local steering_message = vim.deepcopy(submitted.action.message)
+  assert(steering_message.intent == "auto" and #state.queue == 1 and #state.pending_steer == 1,
+    "Ctrl-S behind a queued message joined the explicit queue")
+  assert(vim.wait(2500, function()
+    local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+    local steering = text:find("Steering active turn", 1, true)
+    local queue = text:find("Queued follow-up inputs", 1, true)
+    return steering and queue and steering < queue and text:find("steer the current turn", 1, true)
+      and text:find("explicit queued followup", 1, true)
+  end, 20), "the separate steering section did not render above the explicit queue")
+  steering_message.revision = 1
+  submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
+    suspended = false, execution_busy = true, upsert = { steering_message }, removed = {} })
+  steering_message.delivery = "delivering"
+  receive("input_changed", { revision = state.input.revision + 1, suspended = false,
+    execution_busy = true, upsert = { steering_message }, removed = {} }, "native-controller")
+  assert(#state.pending_steer == 1 and #state.queue == 1, "in-flight steering vanished before acceptance")
+  steering_message.delivery = "accepted"
+  receive("input_changed", { revision = state.input.revision + 1, suspended = false,
+    execution_busy = true, upsert = { steering_message }, removed = {} }, "native-controller")
+  assert(#state.pending_steer == 0 and #state.queue == 1, "steering acceptance changed the explicit queue")
+  receive("input_changed", { revision = state.input.revision + 1, suspended = false,
+    execution_busy = false, upsert = {}, removed = { steering_message.id, queued_message.id } }, "native-controller")
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "draft after host collection" })
   generation = 2
@@ -462,10 +513,10 @@ local success, failure = xpcall(function()
   state.busy = false
   state.queue = { "queued while finalizing" }
   state.status = { kind = "finalizing", exchange_id = "exchange-1", error = "cleanup pending" }
-  controller.drain()
+  controller.render()
   assert(#state.queue == 1 and submitted == nil, "finalizing status drained queued input")
   state.status = { kind = "idle" }
-  controller.drain()
+  controller.render()
   assert(#state.queue == 1 and submitted == nil, "Lua independently dispatched host-owned input")
   state.queue = {}
   local original_plain_request = client.request

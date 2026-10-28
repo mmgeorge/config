@@ -22,6 +22,8 @@ struct Budget {
     normal: usize,
 }
 
+type ResponseObserver = Arc<dyn Fn(&Response) -> io::Result<()> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct MessageSender {
     sender: mpsc::Sender<EncodedFrame>,
@@ -31,6 +33,7 @@ pub struct MessageSender {
     capacity: watch::Sender<()>,
     transfer: Arc<tokio::sync::Semaphore>,
     event_sequence: Arc<AtomicU64>,
+    response_observer: Option<ResponseObserver>,
 }
 
 pub struct MessageReceiver {
@@ -67,6 +70,7 @@ pub fn channel() -> (MessageSender, MessageReceiver) {
             capacity,
             transfer: Arc::new(tokio::sync::Semaphore::new(2)),
             event_sequence: Arc::new(AtomicU64::new(0)),
+            response_observer: None,
         },
         MessageReceiver {
             receiver,
@@ -87,6 +91,26 @@ pub fn encode(message: &impl Serialize, limit: usize) -> io::Result<Vec<u8>> {
 }
 
 impl MessageSender {
+    /// Records a response before transport can fail, without changing event delivery.
+    pub fn observe_responses(
+        &self,
+        observer: impl Fn(&Response) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        let mut sender = self.clone();
+        sender.response_observer = Some(Arc::new(observer));
+        sender
+    }
+
+    /// Uses reserved capacity for small acknowledgements and transfers larger responses losslessly.
+    pub async fn send_control_response(&self, response: Response) -> io::Result<()> {
+        if encode(&response, MAX_CONTROL_BYTES).is_err() {
+            return self.send_response(response).await;
+        }
+        if let Some(observer) = &self.response_observer {
+            observer(&response)?;
+        }
+        self.send_control_wait(Message::Response(response)).await
+    }
     /// Transfers a session event atomically through bounded frames without discarding its payload.
     pub async fn send_event(&self, event: SessionEvent) -> io::Result<()> {
         crate::contract::validate("session", &event.event, &event.payload)
@@ -119,8 +143,19 @@ impl MessageSender {
         .await
     }
 
-    /// Transfer a complete response without exceeding individual frame limits.
+    /// Records a terminal response before attempting synchronous transport admission.
+    pub fn send_terminal_response(&self, response: Response) -> io::Result<()> {
+        if let Some(observer) = &self.response_observer {
+            observer(&response)?;
+        }
+        self.send_terminal(Message::Response(response))
+    }
+
+    /// Transfers a complete response without exceeding individual frame limits.
     pub async fn send_response(&self, response: Response) -> io::Result<()> {
+        if let Some(observer) = &self.response_observer {
+            observer(&response)?;
+        }
         let request_id = response.id;
         let response = Message::Response(response);
         if crate::outbound::encode(&response, crate::MAX_FRAME_BYTES).is_ok() {
@@ -476,6 +511,45 @@ mod tests {
         let response: Response = serde_json::from_slice(next.bytes()).unwrap();
         assert_eq!(response.id, 170);
         receiver.check().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_response_preserves_large_content_and_records_once() {
+        let (sender, mut receiver) = channel();
+        let recorded = Arc::new(AtomicU64::new(0));
+        let observed = recorded.clone();
+        let sender = sender.observe_responses(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        for size in [1, MAX_CONTROL_BYTES, MAX_FRAME_BYTES] {
+            let expected = Response::success(169, "界".repeat(size)).unwrap();
+            let producer = sender.send_control_response(expected.clone());
+            let consumer = async {
+                let mut encoded = String::new();
+                loop {
+                    let frame = receiver.recv().await.unwrap().unwrap();
+                    let message: serde_json::Value = serde_json::from_slice(frame.bytes()).unwrap();
+                    if message["event"] == "result.complete" {
+                        break;
+                    }
+                    if message["event"] == "result.part" {
+                        let part: crate::transfer::JsonPart =
+                            serde_json::from_value(message["payload"].clone()).unwrap();
+                        encoded.push_str(&part.payload);
+                    } else {
+                        encoded = String::from_utf8(frame.bytes().to_vec()).unwrap();
+                        break;
+                    }
+                }
+                let restored: Response = serde_json::from_str(&encoded).unwrap();
+                assert_eq!(restored.result(), expected.result());
+            };
+            let (sent, ()) = tokio::join!(producer, consumer);
+            sent.unwrap();
+            receiver.check().unwrap();
+        }
+        assert_eq!(recorded.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

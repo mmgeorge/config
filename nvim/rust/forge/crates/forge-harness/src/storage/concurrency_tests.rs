@@ -238,12 +238,16 @@ fn deletion_holds_ownership_through_cleanup_and_releases_on_failure() -> Result<
             anyhow::bail!("cleanup failure")
         })
         .unwrap_err();
-    assert!(failure.to_string().contains("cleanup failure"));
+    assert!(format!("{failure:#}").contains("cleanup failure"));
     assert!(store.load_session("target")?.is_some());
-    competitor.acquire_session_lease("target", "competitor")?;
-    assert!(store.delete_session("target").is_err());
-    competitor.release_session_lease("target", "competitor")?;
-    store.delete_session("target")?;
+    assert!(
+        competitor
+            .acquire_session_lease("target", "competitor")
+            .is_err()
+    );
+    assert!(store.list_session(None)?.is_empty());
+    drop(competitor);
+    store.recover_session_deletions()?;
     assert!(store.load_session("target")?.is_none());
     Ok(())
 }

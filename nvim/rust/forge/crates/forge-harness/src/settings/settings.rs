@@ -284,15 +284,37 @@ impl SettingsStore {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        anyhow::ensure!(
+            version == 1,
+            "Settings database schema {version} is incompatible with this Harness; initialize or update Harness"
+        );
         Ok(Self { connection })
     }
 
-    /// Open the current preference schema with transactional revision checks.
+    /// Opens settings without repeating schema writes for a current database.
     pub fn open(data_root: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_root)?;
-        let connection = Connection::open(data_root.join("settings.db"))?;
+        let mut connection = Connection::open(data_root.join("settings.db"))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA journal_mode=WAL;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        anyhow::ensure!(
+            version <= 1,
+            "Settings database schema {version} is newer than supported schema 1; update Harness"
+        );
+        if version == 0 {
+            let _bootstrap = crate::storage::bootstrap_lock(data_root, "settings")?;
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let version: i64 =
+                transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            anyhow::ensure!(
+                version <= 1,
+                "Settings database changed to an unsupported schema"
+            );
+            if version == 0 {
+                transaction.execute_batch("
             CREATE TABLE IF NOT EXISTS setting_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
             INSERT OR IGNORE INTO setting_revision VALUES (1,0);
             CREATE TABLE IF NOT EXISTS setting_layer (scope TEXT NOT NULL, identity TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(scope,identity));
@@ -300,6 +322,10 @@ impl SettingsStore {
             CREATE TABLE IF NOT EXISTS setting_operation (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS setting_application (session_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS setting_resource (id TEXT PRIMARY KEY, scope TEXT NOT NULL, identity TEXT NOT NULL, payload TEXT NOT NULL);")?;
+                transaction.pragma_update(None, "user_version", 1)?;
+            }
+            transaction.commit()?;
+        }
         Ok(Self { connection })
     }
 

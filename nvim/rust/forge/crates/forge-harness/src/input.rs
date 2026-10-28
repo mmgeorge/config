@@ -16,8 +16,9 @@ pub enum InputIntent {
 }
 
 /// Selects whether admission starts a queued turn or adds input to the active turn.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InputRoute {
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRoute {
     Turn,
     Steering,
 }
@@ -47,6 +48,8 @@ pub struct InputMessage {
     pub intent: InputIntent,
     #[serde(default)]
     pub delivery: InputDelivery,
+    #[serde(default)]
+    pub route: Option<InputRoute>,
     pub reservation: Option<String>,
     pub submission_id: Option<String>,
     pub error: Option<String>,
@@ -65,6 +68,10 @@ pub struct InputEdit {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputAction {
+    Retry {
+        id: String,
+        revision: u64,
+    },
     Resume,
     Submit {
         message: InputMessage,
@@ -92,11 +99,13 @@ pub struct InputOperation {
     pub id: String,
     #[serde(default)]
     pub control_revision: u64,
+    pub after_control: Option<String>,
     pub action: InputAction,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct InputUpdate {
+    pub snapshot: Option<InputSnapshot>,
     pub operation_id: Option<String>,
     pub revision: u64,
     pub upsert: Vec<InputMessage>,
@@ -108,17 +117,19 @@ pub struct InputUpdate {
     pub retracted: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct InputSnapshot {
     pub revision: u64,
     pub messages: Vec<InputMessage>,
     pub suspended: bool,
     pub control_revision: u64,
+    pub control_operation_id: Option<String>,
 }
 
 #[derive(Default)]
 struct InputState {
     snapshot: InputSnapshot,
+    submitted: std::collections::HashSet<String>,
     operation: HashMap<String, (String, InputUpdate)>,
 }
 
@@ -130,17 +141,29 @@ pub(crate) struct SessionInputQueue {
 }
 
 impl SessionInputQueue {
+    pub(crate) fn has_pending_for_task(&self, task_id: Option<&str>) -> Result<(u64, bool)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        Ok((
+            state.snapshot.revision,
+            state.snapshot.messages.iter().any(|message| {
+                message.task_id.as_deref() == task_id
+                    && !matches!(
+                        message.delivery,
+                        InputDelivery::Delivering | InputDelivery::Accepted
+                    )
+            }),
+        ))
+    }
+
     pub fn snapshot(&self) -> Result<InputSnapshot> {
         let state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
-        Ok(InputSnapshot {
-            revision: state.snapshot.revision,
-            messages: state.snapshot.messages.clone(),
-            suspended: state.snapshot.suspended,
-            control_revision: state.snapshot.control_revision,
-        })
+        Ok(state.snapshot.clone())
     }
 
     pub fn operation(&self, id: &str) -> Result<Option<InputUpdate>> {
@@ -148,7 +171,12 @@ impl SessionInputQueue {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
-        Ok(state.operation.get(id).map(|(_, outcome)| outcome.clone()))
+        Ok(state.operation.get(id).map(|(_, outcome)| {
+            let mut outcome = outcome.clone();
+            outcome.revision = state.snapshot.revision;
+            outcome.snapshot = Some(state.snapshot.clone());
+            outcome
+        }))
     }
 
     pub fn apply(&self, operation: InputOperation) -> Result<InputUpdate> {
@@ -163,26 +191,42 @@ impl SessionInputQueue {
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
         if let Some((original, outcome)) = state.operation.get(&operation.id) {
             ensure!(*original == request, "input operation identity was reused");
-            return Ok(outcome.clone());
+            let mut outcome = outcome.clone();
+            outcome.revision = state.snapshot.revision;
+            outcome.snapshot = Some(state.snapshot.clone());
+            return Ok(outcome);
         }
         let mut update = InputUpdate {
             operation_id: Some(operation.id.clone()),
             ..Default::default()
         };
         // Validate the complete edit before changing any message in the queue.
-        match Self::validate(&state.snapshot, &operation) {
+        let validation = if let InputAction::Submit { message } = &operation.action
+            && state.submitted.contains(&message.id)
+        {
+            Err(anyhow::anyhow!("message identity was already submitted"))
+        } else {
+            Self::validate(&state.snapshot, &operation)
+        };
+        if validation.is_ok()
+            && let InputAction::Submit { message } = &operation.action
+        {
+            state.submitted.insert(message.id.clone());
+        }
+        match validation {
             Err(error) => update.error = Some(format!("{error:#}")),
             Ok(()) => Self::apply_action(
                 &mut state.snapshot,
                 operation.action,
                 operation.control_revision,
+                operation.after_control.as_deref(),
                 &mut update,
             ),
         }
         Self::advance(&mut state.snapshot, &mut update);
-        state
-            .operation
-            .insert(operation.id, (request, update.clone()));
+        let mut receipt = update.clone();
+        receipt.snapshot = None;
+        state.operation.insert(operation.id, (request, receipt));
         drop(state);
         self.changed.notify_one();
         Ok(update)
@@ -190,6 +234,17 @@ impl SessionInputQueue {
 
     fn validate(snapshot: &InputSnapshot, operation: &InputOperation) -> Result<()> {
         match &operation.action {
+            InputAction::Retry { id, revision } => {
+                let message = Self::editable(snapshot, id, *revision)?;
+                ensure!(
+                    message.delivery == InputDelivery::Failed,
+                    "only a definitely unsent message can be retried"
+                );
+                ensure!(
+                    message.reservation.is_none(),
+                    "finish editing the message before retrying"
+                );
+            }
             InputAction::Resume => ensure!(
                 snapshot.control_revision == operation.control_revision,
                 "delivery control changed before resume"
@@ -246,9 +301,23 @@ impl SessionInputQueue {
         snapshot: &mut InputSnapshot,
         action: InputAction,
         control_revision: u64,
+        after_control: Option<&str>,
         update: &mut InputUpdate,
     ) {
         match action {
+            InputAction::Retry { id, .. } => {
+                let message = snapshot
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == id)
+                    .expect("validated message");
+                message.delivery = InputDelivery::Queued;
+                message.submission_id = None;
+                message.route = None;
+                message.error = None;
+                message.revision += 1;
+                update.upsert.push(message.clone());
+            }
             InputAction::Resume => {
                 snapshot.suspended = false;
                 snapshot.control_revision += 1;
@@ -256,18 +325,26 @@ impl SessionInputQueue {
             InputAction::Submit { mut message } => {
                 message.revision = 1;
                 message.delivery = InputDelivery::Queued;
+                message.route = None;
                 message.reservation = None;
                 message.submission_id = None;
                 message.error = None;
                 let resume = message.intent == InputIntent::Auto
-                    && control_revision == snapshot.control_revision;
+                    && (control_revision == snapshot.control_revision
+                        || after_control.is_some()
+                            && after_control == snapshot.control_operation_id.as_deref());
                 update.prepend = snapshot.suspended && resume;
                 update.upsert.push(message.clone());
-                if update.prepend {
-                    snapshot.messages.insert(0, message);
+                let index = if message.intent == InputIntent::Auto {
+                    snapshot
+                        .messages
+                        .iter()
+                        .position(|entry| entry.intent == InputIntent::Queue)
+                        .unwrap_or(snapshot.messages.len())
                 } else {
-                    snapshot.messages.push(message);
-                }
+                    snapshot.messages.len()
+                };
+                snapshot.messages.insert(index, message);
                 if resume {
                     snapshot.suspended = false;
                 }
@@ -328,33 +405,19 @@ impl SessionInputQueue {
         }
     }
 
-    pub fn suspend(&self, suspended: bool) -> Result<InputUpdate> {
+    pub fn suspend(&self, suspended: bool, operation_id: Option<&str>) -> Result<InputUpdate> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
         state.snapshot.suspended = suspended;
         state.snapshot.control_revision += 1;
+        state.snapshot.control_operation_id = operation_id.map(str::to_owned);
         let mut update = InputUpdate::default();
         Self::advance(&mut state.snapshot, &mut update);
         drop(state);
         self.changed.notify_one();
         Ok(update)
-    }
-
-    pub fn set_intent(&self, id: &str, intent: InputIntent) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
-        let message = state
-            .snapshot
-            .messages
-            .iter_mut()
-            .find(|entry| entry.id == id)
-            .context("message is missing")?;
-        message.intent = intent;
-        Ok(())
     }
 
     pub fn claim(
@@ -377,6 +440,9 @@ impl SessionInputQueue {
         };
         let message = &snapshot.messages[index];
         if snapshot.suspended
+            || snapshot.messages.iter().any(|previous| {
+                previous.task_id == message.task_id && previous.delivery == InputDelivery::Unknown
+            })
             || message.revision != revision
             || message.reservation.is_some()
             || message.delivery != InputDelivery::Queued
@@ -392,13 +458,14 @@ impl SessionInputQueue {
                     && previous.delivery == InputDelivery::Queued)
                 && !matches!(
                     previous.delivery,
-                    InputDelivery::Delivering | InputDelivery::Accepted | InputDelivery::Failed
+                    InputDelivery::Delivering | InputDelivery::Accepted
                 )
         }) {
             return Ok(None);
         }
         let message = &mut snapshot.messages[index];
         message.delivery = InputDelivery::Delivering;
+        message.route = Some(route);
         message.revision += 1;
         Ok(Some(message.clone()))
     }
@@ -414,13 +481,27 @@ impl SessionInputQueue {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
-        let index = state
+        let Some(index) = state
             .snapshot
             .messages
             .iter()
             .position(|message| message.id == id)
-            .context("input message no longer exists")?;
+        else {
+            return Ok(InputUpdate {
+                revision: state.snapshot.revision,
+                snapshot: Some(state.snapshot.clone()),
+                ..Default::default()
+            });
+        };
         let mut update = InputUpdate::default();
+        if state.snapshot.messages[index].delivery == InputDelivery::Accepted && delivery.is_some()
+        {
+            return Ok(InputUpdate {
+                revision: state.snapshot.revision,
+                snapshot: Some(state.snapshot.clone()),
+                ..Default::default()
+            });
+        }
         if let Some(delivery) = delivery {
             let message = &mut state.snapshot.messages[index];
             message.delivery = delivery;
@@ -467,6 +548,7 @@ impl SessionInputQueue {
         update.revision = snapshot.revision;
         update.suspended = snapshot.suspended;
         update.control_revision = snapshot.control_revision;
+        update.snapshot = Some(snapshot.clone());
     }
 }
 

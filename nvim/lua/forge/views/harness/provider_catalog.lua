@@ -76,7 +76,7 @@ function M.models(force, callback)
     local active_model = active.model == "default" and active.resolved_model or active.model
     local context_size = active.context_usage and tonumber(active.context_usage.size)
     local selected = vim.tbl_extend("force", state.session or {}, state.configuring_config or {},
-      state.pending_config or {}, state.task_config or {})
+      state.task_config or {})
     for _, model in ipairs(models) do
       if model.id == selected.model or (selected.model == "default" and model.is_default) then
         if selected.effort and selected.effort ~= "default" then model.selected_reasoning = selected.effort end

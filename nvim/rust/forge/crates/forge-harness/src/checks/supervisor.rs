@@ -55,7 +55,7 @@ struct CheckStateStore {
 struct ActiveCheck {
     run_id: String,
     cancellation: Arc<CheckCancellation>,
-    _admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    _admission: Option<crate::command::ExecutionPermit>,
 }
 
 struct CheckCancellation {
@@ -758,7 +758,7 @@ impl CheckSupervisor {
     fn admit(
         &self,
         run: &CheckRun,
-        admission: Option<tokio::sync::OwnedSemaphorePermit>,
+        admission: Option<crate::command::ExecutionPermit>,
     ) -> Result<Arc<CheckCancellation>> {
         self.validate_owner(run)?;
         let mut state = self
@@ -1506,7 +1506,7 @@ impl CheckSupervisor {
         run: CheckRun,
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
-        admission: Option<tokio::sync::OwnedSemaphorePermit>,
+        admission: Option<crate::command::ExecutionPermit>,
     ) -> Result<String> {
         let (id, _) = self
             .launch(run, sink, external_cancelled, admission)
@@ -1519,7 +1519,7 @@ impl CheckSupervisor {
         run: CheckRun,
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
-        admission: Option<tokio::sync::OwnedSemaphorePermit>,
+        admission: Option<crate::command::ExecutionPermit>,
     ) -> Result<(
         String,
         tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>,

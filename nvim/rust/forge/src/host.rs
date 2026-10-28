@@ -67,7 +67,7 @@ type TaskOutcome = std::result::Result<(Id, Result<()>), JoinError>;
 #[derive(Deserialize)]
 pub(crate) struct RoutedRequestEnvelope {
     #[serde(skip)]
-    pub(crate) harness_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub(crate) harness_admission: Option<forge_harness::command::ExecutionPermit>,
     #[serde(default)]
     pub(crate) session_id: Option<String>,
     #[serde(flatten)]
@@ -401,7 +401,7 @@ impl ConnectionHost {
                     sink.send(Message::Response(Response::failure(
                         envelope.request.id,
                         code,
-                        format!("{error:#}"),
+                        forge_harness::storage::error_message(&error),
                     )))?;
                     continue;
                 }
@@ -423,7 +423,7 @@ impl ConnectionHost {
                     sink.send(Message::Response(Response::failure(
                         request_id,
                         code,
-                        format!("{error:#}"),
+                        forge_harness::storage::error_message(&error),
                     )))?;
                 }
                 Ok(())

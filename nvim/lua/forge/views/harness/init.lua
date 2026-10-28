@@ -90,9 +90,6 @@ function M.open()
   local state = session.harness
   if valid_window(state.composer_win) then
     vim.api.nvim_set_current_win(state.composer_win)
-    if state.goal and state.goal.state == "active" then
-      vim.schedule(controller.drain)
-    end
     return
   end
   state.initial_snapshot_pending = true
@@ -116,10 +113,10 @@ function M.backend_switch_available()
   local state = session.harness
   return state.session ~= nil and not state.busy and not state.switching_backend
     and not state.configuring and not state.state_sync_pending
-    and not state.configuration_debounce and not state.aborting_plan
+    and not state.aborting_plan
     and not (state.status and state.status.kind == "finalizing")
-    and not state.pending_config
     and #(state.queue or {}) == 0 and #(state.pending_steer or {}) == 0
+    and #(state.pending_submit or {}) == 0
 end
 
 ---@class ForgeHarnessBackendDestination

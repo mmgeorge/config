@@ -970,7 +970,7 @@ impl TimelineRenderer<'_> {
                     .rev()
                     .find_map(|turn| turn.tools().last().map(|tool| (turn, tool)))
                 {
-                    self.tool(turn.id(), tool, "", false)?;
+                    self.tool(turn.id(), tool, "", false, exchange)?;
                 }
             }
         }
@@ -1242,7 +1242,7 @@ impl TimelineRenderer<'_> {
             .collect::<Vec<_>>();
         let identity = format!("{}:results", interaction.id);
         if !writes.is_empty() {
-            self.file_change_group(&identity, &writes)?;
+            self.file_change_group(&identity, &writes, interaction)?;
         }
         let runs = interaction
             .node_list
@@ -1596,7 +1596,7 @@ impl TimelineRenderer<'_> {
             None
         };
         self.content_nodes(interaction, agents, depth, &thought.events, questions)?;
-        self.tool_group(&thought.tools)?;
+        self.tool_group(&thought.tools, interaction)?;
         if let Some(first) = thought.writes.call.first() {
             let calls = thought
                 .writes
@@ -1604,7 +1604,7 @@ impl TimelineRenderer<'_> {
                 .iter()
                 .map(|call| call.tool)
                 .collect::<Vec<_>>();
-            self.file_change_group(first.id, &calls)?;
+            self.file_change_group(first.id, &calls, interaction)?;
         }
         if let Some(section) = section {
             let start = section.start;
@@ -1619,7 +1619,11 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn tool_group(&mut self, group: &crate::exchange::ThoughtGroup<'_>) -> Result<()> {
+    fn tool_group(
+        &mut self,
+        group: &crate::exchange::ThoughtGroup<'_>,
+        exchange: &Exchange,
+    ) -> Result<()> {
         let Some(first) = group.call.first() else {
             return Ok(());
         };
@@ -1644,6 +1648,7 @@ impl TimelineRenderer<'_> {
                 call.tool,
                 &group_id,
                 !settled && index + 1 == group.call.len(),
+                exchange,
             )?;
             let node_id = format!("{}:{}:tool", call.turn.id(), call.tool.id);
             self.fold(
@@ -2319,7 +2324,12 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn file_change_group(&mut self, id: &str, calls: &[&crate::exchange::ToolCall]) -> Result<()> {
+    fn file_change_group(
+        &mut self,
+        id: &str,
+        calls: &[&crate::exchange::ToolCall],
+        exchange: &Exchange,
+    ) -> Result<()> {
         use crate::turn::ToolState;
         let identity = format!("{id}:changes");
         let start = self.block.len();
@@ -2408,7 +2418,16 @@ impl TimelineRenderer<'_> {
             )?;
         }
         for (index, tool) in unsuccessful {
-            self.file_change(&format!("{id}:write:{index}"), tool)?;
+            if exchange.output_store.is_some() {
+                let turn = exchange
+                    .turn
+                    .iter()
+                    .find(|turn| turn.tools().any(|candidate| candidate.id == tool.id))
+                    .context("stored failed write has no owning turn")?;
+                self.tool(turn.id(), tool, "", false, exchange)?;
+            } else {
+                self.file_change(&format!("{id}:write:{index}"), tool)?;
+            }
         }
         self.margin -= 2;
         if self.block.len() > details_start {
@@ -2487,13 +2506,27 @@ impl TimelineRenderer<'_> {
         tool: &crate::exchange::ToolCall,
         group: &str,
         preview: bool,
+        exchange: &Exchange,
     ) -> Result<()> {
         let call_id = format!("{interaction}:{}", tool.id);
         ensure!(
             !self.tool.contains_key(&call_id),
             "duplicate tool identity in interaction"
         );
-        let mut output = ToolOutputView::new(call_id.clone(), &tool.output)?;
+        let mut output = if let Some((root, object)) = exchange.output_store.as_ref().zip(
+            exchange
+                .archived_output
+                .get(&format!("{interaction}:{}", tool.id)),
+        ) {
+            let objects = crate::storage::objects::ObjectStore::open(root)?;
+            let path = objects.path(object)?;
+            let bytes = std::fs::metadata(&path)?.len();
+            ToolOutputView::file(call_id.clone(), path, bytes)?
+        } else if let Some(root) = &exchange.output_store {
+            ToolOutputView::stored(call_id.clone(), root, &exchange.id, interaction, &tool.id)?
+        } else {
+            ToolOutputView::new(call_id.clone(), &tool.output)?
+        };
         output.heading(tool);
         output.group = group.to_owned();
         output.live_preview = preview;
@@ -2527,6 +2560,7 @@ impl TimelineRenderer<'_> {
                 .get(&format!("{call_id}:tool"))
                 .copied()
                 .unwrap_or(super::tool::INITIAL_INLINE_BYTES);
+            output.load_prefix(limit)?;
             for chunk in 0..if expanded {
                 output.inline_prefix_chunks(limit)?
             } else {

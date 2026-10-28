@@ -99,9 +99,9 @@ M.empty_diff_rows = {}
 ---@field initial_snapshot_pending? boolean Suppresses stale session presentation until startup synchronization.
 ---@field configuring_config? table
 ---@field configuration_revision? integer
----@field configuration_debounce? boolean
 ---@field configuration_error? string
 ---@field pending_steer table[]
+---@field pending_submit table[]
 ---@field execution_request_owner? table Opaque owner of the current execution callback.
 ---@field question_draft? {owner_id?:string, question_set_id:string, question_id:string, text:string} Rejected clarification retained for retry.
 ---@field transcript_buf integer?
@@ -125,11 +125,8 @@ M.empty_diff_rows = {}
 ---@field plan_review table?
 ---@field command_set ForgeViewCommandSet?
 ---@field goal table?
----@field pending_config table?
 ---@field rename_revision integer?
 ---@field rename_status string?
----@field pending_config_validate boolean?
----@field pending_config_completed (fun(applied: boolean))?
 ---@field mode_restart_requested boolean?
 ---@field mode_restart {accepted: boolean, finished: boolean, applying: boolean, cancelled?: boolean, stopping?: boolean}?
 ---@field host_error string?
@@ -166,6 +163,7 @@ local function new_harness_state()
   queue = {},
   queue_paused = false,
   pending_steer = {},
+  pending_submit = {},
   transcript_buf = nil,
   transcript_win = nil,
   composer_buf = nil,

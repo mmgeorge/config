@@ -17,6 +17,7 @@ local function reset()
   state.task = { { id = "task", kind = "goal", phase = "continue", status = "running" } }
   state.busy, state.no_checkpoint = true, false
   state.execution_notice, state.host_error, state.task_operation = nil, nil, nil
+  state.task_operation_scope, state.task_operation_by_id = nil, nil
   state.sync_error, state.connection_error = nil, nil
   state.state_sync_pending, state.state_sync_again, state.state_sync_callback = nil, nil, nil
   state.queue, state.pending_steer, state.capability = {}, {}, {}
@@ -35,9 +36,9 @@ for _, acknowledged_first in ipairs({ true, false }) do
   controller.task_transition({ action = "permission", change = { kind = "enable_yolo" } })
   local change = last("task.transition")
   assert(change.params.action == "permission" and change.params.change.kind == "enable_yolo" and not change.params.target)
-  if acknowledged_first then change.reply({ state = "accepted" }) end
-  task.receive(state, { id = change.params.operation_id, state = "running" })
-  if not acknowledged_first then change.reply({ state = "accepted" }) end
+  if acknowledged_first then change.reply({ state = "accepted", revision = 1 }) end
+  task.receive(state, { id = change.params.operation_id, state = "running", revision = 2 })
+  if not acknowledged_first then change.reply({ state = "accepted", revision = 1 }) end
   assert(state.task_operation.state == "running", "late acknowledgement regressed execution")
   controller.cancel_turn()
   local pause = last("task.transition")
@@ -77,7 +78,7 @@ reset()
 state.host_error, state.execution_notice, state.busy = "host stopped", "Reopen Harness", false
 state.queue = { { text = "keep queued", task_id = "task" } }
 controller.cancel_turn()
-controller.drain()
+controller.render()
 assert(#requests == 0 and #state.queue == 1 and not state.busy)
 print("harness_mode_restart: passed")
 vim.cmd("qa!")

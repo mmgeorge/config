@@ -4,6 +4,7 @@ fn submit(id: &str) -> InputOperation {
     InputOperation {
         id: format!("submit-{id}"),
         control_revision: 0,
+        after_control: None,
         action: InputAction::Submit {
             message: InputMessage {
                 id: id.into(),
@@ -14,12 +15,39 @@ fn submit(id: &str) -> InputOperation {
                 config: None,
                 intent: InputIntent::Queue,
                 delivery: InputDelivery::Queued,
+                route: None,
                 reservation: None,
                 submission_id: None,
                 error: None,
             },
         },
     }
+}
+
+#[test]
+fn submission_after_pause_resumes_only_that_control_operation() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.suspend(true, Some("first-pause"))?;
+    let mut after_pause = submit("after-pause");
+    after_pause.after_control = Some("first-pause".into());
+    if let InputAction::Submit { message } = &mut after_pause.action {
+        message.intent = InputIntent::Auto;
+    }
+    input.apply(after_pause)?;
+    assert!(!input.snapshot()?.suspended);
+    input.suspend(true, Some("second-pause"))?;
+    let mut delayed = submit("delayed");
+    delayed.after_control = Some("first-pause".into());
+    if let InputAction::Submit { message } = &mut delayed.action {
+        message.intent = InputIntent::Auto;
+    }
+    input.apply(delayed)?;
+    assert!(input.snapshot()?.suspended);
+    let mut queued = submit("explicit-queue");
+    queued.after_control = Some("second-pause".into());
+    input.apply(queued)?;
+    assert!(input.snapshot()?.suspended);
+    Ok(())
 }
 
 #[test]
@@ -31,6 +59,7 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
     let reserved = input.apply(InputOperation {
         id: "reserve".into(),
         control_revision: 0,
+        after_control: None,
         action: InputAction::Reserve {
             id: "first".into(),
             revision: 1,
@@ -43,6 +72,7 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
     let rejected = input.apply(InputOperation {
         id: "stale-edit".into(),
         control_revision: 0,
+        after_control: None,
         action: InputAction::Commit {
             reservation: "editor".into(),
             edits: vec![InputEdit {
@@ -59,6 +89,7 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
     let committed = input.apply(InputOperation {
         id: "commit".into(),
         control_revision: 0,
+        after_control: None,
         action: InputAction::Commit {
             reservation: "editor".into(),
             edits: vec![InputEdit {
@@ -71,13 +102,14 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
         },
     })?;
     assert!(committed.error.is_none());
-    input.suspend(true)?;
+    input.suspend(true, None)?;
     assert!(input.claim("first", 3, InputRoute::Turn)?.is_none());
-    input.suspend(false)?;
+    input.suspend(false, None)?;
     assert!(input.claim("first", 3, InputRoute::Turn)?.is_some());
     let missed_edit = input.apply(InputOperation {
         id: "late-edit".into(),
         control_revision: 0,
+        after_control: None,
         action: InputAction::Reserve {
             id: "first".into(),
             revision: 4,
@@ -101,9 +133,9 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
     assert!(restored.claim("second", 3, InputRoute::Turn)?.is_none());
     assert_eq!(
         restored.operation("submit-first")?.unwrap().revision,
-        first.revision
+        restored.snapshot()?.revision
     );
-    restored.suspend(true)?;
+    restored.suspend(true, None)?;
     let mut delayed = submit("captured-before-pause");
     if let InputAction::Submit { message } = &mut delayed.action {
         message.intent = InputIntent::Auto;
@@ -117,6 +149,7 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
     let resumed = restored.apply(InputOperation {
         id: "resume-current-control".into(),
         control_revision,
+        after_control: None,
         action: InputAction::Resume,
     })?;
     assert!(resumed.error.is_none() && !restored.snapshot()?.suspended);
@@ -163,9 +196,19 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
         Some("pre-delivery failure".into()),
     )?;
     assert!(
-        failed.claim("following", 1, InputRoute::Turn)?.is_some(),
-        "failed input blocked the runnable queue"
+        failed.claim("following", 1, InputRoute::Turn)?.is_none(),
+        "a follow-up bypassed an unresolved failure"
     );
+    failed.apply(InputOperation {
+        id: "discard-failure".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Remove {
+            id: "failed".into(),
+            revision: 2,
+        },
+    })?;
+    assert!(failed.claim("following", 1, InputRoute::Turn)?.is_some());
     Ok(())
 }
 
@@ -181,10 +224,19 @@ fn steering_bypasses_only_explicit_queued_messages() -> Result<()> {
         }
         input.apply(operation)?;
     }
-    assert!(
+    assert_eq!(
         input
-            .claim("first-steering", 1, InputRoute::Turn)?
-            .is_none()
+            .snapshot()?
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "first-steering",
+            "second-steering",
+            "first-queued",
+            "second-queued"
+        ]
     );
     assert!(
         input
@@ -196,13 +248,13 @@ fn steering_bypasses_only_explicit_queued_messages() -> Result<()> {
             .claim("second-steering", 1, InputRoute::Steering)?
             .is_none()
     );
-    input.suspend(true)?;
+    input.suspend(true, None)?;
     assert!(
         input
             .claim("first-steering", 1, InputRoute::Steering)?
             .is_none()
     );
-    input.suspend(false)?;
+    input.suspend(false, None)?;
     assert!(
         input
             .claim("first-steering", 1, InputRoute::Steering)?
@@ -252,6 +304,72 @@ fn steering_respects_uncertain_delivery_and_configuration_barriers() -> Result<(
         configured
             .claim("steering", 1, InputRoute::Steering)?
             .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn accepted_input_never_returns_as_failed_and_retry_preserves_identity() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("message"))?;
+    let claimed = input.claim("message", 1, InputRoute::Turn)?.unwrap();
+    assert!(
+        input
+            .claim("message", claimed.revision, InputRoute::Turn)?
+            .is_none()
+    );
+    let failed = input.delivery(
+        "message",
+        Some(InputDelivery::Failed),
+        Some("attempt-one".into()),
+        Some("not sent".into()),
+    )?;
+    let retry = InputOperation {
+        id: "retry".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Retry {
+            id: "message".into(),
+            revision: failed.upsert[0].revision,
+        },
+    };
+    let retried = input.apply(retry.clone())?;
+    assert!(retried.error.is_none());
+    assert_eq!(retried.upsert[0].id, "message");
+    assert!(retried.upsert[0].submission_id.is_none());
+    assert!(
+        input
+            .claim("message", retried.upsert[0].revision, InputRoute::Turn)?
+            .is_some()
+    );
+    input.delivery(
+        "message",
+        Some(InputDelivery::Accepted),
+        Some("attempt-two".into()),
+        None,
+    )?;
+    input.delivery(
+        "message",
+        Some(InputDelivery::Failed),
+        Some("attempt-one".into()),
+        Some("late failure".into()),
+    )?;
+    assert_eq!(
+        input.snapshot()?.messages[0].delivery,
+        InputDelivery::Accepted
+    );
+    input.delivery("message", None, None, None)?;
+    input.delivery(
+        "message",
+        Some(InputDelivery::Failed),
+        None,
+        Some("late cancellation".into()),
+    )?;
+    assert!(input.snapshot()?.messages.is_empty());
+    let replay = input.apply(retry)?;
+    assert!(
+        replay.snapshot.unwrap().messages.is_empty(),
+        "old acknowledgement resurrected a delivered message"
     );
     Ok(())
 }

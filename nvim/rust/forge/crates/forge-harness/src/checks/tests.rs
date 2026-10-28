@@ -2130,7 +2130,11 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
         crate::session::CheckShell::Nushell,
         "Backpressure test".into(),
     )?;
-    let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let admission = crate::command::SessionCoordinator::new(Arc::new(
+        crate::input::SessionInputQueue::default(),
+    ))
+    .execution
+    .clone();
     let permit = Arc::clone(&admission).acquire_owned().await?;
     let id = tokio::time::timeout(
         Duration::from_secs(1),

@@ -62,6 +62,14 @@ pub(crate) enum ExchangeActivity {
 /// Owns one admitted action or plan phase and its backend turns.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Exchange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_message_id: Option<String>,
+    /// Runtime-only source for deferred tool output. Durable records keep output in their chunk table.
+    #[serde(skip)]
+    pub(crate) output_store: Option<std::path::PathBuf>,
+    /// Immutable output identities retained by fork snapshots independently of source sessions.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub(crate) archived_output: std::collections::HashMap<String, String>,
     #[serde(default)]
     /// Current provider retry, cleared when execution settles.
     pub provider_retry: Option<crate::backend::retry::ProviderRetry>,
@@ -208,6 +216,9 @@ impl Exchange {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            output_store: None,
+            archived_output: Default::default(),
+            input_message_id: None,
             provider_retry: None,
             checkpoint_before: None,
             checkpoint_after: None,
@@ -787,6 +798,24 @@ impl Exchange {
         text: String,
         now_ms: i64,
     ) -> anyhow::Result<ExchangeInput> {
+        self.append_identified_input(None, intent, text, now_ms)
+    }
+
+    pub(crate) fn append_identified_input(
+        &mut self,
+        id: Option<String>,
+        intent: InputIntent,
+        text: String,
+        now_ms: i64,
+    ) -> anyhow::Result<ExchangeInput> {
+        if let Some(id) = &id {
+            if let Some(prompt) = self.node_list.iter().find_map(|node| match node {
+                ExchangeNode::ExchangeInput { prompt } if &prompt.id == id => Some(prompt),
+                _ => None,
+            }) {
+                return Ok(prompt.clone());
+            }
+        }
         anyhow::ensure!(
             self.state == ExchangeState::Running
                 && self.completed_at_ms.is_none()
@@ -810,7 +839,7 @@ impl Exchange {
         let prompt = ExchangeInput {
             question: None,
             intent,
-            id: format!("{}:input:{prompt_ordinal}", self.id),
+            id: id.unwrap_or_else(|| format!("{}:input:{prompt_ordinal}", self.id)),
             text,
             created_at_ms: now_ms,
         };
@@ -972,6 +1001,9 @@ mod test {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            output_store: None,
+            archived_output: Default::default(),
+            input_message_id: None,
             provider_retry: None,
             agent_id: "primary".into(),
             id: "interaction-one".into(),

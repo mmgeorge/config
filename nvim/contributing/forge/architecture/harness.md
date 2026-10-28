@@ -4,6 +4,45 @@ Harness owns durable sessions, exchanges, tasks, goals, child agents, approvals,
 
 Provider-specific transport behavior is described in [Providers](providers.md). Plan lifecycle and checking gates are described in [Planning](planning.md).
 
+## Command ownership and reconciliation
+
+Each session owns a Rust `SessionCoordinator`. Provider execution requires its
+`ExecutionPermit`, while control commands and input admission remain independently
+available. A session never waits behind another session's provider execution.
+Settings changes interrupt the active execution, collect it, apply the change,
+and resume retained work. Pending settings and permission changes execute in
+admission order. A later pause prevents an earlier change from restarting work.
+
+`forge.command` assigns an immutable command identity to mutations. Rust binds
+that identity to the session, host epoch, method, and arguments. Duplicate
+requests return their recorded response. A response is recorded before transport
+delivery, so a missing acknowledgement can be inspected through `command.status`.
+Unknown outcomes remain explicit. Restarting the host never authorizes replay.
+General command receipts last for the controller lifetime. Task operations and
+question-answer receipts have their own durable SQLite records.
+
+Lua retains editor drafts and optimistic intents separately from confirmed state.
+`forge.replica` removes only the acknowledged or rejected intent and rebuilds the
+view over the newest confirmed state. Revision gaps retain the previous usable
+view until replacement state arrives. Task progress uses Rust-issued revisions,
+not a Lua ordering of phase names. Snapshot requests invalidated by intervening
+control events are retried before their results can replace the view.
+
+Question confirmation advances the picker immediately. Each answer names its
+owning exchange or plan, question-set identity, and set revision. Rust commits the
+answer and its receipt in one transaction and returns only elicitation state.
+Answer revisions prevent delayed replies from replacing newer answers, and
+exchange saves preserve answers committed by the independent control path.
+Final submission waits for answer receipts. Rust revalidates the question target
+and completeness before continuing execution. Failed answers remain available
+for correction and explicit retry.
+
+Plan review retains pending captures in order until the preceding edit updates
+their source coordinates. Explicit edits never replace another pending edit.
+Rust continues to validate the reviewed document version and digest before each
+mutation. This document queue is separate from provider input, so a plan edit
+cannot consume a steering message or bypass the provider delivery journal.
+
 ## Agent inspection and conversation recall
 
 The root interaction exposes `harness_config` and seven `harness_session_*` tools
@@ -45,14 +84,14 @@ enclosing host request lifecycle on the normal worker stack.
 
 ## Input delivery and optimistic editing
 
-`SessionController` owns accepted messages through an in-memory `SessionInputQueue`.
+`SessionCoordinator` owns accepted messages through an in-memory `SessionInputQueue`.
 Queue operations atomically update message revisions and retain idempotent
 operation outcomes for that controller's lifetime. `input.apply`, `input.get`, and `input.operation` remain available
 without acquiring the provider execution lock. The input worker reuses execution
 admission, provider steering, task controls, and the submission journal.
 
-Ctrl-S sends ordinary input into an active steerable turn even when Ctrl-Q has
-already queued follow-ups. Explicit follow-ups retain FIFO order for later turns.
+Ctrl-S inserts ordinary input before explicit Ctrl-Q follow-ups and sends it into
+an active steerable turn as soon as the provider permits. Each group retains FIFO order.
 Steering preserves the order of immediate messages and does not bypass uncertain
 delivery, pending configuration, or the session's pause barrier.
 
@@ -69,38 +108,104 @@ the edited draft available rather than changing a message already sent.
 
 Pause establishes a revisioned delivery barrier. Operations captured before that
 barrier cannot undo it when they arrive later. Explicit resume and new input use
-the current control revision. Queued messages retain their original task and
-configuration. Completion checks read the accepted host queue, not a second
+the current control revision. Input captured while a pause request is pending also
+carries that operation's identity, so Rust can resume that pause without letting a
+delayed submission undo a newer pause. Queued messages retain their original task.
+Ordinary prompts use current session settings when dispatched. Only an explicit
+queued model command retains its requested model override. Completion checks read the accepted host queue, not a second
 editor-maintained pending flag.
 
-Provider acceptance and Harness queue acknowledgement are distinct. Confirmed
-non-delivery may become queued input. Uncertain provider writes require journal
+Provider acceptance and Harness queue acknowledgement are distinct. A turn ending
+before dispatch retains the same immediate message for the next eligible interaction.
+Uncertain provider writes require journal
 reconciliation before replay. Message diagnostics render separately from the
 canonical task status and cannot replace plan-review actions.
 
-Claimed messages leave the visible queue without a sending label. Provider
-acceptance publishes independently of response completion, while execution keeps
-its admission permit through finalization. Failed delivery restores the retained
-message. Queue operations do not open SQLite, write files, or wait for another
-session's storage. Pending messages, edit reservations, and queue operation
-outcomes do not survive a host restart. The provider submission journal remains
-durable to prevent uncertain provider delivery from being replayed.
+The active view displays steering above queued follow-ups until provider acceptance.
+Idle submissions remain hidden until their exchange appears. Failed messages remain
+visible in red with the configured retry shortcut and block later follow-ups
+until retry or removal. Acceptance preserves the message
+identity in the exchange, so later staging updates cannot display a second copy.
+Execution keeps its admission permit through finalization. Cancelling execution
+cannot overwrite accepted or uncertain delivery evidence.
+
+Rust publishes a durable running exchange, including its input identity, before
+waiting for provider preparation or previous-exchange finalization. That publication
+drives the prompt and Working display. `PreparedTurn` binds completed preparation
+to one exchange and is consumed by provider dispatch. Checkpoint capture runs
+concurrently, but the tool gate opens only after the baseline is persisted.
+Cancellation collects the owned preparation and provider work. A preparation
+failure settles the existing exchange rather than creating another prompt.
+
+`storage::admission::SessionAdmission` is the read capability for input eligibility.
+Session startup loads its compact task, operation, question, and exchange-ownership
+projection once. Storage mutation methods publish after commit and before returning,
+including writes made through independent connections. The input worker subscribes to
+those publications. Submission handlers read memory and never reopen SQLite to discover
+the selected task or reconstruct execution readiness. Failed publication invalidates
+admission until a successful committed refresh restores it. New storage mutations that
+change these fields must use the same publication boundary. Direct SQL mutations are
+limited to storage implementation and test fixtures.
+
+`SubmissionStore` shares one connection per canonical data directory and one live handle
+per submission identity. Handles read committed delivery evidence from memory. A journal
+write publishes that evidence only after its transaction commits, including all inputs
+acknowledged by one recovered submission. Async steering dispatch uses `persist` to run
+journal work on the blocking pool and awaits its result before crossing the provider-send
+boundary. Connection reuse does not weaken the durable `Prepared → Sending → Accepted`
+ordering. Restart recovery loads the journal again and never interprets `Sending` as
+permission to replay.
+
+Input scheduling reads task identity, control state, and pending-input flags
+without constructing a transcript or hydrating historical tool output. When logging
+is enabled, input transitions include message and submission identities.
+`TraceStore::instrument` records phase start and completion, elapsed time, time
+spent polling, poll count, and cancellation. Preparation, previous finalization,
+checkpoint capture and execution use this instrumentation. Large
+elapsed time with little poll time indicates waiting. Large poll time identifies
+synchronous work in the async path. Nested phase times must not be summed.
+
+Input updates carry complete revisioned queue snapshots. Lua rejects stale updates
+before changing the busy indicator. The operation cache retains each operation's
+outcome without retaining a full historical queue snapshot. Queue operations do not
+open SQLite or write files. Pending messages and edit reservations remain volatile.
+On host restart, the surviving editor preserves unresolved content for inspection
+without replaying it. The provider journal retains delivery evidence, but excludes
+dispatcher-owned messages from its independent recovery of older requests.
 
 Shared history, settings, pins, and provider-delivery journals remain in SQLite.
 Mutating transactions acquire write admission before reading their baselines.
 The existing five-second SQLite busy timeout waits for another writer rather than
 failing a read-to-write transaction upgrade. Read-only snapshots retain deferred
 transactions so they do not exclude writers. Real storage failures and exhausted
-write waits remain explicit.
+write waits remain explicit and reach Neovim as failed requests with the SQLite
+diagnostic and configured wait duration. Exhausted waits do not replay provider work.
+
+The Harness and settings databases store independent schema versions in
+`PRAGMA user_version`. Current databases skip schema creation and record migration.
+An upgrade acquires write ownership and rechecks the version before converting
+records and committing the new version. Newer unsupported schemas remain untouched.
+Observer queries use read-only connections after initialization.
 
 Session renaming, exchange comments, submitted declaration reads, and rollback
 preview reads use the observer connection while a provider turn runs. Deleting
-another session also uses this path, but must acquire that target's operating-system
+another session retires its cached controller only when execution, queued input,
+agents, and checks are idle. It must then acquire that target's operating-system
 ownership lock. The current session and sessions owned by another host remain protected.
+Deletion commits an intent before filesystem cleanup and removes the final database
+record afterward. Interrupted cleanup remains hidden from session selection and
+resumes during initialization. Filesystem cleanup does not hold the database writer.
 Rename writers hold a revocable reference to the current runtime lock and commit
 the name with its timeline event. Runtime saves preserve the committed name, and
 published snapshots read it from storage. An expected-name check prevents a late
 generated title from replacing a newer user rename.
+
+Historical snapshots retain tool metadata and storage references instead of loading
+tool output. Inline expansion reads a requested prefix, and output documents load
+additional complete lines on demand. Raw export preserves the full original bytes.
+Fork snapshots keep immutable output objects independently of their source session.
+Reopening an active session reads its observer snapshot without waiting for the
+provider turn to finish.
 
 ## Timeline storage and incremental projection
 
@@ -1006,11 +1111,10 @@ delivery mode on its active session, then publishes the canonical acknowledgemen
 turn-scoped event sink only after the SDK accepts the message. Prompt mode does not gate the lane. Chat, `/plan`, goals, and
 accepted-plan execution therefore share one steering contract.
 
-The broker keeps an active dispatch response pending until every admitted steering request reaches
-a terminal result. If the provider turn completes first, the backend rejects the unacknowledged
-steering request and Lua moves its text into the ordinary FIFO follow-up queue. Unsupported or idle
-steering leaves the composer untouched. This boundary prevents a completion race from dropping a
-planning constraint while preserving the existing interaction semantics.
+The broker retains admitted steering across provider-turn boundaries. A continuation
+acknowledges its message only after provider acceptance and records that message once
+in the owning exchange. Rust retains routing authority when a turn ends before dispatch.
+Lua never changes an immediate message into an explicit queued follow-up.
 
 Provider checklist events normalize into complete `ProviderTaskUpdate` replacements regardless
 of whether they arrive during `/plan`, accepted-plan execution, or ordinary chat. `TaskTracker`

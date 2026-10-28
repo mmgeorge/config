@@ -1,4 +1,8 @@
 vim.loader.enable(false)
+local data = vim.fn.stdpath("data")
+vim.opt.runtimepath:append(data .. "/site")
+vim.opt.runtimepath:append(data .. "/lazy/render-markdown.nvim")
+vim.opt.runtimepath:append(data .. "/lazy/nvim-treesitter")
 require("render-markdown").setup(require("plugins.markdown")[1].opts())
 
 local markdown = require("forge.render.harness.markdown")

@@ -59,6 +59,11 @@ state.session = { id = "other", name = "Other session", model = "default", resol
 state.pending_config = nil
 other_session.reply({ text = "Wrong session" })
 assert(state.session.name == "Other session")
+controller.rename_session("Must fail visibly")
+local storage_failure = "SQLite contention prevented this operation (configured lock wait: 5 seconds)"
+requests[#requests].reply(nil, storage_failure)
+assert(errors[#errors] == storage_failure, "storage error did not reach the Neovim notification")
+assert(state.session.name == "Other session", "failed storage write changed the displayed name")
 controller.rename_session("")
 assert(requests[#requests].id == "other" and requests[#requests].params.model == "default")
 state.composer_buf = vim.api.nvim_create_buf(false, true)

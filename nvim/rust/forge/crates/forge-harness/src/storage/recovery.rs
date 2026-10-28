@@ -260,6 +260,6 @@ impl SqliteStore {
         transaction.execute("UPDATE task_operation SET payload=json_set(payload,'$.state','cancelled','$.error',NULL) WHERE session_id=?1 AND json_extract(payload,'$.action.action')='pause' AND (json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running') OR (json_extract(payload,'$.state')='outcome_unknown' AND json_extract(payload,'$.error')='Runtime stopped before the operation settled. Inspect task state before resuming'))", [session_id])?;
         transaction.execute("UPDATE task_operation SET payload=json_set(payload,'$.state','outcome_unknown','$.error','Runtime stopped before the operation settled. Inspect task state before resuming') WHERE session_id=?1 AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running','applying','verifying','resuming')", [session_id])?;
         transaction.commit()?;
-        Ok(())
+        self.refresh_admission_membership(session_id)
     }
 }

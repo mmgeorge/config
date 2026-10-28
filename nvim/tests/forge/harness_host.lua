@@ -96,8 +96,15 @@ local success, failure = xpcall(function()
   local first_steering = "Immediate steering behind one queued follow-up"
   local second_steering = "Immediate steering behind two queued follow-ups"
   local active_response = mock.hold(state.session.id, "chat")
+  local idle_session = request("session.new", { name = "Idle cached deletion regression" }).session.id
   compose_and_press(active_prompt, "<C-s>")
   assert(active_response:wait().prompt == active_prompt)
+  assert(request("session.resume", { session_id = state.session.id }).session.id == state.session.id,
+    "reopening an active session waited for provider completion")
+  request("session.delete", { session_id = idle_session })
+  for _, saved in ipairs(request("session.list", { scope = "all" })) do
+    assert(saved.id ~= idle_session, "deleted cached session remained in the picker")
+  end
   local renamed = "Renamed while the provider is active"
   compose_and_press("/rename " .. renamed, "<C-s>")
   assert(vim.wait(3000, function()
@@ -157,6 +164,10 @@ local success, failure = xpcall(function()
   end, 10), "queued follow-ups did not finish after the active response")
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(state.session.name == renamed, "provider completion overwrote the active rename")
+  dofile(root .. "/nvim/tests/forge/support/submission_races.lua")({
+    state = state, controller = controller, client = client, mock = mock, errors = errors,
+    request = request, compose_and_press = compose_and_press,
+  })
   local log_status
   client.request("trace.status", {}, function(result, error)
     assert(not error, error)
@@ -222,6 +233,14 @@ local success, failure = xpcall(function()
   controller.render()
   assert(vim.wait(3000, function() return not state.presentation.syncing end, 10))
   assert(#errors == 0, table.concat(errors, "\n"))
+  local restart_hold = mock.hold(state.session.id, "chat")
+  compose_and_press("Active before host replacement", "<C-s>")
+  restart_hold:wait()
+  compose_and_press("Recover queued text after host replacement", "<C-q>")
+  assert(vim.wait(3000, function()
+    return input_settled() and pending_message("Recover queued text after host replacement") ~= nil
+  end, 10), "restart fixture did not retain the queued message")
+  local restart_message_id = pending_message("Recover queued text after host replacement").id
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "draft survives collected host" })
   local state_settled, state_error = false, nil
   client.request("state.get", {}, function(_, request_error)
@@ -244,6 +263,20 @@ local success, failure = xpcall(function()
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(state.session.name == renamed, "active rename did not survive host restart")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "draft survives collected host")
+  local recovered_queue = vim.wait(3000, function()
+    return not state.input.refreshing and #state.input.rejected == 1
+  end, 10)
+  assert(recovered_queue, "host replacement lost the recoverable queue: " .. vim.inspect({
+    confirmed = state.input.confirmed, rejected = state.input.rejected, queue = state.queue,
+    epoch = state.runtime_epoch, input_epoch = state.input.runtime_epoch,
+  }))
+  local recovery = state.input.rejected[1]
+  assert(recovery.id == restart_message_id and recovery.delivery == "unknown" and recovery.local_only,
+    "host replacement made unresolved queued text executable")
+  for _, exchange in ipairs(request("exchange.list", {})) do
+    assert(exchange.prompt ~= recovery.text, "host replacement automatically replayed queued text")
+  end
+  require("forge.views.harness.input_state").discard_rejected(state, recovery.id)
   assert(require("forge.infra.perf").enabled("harness"), "saved logging preference lost on restart")
   local compaction_count = 0
   for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
@@ -258,10 +291,10 @@ local success, failure = xpcall(function()
     "complete-text planning submission did not settle")
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "planning admission did not clear the draft")
-  require("forge.views.harness.workspace").release(state)
-  assert(state.presentation.close())
 end, debug.traceback)
 cleaning = true
+require("forge.views.harness.workspace").release(state)
+if state.presentation then state.presentation.close() end
 client.stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)

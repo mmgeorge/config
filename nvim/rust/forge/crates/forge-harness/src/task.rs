@@ -211,6 +211,8 @@ impl TaskRecord {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Identifies a durable user intent, including uncertain delivery outcomes.
 pub struct TaskOperation {
+    #[serde(default)]
+    pub revision: u64,
     /// Client-generated idempotency key retained after uncertain delivery.
     pub id: String,
     /// Conversation receiving the intent.
@@ -237,9 +239,9 @@ impl TaskOperation {
     /// Projects bounded control status without retransmitting the submitted prompt.
     pub fn view(&self) -> serde_json::Value {
         serde_json::json!({
-            "id": self.id, "state": self.state,
+            "id": self.id, "state": self.state, "revision": self.revision,
             "action": self.action.get("action"),
-            "error": self.error.as_ref().map(|error| error.chars().take(4096).collect::<String>()),
+            "error": self.error,
         })
     }
 }

@@ -46,7 +46,7 @@ for _, tier in ipairs({ "default", "fast", "ultrafast" }) do
   assert((header:find("󱐋", 1, true) ~= nil) == (tier == "ultrafast"))
   assert(not header:find("unverified", 1, true) and not header:find("unsupported", 1, true), header)
 end
-for _, owner in ipairs({ "pending_config", "configuring_config", "task_config" }) do
+for _, owner in ipairs({ "configuring_config", "task_config" }) do
   for _, pending in ipairs({
     { model = "other" }, { effort = "high" }, { service_tier = "fast" },
     { model = "other", effort = "high" }, { model = "other", service_tier = "ultrafast" },
@@ -85,7 +85,7 @@ state.session.service_tier = nil
 state.model_backend, state.model_list = "codex", { { id = "test", reasoning = { "minimal", "low", "medium", "high" }, service_tiers = { "fast", "ultrafast" } } }
 state.queue, state.pending_steer = {}, {}
 local function settled()
-  assert(vim.wait(1000, function() return not state.configuration_debounce end, 5))
+  assert(#transition > 0, "configuration did not reach Rust immediately")
 end
 local function acknowledge(index)
   local request = transition[index]
@@ -107,11 +107,17 @@ end
 press_effort("effort_up", "i")
 press_effort("effort_down", "i")
 settled()
-assert(#transition == 0 and state.pending_config == nil, "cancelled idle selection reached provider")
+assert(#transition == 2, "idle settings were withheld by Lua")
+acknowledge(1)
+acknowledge(2)
+transition = {}
 press_effort("effort_up", "n")
 press_effort("effort_down", "n")
 settled()
-assert(#transition == 0 and state.pending_config == nil, "normal-mode effort changes did not cancel")
+assert(#transition == 2, "normal-mode settings were withheld by Lua")
+acknowledge(1)
+acknowledge(2)
+transition = {}
 press_effort("effort_down", "n")
 settled()
 assert(#transition == 1 and transition[1].params.config.effort == "low")
@@ -150,11 +156,14 @@ assert(state.task_config.service_tier == "fast", "fast did not replace ultrafast
 controller.toggle_service_tier("ultrafast")
 controller.toggle_service_tier("ultrafast")
 local latest = transition[#transition]
-assert(latest.params.config.effort == "medium" and latest.params.config.service_tier == "default")
+assert(state.task_config.effort == "medium" and latest.params.config.service_tier == "default")
 assert(header:find("test medium*", 1, true) and not header:find("standard", 1, true), header)
 task.receive(state, { id = transition[1].params.operation_id, state = "superseded" })
 assert(state.task_config and state.busy, "old operation cleared the latest desired settings")
 latest.callback({ state = "accepted" })
+for index = 2, #transition - 1 do
+  task.receive(state, { id = transition[index].params.operation_id, state = "completed" })
+end
 state.session.effort, state.session.service_tier = "medium", "default"
 state.task[1].status = "paused"
 task.receive(state, { id = latest.params.operation_id, state = "completed" })
@@ -162,23 +171,23 @@ assert(not state.task_config and not state.busy and state.session.effort == "med
 assert(not header:find("fast", 1, true))
 assert(not header:find("*", 1, true), "applied model properties retained a pending marker")
 state.model_list[#state.model_list + 1] = { id = "other-model", service_tiers = { "fast", "ultrafast" } }
-state.pending_config = { model = "other-model", effort = "high", service_tier = "fast" }
+state.task_config = { model = "other-model", effort = "high", service_tier = "fast" }
 controller.refresh_winbar()
 assert(header:find("󱐌 other-model high", 1, true), header)
 local _, idle_markers = header:gsub("%*", "")
 assert(idle_markers == 0, "idle model changes flashed a pending marker: " .. header)
 state.busy = true
-state.pending_config.service_tier = "ultrafast"
+state.task_config.service_tier = "ultrafast"
 controller.refresh_winbar()
 assert(header:find("󱐋 other-model high", 1, true), header)
 local _, paused_markers = header:gsub("%*", "")
 assert(paused_markers == 0, "paused model changes flashed a pending marker: " .. header)
-state.busy, state.pending_config = false, nil
+state.busy, state.task_config = false, nil
 local count = #transition
 state.capability.ultrafast_mode = false
 controller.toggle_service_tier("ultrafast")
 assert(state.configuration_error:find("does not support ultrafast", 1, true))
-assert(#transition == count and not state.pending_config)
+assert(#transition == count and not state.task_config)
 assert(#errors == 0, table.concat(errors, "\n"))
 local applied
 controller.configure({ effort = "unavailable" }, true, function(value) applied = value end)

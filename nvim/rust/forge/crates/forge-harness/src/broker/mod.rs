@@ -1,3 +1,4 @@
+mod admission;
 mod checks;
 mod execution;
 mod fork;
@@ -583,6 +584,7 @@ pub struct HarnessBroker {
     repositories: Arc<forge_git::store::RepositoryStore>,
     diff: Arc<forge_diff::engine::DiffEngine>,
     store: SqliteStore,
+    pub(crate) submission_store: Arc<crate::backend::submission::SubmissionStore>,
     plan_file: Arc<PlanFileStore>,
     check_runner: Arc<crate::checks::CheckSupervisor>,
     check_setup: bool,
@@ -657,6 +659,7 @@ impl HarnessBroker {
     ) -> Result<Self> {
         let data_root = PathBuf::from(&request.data_root);
         let mut store = SqliteStore::open(&data_root)?;
+        store.recover_session_deletions()?;
         let workspace_kind = runtime.workspace_kind.clone();
         let workspace = match &workspace_kind {
             WorkspaceKind::Git(path) | WorkspaceKind::Untracked(path) => {
@@ -895,6 +898,7 @@ impl HarnessBroker {
         )?;
         let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace));
         let observer = Arc::new(observation::BrokerObserver {
+            admission: store.session_admission(&session.id)?,
             input_schedule: tokio::sync::watch::channel(Default::default()).0,
             lsp: runtime.lsp.clone(),
             status_thoughts: AtomicBool::new(shared.desired.status_thoughts.unwrap_or(false)),
@@ -921,6 +925,10 @@ impl HarnessBroker {
             trace: Arc::clone(&trace),
         });
         let broker = Self {
+            submission_store: crate::backend::submission::SubmissionStore::open(
+                &data_root,
+                trace.clone(),
+            )?,
             context_usage_fresh: false,
             lsp: runtime.lsp.clone(),
             active_operation_id: None,
@@ -970,6 +978,7 @@ impl HarnessBroker {
             timeline_reconciled_after_dispatch: false,
             turn_cancellation: Arc::new(TurnCancellation::new()),
         };
+        broker.store.current_exchange_state(&broker.session.id)?;
         broker.refresh_input_schedule()?;
         let initial_timeline = broker.snapshot()?.timeline;
         broker
@@ -1439,7 +1448,7 @@ impl HarnessBroker {
                     }),
                 );
                 DispatchResult {
-                    response: Response::failure(id, code, format!("{error:#}")),
+                    response: Response::failure(id, code, crate::storage::error_message(&error)),
                     event,
                 }
             }
@@ -1490,7 +1499,38 @@ impl HarnessBroker {
                 Box::pin(self.answer_plan_review_questions(params))
             }
             HarnessMethod::QuestionAsk => Box::pin(self.ask_question(params)),
-            HarnessMethod::QuestionContinue => Box::pin(self.continue_question()),
+            HarnessMethod::QuestionContinue => Box::pin(async move {
+                if let Some(target) = params.get("target") {
+                    let active = self
+                        .snapshot()?
+                        .active_elicitation
+                        .context("question set is no longer active")?;
+                    let owner_id = active.exchange_id.as_ref().or(active.plan_id.as_ref());
+                    anyhow::ensure!(
+                        serde_json::to_value(active.owner)? == target["owner"]
+                            && owner_id.map(String::as_str) == target["id"].as_str()
+                            && Some(active.elicitation.question_set.id.as_str())
+                                == target["set_id"].as_str()
+                            && Some(u64::from(active.elicitation.revision))
+                                == target["revision"].as_u64(),
+                        "question target changed before continuation"
+                    );
+                    anyhow::ensure!(
+                        active
+                            .elicitation
+                            .question_set
+                            .questions
+                            .iter()
+                            .all(|question| active
+                                .elicitation
+                                .answer
+                                .iter()
+                                .any(|answer| answer.question_id == question.id)),
+                        "question answers have not all committed"
+                    );
+                }
+                self.continue_question().await
+            }),
             HarnessMethod::ApprovalContinue => Box::pin(self.continue_after_approval_timeout()),
             HarnessMethod::GoalSet => Box::pin(self.set_goal(params)),
             HarnessMethod::GoalPause => Box::pin(self.pause_goal()),
@@ -2202,15 +2242,13 @@ impl HarnessBroker {
             self.store.save_task(&task)?;
             self.save_session()?;
             if resume {
+                self.configuration_progress("resuming").await?;
                 if self.active_plan_awaits_input()?
                     || self.find_active_interaction_elicitation()?.is_some()
                 {
                     return Box::pin(self
                         .resume_exchange(json!({"text":permission_notice.as_deref().unwrap_or("Continue the interrupted clarification using the updated settings.")})))
                         .await;
-                }
-                if command == "configure" {
-                    self.configuration_progress("resuming").await?;
                 }
                 let reason = match command.as_str() {
                     "permission" => format!("Permission changed to {}", permission.label()),
@@ -2222,9 +2260,7 @@ impl HarnessBroker {
                     .await;
             }
         } else if resume {
-            if command == "configure" {
-                self.configuration_progress("resuming").await?;
-            }
+            self.configuration_progress("resuming").await?;
             let previous = self
                 .store
                 .list_exchange(&self.session.id)?
@@ -3152,10 +3188,7 @@ impl HarnessBroker {
             Ok(crate::agent::AgentRuntime {
                 backend,
                 trace: self.trace.clone(),
-                submission_store: crate::backend::submission::SubmissionStore::open(
-                    &self.data_root,
-                    self.trace.clone(),
-                )?,
+                submission_store: self.submission_store.clone(),
                 permission: self.permission_coordinator.clone(),
                 request,
                 task_id: admission.task.id.clone(),
@@ -4324,12 +4357,7 @@ impl HarnessBroker {
     }
 
     fn find_active_interaction_elicitation(&self) -> Result<Option<Exchange>> {
-        Ok(self
-            .store
-            .list_exchange(&self.session.id)?
-            .into_iter()
-            .rev()
-            .find(|interaction| interaction.awaiting_input && interaction.elicitation.is_some()))
+        self.store.pending_exchange(&self.session.id)
     }
 
     /// Capture the owning planning exchange for a user review or question action.
@@ -5424,9 +5452,16 @@ Planning continuation: turn {} of {}.",
             let objects = self.store.objects.clone();
             let repositories = Arc::clone(&self.repositories);
             let session_id = self.session.id.clone();
+            let trace = self.trace.clone();
+            let exchange_id = interaction.id.clone();
             crate::checkpoint::CheckpointTask(tokio::spawn(async move {
-                checkpoint
-                    .capture(&objects, &repositories, &session_id, now_ms)
+                trace
+                    .instrument(
+                        &session_id,
+                        &exchange_id,
+                        "checkpoint.capture",
+                        checkpoint.capture(&objects, &repositories, &session_id, now_ms),
+                    )
                     .await
             }))
         });
@@ -5490,6 +5525,14 @@ Planning continuation: turn {} of {}.",
                     .map_err(|error| format!("{error:#}")),
             )?;
         }
+        self.trace.record(
+            &self.session.id,
+            "turn.dependency",
+            json!({
+                "exchange_id":interaction.id,"phase":"checkpoint.persist",
+                "status":if saved.is_ok() { "ready" } else { "failed" },
+            }),
+        );
         saved
     }
 
@@ -5647,9 +5690,12 @@ Planning continuation: turn {} of {}.",
         mut request: BackendRequest,
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
+        prepared: admission::PreparedTurn,
     ) -> Result<crate::backend::BackendOutput> {
+        prepared.consume(interaction)?;
         let mut parent_input = self.parent_input.activate(None)?;
         let mut deferred_input = std::collections::VecDeque::new();
+        let mut continuation_command: Option<crate::backend::SteerCommand> = None;
         let mut continuation_count = 0;
         let mut aggregate: Option<crate::backend::BackendOutput> = None;
         let mut continuation_result = self.agent_coordinator.unreported_result();
@@ -5682,6 +5728,7 @@ Planning continuation: turn {} of {}.",
                 &continuation_result,
                 &mut parent_input,
                 &mut deferred_input,
+                continuation_command.take(),
             ))
             .await?;
             for task in continuation_result.drain(..) {
@@ -5775,14 +5822,12 @@ Planning continuation: turn {} of {}.",
                     continue;
                 }
                 if let Some(input) = deferred_input.pop_front() {
-                    self.resume_parent_input(interaction, &input.text, event)
-                        .await?;
                     continuation_input = Some(
                         BackendInput::from_text(input.text.clone())
                             .with_attachments(input.attachments.clone()),
                     );
                     continuation_submission = input.submission.clone();
-                    input.complete(Ok(())).await;
+                    continuation_command = Some(input);
                     continuation_result = self.agent_coordinator.unreported_result();
                     if let Some(BackendInput::Text { text, .. }) = &mut continuation_input {
                         for task in &continuation_result {
@@ -5863,39 +5908,6 @@ Planning continuation: turn {} of {}.",
         self.emit_timeline_patch(patch, event).await
     }
 
-    async fn resume_parent_input(
-        &mut self,
-        interaction: &mut Exchange,
-        text: &str,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        interaction.append_input(
-            crate::exchange::InputIntent::Steering,
-            text.to_owned(),
-            self.clock.now_ms(),
-        )?;
-        if let Some(runtime) = &mut self.exchange_runtime {
-            runtime.retraction_eligible = false;
-        }
-        self.set_parent_wait(interaction, false, event).await?;
-        self.store.save_exchange(interaction)?;
-        self.emit_backend_event(
-            BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "timeline_node_updated".into(),
-                text: None,
-                data: json!({"exchange_id":interaction.id,"node":interaction.node_list.last()}),
-                activity: None,
-                summary: None,
-                task_update: None,
-            },
-            event,
-        )
-        .await
-    }
-
     async fn notify_unavailable_mcp(
         &mut self,
         request: &BackendCatalogRequest,
@@ -5951,6 +5963,7 @@ Planning continuation: turn {} of {}.",
         attached_result: &[crate::agent::AgentTask],
         parent_input: &mut crate::backend::ActiveSteering,
         deferred_input: &mut std::collections::VecDeque<crate::backend::SteerCommand>,
+        continuation_command: Option<crate::backend::SteerCommand>,
     ) -> Result<crate::backend::BackendOutput> {
         if request.mode != PromptMode::Background {
             self.notify_unavailable_mcp(
@@ -5986,8 +5999,7 @@ Planning continuation: turn {} of {}.",
         let backend = Arc::clone(&self.backend);
         let cancellation = Arc::clone(&self.turn_cancellation);
         let retry_trace = Arc::clone(&self.trace);
-        let submission_store =
-            crate::backend::submission::SubmissionStore::open(&self.data_root, self.trace.clone())?;
+        let submission_store = self.submission_store.clone();
         let mut cleanup = cancellation.cleanup.subscribe();
         let (backend_event_sink, mut backend_event_stream) = crate::backend::events::channel();
         let backend_event_sink = backend_event_sink.owned(request.owner()?);
@@ -6069,14 +6081,19 @@ Planning continuation: turn {} of {}.",
             {
                 gate.wait().await?;
             }
-            crate::backend::retry::prompt(
+            let acceptance_sink = backend_event_sink.clone();
+            let response = crate::backend::retry::prompt(
                 backend.as_ref(),
                 request,
                 Some(backend_event_sink),
                 &retry_trace,
                 &submission_store,
-            )
-            .await
+            );
+            if let Some(command) = continuation_command {
+                command.complete_with(response, acceptance_sink).await
+            } else {
+                response.await
+            }
         });
         // Event-loop state must not remain inline in the provider lifecycle future.
         let outcome = Box::pin(async {
@@ -7021,11 +7038,19 @@ Planning continuation: turn {} of {}.",
                 return Ok(());
             }
             if backend_event.kind == "steering_input" {
+                if let Some(id) = backend_event.data["input_message_id"].as_str()
+                    && interaction.node_list.iter().any(|node|
+                        matches!(node, crate::exchange::ExchangeNode::ExchangeInput { prompt } if prompt.id == id)) {
+                    return Ok(());
+                }
                 runtime.retraction_eligible = false;
                 let now_ms = self.clock.now_ms();
                 interaction.observe_blocker("agent_wait".into(), false, now_ms);
                 runtime.active_wait = None;
-                interaction.append_input(
+                interaction.append_identified_input(
+                    backend_event.data["input_message_id"]
+                        .as_str()
+                        .map(str::to_owned),
                     crate::exchange::InputIntent::Steering,
                     backend_event.text.unwrap_or_default(),
                     now_ms,
@@ -7500,15 +7525,6 @@ Planning continuation: turn {} of {}.",
         if timeline_patch.is_empty() {
             return Ok(());
         }
-        self.record_plan_trace(
-            "timeline_patch_emitted",
-            json!({
-                "session_id": timeline_patch.session_id,
-                "base_revision": timeline_patch.base_revision,
-                "revision": timeline_patch.revision,
-                "operation_count": timeline_patch.operation.len(),
-            }),
-        );
         if let Some(event_sink) = self.event_sink.as_ref() {
             let delivery = event_sink
                 .send_wait(BackendEvent {
@@ -7625,15 +7641,16 @@ Planning continuation: turn {} of {}.",
         admit_exchange: bool,
         now_ms: i64,
     ) -> Result<(Exchange, bool, Vec<SessionEvent>)> {
-        let mut interaction_list = self.store.list_exchange(&self.session.id)?;
+        let current = self.store.current_exchange_state(&self.session.id)?;
         if !admit_exchange {
-            let mut interaction = interaction_list
-                .pop()
+            let mut interaction = self
+                .store
+                .latest_exchange(&self.session.id)?
                 .context("continuation has no originating exchange")?;
             interaction.resume(now_ms)?;
             return Ok((interaction, false, Vec::new()));
         }
-        if interaction_list.is_empty() && self.session.name.trim().is_empty() {
+        if current.latest.is_none() && self.session.name.trim().is_empty() {
             let words = text.split_whitespace().collect::<Vec<_>>();
             let title = if words.first().is_some_and(|word| word.starts_with('/')) {
                 words[1..].join(" ")
@@ -7652,9 +7669,14 @@ Planning continuation: turn {} of {}.",
                 self.save_session()?;
             }
         }
-        if let Some(previous) = interaction_list.last_mut()
+        let mut event = Vec::new();
+        if let Some(previous) = current.latest.as_ref()
             && previous.state == ExchangeState::Running
         {
+            let mut previous = self
+                .store
+                .load_exchange(&previous.id)?
+                .context("previous running exchange disappeared")?;
             let outcome = if previous
                 .execution_phase
                 .as_ref()
@@ -7665,13 +7687,11 @@ Planning continuation: turn {} of {}.",
                 ExchangeState::Complete
             };
             if previous.checkpoint_before.is_some() {
-                self.capture_final_checkpoint(previous, outcome).await?;
+                previous.begin_finalization(outcome, now_ms)?;
+            } else {
+                previous.finish(outcome, now_ms)?;
             }
-            previous.finish(outcome, now_ms)?;
-            self.store.save_exchange(previous)?;
-        }
-        let mut event = Vec::new();
-        if let Some(previous) = interaction_list.last() {
+            self.store.save_exchange(&previous)?;
             self.emit_live_interaction(
                 BackendEvent {
                     received_at_ms: None,
@@ -7679,12 +7699,12 @@ Planning continuation: turn {} of {}.",
                     turn_boundary: None,
                     kind: "timeline_exchange_complete".into(),
                     text: None,
-                    data: serde_json::to_value(previous)?,
+                    data: serde_json::to_value(&previous)?,
                     activity: None,
                     summary: None,
                     task_update: None,
                 },
-                previous,
+                &previous,
                 &mut event,
             )
             .await?;
@@ -7695,6 +7715,9 @@ Planning continuation: turn {} of {}.",
                 finalization_error: None,
                 check_owner: None,
                 finalization_outcome: None,
+                output_store: None,
+                archived_output: Default::default(),
+                input_message_id: None,
                 provider_retry: None,
                 agent_id: self.session.primary_agent_id.clone(),
                 id: Uuid::new_v4().to_string(),
@@ -11097,6 +11120,7 @@ mod test {
     }
 
     struct CheckpointBackend {
+        preparation: Option<Arc<PreparationProbe>>,
         started: Arc<tokio::sync::Notify>,
         tool_ran: Arc<std::sync::atomic::AtomicBool>,
         active: Arc<std::sync::atomic::AtomicUsize>,
@@ -11112,6 +11136,14 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for CheckpointBackend {
+        async fn prepare_turn(&self, _: &str) -> Result<()> {
+            if let Some(preparation) = &self.preparation {
+                preparation.started.notify_one();
+                preparation.release.notified().await;
+                anyhow::ensure!(!preparation.fail, "fixture preparation failed");
+            }
+            Ok(())
+        }
         fn checkpoint_tool_gate(&self) -> bool {
             true
         }
@@ -11174,6 +11206,7 @@ mod test {
         let tool_ran = Arc::new(AtomicBool::new(false));
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         broker.backend = Arc::new(CheckpointBackend {
+            preparation: None,
             started: Arc::clone(&started),
             tool_ran: Arc::clone(&tool_ran),
             active: Arc::clone(&active),
@@ -11362,6 +11395,7 @@ mod test {
         let (sink, mut stream) = crate::backend::events::channel();
         broker.event_sink = Some(sink);
         broker.backend = Arc::new(CheckpointBackend {
+            preparation: None,
             started: started.clone(),
             tool_ran: tool_ran.clone(),
             active: Default::default(),
@@ -11451,7 +11485,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn reopened_pause_finalizes_before_admitting_the_next_prompt() -> Result<()> {
+    async fn reopened_pause_finalizes_before_executing_the_admitted_prompt() -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -11464,7 +11498,8 @@ mod test {
         broker.store.save_exchange(&interrupted)?;
         broker
             .store
-            .save_task_operation(&crate::task::TaskOperation {
+            .save_task_operation(&mut crate::task::TaskOperation {
+            revision: 0,
             id: "pause-before-close".into(),
             session_id: session_id.clone(),
             action: json!({"action":"pause"}),
@@ -11494,9 +11529,11 @@ mod test {
             .unwrap_err();
         assert!(format!("{error:#}").contains("capacity is full"));
         let pending = reopened.store.list_exchange(&session_id)?;
-        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].state, ExchangeState::Finalizing);
         assert!(pending[0].finalization_error.is_some());
+        assert_eq!(pending[1].state, ExchangeState::Failed);
+        assert!(pending[1].checkpoint_before.is_none());
         for task in occupied {
             task.finish().await?;
         }
@@ -11508,11 +11545,12 @@ mod test {
             )
             .await?;
         let history = reopened.store.list_exchange(&session_id)?;
-        assert_eq!(history.len(), 2);
+        assert_eq!(history.len(), 3);
         assert_eq!(history[0].state, ExchangeState::Cancelled);
         assert!(history[0].checkpoint_after.is_some());
         assert!(history[0].finalization_error.is_none());
-        assert_eq!(history[1].state, ExchangeState::Complete);
+        assert_eq!(history[1].state, ExchangeState::Failed);
+        assert_eq!(history[2].state, ExchangeState::Complete);
         let pause = reopened
             .store
             .load_task_operation(&session_id, "pause-before-close")?
@@ -11558,6 +11596,8 @@ mod test {
     use crate::agent::AgentExecutionState;
     use crate::session::state_machine::SessionPhase;
     include!("agent_test.rs");
+    include!("input_test.rs");
+    include!("admission_test.rs");
     async fn settle_managed_children(broker: &mut HarnessBroker) -> Result<Vec<SessionEvent>> {
         let mut revision = broker.agent_coordinator.subscribe();
         let mut event = Vec::new();
@@ -11959,6 +11999,7 @@ mod test {
             .create_task(TaskKind::Plan, "Interrupted".into(), None, None)
             .unwrap();
         let operation = TaskOperation {
+            revision: 0,
             id: "clear-before-shutdown".into(),
             session_id: broker.session.id.clone(),
             action: json!({"action":"clear"}),
@@ -12006,6 +12047,7 @@ mod test {
             .create_task(TaskKind::Plan, "Interrupted".into(), None, None)
             .unwrap();
         let mut operation = TaskOperation {
+            revision: 0,
             id: "original".into(),
             session_id: broker.session.id.clone(),
             action: json!({"action":"plan","text":"Original"}),
@@ -12058,6 +12100,7 @@ mod test {
         })).unwrap();
         broker.store.save_exchange(&exchange).unwrap();
         let operation = crate::task::TaskOperation {
+            revision: 0,
             id: "failed-operation".into(),
             session_id: broker.session.id.clone(),
             action: json!({"action":"plan"}),
@@ -13360,6 +13403,9 @@ mod test {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            output_store: None,
+            archived_output: Default::default(),
+            input_message_id: None,
             provider_retry: None,
             agent_id: HarnessSession::primary_agent_id(session_id),
             id: id.into(),

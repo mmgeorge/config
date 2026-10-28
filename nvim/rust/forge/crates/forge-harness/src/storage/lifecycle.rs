@@ -91,7 +91,7 @@ impl SqliteStore {
         })
     }
 
-    /// Holds target ownership across cleanup and deletion. Cleanup errors retain the database record.
+    /// Persists deletion intent before cleanup so interrupted filesystem work can resume safely.
     pub(crate) fn delete_session_with(
         &mut self,
         session_id: &str,
@@ -105,9 +105,38 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("DELETE FROM session_record WHERE id=?1", [session_id])?;
-        cleanup()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO session_deletion(session_id) SELECT id FROM session_record WHERE id=?1",
+            [session_id],
+        )?;
         transaction.commit()?;
+        cleanup().with_context(|| format!("clean up deleting Harness session {session_id}; deletion remains pending and can be retried"))?;
+        self.connection
+            .execute("DELETE FROM session_record WHERE id=?1", [session_id])?;
+        Ok(())
+    }
+
+    /// Completes interrupted deletions before a new runtime selects a session.
+    pub(crate) fn recover_session_deletions(&mut self) -> Result<()> {
+        let pending: Vec<String> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT session_id FROM session_deletion ORDER BY session_id")?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for session_id in pending {
+            let root = self.data_root.clone();
+            let result = self.delete_session_with(&session_id, || {
+                crate::plan::PlanFileStore::new(&root, "").delete_session(&session_id)
+            });
+            if let Err(error) = result {
+                if !error.is::<crate::session::SessionLeaseConflict>() {
+                    return Err(error);
+                }
+            }
+        }
         Ok(())
     }
 

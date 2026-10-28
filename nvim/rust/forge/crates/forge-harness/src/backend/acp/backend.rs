@@ -817,7 +817,7 @@ impl Backend for AcpBackend {
                 "session/prompt",
                 json!({"sessionId":session.id,
             "prompt":prompt}),
-                request.submission.as_deref(),
+                request.submission.as_ref(),
             )
             .await;
         let cleanup = session.state.finish().await;
@@ -971,7 +971,7 @@ impl Backend for AcpBackend {
             crate::attachment::acp_input(text.to_owned(), input.attachments(), image_supported)
                 .await?;
         let submission = match &input {
-            SteeringInput::User { submission, .. } => submission.as_deref(),
+            SteeringInput::User { submission, .. } => submission.as_ref(),
             SteeringInput::AgentResult(_) => None,
         };
         session

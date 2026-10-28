@@ -68,9 +68,19 @@ local before = #host.requests
 host.flush()
 assert(#host.requests == before, "unqueue submitted the text")
 controller.steer_submit()
-assert(text() == "" and state.queue[1].text == "unqueue this")
+assert(text() == "" and #state.queue == 0 and state.pending_submit[1].text == "unqueue this")
 assert(host.requests[#host.requests].parameters.action.message.intent == "auto")
 host.flush()
 assert(#errors == 0 and #warnings == 0, table.concat(errors, "\n"))
+local failure = string.rep("attachment unavailable ", 200)
+local staged = require("forge.views.harness.queue_editor").staging(state, "", {
+  { id = "failed-input", delivery = "failed", text = "Recover this prompt", error = failure },
+})[1]
+assert(staged.failed and staged.id == "failed-input")
+local retry_position = assert(staged.text:find("retry", 1, true))
+local prompt_position = assert(staged.text:find("Recover this prompt", 1, true))
+local failure_position = assert(staged.text:find(failure, 1, true))
+assert(retry_position < prompt_position and prompt_position < failure_position,
+  "long diagnostics hide the failed prompt and retry shortcut")
 print("harness_queue_edit: passed")
 vim.cmd("qa!")

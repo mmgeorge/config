@@ -9,8 +9,8 @@ client.host_accepting = function() return true end
 local requests = {}
 client.request_for = function(_, method, params, callback)
   callback = encode_delivery(callback)
-  assert(method == "harness.document")
-  requests[#requests + 1] = { params = params, callback = callback }
+  assert(method == "harness.document" or method == "plan.entity.rename")
+  requests[#requests + 1] = { method = method, params = params, callback = callback }
 end
 local path = vim.fn.tempname() .. ".md"
 vim.fn.writefile({ "# Native plan", "", "Task" }, path)
@@ -81,6 +81,21 @@ local success, failure = xpcall(function()
   requests[#requests].callback(updated)
   buffer_view.capture_viewport = capture_viewport
   assert(toggled and capture_count == 1, "declaration toggle did not capture at publication")
+  local settled = {}
+  local before = #requests
+  for _, name in ipairs({ "first", "second", "third" }) do
+    assert(owner.submit("plan.entity.rename", { name = name }, function(_, problem)
+      assert(not problem, problem)
+      settled[#settled + 1] = name
+    end))
+  end
+  assert(#requests == before + 1 and #owner.pending_operation == 2,
+    "explicit plan edits overwrote one another while an edit was pending")
+  for index, name in ipairs({ "first", "second", "third" }) do
+    assert(requests[before + index].params.name == name, "plan edits changed order")
+    requests[before + index].callback({})
+  end
+  assert(vim.deep_equal(settled, { "first", "second", "third" }) and #owner.pending_operation == 0)
   local selected
   owner.action("open", function(value) selected = value end)
   local action = requests[#requests]

@@ -6,10 +6,9 @@ impl HarnessBroker {
         text: String,
         mode: PromptMode,
         admission: Option<ExchangeAdmission>,
-        mut input: BackendInput,
+        input: BackendInput,
     ) -> Result<(Value, Vec<SessionEvent>)> {
-        let submission_store =
-            crate::backend::submission::SubmissionStore::open(&self.data_root, self.trace.clone())?;
+        let submission_store = self.submission_store.clone();
         let submission = match self.input_submission.take() {
             Some(submission) => submission,
             None => submission_store.prepare(
@@ -17,129 +16,24 @@ impl HarnessBroker {
                 self.backend.descriptor().kind,
             )?,
         };
-        let (mut interaction, mut event) =
-            Box::pin(self.admit_interaction(&text, mode, admission.as_ref())).await?;
+        let (mut interaction, new_runtime, mut event) = Box::pin(self.admit_interaction(
+            &text,
+            mode,
+            admission.as_ref(),
+            submission.record()?.input_message_id,
+        ))
+        .await?;
 
-        if mode == PromptMode::PlanDiscussion {
-            input = match input {
-                BackendInput::Text { text, attachments } => {
-                    BackendInput::from_text(PlanPrompt::discussion(&text))
-                        .with_attachments(attachments)
-                }
-                BackendInput::Skill {
-                    name,
-                    arguments,
-                    attachments,
-                } => BackendInput::Skill {
-                    name,
-                    arguments: PlanPrompt::discussion(&arguments),
-                    attachments,
-                },
-            };
-        }
-        if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
-            && !input.text().contains("Active declaration design:")
-        {
-            let current_plan_id = self.current_plan_id()?;
-            let plan_id = current_plan_id
-                .as_deref()
-                .context("planning turn has no active plan")?;
-            let document = self
-                .plan_file
-                .read_working_document(&self.session.id, &plan_id)?;
-            let context = PlanPrompt::with_active_document(String::new(), &document.model_json()?);
-            input = match input {
-                BackendInput::Text { text, attachments } => {
-                    BackendInput::from_text(format!("{context}{text}"))
-                        .with_attachments(attachments)
-                }
-                BackendInput::Skill {
-                    name,
-                    arguments,
-                    attachments,
-                } => BackendInput::Skill {
-                    name,
-                    arguments: format!("{context}{arguments}"),
-                    attachments,
-                },
-            };
-        }
-
-        if self.session.backend_session_id.is_none() {
-            input = self.rollback_context(&interaction.id, input)?;
-        }
-        let mut backend_request = self.backend_request(input, mode);
-        backend_request.submission = Some(submission.clone());
-        let owner = crate::backend::ExecutionOwner::root(&self.session.id);
-        if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
-            match &mut backend_request.input {
-                BackendInput::Text { text, .. } => *text = format!("{feedback}\n\n{text}"),
-                BackendInput::Skill { arguments, .. } => {
-                    *arguments = format!("{feedback}\n\n{arguments}")
-                }
-            }
-        }
-        let policy = self
-            .permission_store
-            .read()
-            .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-            .compiled()
-            .clone();
-        let (repository_scope, repository_lease) =
-            crate::control_tools::repository::RepositoryToolScope::open(
-                self.session.id.clone(),
-                interaction.id.clone(),
-                PathBuf::from(&self.session.workspace),
-                policy.clone(),
-                Arc::clone(&self.turn_cancellation.requested),
-                Arc::clone(&self.repositories),
-                Arc::clone(&self.diff),
-            )?;
-        let (harness_scope, harness_lease) =
-            crate::control_tools::harness::HarnessInspectionScope::open(
-                self.session.clone(),
-                self.data_root.clone(),
-                self.permission_store
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-                    .open()
-                    .0,
-                policy.clone(),
-                Arc::clone(&self.turn_cancellation.requested),
-                self.trace.clone(),
-            )?;
-        let (lsp_scope, lsp_lease) = self.lsp.scope(
-            self.session.id.clone(),
-            interaction.id.clone(),
-            PathBuf::from(&self.session.workspace),
-            policy,
-            self.turn_cancellation.requested.clone(),
-        );
-        if let Some(context) = &mut backend_request.control_context {
-            context.lsp = Some(lsp_scope);
-            context.repository = Some(repository_scope);
-            context.harness = Some(harness_scope);
-            context.has_active_elicitation |= interaction.elicitation.is_some();
-        }
-        self.trace.record(
-            &self.session.id,
-            "model.requested",
-            serde_json::to_value(&backend_request)?,
-        );
-        let mut execution =
-            Box::pin(self.prompt_with_timeline(backend_request, &mut interaction, &mut event));
-        // Automatic repair reenters provider execution while its parent request is still polling.
-        // Grow temporary segments here without increasing the worker's stack allocation.
-        let output = std::future::poll_fn(|context| {
-            stacker::maybe_grow(768 * 1024, 1024 * 1024, || {
-                std::future::Future::poll(execution.as_mut(), context)
-            })
-        })
-        .await;
-        drop(execution);
-        drop(repository_lease);
-        drop(harness_lease);
-        drop(lsp_lease);
+        let output = self
+            .run_admitted_provider(
+                mode,
+                input,
+                submission.clone(),
+                new_runtime,
+                &mut interaction,
+                &mut event,
+            )
+            .await;
         let output = match output {
             Ok(output) => output,
             Err(error) => {
@@ -151,6 +45,43 @@ impl HarnessBroker {
                 let cancelled = error.downcast_ref::<TurnCancelled>().is_some();
                 if cancelled && !self.turn_cancellation.restart.load(Ordering::Acquire) {
                     submission.cancel()?;
+                }
+                if self
+                    .exchange_runtime
+                    .as_ref()
+                    .is_none_or(|runtime| runtime.exchange_id != interaction.id)
+                {
+                    interaction.finish(
+                        if cancelled {
+                            ExchangeState::Cancelled
+                        } else {
+                            ExchangeState::Failed
+                        },
+                        self.clock.now_ms(),
+                    )?;
+                    self.store.save_exchange(&interaction)?;
+                    self.emit_live_interaction(
+                        BackendEvent {
+                            received_at_ms: None,
+                            address: None,
+                            turn_boundary: None,
+                            kind: if cancelled {
+                                "timeline_exchange_cancelled"
+                            } else {
+                                "timeline_exchange_failed"
+                            }
+                            .into(),
+                            text: Some(format!("{error:#}")),
+                            data: serde_json::to_value(&interaction)?,
+                            activity: None,
+                            summary: None,
+                            task_update: None,
+                        },
+                        &interaction,
+                        &mut event,
+                    )
+                    .await?;
+                    return Err(error);
                 }
                 if cancelled
                     && let Some(backend_session_id) =
@@ -278,11 +209,9 @@ impl HarnessBroker {
         text: &str,
         mode: PromptMode,
         admission: Option<&ExchangeAdmission>,
-    ) -> Result<(Exchange, Vec<SessionEvent>)> {
-        let (_, mut event) = Box::pin(self.retry_finalization())
-            .await
-            .context("finish previous exchange before starting more work")?;
-        self.backend.prepare_turn(&self.session.id).await?;
+        input_message_id: Option<String>,
+    ) -> Result<(Exchange, bool, Vec<SessionEvent>)> {
+        let mut event = Vec::new();
         let now_ms = self.clock.now_ms();
         let admitted_prompt = admission.map(|value| value.prompt.as_str()).unwrap_or(text);
         let automatic_repair =
@@ -290,8 +219,7 @@ impl HarnessBroker {
         if automatic_repair {
             let mut previous = self
                 .store
-                .list_exchange(&self.session.id)?
-                .pop()
+                .latest_exchange(&self.session.id)?
                 .context("automatic repair has no originating exchange")?;
             anyhow::ensure!(
                 previous.check_owner.as_ref()
@@ -309,6 +237,7 @@ impl HarnessBroker {
             ))
             .await?;
         event.append(&mut admission_event);
+        interaction.input_message_id = input_message_id;
         interaction.approval_mode = Some(self.session.approval_mode);
         if new_interaction && let Some(admission) = admission {
             if self.check_setup {
@@ -359,15 +288,6 @@ impl HarnessBroker {
             }
         }
         if new_interaction {
-            Box::pin(self.start_exchange_runtime(&mut interaction, now_ms)).await?;
-        } else if self
-            .exchange_runtime
-            .as_ref()
-            .is_none_or(|runtime| runtime.exchange_id != interaction.id)
-        {
-            self.resume_exchange_runtime(&interaction)?;
-        }
-        if new_interaction {
             if let Some(event_id) =
                 admission.and_then(|admission| admission.plan_event_id.as_deref())
             {
@@ -414,6 +334,14 @@ impl HarnessBroker {
             &mut event,
         ))
         .await?;
+        self.trace.record(
+            &self.session.id,
+            "turn.state",
+            json!({
+                "exchange_id":interaction.id,"message_id":interaction.input_message_id,
+                "from_state":"queued","to_state":"working",
+            }),
+        );
 
         if mode == PromptMode::Plan
             || admission.is_some_and(|admission| admission.plan_event_id.is_some())
@@ -445,7 +373,7 @@ impl HarnessBroker {
             activity: None, summary: None, task_update: None,
         }, &mut event)).await?;
 
-        Ok((interaction, event))
+        Ok((interaction, new_interaction, event))
     }
 
     async fn complete_interaction(

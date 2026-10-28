@@ -491,10 +491,6 @@ local function dispatch_message(message, timing)
       if result_session_id then client.snapshot_by_id[result_session_id] = message.result end
     elseif pending.method == "history.record" and client.snapshot then
       client.snapshot.prompt_history = vim.deepcopy(message.result or {})
-    elseif (pending.method == "question.answer" or pending.method == "question.skip")
-      and client.snapshot
-    then
-      client.snapshot = vim.deepcopy(message.result)
     end
     local result_session_id = message.result and message.result.session and message.result.session.id
     if result_session_id then client.snapshot_by_id[result_session_id] = message.result end
@@ -954,7 +950,7 @@ end
 ---@param method string
 ---@param params? table
 ---@param callback? fun(result?: any, error?: string, error_detail?: table)
-function M.request_for(session_id, method, params, callback)
+local function send_session_request(session_id, method, params, callback, sending)
   callback = callback or function() end
   local session_callback = scope_callback(session.harness, callback)
   local id = admit_request(method, session_callback)
@@ -967,8 +963,17 @@ function M.request_for(session_id, method, params, callback)
       session_callback(nil, start_error, error_detail)
       return
     end
+    if sending then sending(client.generation) end
     write_request(id, method, params or {}, session_id)
   end)
+end
+
+---@param session_id? string
+---@param method string
+---@param params? table
+---@param callback? ForgeCallback
+function M.request_for(session_id, method, params, callback)
+  require("forge.command").dispatch(send_session_request, session_id, method, params, callback or function() end)
 end
 
 ---@param callback ForgeSubscriber

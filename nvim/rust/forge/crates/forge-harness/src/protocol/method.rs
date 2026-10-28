@@ -3,6 +3,8 @@ use serde::Deserialize;
 /// Identifies an accepted Harness operation before session state is accessed.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum HarnessMethod {
+    #[serde(rename = "command.status")]
+    CommandStatus,
     #[serde(rename = "input.apply")]
     InputApply,
     #[serde(rename = "input.get")]

@@ -11,15 +11,14 @@ use forge_git::store::RepositoryStore;
 use forge_protocol::message::{Message, Request, Response, SessionEvent};
 use forge_protocol::outbound::MessageSender;
 use serde_json::{Value, json};
-use tokio::sync::{
-    Mutex, MutexGuard, Notify, OwnedSemaphorePermit, RwLock, RwLockReadGuard, Semaphore,
-};
+use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, RwLockReadGuard};
 use tokio::task::JoinSet;
 
 use crate::broker::{
     BrokerRuntime, HarnessBroker, InitializeRequest, TurnCancellation, prepare_new_session,
     prepare_provider_fork,
 };
+use crate::command::{CommandAdmission, CommandIdentity, ExecutionPermit, SessionCoordinator};
 use crate::protocol::HarnessMethod;
 use crate::session::{ProviderForkState, SessionLeaseConflict, SessionStore};
 use crate::storage::SqliteStore;
@@ -427,13 +426,13 @@ impl HarnessService {
         &self,
         session_id: Option<&str>,
         method: HarnessMethod,
-    ) -> Result<Option<OwnedSemaphorePermit>> {
+    ) -> Result<Option<ExecutionPermit>> {
         let _activity = self.admit().await?;
         if method.requires_provider_fork() {
             let registry = self.registry().await?;
             let session_id = session_id.unwrap_or(&registry.initial_session_id);
             let controller = registry.resolve(session_id).await?;
-            let _control = Arc::clone(&controller.control_admission)
+            let _control = Arc::clone(&controller.coordinator.control)
                 .try_acquire_owned()
                 .map_err(|_| {
                     crate::broker::RequestNotAdmitted("Harness cleanup is still running")
@@ -451,12 +450,12 @@ impl HarnessService {
             let execution = if interrupted_checks {
                 tokio::time::timeout(
                     Duration::from_secs(10),
-                    Arc::clone(&controller.execution_admission).acquire_owned(),
+                    Arc::clone(&controller.coordinator.execution).acquire_owned(),
                 )
                 .await
                 .context("interrupted checks did not release execution within 10 seconds")??
             } else {
-                Arc::clone(&controller.execution_admission)
+                Arc::clone(&controller.coordinator.execution)
                     .try_acquire_owned()
                     .map_err(|_| {
                         crate::broker::RequestNotAdmitted(
@@ -477,7 +476,7 @@ impl HarnessService {
         &self,
         session_id: &str,
         task_id: Option<&str>,
-    ) -> Result<OwnedSemaphorePermit> {
+    ) -> Result<ExecutionPermit> {
         let registry = self.registry().await?;
         let controller = registry.resolve(session_id).await?;
         let request_revision = controller
@@ -485,10 +484,10 @@ impl HarnessService {
             .request_revision
             .load(Ordering::Acquire);
         loop {
-            let execution = Arc::clone(&controller.execution_admission)
+            let execution = Arc::clone(&controller.coordinator.execution)
                 .acquire_owned()
                 .await?;
-            if let Ok(_control) = Arc::clone(&controller.control_admission).try_acquire_owned() {
+            if let Ok(_control) = Arc::clone(&controller.coordinator.control).try_acquire_owned() {
                 ensure!(
                     self.accepting.load(Ordering::Acquire),
                     "Harness service is closed"
@@ -527,7 +526,7 @@ impl HarnessService {
             // Cleanup may itself need execution ownership. Release it before waiting for cleanup.
             drop(execution);
             drop(
-                Arc::clone(&controller.control_admission)
+                Arc::clone(&controller.coordinator.control)
                     .acquire_owned()
                     .await?,
             );
@@ -541,7 +540,11 @@ impl HarnessService {
         let session_id = session_id.unwrap_or(&registry.initial_session_id);
         let controller = registry.resolve(session_id).await?;
         let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-        admit_task_intent(&controller, session_id, request, &mut store)?;
+        let mut request = request.clone();
+        if let Some(params) = request.params.as_object_mut() {
+            params.remove("_command");
+        }
+        admit_task_intent(&controller, session_id, &request, &mut store)?;
         Ok(())
     }
 
@@ -563,7 +566,102 @@ impl HarnessService {
         session_id: Option<String>,
         mut request: Request,
         sink: &MessageSender,
-        mut admission: Option<OwnedSemaphorePermit>,
+        admission: Option<ExecutionPermit>,
+    ) -> Result<()> {
+        let identity = request
+            .params
+            .as_object_mut()
+            .and_then(|params| params.remove("_command"));
+        if request.method == "command.status" {
+            let registry = self.registry().await?;
+            let session_id = session_id
+                .as_deref()
+                .unwrap_or(&registry.initial_session_id);
+            let controller = registry.resolve(session_id).await?;
+            let id = request.params["id"]
+                .as_str()
+                .context("command identity is required")?;
+            return Ok(sink
+                .send_response(Response::success(
+                    request.id,
+                    controller.coordinator.status(id)?,
+                )?)
+                .await?);
+        }
+        let Some(identity) = identity else {
+            return self
+                .dispatch_request(session_id, request, sink, admission)
+                .await;
+        };
+        let identity: CommandIdentity = serde_json::from_value(identity)?;
+        let registry = self.registry().await?;
+        let owner_id = session_id
+            .as_deref()
+            .unwrap_or(&registry.initial_session_id);
+        let controller = registry.resolve(owner_id).await?;
+        if let Some(epoch) = &identity.runtime_epoch {
+            ensure!(
+                epoch == controller.observer.runtime_epoch(),
+                "command belongs to a previous host lifetime"
+            );
+        }
+        let lease =
+            match controller
+                .coordinator
+                .admit(&identity, &request.method, &request.params)?
+            {
+                CommandAdmission::Recorded(mut response) => {
+                    response.id = request.id;
+                    return Ok(sink.send_response(response).await?);
+                }
+                CommandAdmission::Pending => {
+                    return Ok(sink
+                        .send_response(Response::failure(
+                            request.id,
+                            "outcome_unknown",
+                            "The original command is still being reconciled",
+                        ))
+                        .await?);
+                }
+                CommandAdmission::Execute(lease) => lease,
+            };
+        let coordinator = controller.coordinator.clone();
+        let command_id = identity.id.clone();
+        let attempt = lease.attempt;
+        let request_id = request.id;
+        let recorded = sink.observe_responses(move |response| {
+            if response.id == request_id {
+                coordinator
+                    .complete(&command_id, attempt, response)
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        });
+        let result = self
+            .dispatch_request(session_id, request, &recorded, admission)
+            .await;
+        if let Err(error) = &result {
+            let code = if error.is::<crate::broker::RequestNotAdmitted>() {
+                "not_admitted"
+            } else {
+                "outcome_unknown"
+            };
+            controller.coordinator.complete(
+                &identity.id,
+                attempt,
+                &Response::failure(request_id, code, crate::storage::error_message(error)),
+            )?;
+        }
+        drop(lease);
+        result
+    }
+
+    async fn dispatch_request(
+        &self,
+        session_id: Option<String>,
+        mut request: Request,
+        sink: &MessageSender,
+        mut admission: Option<ExecutionPermit>,
     ) -> Result<()> {
         let method = HarnessMethod::decode(&request.method)?;
         if method == HarnessMethod::Shutdown {
@@ -574,7 +672,7 @@ impl HarnessService {
             } else {
                 json!({"stopped":true})
             };
-            sink.send_terminal(Message::Response(Response::success(request.id, result)?))?;
+            sink.send_terminal_response(Response::success(request.id, result)?)?;
             return Ok(());
         }
         let _activity = self.admit().await?;
@@ -796,7 +894,7 @@ impl HarnessService {
                     .collect();
                 for controller in controller_list {
                     controller.input_stopping.store(true, Ordering::Release);
-                    controller.input.changed.notify_one();
+                    controller.coordinator.submissions.changed.notify_one();
                     if let Some(task) = controller.timeout_task.lock().await.take() {
                         task.abort();
                     }
@@ -906,9 +1004,15 @@ impl HarnessService {
             Arc::clone(&self.repositories),
             Arc::clone(&self.diff),
         )?;
-        let broker =
-            HarnessBroker::initialize_with_runtime(initialize.clone(), Arc::clone(&runtime))?;
-        let snapshot = broker.snapshot()?;
+        let startup_request = initialize.clone();
+        let startup_runtime = runtime.clone();
+        let (broker, snapshot) = tokio::task::spawn_blocking(move || {
+            let broker = HarnessBroker::initialize_with_runtime(startup_request, startup_runtime)?;
+            let snapshot = broker.snapshot()?;
+            Ok::<_, anyhow::Error>((broker, snapshot))
+        })
+        .await
+        .context("Harness session startup worker failed")??;
         let result = serde_json::to_value(&snapshot)?;
         *harness = Some(SessionControllerRegistry::new(
             snapshot.session.id.clone(),
@@ -922,7 +1026,8 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
-    input: Arc<crate::input::SessionInputQueue>,
+    coordinator: Arc<SessionCoordinator>,
+    submission_store: Arc<crate::backend::submission::SubmissionStore>,
     input_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     input_stopping: AtomicBool,
     trace: Arc<crate::trace::TraceStore>,
@@ -935,8 +1040,6 @@ struct SessionController {
     agent_backend_factory: crate::agent::AgentBackendFactory,
     parent_input: crate::backend::SteeringLane,
     compaction_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    execution_admission: Arc<Semaphore>,
-    control_admission: Arc<Semaphore>,
     plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     revision_review: Arc<crate::plan::revision_review::RevisionReview>,
     broker: Mutex<HarnessBroker>,
@@ -1048,7 +1151,8 @@ impl SessionController {
         let input = Arc::new(crate::input::SessionInputQueue::default());
         broker.input_wakeup = Some(input.changed.clone());
         Ok(Arc::new(Self {
-            input,
+            coordinator: SessionCoordinator::new(input),
+            submission_store: broker.submission_store.clone(),
             input_task: Mutex::new(None),
             input_stopping: AtomicBool::new(false),
             trace: broker.trace.clone(),
@@ -1061,8 +1165,6 @@ impl SessionController {
             agent_backend_factory: broker.agent_backend_factory.clone(),
             parent_input: broker.parent_input.clone(),
             compaction_task: Mutex::new(None),
-            execution_admission: Arc::new(Semaphore::new(1)),
-            control_admission: Arc::new(Semaphore::new(1)),
             plan_review: Arc::clone(&broker.plan_review),
             revision_review: Arc::clone(&broker.revision_review),
             presentation: broker.presentation(),
@@ -1162,14 +1264,14 @@ impl SessionController {
                 };
                 let admission = async {
                     loop {
-                        let execution = Arc::clone(&controller.execution_admission)
+                        let execution = Arc::clone(&controller.coordinator.execution)
                             .acquire_owned()
                             .await?;
-                        if let Ok(_control) = controller.control_admission.try_acquire() {
+                        if let Ok(_control) = controller.coordinator.control.try_acquire() {
                             return Ok::<_, anyhow::Error>(execution);
                         }
                         drop(execution);
-                        drop(controller.control_admission.acquire().await?);
+                        drop(controller.coordinator.control.acquire().await?);
                     }
                 };
                 let _admission = tokio::select! {
@@ -1252,7 +1354,7 @@ impl SessionController {
                 let publication = broker.refresh_input_schedule();
                 let result = result.and(publication);
                 drop(broker);
-                controller.input.changed.notify_one();
+                controller.coordinator.submissions.changed.notify_one();
                 match result {
                     Ok(()) => {}
                     Err(error) if error.is::<crate::broker::TurnCancelled>() => {}
@@ -1317,7 +1419,7 @@ impl SessionController {
 impl Drop for SessionController {
     fn drop(&mut self) {
         self.input_stopping.store(true, Ordering::Release);
-        self.input.changed.notify_one();
+        self.coordinator.submissions.changed.notify_one();
         if let Some(task) = self.timeout_task.get_mut().take() {
             task.abort();
         }
@@ -1407,7 +1509,12 @@ impl SessionControllerRegistry {
         initialize.session_id = Some(session_id.to_owned());
         initialize.new_session_name = None;
         initialize.lease_conflict_action = None;
-        let broker = HarnessBroker::initialize_with_runtime(initialize, Arc::clone(&self.runtime))?;
+        let runtime = self.runtime.clone();
+        let broker = tokio::task::spawn_blocking(move || {
+            HarnessBroker::initialize_with_runtime(initialize, runtime)
+        })
+        .await
+        .context("Harness session resume worker failed")??;
         anyhow::ensure!(
             broker.snapshot()?.session.id == session_id,
             "resolved Harness controller does not own requested session {session_id}"
@@ -1619,7 +1726,7 @@ async fn route_request(
     method: HarnessMethod,
     message_sink: &MessageSender,
     syntax: &Arc<SyntaxEngine>,
-    admission: &mut Option<OwnedSemaphorePermit>,
+    admission: &mut Option<ExecutionPermit>,
     prompt_admission: &mut Option<PromptAdmission>,
 ) -> Result<()> {
     if matches!(
@@ -1758,6 +1865,9 @@ async fn route_request(
     if method == HarnessMethod::SessionResume {
         return resume_session(registry, request, message_sink).await;
     }
+    if method == HarnessMethod::SessionDelete {
+        return delete_session(registry, &session_id, request, message_sink).await;
+    }
     if method == HarnessMethod::SessionFork {
         return route_session_fork(registry, session_id, request, message_sink).await;
     }
@@ -1768,6 +1878,10 @@ async fn route_request(
         return route_new_session(registry, session_id, request, message_sink).await;
     }
     let controller = registry.resolve(&session_id).await?;
+    ensure!(
+        !controller.input_stopping.load(Ordering::Acquire),
+        "Harness session is closing"
+    );
     controller.attach_compaction(message_sink).await?;
     controller.attach_input(message_sink).await?;
     if matches!(
@@ -2222,10 +2336,10 @@ async fn route_request(
         method,
         HarnessMethod::BackendSetup | HarnessMethod::BackendAuthenticate
     ) {
-        let control = Arc::clone(&controller.control_admission)
+        let control = Arc::clone(&controller.coordinator.control)
             .try_acquire_owned()
             .context("Provider setup cannot run while cleanup is pending")?;
-        let execution = Arc::clone(&controller.execution_admission)
+        let execution = Arc::clone(&controller.coordinator.execution)
             .try_acquire_owned()
             .context("Finish active work before provider setup or authentication")?;
         Some((control, execution))
@@ -2363,7 +2477,7 @@ async fn route_request(
                 if request.params["interrupt_execution"].as_bool() == Some(true)
                     || controller.backend.has_active_turn(&session_id).await
                 {
-                    let _control = Arc::clone(&controller.control_admission)
+                    let _control = Arc::clone(&controller.coordinator.control)
                         .try_acquire_owned()
                         .context("Harness cleanup is still running")?;
                     controller.interrupt_checks(&session_id, id).await?;
@@ -2382,7 +2496,7 @@ async fn route_request(
                         && controller.agent_coordinator.active_count() == 0,
                     "checks cannot race planning or writing agents"
                 );
-                let admission = Arc::clone(&controller.execution_admission)
+                let admission = Arc::clone(&controller.coordinator.execution)
                     .try_acquire_owned()
                     .context("finish active source work before checks")?;
                 let run = controller.checks.prepare_request(
@@ -2451,10 +2565,10 @@ async fn route_request(
     }
     if method == HarnessMethod::Health {
         message_sink
-            .send_control_wait(Message::Response(Response::success(
+            .send_control_response(Response::success(
                 request.id,
                 json!({"session_id":session_id,"responsive":true}),
-            )?))
+            )?)
             .await?;
         return Ok(());
     }
@@ -2466,12 +2580,12 @@ async fn route_request(
             .context("operation_id is required")?;
         let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         message_sink
-            .send_control_wait(Message::Response(Response::success(
+            .send_control_response(Response::success(
                 request.id,
                 store
                     .load_task_operation(&session_id, id)?
                     .map(|operation| operation.view()),
-            )?))
+            )?)
             .await?;
         return Ok(());
     }
@@ -2617,7 +2731,7 @@ async fn route_request(
     for event in result.event {
         message_sink.send_event(event).await?;
     }
-    controller.input.changed.notify_one();
+    controller.coordinator.submissions.changed.notify_one();
     publish_execution_completion(
         message_sink,
         result.response,
@@ -2632,14 +2746,14 @@ async fn route_request(
 async fn publish_execution_completion(
     sink: &MessageSender,
     response: Response,
-    admission: &mut Option<OwnedSemaphorePermit>,
+    admission: &mut Option<ExecutionPermit>,
     prompt_admission: &mut Option<PromptAdmission>,
     terminal: bool,
 ) -> Result<()> {
     drop(prompt_admission.take());
     drop(admission.take());
     if terminal {
-        sink.send_terminal(Message::Response(response))?;
+        sink.send_terminal_response(response)?;
     } else {
         sink.send_response(response).await?;
     }
@@ -2801,7 +2915,7 @@ fn admit_task_intent(
         .unwrap_or_else(|| {
             task.as_ref()
                 .is_some_and(|task| task.status == crate::task::TaskStatus::Running)
-                || (task.is_none() && controller.execution_admission.available_permits() == 0)
+                || (task.is_none() && controller.coordinator.execution.available_permits() == 0)
         });
     let resume_after_transition = if matches!(action, "pause" | "clear" | "undo") {
         false
@@ -2839,6 +2953,7 @@ fn admit_task_intent(
         None
     };
     let operation = crate::task::TaskOperation {
+        revision: 0,
         id,
         session_id: session_id.to_owned(),
         action: request.params.clone(),
@@ -2851,7 +2966,10 @@ fn admit_task_intent(
     };
     store.admit_task_operation(&operation)?;
     if matches!(action, "pause" | "clear" | "undo") {
-        controller.input.suspend(true)?;
+        controller
+            .coordinator
+            .submissions
+            .suspend(true, Some(&operation.id))?;
     }
     Ok(operation)
 }
@@ -2867,64 +2985,65 @@ async fn route_task_transition(
     let mut operation = admit_task_intent(&controller, &session_id, &request, &mut store)?;
     let admitted = store.claim_task_operation(&session_id, &operation.id)?;
     if !admitted {
-        sink.send_control_wait(Message::Response(Response::success(
+        sink.send_control_response(Response::success(
             request.id,
             store
                 .load_task_operation(&session_id, &operation.id)?
                 .map(|operation| operation.view()),
-        )?))
+        )?)
         .await?;
         return Ok(());
     }
     operation.state = "accepted".into();
-    if operation.action["action"] == "configure" {
-        controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
+    operation.revision += 1;
+    let result = async {
+        sink.send_control_response(Response::success(request.id, operation.view())?)
+            .await?;
+        if operation.action["action"] == "configure" {
+            controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
+        }
+        if let Some(revision) = operation
+            .action
+            .pointer("/config/settings_revision")
+            .and_then(Value::as_u64)
+        {
+            crate::settings::SettingsStore::open(
+                PathBuf::from(&registry.initialize.data_root).as_path(),
+            )?
+            .begin_application(&session_id, &operation.id, revision)?;
+        }
+        let exchange_list = store.list_exchange(&session_id)?;
+        let mut active = exchange_list.iter().filter(|exchange| {
+            exchange.completed_at_ms.is_none()
+                && exchange.state != crate::exchange::ExchangeState::Queued
+                && exchange.disposition == crate::exchange::HistoryDisposition::Current
+        });
+        operation.exchange_id = active.next().map(|exchange| exchange.id.clone());
+        ensure!(
+            active.next().is_none(),
+            "configuration has multiple active exchange owners"
+        );
+        if operation.exchange_id.is_none()
+            && let Some(run_id) = controller.checks.active()?
+        {
+            operation.exchange_id = controller
+                .checks
+                .status(&run_id, 0, false)
+                .await?
+                .owner
+                .exchange_id()
+                .map(str::to_owned);
+        }
+        retain_configuration_event(&mut store, &operation)?;
+        Box::pin(execute_task_transition(
+            &registry,
+            &controller,
+            &mut operation,
+            &mut store,
+            sink,
+        ))
+        .await
     }
-    if let Some(revision) = operation
-        .action
-        .pointer("/config/settings_revision")
-        .and_then(Value::as_u64)
-    {
-        crate::settings::SettingsStore::open(
-            PathBuf::from(&registry.initialize.data_root).as_path(),
-        )?
-        .begin_application(&session_id, &operation.id, revision)?;
-    }
-    let exchange_list = store.list_exchange(&session_id)?;
-    let mut active = exchange_list.iter().filter(|exchange| {
-        exchange.completed_at_ms.is_none()
-            && exchange.state != crate::exchange::ExchangeState::Queued
-            && exchange.disposition == crate::exchange::HistoryDisposition::Current
-    });
-    operation.exchange_id = active.next().map(|exchange| exchange.id.clone());
-    ensure!(
-        active.next().is_none(),
-        "configuration has multiple active exchange owners"
-    );
-    if operation.exchange_id.is_none()
-        && let Some(run_id) = controller.checks.active()?
-    {
-        operation.exchange_id = controller
-            .checks
-            .status(&run_id, 0, false)
-            .await?
-            .owner
-            .exchange_id()
-            .map(str::to_owned);
-    }
-    retain_configuration_event(&mut store, &operation)?;
-    sink.send_control_wait(Message::Response(Response::success(
-        request.id,
-        json!({"id":operation.id,"state":operation.state}),
-    )?))
-    .await?;
-    let result = Box::pin(execute_task_transition(
-        &registry,
-        &controller,
-        &mut operation,
-        &mut store,
-        sink,
-    ))
     .await;
     if operation.action["action"] == "configure" {
         controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
@@ -2944,7 +3063,7 @@ async fn route_task_transition(
             operation.error = Some(format!("{error:#}"));
         }
     }
-    if let Err(error) = store.save_task_operation(&operation) {
+    if let Err(error) = store.save_task_operation(&mut operation) {
         operation.state = "outcome_unknown".into();
         operation.error = Some(format!(
             "Task outcome could not be persisted: {error:#}. Effects may have occurred"
@@ -2957,10 +3076,13 @@ async fn route_task_transition(
             Some("resume" | "plan" | "execute" | "goal" | "fork" | "attach_plan")
         )
     {
-        let update = controller.input.suspend(false)?;
+        let update = controller
+            .coordinator
+            .submissions
+            .suspend(false, Some(&operation.id))?;
         controller.publish_input(update, sink).await?;
     }
-    controller.input.changed.notify_one();
+    controller.coordinator.submissions.changed.notify_one();
     if operation
         .action
         .pointer("/config/settings_revision")
@@ -3066,12 +3188,17 @@ async fn execute_task_transition(
     ) {
         action["resume"] = json!(operation.resume_after_transition);
     }
-    let control = Arc::clone(&controller.control_admission)
+    while store.pending_policy_predecessor(&operation.session_id, &operation.id)? {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let policy_change = matches!(action["action"].as_str(), Some("configure" | "permission"));
+    let control = Arc::clone(&controller.coordinator.control)
         .acquire_owned()
         .await?;
-    if store
-        .latest_task_operation(&operation.session_id)?
-        .is_none_or(|latest| latest.id != operation.id)
+    if !policy_change
+        && store
+            .latest_task_operation(&operation.session_id)?
+            .is_none_or(|latest| latest.id != operation.id)
     {
         operation.state = "superseded".into();
         return Ok(());
@@ -3114,7 +3241,7 @@ async fn execute_task_transition(
     } else {
         None
     };
-    let execution = match Arc::clone(&controller.execution_admission).try_acquire_owned() {
+    let execution = match Arc::clone(&controller.coordinator.execution).try_acquire_owned() {
         Ok(execution) => execution,
         Err(tokio::sync::TryAcquireError::Closed) => {
             anyhow::bail!("session execution admission is closed")
@@ -3150,7 +3277,7 @@ async fn execute_task_transition(
             }
             controller.cancellation.request(restore_prompt);
             // Execution ownership includes finalization and response delivery, independently of read-only broker locks.
-            Arc::clone(&controller.execution_admission)
+            Arc::clone(&controller.coordinator.execution)
                 .acquire_owned()
                 .await?
         }
@@ -3159,14 +3286,22 @@ async fn execute_task_transition(
         .list_exchange(&operation.session_id)?
         .last()
         .map(|exchange| exchange.id.clone());
-    if store
-        .latest_task_operation(&operation.session_id)?
-        .is_none_or(|latest| latest.id != operation.id)
+    if !policy_change
+        && store
+            .latest_task_operation(&operation.session_id)?
+            .is_none_or(|latest| latest.id != operation.id)
     {
         operation.state = "superseded".into();
         return Ok(());
     }
     controller.cancellation.arm(false);
+    if policy_change
+        && store
+            .latest_task_operation(&operation.session_id)?
+            .is_some_and(|latest| latest.id != operation.id)
+    {
+        action["resume"] = json!(false);
+    }
     // Release child collection after acquiring exclusive execution, before the transition resumes work.
     drop(child_quiescence);
     drop(control);
@@ -3175,7 +3310,7 @@ async fn execute_task_transition(
     sink.send_event(SessionEvent {
         session_id: operation.session_id.clone(),
         event: "task_operation".into(),
-        payload: json!({"id": operation.id, "state": "running"}),
+        payload: operation.view(),
     })
     .await?;
     let mut broker = controller.broker.lock().await;
@@ -3252,7 +3387,7 @@ async fn dispatch_task_attempt(
                     .load_task_operation(&routed_session, operation_id)?
                     .context("configuration operation is missing")?;
                 operation.state = state.into();
-                store.save_task_operation(&operation)?;
+                store.save_task_operation(&mut operation)?;
                 retain_configuration_event(&mut store, &operation)?;
                 output
                     .send_control_wait(Message::Event(SessionEvent {
@@ -3432,6 +3567,94 @@ async fn route_session_fork(
     Ok(())
 }
 
+/// Retires only an idle local controller before acquiring durable deletion ownership.
+async fn delete_session(
+    registry: Arc<SessionControllerRegistry>,
+    source_session_id: &str,
+    request: Request,
+    message_sink: &MessageSender,
+) -> Result<()> {
+    let target = request
+        .params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("session.delete requires session_id")?
+        .to_owned();
+    ensure!(
+        target != source_session_id,
+        "cannot delete the active session"
+    );
+    let mut controllers = registry.controller_by_id.write().await;
+    if let Some(controller) = controllers.get(&target).cloned() {
+        let _control = controller
+            .coordinator
+            .control
+            .clone()
+            .try_acquire_owned()
+            .context("cannot delete a session with active control work")?;
+        let _execution = controller
+            .coordinator
+            .execution
+            .clone()
+            .try_acquire_owned()
+            .context("cannot delete a session with active execution")?;
+        ensure!(
+            controller
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .is_empty(),
+            "cannot delete a session with queued input"
+        );
+        ensure!(
+            controller.agent_coordinator.active_count() == 0,
+            "cannot delete a session with active agents"
+        );
+        ensure!(
+            controller.checks.active()?.is_none(),
+            "cannot delete a session with active checks"
+        );
+        let mut broker = controller
+            .broker
+            .try_lock()
+            .context("cannot delete a session with active work")?;
+        broker.release_lease()?;
+        controller.input_stopping.store(true, Ordering::Release);
+        controller.coordinator.submissions.changed.notify_one();
+        controller.coordinator.execution.close();
+        controller.coordinator.control.close();
+        for task in [
+            controller.input_task.lock().await.take(),
+            controller.timeout_task.lock().await.take(),
+            controller.agent_task.lock().await.take(),
+            controller.compaction_task.lock().await.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        controllers.remove(&target);
+    }
+    drop(controllers);
+    let mut store = SqliteStore::open(std::path::Path::new(&registry.initialize.data_root))?;
+    let session = store.load_session(&target)?.context("session not found")?;
+    let plans = crate::plan::PlanFileStore::new(
+        std::path::Path::new(&registry.initialize.data_root),
+        &session.workspace,
+    );
+    store.delete_session_with(&target, || plans.delete_session(&target))?;
+    message_sink
+        .send_response(Response::success(
+            request.id,
+            json!({"deleted":target,"provider_session_preserved":true}),
+        )?)
+        .await?;
+    Ok(())
+}
+
 async fn resume_session(
     registry: Arc<SessionControllerRegistry>,
     request: Request,
@@ -3443,7 +3666,7 @@ async fn resume_session(
         .and_then(Value::as_str)
         .context("session.resume requires session_id")?;
     let controller = registry.resolve(target_session_id).await?;
-    let snapshot = controller.broker.lock().await.snapshot()?;
+    let snapshot = controller.observer.snapshot()?;
     message_sink
         .send_response(Response::success(request.id, snapshot)?)
         .await?;
@@ -3454,13 +3677,13 @@ async fn resume_session(
 async fn acquire_request_broker(
     controller: &SessionController,
     method: HarnessMethod,
-) -> Result<(MutexGuard<'_, HarnessBroker>, Option<OwnedSemaphorePermit>)> {
+) -> Result<(MutexGuard<'_, HarnessBroker>, Option<ExecutionPermit>)> {
     // Provider requests and check setup retain admission from their owning request lane.
     let admitted = method.requires_provider_fork();
     let admission = if admitted {
         None
     } else {
-        match Arc::clone(&controller.execution_admission).try_acquire_owned() {
+        match Arc::clone(&controller.coordinator.execution).try_acquire_owned() {
             Ok(admission) => Some(admission),
             Err(_) if matches!(method, HarnessMethod::GoalPause | HarnessMethod::GoalClear) => None,
             Err(_) => return Err(crate::broker::RequestNotAdmitted(
@@ -3544,8 +3767,44 @@ async fn route_control_request(
     message_sink: &MessageSender,
     syntax: &Arc<SyntaxEngine>,
     trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
-    admission: &mut Option<OwnedSemaphorePermit>,
+    admission: &mut Option<ExecutionPermit>,
 ) -> Result<bool> {
+    if matches!(
+        method,
+        HarnessMethod::QuestionAnswer | HarnessMethod::QuestionSkip
+    ) && request.params.get("target").is_some()
+    {
+        let started = Instant::now();
+        let mut params = request.params.clone();
+        if method == HarnessMethod::QuestionSkip {
+            params["response"] = json!({"kind":"skipped"});
+        }
+        let session_id = controller
+            .catalog_request
+            .read()
+            .await
+            .harness_session_id
+            .clone();
+        let root = controller.data_root.clone();
+        let owner = session_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            SqliteStore::open(&root)?.answer_question_command(&owner, &params)
+        })
+        .await
+        .context("question answer worker failed")??;
+        controller.trace.record(&session_id, "question.answer.committed", json!({"duration_ms":started.elapsed().as_millis(),"operation_id":result["operation_id"]}));
+        message_sink
+            .send_control_response(Response::success(request.id, &result)?)
+            .await?;
+        message_sink
+            .send_event(SessionEvent {
+                session_id,
+                event: "question_updated".into(),
+                payload: result["active_elicitation"].clone(),
+            })
+            .await?;
+        return Ok(true);
+    }
     if matches!(
         method,
         HarnessMethod::PlanTestsDelete
@@ -3712,7 +3971,7 @@ async fn route_control_request(
             | HarnessMethod::BackendMcpSetEnabled
     ) {
         Some(
-            Arc::clone(&controller.control_admission)
+            Arc::clone(&controller.coordinator.control)
                 .try_acquire_owned()
                 .context("Harness cleanup is already running")?,
         )
@@ -3736,7 +3995,7 @@ async fn route_control_request(
                     for event in result.event {
                         message_sink.send_event(event).await?;
                     }
-                    message_sink.send_control(Message::Response(result.response))?;
+                    message_sink.send_control_response(result.response).await?;
                     return Ok(true);
                 }
                 controller
@@ -3813,16 +4072,16 @@ async fn route_control_request(
             validate_root_control(request.params.get("target"))?;
             let attachments =
                 crate::attachment::resolve_input(&controller.data_root, &request.params).await?;
-            let journal = crate::backend::submission::SubmissionStore::open(
-                &controller.data_root,
-                controller.trace.clone(),
-            )?;
-            let submission = journal.prepare_steering(
-                &catalog_request,
-                crate::backend::BackendInput::from_text(text.clone())
-                    .with_attachments(attachments.clone()),
-                controller.backend.descriptor().kind,
-            )?;
+            let input = crate::backend::BackendInput::from_text(text.clone())
+                .with_attachments(attachments.clone());
+            let provider = controller.backend.descriptor().kind;
+            let submission_catalog = catalog_request.clone();
+            let submission = controller
+                .submission_store
+                .persist(move |journal| {
+                    journal.prepare_steering(&submission_catalog, input, provider)
+                })
+                .await?;
             let input = crate::backend::SteeringInput::User {
                 text,
                 attachments,
@@ -3890,7 +4149,7 @@ async fn route_control_request(
             method,
             HarnessMethod::TurnCancel | HarnessMethod::TurnRestart
         ) {
-            message_sink.send_control(Message::Response(response))?;
+            message_sink.send_control_response(response).await?;
         } else {
             message_sink.send_response(response).await?;
         }
@@ -3901,7 +4160,13 @@ async fn route_control_request(
 
 fn initialize_failure(request_id: u64, error: &anyhow::Error) -> Response {
     error.downcast_ref::<SessionLeaseConflict>().map_or_else(
-        || Response::failure(request_id, "initialize_failed", format!("{error:#}")),
+        || {
+            Response::failure(
+                request_id,
+                "initialize_failed",
+                crate::storage::error_message(error),
+            )
+        },
         |conflict| {
             Response::failure_with_data(
                 request_id,
@@ -4142,6 +4407,7 @@ mod tests {
             .insert(registry.initial_session_id.clone(), controller.clone());
         let mut store = SqliteStore::open(&controller.data_root)?;
         let mut operation = crate::task::TaskOperation {
+            revision: 0,
             id: "terminal-config".into(),
             session_id: registry.initial_session_id.clone(),
             action: json!({"action":"configure"}),
@@ -4152,11 +4418,11 @@ mod tests {
             created_at_ms: 1,
             resume_after_transition: false,
         };
-        store.save_task_operation(&operation)?;
+        store.save_task_operation(&mut operation)?;
         assert!(controller.background_terminals().await?.starting);
         assert_eq!(backend.calls.load(Ordering::Acquire), 0);
         operation.state = "completed".into();
-        store.save_task_operation(&operation)?;
+        store.save_task_operation(&mut operation)?;
         let query = controller.background_terminals();
         tokio::pin!(query);
         tokio::select! {
@@ -4167,7 +4433,7 @@ mod tests {
         backend.release.notify_one();
         assert!(query.await?.starting);
         operation.state = "resuming".into();
-        store.save_task_operation(&operation)?;
+        store.save_task_operation(&mut operation)?;
         backend.release.notify_one();
         assert!(
             controller
@@ -4612,7 +4878,7 @@ mod tests {
             .to_owned();
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
-        let execution = controller.execution_admission.acquire().await?;
+        let execution = controller.coordinator.execution.acquire().await?;
         let broker = controller.broker.lock().await;
         let (sink, _output) = forge_protocol::outbound::channel();
         tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()), Request {
@@ -4622,7 +4888,7 @@ mod tests {
         let (approval, answer) = controller.permission.input_timeouts(&session_id)?;
         assert_eq!(approval.amount, 2);
         assert_eq!(answer.amount, 0);
-        assert!(controller.execution_admission.try_acquire().is_err());
+        assert!(controller.coordinator.execution.try_acquire().is_err());
         assert_eq!(broker.snapshot()?.session.approval_timeout, approval);
         drop(broker);
         drop(execution);
@@ -4652,7 +4918,7 @@ mod tests {
         assert_eq!(opened.result().unwrap()["check_editing"], false);
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
-        let execution = controller.execution_admission.acquire().await?;
+        let execution = controller.coordinator.execution.acquire().await?;
         let broker = controller.broker.lock().await;
         let (sink, _output) = forge_protocol::outbound::channel();
         for (index, enabled) in [true, false, true].into_iter().enumerate() {
@@ -4678,7 +4944,7 @@ mod tests {
             let snapshot = controller.observer.snapshot()?;
             assert_eq!(snapshot.check_editing, enabled);
             assert!(snapshot.exchange.is_empty());
-            assert!(controller.execution_admission.try_acquire().is_err());
+            assert!(controller.coordinator.execution.try_acquire().is_err());
             let settings =
                 crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?;
             assert_eq!(
@@ -4720,7 +4986,7 @@ mod tests {
         assert_eq!(opened.result().unwrap()["status_thoughts"], false);
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
-        let execution = controller.execution_admission.acquire().await?;
+        let execution = controller.coordinator.execution.acquire().await?;
         let broker = controller.broker.lock().await;
         let (sink, _output) = forge_protocol::outbound::channel();
         for (index, enabled) in [true, false].into_iter().enumerate() {
@@ -4738,7 +5004,7 @@ mod tests {
             )
             .await??;
             assert_eq!(controller.observer.snapshot()?.status_thoughts, enabled);
-            assert!(controller.execution_admission.try_acquire().is_err());
+            assert!(controller.coordinator.execution.try_acquire().is_err());
             let settings =
                 crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?;
             assert_eq!(
@@ -4839,7 +5105,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_permission_intents_compose_before_superseded_operations_run() -> Result<()> {
+    async fn question_answers_commit_without_waiting_for_provider_execution() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let controller = service.registry().await?.resolve(&session_id).await?;
+        let mut store = SqliteStore::open(&controller.data_root)?;
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+            "id":"question-exchange","session_id":session_id,"agent_id":format!("{session_id}:agent:primary"),
+            "ordinal":1,"prompt":"question","kind":"chat","state":"complete","turn":[],"node_list":[],
+            "created_at_ms":1,"attributed_matches_checkpoint":false,"awaiting_input":true
+        }))?;
+        exchange.elicitation = Some(crate::plan::PlanElicitation::new(serde_json::from_value(
+            json!({
+                "id":"set","questions":[{"id":"choice","header":"Choice","question":"Which?",
+                    "options":[{"label":"Yes","description":"Proceed","recommended":true}],"allow_freeform":true}]
+            }),
+        )?));
+        store.save_exchange(&exchange)?;
+        let _busy = controller.broker.lock().await;
+        let _execution = controller.coordinator.execution.acquire().await?;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        let answer = "retained answer ".repeat(forge_protocol::outbound::MAX_CONTROL_BYTES);
+        tokio::time::timeout(Duration::from_secs(1), service.dispatch_admitted(
+            Some(session_id.clone()), Request { id: 2, method: "question.answer".into(), params: json!({
+                "_command":{"id":"answer"}, "operation_id":"answer",
+                "target":{"owner":"interaction","id":"question-exchange","set_id":"set","revision":1},
+                "question_id":"choice","response":{"kind":"other","text":answer}
+            })}, &sink, None,
+        )).await??;
+        assert_eq!(
+            store
+                .load_exchange("question-exchange")?
+                .unwrap()
+                .elicitation
+                .unwrap()
+                .answer
+                .len(),
+            1
+        );
+        assert_eq!(
+            controller.coordinator.status("answer")?["state"],
+            "completed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_configuration_patches_execute_without_losing_fields() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let mut store = SqliteStore::open(&controller.data_root)?;
+        let mut operation = Vec::new();
+        for (index, config) in [json!({"model":"model-b"}), json!({"effort":"high"})]
+            .into_iter()
+            .enumerate()
+        {
+            operation.push(admit_task_intent(&controller, &session_id, &Request {
+                id: index as u64 + 2, method: "task.transition".into(),
+                params: json!({"operation_id":format!("configure-{index}"),"action":"configure","config":config}),
+            }, &mut store)?);
+        }
+        assert!(store.pending_policy_predecessor(&session_id, &operation[1].id)?);
+        let (sink, _output) = forge_protocol::outbound::channel();
+        for pending in &mut operation {
+            execute_task_transition(&registry, &controller, pending, &mut store, &sink).await?;
+            pending.state = "completed".into();
+            store.save_task_operation(pending)?;
+        }
+        let session = store.load_session(&session_id)?.unwrap();
+        assert_eq!(session.model, "model-b");
+        assert_eq!(session.effort, "high");
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_permission_intents_compose_and_execute_in_order() -> Result<()> {
         for (changes, expected_access, expected_approval, initial_sandbox) in [
             (
                 vec![json!({"kind":"enable_yolo"}), json!({"kind":"enable_yolo"})],
@@ -4924,10 +5281,12 @@ mod tests {
             let mut latest = operations.pop().unwrap();
             assert!(!latest.permission_selection.unwrap().sandbox);
             let (sink, _output) = forge_protocol::outbound::channel();
-            for mut superseded in operations {
-                execute_task_transition(&registry, &controller, &mut superseded, &mut store, &sink)
+            for mut preceding in operations {
+                execute_task_transition(&registry, &controller, &mut preceding, &mut store, &sink)
                     .await?;
-                assert_eq!(superseded.state, "superseded");
+                assert_eq!(preceding.state, "running");
+                preceding.state = "completed".into();
+                store.save_task_operation(&mut preceding)?;
             }
             execute_task_transition(&registry, &controller, &mut latest, &mut store, &sink).await?;
             let confirmed = store.load_session(&session_id)?.unwrap();
@@ -4978,8 +5337,8 @@ mod tests {
         )?;
         assert!(!idle.resume_after_transition);
         idle.state = "completed".into();
-        store.save_task_operation(&idle)?;
-        let active = controller.execution_admission.acquire().await?;
+        store.save_task_operation(&mut idle)?;
+        let active = controller.coordinator.execution.acquire().await?;
         let mut changed = admit_task_intent(
             &controller,
             &session_id,
@@ -4991,7 +5350,7 @@ mod tests {
             "a completed idle configuration suppressed the new active chat"
         );
         changed.state = "completed".into();
-        store.save_task_operation(&changed)?;
+        store.save_task_operation(&mut changed)?;
         let pause = admit_task_intent(
             &controller,
             &session_id,
@@ -5029,12 +5388,24 @@ mod tests {
         let controller = registry.resolve(&session_id).await?;
         let (sink, _output) = forge_protocol::outbound::channel();
         for pending_cleanup in [false, true] {
-            let admission = if pending_cleanup {
-                &controller.control_admission
+            let occupied = if pending_cleanup {
+                (
+                    Some(
+                        controller
+                            .coordinator
+                            .control
+                            .clone()
+                            .acquire_owned()
+                            .await?,
+                    ),
+                    None,
+                )
             } else {
-                &controller.execution_admission
+                (
+                    None,
+                    Some(controller.coordinator.execution.acquire().await?),
+                )
             };
-            let occupied = admission.acquire().await?;
             for method in ["backend.setup", "backend.authenticate"] {
                 let error = service
                     .dispatch(
@@ -5074,7 +5445,7 @@ mod tests {
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
         let broker = controller.broker.lock().await;
-        let execution = controller.execution_admission.acquire().await?;
+        let execution = controller.coordinator.execution.acquire().await?;
         let (sink, mut output) = forge_protocol::outbound::channel();
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -5268,7 +5639,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let _execution = Arc::clone(&controller.execution_admission)
+        let _execution = Arc::clone(&controller.coordinator.execution)
             .try_acquire_owned()
             .unwrap();
         let broker = controller.broker.lock().await;
@@ -6053,7 +6424,7 @@ mod tests {
                 "attributed_matches_checkpoint":false, "node_list":[]
             }))?;
             store.save_exchange(&exchange)?;
-            let previous_execution = controller.execution_admission.acquire().await?;
+            let previous_execution = controller.coordinator.execution.acquire().await?;
             let mut operation = admit_task_intent(
                 &controller,
                 &session_id,
@@ -6165,7 +6536,7 @@ mod tests {
         store.save_exchange(&exchange)?;
         let file = fixture.path().join("keep.txt");
         std::fs::write(&file, "unchanged")?;
-        let execution = controller.execution_admission.acquire().await?;
+        let execution = controller.coordinator.execution.acquire().await?;
         let mut request = Request {
             id: 2,
             method: "task.transition".into(),
@@ -6198,7 +6569,7 @@ mod tests {
             crate::exchange::HistoryDisposition::RolledBack
         );
         assert_eq!(std::fs::read_to_string(file)?, "unchanged");
-        assert_eq!(controller.execution_admission.available_permits(), 1);
+        assert_eq!(controller.coordinator.execution.available_permits(), 1);
         service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }
@@ -6395,7 +6766,7 @@ mod tests {
         );
         let controller = registry.resolve(&session_id).await?;
         assert!(
-            controller.control_admission.try_acquire().is_ok(),
+            controller.coordinator.control.try_acquire().is_ok(),
             "queued work blocked cancellation"
         );
         drop(previous);
@@ -6438,17 +6809,18 @@ mod tests {
             .await?;
         let registry = service.registry().await?;
         let controller = registry.resolve(&registry.initial_session_id).await?;
-        let cleanup = controller.control_admission.acquire().await?;
+        let cleanup = controller.coordinator.control.acquire().await?;
         let mut queued =
             Box::pin(service.prepare_queued_prompt(&registry.initial_session_id, None));
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
         let execution = controller
-            .execution_admission
+            .coordinator
+            .execution
             .try_acquire()
             .expect("queued work blocked cleanup");
         drop(cleanup);
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
-        assert!(controller.control_admission.try_acquire().is_ok());
+        assert!(controller.coordinator.control.try_acquire().is_ok());
         drop(execution);
         drop(tokio::time::timeout(Duration::from_secs(1), queued).await??);
         service.shutdown(Duration::from_secs(1)).await?;
@@ -6464,7 +6836,7 @@ mod tests {
             .await?;
         let registry = service.registry().await?;
         let controller = registry.resolve(&registry.initial_session_id).await?;
-        let execution = controller.execution_admission.acquire().await?;
+        let execution = controller.coordinator.execution.acquire().await?;
         let mut queued =
             Box::pin(service.prepare_queued_prompt(&registry.initial_session_id, None));
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
@@ -6477,14 +6849,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(failure.to_string().contains("belongs to another task"));
-        assert!(controller.execution_admission.try_acquire().is_ok());
+        assert!(controller.coordinator.execution.try_acquire().is_ok());
         service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }
 
     #[tokio::test]
     async fn finalized_execution_releases_admission_before_response_delivery() -> Result<()> {
-        let semaphore = Arc::new(Semaphore::new(1));
+        let semaphore =
+            SessionCoordinator::new(Arc::new(crate::input::SessionInputQueue::default()))
+                .execution
+                .clone();
         let mut admission = Some(Arc::clone(&semaphore).acquire_owned().await?);
         let mut prompt_admission = None;
         let (sink, mut output) = forge_protocol::outbound::channel();
@@ -6571,7 +6946,7 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::task::yield_now().await;
-        assert_eq!(controller.execution_admission.available_permits(), 1);
+        assert_eq!(controller.coordinator.execution.available_permits(), 1);
 
         let schedule = crate::session::InputSchedule {
             revision: 1,
@@ -6591,10 +6966,10 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(999)).await;
         tokio::task::yield_now().await;
-        assert_eq!(controller.execution_admission.available_permits(), 1);
+        assert_eq!(controller.coordinator.execution.available_permits(), 1);
         tokio::time::advance(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
-        assert_eq!(controller.execution_admission.available_permits(), 0);
+        assert_eq!(controller.coordinator.execution.available_permits(), 0);
         controller
             .observer
             .input_schedule
@@ -6603,9 +6978,9 @@ mod tests {
                 ..Default::default()
             });
         tokio::task::yield_now().await;
-        assert_eq!(controller.execution_admission.available_permits(), 1);
+        assert_eq!(controller.coordinator.execution.available_permits(), 1);
 
-        let execution = controller.execution_admission.acquire().await?;
+        let execution = controller.coordinator.execution.acquire().await?;
         controller
             .observer
             .input_schedule
@@ -6618,7 +6993,7 @@ mod tests {
         tokio::task::yield_now().await;
         drop(execution);
         tokio::task::yield_now().await;
-        assert_eq!(controller.execution_admission.available_permits(), 1);
+        assert_eq!(controller.coordinator.execution.available_permits(), 1);
         drop(broker);
         service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
@@ -6670,7 +7045,7 @@ mod tests {
             }
             loop {
                 tokio::task::yield_now().await;
-                if controller.execution_admission.available_permits() == 1 {
+                if controller.coordinator.execution.available_permits() == 1 {
                     break;
                 }
             }
@@ -6686,7 +7061,7 @@ mod tests {
             store.list_exchange(&registry.initial_session_id)?.len(),
             count
         );
-        assert_eq!(controller.execution_admission.available_permits(), 1);
+        assert_eq!(controller.coordinator.execution.available_permits(), 1);
         service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }
@@ -6734,7 +7109,7 @@ mod tests {
             .resolve(&registry.initial_session_id)
             .await
             .unwrap();
-        let cleanup = Arc::clone(&controller.control_admission)
+        let cleanup = Arc::clone(&controller.coordinator.control)
             .try_acquire_owned()
             .unwrap();
         drop(execution);
@@ -6769,7 +7144,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let cleanup = Arc::clone(&controller.control_admission)
+        let cleanup = Arc::clone(&controller.coordinator.control)
             .try_acquire_owned()
             .expect("chat must not retain cleanup admission while its model runs");
         assert!(
@@ -7017,12 +7392,12 @@ mod tests {
                 backend.request.lock().await.is_empty(),
                 "maintenance cannot trigger provider cleanup"
             );
-            assert!(controller.execution_admission.try_acquire().is_err());
+            assert!(controller.coordinator.execution.try_acquire().is_err());
             drop(maintenance);
             let admitted = tokio::time::timeout(Duration::from_secs(2), acquisition).await??;
-            assert!(controller.execution_admission.try_acquire().is_err());
+            assert!(controller.coordinator.execution.try_acquire().is_err());
             drop(admitted);
-            assert!(controller.execution_admission.try_acquire().is_ok());
+            assert!(controller.coordinator.execution.try_acquire().is_ok());
         }
         Ok(())
     }
@@ -7249,7 +7624,7 @@ mod tests {
             request: Mutex::new(Vec::new()),
         });
         Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
-        let _execution = Arc::clone(&controller.execution_admission).try_acquire_owned()?;
+        let _execution = Arc::clone(&controller.coordinator.execution).try_acquire_owned()?;
         for method in [HarnessMethod::GoalPause, HarnessMethod::GoalClear] {
             let owner = controller.broker.lock().await;
             let mut admission = Box::pin(acquire_request_broker(&controller, method));
@@ -7289,7 +7664,7 @@ mod tests {
             request: Mutex::new(Vec::new()),
         });
         Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
-        let _admission = Arc::clone(&controller.execution_admission).try_acquire_owned()?;
+        let _admission = Arc::clone(&controller.coordinator.execution).try_acquire_owned()?;
         let _execution = controller.broker.lock().await;
         let _provider_stop = backend.request.lock().await;
         let error = tokio::time::timeout(
@@ -7316,7 +7691,7 @@ mod tests {
             None,
         )?;
         Arc::get_mut(&mut controller).unwrap().backend = Arc::new(backend);
-        let _execution = Arc::clone(&controller.execution_admission).try_acquire_owned()?;
+        let _execution = Arc::clone(&controller.coordinator.execution).try_acquire_owned()?;
         for method in [HarnessMethod::GoalPause, HarnessMethod::GoalClear] {
             let owner = controller.broker.lock().await;
             let mut admission = Box::pin(acquire_request_broker(&controller, method));
@@ -7355,6 +7730,7 @@ mod tests {
         let message = |id: &str, intent: InputIntent| InputOperation {
             id: format!("operation-{id}"),
             control_revision: 0,
+            after_control: None,
             action: InputAction::Submit {
                 message: InputMessage {
                     id: id.into(),
@@ -7363,6 +7739,7 @@ mod tests {
                     task_id: None,
                     intent,
                     delivery: Default::default(),
+                    route: None,
                     attachments: vec![],
                     config: None,
                     reservation: None,
@@ -7372,7 +7749,8 @@ mod tests {
             },
         };
         controller
-            .input
+            .coordinator
+            .submissions
             .apply(message("first", InputIntent::Auto))?;
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -7383,32 +7761,56 @@ mod tests {
                 },
             ),
         )
-        .await??;
+        .await
+        .with_context(|| {
+            format!(
+                "first input did not reach provider: queue={:?}, task={:?}",
+                controller.coordinator.submissions.snapshot(),
+                controller
+                    .observer
+                    .snapshot()
+                    .map(|snapshot| snapshot.session.current_task_id)
+            )
+        })??;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if controller.input.snapshot()?.messages.iter().any(|message| {
-                    message.id == "first"
-                        && message.delivery == crate::input::InputDelivery::Accepted
-                }) {
+                if controller
+                    .coordinator
+                    .submissions
+                    .snapshot()?
+                    .messages
+                    .iter()
+                    .any(|message| {
+                        message.id == "first"
+                            && message.delivery == crate::input::InputDelivery::Accepted
+                    })
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
             Ok::<(), anyhow::Error>(())
         })
-        .await??;
+        .await
+        .context("input delivery boundary 2")??;
         assert_eq!(
-            controller.execution_admission.available_permits(),
+            controller.coordinator.execution.available_permits(),
             0,
             "delivery acknowledgement must not release active execution"
         );
         controller
-            .input
+            .coordinator
+            .submissions
+            .apply(message("queued", InputIntent::Queue))?;
+        controller
+            .coordinator
+            .submissions
             .apply(message("steered", InputIntent::Auto))?;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if !controller
-                    .input
+                    .coordinator
+                    .submissions
                     .snapshot()?
                     .messages
                     .iter()
@@ -7420,40 +7822,45 @@ mod tests {
             }
             Ok::<(), anyhow::Error>(())
         })
-        .await??;
+        .await
+        .context("input delivery boundary 3")??;
         controller
-            .input
+            .coordinator
+            .submissions
             .apply(message("queued", InputIntent::Queue))?;
-        controller.input.apply(InputOperation {
+        controller.coordinator.submissions.apply(InputOperation {
             id: "edit".into(),
             control_revision: 0,
+            after_control: None,
             action: InputAction::Reserve {
                 id: "queued".into(),
                 revision: 1,
                 reservation: "editor".into(),
             },
         })?;
-        controller.input.suspend(true)?;
+        controller.coordinator.submissions.suspend(true, None)?;
         control
             .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
             .await?;
         tokio::time::timeout(Duration::from_secs(5), async {
-            while controller.execution_admission.available_permits() == 0 {
+            while controller.coordinator.execution.available_permits() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await?;
         let queued = controller
-            .input
+            .coordinator
+            .submissions
             .snapshot()?
             .messages
             .into_iter()
             .find(|message| message.id == "queued")
             .unwrap();
         assert_eq!(queued.reservation.as_deref(), Some("editor"));
-        controller.input.apply(InputOperation {
+        controller.coordinator.submissions.apply(InputOperation {
             id: "commit".into(),
             control_revision: 0,
+            after_control: None,
             action: InputAction::Commit {
                 reservation: "editor".into(),
                 edits: vec![InputEdit {
@@ -7465,22 +7872,293 @@ mod tests {
                 }],
             },
         })?;
-        assert!(controller.input.snapshot()?.suspended);
-        controller.input.suspend(false)?;
+        assert!(controller.coordinator.submissions.snapshot()?.suspended);
+        controller.coordinator.submissions.suspend(false, None)?;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if controller.input.snapshot()?.messages.is_empty() {
+                if controller
+                    .coordinator
+                    .submissions
+                    .snapshot()?
+                    .messages
+                    .is_empty()
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
             Ok::<(), anyhow::Error>(())
         })
+        .await
+        .context("input delivery boundary 4")??;
+        assert_eq!(controller.coordinator.execution.available_permits(), 1);
+        let exchange = SqliteStore::open(&controller.data_root)?.list_exchange(&session_id)?;
+        assert_eq!(
+            exchange
+                .iter()
+                .filter(|exchange| exchange.input_message_id.as_deref() == Some("first"))
+                .count(),
+            1
+        );
+        assert_eq!(exchange.iter().flat_map(|exchange| &exchange.node_list).filter(|node|
+            matches!(node, crate::exchange::ExchangeNode::ExchangeInput { prompt } if prompt.id == "steered")
+        ).count(), 1, "steering must be recorded once under its original message identity");
+        service.shutdown(Duration::from_secs(5)).await?;
+        drop(sink);
+        reader.await.context("input delivery boundary 5")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_retry_sends_once_and_never_replays_uncertain_delivery() -> Result<()> {
+        use crate::backend::submission::{SubmissionStore, SubmissionTarget};
+        use crate::input::{InputDelivery, InputOperation};
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let session_id = registry.initial_session_id.clone();
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let reader = tokio::spawn(async move {
+            while output.recv().await?.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        let message = |id: &str| -> Result<InputOperation> {
+            Ok(serde_json::from_value(
+                json!({"id":format!("submit-{id}"), "action":{
+                    "kind":"submit", "message":{"id":id,"text":"retry regression","intent":"auto"}
+                }}),
+            )?)
+        };
+        controller
+            .coordinator
+            .submissions
+            .apply(message("retry-message")?)?;
+        let failed = controller.coordinator.submissions.delivery(
+            "retry-message",
+            Some(InputDelivery::Failed),
+            None,
+            Some("failed before dispatch".into()),
+        )?;
+        let params = json!({"id":"retry-operation","action":{"kind":"retry", "id":"retry-message", "revision":failed.upsert[0].revision}});
+        for id in [2, 3] {
+            controller
+                .input_request(
+                    Request {
+                        id,
+                        method: "input.apply".into(),
+                        params: params.clone(),
+                    },
+                    HarnessMethod::InputApply,
+                    &sink,
+                )
+                .await?;
+        }
+        controller.attach_input(&sink).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !controller
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
         .await??;
-        assert_eq!(controller.execution_admission.available_permits(), 1);
+        let exchange = SqliteStore::open(&controller.data_root)?.list_exchange(&session_id)?;
+        assert_eq!(
+            exchange
+                .iter()
+                .filter(|exchange| exchange.input_message_id.as_deref() == Some("retry-message"))
+                .count(),
+            1
+        );
+
+        let control = controller
+            .coordinator
+            .control
+            .clone()
+            .acquire_owned()
+            .await?;
+        controller
+            .coordinator
+            .submissions
+            .apply(message("uncertain-message")?)?;
+        let journal = SubmissionStore::open(&controller.data_root, controller.trace.clone())?;
+        let submission = journal.prepare_input(
+            &controller.catalog_request.read().await.clone(),
+            crate::backend::BackendInput::from_text("uncertain"),
+            crate::backend::BackendKind::Mock,
+            Some("uncertain-message".into()),
+        )?;
+        submission.sending(SubmissionTarget::Untracked)?;
+        let uncertain = controller.coordinator.submissions.delivery(
+            "uncertain-message",
+            Some(InputDelivery::Unknown),
+            Some(submission.id().into()),
+            Some("lost acknowledgement".into()),
+        )?;
+        drop(control);
+        let failure = controller.input_request(Request { id:4, method:"input.apply".into(),
+            params:json!({"id":"retry-uncertain","action":{"kind":"retry","id":"uncertain-message","revision":uncertain.upsert[0].revision}})
+        }, HarnessMethod::InputApply, &sink).await.unwrap_err();
+        assert!(format!("{failure:#}").contains("unconfirmed"));
+        assert_eq!(
+            controller.coordinator.submissions.snapshot()?.messages[0].delivery,
+            InputDelivery::Unknown
+        );
+        assert_eq!(
+            SqliteStore::open(&controller.data_root)?
+                .list_exchange(&session_id)?
+                .len(),
+            exchange.len()
+        );
         service.shutdown(Duration::from_secs(5)).await?;
         drop(sink);
         reader.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopening_active_and_deleting_idle_cached_sessions() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let first_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let first = registry.resolve(&first_id).await?;
+        let second = prepare_new_session(
+            std::path::Path::new(&registry.initialize.data_root),
+            &registry.initialize.client_id,
+            "mock",
+            false,
+            &first_id,
+            &json!({"name":"second"}),
+            1,
+        )?;
+        registry.resolve(&second.id).await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let execution = first.coordinator.execution.clone().acquire_owned().await?;
+        let broker = first.broker.lock().await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            service.dispatch(
+                Some(second.id.clone()),
+                Request {
+                    id: 2,
+                    method: "session.resume".into(),
+                    params: json!({"session_id":first_id}),
+                },
+                &sink,
+            ),
+        )
+        .await??;
+        let frame = output.recv().await?.context("resume response is missing")?;
+        let reply: Value = serde_json::from_slice(frame.bytes())?;
+        assert_eq!(reply["result"]["session"]["id"], first_id);
+        assert!(
+            service
+                .dispatch(
+                    Some(second.id.clone()),
+                    Request {
+                        id: 3,
+                        method: "session.delete".into(),
+                        params: json!({"session_id":first_id})
+                    },
+                    &sink
+                )
+                .await
+                .is_err()
+        );
+        drop(broker);
+        drop(execution);
+        service
+            .dispatch(
+                Some(second.id.clone()),
+                Request {
+                    id: 4,
+                    method: "session.delete".into(),
+                    params: json!({"session_id":first_id}),
+                },
+                &sink,
+            )
+            .await?;
+        assert!(
+            !registry
+                .controller_by_id
+                .read()
+                .await
+                .contains_key(&first_id)
+        );
+        assert!(
+            SqliteStore::open(std::path::Path::new(&registry.initialize.data_root))?
+                .load_session(&first_id)?
+                .is_none()
+        );
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_contention_fails_explicitly_and_leaves_host_usable() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let configuration = initialize(&fixture, "mock");
+        let root = PathBuf::from(&configuration.data_root);
+        let opened = service.open_session(1, configuration).await?;
+        let session = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut external = rusqlite::Connection::open(root.join("harness.sqlite3"))?;
+        let lock = external.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let failure = service
+            .dispatch(
+                Some(session.clone()),
+                Request {
+                    id: 2,
+                    method: "history.record".into(),
+                    params: json!({"text":"blocked write"}),
+                },
+                &sink,
+            )
+            .await
+            .unwrap_err();
+        let diagnostic = crate::storage::error_message(&failure);
+        assert!(diagnostic.contains("SQLite contention"));
+        assert!(diagnostic.contains("5 seconds"));
+        lock.rollback()?;
+        service
+            .dispatch(
+                Some(session),
+                Request {
+                    id: 3,
+                    method: "history.record".into(),
+                    params: json!({"text":"successful retry"}),
+                },
+                &sink,
+            )
+            .await?;
+        let reply = output
+            .recv()
+            .await?
+            .context("history retry response is missing")?;
+        let reply: Value = serde_json::from_slice(reply.bytes())?;
+        assert_eq!(reply["id"], 3);
+        assert!(reply["error"].is_null());
+        service.shutdown(Duration::from_secs(2)).await?;
         Ok(())
     }
 

@@ -122,7 +122,7 @@ impl SqliteStore {
             ],
         )?;
         transaction.commit()?;
-        Ok(())
+        self.refresh_admission_membership(session_id)
     }
 
     /// Resolve a child selection to the primary exchange that owns its checkpoint.

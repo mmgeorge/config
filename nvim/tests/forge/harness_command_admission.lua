@@ -79,16 +79,30 @@ for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
   end
 end
 state.busy = true
-controller.drain = function() end
+local input = require("forge.views.harness.input_state")
+local input_host
+local request = client.request_for
+client.request_for = function(session_id, method, params, callback)
+  if input_host and input_host.request(method, params, callback) then return end
+  request(session_id, method, params, callback)
+end
+state.presentation = { capture_prompt = function()
+  return { document = "composer", buffer = state.composer_buf, is_current = function() return true end }
+end }
 for _, prompt in ipairs({ "/workspace/example.png", "  /workspace/example.PNG\n[Image #1]", "/plan/design.md",
   "/workspace/report.pdf", "/workspace/archive.tar.gz", "/workspace/source.rs explain this", "/sess.png",
   "/workspace/Screen shot 2026-10-19.png\n[Image #1]", "/workspace/example.custom",
   "C:\\workspace\\example.png", "\\\\server\\share\\example.png" }) do
   assert(source.accepts_prompt(prompt) and source.queues_execution(prompt), "ordinary text was treated as a command")
   for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
+    state.input = nil
+    input_host = dofile("nvim/tests/forge/support/input.lua").new(state)
+    input.attach(state, function() end)
+    state.busy, state.execution_busy = true, true
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(prompt, "\n", { plain = true }))
     submit()
-    assert(#state.queue == 1 and state.queue[1].text == vim.trim(prompt), "ordinary prompt did not enter the queue")
+    local pending = submit == controller.queue_submit and state.queue or state.pending_steer
+    assert(#pending == 1 and vim.trim(pending[1].text) == vim.trim(prompt), "ordinary prompt changed before submission")
     assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
     state.queue = {}
   end
@@ -118,7 +132,7 @@ for _, case in ipairs({
   { model = "luna", pending = "sol", capable = true, visible = true },
 }) do
   state.session.model = case.model
-  state.pending_config = case.pending and { model = case.pending } or nil
+  state.task_config = case.pending and { model = case.pending } or nil
   state.capability.ultrafast_mode = case.capable
   local completion
   source.new():get_completions({}, function(result) completion = result end)

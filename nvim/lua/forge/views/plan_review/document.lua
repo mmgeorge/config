@@ -20,7 +20,7 @@ local perf = require("forge.infra.perf")
 ---@param callback fun(owner: table?, failure: string?)
 ---@return table
 function M.attach(options, callback)
-  local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_generation(), views = {} }
+  local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_generation(), views = {}, pending_operation = {} }
   local symbol_namespace = vim.api.nvim_create_namespace("forge.plan_review.symbols")
   local delivery = {}
   local function alive()
@@ -153,10 +153,8 @@ function M.attach(options, callback)
   end
   local function enqueue_operation(operation)
     if owner.saving or owner.submission_pending or owner.completing then
-      local previous = owner.pending_operation
-      owner.pending_operation = operation
-      trace_operation(operation, "queued", { queue_count = 1 })
-      if previous and previous.receive then previous.receive(nil, "A newer explicit plan operation replaced this queued operation") end
+      table.insert(owner.pending_operation, operation)
+      trace_operation(operation, "queued", { queue_count = #owner.pending_operation })
     else dispatch_operation(operation) end
   end
   dispatch_operation = function(operation)
@@ -183,9 +181,9 @@ function M.attach(options, callback)
         status = received and "completed" or "failed" })
       trace_operation(operation, "complete", { status = not failure and received and "completed" or "failed" })
       owner.completing = false
-      local pending = owner.pending_operation
+      local pending = owner.pending_operation[1]
       if pending and alive() then
-        owner.pending_operation = nil
+        table.remove(owner.pending_operation, 1)
         dispatch_operation(pending)
       end
       if not received then error(callback_failure, 0) end
@@ -439,21 +437,24 @@ function M.attach(options, callback)
     owner.checks = opened.checks or {}
     sync_view_capture()
     owner.sync_editability()
-    local pending = owner.pending_operation
-    if pending then
+    local retained = {}
+    for _, pending in ipairs(owner.pending_operation) do
       pending.capture = reanchor(pending.capture)
       if pending.method then
         local captured, failure = input.capture(owner.replica, owner.current_view(), pending.method)
         if not captured then
-          owner.pending_operation = nil
           if pending.receive then pending.receive(nil, failure) end
         else
           pending.params.review, pending.params.draft_annotation = captured, pending.capture
           pending.params.draft_source_digest = owner.saved_source_digest
           pending.params.expected_version = owner.version
+          retained[#retained + 1] = pending
         end
+      else
+        retained[#retained + 1] = pending
       end
     end
+    owner.pending_operation = retained
     perf.event("harness", "ui.plan.edit.update", { operation_id = operation_id, document = owner.document,
       phase = "end", elapsed_ms = perf.elapsed_ms(update_started), revision = owner.version })
     return true
@@ -518,14 +519,14 @@ function M.attach(options, callback)
       if not owner.views[window] then open_view(window) end
     end })
     callback(owner)
-    if pending then
-      if pending.method then
-        local captured = pending.params.review
+    for _, operation in ipairs(pending or {}) do
+      if operation.method then
+        local captured = operation.params.review
         captured.document, captured.revision, captured.view = owner.document, owner.replica.revision, owner.view.id
         owner.view.sequence = owner.view.sequence + 1
         captured.sequence = owner.view.sequence
       end
-      enqueue_operation(pending)
+      enqueue_operation(operation)
     end
   end)
   function owner.refresh_views()

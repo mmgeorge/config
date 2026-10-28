@@ -305,19 +305,24 @@ Claude and Antigravity retain provider-defined summary detail through their curr
 Assistant commentary marked with an open circle is separate from the reasoning-summary setting.
 
 Explicit steering sends the current composer text to the active response while
-preserving queued follow-ups. If the active turn cannot accept it, the text joins
-the follow-up queue and Harness shows a warning.
+preserving queued follow-ups. If the active turn ends before dispatch, the message
+keeps its priority for the next eligible interaction. Harness never automatically
+resends a message whose delivery is unconfirmed.
 `Ctrl-C` only interrupts active work. It never submits or steers the composer,
 including while editing a queued message. Drafts and queued follow-ups remain
 unsent while the task is paused. With a child timeline selected, it interrupts
 that child without sending the draft.
-Queued prompts and pending steering appear below the status in the upper timeline
-pane. The lower prompt buffer contains only the draft being edited.
+During active execution, pending steering appears above queued follow-ups below the
+status in the upper timeline pane. Idle submissions stay out of the visual queue
+until their exchange appears. The lower prompt buffer contains only the draft being edited.
 The prompt grows with visual wrapped rows up to its configured maximum height.
 Longer drafts scroll through wrapped rows without inserting newlines into the text.
-Queued prompts remain visible until accepted. If submission fails before acceptance,
-the message and its attachments stay queued for inspection or resubmission. Messages
-waiting for execution capacity do not interrupt the active response or checks.
+During execution, queued prompts remain visible until accepted. If submission fails before acceptance,
+the message and its attachments remain visible in red. `Alt-R` retries the first
+failed message without changing the composer draft. For unconfirmed delivery, the
+same shortcut checks provider acceptance before permitting a resend. Recovery entries
+retained after a host restart require manual delivery confirmation and are not resent
+by this shortcut. Explicitly queued messages do not interrupt the active response or checks.
 The prompt inherits ordinary text-buffer editing and navigation mappings. Harness
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
 Normal mode also supports session commands, including `oe` to reopen a pending
@@ -412,7 +417,8 @@ planning before the clarification arrives therefore does not reject the message
 merely because execution is occupied.
 
 Queued messages and unfinished queue operations stay in session memory, not in
-the shared history database. Restarting the host discards pending queued messages.
+the shared history database. Restarting the host clears its runnable queue. A surviving
+editor retains unresolved content with a recovery notice and does not resend it.
 Provider-delivery evidence remains saved independently so an uncertain send is
 not automatically duplicated.
 

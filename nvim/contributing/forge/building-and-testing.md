@@ -203,6 +203,32 @@ as the operation responds. Cancellation, dropped prompt futures, and provider
 shutdown clear their holds and wake waiting operations. The `harness_host.lua`
 fixture exercises this helper through the real editor transport.
 
+### Submission race regressions
+
+`harness_host.lua` runs `support/submission_races.lua` against the real Rust host,
+SQLite storage, Lua input reconciliation, and transcript presentation. Only the
+provider response and selected transport callbacks are controlled. The suite
+holds acknowledgements across active, completed, and cancelled responses, repeats
+operation identities, loses an acknowledgement, drops a publication, and delivers
+an older snapshot after completion. It also checks failed attachment retries,
+blocked followers, edit reservations across turn completion, stale edit rejection,
+distinct submissions with identical text, independent session execution, and
+recovery of queued text after host replacement.
+
+Run it with `lua-test-mock-integration` and
+`files:["nvim/tests/forge/harness_host.lua"]`. Add race cases to the support module
+with an explicit provider or callback barrier. Assert durable exchange identity,
+queue contents, and preservation of newer composer text. Do not replace the Rust
+queue with a Lua mock or depend on elapsed-time sleeps to establish event order.
+Every wait has a diagnostic deadline, and teardown restores intercepted callbacks
+and collects the isolated host even when an assertion fails.
+
+The Rust case
+`broker::test::deferred_steering_cancellation_preserves_acceptance_boundary` holds
+the provider immediately before and after acceptance. It verifies that cancellation
+rejects unaccepted steering and preserves accepted steering exactly once. Run it
+through `rust-test` with `package:"forge-harness"` and the exact case name.
+
 From the repository root, run an isolated editor test directly in a fresh Neovim:
 
 ```nu

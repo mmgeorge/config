@@ -356,6 +356,10 @@ pub struct PlanElicitation {
     pub question_set: PlanQuestionSet,
     pub revision: u32,
     #[serde(default)]
+    pub answer_revision: u64,
+    #[serde(default)]
+    pub answer_order: std::collections::BTreeMap<String, (String, u64)>,
+    #[serde(default)]
     pub answer: Vec<PlanQuestionAnswer>,
     #[serde(default)]
     pub current_index: usize,
@@ -515,6 +519,8 @@ impl PlanElicitation {
             deadline: None,
             resolution_source: crate::session::ResolutionSource::User,
             revision: 1,
+            answer_revision: 0,
+            answer_order: Default::default(),
             answer: Vec::new(),
             current_index: 0,
             clarification_active: false,
@@ -579,6 +585,7 @@ impl PlanElicitation {
         self.answer
             .retain(|answer| answer.question_id != question.id);
         self.current_index = question_index;
+        self.revision = self.revision.saturating_add(1);
         self.clarification_active = true;
         Ok(())
     }
@@ -599,6 +606,7 @@ impl PlanElicitation {
             question_id: question_id.to_owned(),
             response,
         });
+        self.answer_revision += 1;
         self.current_index = self
             .question_set
             .questions

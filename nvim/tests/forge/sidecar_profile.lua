@@ -1,5 +1,7 @@
 vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 local succeeded, failure = xpcall(function()
+  local runtime = require("rust_sidecar").runtime_root("nvim/lua/forge/builder.lua")
+  assert(runtime == vim.fs.normalize(vim.fn.getcwd() .. "/nvim"), "relative runtime root was not anchored")
   vim.g.forge_build_profile = nil
   package.loaded["forge.builder"] = nil
   local default_builder = require("forge.builder")

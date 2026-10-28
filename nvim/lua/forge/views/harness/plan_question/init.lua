@@ -6,6 +6,24 @@ local picker = require("forge.views.picker")
 
 local active_elicitation = nil
 local active_host = nil
+local active_submission = nil
+
+local function continue_if_ready(submission, host)
+  if submission.continue_requested and not submission.continued
+    and submission.replica.pending() == 0 and not next(submission.failed) then
+    submission.continued = true
+    host.continue()
+  end
+end
+
+local function project_answer(elicitation, intent)
+  elicitation.answer = vim.tbl_filter(function(answer) return answer.question_id ~= intent.question_id end, elicitation.answer or {})
+  elicitation.answer[#elicitation.answer + 1] = { question_id = intent.question_id, response = vim.deepcopy(intent.response), source = "user" }
+  elicitation.current_index = #(elicitation.question_set.questions or {})
+  for index, question in ipairs(elicitation.question_set.questions or {}) do
+    if not model.answer_for(elicitation, question.id) then elicitation.current_index = index - 1 break end
+  end
+end
 
 local function option_list(question, elicitation, allow_ask)
   local entries = model.entries(question, config.options.picker.choice_keys, allow_ask)
@@ -38,6 +56,8 @@ local function question_page_list(elicitation, host)
     end
     local answer = model.answer_for(elicitation, question.id)
     local selected_entry = entries[selected_index]
+    local operation = active_submission and active_submission.by_question[question.id]
+    local failure = operation and active_submission.failed[operation]
     page_list[#page_list + 1] = {
       id = question.id,
       title = question.header or question.question or "Answer Question",
@@ -51,7 +71,8 @@ local function question_page_list(elicitation, host)
         or selected_entry and model.input_text(selected_entry, answer) or "",
       allow_input = true,
       input_height = config.options.picker.input_height,
-      footer = "←→ page  ↑↓ select  Enter confirm  Tab feedback",
+      footer = failure and ("Answer not saved: " .. failure .. " · Enter retry")
+        or "←→ page  ↑↓ select  Enter confirm  Tab feedback",
     }
   end
   return page_list
@@ -83,6 +104,7 @@ local function review_page(elicitation)
 end
 
 local function build_spec(elicitation, host)
+  local submission = active_submission
   local question = model.current_question(elicitation)
   local pages = question and question_page_list(elicitation, host) or { review_page(elicitation) }
   local initial_page = question and math.min((elicitation.current_index or 0) + 1, #pages) or 1
@@ -105,8 +127,15 @@ local function build_spec(elicitation, host)
       if not active_elicitation then return false end
       if result.page.id == "review" then
         if result.option.value == "submit" then
+          if next(submission.failed) then
+            active_elicitation.current_index = 0
+            picker.update(build_spec(active_elicitation, host))
+            return false
+          end
           picker.close(false)
-          host.continue()
+          submission.continue_requested = true
+          if submission.replica.pending() == 0 then continue_if_ready(submission, host)
+          elseif host.pending then host.pending() end
         else
           active_elicitation.current_index = 0
           picker.update(build_spec(active_elicitation, host))
@@ -127,13 +156,47 @@ local function build_spec(elicitation, host)
           option = result.option.value,
           feedback = result.text and result.text ~= "" and result.text or nil,
         }
-      host.answer({ question_id = question_id, response = response }, function(next_elicitation)
+      local identity = require("forge.command").identity()
+      local previous = submission.by_question[question_id]
+      if previous then
+        submission.replica.remove(previous)
+        submission.failed[previous] = nil
+      end
+      local intent = { question_id = question_id, response = response, operation_id = identity }
+      submission.by_question[question_id] = identity
+      submission.replica.begin(identity, intent)
+      active_elicitation = submission.replica.view()
+      picker.update(build_spec(active_elicitation, host))
+      local completed = false
+      host.answer(intent, function(next_elicitation, failure)
+        if active_submission ~= submission or completed then return end
+        completed = true
+        if failure and submission.by_question[question_id] ~= identity then
+          submission.replica.remove(identity)
+          continue_if_ready(submission, host)
+          return
+        elseif failure then
+          submission.failed[identity] = failure
+          if submission.continue_requested then
+            submission.continue_requested = false
+            active_elicitation.current_index = 0
+            picker.open(build_spec(active_elicitation, host))
+          elseif picker.is_open("plan_question") then
+            picker.update(build_spec(active_elicitation, host))
+          end
+          return
+        end
+        submission.replica.remove(identity)
         if not next_elicitation then
           picker.close(false)
           return
         end
-        active_elicitation = vim.deepcopy(next_elicitation)
-        picker.update(build_spec(active_elicitation, host))
+        submission.revision = math.max(submission.revision + 1, next_elicitation.answer_revision or 0)
+        submission.replica.replace(next_elicitation, next_elicitation.answer_revision or submission.revision)
+        active_elicitation = submission.replica.view()
+        if submission.continue_requested then
+          continue_if_ready(submission, host)
+        elseif picker.is_open() then picker.update(build_spec(active_elicitation, host)) end
       end)
       return false
     end,
@@ -146,6 +209,8 @@ end
 function PlanQuestion.open(elicitation, host)
   active_elicitation = vim.deepcopy(elicitation)
   active_host = host
+  active_submission = { replica = require("forge.replica").new(elicitation, elicitation.answer_revision or 0, project_answer),
+    revision = elicitation.answer_revision or 0, by_question = {}, failed = {} }
   picker.open(build_spec(active_elicitation, active_host))
 end
 

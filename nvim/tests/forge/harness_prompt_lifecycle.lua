@@ -37,28 +37,28 @@ local function composer_text() return table.concat(vim.api.nvim_buf_get_lines(st
 local path_prompt = "/workspace/Screen shot.png\n[Image #1]\n\n"
 compose(path_prompt)
 controller.submit()
-assert(composer_text() == "" and state.queue[1].text == path_prompt)
+assert(composer_text() == "" and state.pending_submit[1].text == path_prompt and #state.queue == 0)
 local first = host.requests[1]
 compose("first follow-up")
 controller.queue_submit()
 compose("second follow-up")
 controller.queue_submit()
-assert(#state.queue == 3 and #host.requests == 1, "queued input waited for acknowledgement")
+assert(#state.queue == 2 and #state.pending_submit == 1 and #host.requests == 1, "queued input waited for acknowledgement")
 compose("newer draft")
 current = false
 host.flush()
 assert(composer_text() == "newer draft", "retired capture overwrote the replacement composer")
 host.complete(first)
-assert(#state.queue == 3, "duplicate receipt removed another message")
+assert(#state.queue == 2 and #state.pending_submit == 1, "duplicate receipt removed another message")
 current = true
 
 controller.cancel_turn()
 local pause = controls[#controls]
 assert(pause.method == "task.transition" and pause.parameters.action == "pause")
-assert(pause.parameters.text == nil and state.queue_paused and #state.queue == 3)
+assert(pause.parameters.text == nil and state.queue_paused and #state.queue == 2)
 pause.callback({ state = "completed" })
 local count = #host.requests
-controller.drain()
+controller.render()
 assert(#host.requests == count and composer_text() == "newer draft", "pause drained queued input or overwrote typing")
 controller.task_transition({ action = "resume" })
 local resume = controls[#controls]
@@ -69,31 +69,32 @@ assert(not state.queue_paused)
 compose("active-turn addition")
 state.busy, state.execution_busy = false, true
 controller.submit()
-assert(state.queue[#state.queue].text == "active-turn addition")
+assert(state.pending_steer[#state.pending_steer].text == "active-turn addition")
 assert(host.requests[#host.requests].parameters.action.message.intent == "auto",
   "stale local busy state bypassed host routing")
 host.flush()
 
 state.checks_running, state.active_check_run = true, "check"
 compose("replace check")
+local control_count = #controls
 controller.submit()
-local cancellation = controls[#controls]
-assert(cancellation.method == "checks.cancel" and cancellation.parameters.interrupt_execution)
+assert(#controls == control_count, "Lua interrupted checks instead of submitting input")
+assert(host.requests[#host.requests].parameters.action.message.text == "replace check"
+  and host.requests[#host.requests].parameters.action.message.intent == "auto")
 compose("draft after cancellation")
 controller.cancel_turn()
 local replacement_pause = controls[#controls]
-assert(replacement_pause.method == "task.transition" and not state.check_interrupt_pending)
-cancellation.callback({})
+assert(replacement_pause.method == "task.transition")
 replacement_pause.callback({ state = "completed" })
 assert(state.queue_paused and composer_text() == "draft after cancellation")
 host.flush()
-assert(state.queue[#state.queue].text == "replace check")
+assert(state.pending_steer[#state.pending_steer].text == "replace check")
 state.checks_running, state.active_check_run = false, nil
 
 compose("retract before output")
 submission.start(state, { text = "retract before output", context = state.presentation.capture_prompt() }, function() end)
 host.flush()
-local retracted = state.queue[#state.queue]
+local retracted = state.pending_steer[#state.pending_steer]
 host.revision = host.revision + 1
 input.receive(state, { revision = host.revision, suspended = true, upsert = {}, removed = {}, retracted = retracted.id })
 assert(composer_text() == "retract before output", "retraction did not restore the unchanged composer")
@@ -101,11 +102,11 @@ host.flush()
 compose("retract while typing")
 submission.start(state, { text = "retract while typing", context = state.presentation.capture_prompt() }, function() end)
 host.flush()
-retracted = state.queue[#state.queue]
+retracted = state.pending_steer[#state.pending_steer]
 compose("preserve this")
 host.revision = host.revision + 1
 input.receive(state, { revision = host.revision, suspended = true, upsert = {}, removed = {}, retracted = retracted.id })
-assert(composer_text() == "preserve this" and state.queue[#state.queue].id == retracted.id)
+assert(composer_text() == "preserve this" and state.pending_steer[#state.pending_steer].id == retracted.id)
 assert(#errors == 0, table.concat(errors, "\n"))
 if state.working_timer then state.working_timer:stop() state.working_timer:close() end
 print("harness_prompt_lifecycle: passed")

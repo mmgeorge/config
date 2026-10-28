@@ -1153,15 +1153,21 @@ impl Backend for CopilotBackend {
                     json!({"session_id":session.id().to_string(),"prompt":prompt}),
                 );
                 if let Some(submission) = &request.submission {
-                    submission.sending(super::submission::SubmissionTarget::Copilot {
+                    let target = super::submission::SubmissionTarget::Copilot {
                         session_id: session.id().to_string(),
                         cursor: history.cursor,
                         prompt: message.prompt.clone(),
-                    })?;
+                    };
+                    submission
+                        .persist(move |submission| submission.sending(target))
+                        .await?;
                 }
                 let receipt = session.send(message).await.context("send Copilot prompt")?;
                 if let Some(submission) = &request.submission {
-                    submission.accepted(receipt.clone())?;
+                    let accepted = receipt.clone();
+                    submission
+                        .persist(move |submission| submission.accepted(accepted))
+                        .await?;
                 }
                 Ok(receipt)
             })
@@ -1812,26 +1818,39 @@ impl Backend for CopilotBackend {
                         .tail()
                         .await
                         .context("capture Copilot steering history boundary")?;
-                    submission.sending(super::submission::SubmissionTarget::Copilot {
+                    let target = super::submission::SubmissionTarget::Copilot {
                         session_id: session.id().to_string(),
                         cursor: history.cursor,
                         prompt: message.prompt.clone(),
-                    })?;
+                    };
+                    submission
+                        .persist(move |submission| submission.sending(target))
+                        .await?;
                 }
                 let receipt = session
                     .send(message)
                     .await
                     .context("steer active Copilot turn")?;
                 if let Some(submission) = submission {
-                    submission.accepted(receipt.clone())?;
+                    let accepted = receipt.clone();
+                    submission
+                        .persist(move |submission| submission.accepted(accepted))
+                        .await?;
                 }
                 Ok(receipt)
             })
             .await?;
         if matches!(input, super::SteeringInput::User { .. }) {
+            let input_message_id = match &input {
+                super::SteeringInput::User {
+                    submission: Some(submission),
+                    ..
+                } => submission.record()?.input_message_id,
+                _ => None,
+            };
             self.turn_event(session_id)
                 .await
-                .publish_steering(text)
+                .publish_steering(text, input_message_id)
                 .await?;
         }
         Ok(())
@@ -2871,15 +2890,19 @@ mod test {
         let turn_guard = turn_event.activate(Some(event_sink), None).unwrap();
 
         turn_event
-            .publish_steering("accepted".into())
+            .publish_steering("accepted".into(), Some("message-identity".into()))
             .await
             .unwrap();
         let event = event_stream.try_recv().unwrap();
         assert_eq!(event.kind, "steering_input");
         assert_eq!(event.text.as_deref(), Some("accepted"));
+        assert_eq!(event.data["input_message_id"], "message-identity");
 
         drop(turn_guard);
-        turn_event.publish_steering("late".into()).await.unwrap();
+        turn_event
+            .publish_steering("late".into(), None)
+            .await
+            .unwrap();
         assert!(event_stream.try_recv().is_err());
     }
 }

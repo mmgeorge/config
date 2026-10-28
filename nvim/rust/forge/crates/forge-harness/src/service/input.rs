@@ -1,23 +1,17 @@
 use super::*;
-use crate::backend::submission::{Submission, SubmissionState, SubmissionStore};
+use crate::backend::submission::{Submission, SubmissionState};
 use crate::input::{
     InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputRoute, InputUpdate,
 };
 
 impl SessionController {
     pub(super) fn publish_input_pending(&self) -> Result<()> {
-        let input = self.input.snapshot()?;
-        let snapshot = self.observer.snapshot()?;
-        let pending = input.messages.iter().any(|message| {
-            message.task_id == snapshot.session.current_task_id
-                && !matches!(
-                    message.delivery,
-                    InputDelivery::Delivering | InputDelivery::Accepted | InputDelivery::Failed
-                )
-        });
-        self.observer
-            .completion_queue
-            .update(input.revision, pending)
+        let task_id = self.observer.input_task_id()?;
+        let (revision, pending) = self
+            .coordinator
+            .submissions
+            .has_pending_for_task(task_id.as_deref())?;
+        self.observer.completion_queue.update(revision, pending)
     }
 
     pub(super) async fn publish_input(
@@ -26,8 +20,18 @@ impl SessionController {
         sink: &MessageSender,
     ) -> Result<()> {
         self.publish_input_pending()?;
+        for message in &update.upsert {
+            self.trace.record(
+                self.observer.session_id(),
+                "input.state",
+                json!({
+                    "message_id":message.id,"submission_id":message.submission_id,
+                    "revision":message.revision,"status":message.delivery,
+                }),
+            );
+        }
         let mut payload = serde_json::to_value(update)?;
-        payload["execution_busy"] = json!(self.execution_admission.available_permits() == 0);
+        payload["execution_busy"] = json!(self.coordinator.execution.available_permits() == 0);
         Ok(sink
             .send_event(SessionEvent {
                 session_id: self.catalog_request.read().await.harness_session_id.clone(),
@@ -43,26 +47,36 @@ impl SessionController {
         method: HarnessMethod,
         sink: &MessageSender,
     ) -> Result<()> {
+        let _control = self
+            .coordinator
+            .control
+            .clone()
+            .acquire_owned()
+            .await
+            .context("Harness session is closing")?;
+        ensure!(
+            !self.input_stopping.load(Ordering::Acquire),
+            "Harness session is closing"
+        );
         let result = match method {
             HarnessMethod::InputApply => {
                 let operation: InputOperation = crate::codec::from_value(request.params)?;
-                if self.input.operation(&operation.id)?.is_some() {
-                    let update = self.input.apply(operation)?;
+                if self
+                    .coordinator
+                    .submissions
+                    .operation(&operation.id)?
+                    .is_some()
+                {
+                    let update = self.coordinator.submissions.apply(operation)?;
                     sink.send_response(Response::success(request.id, update)?)
                         .await?;
                     return Ok(());
                 }
                 if let InputAction::Submit { message } = &operation.action {
-                    let snapshot = self.observer.snapshot()?;
                     ensure!(
-                        message.task_id == snapshot.session.current_task_id,
+                        message.task_id == self.observer.input_task_id()?,
                         "message belongs to another task"
                     );
-                    crate::attachment::resolve_input(
-                        &self.data_root,
-                        &json!({"attachments":message.attachments}),
-                    )
-                    .await?;
                     if let Some(config) = &message.config {
                         let config = config
                             .as_object()
@@ -74,6 +88,65 @@ impl SessionController {
                             )),
                             "queued input can only select model settings"
                         );
+                    }
+                }
+                if let InputAction::Retry { id, revision } = &operation.action {
+                    let snapshot = self.coordinator.submissions.snapshot()?;
+                    if let Some(message) =
+                        snapshot.messages.iter().find(|message| &message.id == id)
+                    {
+                        ensure!(
+                            message.revision == *revision,
+                            "message changed before retry"
+                        );
+                        if matches!(
+                            message.delivery,
+                            InputDelivery::Unknown | InputDelivery::Failed
+                        ) && message.submission_id.is_some()
+                        {
+                            let journal = &self.submission_store;
+                            let submission = journal.submission(
+                                message
+                                    .submission_id
+                                    .as_deref()
+                                    .context("delivery evidence is missing")?,
+                            )?;
+                            let record = submission.reconcile(self.backend.as_ref()).await?;
+                            if matches!(record.delivery, SubmissionState::Accepted { .. }) {
+                                let mut update = self
+                                    .coordinator
+                                    .submissions
+                                    .delivery(id, None, None, None)?;
+                                update.operation_id = Some(operation.id.clone());
+                                self.publish_input(update.clone(), sink).await?;
+                                sink.send_response(Response::success(request.id, update)?)
+                                    .await?;
+                                return Ok(());
+                            }
+                            ensure!(
+                                !matches!(record.delivery, SubmissionState::Sending { .. }),
+                                "Delivery is still unconfirmed. The message was not resent."
+                            );
+                            submission.cancel()?;
+                            if message.delivery == InputDelivery::Unknown {
+                                self.publish_input(
+                                    self.coordinator.submissions.delivery(
+                                        id,
+                                        Some(InputDelivery::Failed),
+                                        None,
+                                        Some(
+                                            "Non-delivery confirmed. Retry to send this message."
+                                                .into(),
+                                        ),
+                                    )?,
+                                    sink,
+                                )
+                                .await?;
+                                anyhow::bail!(
+                                    "Non-delivery confirmed. Retry to send this message."
+                                );
+                            }
+                        }
                     }
                 }
                 if let InputAction::Commit { edits, .. } = &operation.action {
@@ -97,28 +170,36 @@ impl SessionController {
                         .await?;
                     }
                 }
-                let update = self.input.apply(operation)?;
-                self.publish_input(update.clone(), sink).await?;
+                let update = self.coordinator.submissions.apply(operation)?;
+                if let Err(error) = self.publish_input(update.clone(), sink).await {
+                    sink.send_response(Response::failure(
+                        request.id,
+                        "outcome_unknown",
+                        format!("Input admitted but state publication failed: {error:#}"),
+                    ))
+                    .await?;
+                    return Ok(());
+                }
                 serde_json::to_value(update)?
             }
             HarnessMethod::InputOperation => serde_json::to_value(
-                self.input.operation(
+                self.coordinator.submissions.operation(
                     request.params["id"]
                         .as_str()
                         .context("input operation identity is required")?,
                 )?,
             )?,
             HarnessMethod::InputGet => {
-                let mut snapshot = serde_json::to_value(self.input.snapshot()?)?;
+                let mut snapshot = serde_json::to_value(self.coordinator.submissions.snapshot()?)?;
                 snapshot["execution_busy"] =
-                    json!(self.execution_admission.available_permits() == 0);
+                    json!(self.coordinator.execution.available_permits() == 0);
                 snapshot
             }
             _ => unreachable!(),
         };
         sink.send_response(Response::success(request.id, result)?)
             .await?;
-        self.input.changed.notify_one();
+        self.coordinator.submissions.changed.notify_one();
         Ok(())
     }
 
@@ -128,13 +209,16 @@ impl SessionController {
             return Ok(());
         }
         let owner = Arc::downgrade(self);
-        let input = self.input.clone();
+        let input = self.coordinator.submissions.clone();
+        let admission_changed = self.observer.admission.changed.clone();
         let sink = sink.clone();
         *task = Some(tokio::spawn(async move {
             let mut jobs = JoinSet::new();
+            let mut job_owner = std::collections::HashMap::new();
             let mut steering = false;
             loop {
                 let notified = input.changed.notified();
+                let state_changed = admission_changed.notified();
                 let Some(controller) = owner.upgrade() else {
                     break;
                 };
@@ -143,7 +227,7 @@ impl SessionController {
                     break;
                 }
                 let progress = controller
-                    .admit_input(&sink, &mut jobs, &mut steering)
+                    .admit_input(&sink, &mut jobs, &mut steering, &mut job_owner)
                     .await;
                 let wait_execution = match progress {
                     Ok(InputProgress::Started) => continue,
@@ -158,15 +242,33 @@ impl SessionController {
                         false
                     }
                 };
-                let admission = controller.execution_admission.clone();
+                let admission = controller.coordinator.execution.clone();
                 drop(controller);
                 tokio::select! {
                     _ = notified => {},
-                    result = jobs.join_next(), if !jobs.is_empty() => {
+                    _ = state_changed => {},
+                    result = jobs.join_next_with_id(), if !jobs.is_empty() => {
                         match result {
-                            Some(Ok(was_steering)) => { if was_steering { steering = false; } }
+                            Some(Ok((id, was_steering))) => {
+                                job_owner.remove(&id);
+                                if was_steering { steering = false; }
+                            }
                             Some(Err(error)) => {
                                 let Some(controller) = owner.upgrade() else { break };
+                                if let Some(id) = job_owner.remove(&error.id()) {
+                                    if let Ok(snapshot) = controller.coordinator.submissions.snapshot() {
+                                        if snapshot.messages.iter().any(|message| message.id == id && message.route == Some(InputRoute::Steering)) {
+                                            steering = false;
+                                        }
+                                    }
+                                    if let Err(failure) = controller.input_failure(&id, format!("Input worker failed: {error}"), &sink).await {
+                                        let _ = sink.send_event(SessionEvent {
+                                            session_id: controller.catalog_request.read().await.harness_session_id.clone(),
+                                            event: "backend_event".into(),
+                                            payload: json!({"kind":"error","text":format!("Could not reconcile failed input worker: {failure:#}")}),
+                                        }).await;
+                                    }
+                                }
                                 let _ = sink.send_event(SessionEvent {
                                     session_id: controller.catalog_request.read().await.harness_session_id.clone(),
                                     event: "backend_event".into(),
@@ -180,7 +282,7 @@ impl SessionController {
                 }
             }
         }));
-        self.input.changed.notify_one();
+        self.coordinator.submissions.changed.notify_one();
         Ok(())
     }
 
@@ -189,30 +291,57 @@ impl SessionController {
         sink: &MessageSender,
         jobs: &mut JoinSet<bool>,
         steering: &mut bool,
+        job_owner: &mut std::collections::HashMap<tokio::task::Id, String>,
     ) -> Result<InputProgress> {
-        let input = self.input.snapshot()?;
+        let input = self.coordinator.submissions.snapshot()?;
         if input.suspended {
             return Ok(InputProgress::Waiting);
         }
-        let snapshot = self.observer.snapshot()?;
+        let Ok(control) = self.coordinator.control.clone().try_acquire_owned() else {
+            return Ok(InputProgress::Waiting);
+        };
+        let snapshot = self.observer.input_readiness()?;
+        if input.messages.iter().any(|message| {
+            message.task_id == snapshot.session.current_task_id
+                && message.delivery == InputDelivery::Unknown
+        }) {
+            return Ok(InputProgress::Waiting);
+        }
         let mut pending = input.messages.into_iter().filter(|message| {
             message.task_id == snapshot.session.current_task_id
                 && !matches!(
                     message.delivery,
-                    InputDelivery::Delivering | InputDelivery::Accepted | InputDelivery::Failed
+                    InputDelivery::Delivering | InputDelivery::Accepted
                 )
         });
         let Some(mut message) = pending.next() else {
+            drop(control);
             return self.complete_input_checks(sink, jobs).await;
         };
-        let Ok(control) = self.control_admission.clone().try_acquire_owned() else {
+        if snapshot.checks_running && message.intent == InputIntent::Auto {
+            if let Some(run_id) = self.checks.active()? {
+                if let Err(error) = self.interrupt_checks(&snapshot.session.id, &run_id).await {
+                    self.publish_input(
+                        self.coordinator.submissions.delivery(
+                            &message.id,
+                            Some(InputDelivery::Failed),
+                            None,
+                            Some(format!("Could not interrupt checks: {error:#}")),
+                        )?,
+                        sink,
+                    )
+                    .await?;
+                    return Ok(InputProgress::Waiting);
+                }
+            }
+            self.coordinator.submissions.changed.notify_one();
             return Ok(InputProgress::Waiting);
-        };
-        let admission = self.execution_admission.clone().try_acquire_owned().ok();
+        }
+        let admission = self.coordinator.execution.clone().try_acquire_owned().ok();
         let steering_available = admission.is_none()
             && !*steering
             && (self.parent_input.is_active()
-                || snapshot.capability.native_steer
+                || snapshot.native_steer
                     && self.backend.has_active_turn(&snapshot.session.id).await);
         if steering_available
             && message.intent == InputIntent::Queue
@@ -229,10 +358,12 @@ impl SessionController {
             return Ok(InputProgress::Waiting);
         }
         if snapshot.session.current_task_id != message.task_id
-            || snapshot.task_operation.as_ref().is_some_and(|operation| {
-                matches!(
-                    operation["state"].as_str(),
-                    Some(
+            || snapshot
+                .operation_state
+                .as_deref()
+                .is_some_and(|operation| {
+                    matches!(
+                        operation,
                         "admitted"
                             | "accepted"
                             | "stopping"
@@ -240,10 +371,9 @@ impl SessionController {
                             | "verifying"
                             | "resuming"
                     )
-                )
-            })
-            || (message.intent == InputIntent::Queue && snapshot.active_elicitation.is_some())
-            || !snapshot.approval.is_empty()
+                })
+            || (message.intent == InputIntent::Queue && snapshot.has_elicitation)
+            || snapshot.has_approval
             || snapshot.checks_running
             || snapshot.task.iter().any(|task| {
                 Some(&task.id) == message.task_id.as_ref()
@@ -273,7 +403,11 @@ impl SessionController {
         } else {
             InputRoute::Turn
         };
-        let Some(message) = self.input.claim(&message.id, message.revision, route)? else {
+        let Some(message) =
+            self.coordinator
+                .submissions
+                .claim(&message.id, message.revision, route)?
+        else {
             return Ok(InputProgress::Waiting);
         };
         if admission.is_some() {
@@ -283,20 +417,29 @@ impl SessionController {
         let controller = self.clone();
         let sink = sink.clone();
         *steering |= steer;
-        jobs.spawn(async move {
+        let message_id = message.id.clone();
+        let worker = jobs.spawn(async move {
             let result = controller.deliver_input(&message, steer, admission, &sink).await;
             if let Err(error) = result {
-                if let Err(persistence) = controller.input_failure(&message.id, format!("{error:#}"), &sink).await {
+                let diagnostic = crate::storage::error_message(&error);
+                if let Err(persistence) = controller.input_failure(&message.id, diagnostic.clone(), &sink).await {
                         let _ = sink.send_event(SessionEvent {
                             session_id: controller.catalog_request.read().await.harness_session_id.clone(),
                             event: "backend_event".into(),
                             payload: json!({"kind":"error","text":format!("Input failed: {error:#}; recording the failure also failed: {persistence:#}")}),
                         }).await;
+                } else {
+                    let _ = sink.send_event(SessionEvent {
+                        session_id: controller.catalog_request.read().await.harness_session_id.clone(),
+                        event: "backend_event".into(),
+                        payload: json!({"kind":"error","text":diagnostic}),
+                    }).await;
                 }
             }
-            controller.input.changed.notify_one();
+            controller.coordinator.submissions.changed.notify_one();
             steer
         });
+        job_owner.insert(worker.id(), message_id);
         Ok(InputProgress::Started)
     }
 
@@ -305,14 +448,13 @@ impl SessionController {
         sink: &MessageSender,
         jobs: &mut JoinSet<bool>,
     ) -> Result<InputProgress> {
-        let snapshot = self.observer.snapshot()?;
-        if !snapshot.checks_deferred || snapshot.checks_running {
+        if !self.observer.completion_queue.deferred()? || self.checks.active()?.is_some() {
             return Ok(InputProgress::Waiting);
         }
-        let Ok(control) = self.control_admission.clone().try_acquire_owned() else {
+        let Ok(control) = self.coordinator.control.clone().try_acquire_owned() else {
             return Ok(InputProgress::Waiting);
         };
-        let Ok(admission) = self.execution_admission.clone().try_acquire_owned() else {
+        let Ok(admission) = self.coordinator.execution.clone().try_acquire_owned() else {
             return Ok(InputProgress::WaitExecution);
         };
         self.cancellation.arm(false);
@@ -333,7 +475,7 @@ impl SessionController {
                     payload: json!({"kind":"error","text":format!("Queue completion checks failed: {error:#}")}),
                 }).await;
             }
-            controller.input.changed.notify_one();
+            controller.coordinator.submissions.changed.notify_one();
             false
         });
         Ok(InputProgress::Started)
@@ -341,14 +483,15 @@ impl SessionController {
 
     async fn input_failure(&self, id: &str, error: String, sink: &MessageSender) -> Result<()> {
         let message = self
-            .input
+            .coordinator
+            .submissions
             .snapshot()?
             .messages
             .into_iter()
             .find(|message| message.id == id)
             .context("failed input is no longer retained")?;
         let delivery = if let Some(id) = &message.submission_id {
-            let journal = SubmissionStore::open(&self.data_root, self.trace.clone())?;
+            let journal = &self.submission_store;
             let submission = journal.submission(id)?;
             match submission.record()?.delivery {
                 SubmissionState::Accepted { .. } => None,
@@ -362,32 +505,48 @@ impl SessionController {
         } else {
             Some(InputDelivery::Failed)
         };
-        self.publish_input(self.input.delivery(id, delivery, None, Some(error))?, sink)
-            .await
+        self.publish_input(
+            self.coordinator
+                .submissions
+                .delivery(id, delivery, None, Some(error))?,
+            sink,
+        )
+        .await
     }
 
     async fn deliver_input(
         &self,
         message: &InputMessage,
         steer: bool,
-        admission: Option<OwnedSemaphorePermit>,
+        admission: Option<ExecutionPermit>,
         sink: &MessageSender,
     ) -> Result<()> {
         let catalog = self.catalog_request.read().await.clone();
+        let trace = self.trace.clone();
+        let session_id = &catalog.harness_session_id;
+        trace.record(
+            session_id,
+            "input.delivery_started",
+            json!({"message_id":message.id,"phase":if steer {"steering"} else {"turn"}}),
+        );
         let attachments = crate::attachment::resolve_input(
             &self.data_root,
             &json!({"attachments":message.attachments}),
         )
         .await?;
-        let journal = SubmissionStore::open(&self.data_root, self.trace.clone())?;
-        let submission = journal.prepare_steering(
-            &catalog,
-            crate::backend::BackendInput::from_text(message.text.clone())
-                .with_attachments(attachments.clone()),
-            self.backend.descriptor().kind,
-        )?;
+        let input = crate::backend::BackendInput::from_text(message.text.clone())
+            .with_attachments(attachments.clone());
+        let provider = self.backend.descriptor().kind;
+        let message_id = message.id.clone();
+        let submission_catalog = catalog.clone();
+        let submission = self
+            .submission_store
+            .persist(move |journal| {
+                journal.prepare_input(&submission_catalog, input, provider, Some(message_id))
+            })
+            .await?;
         self.publish_input(
-            self.input.delivery(
+            self.coordinator.submissions.delivery(
                 &message.id,
                 Some(InputDelivery::Delivering),
                 Some(submission.id().into()),
@@ -396,11 +555,17 @@ impl SessionController {
             sink,
         )
         .await?;
-        if self.input.snapshot()?.suspended || *self.cancellation.subscribe().borrow() {
+        if self.coordinator.submissions.snapshot()?.suspended
+            || *self.cancellation.subscribe().borrow()
+        {
             submission.cancel()?;
             self.publish_input(
-                self.input
-                    .delivery(&message.id, Some(InputDelivery::Queued), None, None)?,
+                self.coordinator.submissions.delivery(
+                    &message.id,
+                    Some(InputDelivery::Queued),
+                    None,
+                    None,
+                )?,
                 sink,
             )
             .await?;
@@ -443,15 +608,20 @@ impl SessionController {
                 submission.cancel()?;
                 drop(broker);
                 drop(admission);
-                self.publish_input(self.input.delivery(&message.id, None, None, None)?, sink)
-                    .await?;
+                self.publish_input(
+                    self.coordinator
+                        .submissions
+                        .delivery(&message.id, None, None, None)?,
+                    sink,
+                )
+                .await?;
                 return Ok(());
             }
             let params = json!({"text":message.text,"attachments":message.attachments});
             let (event_sink, mut events) = crate::backend::events::channel();
             let output = sink.clone();
             let session_id = catalog.harness_session_id.clone();
-            let input = self.input.clone();
+            let input = self.coordinator.submissions.clone();
             let forwarder = tokio::spawn(async move {
                 while let Some(event) = events.recv().await? {
                     if event.kind == "execution_state" || event.kind == "turn_started" {
@@ -473,6 +643,11 @@ impl SessionController {
                 Ok::<(), anyhow::Error>(())
             });
             let mut acceptance = submission.acceptance();
+            trace.record(
+                &catalog.harness_session_id,
+                "input.dispatch_started",
+                json!({"message_id":message.id,"submission_id":submission.id()}),
+            );
             let mut response = {
                 let mut dispatch = Box::pin(
                     broker.dispatch_stream(
@@ -493,7 +668,7 @@ impl SessionController {
                     biased;
                     accepted = acceptance.changed() => {
                         accepted.context("submission acceptance channel closed")?;
-                        self.publish_input(self.input.delivery(
+                        self.publish_input(self.coordinator.submissions.delivery(
                             &message.id, Some(InputDelivery::Accepted), None, None,
                         )?, sink).await?;
                         dispatch.await
@@ -576,9 +751,12 @@ impl SessionController {
             {
                 submission.cancel()?;
                 drop(admission);
-                let mut update =
-                    self.input
-                        .delivery(&message.id, Some(InputDelivery::Queued), None, None)?;
+                let mut update = self.coordinator.submissions.delivery(
+                    &message.id,
+                    Some(InputDelivery::Queued),
+                    None,
+                    None,
+                )?;
                 update.retracted = Some(message.id.clone());
                 self.publish_input(update, sink).await?;
                 return Ok(());
@@ -586,8 +764,13 @@ impl SessionController {
             if message.text == "/compact" && response.response.error().is_none() {
                 submission.cancel()?;
                 drop(admission);
-                self.publish_input(self.input.delivery(&message.id, None, None, None)?, sink)
-                    .await?;
+                self.publish_input(
+                    self.coordinator
+                        .submissions
+                        .delivery(&message.id, None, None, None)?,
+                    sink,
+                )
+                .await?;
                 return Ok(());
             }
             match response.response.error() {
@@ -623,22 +806,40 @@ impl SessionController {
         }
         let delivery = match record.delivery {
             SubmissionState::Accepted { .. } => None,
-            SubmissionState::Prepared if steer => Some(InputDelivery::Queued),
+            SubmissionState::Prepared
+                if steer
+                    && !self.parent_input.is_active()
+                    && !self
+                        .backend
+                        .has_active_turn(&record.request.harness_session_id)
+                        .await =>
+            {
+                Some(InputDelivery::Queued)
+            }
             SubmissionState::Prepared | SubmissionState::Cancelled => Some(InputDelivery::Failed),
             SubmissionState::Sending { .. } => Some(InputDelivery::Unknown),
+        };
+        let error = match delivery {
+            Some(InputDelivery::Queued) => None,
+            Some(InputDelivery::Failed) => {
+                Some(error.unwrap_or_else(|| "Provider did not confirm message acceptance".into()))
+            }
+            Some(InputDelivery::Unknown) => Some(
+                error.unwrap_or_else(|| "Delivery unconfirmed. Reconcile before retrying.".into()),
+            ),
+            _ => error,
         };
         // Proven non-delivery can queue, but it must not be recovered a second time by the adapter.
         if matches!(record.delivery, SubmissionState::Prepared) {
             submission.cancel()?;
         }
-        if delivery == Some(InputDelivery::Queued) {
-            let mut queued = message.clone();
-            queued.intent = InputIntent::Queue;
-            self.input.set_intent(&queued.id, InputIntent::Queue)?;
-        }
         self.publish_input(
-            self.input
-                .delivery(&message.id, delivery, Some(submission.id().into()), error)?,
+            self.coordinator.submissions.delivery(
+                &message.id,
+                delivery,
+                Some(submission.id().into()),
+                error,
+            )?,
             sink,
         )
         .await

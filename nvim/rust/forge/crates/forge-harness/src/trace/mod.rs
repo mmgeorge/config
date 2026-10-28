@@ -1,3 +1,5 @@
+mod future;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +44,12 @@ fn diagnostic_field(key: &str) -> bool {
         "method"
             | "operation"
             | "operation_id"
+            | "message_id"
+            | "submission_id"
+            | "busy_ms"
+            | "poll_count"
+            | "from_state"
+            | "to_state"
             | "request_id"
             | "session_id"
             | "agent_id"
@@ -67,6 +75,7 @@ fn diagnostic_field(key: &str) -> bool {
             | "phase"
             | "elapsed_ms"
             | "duration_ms"
+            | "received_at_ms"
             | "count"
             | "retry_attempt"
             | "max_retries"

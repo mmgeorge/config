@@ -9,10 +9,27 @@ end
 vim.defer_fn = function(callback) timers[#timers + 1] = callback end
 notifications.error = function(message) failures[#failures + 1] = message end
 local state = { session = { id = "conversation" }, task = {} }
-local settled, admitted = 0, 0
+local settled, admitted, background_settled = 0, 0, 0
 local function begin(action)
-  task.transition(state, action, function() end, function() settled = settled + 1 end, function() admitted = admitted + 1 end)
+  task.transition(state, action, function() end, function(_, background)
+    if background then background_settled = background_settled + 1 else settled = settled + 1 end
+  end, function() admitted = admitted + 1 end)
 end
+
+begin({ action = "configure", config = { model = "model-a" } })
+local changing = requests[#requests]
+changing.reply({ state = "applying", revision = 3 })
+begin({ action = "configure", config = { effort = "high" } })
+local rejected = requests[#requests]
+task.receive(state, { id = changing.params.operation_id, state = "resuming", revision = 5 })
+rejected.reply(nil, "rejected", { code = "request_failed" })
+assert(background_settled == 1, "rejected setting did not resolve its completion callback")
+assert(state.task_operation.state == "resuming", "rollback restored obsolete task state")
+changing.reply({ state = "accepted", revision = 2 })
+assert(state.task_operation.state == "resuming", "stale receipt regressed task progress")
+task.receive(state, { id = changing.params.operation_id, state = "completed", revision = 6 })
+requests, timers, failures = {}, {}, {}
+settled, admitted = 0, 0
 
 begin({ action = "plan", text = "Create a plan" })
 local first = requests[1]
@@ -101,5 +118,15 @@ retry.reply({ state = "accepted" })
 assert(not state.execution_notice, "admission success retained a waiting diagnostic")
 task.receive(state, { id = retry.params.operation_id, state = "completed" })
 assert(settled == 7)
+begin({ action = "configure", config = { model = "model-b" } })
+local earlier = requests[#requests]
+begin({ action = "configure", config = { effort = "high" } })
+local latest = requests[#requests]
+earlier.reply(nil, "admission full", { code = "not_admitted" })
+timers[#timers]()
+assert(requests[#requests].params.operation_id == earlier.params.operation_id,
+  "newer settings suppressed retry of an unadmitted earlier intent")
+assert(state.task_operation.id == latest.params.operation_id,
+  "background admission retry displaced the current operation")
 print("harness_tasks: passed")
 vim.cmd("qa!")

@@ -1,13 +1,21 @@
+pub(crate) mod admission;
+mod archive;
+mod current;
 pub(crate) mod inspection;
 pub(crate) mod lifecycle;
 pub(crate) mod model_pin;
 pub mod objects;
 mod ownership;
+mod question;
 mod recovery;
+mod schema;
+pub(crate) use schema::bootstrap_lock;
 mod tool_output;
 
 #[cfg(test)]
 mod concurrency_tests;
+#[cfg(test)]
+mod reliability_tests;
 
 use crate::agent::Agent;
 use crate::checkpoint::CheckpointRecord;
@@ -27,6 +35,25 @@ use std::time::Duration;
 const SESSION_FORMAT_VERSION: u32 = 51;
 const PREFERENCE_FORMAT_VERSION: u32 = 41;
 
+/// Keeps storage failures explicit at the host boundary, including the configured contention wait.
+pub fn error_message(error: &anyhow::Error) -> String {
+    let sqlite = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<rusqlite::Error>());
+    if let Some(rusqlite::Error::SqliteFailure(code, _)) = sqlite {
+        if matches!(
+            code.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ) {
+            return format!(
+                "SQLite contention prevented this operation (configured lock wait: 5 seconds). The operation failed; it was not silently retried. {error:#}"
+            );
+        }
+        return format!("SQLite storage failure: {error:#}");
+    }
+    format!("{error:#}")
+}
+
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
 struct SessionEnvelope {
@@ -37,6 +64,8 @@ struct SessionEnvelope {
 /// Owns SQLite metadata and content-addressed objects for the Harness broker.
 pub struct SqliteStore {
     connection: Connection,
+    admission: std::sync::Arc<admission::AdmissionRegistry>,
+    current_exchange: std::cell::RefCell<Option<current::CurrentExchangeCache>>,
     session_lock: std::collections::HashMap<String, std::sync::Arc<fs::File>>,
     data_root: std::path::PathBuf,
     pub objects: objects::ObjectStore,
@@ -180,7 +209,7 @@ impl SqliteStore {
             params![session.id, encode_session(session)?, session.updated_at_ms],
         )?;
         transaction.commit()?;
-        Ok(())
+        self.publish_admission(&session.id)
     }
 
     /// Publishes acceptance and every execution owner in one commit before provider dispatch.
@@ -249,7 +278,7 @@ impl SqliteStore {
             params![session.id, encode_session(session)?, session.updated_at_ms],
         )?;
         transaction.commit()?;
-        Ok(())
+        self.publish_admission(&session.id)
     }
 
     /// Records an intent before waiting for execution ownership. Duplicate IDs never replay.
@@ -267,14 +296,21 @@ impl SqliteStore {
                 "operation ID was reused for a different action"
             );
         }
+        if changed != 0 {
+            self.publish_admission(&operation.session_id)?;
+        }
         Ok(changed != 0)
     }
 
     /// Claims one admitted intent without allowing duplicate requests to execute it again.
     pub fn claim_task_operation(&mut self, session_id: &str, id: &str) -> Result<bool> {
-        Ok(self.connection.execute(
-            "UPDATE task_operation SET payload=json_set(payload,'$.state','accepted') WHERE session_id=?1 AND id=?2 AND json_extract(payload,'$.state')='admitted'",
-            params![session_id, id])? == 1)
+        let changed = self.connection.execute(
+            "UPDATE task_operation SET payload=json_set(payload,'$.state','accepted','$.revision',coalesce(json_extract(payload,'$.revision'),0)+1) WHERE session_id=?1 AND id=?2 AND json_extract(payload,'$.state')='admitted'",
+            params![session_id, id])? == 1;
+        if changed {
+            self.publish_admission(session_id)?;
+        }
+        Ok(changed)
     }
 
     /// Queries an intent by its original identity after uncertain delivery.
@@ -290,13 +326,25 @@ impl SqliteStore {
     }
 
     /// Publishes a settled intent without dispatching its action again.
-    pub fn save_task_operation(&mut self, operation: &crate::task::TaskOperation) -> Result<()> {
-        self.save_scoped_payload(
-            "task_operation",
-            &operation.id,
-            &operation.session_id,
-            operation,
-        )
+    pub fn save_task_operation(
+        &mut self,
+        operation: &mut crate::task::TaskOperation,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<i64> = transaction.query_row(
+            "SELECT coalesce(json_extract(payload,'$.revision'),0) FROM task_operation WHERE id=?1 AND session_id=?2",
+            params![operation.id,operation.session_id], |row| row.get(0),
+        ).optional()?;
+        let revision = previous.unwrap_or(0) + 1;
+        let mut value = serde_json::to_value(&*operation)?;
+        value["revision"] = serde_json::json!(revision);
+        transaction.execute("INSERT INTO task_operation(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+            params![operation.id,operation.session_id,encode(&value)?])?;
+        transaction.commit()?;
+        operation.revision = u64::try_from(revision)?;
+        self.publish_admission(&operation.session_id)
     }
 
     /// Tests whether a later intent has superseded this pending activation.
@@ -310,164 +358,46 @@ impl SqliteStore {
         )
     }
 
-    /// Open durable storage for the current Harness format.
+    /// Opens storage and upgrades its schema only when its persisted version requires it.
     pub fn open(data_root: &Path) -> Result<Self> {
         fs::create_dir_all(data_root)
             .with_context(|| format!("create Harness data directory {}", data_root.display()))?;
         let objects = objects::ObjectStore::open(data_root)?;
-        let mut connection = Connection::open(data_root.join("harness.sqlite3"))?;
+        let database = data_root.join("harness.sqlite3");
+        let mut connection = Connection::open(&database)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS preference_record (
-                workspace TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                PRIMARY KEY(workspace, backend)
-            );
-            "#,
-        )?;
-        connection.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS session_record (
-                id TEXT PRIMARY KEY,
-                workspace TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL,
-                payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS task_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS task_operation (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS session_workspace_activity
-                ON session_record(workspace, updated_at_ms DESC);
-            CREATE TABLE IF NOT EXISTS exchange_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                agent_id TEXT,
-                ordinal INTEGER NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE,
-                FOREIGN KEY(agent_id) REFERENCES agent_run_record(id) ON DELETE CASCADE
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS exchange_session_ordinal
-                ON exchange_record(session_id, COALESCE(agent_id, ''), ordinal);
-            CREATE TABLE IF NOT EXISTS exchange_comment (
-                id TEXT PRIMARY KEY,
-                interaction_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(interaction_id) REFERENCES exchange_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS plan_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS plan_lifecycle_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS plan_execution_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS plan_deviation_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS plan_audit_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS plan_resolution_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS goal_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS checkpoint_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS prompt_history_record (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS prompt_attachment_record (
-                history_id INTEGER PRIMARY KEY,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(history_id) REFERENCES prompt_history_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS agent_run_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS agent_task_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                agent_id TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE,
-                FOREIGN KEY(agent_id) REFERENCES agent_run_record(id) ON DELETE CASCADE,
-                FOREIGN KEY(id) REFERENCES exchange_record(id) ON DELETE CASCADE,
-                UNIQUE(session_id, operation_id),
-                UNIQUE(agent_id, ordinal)
-            );
-
-            CREATE TABLE IF NOT EXISTS session_event_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS fork_history_record (
-                session_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                payload TEXT NOT NULL,
-                PRIMARY KEY(session_id, ordinal),
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            "#,
-        )?;
-        tool_output::initialize(&mut connection).context("initialize stored tool output")?;
+        schema::initialize(&mut connection, &objects, data_root)
+            .with_context(|| format!("initialize Harness database {}", database.display()))?;
         Ok(Self {
             connection,
+            admission: admission::registry(data_root)?,
+            current_exchange: Default::default(),
             session_lock: Default::default(),
             data_root: data_root.to_owned(),
             objects,
+        })
+    }
+
+    /// Opens initialized storage without schema writes or migration scans.
+    pub(crate) fn read_only(data_root: &Path) -> Result<Self> {
+        let database = data_root.join("harness.sqlite3");
+        let connection =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("open Harness database {}", database.display()))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        anyhow::ensure!(
+            schema::validate(&connection)? == schema::VERSION,
+            "Harness database requires schema initialization before reading"
+        );
+        Ok(Self {
+            connection,
+            admission: admission::registry(data_root)?,
+            current_exchange: Default::default(),
+            session_lock: Default::default(),
+            data_root: data_root.to_owned(),
+            objects: objects::ObjectStore::open(data_root)?,
         })
     }
 
@@ -520,6 +450,14 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        anyhow::ensure!(
+            !transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_deletion WHERE session_id=?1)",
+                [session_id],
+                |row| row.get::<_, bool>(0)
+            )?,
+            "Harness session deletion is pending; resume cleanup before opening the session"
+        );
         let payload: String = transaction
             .query_row(
                 "SELECT payload FROM session_record WHERE id=?1",
@@ -600,7 +538,7 @@ impl SqliteStore {
             ],
         )?;
         transaction.commit()?;
-        Ok(())
+        self.publish_admission(&session.id)
     }
 
     /// Persist an exchange and admit its delegated child requests atomically.
@@ -611,7 +549,11 @@ impl SqliteStore {
             .context("begin exchange write")?;
         Self::write_exchange(&transaction, interaction).context("write exchange")?;
         transaction.commit().context("commit exchange write")?;
-        Ok(())
+        self.publish_admission_exchange(
+            &interaction.session_id,
+            &interaction.id,
+            Some(interaction.awaiting_input && interaction.elicitation.is_some()),
+        )
     }
 
     fn write_exchange(
@@ -628,7 +570,7 @@ impl SqliteStore {
             "INSERT INTO exchange_record(id, session_id, agent_id, ordinal, payload) VALUES(?1, ?2, ?3, ?4, ?5)\
              ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal, payload=excluded.payload \
              WHERE exchange_record.session_id=excluded.session_id AND exchange_record.agent_id IS excluded.agent_id",
-            params![interaction.id, interaction.session_id, interaction.agent_id, interaction.ordinal as i64, tool_output::encode(interaction)?],
+            params![interaction.id, interaction.session_id, interaction.agent_id, interaction.ordinal as i64, question::preserve_answers(transaction, "exchange_record", &interaction.id, tool_output::encode(interaction)?)?],
         )?;
         anyhow::ensure!(
             written == 1,
@@ -717,7 +659,11 @@ impl SqliteStore {
         Self::write_exchange(&transaction, parent)?;
         Self::write_agent_task(&transaction, task)?;
         transaction.commit()?;
-        Ok(())
+        self.publish_admission_exchange(
+            &parent.session_id,
+            &parent.id,
+            Some(parent.awaiting_input && parent.elicitation.is_some()),
+        )
     }
 
     /// Commits one child's durable outcome without exposing a partially completed task.
@@ -750,7 +696,11 @@ impl SqliteStore {
         )?;
         anyhow::ensure!(written == 1, "child completion has no admitted identity");
         transaction.commit()?;
-        Ok(())
+        self.publish_admission_exchange(
+            &exchange.session_id,
+            &exchange.id,
+            Some(exchange.awaiting_input && exchange.elicitation.is_some()),
+        )
     }
 
     fn write_agent_task(
@@ -789,8 +739,19 @@ impl SqliteStore {
 
     /// Remove one provisional interaction after its provider turn is retracted.
     pub fn delete_exchange(&mut self, interaction_id: &str) -> Result<()> {
+        let session_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT session_id FROM exchange_record WHERE id=?1",
+                [interaction_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         self.connection
             .execute("DELETE FROM exchange_record WHERE id=?1", [interaction_id])?;
+        if let Some(session_id) = session_id {
+            self.publish_admission_exchange(&session_id, interaction_id, None)?;
+        }
         Ok(())
     }
 
@@ -914,7 +875,15 @@ impl SqliteStore {
             transaction.execute(&format!("INSERT INTO {table}(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload"), params![id,execution.session_id,encode(&payload)?])?;
         }
         transaction.commit()?;
-        Ok(())
+        if let Some(exchange) = exchange {
+            self.publish_admission_exchange(
+                &execution.session_id,
+                &exchange.id,
+                Some(exchange.awaiting_input && exchange.elicitation.is_some()),
+            )
+        } else {
+            self.publish_admission(&execution.session_id)
+        }
     }
 
     /// Commit an approved scope change and its reconciled scheduler together.
@@ -954,9 +923,33 @@ impl SqliteStore {
         self.save_scoped_payload(table, id, session_id, &payload)
     }
 
+    pub(crate) fn pending_policy_predecessor(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_operation WHERE session_id=?1 AND rowid < (SELECT rowid FROM task_operation WHERE session_id=?1 AND id=?2) AND json_extract(payload,'$.action.action') IN ('configure','permission') AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running','applying','verifying'))",
+            params![session_id, operation_id], |row| row.get(0),
+        )?)
+    }
+
     /// Write a plan lifecycle record.
     pub fn save_plan(&mut self, plan: &PlanRecord) -> Result<()> {
-        self.save_plan_payload("plan_record", &plan.id, &plan.session_id, plan)
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut payload = serde_json::to_value(plan)?;
+        payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+        let payload =
+            question::preserve_answers(&transaction, "plan_record", &plan.id, encode(&payload)?)?;
+        let written = transaction.execute(
+            "INSERT INTO plan_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE plan_record.session_id=excluded.session_id",
+            params![plan.id, plan.session_id, payload],
+        )?;
+        anyhow::ensure!(written == 1, "plan cannot change its owning session");
+        transaction.commit()?;
+        self.publish_admission(&plan.session_id)
     }
 
     /// Load a plan by stable Harness identifier.
@@ -974,8 +967,19 @@ impl SqliteStore {
 
     /// Remove one retracted canonical plan record.
     pub fn delete_plan(&mut self, plan_id: &str) -> Result<()> {
+        let session_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT session_id FROM plan_record WHERE id=?1",
+                [plan_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         self.connection
             .execute("DELETE FROM plan_record WHERE id=?1", [plan_id])?;
+        if let Some(session_id) = session_id {
+            self.publish_admission(&session_id)?;
+        }
         Ok(())
     }
 
@@ -1050,6 +1054,7 @@ impl SqliteStore {
             [session_id],
         )?;
         for entry in &mut history {
+            archive::attach(entry, &self.data_root);
             entry.restore_reports(plan_file);
         }
         history.extend(timeline);
@@ -1068,6 +1073,14 @@ impl SqliteStore {
                 && event.owner == crate::timeline::TimelineOwner::session(&session.id),
             "fork history event must belong to its destination session"
         );
+        let payload = history
+            .iter()
+            .map(|entry| {
+                let mut value = crate::codec::to_value(entry)?;
+                archive::encode(&mut value, &self.objects)?;
+                encode(&value)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1084,10 +1097,10 @@ impl SqliteStore {
             "INSERT INTO agent_run_record(id, session_id, payload) VALUES(?1, ?2, ?3)",
             params![primary.id, primary.session_id, encode(&primary)?],
         )?;
-        for (ordinal, entry) in history.iter().enumerate() {
+        for (ordinal, entry) in payload.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO fork_history_record(session_id, ordinal, payload) VALUES(?1, ?2, ?3)",
-                params![session.id, ordinal as i64, encode(entry)?],
+                params![session.id, ordinal as i64, entry],
             )?;
         }
         transaction.execute(
@@ -1260,7 +1273,11 @@ impl SqliteStore {
         );
         tool_output::synchronize(&transaction, exchange)?;
         transaction.commit()?;
-        Ok(())
+        self.publish_admission_exchange(
+            &exchange.session_id,
+            &exchange.id,
+            Some(exchange.awaiting_input && exchange.elicitation.is_some()),
+        )
     }
 
     /// Load one workspace checkpoint by content digest.
@@ -1348,6 +1365,9 @@ impl SqliteStore {
         );
         self.connection
             .execute(&sql, params![id, session_id, encode(value)?])?;
+        if matches!(table, "task_record" | "plan_record") {
+            self.publish_admission(session_id)?;
+        }
         Ok(())
     }
 
@@ -1416,7 +1436,7 @@ impl SessionStore for SqliteStore {
             params![primary.id, primary.session_id, encode(&primary)?],
         )?;
         transaction.commit()?;
-        Ok(())
+        self.publish_admission(&session.id)
     }
 
     fn load_session(&self, session_id: &str) -> Result<Option<HarnessSession>> {
@@ -1442,7 +1462,7 @@ impl SessionStore for SqliteStore {
 
     fn list_session(&self, workspace: Option<&str>) -> Result<Vec<HarnessSession>> {
         let mut sessions = self.list_current_session(
-            "SELECT payload FROM session_record ORDER BY updated_at_ms DESC",
+            "SELECT payload FROM session_record WHERE NOT EXISTS(SELECT 1 FROM session_deletion WHERE session_id=session_record.id) ORDER BY updated_at_ms DESC",
             [],
         )?;
         if let Some(path) = workspace {
@@ -1799,6 +1819,7 @@ mod test {
             "UPDATE exchange_record SET payload=?1 WHERE id='stream'",
             [encode(&exchange)?],
         )?;
+        store.connection.pragma_update(None, "user_version", 0)?;
         drop(store);
         let mut store = SqliteStore::open(directory.path())?;
         assert_eq!(
@@ -2027,6 +2048,9 @@ mod test {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            output_store: None,
+            archived_output: Default::default(),
+            input_message_id: None,
             provider_retry: None,
             agent_id: "session:agent:primary".into(),
             id: "active".into(),
@@ -2118,6 +2142,9 @@ mod test {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            output_store: None,
+            archived_output: Default::default(),
+            input_message_id: None,
             provider_retry: None,
             agent_id: "session:agent:primary".into(),
             id: "interaction".into(),
