@@ -57,6 +57,7 @@ pub use review_annotation::{
 };
 pub(crate) use review_feedback::render as render_review_feedback;
 pub(crate) mod execution;
+pub(crate) mod review_answer;
 pub(crate) mod review_document;
 mod review_projection;
 pub(crate) mod review_source;

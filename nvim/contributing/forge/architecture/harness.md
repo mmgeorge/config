@@ -892,8 +892,10 @@ may grow past the default picker height within its host bounds and optional heig
 Other pickers retain their configured maximum height.
 
 `/config` groups all controls into Models, Compaction, Checks, Planning, Execute, Permissions,
-Tools, Display, Provider, and Debug. Main and Background model controls retain separate
-mutation owners. Planning owns the plan approval and revision Auto-approve controls.
+Tools, Display, Provider, and Debug. Main, Ask, and Background model controls retain
+separate mutation owners. Ask preferences are stored per provider and apply only
+to same-provider Plan Review forks. Clearing the override restores inheritance
+from the planning session. Planning owns the plan approval and revision Auto-approve controls.
 Execute exposes the Ask/Deny/Allow approval default without a Defaults row.
 The check-editing toggle uses the independent `checks.editing` control.
 Related values share rows, and the selected field replaces the permanent description

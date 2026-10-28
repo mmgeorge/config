@@ -49,6 +49,11 @@ client.request_for = function(session_id, method, params, callback)
   end
   if method == "checks.editing" then callback({ check_editing = params.enabled }) return end
   if method == "session.configure" then
+    if params.ask_model then
+      state.ask_model = vim.deepcopy(params.ask_model)
+      callback({ ask_model = state.ask_model })
+      return
+    end
     for _, key in ipairs({ "model", "effort", "service_tier", "auto_compaction", "approval_timeout", "answer_timeout" }) do
       if params[key] ~= nil then configured_session[key] = params[key] end
     end
@@ -80,7 +85,8 @@ controller.configure = function(params, _, completed)
 end
 local success, failure = xpcall(function()
   state = { session = configured_session, capability = { model_selection = true, effort_selection = true, fast_mode = true, ultrafast_mode = true, native_compact = true, os_sandbox = true }, busy = true }
-  settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
+  local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
+  settings.open(state, host)
   local instance = picker._state_for_test()
   assert(clue_requests > 0, "settings did not exercise the mini.clue integration")
   assert(vim.b[instance.buf].miniclue_disable == true, "picker permits leader triggers to replace its bindings")
@@ -116,7 +122,18 @@ local success, failure = xpcall(function()
     assert(mapping.callback, "missing key " .. binding)
     mapping.callback()
   end
-  assert(#instance.spec.page_list[1].option_list == 21, "settings are not grouped into 21 rows")
+  assert(#instance.spec.page_list[1].option_list == 22, "settings are not grouped into 22 rows")
+  assert(find("ask-model").section == "Models")
+  local _, ask_field = find("ask-model")
+  assert(ask_field.value == "Same as planning")
+  state.ask_model = { model = "other-model", effort = "low", service_tier = "default" }
+  settings.open(state, host)
+  key("ask-thinking", "<Right>")
+  assert(state.ask_model.effort == "high" and configured_session.effort == "medium")
+  key("ask-speed", "<Right>")
+  assert(state.ask_model.service_tier == "fast" and configured_session.model == "mock-model")
+  key("ask-inherit", "<CR>")
+  assert(state.ask_model.model == nil)
   assert(find("session-tools").section == "Tools")
   key("session-tools", "<Space>")
   assert(state.session_tools == false)
@@ -137,12 +154,12 @@ local success, failure = xpcall(function()
   assert(state.check_timing == "after_queue")
   assert(find("automatic-checks").section == "Checks")
   key("automatic-checks", "<Right>")
-  assert(state.automatic_checks ~= false, "arrows toggled automatic checks")
-  key("automatic-checks", "<Space>")
-  assert(state.automatic_checks == false and state.check_timing == "after_queue")
-  assert(find("automatic-checks").fields[1].value == false)
+  assert(state.automatic_checks ~= true, "arrows toggled automatic checks")
   key("automatic-checks", "<Space>")
   assert(state.automatic_checks == true and state.check_timing == "after_queue")
+  assert(find("automatic-checks").fields[1].value == true)
+  key("automatic-checks", "<Space>")
+  assert(state.automatic_checks == false and state.check_timing == "after_queue")
   key("status-thoughts", "<Right>")
   assert(state.status_thoughts ~= true, "arrows must not toggle booleans")
   key("status-thoughts", "<Space>")

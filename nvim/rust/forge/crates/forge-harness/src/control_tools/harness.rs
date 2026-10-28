@@ -420,8 +420,7 @@ impl HarnessInspectionScope {
         let mut result = self.status(reader, session)?;
         result["settings"] = serde_json::to_value(&snapshot.desired)?;
         result["settings"]["session_tools"] = json!(snapshot.desired.session_tools.unwrap_or(true));
-        result["settings"]["automatic_checks"] =
-            json!(snapshot.desired.automatic_checks.unwrap_or(true));
+        result["settings"]["automatic_checks"] = json!(snapshot.desired.automatic_checks_enabled());
         result["settings"]["check_timing"] =
             json!(snapshot.desired.check_timing.unwrap_or_default());
         result["settings"]["check_editing"] =

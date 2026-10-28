@@ -182,15 +182,23 @@ function M.attach(options)
 
   function owner.generate_about(force)
     if not alive() then return end
+    if owner.stop_about_progress then owner.stop_about_progress() owner.stop_about_progress = nil end
     owner.about_started = true
     owner.about_source = options.get_about_source()
     owner.about_revision = (owner.about_revision or 0) + 1
     local revision = owner.about_revision
     local function accept_about(result)
       if not alive() or revision ~= owner.about_revision then return end
+      if owner.stop_about_progress then owner.stop_about_progress() owner.stop_about_progress = nil end
       owner.about = result
-      owner.presentation.about = { state = result.state, text = result.message or "" }
-      publish()
+      local function present_about(progress_text)
+        owner.presentation.about = { state = result.state, text = progress_text or result.message or "", model = result.model }
+        publish()
+      end
+      if result.state == "generating" then
+        owner.stop_about_progress = require("forge.render.generation_progress").watch(result,
+          function() return alive() and revision == owner.about_revision end, present_about)
+      else present_about() end
     end
     local first_request = not owner.about_requested
     owner.about_requested = true
@@ -199,6 +207,7 @@ function M.attach(options)
 
   function owner.clear_about()
     if not alive() then return end
+    if owner.stop_about_progress then owner.stop_about_progress() owner.stop_about_progress = nil end
     owner.about_started = true
     owner.about_revision = (owner.about_revision or 0) + 1
     owner.about = nil
@@ -400,6 +409,7 @@ function M.attach(options)
   end
 
   function owner.close()
+    if owner.stop_about_progress then owner.stop_about_progress() owner.stop_about_progress = nil end
     stop_lookup_timers()
     owner.pending_pr = nil
     owner.closed = true

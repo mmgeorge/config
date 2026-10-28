@@ -4,7 +4,13 @@ local client = require("forge.client")
 local ai_commit = require("forge.integrations.ai_commit")
 local commit = require("forge.integrations.commit")
 local state = forge_reuse.state
-local request = ai_commit._backend.request_async
+local function request(params, callback)
+  forge_reuse.model_calls = forge_reuse.model_calls + 1
+  vim.schedule(function()
+    callback({ state = "ready", message = params.comparison == "staged"
+      and "refactor: describe staged fixture" or forge_reuse.message })
+  end)
+end
 local editor = commit.editor
 local held = {}
 local generation_calls = 0
@@ -64,7 +70,7 @@ local ok, failure = xpcall(function()
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-a>", true, false, true), "xt", false)
   assert(vim.wait(10000, function() return #held == 1 end, 10), "Ctrl-A did not generate staged context")
   assert(generation_calls == 2 and comparison_calls == 0, "Ctrl-A did not issue exactly one generation")
-  assert(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == forge_reuse.message, "regeneration cleared the draft while waiting")
+  assert(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1]:find("Generating with ", 1, true), "regeneration omitted progress")
   held[1]()
   assert(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == "refactor: describe staged fixture", "Ctrl-A did not replace the message")
   local comments = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")

@@ -198,7 +198,7 @@ impl CheckToolScope {
                         definition["auto"] = json!(auto);
                     }
                 }
-                definitions["automatic_checks"] = json!(settings.automatic_checks.unwrap_or(true));
+                definitions["automatic_checks"] = json!(settings.automatic_checks_enabled());
                 definitions["check_timing"] = json!(settings.check_timing.unwrap_or_default());
                 definitions
             }
@@ -471,7 +471,7 @@ impl CheckSupervisor {
         settings: &crate::settings::PortableSettings,
     ) -> Result<Value> {
         let mut catalog = self.catalog(task_id)?;
-        catalog["automatic_checks"] = json!(settings.automatic_checks.unwrap_or(true));
+        catalog["automatic_checks"] = json!(settings.automatic_checks_enabled());
         catalog["check_timing"] = json!(settings.check_timing.unwrap_or_default());
         if let Ok(snapshot) = ConfigSnapshot::load(&self.workspace) {
             let overrides = self.overrides(task_id)?;

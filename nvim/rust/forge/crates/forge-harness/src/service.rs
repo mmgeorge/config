@@ -25,6 +25,8 @@ use crate::storage::SqliteStore;
 
 #[path = "service/input.rs"]
 mod input_delivery;
+#[path = "service/review_questions.rs"]
+mod review_questions;
 
 #[derive(Clone, Copy)]
 enum CheckOperation {
@@ -1910,7 +1912,15 @@ async fn route_request(
         return delete_session(registry, &session_id, request, message_sink).await;
     }
     if method == HarnessMethod::SessionFork {
-        return route_session_fork(registry, session_id, request, message_sink).await;
+        start_session_fork(
+            registry,
+            session_id,
+            request.params,
+            Some(request.id),
+            message_sink,
+        )
+        .await?;
+        return Ok(());
     }
     if matches!(
         method,
@@ -1932,6 +1942,27 @@ async fn route_request(
         return controller
             .input_request(request, method, message_sink)
             .await;
+    }
+    if method == HarnessMethod::PlanAnswerQuestions {
+        return review_questions::answer(registry, controller, session_id, request, message_sink)
+            .await;
+    }
+    if method == HarnessMethod::SessionConfigure
+        && request
+            .params
+            .as_object()
+            .is_some_and(|fields| fields.len() == 1 && fields.contains_key("ask_model"))
+    {
+        let result = controller
+            .broker
+            .lock()
+            .await
+            .configure_ask_model(request.params["ask_model"].clone())
+            .await?;
+        message_sink
+            .send_response(Response::success(request.id, result)?)
+            .await?;
+        return Ok(());
     }
     if method == HarnessMethod::BackendMockResponse {
         let control = controller
@@ -2049,13 +2080,13 @@ async fn route_request(
                 &registry.initialize.backend.kind,
             )?
             .desired;
-        if desired.automatic_checks == Some(false) {
+        if !desired.automatic_checks_enabled() {
             controller.observer.completion_queue.finish()?;
         }
         message_sink
             .send_response(Response::success(
                 request.id,
-                json!({"check_timing":desired.check_timing.unwrap_or_default(), "automatic_checks":desired.automatic_checks.unwrap_or(true), "checks_deferred":controller.observer.completion_queue.deferred()?}),
+                json!({"check_timing":desired.check_timing.unwrap_or_default(), "automatic_checks":desired.automatic_checks_enabled(), "checks_deferred":controller.observer.completion_queue.deferred()?}),
             )?)
             .await?;
         return Ok(());
@@ -3508,12 +3539,13 @@ async fn route_new_session(
     Ok(())
 }
 
-async fn route_session_fork(
+async fn start_session_fork(
     registry: Arc<SessionControllerRegistry>,
     session_id: String,
-    request: Request,
+    params: Value,
+    response_id: Option<u64>,
     message_sink: &MessageSender,
-) -> Result<()> {
+) -> Result<(Arc<SessionController>, Arc<ProviderForkGate>)> {
     let mut task = registry.fork_task.lock().await;
     while let Some(result) = task.try_join_next() {
         result.context("Harness provider fork task failed")?;
@@ -3530,7 +3562,7 @@ async fn route_session_fork(
         &registry.initialize.backend.kind,
         &descriptor.capability,
         &session_id,
-        &request.params,
+        &params,
     )?;
     let child_session_id = preparation.child.id.clone();
     let child_controller = registry.resolve(&child_session_id).await?;
@@ -3541,15 +3573,17 @@ async fn route_session_fork(
         .await
         .insert(child_session_id.clone(), Arc::clone(&gate));
 
-    let mut snapshot = serde_json::to_value(child_controller.broker.lock().await.snapshot()?)?;
-    snapshot["fork_performance"] = json!({
-        "total_ms": preparation.total_duration_ms,
-        "timing": preparation.timing,
-        "provider_pending": true,
-    });
-    message_sink
-        .send_response(Response::success(request.id, snapshot)?)
-        .await?;
+    if let Some(response_id) = response_id {
+        let mut snapshot = serde_json::to_value(child_controller.broker.lock().await.snapshot()?)?;
+        snapshot["fork_performance"] = json!({
+            "total_ms": preparation.total_duration_ms,
+            "timing": preparation.timing,
+            "provider_pending": true,
+        });
+        message_sink
+            .send_response(Response::success(response_id, snapshot)?)
+            .await?;
+    }
     message_sink.send(Message::Event(SessionEvent {
         session_id: child_session_id.clone(),
         event: "session_created".into(),
@@ -3558,6 +3592,8 @@ async fn route_session_fork(
 
     let message_sink = message_sink.clone();
     let registry_for_completion = Arc::clone(&registry);
+    let child_result = Arc::clone(&child_controller);
+    let gate_result = Arc::clone(&gate);
     task.spawn(async move {
         let backend_started = Instant::now();
         let mut result = backend
@@ -3593,7 +3629,7 @@ async fn route_session_fork(
             .await
             .remove(&child_session_id);
     });
-    Ok(())
+    Ok((child_result, gate_result))
 }
 
 /// Retires only an idle local controller before acquiring durable deletion ownership.
@@ -4220,6 +4256,153 @@ mod tests {
         BackendOutput, BackendRequest, TextGeneration,
     };
     use forge_diff::cache::CacheLimits;
+
+    #[tokio::test]
+    async fn plan_review_questions_fork_without_changing_the_main_timeline() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        std::fs::write(fixture.path().join(".forge.json"), r#"{"checks":{}}"#)?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let plan = {
+            let mut broker = controller.broker.lock().await;
+            let result = broker
+                .dispatch(Request {
+                    id: 2,
+                    method: "prompt.submit".into(),
+                    params: json!({"text":"/plan explain the interface"}),
+                })
+                .await;
+            assert!(
+                result.response.error().is_none(),
+                "{:?}",
+                result.response.error()
+            );
+            broker.snapshot()?.active_plan.unwrap()
+        };
+        let mut projection = service.document(Some(session_id.clone()), serde_json::from_value(json!({
+            "operation":"plan_open", "document":"ask-review", "view":"ask-view", "plan_id":plan.id,
+            "digest":plan.review_digest, "width":{"columns":100,"tabstop":4}
+        }))?).await?;
+        projection = crate::plan::reconstruct(None, projection);
+        let row = projection["source_row"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["target"].is_string())
+            .unwrap()
+            .clone();
+        let before = controller.broker.lock().await.snapshot()?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        for (iteration, selection) in [
+            json!({}),
+            json!({"model":"mock-model","effort":"high","service_tier":"fast"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            service
+                .dispatch(
+                    Some(session_id.clone()),
+                    Request {
+                        id: 3,
+                        method: "session.configure".into(),
+                        params: json!({"ask_model":selection}),
+                    },
+                    &sink,
+                )
+                .await?;
+            let configured: Response =
+                serde_json::from_slice(output.recv().await.unwrap().unwrap().bytes())?;
+            assert!(configured.error().is_none());
+            let before_child = registry.controller_by_id.read().await.len();
+            service.dispatch(Some(session_id.clone()), Request { id: 4, method: "plan.questions.answer".into(),
+                params: json!({"draft_source_digest":projection["saved_source_digest"],
+                    "draft_annotation":[{"id":format!("question-{iteration}"),"kind":"question","source":{
+                        "start_line":row["source_line"],"end_line":row["source_line"],"body":"Why this interface?"}}],
+                    "review":{"document":"ask-review","view":"ask-view","sequence":iteration+1,
+                        "revision":projection["snapshot"]["revision"],"block":row["block"],"position":row["position"],
+                        "target":row["target"],"action":"plan.questions.answer"}}) }, &sink).await?;
+            let response = loop {
+                let value: Value =
+                    serde_json::from_slice(output.recv().await.unwrap().unwrap().bytes())?;
+                if value["id"] == 4 {
+                    break value;
+                }
+            };
+            assert!(response.get("error").is_none(), "{response}");
+            assert!(
+                response["result"]["annotation"][0]["reply"]["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("This declaration")
+            );
+            assert_eq!(
+                registry.controller_by_id.read().await.len(),
+                before_child + 1
+            );
+            let after = controller.broker.lock().await.snapshot()?;
+            assert_eq!(after.exchange.len(), before.exchange.len());
+            assert_eq!(
+                after.session.backend_session_id,
+                before.session.backend_session_id
+            );
+            assert_eq!(after.session.model, before.session.model);
+            let store = SqliteStore::open(&fixture.path().join("data"))?;
+            let child = store
+                .list_session(None)?
+                .into_iter()
+                .filter(|session| session.id != session_id)
+                .max_by_key(|session| session.created_at_ms)
+                .unwrap();
+            let turns = store.list_exchange(&child.id)?;
+            assert_eq!(turns.len(), 1);
+            assert_eq!(
+                child.model,
+                if iteration == 0 {
+                    before
+                        .session
+                        .resolved_model
+                        .as_ref()
+                        .unwrap_or(&before.session.model)
+                } else {
+                    "mock-model"
+                }
+            );
+            assert_eq!(
+                child.effort,
+                if iteration == 0 {
+                    before.session.effort.as_str()
+                } else {
+                    "high"
+                }
+            );
+            assert_eq!(
+                child.service_tier,
+                if iteration == 0 {
+                    before.session.service_tier
+                } else {
+                    crate::backend::ServiceTier::Fast
+                }
+            );
+            assert!(
+                child
+                    .backend_session_id
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("-fork")
+            );
+        }
+        service.shutdown(Duration::from_secs(3)).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn isolated_generation_uses_configured_model_without_a_conversation() -> Result<()> {
@@ -5568,7 +5751,10 @@ mod tests {
         let held = control
             .dispatch(
                 &session_id,
-                crate::backend::mock_response::MockResponseCommand::Hold { mode: None },
+                crate::backend::mock_response::MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
             )
             .await?;
         let (sink, _output) = forge_protocol::outbound::channel();
@@ -7741,7 +7927,13 @@ mod tests {
         let session_id = registry.initial_session_id.clone();
         let control = controller.backend.mock_response_control().unwrap();
         let held = control
-            .dispatch(&session_id, MockResponseCommand::Hold { mode: None })
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
             .await?;
         let hold_id = held["id"].as_str().unwrap().to_owned();
         let (sink, mut output) = forge_protocol::outbound::channel();

@@ -176,13 +176,16 @@ end
 
 local function summary_chunks(summary, failure_text)
   summary = summary or {}
+  if summary.state == "generating" then
+    return { { require("forge.render.generation_progress").text(summary), "ForgeStatusFetching" } }
+  end
   local text = summary.text and summary.text:match("[^\n]*") or ""
   local capture = "ForgeStatusPR"
   if text == "" then
     if failure_text and (summary.state == "error" or summary.state == "unavailable") then
       return { { failure_text, "ForgeStatusObjectId" } }
     end
-    text = ({ fetching = "...fetching...", generating = "...generating...", error = "error", unavailable = "unavailable" })[summary.state] or "none"
+    text = ({ fetching = "...fetching...", error = "error", unavailable = "unavailable" })[summary.state] or "none"
     capture = summary.state == "error" and "ErrorMsg" or (summary.state == "fetching" or summary.state == "generating") and "ForgeStatusFetching" or "ForgeStatusObjectId"
   end
   if summary.state == "closed" then text = text .. " [closed]" end

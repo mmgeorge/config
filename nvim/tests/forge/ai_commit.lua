@@ -10,7 +10,7 @@ package.loaded["forge.integrations.background_settings"] = {
   request = function(_, _, callback)
     callback({ settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
   end,
-  model = function() return { model = "fixture-model" } end,
+  model = function() return { model = "fixture-model", thinking = "low", service_tier = "fast" } end,
 }
 local notices = {}
 vim.notify = function(message, level, options)
@@ -19,6 +19,12 @@ end
 
 local function assert_equal(actual, expected, message)
   if actual ~= expected then error((message or "values differ") .. ": " .. vim.inspect(actual) .. " ~= " .. vim.inspect(expected), 2) end
+end
+
+local function assert_progress(buffer)
+  assert(vim.wait(1000, function()
+    return vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1]:find("Generating with fixture-model · thinking low · fast", 1, true)
+  end, 10), "missing model generation progress")
 end
 
 local function run()
@@ -58,14 +64,20 @@ local function run()
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd)
   assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "reused draft", "ready draft was not immediate")
   assert_equal(#requests, 0, "ready draft performed validation")
+  vim.api.nvim_set_current_buf(buffer)
+  vim.api.nvim_win_set_cursor(0, { 3, 4 })
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
   assert_equal(requests[1].params.ignored_paths[1], nil, "staged regeneration excluded a staged path")
   local first = take("generate", "staged")
-  assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "reused draft", "pending generation cleared draft")
+  assert_progress(buffer)
+  local progress_line = vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1]
+  assert(vim.wait(1000, function() return vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1] ~= progress_line end, 10),
+    "generation spinner did not animate")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 3, 4 }), "spinner moved the cursor")
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
   local second = take("generate", "staged")
   first({ state = "ready", message = "obsolete request" })
-  assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "reused draft")
+  assert_progress(buffer)
   second({ state = "ready", message = "staged subject\n\nstaged body" })
   local lines = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
   assert_equal(lines[1], "staged subject")
@@ -84,7 +96,23 @@ local function run()
   local error_count = #notices
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
   take("generate", "staged")({ state = "none" })
+  assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "edited before provider failure", "empty result retained progress")
   assert_equal(#notices, error_count, "empty generation displayed a notification")
+  ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
+  local failed = take("generate", "staged")
+  assert_progress(buffer)
+  failed(nil, "generation failed")
+  assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "edited before provider failure", "failure retained progress")
+  local restored_tick = vim.api.nvim_buf_get_changedtick(buffer)
+  vim.wait(150, function() return false end)
+  assert_equal(vim.api.nvim_buf_get_changedtick(buffer), restored_tick, "failed generation kept animating")
+  ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
+  local abandoned = take("generate", "staged")
+  assert_progress(buffer)
+  vim.api.nvim_exec_autocmds("BufWritePre", { buffer = buffer })
+  assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "edited before provider failure", "write retained progress")
+  abandoned({ state = "ready", message = "must not replace saved message" })
+  assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "edited before provider failure")
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
   local closed = take("generate", "staged")
   vim.api.nvim_buf_delete(buffer, { force = true })
@@ -160,7 +188,7 @@ local function run()
   }
   ai_commit.ensure("D:/harness-fallback", { ref = "HEAD" })
   assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").message, "fix: use recent Harness\n\nPreserve the body.")
-  assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").model, "selected-model (codex)")
+  assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").model, "selected-model (codex) · fast")
   package.loaded["forge.client"].request_generation = function(_, callback)
     callback(nil, "claude commit_message generation failed: Unsupported provider capability: text_generation")
   end

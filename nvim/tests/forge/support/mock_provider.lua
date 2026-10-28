@@ -27,9 +27,10 @@ end
 ---Arm a single response before submitting its prompt. Omit mode to match any prompt.
 ---@param session_id string
 ---@param mode? string
+---@param any_session? boolean Allows matching a newly forked session whose ID is not yet known.
 ---@return ForgeMockResponseHold
-function M.hold(session_id, mode)
-  local result = request(session_id, { operation = "hold", mode = mode })
+function M.hold(session_id, mode, any_session)
+  local result = request(session_id, { operation = "hold", mode = mode, any_session = any_session == true })
   return setmetatable({ id = result.id, session_id = session_id }, Hold)
 end
 

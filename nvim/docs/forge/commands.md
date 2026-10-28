@@ -53,7 +53,9 @@ Automatic About drafts and commit-message regeneration send a compact diff to th
 selected model without progress, waiting, or completion popups. Generation failures
 produce error notifications and preserve the existing draft, including edits made while waiting.
 For a new commit, the editor copies the existing About draft or waits for its in-progress
-generation. It does not start another generation. `Ctrl-A` explicitly regenerates from
+generation. It does not start another generation. About and the commit editor's first
+line show an animated `Generating with <model>` status, including thinking and speed.
+Failures and cancellation restore the previous subject. `Ctrl-A` explicitly regenerates from
 staged changes, or from the latest commit when amending.
 
 Git LFS files are excluded from both the changed-file inventory and compact diff before
@@ -395,6 +397,11 @@ changing interactive plan navigation or starting language servers.
 Tools, Display, Provider, and Debug. Use Up/Down to select a row,
 Tab/Shift-Tab to select its fields, Left/Right to change values, Space to toggle
 `●` enabled or `○` disabled, and Enter to edit a number or open a selector.
+Models includes **Ask** for Plan Review questions created with `A`. It defaults
+to the planning model. Choose a model, thinking level, and speed to override it,
+or **Use planning** to clear the override. Answers run in a forked session using
+the same provider and appear below their review questions without entering the
+main timeline.
 Planning has an approval preference (Keep current, ask, deny, or allow) and an
 Auto-approve control. Execute has an approval default (ask, deny, or allow) for new
 goals and accepted plans. Neither preference changes filesystem access.

@@ -2319,7 +2319,7 @@ function M.configure(next_config, validate_selection, completed)
         return
       end
       state.check_timing = result.check_timing
-      state.automatic_checks = result.automatic_checks ~= false
+      state.automatic_checks = result.automatic_checks == true
       if result.checks_deferred ~= nil then state.checks_deferred = result.checks_deferred end
       M.render()
       if completed then completed(true) end

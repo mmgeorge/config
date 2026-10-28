@@ -96,6 +96,31 @@ impl PlanReviewStore {
         document.editable()?.questions(input)
     }
 
+    /// Validate the captured question against the current admitted review document.
+    pub(crate) fn check_question(
+        &self,
+        id: &DocumentId,
+        question: &PlanReviewQuestion,
+    ) -> Result<()> {
+        let store = self
+            .document
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store.get(id).context("plan review document is closed")?;
+        admission.check()?;
+        ensure!(
+            document
+                .annotation
+                .annotation()
+                .iter()
+                .any(|annotation| annotation.id == question.id
+                    && annotation.kind == ReviewAnnotationKind::Question
+                    && annotation.source.body == question.body),
+            "plan question changed before its answer arrived"
+        );
+        Ok(())
+    }
+
     /// Persist an answer only while its original question and source snapshot remain current.
     pub(crate) fn answer(
         &self,

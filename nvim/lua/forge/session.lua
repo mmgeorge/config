@@ -87,6 +87,7 @@ M.empty_diff_rows = {}
 ---@field execution_busy? boolean
 ---@field request_busy? boolean
 ---@field status_thoughts? boolean
+---@field ask_model? ForgeAskModel
 ---@field subagent_tools? boolean
 ---@field lsp_tools? boolean
 ---@field session_tools? boolean

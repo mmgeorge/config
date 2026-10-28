@@ -14,13 +14,15 @@
 ---@field _state ForgeAICommitState?
 ---@field _states table<string, ForgeAICommitState>
 ---@field _request_ids table<string, integer>
+---@field _buffer_generation table<integer, fun()>
 
-local M = { _request_ids = {}, _states = {} }
+local M = { _request_ids = {}, _states = {}, _buffer_generation = {} }
 local notifications = require("forge.infra.notifications")
 
 ---@param backend ForgeAICommitBackend?
 function M.set_backend(backend) M._backend = backend end
 function M.reset_backend()
+  for _, cancel in pairs(M._buffer_generation) do cancel() end
   M._backend, M._state = nil, nil
   M._states, M._request_ids = {}, {}
 end
@@ -51,13 +53,17 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     local generation, configuration_failure = client.generation_config()
     if not generation then callback(nil, configuration_failure) return end
     local choice = require("forge.integrations.background_settings").model(snapshot, generation.backend.kind)
-    on_model(choice.model .. (choice.thinking ~= nil and (" · thinking " .. choice.thinking) or ""))
+    local function publish_model(label)
+      local speed = choice.service_tier
+      on_model((label:match("[^\r\n]*") or label) .. (speed and speed ~= "default" and (" · " .. speed) or ""))
+    end
+    publish_model(choice.model .. (choice.thinking ~= nil and (" · thinking " .. choice.thinking) or ""))
     local params = { operation = "generate", workspace = cwd,
       comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "head",
       ignored_paths = ignored or {} }
     if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
     else
-      client.request_generation(params, receive, on_model, { model = choice.model,
+      client.request_generation(params, receive, publish_model, { model = choice.model,
         reasoning_effort = choice.thinking, service_tier = choice.service_tier,
         auto_compaction = snapshot.settings.auto_compaction })
     end
@@ -219,6 +225,15 @@ function M.subject(message)
 end
 
 ---@param buf integer
+function M.cancel_buffer_generation(buf)
+  local cancel = M._buffer_generation[buf]
+  if cancel then cancel() end
+  if vim.api.nvim_buf_is_valid(buf) then
+    vim.b[buf].forge_ai_commit_revision = (vim.b[buf].forge_ai_commit_revision or 0) + 1
+  end
+end
+
+---@param buf integer
 ---@param cwd string
 ---@param regenerate? boolean
 ---@param comparison? "latest_commit"
@@ -229,6 +244,8 @@ function M.populate_commit_buffer_when_ready(buf, cwd, regenerate, comparison)
   vim.b[buf].ai_commit_generated = true
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   if not regenerate and lines[1] and lines[1] ~= "" then return end
+  M.cancel_buffer_generation(buf)
+  lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local revision = (vim.b[buf].forge_ai_commit_revision or 0) + 1
   vim.b[buf].forge_ai_commit_revision = revision
   local changedtick = vim.api.nvim_buf_get_changedtick(buf)
@@ -239,23 +256,69 @@ function M.populate_commit_buffer_when_ready(buf, cwd, regenerate, comparison)
       if line:match("^#") then replace_end = position - 1 break end
     end
   end
-  local function apply_message(state)
-    if not vim.api.nvim_buf_is_valid(buf) or vim.b[buf].forge_ai_commit_revision ~= revision then return end
-    if vim.api.nvim_buf_get_changedtick(buf) ~= changedtick then return end
-    if state.state ~= "ready" or not state.message then return end
-    local message_lines = text_to_lines(state.message)
-    if regenerate and replace_end < #lines then message_lines[#message_lines + 1] = "" end
+  local abandoned, displayed, autocmd, replaced = false, nil, nil, false
+  local stop_progress = function() end
+  local view = { buffer = buf, preserve_view = true, sequence = { node = {}, locate = function() end } }
+  local function replace(first, last, replacement)
+    local position = require("forge.buffer_view")
+    local retained = position.capture(view, function() return false end)
     local was_modifiable = vim.bo[buf].modifiable
     vim.bo[buf].modifiable = true
-    vim.api.nvim_buf_set_lines(buf, 0, replace_end, false, message_lines)
+    if replaced and vim.api.nvim_buf_get_changedtick(buf) == changedtick then
+      vim.api.nvim_buf_call(buf, function() vim.cmd("silent! undojoin") end)
+    end
+    vim.api.nvim_buf_set_lines(buf, first, last, false, replacement)
+    replaced = true
     vim.bo[buf].modifiable = was_modifiable
-    local window = vim.fn.bufwinid(buf)
-    if window ~= -1 then vim.api.nvim_win_set_cursor(window, { 1, 0 }) end
+    view.row_count = vim.api.nvim_buf_line_count(buf)
+    position.restore(view, retained)
+    changedtick = vim.api.nvim_buf_get_changedtick(buf)
+  end
+  local function cleanup()
+    stop_progress()
+    if autocmd then pcall(vim.api.nvim_del_autocmd, autocmd) autocmd = nil end
+    M._buffer_generation[buf] = nil
+  end
+  local function restore_subject()
+    if displayed and vim.api.nvim_buf_is_valid(buf)
+      and vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == displayed then
+      replace(0, 1, { lines[1] or "" })
+    end
+  end
+  local function cancel()
+    if abandoned then return end
+    abandoned = true
+    cleanup()
+    restore_subject()
+  end
+  local function current()
+    return not abandoned and vim.api.nvim_buf_is_valid(buf)
+      and vim.b[buf].forge_ai_commit_revision == revision
+      and vim.api.nvim_buf_get_changedtick(buf) == changedtick
+  end
+  local function apply_message(state)
+    if not current() then cancel() return end
+    cleanup()
+    if state.state ~= "ready" or not state.message then restore_subject() return end
+    local message_lines = text_to_lines(state.message)
+    if regenerate and replace_end < #lines then message_lines[#message_lines + 1] = "" end
+    replace(0, replace_end == 0 and displayed and 1 or replace_end, message_lines)
     vim.b[buf].forge_ai_commit_populated = true
   end
   local ref = comparison or (regenerate and "staged" or "HEAD")
   if not regenerate and not get_state(cwd, ref) then return end
-  M.ensure(cwd, { ref = ref, force = regenerate == true }, apply_message)
+  M._buffer_generation[buf] = cancel
+  autocmd = vim.api.nvim_create_autocmd({ "BufWritePre", "BufWipeout" }, { buffer = buf, once = true, callback = cancel })
+  M.ensure(cwd, { ref = ref, force = regenerate == true, on_start = function(state)
+    stop_progress = require("forge.render.generation_progress").watch(state, function()
+      if current() then return true end
+      cancel()
+      return false
+    end, function(text)
+      displayed = text
+      replace(0, 1, { text })
+    end)
+  end }, apply_message)
 end
 
 return M

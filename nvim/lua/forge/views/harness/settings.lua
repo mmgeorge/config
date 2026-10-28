@@ -6,6 +6,17 @@ local notifications = require("forge.infra.notifications")
 local log_buffer_by_path = {}
 local log_revision_by_buffer = {}
 
+local function cycle(values, value, direction)
+  if #values == 0 then return value end
+  local position = math.max(1, vim.fn.index(values, value) + 1)
+  return values[(position - 1 + (direction or 1)) % #values + 1]
+end
+
+---@class ForgeAskModel
+---@field model? string
+---@field effort? string
+---@field service_tier? string
+
 ---@param value any
 ---@return string[]
 local function formatted_json(value)
@@ -177,11 +188,13 @@ function M.open(state, host)
       state.task_config or {})
     active.status_thoughts = state.status_thoughts == true
     active.check_timing = state.check_timing or "after_queue"
-    active.automatic_checks = state.automatic_checks ~= false
+    active.automatic_checks = state.automatic_checks == true
     local configuration_revision = 0
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
     local build_spec
     local commit
+    ---@type ForgeAskModel
+    local ask = vim.deepcopy(state.ask_model or {})
     local timeout_focus = { approval_timeout = "amount", answer_timeout = "amount" }
     local access = require("forge.views.harness.access")
     local function configure(params, completed)
@@ -199,7 +212,7 @@ function M.open(state, host)
           state.task_config or {})
         active.status_thoughts = state.status_thoughts == true
         active.check_timing = state.check_timing or "after_queue"
-        active.automatic_checks = state.automatic_checks ~= false
+        active.automatic_checks = state.automatic_checks == true
         if applied and params.session_tools ~= nil then active.session_tools = params.session_tools end
         if completed then completed(applied) end
         if picker.is_open("harness-config") then picker.update(build_spec()) end
@@ -210,9 +223,36 @@ function M.open(state, host)
     local function apply_access(policy, completed)
       configure({ access = policy }, function(applied) if applied and completed then completed() end end)
     end
+    local function configure_ask(selection, completed)
+      pending = true
+      client.request_for(session_id, "session.configure", { ask_model = selection }, function(result, failure)
+        if not state.session or state.session.id ~= session_id then return end
+        pending = false
+        if failure then notifications.error(failure, "Ask model")
+        else
+          ask = result.ask_model or {}
+          state.ask_model = vim.deepcopy(ask)
+        end
+        if completed then completed(failure == nil) end
+        if picker.is_open("harness-config") then picker.update(build_spec()) end
+      end)
+    end
     local function toggle(context, direction)
       if pending or not context.option then return end
       local id = context.option.id
+      if id == "ask-inherit" then configure_ask(vim.empty_dict()) return end
+      if id == "ask-thinking" or id == "ask-speed" then
+        if not ask.model then return end
+        local model = require("forge.views.harness.model_options").find(commit and commit.model_list or {}, ask.model)
+        local selection = vim.deepcopy(ask)
+        if id == "ask-thinking" then
+          selection.effort = cycle(model and model.reasoning or {}, ask.effort, direction)
+        else
+          selection.service_tier = cycle(require("forge.views.harness.model_options").speeds(model, state.capability or {}), ask.service_tier or "default", direction)
+        end
+        configure_ask(selection)
+        return
+      end
       if commit and commit:change(id, direction or 1) then return end
       if id == "auto-compact" or id == "compact-threshold" then
         local policy = vim.deepcopy(active.auto_compaction or { enabled = false, threshold_tokens = 128000 })
@@ -312,15 +352,10 @@ function M.open(state, host)
       return require("forge.views.harness.model_options").find(commit and commit.model_list, active.model)
     end
     local function change_main(id, direction)
-      local function cycle(values, value)
-        if #values == 0 then return value end
-        local position = math.max(1, vim.fn.index(values, value) + 1)
-        return values[(position - 1 + direction) % #values + 1]
-      end
       if id == "main-model" then
         local models = commit and commit.model_list or {}
         local values = vim.tbl_map(function(model) return model.id end, models)
-        local selected = cycle(values, active.model)
+        local selected = cycle(values, active.model, direction)
         for _, model in ipairs(models) do
           if model.id == selected then
             local speeds = require("forge.views.harness.model_options").speeds(model, state.capability or {})
@@ -331,14 +366,29 @@ function M.open(state, host)
         end
       elseif id == "main-thinking" then
         local model = model_descriptor()
-        configure({ effort = cycle(model and model.reasoning or {}, active.effort) })
+        configure({ effort = cycle(model and model.reasoning or {}, active.effort, direction) })
       elseif id == "main-speed" then
         local values = require("forge.views.harness.model_options").speeds(model_descriptor(), state.capability or {})
-        configure({ service_tier = cycle(values, active.service_tier or "default") })
+        configure({ service_tier = cycle(values, active.service_tier or "default", direction) })
       end
     end
     local function activate(id)
       if commit and id:match("^background%-") and commit:open(id) then return end
+      if id == "ask-model" then
+        local models = vim.deepcopy(commit and commit.model_list or {})
+        for _, model in ipairs(models) do
+          if model.id == ask.model then model.selected_reasoning = ask.effort end
+        end
+        picker.close(false)
+        require("forge.views.harness.model_picker").open({ host = host, model_list = models,
+          backend = active.backend, current_model = ask.model or active.model, is_current = current,
+          on_close = function() if current() then M.open(state, host) end end,
+          on_confirm = function(value)
+            configure_ask({ model = value.model, effort = value.effort, service_tier = "default" },
+              function() if current() then M.open(state, host) end end)
+          end })
+        return
+      end
       if id == "main-model" then
         local models = vim.deepcopy(commit and commit.model_list or {})
         for _, model in ipairs(models) do
@@ -433,6 +483,16 @@ function M.open(state, host)
           field_navigation = true, highlight_selected_text = false, compact_sections = true,
           option_list = {
             row("main-model", "Models", "Main", main),
+            row("ask-model", "Models", "Ask", {
+              field("ask-model", "choice", ask.model or "Same as planning", nil, "Model for forked Plan Review answers.",
+                not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled),
+              field("ask-thinking", "choice", ask.effort or "Default", "Thinking", "Reasoning effort for the Ask model.",
+                not ask.model and "Uses the planning model settings" or catalog_disabled),
+              field("ask-speed", "choice", ask.service_tier or "default", "Speed", "Provider service tier for the Ask model.",
+                not ask.model and "Uses the planning model settings" or catalog_disabled),
+              field("ask-inherit", "action", "Use planning", nil, "Clear the Ask override and inherit the planning model.",
+                not ask.model and "Already uses the planning model" or nil),
+            }),
             row("background-model", "Models", "Background", background_fields),
             row("main-compaction", "Compaction", "Main", {
               field("auto-compact", "toggle", compaction.enabled, "Automatic", "Compact the main conversation after completed turns.",
@@ -444,7 +504,7 @@ function M.open(state, host)
               field("shell", "choice", active.shell == "nushell" and "Nushell" or "System", "Shell", "Shell used for saved checks. Nushell is available when installed."),
             }),
             row("automatic-checks", "Checks", "Automatic", {
-              field("automatic-checks", "toggle", active.automatic_checks ~= false, "Enabled", "Run applicable checks when work completes. Explicit runs and plan Checking remain available when disabled."),
+              field("automatic-checks", "toggle", active.automatic_checks == true, "Enabled", "Run applicable checks when work completes. Explicit runs and plan Checking remain available when disabled."),
               field("check-timing", "choice", active.check_timing == "between_work" and "Between queued work" or "After queue", "Timing", "Run checks after each work item or once the queue finishes."),
             }),
             row("check-editing", "Checks", "Setup", {

@@ -126,6 +126,9 @@ local function run()
   assert_true(vim.api.nvim_buf_get_lines(editor, 0, 1, false)[1] == "AI amended message",
     "amend regeneration did not replace the message")
   vim.api.nvim_buf_set_lines(editor, 0, 1, false, { "updated commit message" })
+  regenerate.callback()
+  assert_true(vim.api.nvim_buf_get_lines(editor, 0, 1, false)[1]:find("Generating with ", 1, true) ~= nil,
+    "pending amend omitted generation progress")
   vim.fn.maparg("<C-c><C-c>", "n", false, true).callback()
   assert_true(vim.wait(30000, function() return commit._active == nil end, 10),
     "real git amend did not settle")

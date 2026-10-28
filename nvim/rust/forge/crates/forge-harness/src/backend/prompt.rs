@@ -28,7 +28,7 @@ impl BackendRequest {
                 "Discuss the active plan. Edit virtual proposals only when the user requests a revision. Do not implement it."
             }
             PromptMode::PlanQuestion => {
-                "Answer the anchored plan review question only. Do not edit, submit, implement, or ask follow-up questions."
+                "Answer the anchored plan review question in this forked session. Submit the answer with plan_review_answer using the supplied question_id, then end the turn. A final message alone does not complete the request. Do not edit, submit, implement, or ask follow-up questions."
             }
             PromptMode::ExecutePlan => {
                 "Continue the Execute task at its supplied phase and accepted revision. Use plan_phase_done, not goal completion, to advance execution."
@@ -93,7 +93,7 @@ impl BackendRequest {
             String::new()
         };
         format!(
-            "Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, reported file writes are rejected in every approval mode. Only the user can enable writes with /write.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Checks run automatically at the configured queue boundary, after the queue by default. Manual runs are generally unnecessary. You may optionally call check_run for earlier feedback. Read recorded results through check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must leave validation to their parent's completion gate.\n{question}{lsp}{harness}",
+            "Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, reported file writes are rejected in every approval mode. Only the user can enable writes with /write.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Read check_definition_list for the live automatic_checks and check_timing settings. Automatic completion checks default to disabled. When enabled, checks run at the configured queue boundary. When disabled, use check_run for required validation. Read recorded results through check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must leave validation to their parent's completion gate.\n{question}{lsp}{harness}",
             self.approval_mode.label(),
             serde_json::to_string(&self.access).expect("access policy serializes")
         )
@@ -170,10 +170,7 @@ mod test {
                 PromptMode::PlanDiscussion,
                 "when the user requests a revision",
             ),
-            (
-                PromptMode::PlanQuestion,
-                "anchored plan review question only",
-            ),
+            (PromptMode::PlanQuestion, "plan_review_answer"),
             (PromptMode::ExecutePlan, "plan_phase_done"),
             (PromptMode::GoalContinuation, "active Goal task"),
             (PromptMode::RequestChanges, "supplied review"),

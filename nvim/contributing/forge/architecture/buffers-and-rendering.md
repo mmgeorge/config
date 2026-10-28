@@ -408,14 +408,17 @@ following message, while its predecessor's editable region ends at that divider.
 Parent deletion requires removing its follow-ups first.
 
 `plan.questions.answer` captures native review identity and semantic anchors,
-then admits a read-only discussion turn in the main provider conversation through
-the broker's existing serialized interaction and timeline pipeline. The timeline
-shows the user's question and the provider's answer. Its instruction requests one
-or two sentences using conversation history, the saved declaration design, and
-the selected source excerpt. It leaves plan state and source unchanged. Questions
-and answers also persist in the annotation store, with
-each answer bound to the question's exact body. Answers retain the exchange's
-measured execution duration. The answer divider
+then forks the source session through the shared same-provider fork coordinator.
+The fork retains conversation history and receives the saved declaration design
+and selected source excerpt without appending work to the main timeline. Its
+instruction requests one or two sentences through `plan_review_answer`, bound to
+the captured question identity and exact body. A final message without that tool
+causes another turn in the fork with a submission reminder. Cancellation, provider
+failures, and stale review identities stop the request. The fork cannot write files
+or mutate plans. `/config` exposes a provider-local Ask model, thinking, and speed
+override. Without an override, the fork inherits the planning session's selection.
+Accepted answers persist in the annotation store with their measured answer
+duration. The answer divider
 renders `Thought for N seconds`, with no invented timing for answers without
 recorded duration.
 Saving unchanged answered questions makes no new model request. Editing a question invalidates its answer,

@@ -76,6 +76,17 @@ impl ControlToolRegistry {
     pub fn definition_list(&self) -> Vec<ControlToolDefinition> {
         let mut definitions = vec![
             ControlToolDefinition {
+                name: "plan_review_answer",
+                description: "Submit the answer to the active Plan Review question in this forked session. Supply question_id and a nonempty answer. Saves the answer on the original review annotation. Call this tool even if you already wrote the answer in a message, then end the turn.",
+                input_schema: strict_object_input_schema(
+                    vec![
+                        ("question_id", string_schema()),
+                        ("answer", string_schema()),
+                    ],
+                    &["question_id", "answer"],
+                ),
+            },
+            ControlToolDefinition {
                 name: "agent_spawn",
                 description: "Start a fresh child using a user-configured profile and task text. The profile owns provider, model, thinking, speed, and instructions. Omit profile to use the configured default. Returns its unique identity without waiting for completion. Child results arrive as separate messages. When only delegated work remains, end your turn. Harness waits for the children and resumes you with their results. New user input can resume you sooner.",
                 input_schema: strict_object_input_schema(
@@ -393,6 +404,17 @@ impl ControlToolRegistry {
         self.definition_list()
             .into_iter()
             .filter(|definition| {
+                if definition.name == "plan_review_answer" {
+                    return context.is_some_and(|context| context.review_answer.is_some());
+                }
+                if context
+                    .is_some_and(|context| context.mode == crate::backend::PromptMode::PlanQuestion)
+                    && !definition.name.starts_with("repository_")
+                    && !lsp::is_tool(definition.name)
+                    && !harness::is_tool(definition.name)
+                {
+                    return false;
+                }
                 if harness::is_tool(definition.name) {
                     return root
                         && context
@@ -518,6 +540,7 @@ pub fn apply_invocation(
             output.question_withdrawal =
                 Some(decode_arguments::<PlanQuestionWithdrawal>(invocation)?);
         }
+        "plan_review_answer" => {}
         "agent_spawn" | "agent_send" | "agent_followup" | "agent_interrupt" | "agent_list"
         | "agent_activity" | "agent_tool_output" => {}
         "lsp_overview"

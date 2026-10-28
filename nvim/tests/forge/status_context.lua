@@ -87,7 +87,15 @@ local ok, failure = xpcall(function()
   assert(#pull_request == lookup_count and owner.pr_timer, "mock PR lookup contacted GitHub")
   owner.generate_about(true)
   assert(owner.pr_timer, "About generation cancelled the independent mock PR timer")
-  generation[#generation]({ state = "generating" })
+  local pending_about = { state = "generating", model = "luna · thinking low · fast" }
+  generation[#generation](pending_about)
+  assert(presentation[#presentation].about.model == pending_about.model, "pending About omitted the model")
+  local progress_text = presentation[#presentation].about.text
+  assert(vim.wait(1000, function() return presentation[#presentation].about.text ~= progress_text end, 10),
+    "pending About did not publish an animated frame")
+  pending_about.model = "resolved-luna · thinking low · fast"
+  assert(vim.wait(1000, function() return presentation[#presentation].about.model == pending_about.model end, 10),
+    "pending About did not publish the resolved model")
   local pending_generation_count = #generation
   current = true
   owner.activate("status:context:about")
@@ -101,7 +109,12 @@ local ok, failure = xpcall(function()
   table.remove(updates).callback({ kind = "about" })
   assert(#errors == 1 and errors[1]:find("authentication failed", 1, true), "opening failed About hid its error")
   local closed_about = owner.about
+  generation[#generation]({ state = "generating", model = "luna" })
+  closed_about = owner.about
   owner.close()
+  local closed_presentations = #presentation
+  vim.wait(150, function() return false end)
+  assert(#presentation == closed_presentations, "closed Status kept animating")
   assert(not owner.pr_timer, "closed Status retained its mock PR timer")
   generation[generation_count + 1]({ state = "ready", message = "late message" })
   assert(owner.about == closed_about, "closed context adopted generation")

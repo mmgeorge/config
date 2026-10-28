@@ -29,7 +29,9 @@ local function await(predicate, message)
   assert(vim.wait(15000, function() return #failures > 0 or predicate() end, 10),
     message .. "\n" .. vim.inspect({ queue = state.queue, task = state.task,
       operation = state.task_operation, input = state.input and { revision = state.input.revision,
-        pending = state.input.pending, suspended = state.input.suspended }, status = state.status }))
+        pending = state.input.pending, suspended = state.input.suspended }, status = state.status,
+      busy = state.busy, state_sync_pending = state.state_sync_pending, checks_running = state.checks_running,
+      checks_deferred = state.checks_deferred, automatic_checks = state.automatic_checks }))
   assert(#failures == 0, table.concat(failures, "\n"))
 end
 local function request(method, params)
@@ -66,10 +68,11 @@ local success, failure = xpcall(function()
   await(completed, "startup configuration did not settle")
   request("session.configure", { shell = "nushell" })
   assert(request("state.get").check_timing == "after_queue")
-  assert(request("state.get").automatic_checks == true, "automatic checks must default on")
+  assert(request("state.get").automatic_checks == false, "automatic checks must default off")
   local check_policy = request("checks.list")
-  assert(check_policy.automatic_checks == true, "check catalog must expose default enablement")
+  assert(check_policy.automatic_checks == false, "check catalog must expose default disablement")
   assert(check_policy.check_timing == "after_queue", "check catalog must expose default timing")
+  request("session.configure", { automatic_checks = true })
 
   submit("First queued change")
   await(function() return starts == 1 end, "first item did not start")

@@ -9,6 +9,7 @@ mod new_session;
 mod observation;
 mod project_checks;
 mod replanning;
+mod review_question;
 pub(crate) use observation::BrokerObserver;
 
 pub use fork::{ForkPreparation, prepare_provider_fork};
@@ -162,6 +163,7 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
 /// Represents the complete client-visible state for one active session.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
+    pub ask_model: crate::settings::AskModel,
     /// Confirmed access label computed by the authoritative filesystem policy.
     pub access_abbreviation: String,
     pub subagent_tools: bool,
@@ -581,6 +583,7 @@ impl ExchangeAdmission {
 
 /// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
 pub struct HarnessBroker {
+    review_answer: Option<Arc<crate::plan::review_answer::ReviewAnswerScope>>,
     context_usage_fresh: bool,
     pub(crate) lsp: Arc<crate::control_tools::lsp::LspService>,
     checkpoint: Option<GitCheckpoint>,
@@ -957,6 +960,7 @@ impl HarnessBroker {
             startup_started.elapsed().as_secs_f64() * 1000.0,
         );
         let mut broker = Self {
+            review_answer: None,
             submission_store: crate::backend::submission::SubmissionStore::open(
                 &data_root,
                 trace.clone(),
@@ -1080,6 +1084,7 @@ impl HarnessBroker {
                 .ok()
         });
         Some(crate::control_tools::ControlTurnContext {
+            review_answer: self.review_answer.clone(),
             submission_cancelled: Some(Arc::clone(&self.turn_cancellation.submission_cancelled)),
             checkpoint: self
                 .exchange_runtime
@@ -1537,9 +1542,9 @@ impl HarnessBroker {
             HarnessMethod::PlanAcceptanceBegin => Box::pin(self.begin_plan_acceptance(params)),
             HarnessMethod::PlanChecksUpdate => Box::pin(self.update_plan_checks(params)),
             HarnessMethod::PlanRequestChanges => Box::pin(self.request_plan_changes(params)),
-            HarnessMethod::PlanAnswerQuestions => {
-                Box::pin(self.answer_plan_review_questions(params))
-            }
+            HarnessMethod::PlanAnswerQuestions => Box::pin(async {
+                anyhow::bail!("plan review questions must route through the session coordinator")
+            }),
             HarnessMethod::QuestionAsk => Box::pin(self.ask_question(params)),
             HarnessMethod::QuestionContinue => Box::pin(async move {
                 if let Some(target) = params.get("target") {
@@ -1787,88 +1792,6 @@ impl HarnessBroker {
             }
             _ => anyhow::bail!("method requires asynchronous handler routing"),
         }
-    }
-
-    async fn answer_plan_review_questions(
-        &mut self,
-        params: Value,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let input: forge_buffer::input::DocumentInput = serde_json::from_value(
-            params
-                .get("review")
-                .cloned()
-                .context("plan question requires its review identity")?,
-        )?;
-        let digest = params
-            .get("draft_source_digest")
-            .and_then(Value::as_str)
-            .context("plan question requires its source digest")?;
-        let annotation = serde_json::from_value(
-            params
-                .get("draft_annotation")
-                .cloned()
-                .context("plan questions require captured annotations")?,
-        )?;
-        let document = input.document.clone();
-        self.plan_review
-            .save_annotations(&document, digest, annotation)?;
-        let question = self.plan_review.questions(input)?;
-        let mut event = Vec::new();
-        for question in question {
-            let instructions = "Answer this plan review question in 1-2 sentences using the current conversation and supplied design context. Return only the answer, with inline backticks for code names. Do not edit or implement the plan, submit a revision, or ask a follow-up question.";
-            self.trace.record(&self.session.id, "plan.question.requested", json!({
-                "id":question.id,"model":self.session.model,"instructions":instructions,"context":question.prompt,
-                "backend_session_id":self.session.backend_session_id,"conversation":"main"
-            }));
-            let mut admission = ExchangeAdmission::chat(question.body.clone());
-            admission.plan_id = Some(question.plan_id.clone());
-            let (result, mut update) = self
-                .run_interaction(
-                    format!("{instructions}\n\n{}", question.prompt),
-                    PromptMode::PlanQuestion,
-                    Some(admission),
-                )
-                .await?;
-            event.append(&mut update);
-            let exchange_id = result
-                .pointer("/exchange/id")
-                .and_then(Value::as_str)
-                .context("plan question completed without its exchange")?;
-            let exchange = self
-                .store
-                .load_exchange(exchange_id)?
-                .context("plan question exchange is no longer available")?;
-            let answer = exchange
-                .turn
-                .iter()
-                .flat_map(|turn| turn.messages())
-                .filter(|message| {
-                    message.kind() == crate::turn::MessageKind::Assistant
-                        && message.delivery() == crate::turn::MessageDelivery::Final
-                })
-                .map(|message| message.text())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            anyhow::ensure!(
-                !answer.trim().is_empty(),
-                "plan question completed without an answer"
-            );
-            self.plan_review.answer(
-                &document,
-                &question,
-                answer.clone(),
-                exchange.duration_ms(),
-            )?;
-            self.trace.record(
-                &self.session.id,
-                "plan.question.answered",
-                json!({"id":question.id,"answer":answer,"duration_ms":exchange.duration_ms()}),
-            );
-        }
-        Ok((
-            json!({"annotation":self.plan_review.annotations(&document)?}),
-            event,
-        ))
     }
 
     fn current_plan_id(&self) -> Result<Option<String>> {
@@ -5222,7 +5145,7 @@ Planning continuation: turn {} of {}.",
                 &self.session.backend,
             )?
             .desired;
-        if check_settings.automatic_checks == Some(false) {
+        if !check_settings.automatic_checks_enabled() {
             self.observer.completion_queue.finish()?;
             return Ok(result);
         }
@@ -5257,15 +5180,14 @@ Planning continuation: turn {} of {}.",
             return Ok(result);
         }
         loop {
-            if settings
+            if !settings
                 .get(
                     &self.session.workspace,
                     &self.session.id,
                     &self.session.backend,
                 )?
                 .desired
-                .automatic_checks
-                == Some(false)
+                .automatic_checks_enabled()
             {
                 automatic.pending = false;
                 automatic.blocked = None;
@@ -5327,15 +5249,14 @@ Planning continuation: turn {} of {}.",
             if run.state == CheckState::Interrupted {
                 return Err(anyhow::Error::new(TurnCancelled));
             }
-            if settings
+            if !settings
                 .get(
                     &self.session.workspace,
                     &self.session.id,
                     &self.session.backend,
                 )?
                 .desired
-                .automatic_checks
-                == Some(false)
+                .automatic_checks_enabled()
             {
                 continue;
             }
@@ -11010,10 +10931,60 @@ mod test {
     }
 
     #[tokio::test]
+    async fn automatic_checks_default_off_until_explicitly_enabled() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.session.shell = crate::session::CheckShell::Nushell;
+        broker.backend = Arc::new(AutomaticCheckBackend {
+            turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            repair: true,
+            explicit: false,
+        });
+        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"print ok","label":"Verify","category":"test"}}}}).to_string())?;
+        assert!(!broker.snapshot()?.automatic_checks);
+        broker
+            .run_interaction(
+                "Default off".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Default off".into())),
+            )
+            .await?;
+        assert!(broker.check_runner.snapshot()?.history.is_empty());
+        broker
+            .configure_session(json!({"automatic_checks":true}))
+            .await?;
+        assert!(broker.snapshot()?.automatic_checks);
+        broker
+            .run_interaction(
+                "Explicitly enabled".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Explicitly enabled".into())),
+            )
+            .await?;
+        assert_eq!(broker.check_runner.snapshot()?.history.len(), 1);
+        broker
+            .configure_session(json!({"automatic_checks":false}))
+            .await?;
+        broker
+            .run_interaction(
+                "Explicitly disabled".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Explicitly disabled".into())),
+            )
+            .await?;
+        assert_eq!(broker.check_runner.snapshot()?.history.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn automatic_checks_complete_when_remaining_queue_is_removed() -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker
+            .configure_session(json!({"automatic_checks":true}))
+            .await?;
         broker.session.approval_mode = ApprovalMode::Allow;
         broker.session.shell = crate::session::CheckShell::Nushell;
         let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -11060,6 +11031,9 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker
+            .configure_session(json!({"automatic_checks":true}))
+            .await?;
         broker.session.shell = crate::session::CheckShell::Nushell;
         broker.backend = Arc::new(AutomaticCheckBackend {
             turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -11123,6 +11097,9 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker
+            .configure_session(json!({"automatic_checks":true}))
+            .await?;
         std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true},"action":{"command":"print ok","label":"Verify","category":"test"}}}}).to_string())?;
         let checkpoint = broker
             .checkpoint
@@ -15380,7 +15357,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn review_questions_use_main_conversation_and_persist_in_timeline_without_revising() {
+    async fn review_question_answers_require_the_scoped_tool_without_revising_the_source() {
         use crate::plan::review_document::ReadOnlyPlanReview;
         use forge_buffer::identity::{DocumentId, InputSequence, ViewId};
         use forge_buffer::input::DocumentInput;
@@ -15463,54 +15440,124 @@ mod test {
             )
             .unwrap();
         let selected_task = serde_json::to_value(broker.current_task().unwrap()).unwrap();
-        let result = broker
-            .dispatch(Request {
-                id: 2,
-                method: "plan.questions.answer".into(),
-                params: params.clone(),
-            })
-            .await;
+        let count = broker.snapshot().unwrap().exchange.len();
+        let (document, mut questions, _) = broker.prepare_review_questions(&params).unwrap();
+        assert_eq!(questions.len(), 1);
+        let scope = crate::plan::review_answer::ReviewAnswerScope::new(
+            Arc::clone(&broker.plan_review),
+            document.clone(),
+            questions.remove(0),
+        );
+        let mut context =
+            crate::control_tools::ControlTurnContext::inactive(PromptMode::PlanQuestion);
+        context.review_answer = Some(Arc::clone(&scope));
+        let names = crate::control_tools::ControlToolRegistry
+            .definition_list_for_context(Some(&context), true)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"plan_review_answer"));
+        assert!(!names.contains(&"design_patch"));
+        assert!(!names.contains(&"question_ask"));
+        let mut runtime = crate::control_tools::ControlToolRuntime::new(context);
         assert!(
-            result.response.error().is_none(),
-            "{:?}",
-            result.response.error()
+            runtime
+                .invoke(crate::control_tools::ControlToolInvocation {
+                    name: "plan_review_answer".into(),
+                    arguments: json!({"question_id":"wrong", "answer":"wrong"})
+                })
+                .await
+                .is_err()
         );
+        assert!(!scope.answered().unwrap());
+        assert!(
+            runtime
+                .invoke(crate::control_tools::ControlToolInvocation {
+                    name: "plan_review_answer".into(),
+                    arguments: json!({"question_id":"question", "answer":"   "})
+                })
+                .await
+                .is_err()
+        );
+        runtime.invoke(crate::control_tools::ControlToolInvocation {
+            name: "plan_review_answer".into(), arguments: json!({"question_id":"question", "answer":"The declaration preserves the caller contract."})
+        }).await.unwrap();
+        assert!(scope.answered().unwrap());
         let snapshot = broker.snapshot().unwrap();
-        let after = snapshot.active_plan.as_ref().unwrap();
-        assert_eq!(after.id, other.id);
-        assert_eq!(
-            snapshot.exchange.last().unwrap().plan_id.as_deref(),
-            Some(before.id.as_str())
-        );
+        assert_eq!(snapshot.exchange.len(), count);
+        assert_eq!(snapshot.active_plan.as_ref().unwrap().id, other.id);
         assert_eq!(
             serde_json::to_value(broker.current_task().unwrap()).unwrap(),
             selected_task
         );
-        assert_eq!(after.review_digest, before.review_digest);
-        assert_eq!(after.model_revision, before.model_revision);
         assert_eq!(broker.session.backend_session_id, thread);
-        assert_eq!(snapshot.exchange.last().unwrap().prompt, "Why this API?");
-        assert!(
-            timeline_text(&snapshot).contains("This declaration defines the proposed interface")
-        );
-        assert!(
-            result.response.result().unwrap()["annotation"][0]["reply"]["body"]
-                .as_str()
+        assert_eq!(
+            broker.plan_review.annotations(&document).unwrap()[0]
+                .reply
+                .as_ref()
                 .unwrap()
-                .contains("This declaration")
+                .body,
+            "The declaration preserves the caller contract."
         );
-        let count = snapshot.exchange.len();
         let mut params = params;
         params["review"]["sequence"] = json!(2);
-        let repeated = broker
-            .dispatch(Request {
-                id: 3,
-                method: "plan.questions.answer".into(),
-                params,
-            })
-            .await;
-        assert!(repeated.response.error().is_none());
-        assert_eq!(broker.snapshot().unwrap().exchange.len(), count);
+        assert!(
+            broker
+                .prepare_review_questions(&params)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert!(
+            broker
+                .configure_ask_model(json!({"model":"missing"}))
+                .await
+                .is_err()
+        );
+        let original_model = broker.session.model.clone();
+        let mut resolved_source = broker.session.clone();
+        resolved_source.model = "default".into();
+        resolved_source.resolved_model = Some("resolved-planning-model".into());
+        assert_eq!(
+            crate::settings::AskModel::default()
+                .resolve(&resolved_source, &[])
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("resolved-planning-model")
+        );
+        broker
+            .configure_ask_model(
+                json!({"model":"mock-model","effort":"high","service_tier":"fast"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(broker.session.model, original_model);
+        assert_eq!(
+            broker.snapshot().unwrap().ask_model.effort.as_deref(),
+            Some("high")
+        );
+
+        params["review"]["sequence"] = json!(3);
+        params["draft_annotation"][0]["id"] = json!("retry-question");
+        params["draft_annotation"][0]["source"]["body"] = json!("Explain the caller contract.");
+        let (document, mut questions, _) = broker.prepare_review_questions(&params).unwrap();
+        assert!(scope.check().is_err());
+        let scope = crate::plan::review_answer::ReviewAnswerScope::new(
+            Arc::clone(&broker.plan_review),
+            document,
+            questions.remove(0),
+        );
+        let backend = Arc::new(super::review_question::test::RetryReviewBackend::new(
+            Arc::clone(&broker.backend),
+        ));
+        broker.backend = backend.clone();
+        broker
+            .run_review_question(Arc::clone(&scope), &crate::settings::AskModel::default())
+            .await
+            .unwrap();
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+        assert!(scope.answered().unwrap());
     }
 
     fn submit_test_plan(
@@ -17212,7 +17259,7 @@ mod test {
         );
         let catalog: Value =
             serde_json::from_str(&scope.invoke("check_definition_list", json!({})).await?)?;
-        assert_eq!(catalog["automatic_checks"], true);
+        assert_eq!(catalog["automatic_checks"], false);
         assert_eq!(catalog["check_timing"], "after_queue");
         let configured = catalog["configured"].clone();
         for (automatic_checks, check_timing) in [

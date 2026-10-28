@@ -68,11 +68,13 @@ local function add_message(scene, key, body)
 end
 
 local function begin_answer(scene, body)
-  scene.hold = mock.hold(scene.review.session_id, "plan_question")
+  scene.hold = mock.hold(scene.review.session_id, "plan_question", true)
   press(scene, ":write<CR>")
   local pending = scene.hold:wait()
   assert(pending.mode == "plan_question" and pending.prompt:find(body, 1, true),
     "response hold captured a different question")
+  assert(pending.session_id ~= scene.review.session_id, "review question entered the main timeline")
+  scene.answer_session_id = pending.session_id
   assert(scene.review.owner.saving, "question did not remain pending before release")
   assert(text(scene):find("Answering…", 1, true), "pending question omitted its progress row")
 end

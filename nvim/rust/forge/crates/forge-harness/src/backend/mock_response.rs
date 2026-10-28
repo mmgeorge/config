@@ -15,7 +15,11 @@ use super::{BackendRequest, PromptMode};
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum MockResponseCommand {
     /// Hold the next matching prompt. An omitted mode matches any prompt mode.
-    Hold { mode: Option<PromptMode> },
+    Hold {
+        mode: Option<PromptMode>,
+        #[serde(default)]
+        any_session: bool,
+    },
     /// Wait for the provider to reach a previously armed hold without polling.
     Wait { id: String },
     /// Release an arrived response. An unclaimed, cancelled, or unknown hold is an error.
@@ -45,6 +49,7 @@ struct ResponseHold {
     id: String,
     session_id: String,
     mode: Option<PromptMode>,
+    any_session: bool,
     state: watch::Sender<ResponseState>,
 }
 
@@ -64,7 +69,7 @@ impl MockResponseControl {
     ) -> Result<Value> {
         let cancel = matches!(&command, MockResponseCommand::Cancel { .. });
         match command {
-            MockResponseCommand::Hold { mode } => {
+            MockResponseCommand::Hold { mode, any_session } => {
                 let id = uuid::Uuid::new_v4().to_string();
                 let (state, _) = watch::channel(ResponseState::Armed);
                 self.hold_queue
@@ -74,6 +79,7 @@ impl MockResponseControl {
                         id: id.clone(),
                         session_id: session_id.to_owned(),
                         mode,
+                        any_session,
                         state,
                     }));
                 Ok(json!({"id":id}))
@@ -126,7 +132,7 @@ impl MockResponseControl {
     pub(crate) fn arrive(&self, request: &BackendRequest) -> Option<MockResponseLease<'_>> {
         let hold_queue = self.hold_queue.lock().unwrap();
         let hold = hold_queue.iter().find(|hold| {
-            hold.session_id == request.harness_session_id
+            (hold.any_session || hold.session_id == request.harness_session_id)
                 && hold.mode.is_none_or(|mode| mode == request.mode)
                 && matches!(*hold.state.borrow(), ResponseState::Armed)
         })?;
@@ -220,6 +226,7 @@ mod tests {
                 "session",
                 MockResponseCommand::Hold {
                     mode: Some(PromptMode::PlanQuestion),
+                    any_session: false,
                 },
             )
             .await?;
@@ -263,10 +270,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_response_hold_keeps_control_with_the_requesting_session() -> Result<()> {
+        let control = MockResponseControl::default();
+        let held = control
+            .dispatch(
+                "source",
+                MockResponseCommand::Hold {
+                    mode: Some(PromptMode::PlanQuestion),
+                    any_session: true,
+                },
+            )
+            .await?;
+        let id = held["id"].as_str().unwrap().to_owned();
+        let hold = control
+            .arrive(&request("fork", PromptMode::PlanQuestion))
+            .unwrap();
+        let observed = control
+            .dispatch("source", MockResponseCommand::Wait { id: id.clone() })
+            .await?;
+        assert_eq!(observed["session_id"], "fork");
+        assert!(
+            control
+                .dispatch("fork", MockResponseCommand::Release { id: id.clone() })
+                .await
+                .is_err()
+        );
+        control
+            .dispatch("source", MockResponseCommand::Release { id })
+            .await?;
+        hold.released().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn early_release_and_wrong_session_leave_the_hold_armed() -> Result<()> {
         let control = MockResponseControl::default();
         let held = control
-            .dispatch("session", MockResponseCommand::Hold { mode: None })
+            .dispatch(
+                "session",
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
             .await?;
         let id = held["id"].as_str().unwrap().to_owned();
         let early = control
@@ -297,7 +343,13 @@ mod tests {
     async fn cancellation_and_dropped_requests_wake_waiters_and_remove_holds() -> Result<()> {
         let control = MockResponseControl::default();
         let held = control
-            .dispatch("session", MockResponseCommand::Hold { mode: None })
+            .dispatch(
+                "session",
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
             .await?;
         let id = held["id"].as_str().unwrap().to_owned();
         let mut waiting =
@@ -311,7 +363,13 @@ mod tests {
         assert!(control.hold_queue.lock().unwrap().is_empty());
 
         let held = control
-            .dispatch("session", MockResponseCommand::Hold { mode: None })
+            .dispatch(
+                "session",
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
             .await?;
         let id = held["id"].as_str().unwrap().to_owned();
         let hold = control
@@ -335,7 +393,13 @@ mod tests {
         );
 
         let held = control
-            .dispatch("session", MockResponseCommand::Hold { mode: None })
+            .dispatch(
+                "session",
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
             .await?;
         let id = held["id"].as_str().unwrap().to_owned();
         let mut waiting =
@@ -353,10 +417,22 @@ mod tests {
     async fn repeated_holds_claim_one_matching_response_in_order() -> Result<()> {
         let control = MockResponseControl::default();
         let first = control
-            .dispatch("session", MockResponseCommand::Hold { mode: None })
+            .dispatch(
+                "session",
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
             .await?;
         let second = control
-            .dispatch("session", MockResponseCommand::Hold { mode: None })
+            .dispatch(
+                "session",
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
             .await?;
         let first_hold = control
             .arrive(&request("session", PromptMode::Chat))

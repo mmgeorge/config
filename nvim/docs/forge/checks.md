@@ -151,7 +151,7 @@ changes source. Keep those dependencies only when the prerequisite is required.
 
 ## Completion and repair
 
-In `/config` under **Checks → Automatic**, **Enabled** starts on. Space toggles
+In `/config` under **Checks → Automatic**, **Enabled** starts off. Space toggles
 it using `●` for enabled and `○` for disabled. Turning it off suppresses automatic
 completion checks. Explicit runs and plan Checking remain available. An already
 running check finishes unless stopped explicitly.

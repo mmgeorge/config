@@ -57,6 +57,11 @@ for _, state in ipairs({ "error", "unavailable" }) do
   local about_line = vim.api.nvim_buf_get_lines(replica.buffer, about_start, about_start + 1, false)[1]
   assert(about_line:match("^About:%s+error$"), "PR fallback hid a commit generation error")
 end
+render.present_context(replica, { about = { state = "generating", text = "old message", model = "luna · thinking low · fast" } })
+local _, generating_start = replica.sequence:position("status:context:about")
+local generating_line = vim.api.nvim_buf_get_lines(replica.buffer, generating_start, generating_start + 1, false)[1]
+assert(generating_line:find("Generating with luna · thinking low · fast", 1, true), generating_line)
+assert(not generating_line:find("old message", 1, true), "generation retained the previous About subject")
 input.close(view)
 require("forge.buffer").close(replica)
 print("status_header_width: Unicode cap, alignment, wrapping, cursor movement and PR fallback passed")

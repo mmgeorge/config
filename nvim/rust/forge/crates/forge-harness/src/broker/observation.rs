@@ -290,11 +290,15 @@ impl BrokerObserver {
     ) -> Result<BrokerSnapshot> {
         let status_thoughts = self.status_thoughts.load(Ordering::Relaxed);
         let mut session = source_session.clone();
-        let settings = crate::settings::SettingsStore::read_only(&self.data_root)?
-            .get(&session.workspace, &session.id, &session.backend)?
-            .desired;
+        let snapshot = crate::settings::SettingsStore::read_only(&self.data_root)?.get(
+            &session.workspace,
+            &session.id,
+            &session.backend,
+        )?;
+        let ask_model = snapshot.ask_model()?;
+        let settings = snapshot.desired;
         let check_timing = settings.check_timing.unwrap_or_default();
-        let automatic_checks = settings.automatic_checks.unwrap_or(true);
+        let automatic_checks = settings.automatic_checks_enabled();
         (session.approval_timeout, session.answer_timeout) =
             self.permission_coordinator.input_timeouts(&session.id)?;
         let goal = source_session
@@ -471,6 +475,7 @@ impl BrokerObserver {
             })
             .collect();
         Ok(BrokerSnapshot {
+            ask_model,
             access_abbreviation: session.access.abbreviation().into(),
             subagent_tools: self.agent_coordinator.enabled(),
             lsp_tools: self.lsp.enabled(&source_session.id),

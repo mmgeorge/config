@@ -197,7 +197,7 @@ function M.editor(target, client_addr)
     record(st.trace, "editor.submit", {
       cancelled = abort, ms = st.trace.editor_opened and perf.elapsed_ms(st.trace.editor_opened),
     })
-    if vim.api.nvim_buf_is_valid(buf) then vim.b[buf].forge_ai_commit_revision = (vim.b[buf].forge_ai_commit_revision or 0) + 1 end
+    if vim.api.nvim_buf_is_valid(buf) then require("forge.integrations.ai_commit").cancel_buffer_generation(buf) end
     if M._active then M._active.aborted = abort end
     if abort and vim.api.nvim_buf_is_valid(buf) then vim.bo[buf].modified = false end
     if not abort and vim.api.nvim_buf_is_valid(buf) then

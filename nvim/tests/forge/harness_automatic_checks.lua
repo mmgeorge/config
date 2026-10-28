@@ -34,7 +34,7 @@ local succeeded, failure = xpcall(function()
   require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "session-blocking" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timeout")
-  request("session.configure", { shell = "nushell" })
+  request("session.configure", { shell = "nushell", automatic_checks = true })
   local done, completed, problem
   client.request("prompt.submit", { text = "Inspect the fixture" }, function(value, error)
     completed, problem, done = value, error, true
