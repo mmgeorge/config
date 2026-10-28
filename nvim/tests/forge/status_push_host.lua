@@ -1,3 +1,4 @@
+require("forge.infra.config").defaults.about_auto_generate = false
 dofile(vim.fn.getcwd() .. "/nvim/tests/forge/fixtures/commit_reuse_manual.lua")
 local state = forge_reuse.state
 local repository = forge_reuse.fixture
@@ -44,14 +45,14 @@ vim.api.nvim_create_autocmd("BufWinLeave", { buffer = state.replica.buffer, call
 writer.execute = function(workspace, action, callback, progress)
   assert(workspace == repository and action.kind == "push", "unexpected write")
   assert(vim.api.nvim_get_current_buf() == state.replica.buffer, "push switched buffers before starting")
-  assert(state.replica.presentation.remote_action.status == "Pushing...", "push did not present initial progress")
+  assert(state.replica.presentation.remote_action.status:find(" Pushing…", 1, true), "push did not present initial progress")
   writes = writes + 1
   return original_execute(workspace, action, function(result) outcome = result callback(result) end, function(text, stream)
     progress(text, stream)
     progress_seen = true
     assert(not left_status and vim.api.nvim_get_current_buf() == state.replica.buffer, "push progress replaced Status")
     local status = state.replica.presentation.remote_action.status
-    local rows = table.concat(state.replica.block["status:context:push"].text, " ")
+    local rows = table.concat(state.replica.source_entry["status:context:push"].text, " ")
     assert(rows:find(status, 1, true) or rows:find(status:sub(1, 20), 1, true), "Git progress did not reach the Push header")
   end)
 end

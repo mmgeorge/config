@@ -100,17 +100,24 @@ function M.producer_handlers(options)
     if not options.is_alive() or remote_active then return end
     local context = options.context and options.context()
     if not context then notifications.error("Repository context is still loading") return end
-    local operation = {}
+    local spinner = require("forge.render.spinner")
+    local operation = { status = action == "push" and "Pushing…" or "Pulling…" }
     remote_active = operation
-    context.set_remote_action({ action = action, status = action == "push" and "Pushing..." or "Pulling..." })
+    local function publish(frame)
+      context.set_remote_action({ action = action, status = frame .. " " .. operation.status })
+    end
+    local stop_spinner = spinner.watch(function()
+      return remote_active == operation and options.is_alive()
+    end, publish)
     require("forge.git.write").execute(options.workspace, { kind = action }, function(result)
       if remote_active ~= operation then return end
+      stop_spinner()
       remote_active = false
       context.set_remote_action(nil)
       if not result.ok then notifications.error("Git " .. action .. " failed: " .. result.output) end
       refresh()
     end, function(text)
-      if remote_active ~= operation then return end
+      if remote_active ~= operation or not options.is_alive() then return end
       local latest, percentage
       for line in text:gmatch("[^\r\n]+") do
         line = vim.trim(line)
@@ -118,7 +125,10 @@ function M.producer_handlers(options)
         if line:match(":%s*%d+%%") then percentage = line end
       end
       latest = percentage or latest
-      if latest then context.set_remote_action({ action = action, status = vim.fn.strcharpart(latest, 0, 1024) }) end
+      if latest then
+        operation.status = latest
+        publish(spinner.frame_at(vim.uv.now()))
+      end
     end)
   end
   local function start_commit(amend)

@@ -1,14 +1,8 @@
 local M = {}
 
-M.spinner_frame_list = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
-
---- Computes the active spinner animation glyph for an epoch timestamp.
----@param now_ms integer Current epoch timestamp in milliseconds.
----@return string glyph Spinner character.
-function M.frame_at(now_ms)
-  local index = math.floor((now_ms or 0) / 120) % #M.spinner_frame_list + 1
-  return M.spinner_frame_list[index]
-end
+local spinner = require("forge.render.spinner")
+M.spinner_frame_list = spinner.frame_list
+M.frame_at = spinner.frame_at
 
 --- Appends an animated status indicator row to the timeline render target.
 ---@param result table Target render collection table.

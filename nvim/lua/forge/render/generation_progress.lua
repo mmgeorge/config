@@ -1,5 +1,5 @@
 local M = {}
-local spinner = require("forge.render.harness.timeline_status")
+local spinner = require("forge.render.spinner")
 
 ---@param state {model?: string}
 ---@param now_ms? integer
@@ -14,22 +14,9 @@ end
 ---@param update fun(text: string)
 ---@return fun()
 function M.watch(state, current, update)
-  local timer = assert(vim.uv.new_timer())
-  local stopped = false
-  local function stop()
-    if stopped then return end
-    stopped = true
-    timer:stop()
-    timer:close()
-  end
-  local function tick()
-    if stopped then return end
-    if state.state ~= "generating" or not current() then stop() return end
+  return spinner.watch(function() return state.state == "generating" and current() end, function()
     update(M.text(state))
-  end
-  timer:start(120, 120, vim.schedule_wrap(tick))
-  tick()
-  return stop
+  end)
 end
 
 return M
