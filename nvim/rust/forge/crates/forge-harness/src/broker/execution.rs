@@ -128,7 +128,7 @@ impl HarnessBroker {
             .filter(|exchange| exchange.id != interaction.id
                 && exchange.execution_id.as_deref() == Some(execution_id))
             .chain(std::iter::once(interaction))
-            .flat_map(|exchange| exchange.turn.iter().flat_map(move |turn| turn.tools().map(move |tool| (turn, tool))))
+            .flat_map(|exchange| exchange.tools())
             .filter(|(_, tool)| matches!(tool.state(), crate::turn::ToolState::Completed | crate::turn::ToolState::Failed))
             .map(|(turn, tool)| json!({"id":tool.id,"call_id":format!("{}:{}", turn.id(), tool.id),"title":tool.title.chars().take(240).collect::<String>(),
                 "state":if tool.state() == crate::turn::ToolState::Failed { "failed" } else { "completed" },
@@ -779,7 +779,7 @@ impl HarnessBroker {
             for tool in interaction
                 .turn
                 .iter()
-                .flat_map(|turn| turn.tools())
+                .flat_map(|turn| interaction.tools_for_turn(turn.id()))
                 .filter(|tool| {
                     matches!(
                         tool.state(),

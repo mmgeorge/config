@@ -26,6 +26,8 @@ function M.open(options, callback)
     loading_mark = {}
   end
   local identity = "harness:" .. options.session_id .. ":" .. tostring(vim.uv.hrtime())
+  ---@class HarnessPresentation
+  ---@field status_view HarnessStatusView
   local owner = { document = identity, closed = false, syncing = false, pending = false, output = {},
     session_id = options.session_id, host_generation = client.host_generation(), views = {},
     timeline_key = "main", timeline_view = {}, epoch = 0,
@@ -225,6 +227,12 @@ function M.open(options, callback)
     request({ operation = "snapshot", document = document.document }, function(snapshot, failure)
       if not alive() then return end
       if failure then fail("Transcript recovery failed: " .. tostring(failure)) return end
+      if document == owner.status_view.native then
+        owner.status_view:apply(snapshot, function(applied)
+          if applied and options.on_update then options.on_update() end
+        end)
+        return
+      end
       owner.applying = true
       replica.apply_async(document, snapshot, alive, guard(function(result)
         owner.applying = false
@@ -243,6 +251,7 @@ function M.open(options, callback)
   local transcript_tick = vim.api.nvim_buf_get_changedtick(options.transcript_buffer)
   local function reject_open(message)
     owner.closed = true
+    if owner.status_view then owner.status_view:close() end
     if owner.selection then owner.selection.close() end
     markdown.clear(options.transcript_buffer)
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
@@ -262,10 +271,11 @@ function M.open(options, callback)
       owner.timeline_view[owner.save_timeline] = saved
       owner.save_timeline = nil
     end,
-    after_commit = function()
-      require("forge.views.harness.status_region").align(owner.transcript, options.transcript_window)
-    end,
     recover = function() recovery(owner.transcript) end })
+  owner.status_view = require("forge.views.harness.status_view").new({
+    transcript = owner.transcript, transcript_window = options.transcript_window,
+    composer_window = options.composer_window, alive = alive, notice = notice, recover = recovery,
+  })
   owner.selection = require("forge.document_commands").attach_selection(owner.transcript, { normalize = false })
   owner.transcript.fold_loading = {}
   owner.view = input.open(owner.transcript, options.transcript_window, transcript_options)
@@ -346,6 +356,8 @@ function M.open(options, callback)
       reject_open("Harness native documents could not be adopted")
       return
     end
+    owner.status_view:apply(opened.status, guard(function(applied)
+    if not applied then reject_open("Harness status could not be adopted") return end
     owner.ready = true
     flush_staging()
     render_markdown()
@@ -353,7 +365,8 @@ function M.open(options, callback)
     if not options.read_only then owner.terminals = require("forge.views.harness.terminals").watch({
       session_id = options.session_id, alive = alive, notice = notice,
       update = function(snapshot)
-        owner.transcript.background_terminals = snapshot
+        owner.status_view.context.background_terminals = snapshot
+        owner.status_view:render()
         if options.on_update then options.on_update() end
       end,
     }) end
@@ -363,6 +376,7 @@ function M.open(options, callback)
     if opened.syntax_pending then vim.schedule(function() owner.highlight() end) end
     if startup then startup.mark("document.ready") startup.watch(options.transcript_buffer) end
     dispatch_next()
+    end))
     end))
   end)
 
@@ -552,11 +566,14 @@ function M.open(options, callback)
         if owner.pending then owner.sync() end
         dispatch_next()
       end
+      local function complete_status()
+        owner.status_view:apply(result.status, guard(function() complete() end))
+      end
       local snapshot = type(result.snapshot) == "table" and result.snapshot or nil
       local update = snapshot or { patch = result.patch or {} }
       if not snapshot and #update.patch == 0 then
         owner.transcript.before_commit()
-        complete()
+        complete_status()
         return
       end
       if not snapshot and #update.patch == 1 then update = update.patch[1] end
@@ -569,7 +586,7 @@ function M.open(options, callback)
             dispatch_next()
             return
           end
-          complete()
+          complete_status()
       end))
     end)
   end
@@ -783,7 +800,7 @@ function M.open(options, callback)
     if not alive() or not owner.ready then return end
     owner.refresh_views()
     render_markdown(true)
-    require("forge.views.harness.status_region").align(owner.transcript, options.transcript_window)
+    owner.status_view:resize()
     owner.pending_width = owner.pending_width or {}
     for window, view in pairs(owner.views) do
       owner.pending_width[view.id] = { view = view.id, width = require("forge.width").capture(window) }
@@ -801,6 +818,28 @@ function M.open(options, callback)
       end, nil, function() owner.resizing = false end)
     end
     send_width()
+  end
+
+  function owner.status_action(callback)
+    if not alive() or not owner.ready then return end
+    local view = action_view()
+    local snapshot = owner.status_view.snapshot
+    if not view or not snapshot then return end
+    local target
+    for _, block in ipairs(snapshot.block) do
+      local status = block.metadata.status
+      if type(status) == "table" and status.hint == "review" then
+        local candidate = block.metadata.target and block.metadata.target[1]
+        if candidate then target = candidate.id end
+      end
+    end
+    if not target then return end
+    view.sequence = view.sequence + 1
+    request({ operation = "status_action", document = identity, status = snapshot.document,
+      revision = snapshot.revision, target = target, view = view.id, sequence = view.sequence }, function(action, failure)
+      if failure then notice(failure) return end
+      callback(action)
+    end)
   end
 
   function owner.open_output(action, previous_input)
@@ -915,8 +954,7 @@ function M.open(options, callback)
     if owner.terminals then owner.terminals.close() end
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     for _, output in ipairs(owner.output) do output.close() end
-    require("forge.views.harness.status_hint").clear(options.transcript_buffer)
-    require("forge.views.harness.status_region").clear(options.transcript_buffer)
+    owner.status_view:close()
     owner.output = {}
     for _, view in pairs(owner.views) do input.close(view) end
     owner.views = {}

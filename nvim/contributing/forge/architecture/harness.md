@@ -121,8 +121,9 @@ Uncertain provider writes require journal
 reconciliation before replay. Message diagnostics render separately from the
 canonical task status and cannot replace plan-review actions.
 
-The active view displays steering above queued follow-ups until provider acceptance.
-Idle submissions remain hidden until their exchange appears. Failed messages remain
+The status split displays pending steering above queued follow-ups until provider acceptance,
+including when execution is paused or idle. Workflow-phase changes preserve that pending block.
+Direct submissions enter exchange history. Failed messages remain
 visible in red with the configured retry shortcut and block later follow-ups
 until retry or removal. Acceptance preserves the message
 identity in the exchange, so later staging updates cannot display a second copy.
@@ -231,6 +232,20 @@ Check updates preserve an active provider phase or user-decision wait. When the
 provider is idle and checks remain active, the primary label is Checking and the
 check row names its trigger. Rust owns both timers, while Lua animates only the
 committed primary status marker.
+
+`OpenPresentation` keeps that status in an independently revisioned `StatusDocument`.
+Transcript projection retains declaration comparisons and conversation content, with
+zero-row anchors for status-only entries. Status snapshots travel with the existing
+open/sync responses. Root-to-agent selection clears root status rather than attributing
+it to the selected child. Returning to the root republishes its current status.
+
+The Lua presentation owns `HarnessStatusView`, which composes native content with local
+notices in a non-focusable split above the composer. Empty content removes the split.
+Session preview suspends it, and closing the presentation retires the native replica,
+display buffer, timers, and details view. A plan-review action validates the status
+document revision, target, registered originating view, and input sequence without
+constructing a transcript-row input. Conversation tools and edits belong to commentary entries in the exchange.
+Steering and typed events remain sibling entries.
 
 Active checks never become historical entries. `TimelineStream::update_checks`
 publishes a lightweight status replacement during execution and atomically removes
@@ -630,15 +645,28 @@ Legacy activity following an intermediate final
 answer retains its relative order. Streaming, completion, and reload use the same layout and node IDs.
 Thoughts and tool groups nest one two-column level below their exchange summary. Tool calls and output
 retain their additional nesting. Adjacent visible tools share one group across provider-turn boundaries.
-Each `ExchangeThought` owns an ordered body of activity groups and steering messages.
-Steering divides activity groups without clearing their commentary owner. A new assistant
-message or question branch changes that owner. Tool completion updates the original call,
-so a late result cannot move beneath a later commentary. Rendering consumes this owned body
-instead of reconstructing ownership separately for steering and activity. Existing sessions
-gain the same grouping when reopened without rewriting their stored event order.
-Hidden reasoning and empty messages do not split that group. Visible commentary, file changes,
-questions, and other timeline content retain their boundaries. Each grouped tool keeps its original
-turn identity for output lookup, actions, and expansion. Final answers remain outside the activity fold. Tool invocation headings retain one display row in both collapsed and expanded states. The shared width-bounded title formatting preserves the duration column and truncates the displayed command or arguments. Full provider titles remain in durable tool state. Active tool previews display the latest four wrapped rows from the incremental output index. New output replaces only the preview body and earlier-line count at the existing presentation cadence. Explicit expansion still reads the full output from its beginning, and settled exchanges remove the automatic preview.
+Each exchange retains an ordered `ExchangeEntry` list with commentary, steering, response,
+and event variants. Commentary owns the only tool store, grouped by provider turn to preserve
+native call identity. Provider turns retain execution lifecycle, messages, and first-seen
+references, but do not retain a second tool store. New tools attach to the current commentary.
+Repeated progress and completion update the original owner even after later commentary or
+steering. Tools arriving without a commentary create a synthetic “Considering initial steps”
+entry. Hidden reasoning and empty messages do not create commentary.
+
+Steering and typed events render beside commentary under the exchange activity heading.
+Collapsing a commentary hides only its tool and file-change groups. Collapsing the outer
+activity heading hides the complete group. `CommentaryView` borrows the persisted ownership
+for rendering, so steering cannot become a child of a commentary fold.
+
+The exchange keeps total, completed, and running tool counters in memory. Tool updates apply
+the difference between the previous and current state. Repeated completion does not increment
+totals again. Reload reconstructs the counters from commentary-owned records. Counters are
+omitted from durable payloads. Existing turn-owned tool stores migrate into commentary on
+read, preserving source order and provider IDs. Output chunks and archived output retain their
+existing exchange/turn/tool identity.
+
+Each grouped tool keeps its original turn identity for output lookup, actions, and expansion.
+Final answers remain outside the activity fold. Tool invocation headings retain one display row in both collapsed and expanded states. The shared width-bounded title formatting preserves the duration column and truncates the displayed command or arguments. Full provider titles remain in durable tool state. Active tool previews display the latest four wrapped rows from the incremental output index. New output replaces only the preview body and earlier-line count at the existing presentation cadence. Explicit expansion still reads the full output from its beginning, and settled exchanges remove the automatic preview.
 `PlanStateMachine` validates question, feedback, submission, review, acceptance, cancellation, and failure
 transitions. `PlanQuestionLedger` records answers, skips, and withdrawals before generation resumes. It matches both
 the provider's logical id and a canonical digest of the user-visible content, so a resolved decision cannot become

@@ -1,8 +1,10 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use forge_buffer::block::{
     BufferBlock, Decoration, StatusHint, StatusPresentation, TargetRange, TextPosition, TextRange,
 };
-use forge_buffer::identity::{BlockId, TargetId};
+use forge_buffer::document::BufferDocument;
+use forge_buffer::identity::{BlockId, DocumentId, DocumentRevision, TargetId};
+use forge_buffer::patch::BufferSnapshot;
 use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 
@@ -10,6 +12,158 @@ use super::projection::TranscriptAction;
 use super::transcript::TranscriptRenderer;
 use crate::checks::CheckActivity;
 use crate::session::state_machine::{ExecutionStatus, SessionPhase, WorkflowActivity};
+
+/// Complete status replacement, source removal, or an unrelated transcript update.
+#[derive(Default)]
+pub(super) enum StatusProjection {
+    #[default]
+    Unchanged,
+    Replace {
+        source: String,
+        rendered: Box<RenderedStatus>,
+    },
+    Remove {
+        source: String,
+    },
+}
+
+impl StatusProjection {
+    pub fn render(
+        entry: &crate::timeline::TimelineEntry,
+        width: &WidthProfile,
+        now_ms: i64,
+    ) -> Result<Self> {
+        let crate::timeline::TimelineEntry::Status {
+            id,
+            status,
+            agent_count,
+            status_thoughts,
+            checks,
+            ..
+        } = entry
+        else {
+            return Ok(Self::Unchanged);
+        };
+        Ok(Self::Replace {
+            source: id.clone(),
+            rendered: Box::new(
+                StatusView {
+                    id,
+                    status,
+                    agent_count: *agent_count,
+                    status_thoughts: *status_thoughts,
+                    checks: checks.as_ref(),
+                }
+                .render(width, now_ms)?,
+            ),
+        })
+    }
+}
+
+/// Native status and action targets retired with their parent presentation.
+pub(super) struct StatusDocument {
+    id: DocumentId,
+    document: BufferDocument,
+    source: Option<String>,
+    action: Option<(TargetId, TranscriptAction)>,
+    content: StatusContent,
+}
+
+#[derive(Clone, Default)]
+struct StatusContent {
+    phase: Option<BufferBlock>,
+    staging: Option<BufferBlock>,
+}
+
+impl StatusDocument {
+    pub fn new(parent: &DocumentId) -> Result<Self> {
+        let id = DocumentId(format!("{}:status", parent.0));
+        Ok(Self {
+            document: BufferDocument::new(id.clone(), Vec::new())?,
+            id,
+            source: None,
+            action: None,
+            content: StatusContent::default(),
+        })
+    }
+
+    pub fn snapshot(&self) -> BufferSnapshot {
+        self.document.snapshot()
+    }
+
+    pub fn id(&self) -> &DocumentId {
+        &self.id
+    }
+
+    pub fn apply(&mut self, projection: StatusProjection) -> Result<()> {
+        let (source, rendered) = match projection {
+            StatusProjection::Unchanged => return Ok(()),
+            StatusProjection::Remove { source } => return self.remove(&source),
+            StatusProjection::Replace { source, rendered } => (source, rendered),
+        };
+        self.publish(StatusContent {
+            phase: rendered.block,
+            ..self.content.clone()
+        })?;
+        self.source = Some(source);
+        self.action = rendered.action;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.publish(StatusContent {
+            phase: None,
+            ..self.content.clone()
+        })?;
+        self.source = None;
+        self.action = None;
+        Ok(())
+    }
+
+    pub fn set_staging(&mut self, staging: Option<BufferBlock>) -> Result<()> {
+        self.publish(StatusContent {
+            staging,
+            ..self.content.clone()
+        })
+    }
+
+    fn publish(&mut self, content: StatusContent) -> Result<()> {
+        let blocks = content
+            .phase
+            .iter()
+            .chain(content.staging.iter())
+            .cloned()
+            .collect();
+        self.document.edit(0..self.document.block_count(), blocks)?;
+        self.content = content;
+        Ok(())
+    }
+
+    pub fn remove(&mut self, source: &str) -> Result<()> {
+        if self.source.as_deref() == Some(source) {
+            self.clear()?;
+        }
+        Ok(())
+    }
+
+    pub fn action(
+        &self,
+        document: &DocumentId,
+        revision: DocumentRevision,
+        target: &TargetId,
+    ) -> Result<TranscriptAction> {
+        ensure!(
+            *document == self.id && revision == self.document.revision(),
+            "status document revision changed"
+        );
+        let (current, action) = self
+            .action
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("status is not actionable"))?;
+        ensure!(current == target, "status action changed");
+        Ok(action.clone())
+    }
+}
 
 /// Main workflow status and independent check progress for one live session.
 pub(super) struct StatusView<'source> {
@@ -35,6 +189,12 @@ impl StatusView<'_> {
             status_thoughts,
             checks,
         } = *self;
+        if matches!(status, SessionPhase::Idle) && checks.is_none() && agent_count == 0 {
+            return Ok(RenderedStatus {
+                block: None,
+                action: None,
+            });
+        }
         let checking = checks.is_some() && matches!(status, SessionPhase::Idle);
         let text = if checking {
             "Checking".into()
@@ -49,15 +209,10 @@ impl StatusView<'_> {
         } else {
             text
         };
-        let text = if text.is_empty() {
-            text
-        } else {
-            format!("\n{text}")
-        };
         let mut block =
             TranscriptRenderer::new(width)?.literal(BlockId(id.to_owned()), &text, 0)?;
         block.metadata.status = Some(StatusPresentation {
-            row: 1,
+            row: 0,
             animated: checking || status.animated(),
             hint: if checking {
                 Some(StatusHint::Working)
@@ -74,7 +229,7 @@ impl StatusView<'_> {
                 }
             },
         });
-        let action = bind_primary_action(&mut block, id, status);
+        let action = bind_action(&mut block, id, status);
         if let Some(checks) = checks {
             append_checks(&mut block, width, checks, now_ms)?;
         }
@@ -86,14 +241,17 @@ impl StatusView<'_> {
         {
             append_reasoning_preview(&mut block, width, summary)?;
         }
-        Ok(RenderedStatus { block, action })
+        Ok(RenderedStatus {
+            block: Some(block),
+            action,
+        })
     }
 }
 
 /// Status rows and their optional plan-review action.
 pub(super) struct RenderedStatus {
     /// Complete status block, including independent check progress.
-    pub block: BufferBlock,
+    pub block: Option<BufferBlock>,
     /// Action owned by the primary status line.
     pub action: Option<(TargetId, TranscriptAction)>,
 }
@@ -154,7 +312,7 @@ fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
     }
 }
 
-fn bind_primary_action(
+fn bind_action(
     block: &mut BufferBlock,
     id: &str,
     status: &SessionPhase,
@@ -163,7 +321,7 @@ fn bind_primary_action(
     if let SessionPhase::AwaitingPlanReview { plan_id, .. } = status {
         block.metadata.decoration.push(Decoration {
             range: TextRange {
-                start: TextPosition { row: 1, column: 0 },
+                start: TextPosition { row: 0, column: 0 },
                 end: TextPosition {
                     row: block.text.row_count(),
                     column: 0,
@@ -176,7 +334,7 @@ fn bind_primary_action(
         block.metadata.target.push(TargetRange {
             id: target.clone(),
             range: TextRange {
-                start: TextPosition { row: 1, column: 0 },
+                start: TextPosition { row: 0, column: 0 },
                 end: TextPosition {
                     row: block.text.row_count(),
                     column: 0,
@@ -202,7 +360,7 @@ fn bind_primary_action(
         block.metadata.target.push(TargetRange {
             id: TargetId(format!("{id}:{role}")),
             range: TextRange {
-                start: TextPosition { row: 1, column: 0 },
+                start: TextPosition { row: 0, column: 0 },
                 end: TextPosition {
                     row: block.text.row_count(),
                     column: 0,
@@ -283,37 +441,9 @@ fn append_reasoning_preview(
         &normalized,
         width,
     )?;
-    let first = rendered.block.text.row(0).unwrap_or("");
-    let preview = if rendered.block.text.row_count() > 1 || width.cells(first, 0)? > width.columns {
-        let suffix = ["...", "..", ".", ""]
-            .into_iter()
-            .find(|suffix| {
-                width
-                    .cells(suffix, 0)
-                    .is_ok_and(|cells| cells <= width.columns)
-            })
-            .unwrap_or("");
-        let available = width.columns.saturating_sub(width.cells(suffix, 0)?);
-        let prefix = if available == 0 {
-            ""
-        } else {
-            let mut preview_width = width.clone();
-            preview_width.columns = available;
-            let (end, _) = preview_width.wrapped_prefix(first, 1, 0)?;
-            let prefix = &first[..end];
-            if width.cells(prefix, 0)? <= available {
-                prefix.trim_end()
-            } else {
-                ""
-            }
-        };
-        format!("{prefix}{suffix}")
-    } else {
-        first.to_owned()
-    };
     let start = block.text.row_count();
     let mut rows = block.text.wire_rows();
-    rows.push(&preview);
+    rows.extend(rendered.block.text.wire_rows());
     block.text = forge_buffer::text::BufferText::from_rows(rows)?;
     block.metadata.decoration.push(Decoration {
         range: TextRange {

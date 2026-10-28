@@ -61,6 +61,7 @@ end
 
 client.host_accepting = function() return true end
 client.request_for = function(_, _, params, callback)
+  callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   if params.operation == "background_terminals" then callback({ supported = false })
   elseif params.operation == "open" then
     vim.schedule(function() callback({ transcript = snapshot(params.document) }) end)

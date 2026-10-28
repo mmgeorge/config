@@ -10,3 +10,6 @@ pub use turn::{Turn, TurnOutcome, TurnState};
 
 pub use message::{Message, MessageDelivery, MessageKind, TurnItem};
 mod identity;
+
+#[cfg(test)]
+pub(crate) mod test_support;

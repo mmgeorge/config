@@ -716,6 +716,8 @@ mod test {
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 1,
+            entry: Vec::new(),
+            tool_counter: Default::default(),
             node_list: Vec::new(),
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),

@@ -3,6 +3,7 @@ local client = require("forge.client")
 local requests = {}
 client.host_accepting = function() return true end
 client.request_for = function(_, _, params, callback)
+  callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   if params.operation == "background_terminals" then callback({ supported = false }) return end
   requests[#requests + 1] = { params = params, callback = callback, time = vim.uv.hrtime() }
 end

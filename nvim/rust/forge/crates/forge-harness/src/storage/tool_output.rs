@@ -63,24 +63,73 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn visit_output(
-    value: &mut Value,
-    mut visit: impl FnMut(&str, &str, &str) -> Result<()>,
+pub(super) fn visit_tool_records(
+    object: &mut serde_json::Map<String, Value>,
+    mut visit: impl FnMut(&str, &str, &mut Value) -> Result<()>,
 ) -> Result<()> {
-    for turn in value["turn"].as_array_mut().into_iter().flatten() {
+    for turn in object
+        .get_mut("turn")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
         let turn_id = turn["id"]
             .as_str()
             .context("stored turn has no identity")?
             .to_owned();
-        for (tool_id, tool) in turn["tool"]["item"].as_object_mut().into_iter().flatten() {
-            let output = tool["output"]
+        for (tool_id, tool) in turn
+            .get_mut("tool")
+            .and_then(|store| store.get_mut("item"))
+            .and_then(Value::as_object_mut)
+            .into_iter()
+            .flatten()
+        {
+            visit(&turn_id, tool_id, tool)?;
+        }
+    }
+    for entry in object
+        .get_mut("entry")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if entry["kind"] != "commentary" {
+            continue;
+        }
+        for group in entry["commentary"]["tool"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            let turn_id = group["turn_id"]
                 .as_str()
-                .context("stored tool output is not text")?;
-            visit(&turn_id, tool_id, output)?;
-            tool["output"] = Value::String(String::new());
+                .context("stored tool group has no turn")?
+                .to_owned();
+            for (tool_id, tool) in group["store"]["item"].as_object_mut().into_iter().flatten() {
+                visit(&turn_id, tool_id, tool)?;
+            }
         }
     }
     Ok(())
+}
+
+fn visit_output(
+    value: &mut Value,
+    mut visit: impl FnMut(&str, &str, &str) -> Result<()>,
+) -> Result<()> {
+    visit_tool_records(
+        value
+            .as_object_mut()
+            .context("stored exchange is not an object")?,
+        |turn, tool_id, tool| {
+            let output = tool["output"]
+                .as_str()
+                .context("stored tool output is not text")?;
+            visit(turn, tool_id, output)?;
+            tool["output"] = Value::String(String::new());
+            Ok(())
+        },
+    )
 }
 
 pub(super) fn initialize_positions(connection: &Connection) -> Result<()> {
@@ -246,9 +295,8 @@ fn replace(
 
 pub(super) fn encode(exchange: &Exchange) -> Result<String> {
     let mut metadata = exchange.clone();
-    for turn in &mut metadata.turn {
-        turn.omit_tool_output();
-    }
+    metadata.reconcile_entries()?;
+    metadata.omit_tool_output();
     let mut value = serde_json::to_value(&metadata)?;
     value["tool_output_format"] = Value::from(2);
     Ok(serde_json::to_string(&value)?)
@@ -265,7 +313,7 @@ pub(super) fn synchronize(connection: &Connection, exchange: &Exchange) -> Resul
         })?
         .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
     for turn in &exchange.turn {
-        for tool in turn.tools() {
+        for tool in exchange.tools_for_turn(turn.id()) {
             let stored = previous.remove(&(turn.id().to_owned(), tool.id.clone()));
             if stored.is_none() {
                 connection.execute(
@@ -426,8 +474,8 @@ impl SqliteStore {
             .iter()
             .find(|turn| turn.provider() == address)
             .context("tool output turn is missing")?;
-        let tool = turn
-            .tools()
+        let tool = exchange
+            .tools_for_turn(turn.id())
             .find(|tool| tool.id == activity.id)
             .context("tool output call is missing")?;
         let admitted: bool = self.connection.query_row(
@@ -484,18 +532,16 @@ impl SqliteStore {
                     .as_str()
                     .context("stored exchange has no identity")?
                     .to_owned();
-                for turn in value["turn"].as_array_mut().into_iter().flatten() {
-                    let turn_id = turn["id"]
-                        .as_str()
-                        .context("stored turn has no identity")?
-                        .to_owned();
-                    for (tool_id, tool) in
-                        turn["tool"]["item"].as_object_mut().into_iter().flatten()
-                    {
+                visit_tool_records(
+                    value
+                        .as_object_mut()
+                        .context("stored exchange is not an object")?,
+                    |turn, tool_id, tool| {
                         tool["output"] =
-                            Value::String(read(&self.connection, &exchange_id, &turn_id, tool_id)?);
-                    }
-                }
+                            Value::String(read(&self.connection, &exchange_id, turn, tool_id)?);
+                        Ok(())
+                    },
+                )?;
                 Ok(serde_json::from_value(value)?)
             })
             .collect()

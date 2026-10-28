@@ -63,6 +63,16 @@ pub struct ToolStore {
 }
 
 impl ToolStore {
+    pub(crate) fn insert(&mut self, tool: ToolCall) {
+        if !self.item.contains_key(&tool.id) {
+            self.order.push(tool.id.clone());
+        }
+        self.item.insert(tool.id.clone(), tool);
+    }
+    pub(crate) fn take(&mut self, id: &str) -> Option<ToolCall> {
+        self.order.retain(|existing| existing != id);
+        self.item.remove(id)
+    }
     pub(crate) fn omit_output(&mut self) {
         for tool in self.item.values_mut() {
             tool.output = super::ToolOutputText::default();

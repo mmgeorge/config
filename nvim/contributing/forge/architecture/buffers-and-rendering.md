@@ -44,10 +44,20 @@ an owned buffer, so reentrant owner cleanup cannot attempt a second deletion.
 ## Native views and atomic publication
 
 `forge.status`, `forge.local_diff`, `forge.source_document`, and `forge.walkthrough`
-bind native services to editor views. The Harness controller binds a native transcript document and a Lua-owned
-composer buffer. Shared document commands resolve configured bindings,
+bind native services to editor views. The Harness controller binds native transcript and
+status documents and a Lua-owned composer buffer. `OpenPresentation` owns both native
+outputs. The status document has an independent identity and revision, and status-only
+updates leave transcript rows unchanged. Shared document commands resolve configured bindings,
 help, selections, and gutters from native metadata. Physical source rows contain source
 text, while decorations provide gutters and selection presentation without changing text.
+
+`HarnessStatusView` owns the non-focusable split above the composer, its native replica,
+and a separate composed display buffer. Local notices and shortcut labels never modify
+the native replica. The display retains complete content and constrains only viewport
+height. Its explicit details action opens that content in a focusable view. Layout changes
+capture and restore transcript positions through `buffer_view` within one synchronous
+operation. Empty status releases the split and separator styling, while the native
+document remains alive until its parent presentation closes.
 
 Composer height follows visual wrapped rows, with one spare row and winbar space, within
 the configured minimum and maximum heights. Text changes and window or editor resize events
@@ -60,11 +70,12 @@ scroll position. The height query stops after the visible-row budget, without li
 draft content. This prevents Insert-mode scrolling before window growth from hiding
 the first line of a short draft.
 
-Queued prompts and pending steering are physical, read-only rows below status in
-the timeline. Lua coalesces changes through the presentation's `staging` operation.
-Rust keeps them in a presentation-local block, separate from durable exchange
-history. These rows use normal timeline scrolling and never enter composer text
-or its height calculation. Refreshing staging preserves intentional transcript browsing.
+Queued prompts and pending steering are read-only rows in the status split.
+Lua coalesces changes through the presentation's `staging` operation. Rust keeps
+them in a separate block of the status document, independent of the workflow phase.
+An idle or paused phase does not hide pending messages. Queue changes do not change
+the transcript revision or enter composer text. Accepted message identities remove
+their pending rows when the corresponding message enters durable exchange history.
 Each staged prompt uses a two-cell hanging indent, so wrapped rows and explicit newlines
 align with the text after its bullet. Resizing reflows that indentation without changing
 the stored draft or queue order.
@@ -171,24 +182,22 @@ Action-target snapshots remain separate and only validate whether a response sti
 
 ## Timeline node projection
 
-The timeline projects ordered exchange items into separate message, tool-group, and change
-nodes. `Exchange::thoughts` derives `ExchangeThought` sections from canonical ordered events,
-with events and separate tool and write groups borrowing their current streamed content.
-The model owns visible-call filtering, activity presence, and group identity. The renderer consumes
-each thought's owned groups directly without rediscovering ownership from raw provider events.
-Thought nodes retain the same kind before and after activity arrives. Each thought with activity
-is collapsed by default. Its heading preserves commentary text without appended activity counts.
-Expanding it shows events in arrival order, then one tool group, then one change group, indented
-two spaces below the thought. Empty thoughts keep their open-circle marker without a container
-fold. Explicit thought expansion survives new activity and completion. Streamed text replacement
-preserves the thought node, content ownership, and fold endpoints. Counts belong to child activity
-headings and the exchange summaries.
-Ordinary tools share a group across interleaved writes and events. New commentary, user input,
-and question interactions end that section. Compaction and other owned events remain inside
-the current thought. Question interactions keep their clarification history outside collapsed thoughts.
-Late results update their original operation without moving it across a boundary. Operations
-after a boundary and before another thought occupy an unlabeled section. Reload derives the
-same ownership and identities without persisting a second copy of content.
+The exchange owns an ordered `ExchangeEntry` list of commentary, steering, responses, and
+typed event references. Commentary owns tool records and their reported file changes. Provider
+turns retain execution metadata and message identities, without a second tool store.
+`Exchange::content` borrows those owners into `CommentaryView` sections for projection.
+
+Steering and events remain siblings of commentary under the exchange activity heading.
+Each commentary with activity is collapsed by default. Its heading preserves commentary text,
+and expanding it reveals its tool and change groups. Collapsing it cannot hide steering.
+Tool updates retain their original commentary owner after new commentary or steering arrives.
+Tools received without an active commentary create an internally marked synthetic
+“Considering initial steps” commentary. Empty provider messages do not create extra entries.
+
+Commentary folds keep stable identities through streaming, completion, and reload. Tool and
+change headings aggregate the commentary-owned records. Exchange tool counters remain in
+memory, update from state transitions, and rebuild on reload without persisting duplicate
+records. Question interactions keep their clarification history outside collapsed commentary.
 Individual tool completion and provider-turn boundaries keep the trailing group live
 while its exchange can append more tools. Its label and fold use that same lifecycle. Timer
 refreshes aggregate every call in the group across provider turns. An active group shows its

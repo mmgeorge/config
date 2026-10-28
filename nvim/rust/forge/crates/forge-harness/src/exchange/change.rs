@@ -12,7 +12,7 @@ impl ProviderChangeIndex {
     /// Merge successful provider file changes from one interaction timeline.
     pub fn record(&mut self, interaction: &Exchange) {
         for turn in &interaction.turn {
-            for tool in turn.tools() {
+            for tool in interaction.tools_for_turn(turn.id()) {
                 self.record_tool_list(std::slice::from_ref(tool));
             }
         }
@@ -66,7 +66,7 @@ impl ProviderDiffBuilder {
 
     /// Include successful edits from each provider turn in an exchange.
     pub fn record(&mut self, exchange: &Exchange) {
-        self.record_tools(exchange.turn.iter().flat_map(|turn| turn.tools()));
+        self.record_tools(exchange.tools().map(|(_, tool)| tool));
     }
 
     fn record_tools<'tool>(&mut self, tool_list: impl Iterator<Item = &'tool ToolCall>) {

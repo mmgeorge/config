@@ -27,6 +27,7 @@ local function snapshot(document)
 end
 client.host_accepting = function() return true end
 client.request_for = function(_, _, params, callback)
+  callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   requests[#requests + 1] = params
   if deferred and (params.operation == "node" or params.operation == "sync") then
     held[#held + 1] = { params = params, callback = callback }

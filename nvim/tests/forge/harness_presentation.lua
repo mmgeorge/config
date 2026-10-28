@@ -11,6 +11,13 @@ local input_state = require("forge.views.harness.input_state")
 local session_state = { session = { id = "test-session" } }
 local host = dofile("nvim/tests/forge/support/input.lua").new(session_state)
 client.request_for = function(session, method, params, callback)
+  local receive = callback
+  callback = function(result, failure, detail)
+    if type(result) == "table" and (params.operation == "open" or params.operation == "sync") then
+      result.status = result.status or { document = params.document .. ":status", revision = 0, block = {} }
+    end
+    receive(result, failure, detail)
+  end
   assert(session == "test-session")
   if host.request(method, params, callback) then return end
   assert(method == "harness.document")
@@ -210,7 +217,7 @@ local ok, failure = xpcall(function()
   assert(not owner.failure and owner.transcript.revision == revision)
   local previous = #requests
   assert(vim.wait(2000, function() return #requests > previous end, 1), "transcript read did not retry")
-  requests[#requests].callback({ patch = {} })
+  requests[#requests].callback({ patch = {}, status = { document = owner.document .. ":status", revision = 0, block = {} } })
   assert(not owner.failure and not owner.sync_failure, "successful retry retained its diagnostic")
   owner.set_staging({ "queued draft" }, {})
   local staging = requests[#requests]
@@ -287,7 +294,7 @@ local ok, failure = xpcall(function()
   assert(#markdown_publication > render_count,
     "appending non-Markdown text did not restore retained response parser boundaries")
   render_count = #markdown_publication
-  refresh().callback({ patch = {} })
+  refresh().callback({ patch = {}, status = { document = owner.document .. ":status", revision = 0, block = {} } })
   assert(#markdown_publication == render_count, "unchanged publication rerendered Markdown")
   refresh().callback({ patch = { {
     document = owner.document, base = 1, next = 2, base_rows = 4, next_rows = 4,
@@ -312,8 +319,8 @@ local ok, failure = xpcall(function()
   }, function(value, error_message) assert(value and not error_message) end)
   opening = requests[#requests]
   local idle = snapshot(opening.params.document, "")
-  idle.block[1].text = { "", "Idle" }
-  idle.block[1].metadata.status = { row = 1, animated = false }
+  idle.block[1].text = {}
+  idle.block[1].metadata.status = nil
   opening.callback({ transcript = idle })
   local status_revision = owner.transcript.revision
   local status_cursor = vim.api.nvim_win_get_cursor(window)
@@ -326,10 +333,10 @@ local ok, failure = xpcall(function()
     vim.api.nvim_exec_autocmds(resize.event, {})
     local height = vim.api.nvim_win_get_height(window) - (vim.wo[window].winbar ~= "" and 1 or 0)
     local measured = vim.api.nvim_win_text_height(window, { start_row = 0 }).all
-    assert(measured == height,
+    assert(owner.status_view.window == nil,
       ("resize left idle status using %d rows in a %d-row pane"):format(measured, height))
     assert(owner.transcript.revision == status_revision, "resize required a new transcript revision")
-    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), { "", "Idle" }),
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), { "" }),
       "resize inserted spacing into transcript text")
     assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), status_cursor), "resize moved the transcript cursor")
     assert(vim.api.nvim_get_current_win() == composer_window, "resize stole composer focus")
@@ -364,10 +371,10 @@ local ok, failure = xpcall(function()
     is_alive = function() return true end, read_only = true,
     request = function(params, callback)
       if params.operation == "open" then
-        callback({ transcript = snapshot(params.document, "Working") })
+        callback({ transcript = snapshot(params.document, "Working"), status = { document = params.document .. ":status", revision = 0, block = {} } })
       else
         if params.operation == "staging" then staged_request[#staged_request + 1] = params end
-        callback({ patch = {} })
+        callback({ patch = {}, status = { document = params.document .. ":status", revision = 0, block = {} } })
       end
     end,
   }, function(value, error_message) assert(value and not error_message) end)

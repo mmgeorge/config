@@ -119,13 +119,14 @@ fn agent_summaries(
 ) -> std::collections::HashMap<String, Value> {
     runs.iter().map(|run| {
         let owned: Vec<_> = exchanges.iter().filter(|exchange| exchange.agent_id == run.id).collect();
-        let tools: Vec<_> = owned.iter().flat_map(|exchange| exchange.turn.iter()).flat_map(|turn|turn.tools()).collect();
+        let tool_count: usize = owned.iter().map(|exchange| exchange.tool_counter.total).sum();
+        let failed_count: usize = owned.iter().map(|exchange| exchange.tool_counter.failed).sum();
         let latest = owned.iter().rev().find(|exchange| exchange.state() == ExchangeState::Running)
             .or_else(|| owned.last());
         let target = latest.and_then(|exchange| exchange.turn.iter().rev().find(|turn| matches!(turn.state(),crate::turn::TurnState::Running)))
             .map(|turn| serde_json::to_value(turn.provider()).expect("provider address"));
         (run.id.clone(), json!({"state":latest.map(|exchange| serde_json::to_value(exchange.state()).expect("exchange state")).unwrap_or_else(|| serde_json::to_value(run.state).expect("agent state")),
-            "tool_count":tools.len(),"failed_count":tools.iter().filter(|tool|tool.failed).count(),"target":target,
+            "tool_count":tool_count,"failed_count":failed_count,"target":target,
             "exchange_count":owned.len(),"latest_exchange_id":latest.map(|exchange|exchange.id.as_str())}))
     }).collect()
 }
@@ -2853,7 +2854,11 @@ impl HarnessBroker {
                     .turn
                     .iter()
                     .find(|turn| turn.id() == reference.turn_id)
-                    .and_then(|turn| turn.tools().find(|tool| tool.id == reference.tool_id))
+                    .and_then(|turn| {
+                        exchange
+                            .tools_for_turn(turn.id())
+                            .find(|tool| tool.id == reference.tool_id)
+                    })
                     .context("tool reference does not identify a recorded call")?;
                 let page = self.store.tool_output_page(
                     &exchange.id,
@@ -7794,6 +7799,8 @@ Planning continuation: turn {} of {}.",
                 check_setup: None,
                 turn: Vec::new(),
                 created_at_ms: now_ms,
+                tool_counter: Default::default(),
+                entry: Vec::new(),
                 node_list: Vec::new(),
                 metrics: crate::exchange::ExchangeMetrics::default(),
                 comment: Vec::new(),
@@ -10663,10 +10670,8 @@ fn attribute_provider_tool(
     ) else {
         return Ok(());
     };
-    if exchange
-        .turn_mut(address)?
-        .attribute_tool(&activity.id, &task_id)?
-    {
+    let turn_id = exchange.turn_mut(address)?.id().to_owned();
+    if exchange.attribute_tool(&turn_id, &activity.id, &task_id)? {
         task.mark_attributed(&task_id);
         exchange.task = Some(task.snapshot().clone());
     }
@@ -13529,6 +13534,8 @@ mod test {
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 1,
+            entry: Vec::new(),
+            tool_counter: Default::default(),
             node_list,
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
@@ -16887,7 +16894,7 @@ mod test {
             .await
             .unwrap();
         assert_eq!(exchange.turn[0].messages()[0].text(), "Inspecting");
-        assert_eq!(exchange.turn[0].tools().count(), 1);
+        assert_eq!(exchange.tools_for_turn(exchange.turn[0].id()).count(), 1);
         assert!(
             exchange
                 .node_list
@@ -16982,7 +16989,7 @@ mod test {
         assert_eq!(exchange.node_list[position].id(), original_id);
         assert_eq!(exchange.turn.len(), 1);
         assert_eq!(exchange.turn[0].messages().len(), 1);
-        assert_eq!(exchange.turn[0].tools().count(), 1);
+        assert_eq!(exchange.tools_for_turn(exchange.turn[0].id()).count(), 1);
     }
 
     #[tokio::test]
@@ -20521,7 +20528,12 @@ mod test {
             interaction[0].turn[0].messages()[0].text(),
             "Creating the nested module."
         );
-        assert_eq!(interaction[0].turn[0].tools().count(), 2);
+        assert_eq!(
+            interaction[0]
+                .tools_for_turn(interaction[0].turn[0].id())
+                .count(),
+            2
+        );
         assert!(
             interaction[0]
                 .checkpoint_diff_text
@@ -20666,7 +20678,7 @@ mod test {
         let child_exchange = |id: &str, path: &str, ordinal: u64| {
             let mut exchange = completed_interaction(id, &broker.session.id, Vec::new());
             exchange.ordinal = ordinal;
-            let mut turn = crate::turn::Turn::new(
+            let mut turn = crate::turn::test_support::TestTurn::new(
                 format!("{id}:turn:1"),
                 crate::backend::ProviderAddress {
                     owner: None,
@@ -20696,7 +20708,11 @@ mod test {
             )
             .unwrap();
             turn.finish(crate::turn::TurnOutcome::Completed, 2).unwrap();
-            exchange.turn.push(turn);
+            let owned = turn.into_exchange();
+            exchange.turn = owned.turn;
+            exchange.node_list = owned.node_list;
+            exchange.entry = owned.entry;
+            exchange.rebuild_tool_counter();
             exchange
         };
         let mut child_interaction = child_exchange("child-interaction", "child.rs", 1);

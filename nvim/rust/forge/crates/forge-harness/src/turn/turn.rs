@@ -1,4 +1,4 @@
-use super::{Message, MessageDelivery, MessageKind, ToolCall, ToolState, ToolStore, TurnItem};
+use super::{Message, MessageDelivery, MessageKind, TurnItem};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -41,16 +41,12 @@ pub struct Turn {
     completed_at_ms: Option<i64>,
     #[serde(default)]
     usage: Option<crate::backend::usage::TokenUsage>,
-    tool: ToolStore,
     message: Vec<Message>,
     item: Vec<TurnItem>,
     current_message: Option<usize>,
 }
 
 impl Turn {
-    pub(crate) fn omit_tool_output(&mut self) {
-        self.tool.omit_output();
-    }
     /// Admit one provider start event into the owning exchange.
     pub(crate) fn new(id: String, provider: ProviderAddress, now_ms: i64) -> Self {
         Self {
@@ -60,7 +56,6 @@ impl Turn {
             started_at_ms: now_ms,
             completed_at_ms: None,
             usage: None,
-            tool: ToolStore::default(),
             message: Vec::new(),
             item: Vec::new(),
             current_message: None,
@@ -103,61 +98,20 @@ impl Turn {
         }
     }
 
-    /// Visit the canonical tool calls owned by this provider execution.
-    pub fn tools(&self) -> impl Iterator<Item = &ToolCall> {
-        self.tool.iter()
-    }
-
-    /// Merge tool progress only while its provider turn remains active.
-    pub(crate) fn record_tool(
-        &mut self,
-        activity: &crate::backend::ToolActivity,
-        now_ms: i64,
-    ) -> Result<()> {
+    pub(crate) fn admit_tool(&mut self, id: &str) -> Result<()> {
         ensure!(
             self.state == TurnState::Running,
             "completed turn rejects tool events"
         );
         self.current_message = None;
-        if self.tool.get(&activity.id).is_none() {
-            self.item.push(TurnItem::Tool {
-                id: activity.id.clone(),
-            });
-        }
-        self.tool.merge(activity, now_ms);
-        Ok(())
-    }
-
-    pub(crate) fn record_tool_event(
-        &mut self,
-        event: crate::backend::ToolEvent<'_>,
-        now_ms: i64,
-    ) -> Result<()> {
-        let activity = event.activity();
-        let observed = event.observed_at_ms(now_ms);
-        let settled = self
-            .tool
-            .get(&activity.id)
-            .is_some_and(|tool| tool.state() != ToolState::Running);
-        self.record_tool(activity, observed)?;
-        if !settled {
-            self.tool.timing(
-                &activity.id,
-                event.timestamp("/params/startedAtMs"),
-                event.timestamp("/params/completedAtMs"),
-                event.timestamp("/params/item/durationMs"),
-            );
+        if !self
+            .item
+            .iter()
+            .any(|item| matches!(item, TurnItem::Tool { id: existing } if existing == id))
+        {
+            self.item.push(TurnItem::Tool { id: id.to_owned() });
         }
         Ok(())
-    }
-
-    /// Attach task provenance before execution settles, retaining the first attribution.
-    pub(crate) fn attribute_tool(&mut self, id: &str, task_id: &str) -> Result<bool> {
-        ensure!(
-            self.state == TurnState::Running,
-            "completed turn rejects attribution changes"
-        );
-        Ok(self.tool.attribute(id, task_id))
     }
 
     /// Borrow the ordered content positions owned by this execution.
@@ -251,7 +205,6 @@ impl Turn {
                 ensure!(previous == outcome, "completed turn outcome cannot change");
             }
             TurnState::Running => {
-                self.tool.finish(outcome, now_ms);
                 self.current_message = None;
                 self.state = TurnState::Finished { outcome };
                 self.completed_at_ms = Some(now_ms.max(self.started_at_ms));
@@ -272,6 +225,7 @@ fn default_delivery(kind: MessageKind) -> MessageDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::test_support::TestTurn as Turn;
 
     #[test]
     fn provider_duration_excludes_delivery_delay_and_stays_frozen() {

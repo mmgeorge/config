@@ -184,7 +184,7 @@ load_session_list = function(instance)
     if picker.is_open("sessions") then
       picker.update(build_spec(instance))
     else
-      session_preview.open(instance.host.transcript_win)
+      session_preview.open(instance.host.transcript_win, instance.host.status_view)
       picker.open(build_spec(instance))
     end
   end)

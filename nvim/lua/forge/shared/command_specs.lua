@@ -124,6 +124,7 @@ M.view_specs = {
     { id = "toggle_activity", label = "activity", desc = "Toggle complete tool output", modes = "n", pinned = false },
     { id = "open_artifact", label = "artifacts", desc = "Open a session artifact", modes = "n", pinned = false,
       hints = { review_status = function() return "open plan" end } },
+    { id = "status_details", label = "status", desc = "Read the complete current Harness status", modes = "n", pinned = false },
     { id = "abort_plan", label = "abort plan", desc = "Abort the current plan and exit Plan mode", modes = "n", pinned = false,
       hints = { review_status = function() return "abort plan" end } },
     { id = "agent", label = "agents", desc = "Switch or start a child-agent timeline", modes = "n", pinned = false },

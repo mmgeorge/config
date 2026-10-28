@@ -1,290 +1,194 @@
+use super::{CommentarySource, Exchange, ExchangeEntry, ExchangeNode};
+use crate::turn::{Message, ToolCall, ToolState, Turn, TurnItem};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
-
-use super::{Exchange, ExchangeNode};
-use crate::turn::{Message, MessageDelivery, MessageKind, ToolCall, ToolState, Turn, TurnItem};
-
-/// Borrows an activity and its original provider-turn identity.
 pub(crate) struct ThoughtCall<'source> {
     pub id: &'source str,
     pub turn: &'source Turn,
     pub tool: &'source ToolCall,
 }
 
-/// Owns ordered activity references while the exchange owns their streamed content.
 pub(crate) struct ThoughtGroup<'source> {
     pub call: Vec<ThoughtCall<'source>>,
     pub live: bool,
 }
 
-/// Keeps activity on either side of steering in its chronological position.
-pub(crate) enum ThoughtBody<'source> {
-    Activity(ThoughtActivity<'source>),
-    Steering(&'source ExchangeNode),
-}
-
-/// Borrows one uninterrupted activity group owned by a commentary.
-pub(crate) struct ThoughtActivity<'source> {
-    pub events: Vec<&'source ExchangeNode>,
+pub(crate) struct CommentaryView<'source> {
+    pub id: &'source str,
+    pub message: Option<&'source Message>,
     pub tools: ThoughtGroup<'source>,
     pub writes: ThoughtGroup<'source>,
 }
 
-impl ThoughtActivity<'_> {
-    fn new() -> Self {
-        Self {
-            events: Vec::new(),
-            tools: ThoughtGroup {
-                call: Vec::new(),
-                live: true,
-            },
-            writes: ThoughtGroup {
-                call: Vec::new(),
-                live: true,
-            },
-        }
-    }
-}
-
-/// Associates one visible assistant thought with its interleaved tools and writes.
-/// Activity before the first thought has no message and uses its first activity ID.
-pub(crate) struct ExchangeThought<'source> {
-    pub id: &'source str,
-    pub message: Option<&'source Message>,
-    pub body: Vec<ThoughtBody<'source>>,
-}
-
-impl<'source> ExchangeThought<'source> {
-    /// Identify thoughts that own expandable activity independently of rendered blocks.
+impl CommentaryView<'_> {
     pub fn has_activity(&self) -> bool {
-        self.body.iter().any(|part| match part {
-            ThoughtBody::Activity(activity) => {
-                !activity.events.is_empty()
-                    || !activity.tools.call.is_empty()
-                    || !activity.writes.call.is_empty()
-            }
-            ThoughtBody::Steering(_) => true,
-        })
-    }
-
-    pub fn events(&self) -> impl Iterator<Item = &&'source ExchangeNode> {
-        self.body.iter().flat_map(|part| match part {
-            ThoughtBody::Activity(activity) => activity.events.as_slice(),
-            ThoughtBody::Steering(node) => std::slice::from_ref(node),
-        })
-    }
-
-    fn activity(&mut self) -> &mut ThoughtActivity<'source> {
-        if !matches!(self.body.last(), Some(ThoughtBody::Activity(_))) {
-            self.body
-                .push(ThoughtBody::Activity(ThoughtActivity::new()));
-        }
-        match self.body.last_mut().expect("thought activity was inserted") {
-            ThoughtBody::Activity(activity) => activity,
-            ThoughtBody::Steering(_) => unreachable!("last thought body is activity"),
-        }
+        !self.tools.call.is_empty() || !self.writes.call.is_empty()
     }
 }
 
-/// Preserves user-input boundaries between owned thought sections.
-pub(crate) enum ThoughtPart<'source> {
-    Thought(usize),
-    Boundary(Vec<&'source ExchangeNode>),
+pub(crate) enum EntryPart<'source> {
+    Commentary(usize),
+    Event(Vec<&'source ExchangeNode>),
 }
 
-/// Resolves thought ownership from the canonical ordered events of one exchange branch.
-/// References always expose current streamed content without a second persisted copy.
-pub(crate) struct ThoughtContent<'source> {
-    pub thought: Vec<ExchangeThought<'source>>,
-    pub part: Vec<ThoughtPart<'source>>,
-}
-
-impl<'source> ThoughtContent<'source> {
-    fn boundary(&mut self, node: &'source ExchangeNode) {
-        if let Some(ThoughtPart::Boundary(nodes)) = self.part.last_mut() {
-            nodes.push(node);
-        } else {
-            self.part.push(ThoughtPart::Boundary(vec![node]));
-        }
-    }
-
-    fn begin(&mut self, id: &'source str, message: Option<&'source Message>) -> usize {
-        let index = self.thought.len();
-        self.thought.push(ExchangeThought {
-            id,
-            message,
-            body: vec![ThoughtBody::Activity(ThoughtActivity::new())],
-        });
-        self.part.push(ThoughtPart::Thought(index));
-        index
-    }
-
-    fn close(&mut self, index: usize, complete: bool) {
-        let thought = &mut self.thought[index];
-        if let Some(ThoughtBody::Activity(activity)) = thought.body.last_mut() {
-            for group in [&mut activity.tools, &mut activity.writes] {
-                group.live = !complete
-                    && group
-                        .call
-                        .iter()
-                        .any(|call| call.tool.state() == ToolState::Running);
-            }
-        }
-    }
+pub(crate) struct ExchangeContentView<'source> {
+    pub commentary: Vec<CommentaryView<'source>>,
+    pub part: Vec<EntryPart<'source>>,
 }
 
 impl Exchange {
-    /// Resolve thought sections for an ordered branch of this exchange.
-    /// New messages and question branches close sections. Steering retains the current owner
-    /// and separates its activity groups without moving events across the input.
-    /// Missing provider references fail instead of dropping activity.
-    pub(crate) fn thoughts<'source>(
+    /// Resolves visible references from persisted commentary ownership.
+    /// Missing message, turn, or activity references fail instead of dropping content.
+    pub(crate) fn content<'source>(
         &'source self,
         nodes: &[&'source ExchangeNode],
-    ) -> Result<ThoughtContent<'source>> {
-        let turns: HashMap<_, _> = self.turn.iter().map(|turn| (turn.id(), turn)).collect();
-        let messages: HashMap<_, _> = self
-            .turn
+    ) -> Result<ExchangeContentView<'source>> {
+        let visible: HashMap<_, _> = nodes
             .iter()
-            .flat_map(|turn| {
-                turn.messages()
-                    .iter()
-                    .map(move |message| ((turn.id(), message.id()), message))
-            })
+            .enumerate()
+            .map(|(position, node)| (node.id(), (position, *node)))
             .collect();
-        let tools: HashMap<_, _> = self
-            .turn
+        let active = self
+            .entry
             .iter()
-            .flat_map(|turn| {
-                turn.tools()
-                    .map(move |tool| ((turn.id(), tool.id.as_str()), tool))
+            .rev()
+            .find(|entry| match entry {
+                ExchangeEntry::Commentary { .. } | ExchangeEntry::Response { .. } => true,
+                ExchangeEntry::Event { id } => self.node_list.iter().any(|node| {
+                    node.id() == id
+                        && matches!(
+                            node,
+                            ExchangeNode::QuestionPresented { .. }
+                                | ExchangeNode::ExchangeInput { .. }
+                        )
+                }),
+                ExchangeEntry::Steering { .. } => false,
             })
-            .collect();
-        let mut content = ThoughtContent {
-            thought: Vec::new(),
+            .filter(|entry| matches!(entry, ExchangeEntry::Commentary { .. }))
+            .map(ExchangeEntry::id);
+        let mut content = ExchangeContentView {
+            commentary: Vec::new(),
             part: Vec::new(),
         };
-        let mut question_turn = std::collections::HashSet::new();
-        let mut preceding_turn = None;
-        for node in &self.node_list {
-            if let ExchangeNode::TurnContent { turn_id, .. } = node {
-                preceding_turn = Some(turn_id.as_str());
-            }
-            let question = match node {
-                ExchangeNode::QuestionPresented { .. } => true,
-                ExchangeNode::PlanEvent { event } => matches!(&event.content,
-                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                        if lifecycle.kind == crate::plan::PlanLifecycleKind::QuestionAsked),
-                _ => false,
+        let mut ordered = Vec::new();
+        for entry in &self.entry {
+            let ExchangeEntry::Commentary { commentary } = entry else {
+                continue;
             };
-            if question && let Some(turn_id) = preceding_turn {
-                question_turn.insert(turn_id);
-            }
-        }
-        let mut active: Option<usize> = None;
-        for node in nodes {
-            if matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.intent == super::InputIntent::Steering)
-            {
-                if let Some(index) = active.filter(|index| {
-                    !content.thought[*index]
-                        .message
-                        .is_some_and(|message| message.delivery() == MessageDelivery::Final)
-                }) {
-                    content.close(index, self.is_finished());
-                    content.thought[index]
-                        .body
-                        .push(ThoughtBody::Steering(node));
-                } else {
-                    if let Some(index) = active.take() {
-                        content.close(index, self.is_finished());
-                    }
-                    content.boundary(node);
-                }
+            let Some((position, _)) = visible.get(entry.anchor()) else {
                 continue;
-            }
-            let input_boundary = matches!(
-                node,
-                ExchangeNode::ExchangeInput { .. } | ExchangeNode::QuestionPresented { .. }
-            ) || matches!(node, ExchangeNode::PlanEvent { event } if matches!(&event.content,
-                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. } if matches!(lifecycle.kind,
-                        crate::plan::PlanLifecycleKind::QuestionAsked | crate::plan::PlanLifecycleKind::QuestionAnswered
-                            | crate::plan::PlanLifecycleKind::QuestionWithdrawn)));
-            if input_boundary {
-                if let Some(index) = active.take() {
-                    content.close(index, self.is_finished());
-                }
-                content.boundary(node);
-                continue;
-            }
-            match node {
-                ExchangeNode::TurnContent {
-                    id,
+            };
+            let message = match &commentary.source {
+                CommentarySource::Initial { .. } => None,
+                CommentarySource::Provider {
                     turn_id,
-                    item: TurnItem::Message { id: message_id },
-                } => {
-                    let message = messages
-                        .get(&(turn_id.as_str(), message_id.as_str()))
-                        .context("thought references a missing provider message")?;
-                    if message.kind() != MessageKind::Assistant || message.text().trim().is_empty()
+                    message_id,
+                } => Some(
+                    self.turn
+                        .iter()
+                        .find(|turn| turn.id() == turn_id)
+                        .and_then(|turn| {
+                            turn.messages()
+                                .iter()
+                                .find(|message| message.id() == message_id)
+                        })
+                        .context("commentary references a missing provider message")?,
+                ),
+            };
+            let live = !self.is_finished() && active == Some(commentary.id.as_str());
+            let mut view = CommentaryView {
+                id: &commentary.id,
+                message,
+                tools: ThoughtGroup {
+                    call: Vec::new(),
+                    live,
+                },
+                writes: ThoughtGroup {
+                    call: Vec::new(),
+                    live,
+                },
+            };
+            for tools in &commentary.tool {
+                let turn = self
+                    .turn
+                    .iter()
+                    .find(|turn| turn.id() == tools.turn_id)
+                    .context("commentary references a missing turn")?;
+                for tool in tools.store.iter() {
+                    let node = nodes.iter().find(|node| matches!(node, ExchangeNode::TurnContent {
+                        turn_id, item: TurnItem::Tool { id }, .. } if turn_id == &tools.turn_id && id == &tool.id));
+                    let Some(node) = node else { continue };
+                    let hidden_question = tool
+                        .title
+                        .split('(')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .ends_with("question_ask")
+                        && self
+                            .node_list
+                            .iter()
+                            .any(|node| matches!(node, ExchangeNode::QuestionPresented { .. }));
+                    let hidden_agent = tool
+                        .title
+                        .split('(')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .ends_with("agent_spawn")
+                        && self.node_list.iter().any(|node| {
+                            matches!(node, ExchangeNode::AgentReference { agent }
+                            if agent.parent_turn_id.as_deref() == Some(turn.id()))
+                        });
+                    if tool.state() == ToolState::Completed
+                        && !tool.failed
+                        && (hidden_question || hidden_agent)
                     {
                         continue;
                     }
-                    if let Some(index) = active.take() {
-                        content.close(index, self.is_finished());
-                    }
-                    active = Some(content.begin(id, Some(message)));
+                    let group = if tool.kind == "file_change" {
+                        &mut view.writes
+                    } else {
+                        &mut view.tools
+                    };
+                    group.live |= !self.is_finished() && tool.state() == ToolState::Running;
+                    group.call.push(ThoughtCall {
+                        id: node.id(),
+                        turn,
+                        tool,
+                    });
                 }
-                ExchangeNode::TurnContent {
-                    id,
-                    turn_id,
-                    item: TurnItem::Tool { id: tool_id },
-                } => {
-                    let turn = turns
-                        .get(turn_id.as_str())
-                        .context("thought references a missing provider turn")?;
-                    let tool = tools
-                        .get(&(turn_id.as_str(), tool_id.as_str()))
-                        .context("thought references a missing provider activity")?;
-                    if !tool.failed && tool.state() == ToolState::Completed {
-                        let name = tool.title.split('(').next().unwrap_or("").trim();
-                        if (name.ends_with("question_ask")
-                            && question_turn.contains(turn_id.as_str()))
-                            || (name.ends_with("agent_spawn")
-                                && self.node_list.iter().any(|node| {
-                                    matches!(node,
-                                ExchangeNode::AgentReference { agent }
-                                    if agent.parent_turn_id.as_deref() == Some(turn_id.as_str()))
-                                }))
+            }
+            let index = content.commentary.len();
+            content.commentary.push(view);
+            ordered.push((*position, EntryPart::Commentary(index)));
+        }
+        for (position, node) in nodes.iter().enumerate() {
+            if let ExchangeNode::TurnContent { turn_id, item, .. } = node {
+                match item {
+                    TurnItem::Tool { .. } => continue,
+                    TurnItem::Message { id } => {
+                        let message = self
+                            .turn
+                            .iter()
+                            .find(|turn| turn.id() == turn_id)
+                            .and_then(|turn| {
+                                turn.messages().iter().find(|message| message.id() == id)
+                            })
+                            .context("timeline references a missing provider message")?;
+                        if message.kind() != crate::turn::MessageKind::Assistant
+                            || message.delivery() != crate::turn::MessageDelivery::Final
                         {
                             continue;
                         }
                     }
-                    let index = *active.get_or_insert_with(|| content.begin(id, None));
-                    let activity = content.thought[index].activity();
-                    let group = if tool.kind == "file_change" {
-                        &mut activity.writes
-                    } else {
-                        &mut activity.tools
-                    };
-                    group.call.push(ThoughtCall { id, turn, tool });
-                }
-                ExchangeNode::Compaction { compaction, .. }
-                    if compaction.state == crate::backend::CompactionState::Running => {}
-                _ => {
-                    if let Some(index) = active {
-                        content.thought[index].activity().events.push(node);
-                    } else {
-                        content.boundary(node);
-                    }
                 }
             }
+            ordered.push((position, EntryPart::Event(vec![*node])));
         }
-        if self.is_finished()
-            && let Some(index) = active
-        {
-            content.close(index, true);
-        }
+        ordered.sort_by_key(|(position, _)| *position);
+        content.part = ordered.into_iter().map(|(_, part)| part).collect();
         Ok(content)
     }
 }
@@ -344,23 +248,19 @@ mod tests {
         exchange.observe_turn(&event, 5)?;
         exchange.observe_turn(&event, 6)?;
         let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
-        let content = restored.thoughts(&restored.node_list.iter().collect::<Vec<_>>())?;
-        assert_eq!(content.thought.len(), 1);
-        assert_eq!(content.thought[0].message.unwrap().text(), "Inspect files");
-        let [
-            ThoughtBody::Activity(before),
-            ThoughtBody::Steering(_),
-            ThoughtBody::Activity(after),
-        ] = content.thought[0].body.as_slice()
-        else {
-            panic!("steering must divide one owner's activity into ordered groups")
-        };
-        assert_eq!(before.tools.call.len(), 1);
-        assert_eq!(before.tools.call[0].tool.id, "before");
-        assert_eq!(before.tools.call[0].tool.state(), ToolState::Completed);
-        assert!(!before.tools.live);
-        assert_eq!(after.tools.call[0].tool.id, "after");
-        assert!(after.tools.live);
+        let content = restored.content(&restored.node_list.iter().collect::<Vec<_>>())?;
+        assert_eq!(content.commentary.len(), 1);
+        assert_eq!(
+            content.commentary[0].message.unwrap().text(),
+            "Inspect files"
+        );
+        let owner = &content.commentary[0];
+        assert_eq!(owner.tools.call.len(), 2);
+        assert_eq!(owner.tools.call[0].tool.id, "before");
+        assert_eq!(owner.tools.call[0].tool.state(), ToolState::Completed);
+        assert_eq!(owner.tools.call[1].tool.id, "after");
+        assert!(owner.tools.live);
+        assert!(matches!(content.part[1], EntryPart::Event(_)));
         assert_eq!(restored.node_list.len(), 4);
         Ok(())
     }
@@ -460,22 +360,14 @@ mod tests {
         let reopened: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
 
         for source in [&running, &settled_group, &reopened] {
-            let content = source.thoughts(&source.node_list.iter().collect::<Vec<_>>())?;
+            let content = source.content(&source.node_list.iter().collect::<Vec<_>>())?;
             let owner = content
-                .thought
+                .commentary
                 .iter()
                 .find(|thought| thought.id == acknowledgement)
                 .unwrap();
-            let [
-                ThoughtBody::Activity(_),
-                ThoughtBody::Steering(_),
-                ThoughtBody::Activity(activity),
-            ] = owner.body.as_slice()
-            else {
-                panic!("acknowledgement lost its steering and activity")
-            };
-            assert_eq!(activity.tools.call.len(), 6);
-            assert_eq!(activity.writes.call.len(), 1);
+            assert_eq!(owner.tools.call.len(), 6);
+            assert_eq!(owner.writes.call.len(), 1);
             for columns in [100, 160] {
                 let projected = project(
                     ProjectionSource::Exchange(source),
@@ -523,7 +415,7 @@ mod tests {
                 };
                 assert!(position("Run checks") < position("I will run"));
                 assert!(position("I will run") < position("That was temporary"));
-                assert!(position("That was temporary") < position("6 tools"));
+                assert!(position("6 tools") < position("That was temporary"));
             }
         }
         Ok(())
@@ -572,12 +464,19 @@ mod tests {
                     change: Default::default(),
                 });
                 exchange.observe_turn(&event, 3)?;
-                let content = exchange.thoughts(&exchange.node_list.iter().collect::<Vec<_>>())?;
+                let content = exchange.content(&exchange.node_list.iter().collect::<Vec<_>>())?;
                 let retained = intent == InputIntent::Steering && phase == "commentary";
-                assert_eq!(content.thought.len(), if retained { 1 } else { 2 });
-                if !retained {
-                    assert!(content.thought[1].message.is_none());
-                    assert!(matches!(content.part[1], ThoughtPart::Boundary(_)));
+                assert_eq!(
+                    content.commentary.len(),
+                    if phase == "commentary" && !retained {
+                        2
+                    } else {
+                        1
+                    }
+                );
+                if !retained && phase == "commentary" {
+                    assert!(content.commentary.last().unwrap().message.is_none());
+                    assert!(matches!(content.part[1], EntryPart::Event(_)));
                 }
             }
         }

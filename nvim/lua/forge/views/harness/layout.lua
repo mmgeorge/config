@@ -1,4 +1,14 @@
 local M = {}
+local composer_observer = {}
+
+---@param window integer
+---@param callback fun()
+---@return fun()
+function M.observe_composer(window, callback)
+  assert(not composer_observer[window], "composer geometry already has an owner")
+  composer_observer[window] = callback
+  return function() if composer_observer[window] == callback then composer_observer[window] = nil end end
+end
 
 local composer_mode_group = vim.api.nvim_create_augroup("ForgeHarnessComposerMode", { clear = false })
 
@@ -148,6 +158,7 @@ function M.resize_composer(composer_buf, composer_win)
   if restore then
     vim.api.nvim_win_call(composer_win, function() vim.fn.winrestview(view) end)
   end
+  if composer_observer[composer_win] then composer_observer[composer_win]() end
 end
 
 ---@param transcript_buf integer

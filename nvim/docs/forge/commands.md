@@ -278,15 +278,15 @@ rollback works without a file checkpoint. Confirming conversation rollback colle
 active execution before changing history and leaves the task paused. An unfinished
 restore requires recovery first.
 
-The status area stays present between responses and shows **Idle** when no work is running.
-It keeps **Working** visible while handing off to the next queued message.
-Idle uses the same static icon as a question wait. At the live transcript tail, the status area
-aligns with the bottom of the pane. Check activity, queued messages, and other current details
-add rows below the phase label only while present. Scrolling through history remains available.
-Queued follow-up inputs have a blank line above their heading, including when no steering inputs are present.
+Live status occupies a non-focusable split immediately above the composer. It stays visible
+while the transcript scrolls through history, and disappears when no work, pending
+message, or local notice remains. The split keeps **Working** visible while handing
+off to the next queued message. Check progress, queued messages, pending steering,
+and local notices share the status split. Paused queues remain visible.
+Normal window cycling skips status. Delivered messages remain in conversation history.
 Each entry previews only its first line on one display row, with an ellipsis when
 that line exceeds the available width. Editing opens the complete message in the
-prompt and keeps the status and queue visible at the bottom of the transcript.
+prompt while live status remains above the composer.
 Live tool output occupies four rows, including blank padding.
 Shell-backed tool headings show the underlying command rather than the shell tool
 wrapper, both while running and after completion. Expanding the call retains its
@@ -296,7 +296,7 @@ Thought headers show successful/total tools and append changed-file counts when
 nonzero. Repeated successful edits to one file count once. Individual tool errors
 and compaction details remain available in the expanded timeline.
 Enable **Thoughts** in `/config` under **Display** to show the latest thought below it in
-italics, aligned with the phase label on one line, with `...` when it exceeds the available width. The option
+italics, aligned with the phase label and wrapped to the available width. The option
 defaults to Off, persists across sessions, and applies without interrupting an
 active response. Thoughts never appear as commentary in the timeline. Only the latest
 readable reasoning summary appears in status when this option is On.
@@ -307,6 +307,9 @@ Submitting a prompt positions the transcript at its tail once.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.
 Claude and Antigravity retain provider-defined summary detail through their current ACP integrations.
 Assistant commentary marked with an open circle is separate from the reasoning-summary setting.
+`oS` opens the complete current status in a readable view, including content taller than
+the status split. Press `q` there to return. Configure or disable that binding through
+`keymaps.harness.status_details`.
 
 Explicit steering sends the current composer text to the active response while
 preserving queued follow-ups. If the active turn ends before dispatch, the message
@@ -316,12 +319,12 @@ resends a message whose delivery is unconfirmed.
 including while editing a queued message. Drafts and queued follow-ups remain
 unsent while the task is paused. With a child timeline selected, it interrupts
 that child without sending the draft.
-During active execution, pending steering appears above queued follow-ups below the
-status in the upper timeline pane. Idle submissions stay out of the visual queue
-until their exchange appears. The lower prompt buffer contains only the draft being edited.
+Pending steering appears above queued follow-ups in the status split. Explicitly
+queued messages remain visible while execution is paused or idle. Direct submissions
+enter exchange history. The lower prompt buffer contains only the draft being edited.
 The prompt grows with visual wrapped rows up to its configured maximum height.
 Longer drafts scroll through wrapped rows without inserting newlines into the text.
-During execution, queued prompts remain visible until accepted. If submission fails before acceptance,
+Queued prompts remain visible until accepted. If submission fails before acceptance,
 the message and its attachments remain visible in red. `Alt-R` retries the first
 failed message without changing the composer draft. For unconfirmed delivery, the
 same shortcut checks provider acceptance before permitting a resend. Recovery entries

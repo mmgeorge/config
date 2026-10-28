@@ -1807,8 +1807,9 @@ mod test {
         }
         let expected = "\u{1b}[31mλ\r\ntail";
         assert_eq!(
-            store.list_exchange("session")?[0].turn[0]
+            store.list_exchange("session")?[0]
                 .tools()
+                .map(|(_, tool)| tool)
                 .next()
                 .unwrap()
                 .output,
@@ -1823,8 +1824,9 @@ mod test {
         drop(store);
         let store = SqliteStore::open(directory.path())?;
         assert_eq!(
-            store.list_exchange("session")?[0].turn[0]
+            store.list_exchange("session")?[0]
                 .tools()
+                .map(|(_, tool)| tool)
                 .next()
                 .unwrap()
                 .output,
@@ -1838,8 +1840,9 @@ mod test {
         drop(store);
         let mut store = SqliteStore::open(directory.path())?;
         assert_eq!(
-            store.list_exchange("session")?[0].turn[0]
+            store.list_exchange("session")?[0]
                 .tools()
+                .map(|(_, tool)| tool)
                 .next()
                 .unwrap()
                 .output,
@@ -1853,11 +1856,19 @@ mod test {
         assert!(store.save_exchange(&exchange).is_err());
         let recovered = store.list_exchange("session")?;
         assert_eq!(
-            recovered[0].turn[0].tools().next().unwrap().output,
+            recovered[0]
+                .tools_for_turn(recovered[0].turn[0].id())
+                .next()
+                .unwrap()
+                .output,
             expected
         );
         assert_eq!(
-            recovered[0].turn[0].tools().next().unwrap().state(),
+            recovered[0]
+                .tools_for_turn(recovered[0].turn[0].id())
+                .next()
+                .unwrap()
+                .state(),
             crate::turn::ToolState::Running
         );
         store
@@ -1865,8 +1876,9 @@ mod test {
             .execute_batch("DROP TRIGGER reject_chunk")?;
         store.save_exchange(&exchange)?;
         assert_eq!(
-            store.list_exchange("session")?[0].turn[0]
+            store.list_exchange("session")?[0]
                 .tools()
+                .map(|(_, tool)| tool)
                 .next()
                 .unwrap()
                 .output,
@@ -2087,6 +2099,8 @@ mod test {
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 10,
+            entry: Vec::new(),
+            tool_counter: Default::default(),
             node_list: Vec::new(),
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
@@ -2187,6 +2201,8 @@ mod test {
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 3,
+            entry: Vec::new(),
+            tool_counter: Default::default(),
             node_list: Vec::new(),
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),

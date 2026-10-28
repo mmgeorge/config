@@ -3173,7 +3173,7 @@ mod test {
         .await?;
         let _server_socket = server.await?;
         let mut output = BackendOutput::default();
-        let mut turn = crate::turn::Turn::new(
+        let mut turn = crate::turn::test_support::TestTurn::new(
             "turn".into(),
             crate::backend::ProviderAddress {
                 owner: None,
@@ -3595,7 +3595,8 @@ mod test {
             thread_id: "child-thread".into(),
             turn_id: "child-turn".into(),
         };
-        let mut turn = crate::turn::Turn::new("child-turn".into(), address.clone(), 0);
+        let mut turn =
+            crate::turn::test_support::TestTurn::new("child-turn".into(), address.clone(), 0);
         let mut output = BackendOutput::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         for (id, action, expected_title) in [
@@ -3669,7 +3670,8 @@ mod test {
         assert_eq!(output.event.len(), 4);
         assert_eq!(turn.tools().count(), 4);
         assert!(output.evidence.tool_called);
-        let restored: crate::turn::Turn = serde_json::from_value(serde_json::to_value(&turn)?)?;
+        let restored: crate::turn::test_support::TestTurn =
+            serde_json::from_value(serde_json::to_value(&turn)?)?;
         assert_eq!(restored.tools().count(), 4);
         assert!(
             restored

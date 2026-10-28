@@ -14,7 +14,7 @@ use crate::timeline::{
     stream::{TimelineOperation, TimelinePatch, TimelineStream},
 };
 
-use super::document::{TranscriptChange, TranscriptDocument, TranscriptEntry};
+use super::document::{TranscriptChange, TranscriptDocument};
 use super::output::OutputDocument;
 use super::projection::{ProjectedEntry, ProjectionSource, TranscriptAction, project};
 
@@ -28,6 +28,7 @@ pub struct SessionPresentation {
 }
 
 struct OpenPresentation {
+    status: super::status::StatusDocument,
     display: super::identity::DisplayRegistry,
     history_input_id: HashSet<String>,
     unsettled_exchange: Vec<String>,
@@ -93,6 +94,7 @@ struct EntryPresentation {
 
 #[derive(Serialize)]
 pub struct PresentationOpen {
+    pub status: BufferSnapshot,
     pub syntax_pending: bool,
     pub transcript: BufferSnapshot,
     pub startup_timing: std::collections::BTreeMap<&'static str, f64>,
@@ -100,6 +102,7 @@ pub struct PresentationOpen {
 
 #[derive(Serialize)]
 pub struct PresentationSync {
+    pub status: BufferSnapshot,
     pub syntax_pending: bool,
     pub patch: Vec<BufferPatch>,
     pub snapshot: Option<BufferSnapshot>,
@@ -108,6 +111,14 @@ pub struct PresentationSync {
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PresentationRequest {
+    StatusAction {
+        document: DocumentId,
+        status: DocumentId,
+        revision: DocumentRevision,
+        view: ViewId,
+        sequence: InputSequence,
+        target: TargetId,
+    },
     Node {
         #[serde(flatten)]
         request: super::nodes::NodeRequest,
@@ -280,6 +291,24 @@ impl SessionPresentation {
     pub fn dispatch(&mut self, request: PresentationRequest) -> Result<serde_json::Value> {
         use serde_json::{json, to_value};
         match request {
+            PresentationRequest::StatusAction {
+                document,
+                status,
+                revision,
+                view,
+                sequence,
+                target,
+            } => {
+                let open = OpenPresentation::document_mut(&mut self.open, &document)?;
+                let previous = open
+                    .input
+                    .get_mut(&view)
+                    .context("unknown status action view")?;
+                ensure!(sequence > *previous, "stale status action sequence");
+                let action = open.status.action(&status, revision, &target)?;
+                *previous = sequence;
+                Ok(to_value(action)?)
+            }
             PresentationRequest::Node { request } => {
                 use super::nodes::NodeAction;
                 let open = OpenPresentation::document_mut(&mut self.open, &request.document)?;
@@ -572,6 +601,7 @@ impl SessionPresentation {
             open.sections.register(view.clone());
             open.input.entry(view).or_insert(InputSequence(0));
             return Ok(PresentationOpen {
+                status: open.status.snapshot(),
                 syntax_pending: syntax_pending(open),
                 transcript: open.sections.document.snapshot()?,
                 startup_timing: std::collections::BTreeMap::from([(
@@ -581,6 +611,7 @@ impl SessionPresentation {
             });
         }
         let mut projected = Vec::new();
+        let mut status = super::status::StatusDocument::new(&document)?;
         let mut display = super::identity::DisplayRegistry::default();
         let unsettled = unsettled_exchanges(
             self.timeline
@@ -588,11 +619,12 @@ impl SessionPresentation {
                 .iter()
                 .map(ProjectionSource::Entry),
         );
-        for (index, entry) in self.timeline.entry_list().iter().enumerate() {
+        let mut visible_entry = false;
+        for entry in self.timeline.entry_list() {
             let mut entry = project(
                 ProjectionSource::Entry(entry),
                 &width,
-                index > 0,
+                visible_entry,
                 &HashMap::new(),
                 &HashMap::new(),
                 &mut display,
@@ -600,6 +632,11 @@ impl SessionPresentation {
             if !unsettled.contains(&entry.entry.id) {
                 settle_responses(&mut entry);
             }
+            visible_entry |= entry
+                .entry
+                .block
+                .iter()
+                .any(|block| block.text.row_count() > 0);
             projected.push(entry);
         }
         startup_timing.insert(
@@ -612,6 +649,7 @@ impl SessionPresentation {
         let mut tool = HashMap::new();
         let mut block = Vec::new();
         for mut projected in projected {
+            status.apply(std::mem::take(&mut projected.status))?;
             for tool in projected.tool.values_mut() {
                 tool.own(&projected.entry.id);
             }
@@ -646,6 +684,7 @@ impl SessionPresentation {
             started.elapsed().as_secs_f64() * 1000.0,
         );
         let opened = PresentationOpen {
+            status: status.snapshot(),
             syntax_pending: !syntax.is_empty()
                 || action
                     .values()
@@ -654,6 +693,7 @@ impl SessionPresentation {
             startup_timing,
         };
         self.open = Some(OpenPresentation {
+            status,
             display,
             history_input_id: history_input_ids(self.timeline.entry_list()),
             unsettled_exchange: unsettled,
@@ -719,12 +759,14 @@ impl SessionPresentation {
         }
         if cursor == current {
             Ok(PresentationSync {
+                status: open.status.snapshot(),
                 syntax_pending: syntax_pending(open),
                 patch,
                 snapshot: None,
             })
         } else {
             Ok(PresentationSync {
+                status: open.status.snapshot(),
                 syntax_pending: syntax_pending(open),
                 patch: Vec::new(),
                 snapshot: Some(open.sections.document.snapshot()?),
@@ -876,6 +918,8 @@ impl SessionPresentation {
             .context("session presentation is not open")?;
         if let Some(output) = open.output.get(document) {
             Ok(output.snapshot())
+        } else if open.status.id() == document {
+            Ok(open.status.snapshot())
         } else {
             self.document(document)?.sections.document.snapshot()
         }
@@ -1309,7 +1353,16 @@ fn refresh_activity<'source>(
         .unwrap_or(&open.last_width)
         .clone();
     let mut blocks = Vec::new();
+    let mut status = Vec::new();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
     for entry in source {
+        if open.agent_scope.is_none() {
+            status.push(super::status::StatusProjection::render(
+                entry, &width, now_ms,
+            )?);
+        }
         for block in super::projection::timing_blocks(
             entry,
             &width,
@@ -1327,7 +1380,11 @@ fn refresh_activity<'source>(
             patches.push(patch);
         }
     }
-    retain_patches(open, patches)
+    retain_patches(open, patches)?;
+    for update in status {
+        open.status.apply(update)?;
+    }
+    Ok(())
 }
 
 fn toggle_inline_output(
@@ -1548,12 +1605,14 @@ fn reflow(
         .unwrap_or(&open.last_width)
         .clone();
     let mut projected = Vec::new();
+    let mut status = super::status::StatusProjection::Unchanged;
     let unsettled = unsettled_exchanges(source.iter().copied());
-    for (index, entry) in source.into_iter().enumerate() {
+    let mut visible_entry = false;
+    for entry in source {
         let mut entry = project(
             entry,
             &width,
-            index > 0,
+            visible_entry,
             &open.sections.nodes.choice,
             &open.sections.nodes.tool_limit,
             &mut open.display,
@@ -1564,6 +1623,11 @@ fn reflow(
         if !unsettled.contains(&entry.entry.id) {
             settle_responses(&mut entry);
         }
+        visible_entry |= entry
+            .entry
+            .block
+            .iter()
+            .any(|block| block.text.row_count() > 0);
         projected.push(entry);
     }
     let mut entry = HashMap::new();
@@ -1572,6 +1636,12 @@ fn reflow(
     let mut tool = HashMap::new();
     let mut blocks = Vec::new();
     for mut projection in projected {
+        if !matches!(
+            projection.status,
+            super::status::StatusProjection::Unchanged
+        ) {
+            status = std::mem::take(&mut projection.status);
+        }
         for tool in projection.tool.values_mut() {
             tool.own(&projection.entry.id);
         }
@@ -1596,7 +1666,13 @@ fn reflow(
     open.sections.nodes.tool = tool;
     open.last_width = width;
     open.unsettled_exchange = unsettled;
-    retain_patches(open, patch)
+    retain_patches(open, patch)?;
+    if matches!(status, super::status::StatusProjection::Unchanged) {
+        open.status.clear()?;
+    } else {
+        open.status.apply(status)?;
+    }
+    Ok(())
 }
 
 fn apply_projection<'operation>(
@@ -1607,6 +1683,7 @@ fn apply_projection<'operation>(
 ) -> Result<()> {
     let width = open.transcript.views.profile().unwrap_or(&open.last_width);
     let mut projected = Vec::new();
+    let mut status = Vec::new();
     let mut changed = Vec::new();
     if open.unsettled_exchange != unsettled {
         for id in open
@@ -1861,6 +1938,7 @@ fn apply_projection<'operation>(
                 if !unsettled.contains(&entry.entry.id) {
                     settle_responses(&mut entry);
                 }
+                status.push(std::mem::take(&mut entry.status));
                 let info = entry_presentation(&entry);
                 projected.push((
                     entry.entry.id.clone(),
@@ -1882,6 +1960,7 @@ fn apply_projection<'operation>(
                 });
             }
             TimelineOperation::Remove { index, id } => {
+                status.push(super::status::StatusProjection::Remove { source: id.clone() });
                 changed.push(TranscriptChange::Remove {
                     index: *index,
                     id: id.clone(),
@@ -1937,7 +2016,11 @@ fn apply_projection<'operation>(
         open.sections.nodes.tool.extend(tool);
         open.syntax.extend(syntax);
     }
-    retain_patches(open, patches)
+    retain_patches(open, patches)?;
+    for update in status {
+        open.status.apply(update)?;
+    }
+    Ok(())
 }
 
 fn history_input_ids(entries: &[TimelineEntry]) -> HashSet<String> {
@@ -1957,11 +2040,7 @@ fn history_input_ids(entries: &[TimelineEntry]) -> HashSet<String> {
 
 fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     use forge_buffer::identity::BlockId;
-
     let block_id = BlockId("harness:staging".into());
-    let mut patch = None;
-    let entry_ids = open.sections.document.entry_ids();
-    let existing = entry_ids.iter().position(|id| id == "harness:staging");
     if let Some(staging) = &open.staging {
         let width = open.transcript.views.profile().unwrap_or(&open.last_width);
         let mut rows = Vec::new();
@@ -2004,41 +2083,11 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
                 priority: 100,
             });
         block.metadata.decoration.extend(decoration);
-        let entry = TranscriptEntry {
-            id: "harness:staging".into(),
-            block: vec![block],
-        };
-        patch = if let Some(index) = existing {
-            open.sections
-                .document
-                .tool_layout(vec![TranscriptChange::Replace { index, entry }])?
-                .into_iter()
-                .last()
-        } else {
-            open.sections
-                .document
-                .tool_layout(vec![TranscriptChange::Insert {
-                    index: entry_ids.len(),
-                    entry,
-                }])?
-                .into_iter()
-                .last()
-        };
-    } else if let Some(index) = existing {
-        patch = open
-            .sections
-            .document
-            .tool_layout(vec![TranscriptChange::Remove {
-                index,
-                id: "harness:staging".into(),
-            }])?
-            .into_iter()
-            .last();
+        let block = (block.text.row_count() > 0).then_some(block);
+        open.status.set_staging(block)
+    } else {
+        open.status.set_staging(None)
     }
-    if let Some(patch) = patch {
-        retain_patch(open, patch)?;
-    }
-    Ok(())
 }
 
 fn append_staging_section(
@@ -2060,7 +2109,9 @@ fn append_staging_section(
     if values.is_empty() {
         return Ok(());
     }
-    rows.push(String::new());
+    if !rows.is_empty() {
+        rows.push(String::new());
+    }
     if !label.is_empty() {
         rows.extend(width.wrap_plain(label, 0)?);
     }
@@ -2563,6 +2614,7 @@ mod tests {
             ViewId("staging-view".into()),
             WidthProfile::default(),
         )?;
+        let status_document = owner.open.as_ref().unwrap().status.id().clone();
         let request: PresentationRequest = serde_json::from_value(serde_json::json!({
             "operation": "staging",
             "sequence": 1,
@@ -2574,17 +2626,25 @@ mod tests {
             owner.dispatch(request)?,
             serde_json::json!({"updated":true})
         );
-        let snapshot = owner.snapshot(&document)?;
+        let snapshot = owner.snapshot(&status_document)?;
         let staging_index = snapshot
             .block
             .iter()
             .position(|block| block.id.0 == "harness:staging")
             .unwrap();
-        assert_eq!(snapshot.block[staging_index - 1].id.0, "status");
+        assert_eq!(staging_index, 0);
+        let transcript = owner.snapshot(&document)?;
+        assert_eq!(transcript.revision, opened.transcript.revision);
+        assert!(
+            transcript
+                .block
+                .iter()
+                .all(|block| block.id.0 != "harness:staging")
+        );
         let rows = snapshot.block[staging_index].text.wire_rows().join("\n");
         assert!(rows.contains("Steering active turn"));
         assert!(rows.contains("active direction"));
-        assert!(rows.starts_with("\nSteering active turn\n"));
+        assert!(rows.starts_with("Steering active turn\n"));
         assert!(rows.contains("\n\nQueued follow-up inputs\n"));
         assert!(rows.find("queued first").unwrap() < rows.find("queued second").unwrap());
         assert!(!owner.timeline.entry_list().iter().any(
@@ -2598,7 +2658,7 @@ mod tests {
             steering: Vec::new(),
         })?;
         assert_eq!(
-            owner.snapshot(&document)?.block[staging_index]
+            owner.snapshot(&status_document)?.block[staging_index]
                 .text
                 .wire_rows()
                 .join("\n"),
@@ -2613,10 +2673,10 @@ mod tests {
             steering: Vec::new(),
         })?;
         assert_eq!(
-            owner.snapshot(&document)?.block[staging_index]
+            owner.snapshot(&status_document)?.block[staging_index]
                 .text
                 .wire_rows(),
-            ["", "Queued follow-up inputs", "• queued only"],
+            ["Queued follow-up inputs", "• queued only"],
             "the first queued input must be separated from the preceding status"
         );
         owner.dispatch(PresentationRequest::Staging {
@@ -2627,13 +2687,13 @@ mod tests {
         })?;
         assert!(
             !owner
-                .snapshot(&document)?
+                .snapshot(&status_document)?
                 .block
                 .iter()
                 .any(|block| block.id.0 == "harness:staging")
         );
         assert!(
-            !owner
+            owner
                 .sync(&document, opened.transcript.revision)?
                 .patch
                 .is_empty()
@@ -2652,6 +2712,7 @@ mod tests {
             ViewId("acceptance-view".into()),
             WidthProfile::default(),
         )?;
+        let status_document = owner.open.as_ref().unwrap().status.id().clone();
         let stage = |sequence| {
             serde_json::from_value::<PresentationRequest>(serde_json::json!({
                 "operation":"staging", "sequence":sequence, "document":document,
@@ -2677,7 +2738,7 @@ mod tests {
             });
         owner.reconcile(vec![entry])?;
         owner.dispatch(stage(2)?)?;
-        let snapshot = owner.snapshot(&document)?;
+        let snapshot = owner.snapshot(&status_document)?;
         let staged = snapshot
             .block
             .iter()
@@ -2707,6 +2768,7 @@ mod tests {
         let document = DocumentId("aligned-staging".into());
         let view = ViewId("aligned-staging-view".into());
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let status_document = owner.open.as_ref().unwrap().status.id().clone();
         let prompt = "a Harness execution request is already running: no permits available\nwhen I entered this prompt it failed\n    never lose this indentation 界";
         owner.dispatch(PresentationRequest::Staging {
             sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
@@ -2726,7 +2788,7 @@ mod tests {
                 view: view.clone(),
                 width: width.clone(),
             })?;
-            let snapshot = owner.snapshot(&document)?;
+            let snapshot = owner.snapshot(&status_document)?;
             let rows = snapshot.block.last().unwrap().text.wire_rows();
             let mut in_prompt = false;
             for row in rows {
@@ -2763,6 +2825,7 @@ mod tests {
         let document = DocumentId("large-staging".into());
         let view = ViewId("large-staging-view".into());
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let status_document = owner.open.as_ref().unwrap().status.id().clone();
         let queue: Vec<_> = (0..1200)
             .map(|index| format!("queue-{index}-{}", "x".repeat(96)))
             .collect();
@@ -2775,7 +2838,7 @@ mod tests {
             steering: vec![steering.clone().into()],
         })?;
         let rows = owner
-            .snapshot(&document)?
+            .snapshot(&status_document)?
             .block
             .iter()
             .find(|block| block.id.0 == "harness:staging")
@@ -2821,7 +2884,7 @@ mod tests {
             },
         ])?;
         assert_eq!(
-            owner.snapshot(&document)?.block.last().unwrap().id.0,
+            owner.snapshot(&status_document)?.block.last().unwrap().id.0,
             "harness:staging"
         );
         owner.dispatch(PresentationRequest::Staging {
@@ -2831,7 +2894,7 @@ mod tests {
             steering: vec![steering.clone().into()],
         })?;
         assert_eq!(
-            owner.snapshot(&document)?.block.last().unwrap().id.0,
+            owner.snapshot(&status_document)?.block.last().unwrap().id.0,
             "harness:staging"
         );
         owner.dispatch(PresentationRequest::Resize {
@@ -2843,7 +2906,7 @@ mod tests {
             },
         })?;
         let rows = owner
-            .snapshot(&document)?
+            .snapshot(&status_document)?
             .block
             .iter()
             .find(|block| block.id.0 == "harness:staging")
@@ -3112,10 +3175,11 @@ mod tests {
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
         active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
         active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
-        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(output);
-        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] =
+        crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["output"] =
+            serde_json::json!(output);
+        crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["status"] =
             serde_json::json!("inProgress");
-        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] =
+        crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["completed_at_ms"] =
             serde_json::Value::Null;
         let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
         let entry = TimelineEntry::Exchange {
@@ -3614,7 +3678,7 @@ mod tests {
                 },
             ])?;
             let document = DocumentId("streamed-thought".into());
-            owner.open(
+            let opened = owner.open(
                 document.clone(),
                 ViewId("view".into()),
                 WidthProfile::default(),
@@ -3641,11 +3705,8 @@ mod tests {
                         .iter()
                         .any(|row| row.contains("Next step.")))
             );
-            let status = snapshot
-                .block
-                .iter()
-                .find(|block| block.id.0 == "session:status")
-                .unwrap();
+            let status_snapshot = owner.snapshot(&opened.status.document)?;
+            let status = &status_snapshot.block[0];
             assert_eq!(
                 status
                     .text
@@ -3663,11 +3724,8 @@ mod tests {
                 }]
             ));
             let toggled = owner.snapshot(&document)?;
-            let status = toggled
-                .block
-                .iter()
-                .find(|block| block.id.0 == "session:status")
-                .unwrap();
+            let status_snapshot = owner.snapshot(&opened.status.document)?;
+            let status = &status_snapshot.block[0];
             assert_eq!(
                 status
                     .text
@@ -3714,9 +3772,9 @@ mod tests {
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
         active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
         active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
-        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] =
+        crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["status"] =
             serde_json::json!("inProgress");
-        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] =
+        crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["completed_at_ms"] =
             serde_json::Value::Null;
         let active = TimelineEntry::Exchange {
             id: "active".into(),
@@ -3739,6 +3797,15 @@ mod tests {
             ViewId("view".into()),
             WidthProfile::default(),
         )?;
+        {
+            let open = owner.open.as_mut().unwrap();
+            open.sections
+                .nodes
+                .choice
+                .insert(exchange.entry[0].id().to_owned(), true);
+            open.transcript.dirty.insert("active".into());
+            retain_patches(open, Vec::new())?;
+        }
         assert!(
             opened
                 .transcript
@@ -3758,6 +3825,7 @@ mod tests {
                 .iter()
                 .any(|block| block.id.0 == historical_preview)
         );
+        let expanded_revision = owner.snapshot(&document)?.revision;
         let event = BackendEvent {
             received_at_ms: None,
             address: Some(ProviderAddress {
@@ -3789,7 +3857,7 @@ mod tests {
             &patch.operation[..],
             [TimelineOperation::ToolOutput { index: 3000, .. }]
         ));
-        let sync = owner.sync(&document, opened.transcript.revision)?;
+        let sync = owner.sync(&document, expanded_revision)?;
         assert!(sync.snapshot.is_none());
         assert!(!sync.patch.is_empty());
         for patch in &sync.patch {
@@ -4344,8 +4412,10 @@ mod tests {
         value["exchange"]["completed_at_ms"] = Value::Null;
         value["exchange"]["execution_started_at_ms"] = json!(1);
         value["exchange"]["turn"][0]["state"] = json!({"kind":"running"});
-        value["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = json!("inProgress");
-        value["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = Value::Null;
+        crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["status"] =
+            json!("inProgress");
+        crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["completed_at_ms"] =
+            Value::Null;
         let mut exchange: Exchange = serde_json::from_value(value["exchange"].take())?;
         let mut event = BackendEvent {
             received_at_ms: None,
@@ -4894,6 +4964,8 @@ mod tests {
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 0,
+            entry: Vec::new(),
+            tool_counter: Default::default(),
             node_list: Vec::new(),
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
@@ -5042,11 +5114,11 @@ mod tests {
             value["exchange"]["completed_at_ms"] = serde_json::Value::Null;
             value["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
             value["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
-            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] =
+            crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["output"] =
                 serde_json::json!(initial);
-            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] =
+            crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["status"] =
                 serde_json::json!("inProgress");
-            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] =
+            crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["completed_at_ms"] =
                 serde_json::Value::Null;
             let mut exchange: Exchange = serde_json::from_value(value["exchange"].take())?;
             let mut owner = SessionPresentation::new("session".into());
@@ -5477,8 +5549,10 @@ mod tests {
             raw["completed_at_ms"] = serde_json::Value::Null;
             raw["execution_started_at_ms"] = serde_json::json!(1);
             raw["turn"][0]["state"] = serde_json::json!({"kind":"running"});
-            raw["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
-            raw["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
+            crate::turn::test_support::tool_value_mut(&mut raw, "tool")["status"] =
+                serde_json::json!("inProgress");
+            crate::turn::test_support::tool_value_mut(&mut raw, "tool")["completed_at_ms"] =
+                serde_json::Value::Null;
             Ok(serde_json::from_value(raw)?)
         };
         let mut child = live("child")?;
@@ -5668,8 +5742,10 @@ mod tests {
         raw["completed_at_ms"] = serde_json::Value::Null;
         raw["execution_started_at_ms"] = serde_json::json!(1);
         raw["turn"][0]["state"] = serde_json::json!({"kind":"running"});
-        raw["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
-        raw["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
+        crate::turn::test_support::tool_value_mut(&mut raw, "tool")["status"] =
+            serde_json::json!("inProgress");
+        crate::turn::test_support::tool_value_mut(&mut raw, "tool")["completed_at_ms"] =
+            serde_json::Value::Null;
         let mut interaction: Exchange = serde_json::from_value(raw)?;
         let agent = TimelineEntry::AgentLifecycle {
             id: "agent:child".into(),
@@ -5726,9 +5802,33 @@ mod tests {
                 .iter()
                 .any(|block| block.id.0 == "main:prompt")
         );
-        assert_eq!(selected.block.last().unwrap().id.0, "harness:staging");
         assert!(
             selected
+                .block
+                .iter()
+                .all(|block| block.id.0 != "harness:staging")
+        );
+        assert_eq!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .status
+                .snapshot()
+                .block
+                .last()
+                .unwrap()
+                .id
+                .0,
+            "harness:staging"
+        );
+        assert!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .status
+                .snapshot()
                 .block
                 .last()
                 .unwrap()
@@ -5811,9 +5911,9 @@ mod tests {
             ViewId("view:compaction-timer".into()),
             WidthProfile::default(),
         )?;
-        let before = opened.transcript.block[0]
+        let before = opened.status.block[0]
             .text
-            .row(1)
+            .row(0)
             .unwrap()
             .strip_prefix("Compacting · ")
             .unwrap()
@@ -5823,13 +5923,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         let update = owner.sync(&document, opened.transcript.revision)?;
         assert!(
-            !update.patch.is_empty(),
-            "elapsed time did not produce a document patch"
+            update.patch.is_empty(),
+            "elapsed time changed the transcript"
         );
-        let refreshed = owner.snapshot(&document)?;
+        let refreshed = owner.snapshot(&opened.status.document)?;
         let after = refreshed.block[0]
             .text
-            .row(1)
+            .row(0)
             .unwrap()
             .strip_prefix("Compacting · ")
             .unwrap()
@@ -5850,20 +5950,8 @@ mod tests {
                 .animated
         );
         owner.update_live(None, None, SessionPhase::Idle, true)?;
-        let idle = owner.snapshot(&document)?;
-        let status = idle
-            .block
-            .iter()
-            .find(|block| block.id.0 == "session:status")
-            .expect("idle status remains visible");
-        assert!(!status.metadata.status.as_ref().unwrap().animated);
-        assert!(
-            status
-                .text
-                .wire_rows()
-                .iter()
-                .any(|row| row.contains("Idle"))
-        );
+        let idle = owner.snapshot(&opened.status.document)?;
+        assert!(idle.block.is_empty());
         Ok(())
     }
 
@@ -5992,7 +6080,8 @@ mod tests {
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
         }])?;
         let synced = owner.sync(&document, opened.transcript.revision)?;
-        assert!(!synced.patch.is_empty());
+        assert!(synced.patch.is_empty());
+        assert!(synced.status.revision > opened.status.revision);
         assert!(synced.snapshot.is_none());
         assert_eq!(owner.open.as_ref().unwrap().pending_submission, Some(1));
         assert!(
@@ -6032,7 +6121,11 @@ mod tests {
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 3 },
         }])?;
-        assert!(owner.snapshot(&document)?.revision > opened.transcript.revision);
+        assert_eq!(
+            owner.snapshot(&document)?.revision,
+            opened.transcript.revision
+        );
+        assert!(owner.snapshot(&opened.status.document)?.revision > opened.status.revision);
         owner.dispatch(PresentationRequest::OpenView {
             document: document.clone(),
             view: ViewId("view:new".into()),
@@ -6044,10 +6137,11 @@ mod tests {
         assert_eq!(owner.open.as_ref().unwrap().last_width.columns, 6);
 
         assert!(
-            !owner
+            owner
                 .sync(&document, opened.transcript.revision)?
-                .patch
-                .is_empty()
+                .status
+                .revision
+                > opened.status.revision
         );
         Ok(())
     }
@@ -6089,7 +6183,8 @@ mod tests {
         let second = ViewId("view:second".into());
         owner.open(document.clone(), first.clone(), WidthProfile::default())?;
         let timeline_revision = owner.revision();
-        let initial = owner.snapshot(&document)?.revision;
+        let status_document = owner.open.as_ref().unwrap().status.snapshot().document;
+        let initial = owner.snapshot(&status_document)?.revision;
         owner.open(
             document.clone(),
             second.clone(),
@@ -6098,7 +6193,7 @@ mod tests {
                 ..WidthProfile::default()
             },
         )?;
-        assert_eq!(owner.snapshot(&document)?.revision, initial);
+        assert_eq!(owner.snapshot(&status_document)?.revision, initial);
         owner.dispatch(PresentationRequest::Resize {
             document: document.clone(),
             view: second.clone(),
@@ -6107,7 +6202,7 @@ mod tests {
                 ..WidthProfile::default()
             },
         })?;
-        assert_eq!(owner.snapshot(&document)?.revision, initial);
+        assert_eq!(owner.snapshot(&status_document)?.revision, initial);
         owner.dispatch(PresentationRequest::CloseView {
             document: document.clone(),
             view: first,
@@ -6124,9 +6219,18 @@ mod tests {
                 .columns,
             6
         );
-        assert!(owner.snapshot(&document)?.revision > initial);
+        assert!(owner.snapshot(&status_document)?.revision > initial);
         assert_eq!(owner.revision(), timeline_revision);
-        assert!(!owner.sync(&document, initial)?.patch.is_empty());
+        assert!(
+            owner
+                .sync(&document, owner.snapshot(&document)?.revision)?
+                .patch
+                .is_empty()
+        );
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "session_status_test.rs"]
+mod status_test;

@@ -94,7 +94,7 @@ pub(crate) enum ExchangeActivity {
 }
 
 /// Owns one admitted action or plan phase and its backend turns.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Exchange {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_message_id: Option<String>,
@@ -151,6 +151,10 @@ pub struct Exchange {
     pub created_at_ms: i64,
     pub node_list: Vec<ExchangeNode>,
     #[serde(default)]
+    pub entry: Vec<super::ExchangeEntry>,
+    #[serde(skip)]
+    pub tool_counter: super::ToolCounter,
+    #[serde(default)]
     /// Provider executions owned by this request, independently of UI grouping.
     pub turn: Vec<crate::turn::Turn>,
     #[serde(flatten)]
@@ -164,6 +168,155 @@ pub struct Exchange {
     pub comment: Vec<ExchangeComment>,
     #[serde(default)]
     pub task: Option<TaskSnapshot>,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "Exchange")]
+struct ExchangeRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_message_id: Option<String>,
+    /// Runtime-only source for deferred tool output. Durable records keep output in their chunk table.
+    #[serde(skip)]
+    pub(crate) output_store: Option<std::path::PathBuf>,
+    /// Immutable output identities retained by fork snapshots independently of source sessions.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub(crate) archived_output: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    /// Current provider retry, cleared when execution settles.
+    pub provider_retry: Option<crate::backend::retry::ProviderRetry>,
+    #[serde(default)]
+    /// Retains one check baseline across queued work and automatic repair turns.
+    pub check_owner: Option<String>,
+    /// Durable failure that keeps cleanup retryable without replaying execution.
+    #[serde(default)]
+    pub finalization_error: Option<String>,
+    /// Persistent agent identity that owns this exchange.
+    pub agent_id: String,
+    pub id: String,
+    pub session_id: String,
+    pub ordinal: u64,
+    pub prompt: String,
+    #[serde(default)]
+    /// Lifecycle event that admitted this exchange instead of a user message.
+    pub lifecycle: Option<String>,
+    #[serde(default)]
+    pub kind: ExchangeKind,
+    #[serde(default)]
+    /// Approval selection captured when this exchange starts.
+    pub approval_mode: Option<crate::session::ApprovalMode>,
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub execution_phase: Option<ExecutionPhase>,
+    #[serde(default)]
+    /// Goal whose lifecycle caused this exchange.
+    pub goal_id: Option<String>,
+    #[serde(flatten)]
+    pub(crate) phase: super::ExchangePhase,
+    pub checkpoint_before: Option<String>,
+    pub checkpoint_after: Option<String>,
+    pub attributed_diff_text: Option<String>,
+    pub checkpoint_diff_text: Option<String>,
+    pub attributed_matches_checkpoint: bool,
+    /// Retains terminal approvals and their response source after the picker closes.
+    #[serde(default)]
+    pub approval_resolution: Vec<crate::backend::approval::ApprovalRequestView>,
+    /// Owns the setup question boundary independently of the active plan.
+    pub check_setup: Option<crate::checks::CheckSetupState>,
+    pub created_at_ms: i64,
+    pub node_list: Vec<ExchangeNode>,
+    #[serde(default)]
+    pub entry: Vec<super::ExchangeEntry>,
+    #[serde(skip)]
+    pub tool_counter: super::ToolCounter,
+    #[serde(default)]
+    /// Provider executions owned by this request, independently of UI grouping.
+    pub turn: Vec<crate::turn::Turn>,
+    #[serde(flatten)]
+    pub(crate) question: super::ExchangeQuestion,
+    #[serde(flatten)]
+    pub(crate) clock: super::ExchangeClock,
+    #[serde(default)]
+    /// Retains usage identities and observed tool, approval, and delegated wait occupancy.
+    pub metrics: ExchangeMetrics,
+    #[serde(default)]
+    pub comment: Vec<ExchangeComment>,
+    #[serde(default)]
+    pub task: Option<TaskSnapshot>,
+}
+
+impl<'de> Deserialize<'de> for Exchange {
+    fn deserialize<Deserializer: serde::Deserializer<'de>>(
+        deserializer: Deserializer,
+    ) -> Result<Self, Deserializer::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let mut legacy = std::collections::HashMap::new();
+        for turn in value
+            .get_mut("turn")
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            let id = turn["id"].as_str().unwrap_or_default().to_owned();
+            if let Some(tool) = turn
+                .as_object_mut()
+                .and_then(|turn| turn.remove("tool"))
+                .filter(|tool| !tool.is_null())
+            {
+                legacy.insert(
+                    id,
+                    serde_json::from_value::<crate::turn::ToolStore>(tool)
+                        .map_err(serde::de::Error::custom)?,
+                );
+            }
+        }
+        let mut exchange = ExchangeRecord::deserialize(value).map_err(serde::de::Error::custom)?;
+        for turn in &exchange.turn {
+            if let Some(store) = legacy.get(turn.id()) {
+                for tool in store.iter() {
+                    let present = exchange.node_list.iter().any(|node| matches!(node,
+                        ExchangeNode::TurnContent { turn_id, item: crate::turn::TurnItem::Tool { id }, .. }
+                        if turn_id == turn.id() && id == &tool.id));
+                    if !present {
+                        exchange.node_list.push(ExchangeNode::TurnContent {
+                            id: format!("{}:content:{}", turn.id(), tool.id),
+                            turn_id: turn.id().to_owned(),
+                            item: crate::turn::TurnItem::Tool {
+                                id: tool.id.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        exchange
+            .reconcile_entries()
+            .map_err(serde::de::Error::custom)?;
+        let positions: Vec<_> = exchange
+            .node_list
+            .iter()
+            .filter_map(|node| match node {
+                ExchangeNode::TurnContent {
+                    turn_id,
+                    item: crate::turn::TurnItem::Tool { id },
+                    ..
+                } => Some((turn_id.clone(), id.clone())),
+                _ => None,
+            })
+            .collect();
+        for (turn_id, id) in positions {
+            if let Some(tool) = legacy.get_mut(&turn_id).and_then(|store| store.take(&id)) {
+                exchange
+                    .tool_store_mut(&turn_id, &id)
+                    .map_err(serde::de::Error::custom)?
+                    .insert(tool);
+            }
+        }
+        exchange.rebuild_tool_counter();
+        Ok(exchange)
+    }
 }
 
 impl Exchange {
@@ -288,6 +441,8 @@ impl Exchange {
             approval_resolution: Vec::new(),
             check_setup: None,
             created_at_ms: delegation.created_at_ms,
+            tool_counter: Default::default(),
+            entry: Vec::new(),
             node_list: Vec::new(),
             turn: Vec::new(),
             metrics: ExchangeMetrics::default(),
@@ -317,6 +472,7 @@ impl Exchange {
             ),
             "only an open exchange can finalize"
         );
+        self.settle_tools(now_ms);
         self.pause(now_ms);
         self.metrics.settle(self.elapsed(now_ms));
         self.set_awaiting_input(false);
@@ -431,7 +587,10 @@ impl Exchange {
                 else {
                     return Ok(false);
                 };
+                let turn_id = turn.id().to_owned();
                 turn.finish(outcome, now_ms)?;
+                self.finish_tools(&turn_id, outcome, now_ms);
+                self.rebuild_tool_counter();
                 let prefix = format!("tool:{}:{}:", address.thread_id, address.turn_id);
                 let elapsed = self.elapsed(now_ms);
                 for id in self
@@ -439,7 +598,7 @@ impl Exchange {
                     .iter()
                     .find(|turn| turn.provider() == address)
                     .into_iter()
-                    .flat_map(|turn| turn.tools())
+                    .flat_map(|turn| self.tools_for_turn(turn.id()))
                     .map(|tool| format!("{prefix}{}", tool.id))
                     .collect::<Vec<_>>()
                 {
@@ -455,20 +614,14 @@ impl Exchange {
                     return Ok(false);
                 }
                 let item_count = turn.items().len();
+                let mut new_tool = false;
                 if let Some(tool_event) = event.tool_event() {
                     let tool = tool_event.activity();
-                    let known = turn.tools().any(|existing| existing.id == tool.id);
-                    turn.record_tool_event(tool_event, now_ms)?;
-                    let running = turn
-                        .tools()
-                        .find(|existing| existing.id == tool.id)
-                        .is_some_and(|tool| tool.state() == crate::turn::ToolState::Running);
-                    if !known && !running {
-                        self.metrics.timing_complete = false;
-                    }
-                    let id = format!("tool:{}:{}:{}", address.thread_id, address.turn_id, tool.id);
-                    let elapsed = self.clock.elapsed(event.observed_at_ms(now_ms));
-                    self.metrics.block(id, running, elapsed);
+                    new_tool = !turn.items().iter().any(|item| {
+                        matches!(item,
+                        crate::turn::TurnItem::Tool { id } if id == &tool.id)
+                    });
+                    turn.admit_tool(&tool.id)?;
                 }
                 if let Some(text) = event.text.as_deref() {
                     let kind = match event.kind.as_str() {
@@ -501,6 +654,24 @@ impl Exchange {
                         item,
                     });
                 }
+                self.reconcile_entries()?;
+                if let Some(tool_event) = event.tool_event() {
+                    self.record_tool_event(&turn_id, tool_event, now_ms)?;
+                    let activity = tool_event.activity();
+                    let running = self
+                        .tools_for_turn(&turn_id)
+                        .find(|tool| tool.id == activity.id)
+                        .is_some_and(|tool| tool.state() == crate::turn::ToolState::Running);
+                    if new_tool && !running {
+                        self.metrics.timing_complete = false;
+                    }
+                    let id = format!(
+                        "tool:{}:{}:{}",
+                        address.thread_id, address.turn_id, activity.id
+                    );
+                    let elapsed = self.clock.elapsed(event.observed_at_ms(now_ms));
+                    self.metrics.block(id, running, elapsed);
+                }
                 if let Some(reads) = event.data.get("skill_reads") {
                     let reads: Vec<crate::skill::SkillRead> =
                         serde_json::from_value(reads.clone())?;
@@ -509,7 +680,10 @@ impl Exchange {
                             .turn
                             .iter()
                             .find(|turn| turn.id() == turn_id)
-                            .and_then(|turn| turn.tools().find(|tool| tool.id == read.tool_id))
+                            .and_then(|turn| {
+                                self.tools_for_turn(turn.id())
+                                    .find(|tool| tool.id == read.tool_id)
+                            })
                             .is_some_and(|tool| {
                                 tool.state() == crate::turn::ToolState::Completed && !tool.failed
                             });
@@ -531,6 +705,7 @@ impl Exchange {
                 }
             }
         }
+        self.reconcile_entries()?;
         self.metrics.observe_elapsed(self.elapsed(now_ms));
         Ok(true)
     }
@@ -624,6 +799,7 @@ impl Exchange {
                 turn.finish(crate::turn::TurnOutcome::Interrupted, now_ms)?;
             }
         }
+        self.settle_tools(now_ms);
         self.pause(now_ms);
         self.metrics.settle(self.elapsed(now_ms));
         Ok(())
@@ -753,6 +929,7 @@ impl Exchange {
                 )?;
             }
         }
+        self.settle_tools(now_ms);
         self.pause(now_ms);
         self.metrics.settle(self.elapsed(now_ms));
         self.phase.complete(outcome, now_ms);
@@ -875,6 +1052,7 @@ impl Exchange {
         self.node_list.push(ExchangeNode::ExchangeInput {
             prompt: prompt.clone(),
         });
+        self.reconcile_entries()?;
         Ok(prompt)
     }
 
@@ -1075,6 +1253,8 @@ mod test {
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 1,
+            tool_counter: Default::default(),
+            entry: Vec::new(),
             node_list: Vec::new(),
             metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
@@ -1416,7 +1596,7 @@ mod test {
             changes.paths().contains("owned.rs"),
             "attribution depended on presentation segments"
         );
-        assert_eq!(exchange.turn[0].tools().count(), 1);
+        assert_eq!(exchange.tools_for_turn(exchange.turn[0].id()).count(), 1);
         event.activity = None;
 
         event.turn_boundary = Some(TurnBoundary::Finished {

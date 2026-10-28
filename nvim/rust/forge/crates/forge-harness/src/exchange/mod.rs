@@ -1,5 +1,6 @@
 mod change;
 mod change_result;
+mod content;
 mod exchange;
 mod lifecycle;
 mod metrics;
@@ -22,6 +23,8 @@ pub use node::{
     PlanCommentResolution, QuestionInput,
 };
 pub use task::{TaskItem, TaskSnapshot, TaskTracker};
-pub(crate) use thought::{ExchangeThought, ThoughtBody, ThoughtCall, ThoughtGroup, ThoughtPart};
+pub(crate) use thought::{CommentaryView, EntryPart, ThoughtCall, ThoughtGroup};
 
 pub use crate::turn::ToolCall;
+
+pub use content::{Commentary, CommentarySource, CommentaryTools, ExchangeEntry, ToolCounter};

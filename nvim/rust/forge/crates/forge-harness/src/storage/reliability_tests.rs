@@ -209,8 +209,8 @@ fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
     store.save_exchange(&exchange)?;
     let metadata = store.list_exchange_metadata("session")?;
     assert!(
-        metadata[0].turn[0]
-            .tools()
+        metadata[0]
+            .tools_for_turn(metadata[0].turn[0].id())
             .next()
             .unwrap()
             .output

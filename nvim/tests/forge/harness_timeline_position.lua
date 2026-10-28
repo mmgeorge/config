@@ -4,6 +4,7 @@ local request_for, host_accepting = client.request_for, client.host_accepting
 local pending = {}
 client.host_accepting = function() return true end
 client.request_for = function(_, _, params, callback)
+  callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   if params.operation == "background_terminals" then callback({ supported = false }) return end
   pending[#pending + 1] = { params = params, callback = callback }
 end

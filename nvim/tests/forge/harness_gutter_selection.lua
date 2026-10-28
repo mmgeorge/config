@@ -27,6 +27,7 @@ local success, failure = xpcall(function()
     client.subscribe = function() return function() end end
     _G.open_response = nil
     client.request_for = function(_, method, params, callback)
+  callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
       if method == "harness.document" and params.operation == "open" then
         open_response = { document = params.document, callback = callback }
       elseif method == "harness.document" and params.operation == "background_terminals" then

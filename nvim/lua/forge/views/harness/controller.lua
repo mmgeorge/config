@@ -101,6 +101,7 @@ local function picker_host(state)
   end
   return {
     action_list = actions,
+    status_view = state.presentation and state.presentation.status_view,
     window_list = window_list,
     control_win = control_win,
     transcript_win = state.transcript_win,
@@ -305,26 +306,17 @@ render_status_hint = function(state)
     end
   end
   if state.presentation and state.presentation.transcript then
-    state.presentation.transcript.restore_recovery = state.restore_recovery
-    state.presentation.transcript.recap = state.recap
-    state.presentation.transcript.rename_status = state.rename_status
-    state.presentation.transcript.message_notice = diagnostic.get(state, "execution_notice", "warning")
-    state.presentation.transcript.status_notice = require("forge.views.harness.health").notice(state)
+    local status_context = {
+      restore_recovery = state.restore_recovery, recap = state.recap, rename_status = state.rename_status,
+      message_notice = diagnostic.get(state, "execution_notice", "warning"),
+      status_notice = require("forge.views.harness.health").notice(state),
+    }
     if state.presentation.set_staging then
-      local active = state.execution_busy == true
-      local recovery = {}
-      if not active then
-        for _, entry in ipairs(state.queue or {}) do
-          if entry.error then recovery[#recovery + 1] = entry end
-        end
-      end
-      state.presentation.set_staging(queue_editor.staging(state, composer_text(state.composer_buf), active and state.queue or recovery),
-        active and queue_editor.staging(state, nil, state.pending_steer or {}) or {})
+      state.presentation.set_staging(queue_editor.staging(state, composer_text(state.composer_buf), state.queue or {}),
+        queue_editor.staging(state, nil, state.pending_steer or {}))
     end
     if state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
-      require("forge.views.harness.status_hint").render(state.presentation.transcript,
-        M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
-      require("forge.views.harness.status_region").align(state.presentation.transcript, state.transcript_win)
+      state.presentation.status_view:render(status_context, M.command_set())
     end
   end
 end
@@ -364,7 +356,7 @@ function M.render()
   state.presentation = require("forge.views.harness.presentation").open({
     startup_trace = state.startup_trace,
     session_id = state.session.id, transcript_buffer = state.transcript_buf, composer_buffer = state.composer_buf,
-    transcript_window = state.transcript_win,
+    transcript_window = state.transcript_win, composer_window = state.composer_win,
     is_alive = function() return vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf) end,
     notice = function(message) if owns_presentation() then notifications.error(message, "ForgeHarness") end end,
     on_update = function()
@@ -1143,6 +1135,16 @@ end
 function M.open_artifact_picker()
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_generation()
+  if state.presentation and state.status and state.status.kind == "awaiting_plan_review" then
+    state.presentation.status_action(function(action)
+      client.request_for(session_id, "plan.get", { plan_id = action.plan_id, revision = action.revision }, function(plan, failure)
+        if not state.session or state.session.id ~= session_id or client.host_generation() ~= generation then return end
+        if failure then notifications.error(failure, "Harness artifact") return end
+        require("forge.views.plan_review").open(plan)
+      end)
+    end)
+    return
+  end
   local function current()
     return state.session and state.session.id == session_id and client.host_generation() == generation
   end
@@ -2231,7 +2233,7 @@ function M.task_transition(action, submitted_text, completed, method)
     if harness_state() ~= state then
       state.busy = false
       if state.presentation and state.presentation.transcript then
-        require("forge.views.harness.status_hint").clear(state.presentation.transcript.buffer)
+        state.presentation.status_view:resize()
       end
       synchronize_state(nil, state)
       return
@@ -2453,6 +2455,10 @@ function M.command_set()
   command_set.register(set, "next_prompt", function() M.jump_prompt(1) end)
   command_set.register(set, "toggle_activity", M.toggle_activity)
   command_set.register(set, "open_artifact", M.open_artifact_picker)
+  command_set.register(set, "status_details", function()
+    local presentation = harness_state().presentation
+    if presentation then presentation.status_view:open_details() end
+  end)
   command_set.register(set, "abort_plan", M.abort_plan)
   command_set.register(set, "agent", M.open_agent_picker)
   command_set.register(set, "sessions", M.open_session_picker)

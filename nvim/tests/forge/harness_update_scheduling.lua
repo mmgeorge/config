@@ -10,6 +10,7 @@ end
 local requests, notices = {}, {}
 client.host_accepting = function() return true end
 client.request_for = function(_, _, params, callback)
+  callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   requests[#requests + 1] = { params = params, callback = callback }
 end
 local owner

@@ -225,11 +225,15 @@ impl TimelineStream {
         else {
             return Ok(None);
         };
-        if !turn.tools().any(|tool| tool.id == activity.id) {
+        let turn_id = turn.id().to_owned();
+        if !target
+            .tools_for_turn(&turn_id)
+            .any(|tool| tool.id == activity.id)
+        {
             return Ok(None);
         }
-        let call = crate::turn::ToolAddress::new(turn.id(), &activity.id);
-        turn.record_tool_event(tool_event, exchange.created_at_ms)?;
+        let call = crate::turn::ToolAddress::new(&turn_id, &activity.id);
+        target.record_tool_event(&turn_id, tool_event, exchange.created_at_ms)?;
         target.metrics = exchange.metrics.clone();
         let base_revision = self.revision;
         ensure!(
@@ -700,7 +704,8 @@ fn ticking(entry: &TimelineEntry) -> bool {
             !exchange.is_finished()
                 && (exchange.execution_started_at_ms().is_some()
                     || exchange.turn.iter().any(|turn| {
-                        turn.tools()
+                        exchange
+                            .tools_for_turn(turn.id())
                             .any(|tool| tool.state() == crate::turn::ToolState::Running)
                     }))
                 || agent_by_id.values().any(ticking)
@@ -718,7 +723,8 @@ fn ticking(entry: &TimelineEntry) -> bool {
                 !exchange.is_finished()
                     && (exchange.execution_started_at_ms().is_some()
                         || exchange.turn.iter().any(|turn| {
-                            turn.tools()
+                            exchange
+                                .tools_for_turn(turn.id())
                                 .any(|tool| tool.state() == crate::turn::ToolState::Running)
                         }))
             }) || agent.iter().any(ticking)
@@ -1078,7 +1084,7 @@ mod test {
         else {
             panic!("expected reconciled exchange");
         };
-        let tool = updated.turn[0].tools().next().unwrap();
+        let tool = updated.tools_for_turn(updated.turn[0].id()).next().unwrap();
         assert_eq!(tool.output, "Patch context did not match");
         assert!(tool.failed);
         Ok(())

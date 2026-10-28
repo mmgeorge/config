@@ -85,6 +85,7 @@
 ---@field history_next ForgeKeymap
 ---@field toggle_activity ForgeKeymap
 ---@field open_artifact ForgeKeymap
+---@field status_details ForgeKeymap
 ---@field abort_plan ForgeKeymap
 ---@field agent ForgeKeymap
 ---@field sessions ForgeKeymap
@@ -292,6 +293,7 @@ M.defaults = {
       history_next = { "<Down>", "<M-Down>" },
       toggle_activity = { "oa", "<Tab>" },
       open_artifact = "op",
+      status_details = "oS",
       abort_plan = "or",
       agent = "og",
       sessions = "os",

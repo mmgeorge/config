@@ -69,6 +69,7 @@ pub enum TranscriptAction {
 }
 
 pub struct ProjectedEntry {
+    pub(super) status: super::status::StatusProjection,
     pub(crate) workspace_error: Option<String>,
     #[cfg(test)]
     display: crate::buffer::identity::DisplayRegistry,
@@ -80,6 +81,14 @@ pub struct ProjectedEntry {
 }
 
 impl ProjectedEntry {
+    #[cfg(test)]
+    fn status_block(&self) -> &BufferBlock {
+        let super::status::StatusProjection::Replace { rendered, .. } = &self.status else {
+            panic!("status replacement missing")
+        };
+        rendered.block.as_ref().expect("visible status missing")
+    }
+
     pub(super) fn require_workspace_preview(&self) -> Result<()> {
         if let Some(error) = &self.workspace_error {
             anyhow::bail!(
@@ -349,16 +358,7 @@ pub(super) fn timing_blocks(
         }
     }
     if matches!(entry, TimelineEntry::Status { .. }) {
-        return Ok(project(
-            ProjectionSource::Entry(entry),
-            width,
-            false,
-            expanded,
-            &HashMap::new(),
-            &mut crate::buffer::identity::DisplayRegistry::default(),
-        )?
-        .entry
-        .block);
+        return Ok(Vec::new());
     }
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     if matches!(entry, TimelineEntry::Checks { .. }) {
@@ -435,7 +435,7 @@ pub(super) fn timing_blocks(
         }
         let mut groups: BTreeMap<&str, Vec<_>> = BTreeMap::new();
         for turn in &exchange.turn {
-            for tool in turn.tools() {
+            for tool in exchange.tools_for_turn(turn.id()) {
                 let Some(call_id) = display.tool(
                     &entry.id(),
                     &crate::turn::ToolAddress::new(turn.id(), &tool.id),
@@ -687,7 +687,15 @@ fn project_at_with_separator(
         }
     }
     if projection.block.is_empty() {
-        projection.literal(&format!("{}:empty", entry.id()), "", None)?;
+        if matches!(entry, ProjectionSource::Entry(TimelineEntry::Status { .. })) {
+            projection.push(BufferBlock {
+                id: BlockId(format!("{}:empty", entry.id())),
+                text: Default::default(),
+                metadata: Default::default(),
+            })?;
+        } else {
+            projection.literal(&format!("{}:empty", entry.id()), "", None)?;
+        }
     }
     let mut blocks: Vec<_> = projection
         .block
@@ -701,6 +709,12 @@ fn project_at_with_separator(
         super::message::prepare(block, width)?;
     }
     Ok(ProjectedEntry {
+        status: match entry {
+            ProjectionSource::Entry(entry) => {
+                super::status::StatusProjection::render(entry, width, now_ms)?
+            }
+            ProjectionSource::Exchange(_) => super::status::StatusProjection::Unchanged,
+        },
         workspace_error: projection.workspace_error,
         #[cfg(test)]
         display: projection.display.snapshot(),
@@ -771,26 +785,7 @@ impl TimelineRenderer<'_> {
             }
             TimelineEntry::Checks { run, .. } => self.checks(run, true, None)?,
             TimelineEntry::SessionEvent { event, .. } => self.session_event(event)?,
-            TimelineEntry::Status {
-                id,
-                status,
-                agent_count,
-                status_thoughts,
-                checks,
-                ..
-            } => {
-                let rendered = super::status::StatusView {
-                    id,
-                    status,
-                    agent_count: *agent_count,
-                    status_thoughts: *status_thoughts,
-                    checks: checks.as_ref(),
-                }
-                .render(&self.content_width(), self.now_ms)?;
-                if let Some((target, action)) = rendered.action {
-                    self.action.insert(target, action);
-                }
-                self.push(rendered.block)?;
+            TimelineEntry::Status { id, status, .. } => {
                 if let SessionPhase::Working {
                     execution: Some(execution),
                     activity,
@@ -1074,12 +1069,12 @@ impl TimelineRenderer<'_> {
                         MarkdownRole::Commentary,
                     )?;
                 }
-                if let Some((turn, tool)) = exchange
-                    .turn
-                    .iter()
-                    .rev()
-                    .find_map(|turn| turn.tools().last().map(|tool| (turn, tool)))
-                {
+                if let Some((turn, tool)) = exchange.turn.iter().rev().find_map(|turn| {
+                    exchange
+                        .tools_for_turn(turn.id())
+                        .last()
+                        .map(|tool| (turn, tool))
+                }) {
                     let call = crate::exchange::ThoughtCall {
                         id: &tool.id,
                         turn,
@@ -1665,34 +1660,43 @@ impl TimelineRenderer<'_> {
         questions: Option<&super::question::QuestionHistory<'exchange>>,
         response_role: MarkdownRole,
     ) -> Result<()> {
-        let content = interaction.thoughts(visible)?;
+        let content = interaction.content(visible)?;
         for part in &content.part {
             match part {
-                crate::exchange::ThoughtPart::Boundary(nodes) => {
-                    self.content_nodes(interaction, agents, depth, nodes, questions)?;
+                crate::exchange::EntryPart::Event(nodes) => {
+                    if let [
+                        ExchangeNode::TurnContent {
+                            turn_id,
+                            item: crate::turn::TurnItem::Message { id },
+                            ..
+                        },
+                    ] = nodes.as_slice()
+                    {
+                        let message = interaction
+                            .turn
+                            .iter()
+                            .find(|turn| turn.id() == turn_id)
+                            .and_then(|turn| {
+                                turn.messages().iter().find(|message| message.id() == id)
+                            })
+                            .context("response references a missing provider message")?;
+                        self.markdown(nodes[0].id(), message.text(), response_role)?;
+                    } else {
+                        self.content_nodes(interaction, agents, depth, nodes, questions)?;
+                    }
                 }
-                crate::exchange::ThoughtPart::Thought(index) => {
-                    self.thought(
-                        interaction,
-                        agents,
-                        depth,
-                        &content.thought[*index],
-                        questions,
-                        response_role,
-                    )?;
+                crate::exchange::EntryPart::Commentary(index) => {
+                    self.commentary(interaction, &content.commentary[*index], response_role)?;
                 }
             }
         }
         Ok(())
     }
 
-    fn thought<'exchange>(
+    fn commentary<'exchange>(
         &mut self,
         interaction: &'exchange Exchange,
-        agents: &HashMap<&str, &TimelineEntry>,
-        depth: usize,
-        thought: &crate::exchange::ExchangeThought<'exchange>,
-        questions: Option<&super::question::QuestionHistory<'exchange>>,
+        thought: &crate::exchange::CommentaryView<'exchange>,
         response_role: MarkdownRole,
     ) -> Result<()> {
         let section = if let Some(message) = thought.message {
@@ -1704,22 +1708,17 @@ impl TimelineRenderer<'_> {
                 thought.has_activity().then(|| self.begin_section(2))
             }
         } else {
-            None
+            self.markdown(
+                thought.id,
+                "Considering initial steps",
+                MarkdownRole::Commentary,
+            )?;
+            Some(self.begin_section(2))
         };
-        for part in &thought.body {
-            match part {
-                crate::exchange::ThoughtBody::Steering(node) => {
-                    self.content_nodes(interaction, agents, depth, &[*node], questions)?;
-                }
-                crate::exchange::ThoughtBody::Activity(activity) => {
-                    self.content_nodes(interaction, agents, depth, &activity.events, questions)?;
-                    self.tool_group(&activity.tools, interaction)?;
-                    if let Some(first) = activity.writes.call.first() {
-                        let calls = activity.writes.call.iter().collect::<Vec<_>>();
-                        self.file_change_group(first.id, &calls, interaction)?;
-                    }
-                }
-            }
+        self.tool_group(&thought.tools, interaction)?;
+        if let Some(first) = thought.writes.call.first() {
+            let calls = thought.writes.call.iter().collect::<Vec<_>>();
+            self.file_change_group(first.id, &calls, interaction)?;
         }
         if let Some(section) = section {
             self.finish_section(section, thought.id, true).kind = NodeKind::Thought;
@@ -1824,8 +1823,21 @@ impl TimelineRenderer<'_> {
                     )?;
                 }
                 ExchangeNode::Compaction { id, compaction } => self.compaction(id, compaction)?,
+                ExchangeNode::TurnContent {
+                    turn_id,
+                    item: crate::turn::TurnItem::Message { id },
+                    ..
+                } => {
+                    let message = interaction
+                        .turn
+                        .iter()
+                        .find(|turn| turn.id() == turn_id)
+                        .and_then(|turn| turn.messages().iter().find(|message| message.id() == id))
+                        .context("response references a missing provider message")?;
+                    self.markdown(node.id(), message.text(), MarkdownRole::Response)?;
+                }
                 ExchangeNode::TurnContent { .. } => {
-                    anyhow::bail!("provider content must be rendered through its thought owner");
+                    anyhow::bail!("tool content requires a commentary owner")
                 }
                 ExchangeNode::PlanEvent { event } => {
                     self.plan_event(event)?;
@@ -3128,19 +3140,10 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
 }
 
 fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String) -> String {
-    let count: usize = interaction
-        .turn
-        .iter()
-        .map(|turn| turn.tools().count())
-        .sum();
+    let count = interaction.tool_counter.total;
     let mut sections = vec![summary];
     if count > 0 {
-        let passed = interaction
-            .turn
-            .iter()
-            .flat_map(|turn| turn.tools())
-            .filter(|tool| tool.state() == crate::turn::ToolState::Completed && !tool.failed)
-            .count();
+        let passed = interaction.tool_counter.completed;
         let duration = interaction
             .metrics
             .tool_ms(interaction.elapsed(now_ms))
@@ -4920,7 +4923,7 @@ mod tests {
             stored.output_store = Some(directory.path().to_owned());
             let objects = crate::storage::objects::ObjectStore::open(directory.path())?;
             for turn in &stored.turn {
-                for tool in turn.tools() {
+                for tool in exchange.tools_for_turn(turn.id()) {
                     let object = objects.put(tool.output.as_bytes())?;
                     stored
                         .archived_output
@@ -6785,7 +6788,7 @@ mod tests {
                 );
                 assert_eq!(
                     blocks[position].metadata.layout.as_ref().unwrap().indent,
-                    if label == "Read skill" { 6 } else { 8 },
+                    if label == "Read skill" { 4 } else { 8 },
                     "{label}"
                 );
             }
@@ -6931,20 +6934,19 @@ mod tests {
         };
         let initial = render(execution.clone());
         assert_eq!(
-            initial.entry.block[0].text.wire_rows(),
+            initial.status_block().text.wire_rows(),
             vec![
-                "",
                 "Implementing · 133s · 2 files need attention",
                 "Checking files"
             ]
         );
         assert!(
-            initial.entry.block[0].metadata.target[0]
+            initial.status_block().metadata.target[0]
                 .id
                 .0
                 .ends_with(":working")
         );
-        assert!(initial.entry.block[1].metadata.fold[0].closed);
+        assert!(initial.entry.block[0].metadata.fold[0].closed);
         let file_id = format!(
             "session:status:implementation:execution:{}",
             crate::plan::digest(b"src/player.rs")
@@ -6965,8 +6967,8 @@ mod tests {
         );
         let repeated = render(execution.clone());
         assert_eq!(
-            initial.entry.block[1].metadata.fold,
-            repeated.entry.block[1].metadata.fold
+            initial.entry.block[0].metadata.fold,
+            repeated.entry.block[0].metadata.fold
         );
         println!(
             "IMPLEMENTATION_STATUS_FIXTURE:{}",
@@ -6982,8 +6984,8 @@ mod tests {
             .extend(["src/player.rs".into(), "src/ui.rs".into()]);
         let matched = render(execution);
         assert_eq!(
-            matched.entry.block[0].text.wire_rows(),
-            vec!["", "Verifying · 133s · all files matched", "Checking files"]
+            matched.status_block().text.wire_rows(),
+            vec!["Verifying · 133s · all files matched", "Checking files"]
         );
         assert!(
             matched
@@ -6998,7 +7000,6 @@ mod tests {
     fn status_text_and_animation_are_committed_together() {
         use forge_buffer::block::StatusHint;
         let cases = [
-            (SessionPhase::Idle, "Idle", false, None),
             (SessionPhase::Paused, "Paused", false, None),
             (
                 SessionPhase::AwaitingApproval {
@@ -7101,12 +7102,12 @@ mod tests {
                 3000,
             )
             .unwrap();
-            let block = &projection.entry.block[0];
-            assert_eq!(block.text.wire_rows(), vec!["", expected]);
+            let block = projection.status_block();
+            assert_eq!(block.text.wire_rows(), vec![expected]);
             assert_eq!(
                 block.metadata.status,
                 Some(forge_buffer::block::StatusPresentation {
-                    row: 1,
+                    row: 0,
                     animated,
                     hint
                 })
@@ -7142,10 +7143,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            projection.entry.block[0].text.wire_rows(),
-            vec!["", "Working · 3s"]
+            projection.status_block().text.wire_rows(),
+            vec!["Working · 3s"]
         );
-        let status = &projection.entry.block[0].metadata;
+        let status = &projection.status_block().metadata;
         assert!(
             status.gutter.is_empty(),
             "status text must not be split into the sign column"
@@ -7186,24 +7187,23 @@ mod tests {
             )
             .unwrap();
 
-            let block = &projection.entry.block[0];
+            let block = projection.status_block();
             let rows = block.text.wire_rows();
-            assert_eq!(rows[0], "");
-            assert_eq!(rows[1], format!("{} · 3s", activity.active_label()));
+            assert_eq!(rows[0], format!("{} · 3s", activity.active_label()));
             assert_eq!(
-                rows[2..].join(" ").trim(),
+                rows[1..].join(" ").trim(),
                 "Considering virtual program implementation I'm thinking about changes"
             );
-            assert!(rows[2..].iter().all(|row| !row.starts_with(' ')));
+            assert!(rows[1..].iter().all(|row| !row.starts_with(' ')));
             assert!(block.metadata.status.as_ref().unwrap().animated);
-            assert_eq!(block.metadata.status.as_ref().unwrap().row, 1);
+            assert_eq!(block.metadata.status.as_ref().unwrap().row, 0);
             assert!(
                 block
                     .metadata
                     .decoration
                     .iter()
                     .any(|decoration| decoration.capture == "ForgeHarnessCommentary"
-                        && decoration.range.start.row == 2
+                        && decoration.range.start.row == 1
                         && decoration.range.start.column == 0
                         && decoration.range.end.row <= rows.len())
             );
@@ -7211,48 +7211,32 @@ mod tests {
     }
 
     #[test]
-    fn working_status_ellipsizes_reasoning_and_omits_empty_previews() {
-        for (summary, columns, expected) in [
-            ("", 32, None),
-            (" \n\t ", 32, None),
-            ("short\nthought", 32, Some("short thought")),
-            ("**short**", 5, Some("short")),
-            ("12345678", 8, Some("12345678")),
-            ("123456789", 8, Some("12345...")),
-            ("界界界界界", 8, Some("界界...")),
-            (
-                "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
-                8,
-                Some("e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}..."),
-            ),
-            ("👩‍💻👩‍💻👩‍💻", 5, Some("👩‍💻...")),
-            ("overflow", 1, Some(".")),
-            ("overflow", 2, Some("..")),
-        ] {
-            let width = WidthProfile {
-                columns,
-                ..Default::default()
-            };
+    fn working_status_retains_complete_reasoning_and_omits_empty_previews() {
+        for summary in ["", " \n\t ", "short thought", "界界界界界", "overflow"] {
             let projection = project_at(
                 &TimelineEntry::Status {
-                    checks: None,
-                    id: "session:status".into(),
+                    id: "status".into(),
                     created_at_ms: 0,
-                    status_thoughts: true,
+                    checks: None,
                     agent_count: 0,
+                    status_thoughts: true,
                     status: SessionPhase::Working {
-                        duration_ms: 37_000,
+                        duration_ms: 0,
                         started_at_ms: None,
-                        activity: WorkflowActivity::Planning,
+                        activity: WorkflowActivity::Working,
                         execution: None,
                         reasoning_summary: Some(summary.into()),
                     },
                 },
-                &width,
+                &WidthProfile {
+                    columns: 2,
+                    ..Default::default()
+                },
                 0,
             )
             .unwrap();
-            let block = &projection.entry.block[0];
+            let block = projection.status_block();
+            let normalized = summary.split_whitespace().collect::<Vec<_>>().join(" ");
             let rows = block.text.wire_rows();
             let preview_start = block
                 .metadata
@@ -7260,15 +7244,18 @@ mod tests {
                 .iter()
                 .find(|decoration| decoration.capture == "ForgeHarnessCommentary")
                 .map(|decoration| decoration.range.start.row);
-            if let Some(expected) = expected {
-                let start = preview_start.expect("missing thought preview");
-                assert_eq!(rows.len(), start + 1, "{summary:?} at {columns} columns");
-                assert_eq!(rows[start], expected);
-                assert!(width.cells(rows[start], 0).unwrap() <= columns);
-            } else {
+            if normalized.is_empty() {
                 assert!(preview_start.is_none());
-                assert_eq!(rows, vec!["", "Planning · 37s"]);
+            } else {
+                assert_eq!(rows[preview_start.unwrap()..].join(""), normalized);
             }
+            assert!(
+                projection
+                    .entry
+                    .block
+                    .iter()
+                    .all(|block| block.text.row_count() == 0)
+            );
         }
     }
 
@@ -7294,9 +7281,9 @@ mod tests {
                 0,
             )
             .unwrap();
-            let block = &projected.entry.block[0];
+            let block = projected.status_block();
             let rows = block.text.wire_rows();
-            assert_eq!(rows[1], "Working · 3s");
+            assert_eq!(rows[0], "Working · 3s");
             assert_eq!(
                 rows.iter()
                     .any(|row| row.contains("Inspecting the selected files")),
@@ -7338,10 +7325,10 @@ mod tests {
                 0,
             )
             .unwrap();
-            let block = &projected.entry.block[0];
-            assert_eq!(block.text.wire_rows(), vec!["", "Waiting for your answer"]);
+            let block = projected.status_block();
+            assert_eq!(block.text.wire_rows(), vec!["Waiting for your answer"]);
             assert_eq!(block.metadata.target[0].id.0, "session:status:question");
-            assert_eq!(block.metadata.target[0].range.start.row, 1);
+            assert_eq!(block.metadata.target[0].range.start.row, 0);
             assert!(block.metadata.fold.is_empty());
             assert!(projected.action.is_empty());
         }
@@ -7365,16 +7352,22 @@ mod tests {
             0,
         )
         .unwrap();
-        let block = &projected.entry.block[0];
+        let block = projected.status_block();
         assert_eq!(
             block.text.wire_rows(),
-            vec!["", "Waiting for plan review · revision 1"]
+            vec!["Waiting for plan review · revision 1"]
         );
         let target = &block.metadata.target[0];
-        assert_eq!(target.range.start.row, 1);
+        assert_eq!(target.range.start.row, 0);
         assert_eq!(target.range.start.column, 0);
-        assert!(matches!(projected.action.get(&target.id),
-            Some(super::TranscriptAction::Plan { plan_id, .. }) if plan_id == "pending-plan"));
+        assert!(projected.action.is_empty());
+        let crate::buffer::status::StatusProjection::Replace { rendered, .. } = &projected.status
+        else {
+            panic!("missing status")
+        };
+        assert!(
+            matches!(&rendered.action, Some((_, super::TranscriptAction::Plan { plan_id, .. })) if plan_id == "pending-plan")
+        );
         assert!(block.metadata.fold.is_empty());
     }
 
@@ -8113,9 +8106,9 @@ mod tests {
             checks: crate::checks::CheckActivity::from_run(&run),
         };
         let projected = project_at(&status, &WidthProfile::default(), 1000)?;
-        let rows = projected.entry.block[0].text.wire_rows();
-        assert_eq!(rows[1], "Working · 1s");
-        assert!(rows[2].starts_with("Checks running"));
+        let rows = projected.status_block().text.wire_rows();
+        assert_eq!(rows[0], "Working · 1s");
+        assert!(rows[1].starts_with("Checks running"));
         assert!(rows.iter().any(|row| row.contains("cargo test running")));
         assert!(
             rows.iter()
@@ -8182,9 +8175,10 @@ mod tests {
         };
         let profile = WidthProfile::default();
         let projected = project_at(&entry, &profile, 1000)?;
-        assert_eq!(projected.entry.block[0].text.row(1), Some("Checking"));
+        assert_eq!(projected.status_block().text.row(0), Some("Checking"));
         assert!(
-            projected.entry.block[0]
+            projected
+                .status_block()
                 .metadata
                 .status
                 .as_ref()
@@ -8192,7 +8186,8 @@ mod tests {
                 .animated
         );
         assert!(
-            projected.entry.block[0]
+            projected
+                .status_block()
                 .text
                 .wire_rows()
                 .iter()
@@ -8210,12 +8205,7 @@ mod tests {
             &projected.tool,
             &projected.display,
         )?;
-        assert_eq!(refreshed.len(), 1);
-        assert_eq!(refreshed[0].id.0, "status");
-        assert_ne!(
-            refreshed[0].text,
-            document.block(&refreshed[0].id).unwrap().text
-        );
+        assert!(refreshed.is_empty(), "status clock entered the transcript");
         assert!(projected.tool.is_empty());
         run.commands[0].state = crate::checks::CheckState::Passed;
         run.commands[0].completed_at_ms = Some(2000);
@@ -8424,7 +8414,8 @@ mod tests {
         assert!(live.ends_with("│ 2 files changed"));
         let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
         assert_eq!(super::exchange_activity_summary(&restored, 2000), live);
-        source["turn"][0]["tool"]["item"]["pending"]["status"] = json!("completed");
+        crate::turn::test_support::tool_value_mut(&mut source, "pending")["status"] =
+            json!("completed");
         let exchange: Exchange = serde_json::from_value(source)?;
         let entry = TimelineEntry::Exchange {
             id: exchange.id.clone(),
@@ -8485,7 +8476,7 @@ mod tests {
             "● Planned 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps"
         );
         for status in ["running", "cancelled", "interrupted"] {
-            value["turn"][0]["tool"]["item"]["1"]["status"] = json!(status);
+            crate::turn::test_support::tool_value_mut(&mut value, "1")["status"] = json!(status);
             let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
             assert!(super::exchange_activity_summary(&exchange, 44000).contains("18/20 tools"));
         }

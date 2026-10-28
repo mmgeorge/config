@@ -132,8 +132,11 @@ fn output_saves_pages_and_migration_preserve_content_without_history_reads() -> 
         expected
     );
     assert_eq!(
-        reopened.load_exchange("output")?.unwrap().turn[0]
+        reopened
+            .load_exchange("output")?
+            .unwrap()
             .tools()
+            .map(|(_, tool)| tool)
             .next()
             .unwrap()
             .output,

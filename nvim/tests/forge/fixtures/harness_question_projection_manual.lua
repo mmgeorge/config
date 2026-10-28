@@ -18,9 +18,9 @@ state.active_elicitation = { owner = "interaction", exchange_id = "question-flow
       options = { { label = "Rust CLI", description = "Replace the demo" } }, allow_freeform = true },
   } }, answer = {}, current_index = 0,
 } }
-blocks[#blocks + 1] = { id = "status", text = { "", "Waiting for your answer" }, metadata = {
-  status = { row = 1, animated = false, hint = "question" },
-  target = { { id = "status:question", range = { start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 } } } },
+local status_block = { id = "status", text = { "Waiting for your answer" }, metadata = {
+  status = { row = 0, animated = false, hint = "question" },
+  target = { { id = "status:question", range = { start = { row = 0, column = 0 }, ["end"] = { row = 1, column = 0 } } } },
   decoration = {}, fold = {}, editable_region = {},
 } }
 assert(buffer.apply_snapshot(transcript, { document = transcript.document, revision = 0, block = blocks }).kind == "Applied")
@@ -38,5 +38,10 @@ client.subscribe = function() return function() end end
 controller.render = function() end
 controller.attach()
 folds.attach(transcript, state.transcript_win)
-require("forge.views.harness.status_hint").render(transcript, state.command_set, 100)
+local status_view = require("forge.views.harness.status_view").new({ transcript = transcript,
+  transcript_window = state.transcript_win, composer_window = state.composer_win,
+  alive = function() return true end, notice = function(message) error(message) end, recover = function() end })
+state.presentation.status_view = status_view
+status_view:render({}, state.command_set)
+status_view:apply({ document = transcript.document .. ":status", revision = 0, block = { status_block } }, function(ok) assert(ok) end)
 vim.fn.search("Question presented", "w")

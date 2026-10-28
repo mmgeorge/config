@@ -133,7 +133,7 @@ function M.finish(state, draft)
   return edit.original_draft, nil, edit.original_attachments
 end
 
----Mark the reserved entry in the timeline without changing queued payloads.
+---Mark the reserved entry in the status split without changing queued payloads.
 ---@param state table
 ---@param draft string
 ---@return (string|{text: string})[]

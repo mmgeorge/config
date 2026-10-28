@@ -62,6 +62,7 @@ M.diff_line_content_lengths = {}
 M.empty_diff_rows = {}
 
 ---@class ForgeHarnessPresentationState
+---@field presentation? HarnessPresentation
 ---@field client table?
 ---@field ready boolean
 ---@field busy boolean

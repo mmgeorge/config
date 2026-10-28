@@ -13,29 +13,17 @@ pub(super) fn encode(value: &mut Value, objects: &ObjectStore) -> Result<()> {
                 let mut archived = object
                     .remove("archived_output")
                     .unwrap_or_else(|| serde_json::json!({}));
-                for turn in object
-                    .get_mut("turn")
-                    .and_then(Value::as_array_mut)
-                    .into_iter()
-                    .flatten()
-                {
-                    let turn_id = turn["id"]
-                        .as_str()
-                        .context("inherited turn has no identity")?
-                        .to_owned();
-                    for (tool_id, tool) in
-                        turn["tool"]["item"].as_object_mut().into_iter().flatten()
-                    {
-                        if let Some(output) = tool.get_mut("output") {
-                            let text = output.as_str().context("inherited output is not text")?;
-                            if !text.is_empty() {
-                                archived[format!("{turn_id}:{tool_id}")] =
-                                    Value::String(objects.put(text.as_bytes())?);
-                                *output = Value::String(String::new());
-                            }
+                super::tool_output::visit_tool_records(object, |turn_id, tool_id, tool| {
+                    if let Some(output) = tool.get_mut("output") {
+                        let text = output.as_str().context("inherited output is not text")?;
+                        if !text.is_empty() {
+                            archived[format!("{turn_id}:{tool_id}")] =
+                                Value::String(objects.put(text.as_bytes())?);
+                            *output = Value::String(String::new());
                         }
                     }
-                }
+                    Ok(())
+                })?;
                 if archived
                     .as_object()
                     .is_some_and(|entries| !entries.is_empty())

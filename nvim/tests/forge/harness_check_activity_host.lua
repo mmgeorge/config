@@ -76,15 +76,19 @@ local function request(method, params)
   return value
 end
 
-local function transcript()
-  return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+local function presentation_text()
+  local status = state.presentation and state.presentation.status_view
+  local lines = vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)
+  if status then vim.list_extend(lines, status.content and status.content.lines or {}) end
+  return table.concat(lines, "\n")
 end
 
-local function assert_status_region()
-  local height = vim.api.nvim_win_get_height(state.transcript_win)
-    - (vim.wo[state.transcript_win].winbar ~= "" and 1 or 0)
-  local used = vim.api.nvim_win_text_height(state.transcript_win, { start_row = 0 }).all
-  assert(used == height, ("status occupied %d rows in a %d-row viewport"):format(used, height))
+local function assert_status_split()
+  local view = state.presentation.status_view
+  if not view.content or #view.content.lines == 0 then assert(view.window == nil) return end
+  assert(view.window and vim.api.nvim_win_is_valid(view.window))
+  assert(not vim.api.nvim_win_get_config(view.window).focusable)
+  assert(vim.api.nvim_win_get_height(view.window) <= vim.api.nvim_win_text_height(view.window, { start_row = 0 }).all)
 end
 
 local succeeded, failure = xpcall(function()
@@ -95,26 +99,26 @@ local succeeded, failure = xpcall(function()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), table.concat(errors, "\n"))
   local prompt_failure
   client.request("prompt.submit", { text = "Read while checks run" }, function(_, message) prompt_failure = message end)
-  assert(vim.wait(3000, function() return transcript():find("Working", 1, true) ~= nil end, 10),
-    "provider did not start: " .. tostring(prompt_failure) .. "\n" .. transcript() .. "\n" .. table.concat(errors, "\n"))
+  assert(vim.wait(3000, function() return presentation_text():find("Working", 1, true) ~= nil end, 10),
+    "provider did not start: " .. tostring(prompt_failure) .. "\n" .. presentation_text() .. "\n" .. table.concat(errors, "\n"))
   request("turn.cancel")
-  assert(vim.wait(3000, function() return transcript():find("Idle", 1, true) ~= nil end, 10))
+  assert(vim.wait(3000, function() return state.presentation and state.presentation.status_view.snapshot and #state.presentation.status_view.snapshot.block == 0 end, 10))
   local run_id = request("checks.run", { check = { "activity", "empty" } }).run_id
   assert(vim.wait(3000, function()
     answer_permissions()
-    return transcript():find("Activity fixture", 1, true) ~= nil
-      and transcript():find("Checks running", 1, true) ~= nil
+    return presentation_text():find("Activity fixture", 1, true) ~= nil
+      and presentation_text():find("Checks running", 1, true) ~= nil
   end, 10), "live check did not reach the status area")
   local snapshot = request("state.get")
   assert(snapshot.checks_running and snapshot.active_check_run == run_id)
   assert(snapshot.status.kind == "idle", "check replaced the primary phase")
-  local running = transcript()
+  local running = presentation_text()
   local phase_row, checks_row = running:find("Checking", 1, true), running:find("Checks running", 1, true)
   assert(not running:find("User requested", 1, true) and not running:find("Agent requested", 1, true),
     "check progress must not expose requester labels")
   assert(phase_row and checks_row and phase_row < checks_row, running)
   assert(not running:find("retained check output", 1, true), "running status exposed check output")
-  assert_status_region()
+  assert_status_split()
   if hold > 0 then vim.wait(hold, function() vim.cmd("redraw") return false end, 20) end
   local result
   assert(vim.wait(10000, function()
@@ -123,15 +127,15 @@ local succeeded, failure = xpcall(function()
   end, 20), "check did not finish")
   assert(result.state == "passed", vim.inspect(result))
   assert(vim.wait(3000, function()
-    return transcript():find("Checks finished", 1, true) ~= nil
-      and transcript():find("Checks running", 1, true) == nil
+    return presentation_text():find("Checks finished", 1, true) ~= nil
+      and presentation_text():find("Checks running", 1, true) == nil
   end, 10), "completion did not move the result into history")
   local completed = request("state.get")
   assert(not completed.checks_running and (completed.active_check_run == nil or completed.active_check_run == vim.NIL))
   assert(completed.status.kind == "idle", "completion changed primary work")
-  local _, count = transcript():gsub("Checks finished", "")
+  local _, count = presentation_text():gsub("Checks finished", "")
   assert(count == 1, "result history was duplicated")
-  assert(not transcript():find("retained check output", 1, true), "result output was not collapsed")
+  assert(not presentation_text():find("retained check output", 1, true), "result output was not collapsed")
   local _, check_row = state.presentation.transcript.sequence:position(run_id .. ":checks")
   assert(check_row ~= nil, "check result heading is missing")
   vim.api.nvim_set_current_win(state.transcript_win)
@@ -146,23 +150,29 @@ local succeeded, failure = xpcall(function()
   vim.api.nvim_win_set_cursor(state.transcript_win, { category_row + 1, 0 })
   assert(state.presentation.toggle_heading(state.transcript_win), "test category did not expand")
   assert(vim.wait(3000, function()
-    return transcript():find("Activity fixture", 1, true) ~= nil
+    return presentation_text():find("Activity fixture", 1, true) ~= nil
   end, 10), "executed check is missing from expanded results")
-  assert(not transcript():find("Unused fixture", 1, true), "skipped check appeared in expanded results")
+  assert(not presentation_text():find("Unused fixture", 1, true), "skipped check appeared in expanded results")
   local empty_command
   for _, command in ipairs(result.commands) do
     if command.context.definition_id == "empty" then empty_command = command.id end
   end
   assert(empty_command, "empty check result is missing")
+  local function transcript_row(text)
+    for index, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
+      if line:find(text, 1, true) then return index - 1 end
+    end
+  end
+  local empty_heading_row
   assert(vim.wait(3000, function()
-    return state.presentation.transcript.sequence.node[empty_command .. ":tool"] ~= nil
+    empty_heading_row = transcript_row("Empty fixture")
+    return empty_heading_row ~= nil
   end, 10), "empty check tool did not load")
-  local _, empty_heading_row = state.presentation.transcript.sequence:position(empty_command .. ":tool")
   assert(empty_heading_row, "empty check heading is missing")
   vim.api.nvim_win_set_cursor(state.transcript_win, { empty_heading_row + 1, 0 })
   assert(state.presentation.toggle_heading(state.transcript_win), "empty check did not expand")
-  assert(vim.wait(3000, function() return transcript():find("no output", 1, true) ~= nil end, 10))
-  local _, output_row = state.presentation.transcript.sequence:position(empty_command .. ":preview")
+  assert(vim.wait(3000, function() return presentation_text():find("no output", 1, true) ~= nil end, 10))
+  local output_row = transcript_row("no output")
   assert(output_row, "empty output row is missing")
   vim.api.nvim_win_set_cursor(state.transcript_win, { output_row + 1, 0 })
   vim.cmd("normal! zz")
@@ -175,10 +185,9 @@ local succeeded, failure = xpcall(function()
     "output row inherited a heading triangle: " .. rendered_output)
   vim.api.nvim_win_set_cursor(state.transcript_win, { empty_heading_row + 1, 0 })
   assert(state.presentation.toggle_heading(state.transcript_win), "empty check did not collapse")
-  assert(vim.wait(3000, function() return transcript():find("no output", 1, true) == nil end, 10))
-  assert(vim.api.nvim_buf_get_lines(state.transcript_buf, -2, -1, false)[1] == "Idle",
-    "idle retained unused rows below the phase")
-  assert_status_region()
+  assert(vim.wait(3000, function() return presentation_text():find("no output", 1, true) == nil end, 10))
+  assert(#state.presentation.status_view.snapshot.block == 0, "idle retained native status content")
+  assert_status_split()
   assert(#errors == 0, table.concat(errors, "\n"))
   if hold > 0 then vim.wait(hold, function() vim.cmd("redraw") return false end, 20) end
 
@@ -203,8 +212,8 @@ local succeeded, failure = xpcall(function()
     interaction_mode = "reconcile", open_mode = "tab",
   })
   state = require("forge.session").harness
-  assert(vim.wait(5000, function() return transcript():find("Checks finished", 1, true) ~= nil end, 10),
-    "restored exchange hid its check summary inside collapsed activity: " .. transcript()
+  assert(vim.wait(5000, function() return presentation_text():find("Checks finished", 1, true) ~= nil end, 10),
+    "restored exchange hid its check summary inside collapsed activity: " .. presentation_text()
       .. "\nhistory=" .. vim.inspect(vim.tbl_map(function(entry)
         return {id = entry.id, state = entry.state, owner = entry.owner}
       end, request("checks.list").history))
@@ -225,7 +234,7 @@ local succeeded, failure = xpcall(function()
     local rendered = ""
     for column = 1, 120 do rendered = rendered .. vim.fn.screenstring(position.row, column) end
     assert(rendered:find("Checks finished", 1, true), "screen is missing check summary: " .. rendered)
-    assert(not transcript():find("retained check output", 1, true), "restored output was expanded")
+    assert(not presentation_text():find("retained check output", 1, true), "restored output was expanded")
   end
   assert_visible_check()
   for _, expanded in ipairs({ true, false }) do
@@ -239,7 +248,7 @@ local succeeded, failure = xpcall(function()
     end, 10), "activity toggle did not settle")
     assert_visible_check()
   end
-  local _, restored_count = transcript():gsub("Checks finished", "")
+  local _, restored_count = presentation_text():gsub("Checks finished", "")
   assert(restored_count == 1, "restored check summary was duplicated")
 
   local rust_root = workspace .. "/nvim/rust/forge"
@@ -270,16 +279,16 @@ local succeeded, failure = xpcall(function()
   local streaming_id = request("checks.run", { check = { "rust-stream" }, inputs = { test = "streaming" } }).run_id
   assert(vim.wait(30000, function()
     answer_permissions()
-    return transcript():find("    running 1 test", 1, true) ~= nil
-  end, 10), "Rust callback buffered output until exit: " .. transcript())
+    return presentation_text():find("    running 1 test", 1, true) ~= nil
+  end, 10), "Rust callback buffered output until exit: " .. presentation_text())
   local active_rust = request("checks.status", { run_id = streaming_id })
   assert(active_rust.state == "running", "streaming evidence arrived only after Cargo finished")
-  local live_text = transcript()
+  local live_text = presentation_text()
   assert(live_text:find("Rust streaming fixture", 1, true), live_text)
   assert(not live_text:find("Compiling stream-fixture", 1, true), "status retained earlier output lines")
   local _, live_lines = live_text:gsub("    running 1 test", "")
   assert(live_lines == 1, "status must show exactly one latest output line")
-  assert_status_region()
+  assert_status_split()
   vim.fn.writefile({ "release" }, rust_root .. "/release-check")
   local rust_result
   assert(vim.wait(15000, function()
@@ -291,8 +300,8 @@ local succeeded, failure = xpcall(function()
   assert(report.output:find("Compiling stream-fixture", 1, true), "report lost stderr")
   assert(report.output:find("test streaming ... ok", 1, true), "report lost stdout")
   assert(vim.wait(3000, function()
-    return transcript():find("Checks running", 1, true) == nil
-      and transcript():find("running 1 test", 1, true) == nil
+    return presentation_text():find("Checks running", 1, true) == nil
+      and presentation_text():find("running 1 test", 1, true) == nil
   end, 10), "completed Rust output did not collapse")
   for _, exact_test in ipairs({ "failure", "missing" }) do
     local failed_id = request("checks.run", { check = { "rust-stream" }, inputs = { test = exact_test } }).run_id

@@ -43,7 +43,6 @@ if vim.g.forge_fold_marker_child then
     deferred("lazy-exchange", "▸ Deferred exchange", "▸", 2),
     deferred("lazy-group", "Deferred tools", "▸", 4),
     deferred("lazy-tool", "Deferred command", "•", 6),
-    status,
   } }).kind == "Applied")
   local options = { margin = 0, fold_markers = true, columns = { signcolumn = "yes:1", statuscolumn = "%s" },
     conceal = { level = 3, cursor = "nvic" } }
@@ -57,7 +56,6 @@ if vim.g.forge_fold_marker_child then
   vim.o.showtabline, vim.o.laststatus = 0, 0
   local hint = require("forge.views.harness.status_hint")
   local commands = require("forge.shared.view_command_set").new()
-  hint.render(owner, commands, 55)
   _G.marker_fixture = { owner = owner, opened = opened, closed = closed, commands = commands }
   return
 end
@@ -95,21 +93,7 @@ local ok, failure = xpcall(function()
     local event = screen[name]:match("[^\n]*Plan accepted[^\n]*")
     assert(vim.trim(prompt) == "● /execute last", "duplicate prompt marker: " .. prompt)
     assert(vim.trim(event) == "◇ Plan accepted", "duplicate event marker: " .. event)
-    assert(screen[name]:match("[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]+ +Resolving"), "missing rendered spinner: " .. screen[name])
   end
-  run([[
-    marker_fixture.owner.status_notice = { text = "Waiting for your approval", animated = false, waiting = true }
-    require("forge.views.harness.status_hint").render(marker_fixture.owner, marker_fixture.commands, 55)
-  ]])
-  local waiting = capture()
-  for _, name in ipairs({ "opened", "closed" }) do
-    local line = waiting[name]:match("[^\n]*Waiting for your approval[^\n]*")
-    assert(line and vim.trim(line) == "◷ Waiting for your approval", "missing or duplicate waiting icon: " .. waiting[name])
-  end
-  run([[
-    marker_fixture.owner.status_notice = nil
-    require("forge.views.harness.status_hint").render(marker_fixture.owner, marker_fixture.commands, 55)
-  ]])
   assert(screen.opened:find("◇ Plan accepted", 1, true), screen.opened)
   assert(screen.opened:find("▸ Executing plan", 1, true), screen.opened)
   assert(screen.closed:find("▸ Executing plan", 1, true), screen.closed)

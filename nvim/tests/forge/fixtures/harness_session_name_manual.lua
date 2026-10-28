@@ -11,16 +11,14 @@ local buffer = require("forge.buffer")
 local transcript = buffer.open("session-name-status", {})
 state.transcript_buf = transcript.buffer
 vim.api.nvim_win_set_buf(state.transcript_win, transcript.buffer)
-assert(buffer.apply_snapshot(transcript, {
-  document = transcript.document, revision = 0, block = { {
-    id = "status", text = { "User: Fix background terminal counts", "", "Working · 2s" },
-    metadata = { status = { row = 2, animated = true, hint = "working" }, target = { { id = "status:working", range = {
-      start = { row = 2, column = 0 }, ["end"] = { row = 3, column = 0 },
-    } } }, decoration = {}, fold = {}, editable_region = {} },
-  } },
-}).kind == "Applied")
+local status_block = { id = "status", text = { "Working · 2s" }, metadata = {
+  status = { row = 0, animated = true, hint = "working" }, target = {}, decoration = {}, editable_region = {},
+} }
+assert(buffer.apply_snapshot(transcript, { document = transcript.document, revision = 0, block = {
+  { id = "prompt", text = { "User: Fix background terminal counts" }, metadata = {} },
+} }).kind == "Applied")
 state.presentation = { transcript = transcript, close = function()
-  require("forge.views.harness.status_hint").clear(transcript.buffer)
+  state.presentation.status_view:close()
   return true
 end }
 client.request_for = function(id, method, params, callback)
@@ -38,4 +36,9 @@ client.request_for = function(id, method, params, callback)
 end
 controller.attach()
 controller.refresh_winbar()
-require("forge.views.harness.status_hint").render(transcript, state.command_set, 100)
+local status_view = require("forge.views.harness.status_view").new({ transcript = transcript,
+  transcript_window = state.transcript_win, composer_window = state.composer_win,
+  alive = function() return true end, notice = function(message) error(message) end, recover = function() end })
+state.presentation.status_view = status_view
+status_view:render({}, state.command_set)
+status_view:apply({ document = transcript.document .. ":status", revision = 0, block = { status_block } }, function(ok) assert(ok) end)

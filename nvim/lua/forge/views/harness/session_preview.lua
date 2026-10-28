@@ -7,8 +7,9 @@ local active = nil
 
 ---@param transcript_win integer
 ---@return table
-function SessionPreview.open(transcript_win)
+function SessionPreview.open(transcript_win, status_view)
   SessionPreview.close()
+  if status_view then status_view:suspend(true) end
   local source_buf = vim.api.nvim_win_get_buf(transcript_win)
   local source_view = vim.api.nvim_win_call(transcript_win, vim.fn.winsaveview)
   local preview_buf = vim.api.nvim_create_buf(false, true)
@@ -27,6 +28,7 @@ function SessionPreview.open(transcript_win)
   layout.configure_gutterless_window(transcript_win)
   layout.attach_scroll_boundary(preview_buf, transcript_win)
   active = {
+    status_view = status_view,
     transcript_win = transcript_win,
     source_buf = source_buf,
     source_view = source_view,
@@ -70,6 +72,7 @@ function SessionPreview.close()
   if vim.api.nvim_buf_is_valid(preview.preview_buf) then
     vim.api.nvim_buf_delete(preview.preview_buf, { force = true })
   end
+  if preview.status_view then preview.status_view:suspend(false) end
 end
 
 return SessionPreview

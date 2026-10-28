@@ -103,7 +103,10 @@ impl AgentActivity {
                         }, "text":text, "truncated":truncated})
                     }
                     TurnItem::Tool { id } => {
-                        let Some(tool) = turn.tools().find(|tool| tool.id == *id) else {
+                        let Some(tool) = exchange
+                            .tools_for_turn(turn.id())
+                            .find(|tool| tool.id == *id)
+                        else {
                             continue;
                         };
                         let (category, category_truncated) = preview(&tool.kind, 256);

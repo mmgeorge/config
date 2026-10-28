@@ -234,7 +234,7 @@ impl HarnessInspectionScope {
                             }
                         }
                         if search.iter().any(|field|field=="tool_outputs") {
-                            for turn in &exchange.turn { for tool in turn.tools() {
+                            for turn in &exchange.turn { for tool in exchange.tools_for_turn(turn.id()) {
                                 let mut tail=String::new();
                                 reader.output(&exchange.id,turn.id(),&tool.id,|text| {
                                     self.check(name)?;
@@ -277,7 +277,7 @@ impl HarnessInspectionScope {
                     )?;
                     page.push(exchange_summary(&exchange))?;
                     for turn in &exchange.turn {
-                        for tool in turn.tools() {
+                        for tool in exchange.tools_for_turn(turn.id()) {
                             page.push(
                                 json!({"kind":"tool","turn_id":turn.id(),"tool_call_id":tool.id,
                             "name":tool.title,"status":tool.status}),
@@ -321,7 +321,8 @@ impl HarnessInspectionScope {
                         .iter()
                         .filter(|turn| input.turn_id.as_deref().is_none_or(|id| id == turn.id()))
                         .flat_map(|turn| {
-                            turn.tools()
+                            exchange
+                                .tools_for_turn(turn.id())
                                 .filter(move |tool| tool.id == tool_id)
                                 .map(move |tool| (turn, tool))
                         })
