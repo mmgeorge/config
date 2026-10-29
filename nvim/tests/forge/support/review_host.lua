@@ -20,7 +20,7 @@ function M.runner(options)
   end
   return function(method, params, callback)
     vim.schedule(function()
-      if method == "review.open_pr" then
+      if method == "github.review.document.open" then
         next_id = next_id + 1
         local text = options.observe(params.target)
         local state = { id = "fixture-review-" .. next_id, target = params.target, field = {} }
@@ -33,8 +33,7 @@ function M.runner(options)
       end
       local state = document[params.document]
       if not state then callback(nil, "unknown review document") return end
-      if method == "review.close" then document[state.id] = nil callback({ closed = true }) return end
-      if method == "review.snapshot" then callback(snapshot(state)) return end
+      if method == "github.review.document.close" then document[state.id] = nil callback({ closed = true }) return end
       if method == "review.region_edit" then
         local field = assert(state.field[params.region])
         assert(params.base == field.revision and params.sequence > field.sequence, "stale fixture edit")
@@ -42,7 +41,7 @@ function M.runner(options)
         callback({ document = state.id, region = params.region, revision = field.revision, sequence = field.sequence })
         return
       end
-      assert(method == "review.save", method)
+      assert(method == "github.review.document.save", method)
       local edit = {}
       for _, region in ipairs({ "title", "body" }) do
         if state.field[region].text ~= state.field[region].baseline then edit[region] = state.field[region].text end

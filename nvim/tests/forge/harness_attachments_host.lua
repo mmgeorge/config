@@ -36,7 +36,7 @@ local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback) callback({ ok = true, path = binary }) return function() end end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local attachment = require("forge.views.harness.attachment")
@@ -142,7 +142,7 @@ end, debug.traceback)
 local function cleanup()
   require("forge.views.harness.workspace").release(state)
   if state.presentation then state.presentation.close() end
-  client.stop()
+  client.host_stop()
   local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
   vim.fn.chdir(root)
   vim.fn.stdpath = original_stdpath

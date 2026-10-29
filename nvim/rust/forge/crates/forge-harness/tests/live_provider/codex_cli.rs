@@ -32,11 +32,7 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         context_window: None,
         service_tier: forge_harness::backend::ServiceTier::Fast,
         access: Default::default(),
-        approval_mode: if mode == PromptMode::Plan {
-            ApprovalMode::Ask
-        } else {
-            ApprovalMode::Ask
-        },
+        approval_mode: ApprovalMode::Ask,
         backend_session_id: None,
         submission: None,
         recovered_input: Vec::new(),
@@ -476,7 +472,7 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
         Duration::from_secs(90),
         broker.dispatch(Request {
             id: 1,
-            method: "agent.start".into(),
+            method: "session.agent.start".into(),
             params: serde_json::json!({
                 "profile": "code-explorer",
                 "text": "Read README.md and report its heading to the parent."

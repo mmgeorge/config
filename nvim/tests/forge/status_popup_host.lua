@@ -81,7 +81,7 @@ local ok, failure = xpcall(function()
   assert(state.replica.source_entry["status:context:issues"].text[1] == "Issues: #7 #42")
   assert(#notices == 0, table.concat(notices, "\n"))
   status.close(state)
-  client.stop()
+  client.host_stop()
 end, debug.traceback)
 if not ok then io.stderr:write(tostring(failure), "\n") vim.cmd("cquit 1") end
 print("native discard confirmations and inline Issues persistence passed")

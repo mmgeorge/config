@@ -560,8 +560,10 @@ async fn notification_close_collects_pending_page_without_reflowing_canonical_ro
         .view(&id, ViewId("view".into()), WidthProfile::default())
         .unwrap();
     let revision = service.snapshot(&id).unwrap().revision;
-    let mut narrow = WidthProfile::default();
-    narrow.columns = 16;
+    let narrow = WidthProfile {
+        columns: 16,
+        ..WidthProfile::default()
+    };
     assert!(
         service
             .view(&id, ViewId("secondary".into()), narrow)

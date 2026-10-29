@@ -213,7 +213,7 @@ async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
     let model_response = broker
         .dispatch(Request {
             id: 1,
-            method: "backend.models".into(),
+            method: "session.provider.model.list".into(),
             params: Value::Null,
         })
         .await;
@@ -277,7 +277,7 @@ async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
         Duration::from_secs(120),
         broker.dispatch(Request {
             id: 3,
-            method: "prompt.submit".into(),
+            method: "session.prompt.submit".into(),
             params: json!({
                 "text": "Reply with exactly COPILOT_OK. Do not call tools."
             }),

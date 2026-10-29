@@ -1,10 +1,12 @@
 vim.loader.enable(false)
 local client = require("forge.client")
-local original_request = client.request_for
-local original_accepting = client.host_accepting
+local original_request = client.request
+local original_accepting = client.host_is_accepting
 local request_list = {}
-client.host_accepting = function() return true end
-client.request_for = function(_, _, params, callback)
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
   callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   if params.operation == "background_terminals" then callback({ supported = false }) return end
   request_list[#request_list + 1] = { params = params, callback = callback }
@@ -139,6 +141,6 @@ local success, failure = xpcall(function()
   assert(owner.close())
 end, debug.traceback)
 if owner and not owner.closed then owner.close() end
-client.request_for, client.host_accepting = original_request, original_accepting
+client.request, client.host_is_accepting = original_request, original_accepting
 if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1")
 else print("harness_transcript_follow OK") vim.cmd("qa!") end

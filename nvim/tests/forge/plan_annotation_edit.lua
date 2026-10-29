@@ -1,10 +1,13 @@
 local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
-local original_request, original_accepting = client.request_for, client.host_accepting
-client.host_accepting = function() return true end
+local original_request, original_accepting = client.request, client.host_is_accepting
+client.host_is_accepting = function() return true end
 local requests = {}
-client.request_for = function(_, method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
   requests[#requests + 1] = { method = method, params = params, callback = callback }
 end
@@ -30,8 +33,8 @@ local success, failure = xpcall(function()
   local literal = "literal ** comment"
   vim.api.nvim_buf_set_lines(native_buffer, body_row, body_row + 1, false, { literal, "second line" })
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = native_buffer })
-  owner.submit("plan.request_changes", { comment = "Review" }, function() end)
-  assert(#requests == 2 and requests[2].method == "plan.request_changes", "submission did not capture local annotations")
+  owner.submit("session.plan.changes.request", { comment = "Review" }, function() end)
+  assert(#requests == 2 and requests[2].method == "session.plan.changes.request", "submission did not capture local annotations")
   local annotation = requests[2].params.draft_annotation
   assert(#annotation == 1 and annotation[1].source.body == literal .. "\nsecond line",
     "review submission changed annotation bytes")
@@ -47,7 +50,7 @@ local success, failure = xpcall(function()
   assert(owner.close())
 end, debug.traceback)
 if owner then owner.close() end
-client.request_for, client.host_accepting = original_request, original_accepting
+client.request, client.host_is_accepting = original_request, original_accepting
 vim.fn.delete(path)
 assert(success, failure)
 print("plan_annotation_edit: passed")

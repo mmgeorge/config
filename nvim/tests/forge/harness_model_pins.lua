@@ -7,7 +7,10 @@ local picker = require("forge.views.picker")
 local picker_state = require("forge.views.picker.state")
 local errors, request_list, confirmed = {}, {}, nil
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
-client.request = function(method, parameter, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local parameter = request_specification.params or {}
+
   request_list[#request_list + 1] = { method = method, parameter = parameter, callback = callback }
 end
 local function invoke(key)
@@ -43,7 +46,7 @@ local success, failure = xpcall(function()
   assert(selected().value.picker_reasoning == "high")
   invoke("p")
   local write = request_list[#request_list]
-  assert(write.method == "backend.model_pin" and write.parameter.model == "newer" and write.parameter.pinned)
+  assert(write.method == "provider.model.pin.set" and write.parameter.model == "newer" and write.parameter.pinned)
   local count = #request_list
   invoke("p")
   assert(#request_list == count, "pin writes overlapped")

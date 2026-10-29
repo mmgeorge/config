@@ -2,7 +2,7 @@ local client = require("forge.client")
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local layout = require("forge.views.harness.layout")
-client.subscribe = function() return function() end end
+client.session_events_subscribe = function() return function() end end
 state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
   layout.open("session-name-manual")
 state.session = { id = "session-name-manual", name = "Existing session", model = "selected-model", effort = "high" }
@@ -21,14 +21,18 @@ state.presentation = { transcript = transcript, close = function()
   state.presentation.status_view:close()
   return true
 end }
-client.request_for = function(id, method, params, callback)
+client.request = function(request_specification, callback)
+  local id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   assert(id == state.session.id)
-  if method == "harness.document" then
+  if method == "session.document" then
     assert(params.operation == "session_name" and params.model == "selected-model")
     vim.defer_fn(function() callback({ text = "Background terminal counts" }) end, 8000)
   elseif method == "session.rename" then
     callback({ name = params.name })
-  elseif method == "history.record" then
+  elseif method == "session.prompt.history.record" then
     callback({})
   else
     error("unexpected request " .. method)

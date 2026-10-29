@@ -407,7 +407,7 @@ outer border in the compact view. Shared divider hit testing belongs to the
 following message, while its predecessor's editable region ends at that divider.
 Parent deletion requires removing its follow-ups first.
 
-`plan.questions.answer` captures native review identity and semantic anchors,
+`session.plan.question.answer` captures native review identity and semantic anchors,
 then forks the source session through the shared same-provider fork coordinator.
 The fork retains conversation history and receives the saved declaration design
 and selected source excerpt without appending work to the main timeline. Its
@@ -453,7 +453,7 @@ Enclosing declarations retain normal syntax highlighting. Omitted ranges render
 `...` without declaration or edit targets, while a single omitted line retains its
 source text and coordinates. Shared diff delivery preserves these rows across chunks.
 Transcript declaration targets retain the plan identity,
-submitted revision, path, and side. `plan.declaration` reads that immutable
+submitted revision, path, and side. `session.plan.declaration.get` reads that immutable
 snapshot, and navigation opens a read-only declaration buffer. Removed rows open
 the previous proposal, or the source baseline on the first submission. Navigation
 never substitutes the current working-tree file for a saved declaration.

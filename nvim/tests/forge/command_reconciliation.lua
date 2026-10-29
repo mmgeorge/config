@@ -53,11 +53,11 @@ print("command_reconciliation: passed")
 
 local client = require("forge.client")
 local command = require("forge.command")
-local original_generation, original_defer = client.host_generation, vim.defer_fn
+local original_generation, original_defer = client.host_get_generation, vim.defer_fn
 local notifications = require("forge.infra.notifications")
 local original_error = notifications.error
 local generation, timers, requests, outcome = 1, {}, {}, {}
-client.host_generation = function() return generation end
+client.host_get_generation = function() return generation end
 vim.defer_fn = function(callback) timers[#timers + 1] = callback end
 notifications.error = function() end
 local function transport(_, method, params, callback, sending)
@@ -68,7 +68,7 @@ command.dispatch(transport, "session", "session.rename", { name = "New name" },
   function(result, failure) outcome[#outcome + 1] = { result = result, failure = failure } end)
 requests[1].callback(nil, "lost acknowledgement")
 timers[1]()
-assert(requests[2].method == "command.status", "unknown delivery replayed the mutation")
+assert(requests[2].method == "session.command.status.get", "unknown delivery replayed the mutation")
 requests[2].callback({ state = "completed", response = { result = { name = "New name" } } })
 assert(#outcome == 1 and outcome[1].result.name == "New name")
 requests[1].callback({ name = "New name" })
@@ -79,4 +79,4 @@ generation = 2
 requests[3].callback(nil, "host stopped")
 assert(#requests == 3 and outcome[2].failure:find("Host restarted", 1, true),
   "host replacement replayed an unresolved mutation")
-client.host_generation, vim.defer_fn, notifications.error = original_generation, original_defer, original_error
+client.host_get_generation, vim.defer_fn, notifications.error = original_generation, original_defer, original_error

@@ -4,7 +4,7 @@ local cache = require("github.repo_cache")
 local directory = vim.fn.tempname()
 local repo = "owner/repo"
 cache.set_data_dir_for_test(directory)
-index._reset_for_test()
+index._host_reset_for_test()
 local original_notify = vim.notify
 vim.notify = function() end
 
@@ -65,7 +65,7 @@ local ok, failure = xpcall(function()
   assert(result and not result.ok and #index.list(repo) == 0)
 end, debug.traceback)
 
-index._reset_for_test()
+index._host_reset_for_test()
 cache.set_data_dir_for_test(nil)
 vim.notify = original_notify
 vim.fn.delete(directory, "rf")

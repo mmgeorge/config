@@ -27,8 +27,10 @@ local source = {
 }
 local original_request = client.request
 local request_count = 0
-client.request = function(method, _, callback)
-  assert(method == "backend.models", "context discovery requested an unrelated catalog")
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+  assert(method == "session.provider.model.list", "context discovery requested an unrelated catalog")
   request_count = request_count + 1
   callback(vim.deepcopy(source), nil)
 end

@@ -54,8 +54,7 @@ local function has_ts_lsp(bufnr)
     return false
   end
 
-  local clients = vim.lsp.get_clients and vim.lsp.get_clients({ bufnr = bufnr })
-      or vim.lsp.get_active_clients({ bufnr = bufnr })
+  local clients = vim.lsp.get_clients({ bufnr = bufnr })
   for _, client in ipairs(clients) do
     if ts_lsp_names[client.name] then
       return true

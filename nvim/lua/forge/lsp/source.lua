@@ -8,7 +8,7 @@ function M.read_failure(path, failure)
   if failure:find("EACCES", 1, true) or failure:find("EPERM", 1, true) then return "access_denied: " .. path end
   return "read_failed: " .. path .. " — " .. failure
 end
----@type table<integer, { count: integer, owned: boolean }>
+---@type table<integer, { count: integer, owned: boolean, generation: integer, timer?: uv.uv_timer_t }>
 local leases = {}
 
 ---@param buffer integer

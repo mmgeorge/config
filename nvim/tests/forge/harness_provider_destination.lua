@@ -22,7 +22,10 @@ picker.close = function(notify)
   if notify ~= false and spec and spec.on_close then spec.on_close() end
 end
 harness.switch_backend = function(backend, destination) selected = { backend = backend, destination = destination } end
-client.request = function(method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   if method == 'session.preview' then callback({ preview = params.session_id }) return end
   assert(method == 'session.list' and params.scope == 'repo')
   if list_failure then callback(nil, 'list failed') return end

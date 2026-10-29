@@ -20,6 +20,29 @@ function M.capture(window)
   return baseline
 end
 
+---@class ForgeWindowInheritance
+---@field baseline table<string, string|boolean|number>
+---@field applied table<string, string|boolean|number>
+
+---Capture presentation before Neovim copies buffer-local window options to a new file.
+---@param window integer
+---@return ForgeWindowInheritance
+function M.capture_inheritance(window)
+  local inherited = { baseline = M.capture(window), applied = {} }
+  for _, name in ipairs(option) do inherited.applied[name] = vim.wo[window][name] end
+  return inherited
+end
+
+---Restore copied options without replacing destination-owned presentation or autocmd changes.
+---@param window integer
+---@param inherited ForgeWindowInheritance
+function M.restore_inheritance(window, inherited)
+  if not vim.api.nvim_win_is_valid(window) or window_owner[window] then return end
+  for name, value in pairs(inherited.applied) do
+    if vim.wo[window][name] == value then vim.wo[window][name] = inherited.baseline[name] end
+  end
+end
+
 ---@param window integer
 ---@param owner table
 ---@param baseline table<string, string|boolean|number>

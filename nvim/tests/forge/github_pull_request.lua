@@ -10,7 +10,7 @@ end)
 local target = { repo = "owner/repo", number = 7, node_id = "PR_fixture" }
 local result
 pull_request.transition_async(vim.fn.getcwd(), target, "DRAFT", function(value) result = value end)
-assert(route == "github.actor")
+assert(route == "github.actor.get")
 pending({ login = "viewer", node_id = "ACTOR" })
 assert(route == "github.review.mutate")
 local capture = params.request
@@ -19,7 +19,7 @@ pending({ version = 1, resource = capture.resource,
   capture = { operation_id = capture.operation_id, actor = "ACTOR" },
   state = { phase = "confirmed", result = { state = "OPEN", isDraft = true } },
   confirmed_steps = { { state = "OPEN", isDraft = false } } })
-assert(route == "github.recovery.ack" and result == nil)
+assert(route == "github.recovery.acknowledge" and result == nil)
 pending({})
 assert(result.ok and result.state == "OPEN" and result.is_draft)
 pull_request.transition_async(vim.fn.getcwd(), target, "DRAFT", function(value) result = value end)

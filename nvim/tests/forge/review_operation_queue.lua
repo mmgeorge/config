@@ -24,7 +24,7 @@ local state = {
   verdict_provider = function(callback) callback("comment") end,
 }
 review.save(state)
-assert(#request == 1 and request[1].method == "review.save")
+assert(#request == 1 and request[1].method == "github.review.document.save")
 local superseded_comment, superseded_submission, superseded_lifecycle
 review.comment(state, { operation = "save", comment = 1, action = "save" }, function(result, failure)
   assert(not result) superseded_comment = failure
@@ -50,7 +50,7 @@ editable.record(state.replica.editable, comment_region, { "Newer unsaved comment
 assert(state.pending_operation.kind == "comment" and #request == 1)
 request[1].callback({ snapshot = { uncertain = false, field = {} }, remote = { outcome = "confirmed" } })
 assert(vim.wait(1000, function() return #request == 2 end))
-assert(request[2].method == "review.comment")
+assert(request[2].method == "github.review.document.comment")
 assert(request[2].params.capture[1].text == "Frozen comment", "dispatch recaptured later typing")
 local superseded_close
 review.transition(state, "CLOSED", function(result, failure)
@@ -59,7 +59,7 @@ end)
 request[2].callback({})
 assert(vim.wait(1000, function() return #request == 3 end))
 assert(callback_ran and superseded_close)
-assert(request[3].method == "review.transition" and request[3].params.desired == "OPEN")
+assert(request[3].method == "github.review.document.transition" and request[3].params.desired == "OPEN")
 assert(editable.capture_draft(state.replica.editable, { [comment_region] = true })[1].text == "Newer unsaved comment")
 request[3].callback({ lifecycle = { state = "OPEN" } })
 assert(vim.wait(1000, function() return not state.lifecycle_running end))
@@ -74,10 +74,10 @@ assert(review.recover_batched_submission(state, { resolution = "not_dispatched" 
   assert(#request == 4, "recovery callback dispatched before completion settled")
   recovery_callback_ran = true
 end))
-assert(#request == 4 and request[4].method == "review.submit_batched_recover")
+assert(#request == 4 and request[4].method == "github.review.document.batch.recover")
 request[4].callback({ submission = {}, fresh_required = false })
 assert(vim.wait(1000, function() return #request == 5 end))
-assert(not state.submission_recovery and request[5].method == "review.transition")
+assert(not state.submission_recovery and request[5].method == "github.review.document.transition")
 assert(recovery_callback_ran and request[5].params.desired == "OPEN")
 request[5].callback({ lifecycle = { state = "OPEN" } })
 assert(vim.wait(1000, function() return not state.lifecycle_running end))
@@ -125,7 +125,7 @@ assert(#request == 9 and state.pending_operation == retained_operation)
 assert(review.comment(state, { operation = "recover", comment = 1 }))
 request[10].callback({ snapshot = { region = comment_region, comment = 1, uncertain = false } })
 assert(vim.wait(1000, function() return #request == 11 end))
-assert(request[11].method == "review.transition" and request[11].params.desired == "OPEN")
+assert(request[11].method == "github.review.document.transition" and request[11].params.desired == "OPEN")
 assert(editable.capture_draft(state.replica.editable, { [comment_region] = true })[1].text == "Newer unsaved comment")
 request[11].callback({ lifecycle = { state = "OPEN" } })
 assert(vim.wait(1000, function() return not state.lifecycle_running end))

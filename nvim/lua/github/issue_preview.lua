@@ -1,8 +1,8 @@
 local comment_rows = require("github.comment_rows")
-local datetime_ok, datetime = pcall(require, "forge.integrations.datetime")
-if not datetime_ok then datetime = nil end
-local ui_ok, ui = pcall(require, "forge.infra.ui")
-if not ui_ok then ui = nil end
+local datetime_ok, datetime_module = pcall(require, "forge.integrations.datetime")
+local datetime = datetime_ok and datetime_module or nil
+local ui_ok, ui_module = pcall(require, "forge.infra.ui")
+local ui = ui_ok and ui_module or nil
 
 local M = {}
 local decoration_namespace = vim.api.nvim_create_namespace("github.issue_preview.decorations")
@@ -102,11 +102,11 @@ local function activity_text(item)
     if epoch and (not latest_epoch or epoch > latest_epoch) then latest, latest_epoch = value, epoch
     elseif not epoch and (latest == "" or value > latest) then latest = value end
   end
-  consider(item.updated_at or item.updatedAt)
-  consider(item.created_at or item.createdAt)
+  consider(item.updated_at)
+  consider(item.created_at)
   for _, comment in ipairs(type(item.comments) == "table" and item.comments or {}) do
-    consider(comment.updated_at or comment.updatedAt)
-    consider(comment.created_at or comment.createdAt)
+    consider(comment.updated_at)
+    consider(comment.created_at)
   end
   return latest ~= "" and relative_datetime(latest) or ""
 end
@@ -208,7 +208,7 @@ end
 local function render_item(item, folds)
   local comments = {}
   for _, comment in ipairs(type(item.comments) == "table" and item.comments or {}) do
-    comments[#comments + 1] = { user = comment.author or comment.user or "unknown", body = comment.body or "", created_at = comment.created_at or comment.createdAt or "", updated_at = comment.updated_at or comment.updatedAt or "", remote_id = comment.id or comment.databaseId or comment.url, url = comment.url }
+    comments[#comments + 1] = { user = comment.author, body = comment.body, created_at = comment.created_at, updated_at = comment.updated_at, remote_id = comment.url, url = comment.url }
   end
   local options = { comment_icon = ui and ui.comment_icon or "", entry_id = comment_rows.entry_id,
     line_hl_group = "ForgeReviewComment", body_hl_group = "ForgeReviewComment", date_hl_group = "ForgeStatusDate",
@@ -231,8 +231,7 @@ local function render_item(item, folds)
     highlights[#highlights + 1] = { line = row, start_col = 14, end_col = 14 + #activity, hl_group = "ForgeStatusDate" }
   end
   if item.kind == "pr" then add_meta(lines, "Head", item.head_ref_name or "") add_meta(lines, "Base", item.base_ref_name or "") end
-  local milestone_title = type(item.milestone) == "table" and item.milestone.title or item.milestone
-  local milestone = vim.trim(tostring(milestone_title or ""))
+  local milestone = vim.trim(item.milestone or "")
   if milestone ~= "" and ui and ui.milestone_icon then milestone = ui.milestone_icon .. " " .. milestone end
   add_meta(lines, "Release", milestone)
   local projects = names(item.projects, "name")

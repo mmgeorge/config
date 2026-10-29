@@ -74,7 +74,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 require("forge.views.plan_review.references").show_caller = true
 local definition = require("forge.views.plan_review.workspace_definition")
 definition.request = function(query, current, receive)
@@ -976,7 +976,7 @@ if success and vim.g.forge_test_manual and vim.g.forge_plan_behavior_verified th
 end
 picker.close(false)
 require("forge.views.harness.workspace").release(state)
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

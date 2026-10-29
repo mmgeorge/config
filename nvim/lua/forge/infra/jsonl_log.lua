@@ -7,14 +7,14 @@ local M = {}
 ---@param directory string
 ---@param complete fun(failure?: string)
 local function ensure_directory(directory, complete)
-  vim.uv.fs_mkdir(directory, 448, function(failure, _, code)
-    if not failure or code == "EEXIST" or failure:match("^EEXIST:") then complete() return end
+  vim.uv.fs_mkdir(directory, 448, function(failure)
+    if not failure or failure:match("^EEXIST:") then complete() return end
     local parent = vim.fs.dirname(directory)
-    if not (code == "ENOENT" or failure:match("^ENOENT:")) or not parent or parent == directory then complete(failure) return end
+    if not failure:match("^ENOENT:") or not parent or parent == directory then complete(failure) return end
     ensure_directory(parent, function(parent_failure)
       if parent_failure then complete(parent_failure) return end
-      vim.uv.fs_mkdir(directory, 448, function(create_failure, _, create_code)
-        if create_code == "EEXIST" or (create_failure and create_failure:match("^EEXIST:")) then complete()
+      vim.uv.fs_mkdir(directory, 448, function(create_failure)
+        if create_failure and create_failure:match("^EEXIST:") then complete()
         else complete(create_failure) end
       end)
     end)
@@ -73,8 +73,8 @@ function M.new(path, report, rotation_bytes)
     end
     local function rotate()
       if not rotation_bytes or resume then open() return end
-      vim.uv.fs_stat(target, function(failure, stat, code)
-        if failure and code ~= "ENOENT" and not failure:match("^ENOENT:") then fail(failure) return end
+      vim.uv.fs_stat(target, function(failure, stat)
+        if failure and not failure:match("^ENOENT:") then fail(failure) return end
         if not stat or stat.size < rotation_bytes then open() return end
         vim.uv.fs_rename(target, target .. ".1", function(rename_failure)
           if rename_failure then fail(rename_failure) return end

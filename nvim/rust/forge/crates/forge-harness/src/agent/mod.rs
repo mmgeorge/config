@@ -1,5 +1,4 @@
 mod activity;
-mod agent;
 mod backend;
 mod capability;
 mod coordinator;
@@ -7,6 +6,7 @@ mod coordinator;
 mod coordinator_test;
 mod delegation;
 mod event;
+mod identity;
 mod profile;
 mod registry;
 mod runtime;
@@ -24,11 +24,11 @@ pub use profile::{AgentProfile, AgentProfileDocument, AgentProfileStore};
 pub use selection::AgentSelection;
 pub use task::{AgentMessage, AgentSource, AgentTask, MessageDelivery};
 
-pub use agent::{Agent, AgentExecutionState, AgentState};
 pub use backend::{AgentBackendFactory, provider_name};
 pub use capability::AgentCapability;
 pub use delegation::Delegation;
 pub use event::AgentLifecycleEvent;
+pub use identity::{Agent, AgentExecutionState, AgentState};
 pub use registry::AgentRegistry;
 pub use runtime::AgentRuntime;
 pub use tool_scope::{AgentToolLease, AgentToolScope};

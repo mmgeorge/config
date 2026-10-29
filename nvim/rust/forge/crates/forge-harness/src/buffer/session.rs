@@ -349,12 +349,14 @@ impl SessionPresentation {
                 }
                 open.sections.set(
                     &mut open.transcript,
-                    request.view,
-                    request.sequence,
-                    &request.node,
-                    expanded,
-                    more,
-                    Some((request.rows, request.width)),
+                    crate::buffer::sections::SectionRequest {
+                        view: request.view,
+                        sequence: request.sequence,
+                        id: &request.node,
+                        expanded,
+                        more,
+                        page: Some((request.rows, request.width)),
+                    },
                 )?;
                 retain_patches(open, Vec::new())?;
                 Ok(json!({}))
@@ -1283,7 +1285,7 @@ fn unsettled_exchanges<'source>(
 ) -> Vec<String> {
     let mut exchanges = source.filter_map(|entry| match entry {
         ProjectionSource::Entry(TimelineEntry::Exchange { id, exchange, .. }) => {
-            Some((id, exchange))
+            Some((id, exchange.as_ref()))
         }
         ProjectionSource::Exchange(exchange) => Some((&exchange.id, exchange)),
         _ => None,
@@ -1440,11 +1442,13 @@ fn toggle_inline_output(
     let mut heading = renderer.tool_header(
         heading_id,
         previous_heading.metadata.target[0].id.clone(),
-        &call.kind,
-        call.elapsed_ms(now),
-        call.failed,
-        &call.title,
-        expanded,
+        crate::buffer::transcript::ToolHeading {
+            kind: &call.kind,
+            elapsed_ms: call.elapsed_ms(now),
+            failed: call.failed,
+            title: &call.title,
+            expanded,
+        },
     )?;
     heading.metadata.layout = layout.clone();
     heading.metadata.fold = previous_heading.metadata.fold.clone();
@@ -1535,7 +1539,9 @@ fn toggle_inline_output(
         .chain(std::iter::once(&hidden))
         .flat_map(|block| block.metadata.target.iter().map(|target| target.id.clone()))
         .collect::<Vec<_>>();
-    let mut changes = vec![TranscriptChange::Block { block: heading }];
+    let mut changes = vec![TranscriptChange::Block {
+        block: (heading).into(),
+    }];
     if !body.is_empty() || first_chunk < removed_chunks {
         changes.push(TranscriptChange::ToolBody {
             owner: owner.clone(),
@@ -1549,7 +1555,9 @@ fn toggle_inline_output(
             block: body,
         });
     }
-    changes.push(TranscriptChange::Block { block: hidden });
+    changes.push(TranscriptChange::Block {
+        block: (hidden).into(),
+    });
     let patches = match open.transcript.tool_layout(changes) {
         Ok(patches) => patches,
         Err(failure) => {
@@ -1698,7 +1706,9 @@ fn apply_projection<'operation>(
                 if let Some(previous) = open.transcript.document.block(&response) {
                     let mut block = previous.clone();
                     super::message::settle(&mut block);
-                    changed.push(TranscriptChange::Block { block });
+                    changed.push(TranscriptChange::Block {
+                        block: block.into(),
+                    });
                 }
             }
         }
@@ -1768,7 +1778,7 @@ fn apply_projection<'operation>(
                 open.action.extend(replacement.action);
                 open.syntax.extend(replacement.syntax);
                 changed.push(TranscriptChange::Block {
-                    block: replacement.block,
+                    block: (replacement.block).into(),
                 });
             }
             TimelineOperation::ToolOutput {
@@ -1845,7 +1855,9 @@ fn apply_projection<'operation>(
                         let mut node = node.clone();
                         node.more = more;
                         heading.metadata.node = Some(node);
-                        changed.push(TranscriptChange::Block { block: heading });
+                        changed.push(TranscriptChange::Block {
+                            block: (heading).into(),
+                        });
                     }
                 }
                 let identity = |chunk| {
@@ -1920,7 +1932,9 @@ fn apply_projection<'operation>(
                         block,
                     });
                 }
-                changed.push(TranscriptChange::Block { block: hidden });
+                changed.push(TranscriptChange::Block {
+                    block: (hidden).into(),
+                });
             }
             TimelineOperation::Insert { index, entry }
             | TimelineOperation::Replace { index, entry } => {
@@ -2237,9 +2251,12 @@ mod tests {
             };
             child = Some(TimelineEntry::AgentLifecycle {
                 id: identity,
+
                 created_at_ms: 0,
-                run,
-                exchange: vec![exchange],
+                run: run.into(),
+
+                exchange: vec![*exchange],
+
                 agent: nested,
             });
         }
@@ -3035,12 +3052,14 @@ mod tests {
             let open = owner.open.as_mut().unwrap();
             open.sections.set(
                 &mut open.transcript,
-                ViewId("view".into()),
-                99,
-                "implementation:exchange",
-                false,
-                false,
-                None,
+                crate::buffer::sections::SectionRequest {
+                    view: ViewId("view".into()),
+                    sequence: 99,
+                    id: "implementation:exchange",
+                    expanded: false,
+                    more: false,
+                    page: None,
+                },
             )?;
             retain_patches(open, Vec::new())?;
         }
@@ -3063,12 +3082,14 @@ mod tests {
             let open = owner.open.as_mut().unwrap();
             open.sections.set(
                 &mut open.transcript,
-                ViewId("view".into()),
-                100,
-                "implementation:exchange",
-                true,
-                false,
-                None,
+                crate::buffer::sections::SectionRequest {
+                    view: ViewId("view".into()),
+                    sequence: 100,
+                    id: "implementation:exchange",
+                    expanded: true,
+                    more: false,
+                    page: None,
+                },
             )?;
             retain_patches(open, Vec::new())?;
         }
@@ -3151,12 +3172,14 @@ mod tests {
         for (index, id) in ids.iter().enumerate() {
             open.sections.set(
                 &mut open.transcript,
-                ViewId(view.into()),
-                index as u64 + 1,
-                id,
-                true,
-                false,
-                None,
+                crate::buffer::sections::SectionRequest {
+                    view: ViewId(view.into()),
+                    sequence: index as u64 + 1,
+                    id,
+                    expanded: true,
+                    more: false,
+                    page: None,
+                },
             )?;
             open.sections.quota_for_test(id, 16 * 1024 * 1024);
         }
@@ -3184,8 +3207,10 @@ mod tests {
         let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
         let entry = TimelineEntry::Exchange {
             id: "active".into(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: HashMap::new(),
         };
         let mut owner = SessionPresentation::new("session".into());
@@ -3313,8 +3338,10 @@ mod tests {
             owner.open.as_mut().unwrap(),
             &[TimelineEntry::Exchange {
                 id: "active".into(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             }],
         )?;
@@ -3388,8 +3415,10 @@ mod tests {
         exchange.observe_turn(&event, 2)?;
         let entry = TimelineEntry::Exchange {
             id: "active".into(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: HashMap::new(),
         };
         let mut owner = SessionPresentation::new("session".into());
@@ -3490,8 +3519,10 @@ mod tests {
         exchange.observe_turn(&tool_event, 2)?;
         let entry = TimelineEntry::Exchange {
             id: "active".into(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: HashMap::new(),
         };
         let mut owner = SessionPresentation::new("session".into());
@@ -3606,8 +3637,10 @@ mod tests {
             interaction_entry("settled"),
             TimelineEntry::Exchange {
                 id: "active".into(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             },
         ])?;
@@ -3658,8 +3691,10 @@ mod tests {
             owner.initialize(vec![
                 TimelineEntry::Exchange {
                     id: "active".into(),
+
                     created_at_ms: 0,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 TimelineEntry::Status {
@@ -3778,8 +3813,10 @@ mod tests {
             serde_json::Value::Null;
         let active = TimelineEntry::Exchange {
             id: "active".into(),
+
             created_at_ms: 0,
-            exchange: serde_json::from_value(active["exchange"].take())?,
+            exchange: serde_json::from_value::<Box<Exchange>>(active["exchange"].take())?,
+
             agent_by_id: HashMap::new(),
         };
         let TimelineEntry::Exchange { mut exchange, .. } = active.clone() else {
@@ -3924,8 +3961,10 @@ mod tests {
         exchange.resume(0)?;
         let entry = |exchange: &Exchange| TimelineEntry::Exchange {
             id: exchange.id.clone(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: HashMap::new(),
         };
         let mut owner = SessionPresentation::new("session".into());
@@ -4058,7 +4097,7 @@ mod tests {
                     .node_list
                     .push(crate::exchange::ExchangeNode::Compaction {
                         id: "compaction".into(),
-                        compaction: crate::backend::Compaction {
+                        compaction: (crate::backend::Compaction {
                             id: "compaction".into(),
                             thread_id: "thread".into(),
                             state: crate::backend::CompactionState::Completed,
@@ -4066,7 +4105,8 @@ mod tests {
                             started_at_ms: Some(2),
                             completed_at_ms: Some(3),
                             result: Default::default(),
-                        },
+                        })
+                        .into(),
                     });
             }
             event.activity = Some(ToolActivity {
@@ -4444,8 +4484,10 @@ mod tests {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![TimelineEntry::Exchange {
             id: "parallel".into(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: HashMap::new(),
         }])?;
         let document = DocumentId("hidden-parallel".into());
@@ -4531,8 +4573,10 @@ mod tests {
         exchange.observe_turn(&event, 4)?;
         owner.reconcile(vec![TimelineEntry::Exchange {
             id: "parallel".into(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: HashMap::new(),
         }])?;
         assert_eq!(
@@ -4575,8 +4619,10 @@ mod tests {
         exchange.observe_turn(&event, 6)?;
         owner.reconcile(vec![TimelineEntry::Exchange {
             id: "parallel".into(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: HashMap::new(),
         }])?;
         let settled = owner.snapshot(&document)?;
@@ -4642,8 +4688,10 @@ mod tests {
         );
         owner.reconcile(vec![TimelineEntry::Exchange {
             id: "parallel".into(),
+
             created_at_ms: 0,
-            exchange,
+            exchange: exchange.into(),
+
             agent_by_id: HashMap::new(),
         }])?;
         let activity = "parallel:exchange";
@@ -5010,9 +5058,11 @@ mod tests {
             .unwrap();
         TimelineEntry::Exchange {
             id: identity.into(),
+
             created_at_ms: 0,
+
             agent_by_id: HashMap::new(),
-            exchange: interaction,
+            exchange: (interaction).into(),
         }
     }
 
@@ -5122,8 +5172,10 @@ mod tests {
             let mut owner = SessionPresentation::new("session".into());
             owner.initialize(vec![TimelineEntry::Exchange {
                 id: "active".into(),
+
                 created_at_ms: 0,
-                exchange: exchange.clone(),
+                exchange: (exchange.clone()).into(),
+
                 agent_by_id: HashMap::new(),
             }])?;
             let document = DocumentId("stream-page".into());
@@ -5398,8 +5450,9 @@ mod tests {
                 |identity: &str, exchange: Vec<Exchange>, agent: Vec<TimelineEntry>| {
                     TimelineEntry::AgentLifecycle {
                         id: identity.into(),
+
                         created_at_ms: 0,
-                        run: crate::agent::Agent {
+                        run: (crate::agent::Agent {
                             id: identity.into(),
                             session_id: "session".into(),
                             provider_thread_id: Some(identity.into()),
@@ -5413,20 +5466,25 @@ mod tests {
                             state: crate::agent::AgentState::Ready,
                             created_at_ms: 0,
                             updated_at_ms: 0,
-                        },
+                        })
+                        .into(),
+
                         exchange,
+
                         agent,
                     }
                 };
             let entry = if nesting == "plan" {
                 TimelineEntry::Exchange {
                     id: exchange.id.clone(),
+
                     created_at_ms: exchange.created_at_ms,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()),
+
                     agent_by_id: HashMap::new(),
                 }
             } else {
-                let child = agent_entry("child", vec![exchange.clone()], Vec::new());
+                let child = agent_entry("child", vec![*exchange.clone()], Vec::new());
                 if nesting == "agent" {
                     child
                 } else {
@@ -5572,15 +5630,20 @@ mod tests {
         });
         let entry = |child: Exchange| TimelineEntry::Exchange {
             id: parent.id.clone(),
+
             created_at_ms: 0,
-            exchange: parent.clone(),
+            exchange: (parent.clone()).into(),
+
             agent_by_id: HashMap::from([(
                 run.id.clone(),
                 TimelineEntry::AgentLifecycle {
                     id: run.id.clone(),
+
                     created_at_ms: 0,
-                    run: run.clone(),
+                    run: (run.clone()).into(),
+
                     exchange: vec![child],
+
                     agent: Vec::new(),
                 },
             )]),
@@ -5747,8 +5810,9 @@ mod tests {
         let mut interaction: Exchange = serde_json::from_value(raw)?;
         let agent = TimelineEntry::AgentLifecycle {
             id: "agent:child".into(),
+
             created_at_ms: 0,
-            run: Agent {
+            run: (Agent {
                 id: "child-run".into(),
                 session_id: "session".into(),
                 provider_thread_id: None,
@@ -5762,8 +5826,11 @@ mod tests {
                 state: AgentState::Ready,
                 created_at_ms: 0,
                 updated_at_ms: 1,
-            },
+            })
+            .into(),
+
             exchange: vec![interaction.clone()],
+
             agent: Vec::new(),
         };
         let mut owner = SessionPresentation::new("session".into());

@@ -7,7 +7,7 @@ fn goal_command_request(transport: &str, command: &str, id: u64) -> Request {
     };
     let (method, params) = match transport {
         "transition" => (
-            "task.transition".to_owned(),
+            "session.command.apply".to_owned(),
             if command == "goal" {
                 json!({"operation_id":operation,"action":"goal","text":"Preserve the held provider"})
             } else {
@@ -16,22 +16,22 @@ fn goal_command_request(transport: &str, command: &str, id: u64) -> Request {
         ),
         "rpc" => (
             if command == "goal" {
-                "goal.set".into()
+                "session.goal.set".into()
             } else {
-                format!("goal.{command}")
+                format!("session.goal.{command}")
             },
             json!({"operation_id":operation,"objective":"Preserve the held provider"}),
         ),
         "prompt" => (
-            "prompt.submit".into(),
+            "session.prompt.submit".into(),
             json!({"operation_id":operation,"text":text}),
         ),
         "steer" => (
-            "turn.steer".into(),
+            "session.turn.steer".into(),
             json!({"operation_id":operation,"text":text}),
         ),
         "input" => (
-            "input.apply".into(),
+            "session.input.apply".into(),
             json!({"id":operation,"operation_id":operation,
             "action":{"kind":"submit","message":{"id":operation,"text":text,"intent":"auto","attachments":[]}}}),
         ),
@@ -51,7 +51,7 @@ async fn goal_command_aliases_preserve_held_provider_and_idempotent_receipts() -
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let session_id = registry.initial_session_id.clone();
+        let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
         let control = controller.backend.mock_response_control().unwrap();
         let hold = control
@@ -75,7 +75,7 @@ async fn goal_command_aliases_preserve_held_provider_and_idempotent_receipts() -
                 Some(session_id.clone()),
                 Request {
                     id: 2,
-                    method: "input.apply".into(),
+                    method: "session.input.apply".into(),
                     params: json!({"id":"original","action":{"kind":"submit","message":{
                 "id":"original","text":"Inspect startup","intent":"auto","attachments":[]}}}),
                 },
@@ -187,7 +187,7 @@ async fn goal_command_aliases_preserve_held_provider_and_idempotent_receipts() -
 #[tokio::test]
 async fn goal_continue_aliases_reuse_the_completed_source_and_receipt() -> Result<()> {
     use crate::backend::mock_response::MockResponseCommand;
-    for transport in ["transition", "rpc", "prompt", "input", "steer"] {
+    for transport in ["transition", "prompt", "input", "steer"] {
         let fixture = tempfile::tempdir()?;
         crate::checks::configure_fixture(fixture.path());
         let service = service();
@@ -195,7 +195,7 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt() -> Resul
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let session_id = registry.initial_session_id.clone();
+        let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
         let (sink, mut output) = forge_protocol::outbound::channel();
         let reader = tokio::spawn(async move {
@@ -208,7 +208,7 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt() -> Resul
                 Some(session_id.clone()),
                 Request {
                     id: 2,
-                    method: "prompt.submit".into(),
+                    method: "session.prompt.submit".into(),
                     params: json!({"text":"Inspect startup"}),
                 },
                 &sink,
@@ -322,7 +322,7 @@ async fn queued_input_edited_to_goal_is_a_state_command_with_one_receipt() -> Re
         .open_session(1, initialize(&fixture, "mock"))
         .await?;
     let registry = service.registry().await?;
-    let session_id = registry.initial_session_id.clone();
+    let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
     let control = controller.backend.mock_response_control().unwrap();
     let hold = control
@@ -346,7 +346,7 @@ async fn queued_input_edited_to_goal_is_a_state_command_with_one_receipt() -> Re
             Some(session_id.clone()),
             Request {
                 id: 2,
-                method: "input.apply".into(),
+                method: "session.input.apply".into(),
                 params: json!({"id":"original","action":{"kind":"submit","message":{
             "id":"original","text":"Inspect startup","intent":"auto","attachments":[]}}}),
             },
@@ -576,7 +576,7 @@ async fn plan_replacement_waits_for_turn_boundary_without_cancelling() -> Result
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let session_id = registry.initial_session_id.clone();
+        let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
         let control = controller.backend.mock_response_control().unwrap();
         let held = control
@@ -598,7 +598,7 @@ async fn plan_replacement_waits_for_turn_boundary_without_cancelling() -> Result
         if planning {
             let request = Request {
                 id: 2,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"original-plan","action":"plan","text":"Original plan"}),
             };
             service.prepare_task(Some(&session_id), &request).await?;
@@ -642,7 +642,7 @@ async fn plan_replacement_waits_for_turn_boundary_without_cancelling() -> Result
         let original = store.latest_exchange(&session_id)?.unwrap();
         let request = Request {
             id: 3,
-            method: "task.transition".into(),
+            method: "session.command.apply".into(),
             params: json!({"operation_id":"replacement-plan","action":"plan","text":"Replacement plan"}),
         };
         service.prepare_task(Some(&session_id), &request).await?;
@@ -720,7 +720,7 @@ async fn goal_continuation_uses_durable_input_and_yields_to_user_queue() -> Resu
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let session_id = registry.initial_session_id.clone();
+        let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
         let control = controller.backend.mock_response_control().unwrap();
         let held = control
@@ -755,7 +755,7 @@ async fn goal_continuation_uses_durable_input_and_yields_to_user_queue() -> Resu
             .await?;
         controller.attach_input(&sink).await?;
         service.dispatch(Some(session_id.clone()), Request {
-            id: 2, method: "task.transition".into(),
+            id: 2, method: "session.command.apply".into(),
             params: json!({"operation_id":"start-goal","action":"goal","text":"Finish the work"}),
         }, &sink).await?;
         tokio::time::timeout(
@@ -773,14 +773,14 @@ async fn goal_continuation_uses_durable_input_and_yields_to_user_queue() -> Resu
                 .input_request(
                     Request {
                         id: 3,
-                        method: "input.apply".into(),
+                        method: "session.input.apply".into(),
                         params: json!({"id":"queued-user","action":{"kind":"submit","message":{
                             "id":"user-message", "text":"Use the revised requirement",
                             "intent":"queue", "attachments":[],"config":null,
                             "reservation":null,"submission_id":null,"error":null
                         }}}),
                     },
-                    HarnessMethod::InputApply,
+                    RuntimeMethod::SessionInputApply,
                     &sink,
                 )
                 .await?;
@@ -846,7 +846,7 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
         .open_session(1, initialize(&fixture, "mock"))
         .await?;
     let registry = original_service.registry().await?;
-    let session_id = registry.initial_session_id.clone();
+    let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let reader = tokio::spawn(async move {
@@ -881,7 +881,7 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
     let hold_id = held["id"].as_str().unwrap().to_owned();
     controller.attach_input(&sink).await?;
     original_service.dispatch(Some(session_id.clone()), Request {
-        id: 3, method: "task.transition".into(),
+        id: 3, method: "session.command.apply".into(),
         params: json!({"operation_id":"restart-goal","action":"goal","text":"Finish after restart"}),
     }, &sink).await?;
     tokio::time::timeout(
@@ -1019,7 +1019,7 @@ async fn running_goal_promotion_steers_without_cancelling() -> Result<()> {
         .open_session(1, initialize(&fixture, "mock"))
         .await?;
     let registry = service.registry().await?;
-    let session_id = registry.initial_session_id.clone();
+    let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
     let control = controller.backend.mock_response_control().unwrap();
     let held = control
@@ -1084,7 +1084,7 @@ async fn running_goal_promotion_steers_without_cancelling() -> Result<()> {
         .context("original exchange missing")?;
     let request = Request {
         id: 2,
-        method: "task.transition".into(),
+        method: "session.command.apply".into(),
         params: json!({"operation_id":"live-goal","action":"goal","text":"Finish startup work"}),
     };
     service.prepare_task(Some(&session_id), &request).await?;
@@ -1149,7 +1149,7 @@ async fn running_goal_promotion_steers_without_cancelling() -> Result<()> {
             Some(session_id.clone()),
             Request {
                 id: 4,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"pause-live-goal","action":"pause"}),
             },
             &sink,
@@ -1194,7 +1194,7 @@ async fn running_goal_promotion_steers_without_cancelling() -> Result<()> {
             Some(session_id.clone()),
             Request {
                 id: 5,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"resume-live-goal","action":"resume"}),
             },
             &sink,
@@ -1231,7 +1231,7 @@ async fn running_goal_promotion_steers_without_cancelling() -> Result<()> {
             Some(session_id.clone()),
             Request {
                 id: 3,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"clear-live-goal","action":"clear"}),
             },
             &sink,
@@ -1264,7 +1264,7 @@ async fn reviewed_execution_fixture(
     sink: &MessageSender,
 ) -> Result<Value> {
     service.dispatch(Some(session_id.to_owned()), Request {
-        id: 31, method: "task.transition".into(),
+        id: 31, method: "session.command.apply".into(),
         params: json!({"operation_id":"fixture-plan","action":"plan","text":"Inspect the project"}),
     }, sink).await?;
     let plan = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1297,7 +1297,7 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let session_id = registry.initial_session_id.clone();
+        let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
         let (sink, mut output) = forge_protocol::outbound::channel();
         let reader = tokio::spawn(async move {
@@ -1312,7 +1312,7 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
                 Some(session_id.clone()),
                 Request {
                     id: 32,
-                    method: "task.transition".into(),
+                    method: "session.command.apply".into(),
                     params: json!({"operation_id":"fixture-pause-plan","action":"pause"}),
                 },
                 &sink,
@@ -1333,14 +1333,14 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
             .input_request(
                 Request {
                     id: 33,
-                    method: "input.apply".into(),
+                    method: "session.input.apply".into(),
                     params: json!({
                         "id":"held-chat", "action":{"kind":"submit","message":{"id":"held-chat",
                         "text":"Inspect startup", "intent":"auto", "attachments":[], "config":null,
                         "reservation":null,"submission_id":null,"error":null}}
                     }),
                 },
-                HarnessMethod::InputApply,
+                RuntimeMethod::SessionInputApply,
                 &sink,
             )
             .await?;
@@ -1356,7 +1356,7 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
         .await??;
         let method = if acceptance == "alias" {
             params.as_object_mut().unwrap().remove("action");
-            "plan.accept"
+            "session.plan.accept"
         } else if acceptance == "review" {
             let mut begin = params.clone();
             begin["operation_id"] = json!("begin-held-review");
@@ -1367,7 +1367,7 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
                     Some(session_id.clone()),
                     Request {
                         id: 34,
-                        method: "plan.acceptance.begin".into(),
+                        method: "session.plan.acceptance.begin".into(),
                         params: begin,
                     },
                     &sink,
@@ -1415,7 +1415,7 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
             .enumerate()
             {
                 let error = tokio::time::timeout(Duration::from_secs(1), service.dispatch(Some(session_id.clone()),
-                    Request { id:50 + index as u64, method:"task.transition".into(), params:json!({
+                    Request { id:50 + index as u64, method:"session.command.apply".into(), params:json!({
                         "operation_id":format!("stale-acceptance-{index}"), "action":"complete_acceptance",
                         "plan_id":plan_id, "digest":digest,
                     }) }, &sink)).await?.expect_err("stale acceptance must fail");
@@ -1433,9 +1433,9 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
                 assert_eq!(controller.coordinator.execution.available_permits(), 0);
             }
             params = json!({"operation_id":"complete-held-review"});
-            "question.continue"
+            "session.question.continue"
         } else {
-            "task.transition"
+            "session.command.apply"
         };
         let request = Request {
             id: 35,
@@ -1469,7 +1469,7 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
                 Some(session_id.clone()),
                 Request {
                     id: 35,
-                    method: "task.transition".into(),
+                    method: "session.command.apply".into(),
                     params: json!({"operation_id":"clear-pending-execution","action":"clear"}),
                 },
                 &sink,
@@ -1510,7 +1510,7 @@ async fn saved_plan_actions_preserve_held_provider_and_reject_foreign_artifacts(
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let session_id = registry.initial_session_id.clone();
+        let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
         let (sink, mut output) = forge_protocol::outbound::channel();
         let reader = tokio::spawn(async move {
@@ -1526,7 +1526,7 @@ async fn saved_plan_actions_preserve_held_provider_and_reject_foreign_artifacts(
                 Some(session_id.clone()),
                 Request {
                     id: 41,
-                    method: "task.transition".into(),
+                    method: "session.command.apply".into(),
                     params: json!({"operation_id":"pause-saved-source","action":"pause"}),
                 },
                 &sink,
@@ -1544,11 +1544,11 @@ async fn saved_plan_actions_preserve_held_provider_and_reject_foreign_artifacts(
             .await?;
         let hold_id = held["id"].as_str().unwrap().to_owned();
         controller.input_request(Request {
-            id: 42, method: "input.apply".into(),
+            id: 42, method: "session.input.apply".into(),
             params: json!({"id":"held-plan-action-chat","action":{"kind":"submit","message":{
                 "id":"held-plan-action-chat","text":"Inspect current workspace","intent":"auto",
                 "attachments":[],"config":null,"reservation":null,"submission_id":null,"error":null}}}),
-        }, HarnessMethod::InputApply, &sink).await?;
+        }, RuntimeMethod::SessionInputApply, &sink).await?;
         tokio::time::timeout(
             Duration::from_secs(5),
             control.dispatch(
@@ -1577,7 +1577,7 @@ async fn saved_plan_actions_preserve_held_provider_and_reject_foreign_artifacts(
         foreign_plan.session_id = child.id;
         store.save_plan(&foreign_plan)?;
         let failure = tokio::time::timeout(Duration::from_secs(1), service.dispatch(Some(session_id.clone()),
-            Request { id: 43, method: "task.transition".into(), params: json!({
+            Request { id: 43, method: "session.command.apply".into(), params: json!({
                 "operation_id":format!("foreign-{action}"),"action":action,"plan_id":foreign_plan.id,
             }) }, &sink)).await?.expect_err("foreign plan selection must fail");
         assert!(failure.to_string().contains("another"), "{failure:#}");
@@ -1591,7 +1591,7 @@ async fn saved_plan_actions_preserve_held_provider_and_reject_foreign_artifacts(
                 Some(session_id.clone()),
                 Request {
                     id: 44,
-                    method: "task.transition".into(),
+                    method: "session.command.apply".into(),
                     params: json!({
                         "operation_id":format!("saved-{action}"),"action":action,"plan_id":plan_id,
                     }),
@@ -1637,7 +1637,7 @@ async fn saved_plan_actions_preserve_held_provider_and_reject_foreign_artifacts(
                 Some(session_id.clone()),
                 Request {
                     id: 45,
-                    method: "task.transition".into(),
+                    method: "session.command.apply".into(),
                     params: json!({"operation_id":"clear-saved-action","action":"clear"}),
                 },
                 &sink,
@@ -1669,7 +1669,7 @@ async fn checking_continuation_returns_to_verify_without_provider_exchange() -> 
         .open_session(1, initialize(&fixture, "mock"))
         .await?;
     let registry = service.registry().await?;
-    let session_id = registry.initial_session_id.clone();
+    let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let reader = tokio::spawn(async move {
@@ -1814,7 +1814,7 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
         .open_session(1, initialize(&fixture, "mock"))
         .await?;
     let registry = service.registry().await?;
-    let session_id = registry.initial_session_id.clone();
+    let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
     controller.observer.set_native_goal_for_test(true)?;
     let mut store = SqliteStore::open(&controller.data_root)?;

@@ -306,11 +306,11 @@ function M.delete_repo(repo, callback)
     if callback then callback(value.deleted, nil) end
   end
   local accepted, failure = pcall(function()
-    require("forge.client").request_host("github.issues", {
+    require("forge.client").request({ method = "github.issue.list", params = {
       database = vim.fs.joinpath(repository_path, "issues", "issues.redb"),
       repo = normalized,
       request = { operation = "delete_cache" },
-    }, finish)
+    } }, finish)
   end)
   if not accepted then
     if completed then error(failure) end

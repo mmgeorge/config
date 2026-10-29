@@ -90,7 +90,7 @@ function M.acquire(source, root, executable, callback)
   if not created then finish(tostring(create_error), 0) return end
   local temporary = vim.fs.joinpath(directory, ("%s-%s.tmp"):format(vim.fn.getpid(), vim.uv.hrtime()))
   local copy_started = vim.uv.hrtime()
-  vim.uv.fs_copyfile(source, temporary, vim.schedule_wrap(function(copy_error)
+  vim.uv.fs_copyfile(source, temporary, 0, vim.schedule_wrap(function(copy_error)
     local copy_ms = (vim.uv.hrtime() - copy_started) / 1e6
     if copy_error then vim.uv.fs_unlink(temporary) finish("Failed to copy Rust sidecar executable: " .. tostring(copy_error), copy_ms) return end
     local current = vim.uv.fs_stat(source)

@@ -25,8 +25,10 @@ local function snapshot(document)
   if not expanded then table.remove(value.block) end
   return value
 end
-client.host_accepting = function() return true end
-client.request_for = function(_, _, params, callback)
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
   callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   requests[#requests + 1] = params
   if deferred and (params.operation == "node" or params.operation == "sync") then

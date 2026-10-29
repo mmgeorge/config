@@ -650,11 +650,9 @@ fn flush_comment(
     paragraph.clear();
 }
 
-fn layout_tokens(
-    language: SyntaxLanguage,
-    text: &str,
-) -> Result<std::collections::BTreeMap<Vec<(u16, usize)>, (DeclarationPosition, String)>, SyntaxError>
-{
+type LayoutTokenMap = std::collections::BTreeMap<Vec<(u16, usize)>, (DeclarationPosition, String)>;
+
+fn layout_tokens(language: SyntaxLanguage, text: &str) -> Result<LayoutTokenMap, SyntaxError> {
     let surrogate = declaration_surrogate(language, text)?;
     let mut parser = Parser::new();
     parser
@@ -680,7 +678,7 @@ fn collect_tokens(
     text: &str,
     lengths: &[usize],
     identity: &mut Vec<(u16, usize)>,
-    tokens: &mut std::collections::BTreeMap<Vec<(u16, usize)>, (DeclarationPosition, String)>,
+    tokens: &mut LayoutTokenMap,
 ) {
     if node.child_count() == 0
         || matches!(node.kind(), "line_comment" | "block_comment" | "comment")
@@ -762,18 +760,15 @@ pub(super) fn declaration_surrogate(
                     format!("{line}\n")
                 }
             } else if language == SyntaxLanguage::Lua
-                && text.starts_with("local ")
-                && !text.contains('=')
-                && text[6..]
-                    .chars()
-                    .all(|character| character.is_alphanumeric() || character == '_')
-            {
-                format!("{line} = nil\n")
-            } else if language == SyntaxLanguage::Lua
-                && !text.is_empty()
-                && text
-                    .chars()
-                    .all(|character| character.is_alphanumeric() || matches!(character, '_' | '.'))
+                && ((text.starts_with("local ")
+                    && !text.contains('=')
+                    && text[6..]
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || character == '_'))
+                    || (!text.is_empty()
+                        && text.chars().all(|character| {
+                            character.is_alphanumeric() || matches!(character, '_' | '.')
+                        })))
             {
                 format!("{line} = nil\n")
             } else {

@@ -5,7 +5,7 @@ local original_backend = ai_commit._backend
 local original_client = package.loaded["forge.client"]
 local original_notify = vim.notify
 local original_settings = package.loaded["forge.integrations.background_settings"]
-local function generation_config() return { backend = { kind = "codex" } } end
+local function generation_get_config() return { backend = { kind = "codex" } } end
 package.loaded["forge.integrations.background_settings"] = {
   request = function(_, _, callback)
     callback({ settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
@@ -179,8 +179,8 @@ local function run()
   ai_commit.reset_backend()
   package.loaded["forge.client"] = {
     request = function() error("Commit generation initialized a conversation") end,
-    generation_config = generation_config,
-    request_generation = function(params, callback, on_model)
+    generation_get_config = generation_get_config,
+    generation_request = function(params, callback, on_model)
       assert_equal(params.model, nil, "fallback hardcoded a provider or model")
       on_model("selected-model (codex)")
       callback({ state = "ready", message = "fix: use recent Harness\n\nPreserve the body." })
@@ -189,7 +189,7 @@ local function run()
   ai_commit.ensure("D:/harness-fallback", { ref = "HEAD" })
   assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").message, "fix: use recent Harness\n\nPreserve the body.")
   assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").model, "selected-model (codex) · fast")
-  package.loaded["forge.client"].request_generation = function(_, callback)
+  package.loaded["forge.client"].generation_request = function(_, callback)
     callback(nil, "claude commit_message generation failed: Unsupported provider capability: text_generation")
   end
   ai_commit.ensure("D:/unsupported-harness", { ref = "HEAD" })

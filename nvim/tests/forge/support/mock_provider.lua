@@ -15,7 +15,7 @@ Hold.__index = Hold
 
 local function request(session_id, params)
   local completed, result, failure = false, nil, nil
-  client.request_for(session_id, "backend.mock_response", params, function(response, diagnostic)
+  client.request({ session_id = session_id, method = "session.provider.mock_response", params = params }, function(response, diagnostic)
     result, failure, completed = response, diagnostic, true
   end)
   assert(vim.wait(10000, function() return completed end),

@@ -171,15 +171,18 @@ function M.sign()
   if vim.v.virtnum ~= 0 then return blank end
   local location = require("forge.buffer").locate(session, vim.v.lnum - 1, 0)
   local node = location and session.sequence.node[location.block]
+  if not location or not node then return blank end
   local status = node and node.entry.metadata.status
   if status and status ~= vim.NIL and location.position.row == status.row then
     if not selected then return "%s" end
     local sign = vim.api.nvim_eval_statusline("%s", { winid = window, use_statuscol_lnum = vim.v.lnum }).str
     return "%#Visual#" .. sign:gsub("%%", "%%%%") .. "%*"
   end
-  local layout = node and location.position.row == 0 and node.entry.metadata.layout
+  if location.position.row ~= 0 then return blank end
+  ---@type ForgeContentLayout?
+  local layout = node.entry.metadata.layout
   local marker = layout and require("forge.content_layout").marker(node.entry)
-  if not marker or marker == vim.NIL or layout.indent ~= 2 then return blank end
+  if not layout or not marker or marker == vim.NIL or layout.indent ~= 2 then return blank end
   return "%#" .. (selected and "Visual" or marker.capture) .. "#" .. marker.text .. " %*"
 end
 
@@ -270,15 +273,6 @@ function M.release(window)
   if vim.api.nvim_win_is_valid(window) then
     for _, name in ipairs({ "foldmethod", "foldenable", "foldcolumn" }) do vim.wo[window][name] = saved[name] end
   end
-end
-
-function M.restore_inherited(origin, target)
-  local saved = window_state[origin]
-  if not saved then return end
-  if vim.api.nvim_win_is_valid(target) then
-    for _, name in ipairs({ "foldmethod", "foldenable", "foldcolumn" }) do vim.wo[target][name] = saved[name] end
-  end
-  if origin == target then M.release(origin) end
 end
 
 function M.detach(session)

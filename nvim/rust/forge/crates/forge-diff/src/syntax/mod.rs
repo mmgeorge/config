@@ -176,10 +176,9 @@ mod tests {
                         let winning = metadata
                             .visible_decoration
                             .iter()
-                            .filter(|span| {
+                            .rfind(|span| {
                                 span.range.start.column <= column && span.range.end.column > column
                             })
-                            .next_back()
                             .unwrap();
                         assert!(
                             winning.capture.starts_with(capture),
@@ -803,7 +802,7 @@ mod tests {
             .await
             .unwrap();
         let outline = handle.outline();
-        assert_eq!(outline.import, [0..3]);
+        assert_eq!(outline.import, std::iter::once(0..3).collect::<Vec<_>>());
         assert_eq!(outline.scope.len(), 2);
         assert_eq!(outline.scope[0].identity, "class_definition:Client");
         assert_eq!(outline.scope[0].signature, 3..5);
@@ -826,7 +825,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!handle.0.tree[0].root_node().has_error());
-        assert_eq!(handle.outline().import, [1..2]);
+        assert_eq!(
+            handle.outline().import,
+            std::iter::once(1..2).collect::<Vec<_>>()
+        );
         for row in [2, 3, 5] {
             assert!(
                 handle

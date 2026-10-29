@@ -158,6 +158,7 @@ impl TraceStore {
             .then(|| {
                 OpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .read(true)
                     .write(true)
                     .open(&path)
@@ -237,6 +238,7 @@ impl TraceStore {
             Some(
                 OpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .read(true)
                     .write(true)
                     .open(&self.path)
@@ -264,6 +266,7 @@ impl TraceStore {
         *file = None;
         let cleared = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&self.path)
@@ -286,6 +289,7 @@ impl TraceStore {
         fs::create_dir_all(path.parent().unwrap())?;
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path.with_extension("lock"))?;
@@ -376,6 +380,7 @@ impl TraceStore {
         fs::create_dir_all(path.parent().unwrap())?;
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path.with_extension("lock"))?;

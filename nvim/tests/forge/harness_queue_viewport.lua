@@ -14,13 +14,18 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local failures = {}
 require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end
 local function await(predicate, message)
-  assert(vim.wait(5000, function() return #failures > 0 or predicate() end, 10), message)
+  assert(vim.wait(5000, function() return #failures > 0 or predicate() end, 10), message .. ": " .. vim.inspect({
+    ready = state.ready, session = state.session, initial_snapshot_pending = state.initial_snapshot_pending,
+    presentation = state.presentation and { ready = state.presentation.ready, failure = state.presentation.failure,
+      syncing = state.presentation.syncing, pending = state.presentation.pending },
+    input = state.input, host = { ready = client._client.ready, runtime_ready = client._client.runtime_ready },
+  }))
   assert(#failures == 0, table.concat(failures, "\n"))
 end
 local function settled()
@@ -87,7 +92,7 @@ local success, failure = xpcall(function()
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath

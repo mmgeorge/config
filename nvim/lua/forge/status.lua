@@ -40,6 +40,7 @@ local host_unavailable_message = "Forge host stopped or restarted; refresh or re
 ---@field view table<integer, ForgeStatusView>
 ---@field active boolean
 ---@field pending boolean
+---@field pending_expansion? table<string, integer>
 ---@field scheduled boolean
 ---@field done table<integer|string, boolean>
 ---@field recovering? boolean
@@ -72,7 +73,7 @@ end
 local function host_current(state)
   if runner_for_test or not state.host_generation then return true end
   local client = require("forge.client")
-  return state.host_generation == client.host_generation() and client.host_accepting()
+  return state.host_generation == client.host_get_generation() and client.host_is_accepting()
 end
 
 ---@param state ForgeNativeStatus
@@ -83,7 +84,7 @@ local function request(state, params, callback, method)
   state.request_queue = state.request_queue or {}
   local function start()
     local request_started = vim.uv.hrtime()
-    require("forge.startup_log").write("status.request", { document = state.document, method = method or "status", operation = params.operation,
+    require("forge.startup_log").write("status.request", { document = state.document, method = method or "repository.status.document", operation = params.operation,
       queue_wait_us = math.floor((request_started - queued_at) / 1000) })
     state.request_active = true
     local delivered = false
@@ -94,7 +95,7 @@ local function request(state, params, callback, method)
       require("forge.startup_log").write("status.response", { document = state.document, operation = params.operation,
         error = failure, elapsed_ms = math.floor((vim.uv.hrtime() - request_started) / 1e6) })
       if result and not failure and not runner_for_test and not state.host_generation then
-        state.host_generation = require("forge.client").host_generation()
+        state.host_generation = require("forge.client").host_get_generation()
       end
       vim.schedule(function()
         local callback_started = vim.uv.hrtime()
@@ -119,8 +120,8 @@ local function request(state, params, callback, method)
     end
     if not host_current(state) then receive(nil) return end
     local ok, failure = pcall(function()
-      if runner_for_test then runner_for_test(method or "status", params, receive)
-      else require("forge.client").request_host(method or "status", params, receive, function(progress)
+      if runner_for_test then runner_for_test(method or "repository.status.document", params, receive)
+      else require("forge.client").request({ method = method or "repository.status.document", params = params }, receive, function(progress)
         require("forge.startup_log").write("status.native.timing", {
           document = state.document, operation = params.operation, timing = progress,
         })
@@ -296,7 +297,7 @@ function M.demand(state)
       local owner = history.new(state.document, demand.commit)
       state.replica.commit[demand.commit] = owner
       if not runner_for_test then
-        owner.unsubscribe = require("forge.client").subscribe_document(owner.document, function(event, update, generation)
+        owner.unsubscribe = require("forge.client").document_events_subscribe(owner.document, function(event, update, generation)
           vim.schedule(function()
             if not state.active or state.replica.commit[owner.oid] ~= owner
               or state.host_generation and generation ~= state.host_generation then return end
@@ -510,7 +511,7 @@ function M.navigate_step(state)
       end
     end
     if not result.more then state.navigation = nil end
-  end, "status.navigate")
+  end, "repository.status.navigate")
 end
 
 function M.action(state, action, visual)
@@ -588,7 +589,7 @@ function M.action(state, action, visual)
         M.demand(state)
       else M.refresh(state) end
       if result.operation_id then
-        require("forge.client").request_host("repository.write", { operation = "acknowledge", operation_id = result.operation_id }, function(_, ack_failure)
+        require("forge.client").request({ method = "repository.write", params = { operation = "acknowledge", operation_id = result.operation_id } }, function(_, ack_failure)
           if ack_failure then notice(ack_failure) end
         end)
       end
@@ -703,7 +704,7 @@ function M.open(options)
   end
   state.group = vim.api.nvim_create_augroup("ForgeNativeStatus" .. next_document, { clear = true })
   if not runner_for_test then
-    state.unsubscribe_document = require("forge.client").subscribe_document(document, function(event, update, generation)
+    state.unsubscribe_document = require("forge.client").document_events_subscribe(document, function(event, update, generation)
       vim.schedule(function()
         if not state.active or (state.host_generation and generation ~= state.host_generation) then return end
         if event == "status.resync" then recover(state)
@@ -784,12 +785,12 @@ function M.open(options)
       local cursor = vim.api.nvim_win_get_cursor(0)
       local located = buffer.locate(state.replica, cursor[1] - 1, cursor[2])
       local location = located and located.location
-      if location and location.kind == "context" and location.role:match("^recent:") and not require("forge.nodes").closed(state.replica, located.block) then
+      if located and location and location.kind == "context" and location.role:match("^recent:") and not require("forge.nodes").closed(state.replica, located.block) then
         local oid = location.role:sub(8)
         local owner = state.replica.commit[oid]
         if owner and owner.failure then state.replica.commit[oid] = nil end
       end
-      if location and location.kind == "file" and not state.done[location.id] and not require("forge.nodes").closed(state.replica, located.block) then
+      if located and location and location.kind == "file" and not state.done[location.id] and not require("forge.nodes").closed(state.replica, located.block) then
         state.body_started = state.body_started or {}
         state.body_started[location.id] = started
         require("forge.startup_log").write("status.body.requested", { document = state.document, file = location.id }, started)
@@ -895,19 +896,20 @@ function M.open(options)
           return source
         end,
         present = function(presentation) buffer.present_context(state.replica, presentation) end,
-        request = function(params, callback) request(state, params, callback, "status.context") end,
+        request = function(params, callback) request(state, params, callback, "repository.status.context") end,
         is_input_current = current,
         input_window = function(captured)
           for attached, view in pairs(state.view) do if view.id == captured.view then return attached end end
         end,
         capture_input = function(target, original)
+          ---@type integer?
           local window = vim.api.nvim_get_current_win()
           if original then
             window = nil
             for attached, view in pairs(state.view) do if view.id == original.view then window = attached break end end
             if not window then return nil, "Context view closed" end
           end
-          if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then return nil, "Context view is not attached" end
+          if not window or not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then return nil, "Context view is not attached" end
           local captured, failure = input.capture(state.replica, view_for(state, window), "context")
           if captured and (captured.location.kind ~= "context" or "status:context:" .. captured.location.role ~= target) then return nil, "Context target changed" end
           return captured, failure

@@ -167,7 +167,7 @@ return {
         callback = function(ev)
           local client = vim.lsp.get_client_by_id(ev.data.client_id)
           -- if client.name ~= "slangd" then
-          client.server_capabilities.semanticTokensProvider = nil
+          if client then client.server_capabilities.semanticTokensProvider = nil end
           -- end
         end,
       })

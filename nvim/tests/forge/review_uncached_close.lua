@@ -3,9 +3,9 @@ local review = require("forge.review_document")
 local editable = require("forge.editable")
 local closed = 0
 review._set_runner_for_test(function(method, params, callback)
-  if method == "review.open_pr" then callback({ document = "uncached-review" })
-  elseif method == "review.header" or method == "review.load" or method == "review.view" then callback({})
-  elseif method == "review.materialize" then
+  if method == "github.review.document.open" then callback({ document = "uncached-review" })
+  elseif method == "github.review.document.header.load" or method == "github.review.document.load" or method == "github.review.document.view.set" then callback({})
+  elseif method == "github.review.document.render" then
     callback({ snapshot = { document = params.document, revision = 0, block = {
       { id = "region:body", text = { "initial" }, metadata = {
         target = {}, decoration = {}, editable_region = {
@@ -14,7 +14,7 @@ review._set_runner_for_test(function(method, params, callback)
         },
       } },
     } } })
-  elseif method == "review.close" then closed = closed + 1 callback({})
+  elseif method == "github.review.document.close" then closed = closed + 1 callback({})
   else error("unexpected request " .. method) end
 end)
 local origin = vim.api.nvim_get_current_buf()

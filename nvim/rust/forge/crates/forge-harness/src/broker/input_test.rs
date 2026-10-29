@@ -3,18 +3,39 @@ async fn ordinary_input_does_not_activate_a_pending_plan_entry() -> Result<()> {
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let prepared = broker.plan_file.prepare_entry(&broker.session.id, "Pending plan".into(), None, 1)?;
+    let prepared =
+        broker
+            .plan_file
+            .prepare_entry(&broker.session.id, "Pending plan".into(), None, 1)?;
     let mut task = crate::task::ActiveTask::plan(prepared.record, 1);
     task.request_entry(prepared.instruction, 1)?;
-    let pending = broker.task_controller.change(&mut broker.store, None,
-        crate::task::TaskChange::Install(Box::new(task)), 1)?.unwrap();
-    let response = broker.dispatch(Request { id: 2, method: "prompt.submit".into(),
-        params: json!({"text":"Explain the current approach"}) }).await;
-    assert!(response.response.error().is_none(), "{:?}", response.response.error());
+    let pending = broker
+        .task_controller
+        .change(
+            &mut broker.store,
+            None,
+            crate::task::TaskChange::Install(Box::new(task)),
+            1,
+        )?
+        .unwrap();
+    let response = broker
+        .dispatch(Request {
+            id: 2,
+            method: "session.prompt.submit".into(),
+            params: json!({"text":"Explain the current approach"}),
+        })
+        .await;
+    assert!(
+        response.response.error().is_none(),
+        "{:?}",
+        response.response.error()
+    );
     let current = broker.task_controller.current()?.unwrap();
     assert_eq!(current.revision, pending.revision);
     assert!(!current.entry_accepted());
-    let crate::task::TaskWorkflow::Plan { plan } = current.workflow else { unreachable!() };
+    let crate::task::TaskWorkflow::Plan { plan } = current.workflow else {
+        unreachable!()
+    };
     assert_eq!(plan.artifact.state, crate::plan::PlanState::Generating);
     let exchange = broker.store.latest_exchange(&broker.session.id)?.unwrap();
     assert_eq!(exchange.prompt, "Explain the current approach");

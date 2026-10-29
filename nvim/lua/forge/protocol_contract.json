@@ -1,5 +1,5 @@
 {
-  "version": 28,
+  "version": 29,
   "node": {
     "kind": [
       "exchange",
@@ -318,13 +318,6 @@
     }
   },
   "request": {
-    "repository.generate.progress": {
-      "route": "progress",
-      "required": {
-        "session_id": "string",
-        "event": "object"
-      }
-    },
     "result.part": {
       "route": "transport",
       "required": {}
@@ -333,15 +326,22 @@
       "route": "transport",
       "required": {}
     },
-    "status.progress": {
-      "route": "progress",
-      "required": {}
-    },
-    "github.sync.progress": {
-      "route": "progress",
-      "required": {}
-    },
     "repository.write.progress": {
+      "route": "progress",
+      "required": {}
+    },
+    "repository.generation.progress": {
+      "route": "progress",
+      "required": {
+        "session_id": "string",
+        "event": "object"
+      }
+    },
+    "repository.status.document.progress": {
+      "route": "progress",
+      "required": {}
+    },
+    "github.issue.sync.progress": {
       "route": "progress",
       "required": {}
     }
@@ -362,6 +362,890 @@
     "status.resync": {
       "route": "handle",
       "required": {}
+    }
+  },
+  "methods": {
+    "agent.profile.get": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "agent.profile.save": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "background.session.document": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "background.settings": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "github.actor.get": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.comment": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.issue.document": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.issue.get": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.issue.list": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.issue.sync": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.notification.document": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.notification.list": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.pull_request": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.pull_request.creation.context": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.recovery.acknowledge": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.recovery.draft.settle": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.recovery.inspect": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.recovery.resolve": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.repository.metadata": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.batch.begin": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.batch.recover": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.batch.submit": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.close": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.comment": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.file.get": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.file.page.get": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.file.viewed.set": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.header.load": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.input.apply": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.lifecycle.reconcile": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.lifecycle.resolve": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.load": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.open": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.reconcile": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.render": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.save": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.section.get": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.thread.get": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.transition": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.document.view.set": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.draft.get": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.draft.save": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.mutate": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "github.review.submission.context": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "host.initialize": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "control",
+      "recovery": "none"
+    },
+    "host.shutdown": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "control",
+      "recovery": "none"
+    },
+    "host.trace.configure": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "control",
+      "recovery": "none"
+    },
+    "host.trace.status": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "host.transport.consumed": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "permissions.document.open": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "permissions.document.save": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "provider.model.pin.list": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "provider.model.pin.set": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "repository.generation": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "repository.revision.list": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "repository.source.document": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "repository.status.context": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "repository.status.document": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "repository.status.navigate": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "repository.walkthrough.document": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "repository.write": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "service"
+    },
+    "session.agent.followup": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.agent.interrupt": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.agent.interrupt_all": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.agent.message.send": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.agent.model.list": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.agent.start": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.approval.continue": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.approval.resolve": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "control",
+      "recovery": "session_command"
+    },
+    "session.attachment.import": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.check.cancel": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.check.complete": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.check.editing.set": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.check.list": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.check.override": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.check.run": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.check.status": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.command.apply": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "control",
+      "recovery": "session_command"
+    },
+    "session.command.operation.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "control",
+      "recovery": "none"
+    },
+    "session.command.status.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.compact": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.configure": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.delete": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.document": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.exchange.comment.save": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.exchange.list": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.exchange.recovery": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.exchange.rollback.apply": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.exchange.rollback.prepare": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.exchange.rollback.preview": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.fork": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.goal.clear": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.goal.pause": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.goal.resume": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.goal.set": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.health.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "control",
+      "recovery": "none"
+    },
+    "session.initialize": {
+      "session_context": "none",
+      "readiness": "runtime",
+      "admission": "control",
+      "recovery": "none"
+    },
+    "session.input.apply": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.input.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.input.operation.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.input.timeout.configure": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.list": {
+      "session_context": "none",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.lsp.analyze": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.lsp.authorize": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.lsp.respond": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.new": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.permission.set": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.plan.accept": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.plan.acceptance.begin": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.plan.acceptance.cancel": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.plan.cancel": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.plan.changes.request": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.plan.check.update": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.plan.declaration.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.plan.entity.rename": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.plan.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.plan.list": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.plan.question.answer": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.plan.test.delete": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.preview": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.prompt.history.record": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.prompt.submit": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.provider.authenticate": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.provider.capabilities.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.provider.mcp.list": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.provider.mock_response": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.provider.model.list": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.provider.setup": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.provider.skill.list": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.question.answer": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.question.ask": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.question.continue": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.question.skip": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.rename": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "session.resume": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.state.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.task.get": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.trace.clear": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.turn.cancel": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "control",
+      "recovery": "session_command"
+    },
+    "session.turn.restart": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "control",
+      "recovery": "session_command"
+    },
+    "session.turn.steer": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "settings.get": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "settings.import.apply": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "settings.import.preview": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "settings.mcp.set_enabled": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "settings.skill.set_enabled": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
+    },
+    "settings.update": {
+      "session_context": "optional",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "session_command"
     }
   }
 }

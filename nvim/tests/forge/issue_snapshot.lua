@@ -158,7 +158,7 @@ end, debug.traceback)
 vim.uv.fs_open = original_open
 vim.uv.fs_read, vim.uv.fs_close = original_read, original_close
 snapshot.clear()
-index._reset_for_test()
+index._host_reset_for_test()
 cache.set_data_dir_for_test(nil)
 vim.notify = original_notify
 if owned_root and vim.uv.fs_realpath(root) == owned_root then vim.fn.delete(root, "rf") end

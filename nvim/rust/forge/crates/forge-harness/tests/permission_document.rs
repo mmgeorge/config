@@ -72,7 +72,7 @@ async fn opens_validates_and_atomically_replaces_the_permission_document() {
     let opened = broker
         .dispatch(Request {
             id: 1,
-            method: "permissions.open".into(),
+            method: "permissions.document.open".into(),
             params: json!({}),
         })
         .await;
@@ -92,7 +92,7 @@ async fn opens_validates_and_atomically_replaces_the_permission_document() {
     let saved = broker
         .dispatch(Request {
             id: 2,
-            method: "permissions.save".into(),
+            method: "permissions.document.save".into(),
             params: json!({ "source": source }),
         })
         .await;
@@ -101,7 +101,7 @@ async fn opens_validates_and_atomically_replaces_the_permission_document() {
     let invalid = broker
         .dispatch(Request {
             id: 3,
-            method: "permissions.save".into(),
+            method: "permissions.document.save".into(),
             params: json!({ "source": "not json" }),
         })
         .await;
@@ -121,7 +121,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         let response = broker
             .dispatch(Request {
                 id: 10,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": command }),
             })
             .await;
@@ -132,7 +132,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
     broker
         .dispatch(Request {
             id: 11,
-            method: "prompt.submit".into(),
+            method: "session.prompt.submit".into(),
             params: json!({ "text": "/write" }),
         })
         .await;
@@ -140,7 +140,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         let changed = broker
             .dispatch(Request {
                 id: 12,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": command }),
             })
             .await;
@@ -154,7 +154,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
     let planned = broker
         .dispatch(Request {
             id: 13,
-            method: "prompt.submit".into(),
+            method: "session.prompt.submit".into(),
             params: json!({ "text": "/plan preserve the selected mode" }),
         })
         .await;
@@ -168,7 +168,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
     let retained = broker
         .dispatch(Request {
             id: 15,
-            method: "prompt.submit".into(),
+            method: "session.prompt.submit".into(),
             params: json!({ "text": "/plan" }),
         })
         .await;
@@ -181,7 +181,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
     let accepted = broker
         .dispatch(Request {
             id: 14,
-            method: "plan.accept".into(),
+            method: "session.plan.accept".into(),
             params: json!({
                 "plan_id": plan.id,
                 "digest": plan.review_digest.as_deref().unwrap(),

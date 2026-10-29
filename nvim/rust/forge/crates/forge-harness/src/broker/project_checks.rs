@@ -234,7 +234,7 @@ impl HarnessBroker {
 
     pub(super) async fn project_checks(
         &mut self,
-        method: HarnessMethod,
+        method: RuntimeMethod,
         params: Value,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         self.check_runner.refresh_changes().await?;
@@ -250,7 +250,7 @@ impl HarnessBroker {
                     .to_owned()
             });
         let result = match method {
-            HarnessMethod::ChecksList => {
+            RuntimeMethod::SessionCheckList => {
                 let settings = crate::settings::SettingsStore::open(&self.data_root)?
                     .get(
                         &self.session.workspace,
@@ -262,12 +262,12 @@ impl HarnessBroker {
                     .catalog_preview(task_id.as_deref(), self.session.shell, &settings)
                     .await?
             }
-            HarnessMethod::ChecksOverride => {
+            RuntimeMethod::SessionCheckOverride => {
                 let overrides = serde_json::from_value(params)?;
                 self.check_runner
                     .set_overrides(task_id.as_deref(), overrides)?
             }
-            HarnessMethod::ChecksRun => {
+            RuntimeMethod::SessionCheckRun => {
                 anyhow::ensure!(
                     self.agent_coordinator.active_count() == 0
                         && !self.current_task_is_plan()?
@@ -288,7 +288,7 @@ impl HarnessBroker {
                 )?;
                 json!({"run_id":self.check_runner.start(run, self.event_sink.clone(),None,None).await?})
             }
-            HarnessMethod::ChecksStatus => {
+            RuntimeMethod::SessionCheckStatus => {
                 let wait_for_completion = params["wait_for_completion"].as_bool().unwrap_or(false);
                 let wait_ms = params["wait_ms"]
                     .as_u64()
@@ -303,15 +303,10 @@ impl HarnessBroker {
                         .await?,
                 )?
             }
-            HarnessMethod::ChecksCancel => {
+            RuntimeMethod::SessionCheckCancel => {
                 let id = required_text(&params, "run_id")?;
                 self.check_runner.cancel(&id)?;
                 json!({"run_id":id,"cancellation_requested":true})
-            }
-            HarnessMethod::ChecksSaveDefaults => {
-                self.check_runner
-                    .save_defaults(task_id.as_deref(), self.event_sink.as_ref())
-                    .await?
             }
             _ => anyhow::bail!("unknown checks operation"),
         };

@@ -53,7 +53,7 @@ for _, entry in ipairs(source) do
 end
 
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local github = require("forge.integrations.gh")
 github.prs_for_branch_async = function(_, _, _, callback) callback({ ok = true, prs = {} }) end
 github.current_pr_async = function(_, callback) callback({ ok = true }) end
@@ -111,7 +111,7 @@ local success, failure = xpcall(function()
   assert(#notices == 0, table.concat(notices, "\n"))
 end, debug.traceback)
 status.close(state)
-client.stop()
+client.host_stop()
 assert(vim.wait(10000, function() return client._client.process == nil end, 20))
 vim.notify = original_notify
 vim.fn.delete(fixture, "rf")

@@ -39,9 +39,9 @@ function M.request(source, current, receive)
       and vim.api.nvim_buf_get_changedtick(buffer) == changedtick)
       and (not client or not client:is_stopped())
   end
-  deadline = vim.uv.new_timer()
+  deadline = assert(vim.uv.new_timer())
   deadline:start(5000, 0, vim.schedule_wrap(function() finish(nil, "Language-server definition lookup timed out after five seconds") end))
-  guard = vim.uv.new_timer()
+  guard = assert(vim.uv.new_timer())
   guard:start(50, 50, vim.schedule_wrap(function()
     if not valid() then finish(nil, nil, "cancelled") end
   end))

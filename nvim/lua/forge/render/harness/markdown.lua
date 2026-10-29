@@ -30,7 +30,7 @@ end
 
 --- Tests whether a zero-based row index is enclosed by any range in the list.
 ---@param row integer Zero-based row index.
----@param range_list { first0: integer, after0: integer }[] Array of range boundaries.
+---@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of range boundaries.
 ---@return boolean in_range True if row falls inside any range.
 local function row_in_range(row, range_list)
   for _, range in ipairs(range_list) do
@@ -40,7 +40,7 @@ local function row_in_range(row, range_list)
 end
 
 --- Formats line ranges into Tree-sitter parser region bounding rectangles.
----@param range_list { first0: integer, after0: integer }[] Array of range boundaries.
+---@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of range boundaries.
 ---@return table[] regions Nested parser region coordinates.
 local function parser_region_list(range_list)
   local region_list = {}
@@ -88,7 +88,7 @@ end
 
 --- Removes render-markdown extmarks that fall outside designated markdown ranges.
 ---@param buf integer Target buffer number.
----@param range_list { first0: integer, after0: integer }[] Array of range boundaries.
+---@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of range boundaries.
 local function prune_extmarks(buf, range_list)
   local ok, ui = pcall(require, "render-markdown.core.ui")
   if not ok or not ui.ns then return end
@@ -109,7 +109,9 @@ function M.clear(buf)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   vim.treesitter.stop(buf)
   local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
-  if parser_ok then
+  if parser_ok and parser then
+    -- Neovim has no public setter for restricting a live buffer parser to transcript regions.
+    ---@diagnostic disable-next-line: invisible
     pcall(parser.set_included_regions, parser, {})
   end
   local ui_ok, ui = pcall(require, "render-markdown.core.ui")
@@ -119,7 +121,7 @@ end
 --- Configures Tree-sitter regions and triggers markdown rendering for specified buffer ranges.
 ---@param buf integer Target buffer number.
 ---@param win integer? Target window handle.
----@param range_list { first0: integer, after0: integer }[] Array of zero-based line ranges.
+---@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of zero-based line ranges.
 function M.render(buf, win, range_list)
   if #range_list == 0 then
     M.clear(buf)
@@ -129,10 +131,12 @@ function M.render(buf, win, range_list)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   local ok, render_markdown = pcall(require, "render-markdown")
   if not ok or type(render_markdown.render) ~= "function" then return end
-  if not render_markdown.initialized then render_markdown.setup() end
+  render_markdown.setup()
   local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
-  if not parser_ok then return end
+  if not parser_ok or not parser then return end
   perf.trace("harness", "ui.markdown.regions", { buf = buf, count = #range_list }, function()
+    -- Preserve source coordinates while excluding non-Markdown and folded transcript content.
+    ---@diagnostic disable-next-line: invisible
     pcall(parser.set_included_regions, parser, parser_region_list(range_list))
   end)
   local epoch = (render_epoch[buf] or 0) + 1

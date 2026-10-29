@@ -9,8 +9,8 @@ local original_startup_log_path = startup_log.path
 startup_log.path = function() return startup_log_path end
 local original_context = package.loaded["forge.views.status.status_context"]
 local client = require("forge.client")
-local original_start = client.start
-client.start = function() end
+local original_start = client.host_start
+client.host_start = function() end
 local context_attachment = {}
 local refocus_checks = 0
 local context_refresh = {}
@@ -138,7 +138,7 @@ local succeeded, failure = xpcall(function()
 end, debug.traceback)
 
 status._set_runner_for_test(nil)
-client.start = original_start
+client.host_start = original_start
 startup_log.path = original_startup_log_path
 vim.fn.delete(startup_log_path)
 package.loaded["forge.views.status.status_context"] = original_context

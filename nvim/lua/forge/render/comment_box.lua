@@ -28,6 +28,10 @@ local display_text = require("forge.render.display_text")
 ---@class ForgeCommentBoxModule
 local M = {}
 
+---@class ForgeCommentBoxLines : table[]
+---@field reply_start_row? integer
+---@field reply_start_list? integer[]
+
 M.box_max_inner_width = 84
 
 ---@type ForgeCommentBoxStyle
@@ -58,7 +62,7 @@ M.wrap_text = display_text.wrap
 ---@param desc ForgeCommentBoxContent Comment heading, body, and reply metadata.
 ---@param win_width integer Total available window column width.
 ---@param style ForgeCommentBoxStyle? Optional custom highlight group styling.
----@return table[] box_lines Array of row segment arrays with an optional zero-based reply_start_row for readonly thread hit testing.
+---@return ForgeCommentBoxLines box_lines Rendered rows and reply boundaries.
 function M.build_box_lines(desc, win_width, style)
   style = style or M.default_style
   local inner_width = math.max(4, math.min(M.box_max_inner_width, (tonumber(win_width) or 80) - 8))

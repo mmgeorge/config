@@ -38,7 +38,7 @@ pub enum SessionEventKind {
     },
     /// Retains an explicitly requested compaction without creating a user exchange.
     Compaction {
-        compaction: crate::backend::Compaction,
+        compaction: Box<crate::backend::Compaction>,
     },
     Renamed {
         name: String,
@@ -72,13 +72,13 @@ pub enum TimelineEntry {
     Exchange {
         id: String,
         created_at_ms: i64,
-        exchange: Exchange,
+        exchange: Box<Exchange>,
         agent_by_id: HashMap<String, TimelineEntry>,
     },
     AgentLifecycle {
         id: String,
         created_at_ms: i64,
-        run: Agent,
+        run: Box<Agent>,
         exchange: Vec<Exchange>,
         agent: Vec<TimelineEntry>,
     },
@@ -90,7 +90,7 @@ pub enum TimelineEntry {
     Checks {
         id: String,
         created_at_ms: i64,
-        run: crate::checks::CheckRun,
+        run: Box<crate::checks::CheckRun>,
     },
     #[serde(skip_deserializing)]
     Status {
@@ -219,7 +219,7 @@ impl TimelineEntry {
                 ..
             } => {
                 if exchange.id == replacement.id {
-                    *exchange = crate::plan::event::replacement_exchange(exchange, replacement)?;
+                    **exchange = crate::plan::event::replacement_exchange(exchange, replacement)?;
                     Ok(true)
                 } else {
                     for agent in agent_by_id.values_mut() {
@@ -339,8 +339,9 @@ impl TimelineProjector {
             if !timeline.iter().any(|entry| entry.id() == run.id) {
                 timeline.push(TimelineEntry::Checks {
                     id: run.id.clone(),
+
                     created_at_ms: run.started_at_ms,
-                    run,
+                    run: run.into(),
                 });
             }
         }
@@ -416,8 +417,10 @@ impl TimelineProjector {
             .into_iter()
             .map(|exchange| TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: exchange.created_at_ms,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             })
             .collect::<Vec<_>>();
@@ -625,9 +628,12 @@ fn build_agent_entry(
     }
     TimelineEntry::AgentLifecycle {
         id: run.id.clone(),
+
         created_at_ms: run.created_at_ms,
+
         exchange: interaction,
-        run,
+        run: run.into(),
+
         agent,
     }
 }
@@ -949,14 +955,18 @@ mod test {
         let mut entries = vec![
             TimelineEntry::Exchange {
                 id: first.id.clone(),
+
                 created_at_ms: 1,
-                exchange: first,
+                exchange: (first).into(),
+
                 agent_by_id: std::collections::HashMap::new(),
             },
             TimelineEntry::Exchange {
                 id: second.id.clone(),
+
                 created_at_ms: 2,
-                exchange: second,
+                exchange: (second).into(),
+
                 agent_by_id: std::collections::HashMap::new(),
             },
         ];

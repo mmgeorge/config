@@ -218,7 +218,10 @@ async fn fixture(stale: bool) -> (tempfile::TempDir, WalkthroughService, Documen
         target: HashMap::new(),
         annotation: HashMap::new(),
     };
-    let (blocks, targets) = project(&document, &WidthProfile::default()).unwrap();
+    let WalkthroughProjection {
+        block: blocks,
+        target: targets,
+    } = project(&document, &WidthProfile::default()).unwrap();
     document.buffer = BufferDocument::new(id.clone(), blocks).unwrap();
     document.target = targets;
     service
@@ -261,7 +264,8 @@ async fn numbered_outline_and_bordered_annotation_keep_the_source_anchor() {
             2,
         )]));
         document.inventory_diagnostic = None;
-        let (blocks, _) = project(&document, &WidthProfile::default()).unwrap();
+        let WalkthroughProjection { block: blocks, .. } =
+            project(&document, &WidthProfile::default()).unwrap();
         let rows = blocks
             .iter()
             .flat_map(|block| (0..block.text.row_count()).map(|row| block.text.row(row).unwrap()))

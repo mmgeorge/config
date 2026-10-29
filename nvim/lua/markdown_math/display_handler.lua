@@ -6,7 +6,7 @@ local environment = require("render-markdown.lib.env")
 local Marks = require("render-markdown.lib.marks")
 local RequestContext = require("render-markdown.request.context")
 
----@class MarkdownMathHandlerContext
+---@class MarkdownMathHandlerContext : render.md.handler.Context
 ---@field buf integer
 ---@field root TSNode
 

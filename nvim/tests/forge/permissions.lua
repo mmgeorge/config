@@ -17,10 +17,13 @@ local ok, failure = pcall(function()
   local defer_save, pending_save, defer_open, pending_open
 
   package.loaded["forge.client"] = {
-    start_harness = function(callback) callback({}, nil) end,
-    request = function(method, params, callback)
+    session_initialize = function(callback) callback({}, nil) end,
+    request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
       request_list[#request_list + 1] = { method = method, params = params }
-      if method == "permissions.open" then
+      if method == "permissions.document.open" then
         if defer_open then pending_open = callback return end
         callback({ path = permission_path, source = permission_source }, nil)
       elseif defer_save then
@@ -60,9 +63,9 @@ local ok, failure = pcall(function()
   vim.api.nvim_exec_autocmds("BufWriteCmd", { buffer = buffer })
   assert_true(not vim.bo[buffer].modified, "an accepted document should become clean")
   assert_equals(notification_list[#notification_list].level, "info", "an accepted document should report success")
-  assert_equals(request_list[1].method, "permissions.open", "the view should load through the broker")
-  assert_equals(request_list[2].method, "permissions.save", "the view should save through the broker")
-  assert_equals(request_list[3].method, "permissions.save", "the corrected document should be resubmitted")
+  assert_equals(request_list[1].method, "permissions.document.open", "the view should load through the broker")
+  assert_equals(request_list[2].method, "permissions.document.save", "the view should save through the broker")
+  assert_equals(request_list[3].method, "permissions.document.save", "the corrected document should be resubmitted")
 
   local buffer_count = #vim.api.nvim_list_bufs()
   require("forge.views.permissions").open()

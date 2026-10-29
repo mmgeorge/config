@@ -66,9 +66,9 @@ function M.open(options)
   request = function()
     if not vim.api.nvim_buf_is_valid(buffer) then return end
     attempts = attempts + 1
-    require("forge.client").request_host("repository.generate", {
+    require("forge.client").request({ method = "repository.generation", params = {
       operation = "preview", workspace = workspace, comparison = comparison,
-    }, function(result, failure)
+    } }, function(result, failure)
       if not vim.api.nvim_buf_is_valid(buffer) then return end
       if failure then fail(failure) return end
       ---@cast result ForgeCommitPromptResponse?

@@ -4,7 +4,6 @@ use anyhow::Result;
 use forge_github::model::GithubRepositoryId;
 use forge_github::recovery::RecoveryResource;
 use forge_github::remote::{GithubRemote, PendingReviewExpected};
-use forge_github::review_api::ReviewReadRequest;
 use forge_github::review_mutation::{RecoveryResolution, ReviewMutationRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -12,18 +11,17 @@ use serde_json::{Value, json};
 use crate::runtime::ForgeRuntime;
 
 pub(crate) enum GithubRoute {
-    Actor,
-    CreationContext,
+    ActorGet,
+    PullRequestCreationContext,
     ReviewSubmissionContext,
-    NotificationPage,
-    ReviewRead,
+    NotificationList,
     ReviewMutate,
     RecoveryInspect,
     RecoveryResolve,
     RecoveryAcknowledge,
-    RecoverySettleDraft,
-    ReviewDraft,
-    ReviewDraftWrite,
+    RecoveryDraftSettle,
+    ReviewDraftGet,
+    ReviewDraftSave,
 }
 
 #[derive(Deserialize)]
@@ -54,15 +52,6 @@ struct NotificationPageParams {
 struct ActorParams {
     directory: PathBuf,
     repository: GithubRepositoryId,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewReadParams {
-    directory: PathBuf,
-    request: ReviewReadRequest,
-    #[serde(default)]
-    collection: bool,
 }
 
 #[derive(Deserialize)]
@@ -115,12 +104,12 @@ pub(super) async fn route(
     params: Value,
 ) -> Result<Value> {
     Ok(match operation {
-        GithubRoute::CreationContext => {
+        GithubRoute::PullRequestCreationContext => {
             let params: CreationContextParams = serde_json::from_value(params)?;
             let remote = host.github_remote.for_directory(params.directory)?;
             serde_json::to_value(remote.creation_context().await?)?
         }
-        GithubRoute::NotificationPage => {
+        GithubRoute::NotificationList => {
             let params: NotificationPageParams = serde_json::from_value(params)?;
             let remote = host.github_remote.for_directory(params.directory.clone())?;
             serde_json::to_value(
@@ -143,27 +132,10 @@ pub(super) async fn route(
                     .await?,
             )?
         }
-        GithubRoute::Actor => {
+        GithubRoute::ActorGet => {
             let params: ActorParams = serde_json::from_value(params)?;
             let remote = host.github_remote.for_directory(params.directory)?;
             serde_json::to_value(remote.read_actor(params.repository).await?)?
-        }
-        GithubRoute::ReviewRead => {
-            let params: ReviewReadParams = serde_json::from_value(params)?;
-            let remote = host.github_remote.for_directory(params.directory.clone())?;
-            if params.collection {
-                serde_json::to_value(
-                    host.github
-                        .review_collection(params.directory, remote, params.request)
-                        .await?,
-                )?
-            } else {
-                serde_json::to_value(
-                    host.github
-                        .review_page(params.directory, remote, params.request)
-                        .await?,
-                )?
-            }
         }
         GithubRoute::ReviewMutate => {
             let params: ReviewMutateParams = serde_json::from_value(params)?;
@@ -195,18 +167,18 @@ pub(super) async fn route(
                 .await?;
             json!({"acknowledged":true})
         }
-        GithubRoute::RecoverySettleDraft => {
+        GithubRoute::RecoveryDraftSettle => {
             let params: RecoverySettleDraftParams = serde_json::from_value(params)?;
             host.github
                 .recovery_settle_draft(params.resource, params.operation_id, params.draft)
                 .await?;
             json!({"acknowledged":true})
         }
-        GithubRoute::ReviewDraft => {
+        GithubRoute::ReviewDraftGet => {
             let params: RecoveryInspectParams = serde_json::from_value(params)?;
             serde_json::to_value(host.github.review_draft(params.resource).await?)?
         }
-        GithubRoute::ReviewDraftWrite => {
+        GithubRoute::ReviewDraftSave => {
             let params: ReviewDraftWriteParams = serde_json::from_value(params)?;
             host.github
                 .review_draft_write(params.resource, params.draft)

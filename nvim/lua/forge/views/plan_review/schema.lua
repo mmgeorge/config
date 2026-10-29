@@ -2,13 +2,17 @@ local M = {}
 
 local notifications = require("forge.infra.notifications")
 
+---@class ForgePlanReviewWindow
+---@field buf integer
+---@field win? integer
+
 ---@param plan table
 ---@return string
 local function canonical_plan_path(plan)
   return vim.fs.joinpath(vim.fs.dirname(plan.working_path), "working.json")
 end
 
----@param review ForgePlanReviewSession
+---@param review ForgePlanReviewWindow
 ---@param schema_buf integer
 local function return_to_review(review, schema_buf)
   if not vim.api.nvim_buf_is_valid(review.buf) then
@@ -25,7 +29,7 @@ local function return_to_review(review, schema_buf)
 end
 
 ---@param plan table
----@param review ForgePlanReviewSession
+---@param review ForgePlanReviewWindow
 function M.open(plan, review)
   local path = canonical_plan_path(plan)
   local read_ok, line_list = pcall(vim.fn.readfile, path)

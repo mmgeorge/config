@@ -13,7 +13,7 @@ use forge_github::{
     service::IssueOperation,
     sync::{SyncProgress, SyncRequest},
 };
-use forge_harness::protocol::HarnessMethod;
+use forge_harness::protocol::RuntimeMethod;
 use forge_protocol::message::{DocumentEvent, Message, RequestEvent, Response};
 use forge_protocol::outbound::MessageSender;
 use forge_review::edit::RegionEdit;
@@ -125,7 +125,7 @@ struct ReviewDocumentParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewMaterializeParams {
+struct ReviewRenderParams {
     document: DocumentId,
     width: forge_buffer::width::WidthProfile,
 }
@@ -157,7 +157,7 @@ struct ReviewFileParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewFileMoreParams {
+struct ReviewFilePageParams {
     document: DocumentId,
     path: String,
 }
@@ -181,14 +181,7 @@ struct ReviewViewParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewCloseViewParams {
-    document: DocumentId,
-    view: forge_buffer::identity::ViewId,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewActionParams {
+struct ReviewInputParams {
     input: forge_buffer::input::DocumentInput,
     directory: PathBuf,
 }
@@ -218,7 +211,7 @@ struct ReviewSetViewedParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewSubmitBatchedParams {
+struct ReviewBatchSubmitParams {
     document: DocumentId,
     verdict: forge_review::review::ReviewVerdict,
     #[serde(default)]
@@ -229,7 +222,7 @@ struct ReviewSubmitBatchedParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewSubmitBatchedRecoverParams {
+struct ReviewBatchRecoverParams {
     document: DocumentId,
     operation_id: String,
     resolution: forge_github::review_mutation::RecoveryResolution,
@@ -244,7 +237,7 @@ struct StatusNavigationParams {
 
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
-enum HarnessSourceRequest {
+enum SessionSourceRequest {
     OpenDiff {
         document: DocumentId,
         input: forge_buffer::input::DocumentInput,
@@ -357,66 +350,63 @@ enum StatusContextRequest {
 
 pub(crate) enum RoutedMethod {
     Github(github_routes::GithubRoute),
-    HarnessInitialize,
-    TranscriptDocument,
-    Revisions,
+    SessionInitialize,
+    SessionDocument,
+    RepositoryRevisionList,
     RepositoryWrite,
-    RepositoryGenerate,
-    GenerationSettings,
-    BackgroundTimeline,
-    Status,
-    StatusContext,
-    StatusNavigate,
-    Walkthrough,
-    Notifications,
-    Source,
-    Issues,
-    IssueSync,
-    IssueDetail,
-    Metadata,
-    PullRequest,
-    Comment,
-    ReviewOpen,
-    ReviewSnapshot,
-    ReviewMaterialize,
-    ReviewSection,
-    ReviewLoad,
-    ReviewHeader,
-    ReviewFile,
-    ReviewFileMore,
-    ReviewThread,
-    ReviewView,
-    ReviewCloseView,
-    ReviewAction,
-    ReviewTransition,
-    ReviewLifecycleReconcile,
-    ReviewLifecycleResolve,
-    ReviewBeginBatched,
-    ReviewSetViewed,
-    ReviewSubmitBatched,
-    ReviewSubmitBatchedRecover,
-    IssueDocument,
-    ReviewSave,
-    ReviewReconcile,
-    ReviewClose,
-    ReviewComment,
-    Shutdown,
-    Harness(HarnessMethod),
+    RepositoryGeneration,
+    BackgroundSettings,
+    BackgroundSessionDocument,
+    RepositoryStatusDocument,
+    RepositoryStatusContext,
+    RepositoryStatusNavigate,
+    RepositoryWalkthroughDocument,
+    GithubNotificationDocument,
+    RepositorySourceDocument,
+    GithubIssueList,
+    GithubIssueSync,
+    GithubIssueGet,
+    GithubRepositoryMetadata,
+    GithubPullRequest,
+    GithubComment,
+    GithubReviewDocumentOpen,
+    GithubReviewDocumentRender,
+    GithubReviewDocumentSectionGet,
+    GithubReviewDocumentLoad,
+    GithubReviewDocumentHeaderLoad,
+    GithubReviewDocumentFileGet,
+    GithubReviewDocumentFilePageGet,
+    GithubReviewDocumentThreadGet,
+    GithubReviewDocumentViewSet,
+    GithubReviewDocumentInputApply,
+    GithubReviewDocumentTransition,
+    GithubReviewDocumentLifecycleReconcile,
+    GithubReviewDocumentLifecycleResolve,
+    GithubReviewDocumentBatchBegin,
+    GithubReviewDocumentFileViewedSet,
+    GithubReviewDocumentBatchSubmit,
+    GithubReviewDocumentBatchRecover,
+    GithubIssueDocument,
+    GithubReviewDocumentSave,
+    GithubReviewDocumentReconcile,
+    GithubReviewDocumentClose,
+    GithubReviewDocumentComment,
+    HostShutdown,
+    Runtime(RuntimeMethod),
 }
 
 fn decode_method(method: &str) -> Result<RoutedMethod> {
     match method {
-        "github.actor" => Ok(RoutedMethod::Github(github_routes::GithubRoute::Actor)),
-        "github.notifications.page" => Ok(RoutedMethod::Github(
-            github_routes::GithubRoute::NotificationPage,
+        "github.actor.get" => Ok(RoutedMethod::Github(github_routes::GithubRoute::ActorGet)),
+        "github.notification.list" => Ok(RoutedMethod::Github(
+            github_routes::GithubRoute::NotificationList,
         )),
-        "github.review.submission_context" => Ok(RoutedMethod::Github(
+        "github.review.submission.context" => Ok(RoutedMethod::Github(
             github_routes::GithubRoute::ReviewSubmissionContext,
         )),
-        "github.creation.context" => Ok(RoutedMethod::Github(
-            github_routes::GithubRoute::CreationContext,
+        "github.pull_request.creation.context" => Ok(RoutedMethod::Github(
+            github_routes::GithubRoute::PullRequestCreationContext,
         )),
-        "github.review.read" => Ok(RoutedMethod::Github(github_routes::GithubRoute::ReviewRead)),
         "github.review.mutate" => Ok(RoutedMethod::Github(
             github_routes::GithubRoute::ReviewMutate,
         )),
@@ -426,65 +416,70 @@ fn decode_method(method: &str) -> Result<RoutedMethod> {
         "github.recovery.resolve" => Ok(RoutedMethod::Github(
             github_routes::GithubRoute::RecoveryResolve,
         )),
-        "github.recovery.ack" => Ok(RoutedMethod::Github(
+        "github.recovery.acknowledge" => Ok(RoutedMethod::Github(
             github_routes::GithubRoute::RecoveryAcknowledge,
         )),
-        "github.recovery.settle_draft" => Ok(RoutedMethod::Github(
-            github_routes::GithubRoute::RecoverySettleDraft,
+        "github.recovery.draft.settle" => Ok(RoutedMethod::Github(
+            github_routes::GithubRoute::RecoveryDraftSettle,
         )),
-        "github.review.draft" => Ok(RoutedMethod::Github(
-            github_routes::GithubRoute::ReviewDraft,
+        "github.review.draft.get" => Ok(RoutedMethod::Github(
+            github_routes::GithubRoute::ReviewDraftGet,
         )),
-        "github.review.draft.write" => Ok(RoutedMethod::Github(
-            github_routes::GithubRoute::ReviewDraftWrite,
+        "github.review.draft.save" => Ok(RoutedMethod::Github(
+            github_routes::GithubRoute::ReviewDraftSave,
         )),
-        "harness.initialize" => Ok(RoutedMethod::HarnessInitialize),
-        "harness.document" => Ok(RoutedMethod::TranscriptDocument),
-        "repository.revisions" => Ok(RoutedMethod::Revisions),
+        "session.initialize" => Ok(RoutedMethod::SessionInitialize),
+        "session.document" => Ok(RoutedMethod::SessionDocument),
+        "repository.revision.list" => Ok(RoutedMethod::RepositoryRevisionList),
         "repository.write" => Ok(RoutedMethod::RepositoryWrite),
-        "repository.generate" => Ok(RoutedMethod::RepositoryGenerate),
-        "background.settings" => Ok(RoutedMethod::GenerationSettings),
-        "background.timeline" => Ok(RoutedMethod::BackgroundTimeline),
-        "status" => Ok(RoutedMethod::Status),
-        "status.context" => Ok(RoutedMethod::StatusContext),
-        "status.navigate" => Ok(RoutedMethod::StatusNavigate),
-        "walkthrough" => Ok(RoutedMethod::Walkthrough),
-        "notifications.document" => Ok(RoutedMethod::Notifications),
-        "issue.document" => Ok(RoutedMethod::IssueDocument),
-        "source.document" => Ok(RoutedMethod::Source),
-        "github.issues" => Ok(RoutedMethod::Issues),
-        "github.sync" => Ok(RoutedMethod::IssueSync),
-        "github.detail" => Ok(RoutedMethod::IssueDetail),
-        "github.metadata" => Ok(RoutedMethod::Metadata),
-        "github.pull_request" => Ok(RoutedMethod::PullRequest),
-        "github.comment" => Ok(RoutedMethod::Comment),
-        "review.open_pr" => Ok(RoutedMethod::ReviewOpen),
-        "review.open" => Ok(RoutedMethod::ReviewOpen),
-        "review.snapshot" => Ok(RoutedMethod::ReviewSnapshot),
-        "review.materialize" => Ok(RoutedMethod::ReviewMaterialize),
-        "review.section" => Ok(RoutedMethod::ReviewSection),
-        "review.load" => Ok(RoutedMethod::ReviewLoad),
-        "review.header" => Ok(RoutedMethod::ReviewHeader),
-        "review.file" => Ok(RoutedMethod::ReviewFile),
-        "review.file.more" => Ok(RoutedMethod::ReviewFileMore),
-        "review.thread" => Ok(RoutedMethod::ReviewThread),
-        "review.view" => Ok(RoutedMethod::ReviewView),
-        "review.view.close" => Ok(RoutedMethod::ReviewCloseView),
-        "review.act" => Ok(RoutedMethod::ReviewAction),
-        "review.transition" => Ok(RoutedMethod::ReviewTransition),
-        "review.lifecycle_reconcile" => Ok(RoutedMethod::ReviewLifecycleReconcile),
-        "review.lifecycle_resolve" => Ok(RoutedMethod::ReviewLifecycleResolve),
-        "review.begin_batched" => Ok(RoutedMethod::ReviewBeginBatched),
-        "review.set_viewed" => Ok(RoutedMethod::ReviewSetViewed),
-        "review.submit_batched" => Ok(RoutedMethod::ReviewSubmitBatched),
-        "review.submit_batched_recover" => Ok(RoutedMethod::ReviewSubmitBatchedRecover),
-        "review.save" => Ok(RoutedMethod::ReviewSave),
-        "review.reconcile" => Ok(RoutedMethod::ReviewReconcile),
-        "review.close" => Ok(RoutedMethod::ReviewClose),
-        "review.comment" => Ok(RoutedMethod::ReviewComment),
-        "shutdown" => Ok(RoutedMethod::Shutdown),
-        "initialize" => anyhow::bail!("Forge host is already initialized"),
-        method => HarnessMethod::decode(method).map(RoutedMethod::Harness),
+        "repository.generation" => Ok(RoutedMethod::RepositoryGeneration),
+        "background.settings" => Ok(RoutedMethod::BackgroundSettings),
+        "background.session.document" => Ok(RoutedMethod::BackgroundSessionDocument),
+        "repository.status.document" => Ok(RoutedMethod::RepositoryStatusDocument),
+        "repository.status.context" => Ok(RoutedMethod::RepositoryStatusContext),
+        "repository.status.navigate" => Ok(RoutedMethod::RepositoryStatusNavigate),
+        "repository.walkthrough.document" => Ok(RoutedMethod::RepositoryWalkthroughDocument),
+        "github.notification.document" => Ok(RoutedMethod::GithubNotificationDocument),
+        "github.issue.document" => Ok(RoutedMethod::GithubIssueDocument),
+        "repository.source.document" => Ok(RoutedMethod::RepositorySourceDocument),
+        "github.issue.list" => Ok(RoutedMethod::GithubIssueList),
+        "github.issue.sync" => Ok(RoutedMethod::GithubIssueSync),
+        "github.issue.get" => Ok(RoutedMethod::GithubIssueGet),
+        "github.repository.metadata" => Ok(RoutedMethod::GithubRepositoryMetadata),
+        "github.pull_request" => Ok(RoutedMethod::GithubPullRequest),
+        "github.comment" => Ok(RoutedMethod::GithubComment),
+        "github.review.document.open" => Ok(RoutedMethod::GithubReviewDocumentOpen),
+        "github.review.document.render" => Ok(RoutedMethod::GithubReviewDocumentRender),
+        "github.review.document.section.get" => Ok(RoutedMethod::GithubReviewDocumentSectionGet),
+        "github.review.document.load" => Ok(RoutedMethod::GithubReviewDocumentLoad),
+        "github.review.document.header.load" => Ok(RoutedMethod::GithubReviewDocumentHeaderLoad),
+        "github.review.document.file.get" => Ok(RoutedMethod::GithubReviewDocumentFileGet),
+        "github.review.document.file.page.get" => Ok(RoutedMethod::GithubReviewDocumentFilePageGet),
+        "github.review.document.thread.get" => Ok(RoutedMethod::GithubReviewDocumentThreadGet),
+        "github.review.document.view.set" => Ok(RoutedMethod::GithubReviewDocumentViewSet),
+        "github.review.document.input.apply" => Ok(RoutedMethod::GithubReviewDocumentInputApply),
+        "github.review.document.transition" => Ok(RoutedMethod::GithubReviewDocumentTransition),
+        "github.review.document.lifecycle.reconcile" => {
+            Ok(RoutedMethod::GithubReviewDocumentLifecycleReconcile)
+        }
+        "github.review.document.lifecycle.resolve" => {
+            Ok(RoutedMethod::GithubReviewDocumentLifecycleResolve)
+        }
+        "github.review.document.batch.begin" => Ok(RoutedMethod::GithubReviewDocumentBatchBegin),
+        "github.review.document.file.viewed.set" => {
+            Ok(RoutedMethod::GithubReviewDocumentFileViewedSet)
+        }
+        "github.review.document.batch.submit" => Ok(RoutedMethod::GithubReviewDocumentBatchSubmit),
+        "github.review.document.batch.recover" => {
+            Ok(RoutedMethod::GithubReviewDocumentBatchRecover)
+        }
+        "github.review.document.save" => Ok(RoutedMethod::GithubReviewDocumentSave),
+        "github.review.document.reconcile" => Ok(RoutedMethod::GithubReviewDocumentReconcile),
+        "github.review.document.close" => Ok(RoutedMethod::GithubReviewDocumentClose),
+        "github.review.document.comment" => Ok(RoutedMethod::GithubReviewDocumentComment),
+        "host.shutdown" => Ok(RoutedMethod::HostShutdown),
+        "host.initialize" => anyhow::bail!("Forge host is already initialized"),
+        method => RuntimeMethod::decode(method).map(RoutedMethod::Runtime),
     }
 }
 
@@ -501,6 +496,15 @@ enum StatusSubscription {
 pub(crate) struct HostRouter {
     host: Arc<ForgeRuntime>,
     status_events: std::sync::Mutex<StatusSubscription>,
+    #[cfg(test)]
+    pub(crate) preparation_hold: std::sync::Mutex<Option<PreparationHold>>,
+}
+
+#[cfg(test)]
+pub(crate) struct PreparationHold {
+    pub(crate) request_id: u64,
+    pub(crate) arrived: tokio::sync::oneshot::Sender<()>,
+    pub(crate) released: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl HostRouter {
@@ -508,6 +512,8 @@ impl HostRouter {
         Self {
             host,
             status_events: std::sync::Mutex::new(StatusSubscription::Idle),
+            #[cfg(test)]
+            preparation_hold: std::sync::Mutex::new(None),
         }
     }
 
@@ -515,22 +521,41 @@ impl HostRouter {
         &self,
         envelope: &mut RoutedRequestEnvelope,
     ) -> Result<RoutedMethod> {
+        #[cfg(test)]
+        {
+            let held = {
+                let mut hold = self.preparation_hold.lock().unwrap();
+                if hold
+                    .as_ref()
+                    .is_some_and(|hold| hold.request_id == envelope.request.id)
+                {
+                    hold.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(held) = held {
+                let _ = held.arrived.send(());
+                held.released.await?;
+            }
+        }
+        envelope.validate_context()?;
         let mut method = decode_method(&envelope.request.method)?;
-        if matches!(method, RoutedMethod::Harness(_)) {
+        if matches!(method, RoutedMethod::Runtime(_)) {
             self.host
                 .harness
                 .normalize_request(envelope.session_id.as_deref(), &mut envelope.request)
                 .await?;
             method = decode_method(&envelope.request.method)?;
         }
-        if let RoutedMethod::Harness(harness_method) = method {
+        if let RoutedMethod::Runtime(harness_method) = method {
             // Queued prompts wait in their request task so the input lane can still cancel work.
-            if harness_method == HarnessMethod::PromptSubmit
+            if harness_method == RuntimeMethod::SessionPromptSubmit
                 && envelope.request.params["queued"].as_bool() == Some(true)
             {
                 return Ok(method);
             }
-            if harness_method == HarnessMethod::TaskTransition {
+            if harness_method == RuntimeMethod::SessionCommandApply {
                 self.host
                     .harness
                     .prepare_task(envelope.session_id.as_deref(), &envelope.request)
@@ -571,7 +596,7 @@ impl HostRouter {
         let harness_admission = envelope.harness_admission;
         let request = envelope.request;
         match method {
-            RoutedMethod::StatusNavigate => {
+            RoutedMethod::RepositoryStatusNavigate => {
                 let params: StatusNavigationParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
@@ -580,9 +605,9 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::TranscriptDocument => {
+            RoutedMethod::SessionDocument => {
                 if request.params.get("operation").and_then(Value::as_str) == Some("open_diff") {
-                    let HarnessSourceRequest::OpenDiff { document, input } =
+                    let SessionSourceRequest::OpenDiff { document, input } =
                         serde_json::from_value(request.params)?;
                     let text = self
                         .host
@@ -605,7 +630,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::StatusContext => {
+            RoutedMethod::RepositoryStatusContext => {
                 let params: StatusContextRequest = serde_json::from_value(request.params)?;
                 let result = match params {
                     StatusContextRequest::Action { input } => {
@@ -642,7 +667,7 @@ impl HostRouter {
                 };
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::Source => {
+            RoutedMethod::RepositorySourceDocument => {
                 let params: SourceRequest = serde_json::from_value(request.params)?;
                 let result = match params {
                     SourceRequest::Open {
@@ -681,7 +706,7 @@ impl HostRouter {
                 let result = github_routes::route(&self.host, operation, request.params).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::RepositoryGenerate => {
+            RoutedMethod::RepositoryGeneration => {
                 let result = self
                     .host
                     .generation
@@ -693,7 +718,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::BackgroundTimeline => {
+            RoutedMethod::BackgroundSessionDocument => {
                 let result = self
                     .host
                     .harness
@@ -702,23 +727,23 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::GenerationSettings => {
+            RoutedMethod::BackgroundSettings => {
                 let result = crate::runtime::commit_message::settings(request.params).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::Notifications => {
+            RoutedMethod::GithubNotificationDocument => {
                 let result = notification_routes::route(&self.host, request.params).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::IssueDocument => {
+            RoutedMethod::GithubIssueDocument => {
                 let result = issue_routes::route(&self.host, request.params).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::Walkthrough => {
+            RoutedMethod::RepositoryWalkthroughDocument => {
                 let result = walkthrough_routes::route(&self.host, request.params).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::Status => {
+            RoutedMethod::RepositoryStatusDocument => {
                 let params = serde_json::from_value(request.params)?;
                 let result = match params {
                     StatusRequest::Local { document, filename } => {
@@ -775,7 +800,7 @@ impl HostRouter {
                         let result = serde_json::to_value(snapshot)?;
                         sink.send(Message::RequestEvent(RequestEvent {
                             request_id: request.id,
-                            event: "status.progress".into(),
+                            event: forge_protocol::contract::RequestEventName::RepositoryStatusDocumentProgress.as_str().into(),
                             payload: json!({
                                 "phase":"open",
                                 "native":timing,
@@ -834,7 +859,7 @@ impl HostRouter {
                 let result = self.host.writes.request(params, request.id, sink).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewComment => {
+            RoutedMethod::GithubReviewDocumentComment => {
                 let params: ReviewCommentParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
@@ -848,7 +873,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewOpen => {
+            RoutedMethod::GithubReviewDocumentOpen => {
                 let params: ReviewOpenParams = serde_json::from_value(request.params)?;
                 let remote = self
                     .host
@@ -886,7 +911,7 @@ impl HostRouter {
                 };
                 send_completed_result(sink, request.id, snapshot).await?;
             }
-            RoutedMethod::ReviewFile => {
+            RoutedMethod::GithubReviewDocumentFileGet => {
                 let params: ReviewFileParams = serde_json::from_value(request.params)?;
                 let remote = self
                     .host
@@ -899,8 +924,8 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewFileMore => {
-                let params: ReviewFileMoreParams = serde_json::from_value(request.params)?;
+            RoutedMethod::GithubReviewDocumentFilePageGet => {
+                let params: ReviewFilePageParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
                     .review
@@ -908,7 +933,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewThread => {
+            RoutedMethod::GithubReviewDocumentThreadGet => {
                 let params: ReviewThreadParams = serde_json::from_value(request.params)?;
                 let remote = self
                     .host
@@ -927,7 +952,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewView => {
+            RoutedMethod::GithubReviewDocumentViewSet => {
                 let params: ReviewViewParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
@@ -936,21 +961,12 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewCloseView => {
-                let params: ReviewCloseViewParams = serde_json::from_value(request.params)?;
-                let result = self
-                    .host
-                    .review
-                    .close_view(&params.document, &params.view)
-                    .await?;
-                send_completed_result(sink, request.id, result).await?;
-            }
-            RoutedMethod::ReviewAction => {
-                let params: ReviewActionParams = serde_json::from_value(request.params)?;
+            RoutedMethod::GithubReviewDocumentInputApply => {
+                let params: ReviewInputParams = serde_json::from_value(request.params)?;
                 let result = self.host.review.act(params.input, params.directory).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewTransition => {
+            RoutedMethod::GithubReviewDocumentTransition => {
                 let params: ReviewTransitionParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
@@ -959,7 +975,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewLifecycleReconcile => {
+            RoutedMethod::GithubReviewDocumentLifecycleReconcile => {
                 let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
@@ -968,7 +984,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewLifecycleResolve => {
+            RoutedMethod::GithubReviewDocumentLifecycleResolve => {
                 let params: ReviewLifecycleResolveParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
@@ -977,12 +993,12 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewBeginBatched => {
+            RoutedMethod::GithubReviewDocumentBatchBegin => {
                 let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
                 let result = self.host.review.begin_batched(&params.document).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewSetViewed => {
+            RoutedMethod::GithubReviewDocumentFileViewedSet => {
                 let params: ReviewSetViewedParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
@@ -991,8 +1007,8 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewSubmitBatched => {
-                let params: ReviewSubmitBatchedParams = serde_json::from_value(request.params)?;
+            RoutedMethod::GithubReviewDocumentBatchSubmit => {
+                let params: ReviewBatchSubmitParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
                     .review
@@ -1005,9 +1021,8 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewSubmitBatchedRecover => {
-                let params: ReviewSubmitBatchedRecoverParams =
-                    serde_json::from_value(request.params)?;
+            RoutedMethod::GithubReviewDocumentBatchRecover => {
+                let params: ReviewBatchRecoverParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
                     .review
@@ -1019,7 +1034,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewHeader => {
+            RoutedMethod::GithubReviewDocumentHeaderLoad => {
                 let params: ReviewLoadParams = serde_json::from_value(request.params)?;
                 if let Some(initial) = params.initial {
                     self.host.review.retain_pr_snapshot(
@@ -1044,7 +1059,7 @@ impl HostRouter {
                 )
                 .await?;
             }
-            RoutedMethod::ReviewLoad => {
+            RoutedMethod::GithubReviewDocumentLoad => {
                 let params: ReviewLoadParams = serde_json::from_value(request.params)?;
                 let remote = self
                     .host
@@ -1063,7 +1078,7 @@ impl HostRouter {
                 )
                 .await?;
             }
-            RoutedMethod::ReviewSection => {
+            RoutedMethod::GithubReviewDocumentSectionGet => {
                 let params: ReviewSectionParams = serde_json::from_value(request.params)?;
                 let remote = self
                     .host
@@ -1082,8 +1097,8 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewMaterialize => {
-                let params: ReviewMaterializeParams = serde_json::from_value(request.params)?;
+            RoutedMethod::GithubReviewDocumentRender => {
+                let params: ReviewRenderParams = serde_json::from_value(request.params)?;
                 let result = self
                     .host
                     .review
@@ -1091,16 +1106,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::ReviewSnapshot => {
-                let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
-                send_completed_result(
-                    sink,
-                    request.id,
-                    self.host.review.snapshot(&params.document)?,
-                )
-                .await?;
-            }
-            RoutedMethod::ReviewSave => {
+            RoutedMethod::GithubReviewDocumentSave => {
                 let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
                 send_completed_result(
                     sink,
@@ -1112,7 +1118,7 @@ impl HostRouter {
                 )
                 .await?;
             }
-            RoutedMethod::ReviewReconcile => {
+            RoutedMethod::GithubReviewDocumentReconcile => {
                 let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
                 send_completed_result(
                     sink,
@@ -1121,7 +1127,7 @@ impl HostRouter {
                 )
                 .await?;
             }
-            RoutedMethod::ReviewClose => {
+            RoutedMethod::GithubReviewDocumentClose => {
                 let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
                 self.host.review.close_document(&params.document)?;
                 sink.send(Message::Response(Response::success(
@@ -1129,7 +1135,7 @@ impl HostRouter {
                     json!({"closed":true}),
                 )?))?;
             }
-            RoutedMethod::Metadata => {
+            RoutedMethod::GithubRepositoryMetadata => {
                 let params: MetadataParams = serde_json::from_value(request.params)?;
                 let remote = self.host.github_remote.for_directory(params.directory)?;
                 let metadata = self
@@ -1139,7 +1145,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, metadata).await?;
             }
-            RoutedMethod::Comment => {
+            RoutedMethod::GithubComment => {
                 let params: CommentParams = serde_json::from_value(request.params)?;
                 let remote = self.host.github_remote.for_directory(params.directory)?;
                 let result = self
@@ -1149,7 +1155,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::PullRequest => {
+            RoutedMethod::GithubPullRequest => {
                 let params: PullRequestParams = serde_json::from_value(request.params)?;
                 let remote = self.host.github_remote.for_directory(params.directory)?;
                 let result = self
@@ -1159,7 +1165,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::IssueDetail => {
+            RoutedMethod::GithubIssueGet => {
                 let params: IssueDetailParams = serde_json::from_value(request.params)?;
                 let store = IssueStore::new(
                     params.database,
@@ -1174,7 +1180,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, detail).await?;
             }
-            RoutedMethod::IssueSync => {
+            RoutedMethod::GithubIssueSync => {
                 let params: IssueSyncRequest = serde_json::from_value(request.params)?;
                 let store = IssueStore::new(
                     params.database,
@@ -1198,13 +1204,13 @@ impl HostRouter {
                         changed = progress.changed(), if observing => {
                             if changed.is_err() { observing = false; continue; }
                             let payload = serde_json::to_value(progress.borrow_and_update().clone())?;
-                            sink.send(Message::RequestEvent(RequestEvent { request_id: request.id, event: "github.sync.progress".into(), payload }))?;
+                            sink.send(Message::RequestEvent(RequestEvent { request_id: request.id, event: forge_protocol::contract::RequestEventName::GithubIssueSyncProgress.as_str().into(), payload }))?;
                         }
                     }
                 };
                 sink.send(Message::Response(Response::success(request.id, result)?))?;
             }
-            RoutedMethod::Issues => {
+            RoutedMethod::GithubIssueList => {
                 let params: IssueRequest = serde_json::from_value(request.params)?;
                 let store = IssueStore::new(
                     params.database,
@@ -1214,15 +1220,28 @@ impl HostRouter {
                 let result = self.host.github.execute(store, params.request).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::HarnessInitialize => {
-                let response = self
-                    .host
-                    .harness
-                    .open_session(request.id, serde_json::from_value(request.params)?)
-                    .await?;
+            RoutedMethod::SessionInitialize => {
+                let services_only = request
+                    .params
+                    .get("services_only")
+                    .map(|value| value.as_bool().context("services_only must be a boolean"))
+                    .transpose()?
+                    .unwrap_or(false);
+                let initialize = serde_json::from_value(request.params)?;
+                let response = if services_only {
+                    self.host
+                        .harness
+                        .initialize_services(request.id, initialize)
+                        .await?
+                } else {
+                    self.host
+                        .harness
+                        .open_session(request.id, initialize)
+                        .await?
+                };
                 sink.send_response(response).await?;
             }
-            RoutedMethod::Revisions => {
+            RoutedMethod::RepositoryRevisionList => {
                 let params: RevisionRequest = serde_json::from_value(request.params)?;
                 let repository = self
                     .host
@@ -1271,10 +1290,10 @@ impl HostRouter {
                 let page = revision_page(&repository, &candidates, params.offset)?;
                 sink.send(Message::Response(Response::success(request.id, page)?))?;
             }
-            RoutedMethod::Shutdown => {
+            RoutedMethod::HostShutdown => {
                 anyhow::bail!("shutdown must route through the Forge connection host")
             }
-            RoutedMethod::Harness(_) => {
+            RoutedMethod::Runtime(_) => {
                 self.host
                     .harness
                     .dispatch_admitted(envelope.session_id, request, sink, harness_admission)
@@ -1483,6 +1502,39 @@ fn revision_page(
 mod tests {
     use super::*;
     use forge_git::completion::{RevisionBackend, RevisionId};
+
+    #[test]
+    fn renamed_methods_preserve_dispatch() {
+        for (method, _) in forge_protocol::contract::METHODS {
+            if matches!(*method, "host.initialize" | "host.transport.consumed") {
+                continue;
+            }
+            assert!(decode_method(method).is_ok(), "missing route for {method}");
+        }
+    }
+
+    #[test]
+    fn retired_method_names_are_rejected() {
+        for method in [
+            "initialize",
+            "shutdown",
+            "status",
+            "walkthrough",
+            "task.transition",
+            "task.list",
+            "task.operation",
+            "goal.set",
+            "review.open_pr",
+            "queue.edit_last",
+            "plan.deviation.resolve",
+            "session.plan.deviation.resolve",
+        ] {
+            assert!(
+                decode_method(method).is_err(),
+                "retired route accepted: {method}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn revision_pages_preserve_candidates_beyond_previous_cache_budget() {

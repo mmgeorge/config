@@ -31,7 +31,8 @@ local success, failure = xpcall(function()
   vim.wo.conceallevel = 2
   local presentation = require("forge.window_presentation")
   local status_owner = {}
-  presentation.retain(vim.api.nvim_get_current_win(), status_owner, presentation.capture(vim.api.nvim_get_current_win()))
+  local status_baseline = presentation.capture(vim.api.nvim_get_current_win())
+  presentation.retain(vim.api.nvim_get_current_win(), status_owner, status_baseline)
   vim.wo.number = false
   vim.wo.signcolumn = "no"
   vim.wo.foldcolumn = "0"
@@ -82,6 +83,8 @@ local success, failure = xpcall(function()
   assert(vim.wo.foldmethod == "expr" and vim.wo.foldexpr == "0", "source close leaked source folding")
   assert(vim.wo.conceallevel == 0, "source close leaked source conceal")
   local origin_window = vim.api.nvim_get_current_win()
+  -- The real Status view reacquires presentation ownership when its buffer reenters the window.
+  presentation.retain(origin_window, status_owner, status_baseline)
   local tab_count = #vim.api.nvim_list_tabpages()
   local tab_source = source.open({ workspace = vim.fn.getcwd(), path = "history.md", revision = revision,
     line = 4, layout = "tab" })
@@ -89,13 +92,17 @@ local success, failure = xpcall(function()
   assert(#vim.api.nvim_list_tabpages() == tab_count + 1, "historical source did not open a tab")
   assert(vim.api.nvim_win_get_buf(origin_window) == origin, "historical source replaced its origin")
   assert(vim.api.nvim_win_get_cursor(0)[1] == 4 and vim.wo.number,
-    "historical tab lost its source position or presentation")
+    "historical tab lost its source position or presentation: " .. vim.inspect({
+      cursor = vim.api.nvim_win_get_cursor(0), number = vim.wo.number,
+      window = vim.api.nvim_get_current_win(), source_window = tab_source.window,
+    }))
   local tab_origin = tab_source.return_view[vim.api.nvim_get_current_win()].buffer
   assert(tab_origin ~= origin, "source tab did not retain its own placeholder")
   vim.api.nvim_buf_delete(tab_origin, { force = true })
   source.close(tab_source)
   assert(#vim.api.nvim_list_tabpages() == tab_count, "closing historical source retained its empty tab")
   assert(vim.api.nvim_get_current_win() == origin_window)
+  presentation.release(origin_window, status_owner)
   vim.wo.winbar = "%f"
   vim.wo.number = true
   local commit = source.open_commit({ workspace = vim.fn.getcwd(), oid = revision })

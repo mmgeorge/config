@@ -3,7 +3,9 @@ use crate::backend::{
     BackendCapability, BackendForkRequest, BackendForkResult, BackendInput, BackendRequest,
     BackendTimingRecord, PromptMode,
 };
-use crate::session::{HarnessSession, ProviderForkPoint, ProviderForkState, SessionStore};
+use crate::session::{
+    HarnessSession, ProviderForkPoint, ProviderForkState, SessionPurpose, SessionStore,
+};
 use crate::storage::SqliteStore;
 use crate::timeline::{
     SessionEventKind, SessionEventRecord, TimelineEntry, TimelineProjection, TimelineProjector,
@@ -32,6 +34,7 @@ pub fn prepare_provider_fork(
     capability: &BackendCapability,
     default_source_session_id: &str,
     params: &Value,
+    purpose: SessionPurpose,
 ) -> Result<ForkPreparation> {
     let fork_started = Instant::now();
     let persistence_started = Instant::now();
@@ -69,6 +72,7 @@ pub fn prepare_provider_fork(
         .unwrap_or_default()
         .as_millis() as i64;
     let mut child = source.clone();
+    child.purpose = purpose;
     child.id.clone_from(&target_session_id);
     child.primary_agent_id = HarnessSession::primary_agent_id(&target_session_id);
     child.name = resolve_fork_name(params, &source.name, &existing_name_set);
@@ -217,7 +221,7 @@ impl HarnessBroker {
         Ok(SessionEvent {
             session_id: self.session.id.clone(),
             event: event.into(),
-            payload: json!({ "session": self.session, "timing": timing }),
+            payload: json!({ "session": self.session_view()?, "timing": timing }),
         })
     }
 }

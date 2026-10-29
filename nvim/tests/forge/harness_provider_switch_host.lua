@@ -13,7 +13,7 @@ package.loaded['forge.builder'] = { ensure = function(callback)
   return function() end
 end }
 local client = require('forge.client')
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local harness = require('forge.views.harness')
 local controller = require('forge.views.harness.controller')
 local session = require('forge.session')
@@ -32,7 +32,7 @@ local success, failure = xpcall(function()
   local tab_count = #vim.api.nvim_list_tabpages()
   local function request(method, params)
     local result, failure, completed
-    client.request(method, params, function(value, request_error)
+    client.request({ method = method, params = params, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, request_error)
       result, failure, completed = value, request_error, true
     end)
     assert(vim.wait(10000, function() return completed end, 10), method .. ' did not complete')
@@ -45,11 +45,20 @@ local success, failure = xpcall(function()
     desired = { shell = 'system', default_approval = 'allow', plan_auto_approve_revisions = false },
   })
   assert(vim.wait(10000, function()
-    local observed = request('task.operation', { operation_id = operation.id })
+    local observed = request('session.command.operation.get', { operation_id = operation.id })
     return observed.state == 'completed' or observed.state == 'failed'
   end, 10), 'portable settings did not settle')
-  assert(request('task.operation', { operation_id = operation.id }).state == 'completed')
+  assert(request('session.command.operation.get', { operation_id = operation.id }).state == 'completed')
   assert(vim.wait(3000, function() return harness.backend_switch_available() end, 10))
+  local function switch_backend(backend, destination)
+    assert(vim.wait(10000, harness.backend_switch_available, 10), 'provider controls did not become available: '
+      .. vim.inspect({ busy = session.harness.busy, configuring = session.harness.configuring,
+        switching = session.harness.switching_backend, syncing = session.harness.state_sync_pending,
+        operation = session.harness.task_operation, status = session.harness.status,
+        queue = session.harness.queue, steering = session.harness.pending_steer,
+        submission = session.harness.pending_submit }))
+    harness.switch_backend(backend, destination)
+  end
   local function settle(backend)
     assert(vim.wait(10000, function()
       local state = session.harness
@@ -75,7 +84,7 @@ local success, failure = xpcall(function()
     if option.id == 'provider' then provider_option = option break end
   end
   assert(provider_option, 'configuration omitted provider selection')
-  config_picker.spec.on_confirm({ option = provider_option })
+  config_picker.spec.on_field_action({ field = { id = 'provider' }, option = provider_option }, 'activate', 1)
   local provider_picker = picker._state_for_test()
   for _, option in ipairs(provider_picker.spec.page_list[1].option_list) do
     if option.value == 'copilot' then provider_picker.spec.on_confirm({ option = option }) break end
@@ -87,35 +96,35 @@ local success, failure = xpcall(function()
   local chosen_id = session.harness.session.id
   assert(chosen_id ~= source_id)
   local created
-  client.request('session.new', { name = 'newer Copilot chat' }, function(result, request_error)
+  client.request({ method = 'session.new', params = { name = 'newer Copilot chat' }, session_id = assert(require("forge.session").harness.session).id }, function(result, request_error)
     assert(not request_error, request_error)
     created = result
   end)
   assert(vim.wait(3000, function() return created ~= nil end, 10))
   controller.activate_snapshot(created)
   assert(created.session.id ~= chosen_id)
-  harness.switch_backend('codex', { kind = 'resume', session_id = source_id })
+  switch_backend('codex', { kind = 'resume', session_id = source_id })
   settle('codex')
   assert(session.harness.session.id == source_id)
-  harness.switch_backend('copilot', { kind = 'resume', session_id = chosen_id })
+  switch_backend('copilot', { kind = 'resume', session_id = chosen_id })
   settle('copilot')
   assert(session.harness.session.id == chosen_id, 'resumed latest instead of the selected session')
   for _, backend in ipairs({ 'claude', 'antigravity' }) do
-    harness.switch_backend(backend, { kind = 'new' })
+    switch_backend(backend, { kind = 'new' })
     settle(backend)
     assert(session.harness.session.model == 'default', 'provider switch copied a foreign model')
   end
-  harness.switch_backend('copilot', { kind = 'resume', session_id = chosen_id })
+  switch_backend('copilot', { kind = 'resume', session_id = chosen_id })
   settle('copilot')
   local config = require('forge.infra.config')
   config.options.harness.backends.codex.command = {}
-  harness.switch_backend('codex', { kind = 'new' })
+  switch_backend('codex', { kind = 'new' })
   assert(vim.wait(10000, function() return #errors > 0 and session.harness.ready and not session.harness.switching_backend end, 10))
   assert(session.harness.session.id == chosen_id and config.options.harness.backend == 'copilot')
   assert(errors[1]:find('Codex backend requires', 1, true), errors[1])
 end, debug.traceback)
 picker.close(false)
-client.stop()
+client.host_stop()
 local collected = vim.wait(6000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath

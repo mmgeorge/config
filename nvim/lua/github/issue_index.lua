@@ -398,7 +398,7 @@ local function request_storage(repo, operation, callback)
     if storage_runner_for_test then
       storage_runner_for_test(params, finish)
     else
-      require("forge.client").request_host("github.issues", params, finish)
+      require("forge.client").request({ method = "github.issue.list", params = params }, finish)
     end
   end)
   if not ok then
@@ -656,7 +656,7 @@ local function fetch_detail_async(cwd, repo, number)
       request = { repository = { hostname = hostname, owner = owner, name = name }, number = number } }
     local accepted, request_failure = pcall(function()
       if detail_runner_for_test then detail_runner_for_test(params, complete)
-      else require("forge.client").request_host("github.detail", params, complete) end
+      else require("forge.client").request({ method = "github.issue.get", params = params }, complete) end
     end)
     if not accepted then
       if completed then error(request_failure) end
@@ -1088,7 +1088,7 @@ function M.sync_repo(cwd, repo, opts)
       if sync_runner_for_test then
         sync_runner_for_test(params, complete, progress)
       else
-        require("forge.client").request_host("github.sync", params, complete, progress)
+        require("forge.client").request({ method = "github.issue.sync", params = params }, complete, progress)
       end
     end)
     if not accepted then

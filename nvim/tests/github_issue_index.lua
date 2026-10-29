@@ -40,7 +40,7 @@ local function recover_fixture(params, callback)
 end
 issue_index._set_storage_runner_for_test(recover_fixture)
 local host_client = require("forge.client")
-local original_request_host = host_client.request_host
+local original_request = host_client.request
 local original_hostname = repo_cache.hostname
 local original_system = vim.system
 local host_builder = require("forge.builder")
@@ -140,9 +140,9 @@ local ok, err = xpcall(function()
   local stale_cwd = vim.fs.joinpath(test_root, "stale-cwd")
   repo_cache.remember_cwd_repo(stale_cwd, stale_repo)
   local stale_delete_callback
-  host_client.request_host = function(method, params, callback)
-    assert_equals(method, "github.issues", "stale cache deletion must use the shared host")
-    assert_equals(params.request.operation, "delete_cache", "stale cache deletion operation")
+  host_client.request = function(request, callback)
+    assert_equals(request.method, "github.issue.list", "stale cache deletion must use the shared host")
+    assert_equals(request.params.request.operation, "delete_cache", "stale cache deletion operation")
     stale_delete_callback = callback
     return 1
   end
@@ -157,7 +157,7 @@ local ok, err = xpcall(function()
   stale_delete_callback({ deleted = false }, nil)
   issue_index.sync_repo(stale_cwd, stale_repo)
   assert_equals(stale_count, 1, "missing repository retried automatically")
-  host_client.request_host = original_request_host
+  host_client.request = original_request
 
   issue_index._set_sync_runner_for_test(function() error("mismatched host reached the service") end)
   vim.g.github_issue_index_hostname = "mismatched.example"
@@ -317,7 +317,7 @@ local ok, err = xpcall(function()
   assert_true(vim.wait(31000, function() return compiled ~= nil end, 5), "native gh fixture compilation did not finish")
   assert_equals(compiled.code, 0, "native gh fixture compilation failed: " .. tostring(compiled.stderr))
   host_builder.ensure = function(callback) callback({ ok = true, path = binary }) end
-  host_client._set_launcher_for_test(function(command, options, on_exit)
+  host_client._host_set_launcher_for_test(function(command, options, on_exit)
     options.env = { PATH = test_root }
     return vim.system(command, options, on_exit)
   end)
@@ -351,13 +351,13 @@ local ok, err = xpcall(function()
   issue_index.invalidate_repo(native_repo)
   local native_reads_before_recovery = #vim.fn.globpath(native_cwd, "started.*", false, true)
   local committed
-  host_client.request_host("github.issues", {
+  host_client.request({ method = "github.issue.list", params = {
     database = issue_index.db_path(native_repo), repo = native_repo,
     request = { operation = "upsert_page", scope = "open", page = { completed = true, issues = {
       { repo = native_repo, number = 202, title = "Recovered after interruption", state = "OPEN",
         url = "https://" .. repo_cache.hostname() .. "/" .. native_repo .. "/issues/202", labels = {} },
     } } },
-  }, function(result, request_error) assert_true(not request_error, request_error) committed = result end)
+  } }, function(result, request_error) assert_true(not request_error, request_error) committed = result end)
   assert_true(vim.wait(3000, function() return committed ~= nil end, 5), "interrupted-publication fixture did not commit")
   assert_true(committed.state.revision > old_snapshot.revision, "database revision did not advance")
   local stale_snapshot = vim.json.decode(table.concat(vim.fn.readfile(issue_index.snapshot_path(native_repo)), "\n"))
@@ -423,12 +423,12 @@ local ok, err = xpcall(function()
   assert_equals(issue_index.cached_detail(native_repo, 201), nil, "native deletion retained cached detail")
   assert_equals(#repo_cache.contributors(native_repo), 0, "native deletion retained repository metadata")
   local process = host_client._client.process
-  host_client.stop()
+  host_client.host_stop()
   assert_equals(process:wait(2000).code, 0, "issue host failed to stop")
 end, debug.traceback)
 
-host_client._reset_for_test()
-host_client.request_host = original_request_host
+host_client._host_reset_for_test()
+host_client.request = original_request
 repo_cache.hostname = original_hostname
 vim.system = original_system
 host_builder.ensure = original_host_ensure

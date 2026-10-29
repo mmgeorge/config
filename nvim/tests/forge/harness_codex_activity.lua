@@ -18,7 +18,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 ---@type string[]
 local errors = {}
@@ -34,10 +34,10 @@ end
 ---@return any
 local function request(method, parameter)
   local settled, result, failure
-  client.request(method, parameter or {}, function(value, error)
+  client.request({ method = method, params = parameter or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, error)
     result, failure, settled = value, error, true
   end)
-  assert(vim.wait(method == "prompt.submit" and 90000 or 15000, function()
+  assert(vim.wait(method == "session.prompt.submit" and 90000 or 15000, function()
     for _, approval in ipairs(state.approval or {}) do
       if not resolved_approval[approval.id] then
         resolved_approval[approval.id] = true
@@ -46,7 +46,7 @@ local function request(method, parameter)
         for _, item in ipairs(approval.item_list or {}) do
           answer[#answer + 1] = { item_id = item.id, choice_id = "allow_once" }
         end
-        client.request("approval.resolve", { approval_id = approval.id, answer_list = answer }, function(_, error)
+        client.request({ method = "session.approval.resolve", params = { approval_id = approval.id, answer_list = answer }, session_id = assert(require("forge.session").harness.session).id }, function(_, error)
           assert(not error, error)
         end)
       end
@@ -78,8 +78,8 @@ local succeeded, failure = xpcall(function()
   end, 10), "startup timeout")
   assert(state.session, table.concat(errors, "\n"))
   request("session.configure", { model = "gpt-5.6-terra", effort = "high", service_tier = "fast" })
-  request("trace.configure", { enabled = true })
-  request("prompt.submit", { text = "Verify this isolated fixture. First call repository_status with offset 0. "
+  request("host.trace.configure", { enabled = true })
+  request("session.prompt.submit", { text = "Verify this isolated fixture. First call repository_status with offset 0. "
     .. "Then read README.md with a shell tool. Do not edit files or call other tools. "
     .. "Determine the counter after 23 updates and whether the result is odd. Explain the arithmetic briefly "
     .. "and finish with CODEX_ACTIVITY_VERIFIED." })
@@ -88,7 +88,7 @@ local succeeded, failure = xpcall(function()
     return not state.busy and transcript():find("Thought", 1, true)
       and transcript():find("CODEX_ACTIVITY_VERIFIED", 1, true)
   end, 10), "completed turn did not publish its settled transcript\n" .. transcript())
-  local trace_path = request("trace.status").path
+  local trace_path = request("host.trace.status").path
   local summary, arguments, command = false, false, false
   for _, line in ipairs(vim.fn.readfile(trace_path)) do
     local record = vim.json.decode(line)
@@ -156,7 +156,7 @@ local succeeded, failure = xpcall(function()
 end, debug.traceback)
 if succeeded and vim.g.forge_codex_activity_visual then return end
 local stopped = false
-client.stop(nil, function() stopped = true end)
+client.host_stop(nil, function() stopped = true end)
 vim.wait(10000, function() return stopped end, 10)
 vim.fn.stdpath = original_stdpath
 if not succeeded then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end

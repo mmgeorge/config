@@ -22,7 +22,7 @@ poll_trace = function(final)
   trace.pending = true
   trace.final = false
   local cursor = trace.cursor
-  client.request_host("repository.write", { operation = "trace", after = cursor }, function(result, failure)
+  client.request({ method = "repository.write", params = { operation = "trace", after = cursor } }, function(result, failure)
     trace.pending = false
     if failure or type(result) ~= "table" or type(result.trace) ~= "table" then
       perf.event("diff", "git.write.trace.unavailable", { status = "failed" })
@@ -98,7 +98,7 @@ function M.execute(workspace, action, callback, progress, trace_id)
     cancelled = true
     record("cancel")
     if intent or operation_id then
-      client.request_host("repository.write", { operation = "cancel", intent = intent, operation_id = operation_id }, function(_, failure)
+      client.request({ method = "repository.write", params = { operation = "cancel", intent = intent, operation_id = operation_id } }, function(_, failure)
         if failure then notifications.error("Git cancellation failed: " .. failure) end
       end)
     end
@@ -139,7 +139,7 @@ function M.execute(workspace, action, callback, progress, trace_id)
     if operation_id and not uncertain then
       local acknowledgement_started = perf.now()
       record("acknowledge.start", { operation_id = operation_id })
-      client.request_host("repository.write", { operation = "acknowledge", operation_id = operation_id }, function(_, acknowledgement_error)
+      client.request({ method = "repository.write", params = { operation = "acknowledge", operation_id = operation_id } }, function(_, acknowledgement_error)
         if tracing then poll_trace(true) end
         record("acknowledge.complete", { operation_id = operation_id, ms = perf.elapsed_ms(acknowledgement_started),
           status = acknowledgement_error and "failed" or "ok" })
@@ -147,7 +147,7 @@ function M.execute(workspace, action, callback, progress, trace_id)
       end)
     end
   end
-  client.request_host("repository.write", { operation = "prepare", workspace = workspace, action = action }, function(prepared, failure)
+  client.request({ method = "repository.write", params = { operation = "prepare", workspace = workspace, action = action } }, function(prepared, failure)
     record("prepare.complete", { ms = perf.elapsed_ms(started), status = failure and "failed" or "ok" })
     if failure then finish(nil, failure) return end
     if type(prepared) ~= "table" or type(prepared.intent) ~= "string" or prepared.intent == "" then
@@ -162,7 +162,7 @@ function M.execute(workspace, action, callback, progress, trace_id)
     if cancelled then cancel() finish(nil, "Git write cancelled before submission") return end
     submitted = perf.now()
     record("submit.start")
-    client.request_host("repository.write", { operation = "submit", intent = intent }, finish, function(chunk)
+    client.request({ method = "repository.write", params = { operation = "submit", intent = intent } }, finish, function(chunk)
       if progress_failure then return end
       local received, receive_error = pcall(function()
         local state = stream[chunk.stream]

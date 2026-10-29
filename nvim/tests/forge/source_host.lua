@@ -22,7 +22,7 @@ package.loaded["forge.builder"] = {
   end,
 }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local source = require("forge.source_document")
 local notices, state = {}, nil
 local function git(arguments)
@@ -60,7 +60,7 @@ local ok, failure = xpcall(function()
   state = nil
 end, debug.traceback)
 if state then source.close(state) end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.stdpath = original_stdpath
 vim.fn.delete(fixture, "rf")

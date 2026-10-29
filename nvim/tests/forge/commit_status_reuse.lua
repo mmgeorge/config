@@ -86,7 +86,7 @@ if commit._active then
   end
 end
 require("forge.status").close(state)
-client.stop()
+client.host_stop()
 assert(vim.wait(6000, function() return client._client.process == nil end, 20), "fixture host did not stop")
 vim.fn.chdir(root)
 vim.fn.delete(forge_reuse.fixture, "rf")

@@ -118,7 +118,7 @@ function M.adopt(status)
 end
 
 local function request(session_id, method, params, callback)
-  client.request_for(session_id, method, params, function(status, failure)
+  client.request({ session_id = session_id, method = method, params = params }, function(status, failure)
     if failure then notifications.error(failure, "Harness logging") return end
     M.adopt(status)
     if callback then callback(status) end
@@ -160,11 +160,11 @@ end
 function M.log(session_id, action)
   action = action or "open"
   if action == "open" or action == "" then
-    request(session_id, "trace.status", {}, open_log)
+    request(session_id, "host.trace.status", {}, open_log)
   elseif action == "on" or action == "off" then
-    request(session_id, "trace.configure", { enabled = action == "on" })
+    request(session_id, "host.trace.configure", { enabled = action == "on" })
   elseif action == "clear" then
-    request(session_id, "trace.session.clear", {}, function(status)
+    request(session_id, "session.trace.clear", {}, function(status)
       local buffer = log_buffer_by_path[status.path]
       if buffer and vim.api.nvim_buf_is_valid(buffer) then refresh_log(status.path, buffer, true) end
     end)
@@ -180,7 +180,7 @@ function M.open(state, host)
   local session_id = state.session.id
   M._revision = (M._revision or 0) + 1
   local owner_revision = M._revision
-  request(session_id, "trace.status", {}, function(status)
+  request(session_id, "host.trace.status", {}, function(status)
     if not state.session or state.session.id ~= session_id then return end
     local pending = false
     ---@type table<string, any>
@@ -225,7 +225,7 @@ function M.open(state, host)
     end
     local function configure_ask(selection, completed)
       pending = true
-      client.request_for(session_id, "session.configure", { ask_model = selection }, function(result, failure)
+      client.request({ session_id = session_id, method = "session.configure", params = { ask_model = selection } }, function(result, failure)
         if not state.session or state.session.id ~= session_id then return end
         pending = false
         if failure then notifications.error(failure, "Ask model")
@@ -333,7 +333,7 @@ function M.open(state, host)
         configure({ automatic_checks = active.automatic_checks == false })
       elseif id == "logging" then
         pending = true
-        client.request_for(session_id, "trace.configure", { enabled = not status.enabled }, function(result, failure)
+        client.request({ method = "host.trace.configure", params = { enabled = not status.enabled } }, function(result, failure)
           pending = false
           if failure then notifications.error(failure, "Harness logging") return end
           status = result
@@ -343,7 +343,8 @@ function M.open(state, host)
       end
     end
     local function current()
-      return M._revision == owner_revision and state.session ~= nil and state.session.id == session_id
+      return M._revision == owner_revision and not state.switching_backend
+        and state.session ~= nil and state.session.id == session_id
     end
     local function redraw()
       if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
@@ -561,7 +562,7 @@ function M.open(state, host)
           local id = context.field.id
           if id == "check-editing" then
             pending = true
-            client.request_for(session_id, "checks.editing", { enabled = not state.check_editing }, function(result, failure)
+            client.request({ session_id = session_id, method = "session.check.editing.set", params = { enabled = not state.check_editing } }, function(result, failure)
               if not current() then return end
               pending = false
               if failure then notifications.error(failure, "Harness checks") else state.check_editing = result.check_editing == true end
@@ -597,7 +598,7 @@ function M.open(state, host)
     commit = require("forge.views.harness.background_configuration").new({
       backend = active.backend, session_id = session_id, host = host,
       capability = function() return state.capability or {} end,
-      current = function() return M._revision == owner_revision and state.session ~= nil and state.session.id == session_id end,
+      current = current,
       changed = function() if commit and picker.is_open("harness-config") then picker.update(build_spec()) end end,
       reopen = function() M.open(state, host) end,
     })

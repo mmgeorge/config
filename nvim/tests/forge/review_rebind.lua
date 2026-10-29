@@ -62,13 +62,13 @@ local uncertain = false
 local baseline = "Original"
 state.notice = function() end
 review._set_runner_for_test(function(method, params, callback)
-  if method == "review.open" then
+  if method == "github.review.document.open" then
     entered_batched = false
     replacement_document = "replacement-" .. tostring(vim.uv.hrtime())
     callback({ document = replacement_document, uncertain = uncertain, field = {
       { region = "title", baseline = baseline, revision = 0, uncertain = uncertain } } })
-  elseif method == "review.header" or method == "review.load" or method == "review.view" or method == "review.section" then callback({})
-  elseif method == "review.materialize" then
+  elseif method == "github.review.document.header.load" or method == "github.review.document.load" or method == "github.review.document.view.set" or method == "github.review.document.section.get" then callback({})
+  elseif method == "github.review.document.render" then
     assert(entered_batched, "replacement presentation omitted batched-review restoration")
     delayed = function()
       local replacement = vim.deepcopy(snapshot)
@@ -77,13 +77,13 @@ review._set_runner_for_test(function(method, params, callback)
         { region = "title", baseline = baseline, revision = 0, uncertain = uncertain } },
         comment = {}, inline_anchor = { ["inline:assets"] = replacement_anchor } })
     end
-  elseif method == "review.close" then closed = params.document callback({})
-  elseif method == "review.begin_batched" then entered_batched = true callback({ mode = "batched" })
-  elseif method == "review.transition" then
+  elseif method == "github.review.document.close" then closed = params.document callback({})
+  elseif method == "github.review.document.batch.begin" then entered_batched = true callback({ mode = "batched" })
+  elseif method == "github.review.document.transition" then
     assert(params.document == state.document, "queued lifecycle retained the obsolete host identity")
     transitioned = params.document
     callback({ lifecycle = { state = "CLOSED", is_draft = false }, fresh_required = false })
-  elseif method == "review.save" then queued_save, complete_save = vim.deepcopy(params), callback
+  elseif method == "github.review.document.save" then queued_save, complete_save = vim.deepcopy(params), callback
   else error("unexpected recovery request " .. method) end
 end)
 local retained_buffer = state.replica.buffer
@@ -112,7 +112,7 @@ complete_save({ snapshot = { uncertain = false, field = {
 assert(vim.wait(1000, function() return not state.saving end))
 state.host_lost, delayed, recovered = true, nil, nil
 baseline = "Unsaved title"
-state.pending_operation = { kind = "lifecycle", method = "review.transition",
+state.pending_operation = { kind = "lifecycle", method = "github.review.document.transition",
   params = { document = state.document, desired = "CLOSED" } }
 assert(review.rebind(state, function(value, failure) assert(not failure, failure) recovered = value end))
 assert(vim.wait(1000, function() return delayed ~= nil end))

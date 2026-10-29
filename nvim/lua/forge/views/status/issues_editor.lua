@@ -1,22 +1,20 @@
 local M = {}
 local key = "status:context:issues"
 
----@class ForgeStatusIssuesEditor
----@field text? string Unsaved Issues row retained across generated updates.
----@field dirty boolean
----@field sequence integer
----@field saving? boolean
----@field repairing? boolean
----@field sync fun()
----@field focus fun(window: integer)
----@field save fun()
-
 ---@param replica ForgeStatusReplica
 ---@param save fun(text: string, callback: fun(success: boolean))
 ---@return ForgeStatusIssuesEditor editor
 function M.attach(replica, save)
   local buffer = replica.buffer
-  ---@type ForgeStatusIssuesEditor
+  ---@class ForgeStatusIssuesEditor
+  ---@field text? string Unsaved Issues row retained across generated updates.
+  ---@field dirty boolean
+  ---@field sequence integer
+  ---@field saving? boolean
+  ---@field repairing? boolean
+  ---@field sync fun()
+  ---@field focus fun(window: integer)
+  ---@field save fun()
   local editor = { dirty = false, sequence = 0 }
   replica.issues_editor = editor
   local function row()
@@ -55,7 +53,7 @@ function M.attach(replica, save)
       if not vim.api.nvim_buf_is_valid(buffer) or replica.status == "Closed" then return end
       local lines = {}
       for index = 0, replica.sequence:rows() - 1 do
-        local node = replica.sequence:locate(index)
+        local node = assert(replica.sequence:locate(index))
         local _, start = replica.sequence:position(node.id)
         local cached = replica.projection and replica.projection.cache[node.id]
         local projected = cached and cached.block
@@ -74,7 +72,7 @@ function M.attach(replica, save)
   vim.api.nvim_buf_attach(buffer, false, { on_lines = function(_, _, tick, first, last, next_last)
     if replica.applying or editor.repairing then return end
     local target = row()
-    local text = first == target and last == target + 1 and next_last == last
+    local text = target ~= nil and first == target and last == target + 1 and next_last == last
       and vim.api.nvim_buf_get_lines(buffer, first, next_last, false)[1]
     if not text or text:find("%z") then reject_edit() return end
     local value = vim.tbl_extend("force", replica.source_entry[key], {

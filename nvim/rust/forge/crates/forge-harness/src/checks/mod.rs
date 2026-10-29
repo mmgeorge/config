@@ -41,7 +41,7 @@ pub use selection::{
     CheckCase, CheckReceipt, CheckRunRequest, CheckSelection, RunRequest, SelectedChecks,
 };
 pub(crate) use supervisor::CheckAdmission;
-pub use supervisor::CheckSupervisor;
+pub use supervisor::{CheckSupervisor, CheckSupervisorContext};
 pub(crate) use tools::CheckAuthority;
 pub(crate) use tools::CheckToolScope;
 pub(crate) use tools::ConfigureChecks;

@@ -35,7 +35,7 @@ end
 ---@param value any
 ---@return string
 function M.body_text(value)
-  return tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+  return (tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n"))
 end
 
 ---@param body string?
@@ -53,7 +53,7 @@ function M.preview_text(body)
     if trimmed ~= "" then parts[#parts + 1] = trimmed end
     ::continue::
   end
-  return table.concat(parts, " "):gsub("%s+", " ")
+  return (table.concat(parts, " "):gsub("%s+", " "))
 end
 
 ---@param body string?
@@ -120,7 +120,7 @@ function M.prefix(comment, alignment, has_preview, opts)
     prefix = prefix .. " " .. M.pad_right(date_text, has_preview and date_width or 0)
   end
   if has_preview then return prefix end
-  return prefix:gsub("%s+$", "")
+  return (prefix:gsub("%s+$", ""))
 end
 
 ---@param comment table

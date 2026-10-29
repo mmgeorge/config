@@ -168,7 +168,10 @@ mod tests {
         assert!(
             runtime
                 .harness
-                .prepare(None, forge_harness::protocol::HarnessMethod::StateGet)
+                .prepare(
+                    None,
+                    forge_harness::protocol::RuntimeMethod::SessionStateGet
+                )
                 .await
                 .is_err()
         );

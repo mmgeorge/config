@@ -8,7 +8,7 @@ assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), executable))
 local stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return kind == "data" and data or stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback) vim.schedule(function() callback({ok=true,path=executable}) end) return function() end end }
-local client = require("forge.client") client._set_launcher_for_test(vim.system)
+local client = require("forge.client") client._host_set_launcher_for_test(vim.system)
 local walkthrough = require("forge.walkthrough")
 require("forge.infra.config").options.walkthrough_inventory = false
 local state, notices = nil, {}
@@ -28,10 +28,11 @@ local ok, failure = xpcall(function()
   assert(vim.wait(45000,function() return #notices>0 or state.replica.status=="Applied" and not state.pending and #state.queue==0 end,10), "Walkthrough did not settle")
   assert(#notices==0,table.concat(notices,"\n"))
   assert(vim.bo[state.replica.buffer].readonly and vim.wo.foldmethod=="manual")
+  assert(require("forge.buffer").set_expansion(state.replica,"walkthrough:task:0:subtask:0",true))
   local row
   for index,line in ipairs(vim.api.nvim_buf_get_lines(state.replica.buffer,0,-1,true)) do if line:find("Modify Function: captured",1,true) then row=index break end end
-  assert(row,"native change target missing")
-  vim.cmd("normal! zR") vim.api.nvim_win_set_cursor(0,{row,0})
+  assert(row,"native change target missing: " .. vim.inspect(vim.api.nvim_buf_get_lines(state.replica.buffer,0,-1,true)))
+  vim.api.nvim_win_set_cursor(0,{row,0})
   walkthrough.open_change(state)
   assert(vim.wait(10000,function() return #notices>0 or not state.opening and not state.pending and #state.queue==0
     and state.source[1] and state.source[1].annotation and state.source[1].source.replica.status=="Applied" end,10),"Walkthrough source did not settle")
@@ -43,21 +44,21 @@ local ok, failure = xpcall(function()
   assert(vim.tbl_contains(review,"local captured = 1") and vim.tbl_contains(review,"local captured = 2"))
   assert(vim.deep_equal(vim.api.nvim_buf_get_lines(owner.source.replica.buffer,0,-1,true),{"local captured = 2","return captured"}))
   local source_row
-  for index,line in ipairs(review) do if line=="return captured" then source_row=index break end end
-  assert(source_row)
+  for index,line in ipairs(review) do if line=="local captured = 2" then source_row=index break end end
+  assert(source_row, "source row missing: " .. vim.inspect(review))
   vim.api.nvim_set_current_win(owner.window)
   vim.api.nvim_win_set_cursor(0,{source_row,0})
   vim.fn.maparg("o","n",false,true).callback()
   assert(vim.wait(5000,function() return #notices>0 or vim.api.nvim_get_current_buf()==owner.source.replica.buffer end,10),"native source action did not settle")
   assert(#notices==0,table.concat(notices,"\n"))
-  assert(vim.api.nvim_win_get_cursor(0)[1]==2)
+  assert(vim.api.nvim_win_get_cursor(0)[1]==1)
   vim.fn.maparg("q","n",false,true).callback()
   assert(vim.api.nvim_get_current_buf()==owner.annotation.buffer)
   assert(git({"diff","--cached","--name-only"})=="")
   walkthrough.close(state) state=nil
 end,debug.traceback)
 if state then walkthrough.close(state) end
-client.stop()
+client.host_stop()
 local collected=vim.wait(5000,function() return client._client.process==nil end,10)
 vim.fn.stdpath=stdpath
 vim.fn.delete(fixture,"rf") vim.fn.delete(data,"rf")

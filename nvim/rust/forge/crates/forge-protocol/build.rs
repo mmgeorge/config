@@ -1,6 +1,10 @@
 use serde::Deserialize;
 use std::{collections::BTreeMap, error::Error, fmt::Write, fs, path::PathBuf};
 
+#[path = "src/method_policy.rs"]
+#[allow(dead_code)]
+mod method_policy;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Contract {
@@ -10,6 +14,7 @@ struct Contract {
     backend: BTreeMap<String, Event>,
     request: BTreeMap<String, Event>,
     document: BTreeMap<String, Event>,
+    methods: BTreeMap<String, method_policy::MethodPolicy>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +68,45 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut generated = format!("const CONTRACT_VERSION: u32 = {};\n", contract.version);
+    writeln!(
+        generated,
+        "/// Request event names generated from the shared transport contract."
+    )?;
+    writeln!(
+        generated,
+        "#[derive(Clone, Copy, Debug, Eq, PartialEq)]\npub enum RequestEventName {{"
+    )?;
+    for name in contract.request.keys() {
+        if let Some(method) = name.strip_suffix(".progress")
+            && !contract.methods.contains_key(method)
+        {
+            return Err(format!("progress event has no corresponding method: {name}").into());
+        }
+        writeln!(generated, "{},", event_variant(name))?;
+    }
+    writeln!(
+        generated,
+        "}}\nimpl RequestEventName {{\n/// Exact event name on the wire.\npub const fn as_str(self) -> &'static str {{ match self {{"
+    )?;
+    for name in contract.request.keys() {
+        writeln!(generated, "Self::{} => {name:?},", event_variant(name))?;
+    }
+    writeln!(generated, "}} }} }}")?;
+    writeln!(
+        generated,
+        "pub static METHODS: &[(&str, crate::method_policy::MethodPolicy)] = &["
+    )?;
+    for (name, policy) in contract.methods {
+        if name.is_empty() {
+            return Err("method names must be nonempty".into());
+        }
+        writeln!(
+            generated,
+            "({name:?}, crate::method_policy::MethodPolicy {{ session_context: crate::method_policy::SessionContext::{:?}, readiness: crate::method_policy::Readiness::{:?}, admission: crate::method_policy::Admission::{:?}, recovery: crate::method_policy::Recovery::{:?} }}),",
+            policy.session_context, policy.readiness, policy.admission, policy.recovery
+        )?;
+    }
+    writeln!(generated, "];")?;
     for (channel, events) in [
         ("SESSION", contract.session),
         ("BACKEND", contract.backend),
@@ -119,4 +163,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         generated,
     )?;
     Ok(())
+}
+
+fn event_variant(name: &str) -> String {
+    name.split(['.', '_'])
+        .map(|part| {
+            let mut characters = part.chars();
+            characters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(characters).collect()
+            })
+        })
+        .collect()
 }

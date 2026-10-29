@@ -141,7 +141,10 @@ impl BackgroundManager {
                 if let (Some((delivery, request_id)), Some(progress)) = (&delivery, progress) {
                     let _ = delivery.send(Message::RequestEvent(RequestEvent {
                         request_id: *request_id,
-                        event: "repository.generate.progress".into(),
+                        event:
+                            forge_protocol::contract::RequestEventName::RepositoryGenerationProgress
+                                .as_str()
+                                .into(),
                         payload: json!({"session_id":progress_session,"event":progress}),
                     }));
                 }
@@ -203,18 +206,7 @@ impl BackgroundManager {
         });
         let input = request.purpose.background_input(&request.input);
         let result = broker
-            .generate_background(
-                input,
-                identity,
-                request.config.model,
-                request
-                    .config
-                    .reasoning_effort
-                    .unwrap_or_else(|| "low".into()),
-                request.config.service_tier,
-                policy,
-                sink,
-            )
+            .generate_background(input, identity, request.config, policy, sink)
             .await
             .and_then(|text| request.purpose.validate(&text));
         timeout.abort();

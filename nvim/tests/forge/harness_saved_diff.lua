@@ -4,12 +4,12 @@ local closed = false
 local captured = { document = "transcript", sequence = 2, revision = 4 }
 source._set_runner_for_test(function(method, params, callback)
   if params.operation == "open_diff" then
-    assert(method == "harness.document" and params.input == captured and not params.text)
+    assert(method == "session.document" and params.input == captured and not params.text)
     callback({ title = "Saved changes", object = "exact-source", revision = "saved", more = false,
       snapshot = { document = params.document, revision = 0, block = { { id = "diff", text = { "--- a/path", "+++ b/path" },
         metadata = { target = {}, decoration = {}, editable_region = {} } } } } })
   else
-    assert(method == "source.document")
+    assert(method == "repository.source.document")
     if params.operation == "close" then closed = true end
     callback({})
   end

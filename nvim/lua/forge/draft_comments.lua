@@ -72,8 +72,10 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field default_folded? boolean
 ---@field ancestor_ids? string[]
 ---@field annotation_anchor? boolean
+---@field hidden? boolean
 
 ---@class ForgeDraftCommentOptions
+---@field baseline? ForgeDraftCommentCapture[]
 ---@field focused_id? integer|string Retains the focused annotation during a source update.
 ---@field readonly? boolean
 ---@field heading? string
@@ -222,7 +224,7 @@ local function flatten_segmented_line(segmented_line)
 end
 
 ---@param state ForgeDraftCommentState
----@param annotation_id integer
+---@param annotation_id integer|string
 ---@return ForgeDraftComment?
 local function find_annotation(state, annotation_id)
   for _, annotation in ipairs(state.annotation_list) do
@@ -266,7 +268,8 @@ local function remove_annotation(state, annotation)
 end
 
 ---@class ForgeDraftCommentRenderTarget
----@field annotation_id integer?
+---@field annotation_id integer|string|nil
+---@field reply_index integer?
 ---@field source_line integer?
 
 ---@class ForgeDraftCommentProjection
@@ -275,7 +278,7 @@ end
 ---@field range_list ForgeDraftCommentRange[]
 ---@field compact_highlight_list { row: integer, start_col: integer, end_col: integer, hl: string }[]
 ---@field source_highlight_list { row: integer, start_col: integer, end_col: integer, hl: string }[]
----@field source_record_list { row: integer, source_line: integer }[]
+---@field source_record_list { row: integer, source_line: integer, source_index: integer }[]
 ---@field line_meta_list table[]
 
 ---@param state ForgeDraftCommentState
@@ -462,8 +465,8 @@ end
 ---@param projection ForgeDraftCommentProjection
 local function apply_projection(state, projection)
   local previous = vim.api.nvim_buf_get_lines(state.buf, 0, -1, false)
-  local change_list = vim.diff(table.concat(previous, "\n") .. "\n",
-    table.concat(projection.line_list, "\n") .. "\n", { result_type = "indices", algorithm = "histogram" })
+  local change_list = assert(vim.text.diff(table.concat(previous, "\n") .. "\n",
+    table.concat(projection.line_list, "\n") .. "\n", { result_type = "indices", algorithm = "histogram" }))
   for index = #change_list, 1, -1 do
     local change = change_list[index]
     local start = change[2] == 0 and change[1] or change[1] - 1
@@ -609,7 +612,7 @@ local function handle_cursor_moved(state)
   sync_focused_body(state)
   local row = vim.api.nvim_win_get_cursor(win)[1] - 1
   local annotation, range, reply = annotation_at_row(state, row)
-  if annotation then
+  if annotation and range then
     if annotation.readonly then sync_cursor_modifiable(state, win) return end
     if not annotation.focused then
       local reply_index = range.reply_index

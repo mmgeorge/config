@@ -624,7 +624,7 @@ function try_select_node(node, query, tree, bufnr)
 end
 
 --- Get the current visual selection (region) as start and end positions
---- @return table {start = {line, col}, finish = {line, col}}
+--- @return boolean
 -- local function get_visual_selection_region()
 --   local start_pos = vim.api.nvim_buf_get_mark(0, '<')
 --   local end_pos = vim.api.nvim_buf_get_mark(0, '>')

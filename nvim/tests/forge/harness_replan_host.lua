@@ -16,7 +16,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local picker = require("forge.views.picker")
@@ -44,7 +44,7 @@ local success, failure = xpcall(function()
   submit("Why did you choose this design?")
   await(function() return not state.busy end, "discussion did not finish")
   local history
-  client.request("exchange.list", {}, function(value, failure) assert(not failure, failure) history = value end)
+  client.request({ method = "session.exchange.list", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(value, failure) assert(not failure, failure) history = value end)
   await(function() return history ~= nil end, "discussion history missing")
   local discussion = assert(vim.iter(history):find(function(exchange)
     return exchange.prompt == "Why did you choose this design?" and exchange.state == "complete"
@@ -57,7 +57,7 @@ local success, failure = xpcall(function()
   local revision_path = vim.fs.joinpath(vim.fs.dirname(source.working_path), "revisions", "submitted-0001.json")
   local original = vim.fn.readfile(revision_path, "b")
   local response
-  client.request_for(state.session.id, "plan.request_changes", { plan_id = source.id, comment = "Refine the description" }, function(result, request_error)
+  client.request({ session_id = state.session.id, method = "session.plan.changes.request", params = { plan_id = source.id, comment = "Refine the description" } }, function(result, request_error)
     assert(not request_error, request_error)
     response = result
   end)
@@ -102,7 +102,7 @@ local success, failure = xpcall(function()
   end, "Harness did not exit")
 end, debug.traceback)
 picker.close(false)
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

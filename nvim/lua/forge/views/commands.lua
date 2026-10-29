@@ -56,6 +56,7 @@ function M.open_file_revision(file, rev)
 end
 
 ---@class ForgeOpenPROptions
+---@field started_at? integer
 ---@field cwd? string
 ---@field repo? string
 ---@field window? integer
@@ -254,7 +255,7 @@ end
 function M.open(started_at)
   local command_started = started_at or vim.uv.hrtime()
   require("forge.startup_log").write("status.command.enter")
-  require("forge.client").start()
+  require("forge.client").host_start()
   local native = require("forge.status")
   local workspace, window = vim.fn.getcwd(), vim.api.nvim_get_current_win()
   if native_main_status and native_main_status.workspace == workspace and native_main_status.state.active

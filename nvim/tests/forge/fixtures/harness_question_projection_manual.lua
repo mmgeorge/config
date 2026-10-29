@@ -34,7 +34,7 @@ state.presentation = {
   open_output = function() return false end,
   toggle_heading = function(window) return folds.toggle_heading(transcript, window) end,
 }
-client.subscribe = function() return function() end end
+client.session_events_subscribe = function() return function() end end
 controller.render = function() end
 controller.attach()
 folds.attach(transcript, state.transcript_win)

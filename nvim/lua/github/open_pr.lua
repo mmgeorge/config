@@ -305,10 +305,10 @@ local function collect_diff_context(cwd, branch, base_ref, base_commit, head_com
   local request
   request = function()
     attempts = attempts + 1
-    require("forge.client").request_host("repository.generate", {
+    require("forge.client").request({ method = "repository.generation", params = {
       operation = "context", workspace = cwd, comparison = "pull_request",
       base = base_commit, head = head_commit, max_bytes = limit,
-    }, function(result, failure)
+    } }, function(result, failure)
       if failure then callback(nil, failure) return end
       if type(result) ~= "table" then callback(nil, "Missing native PR diff context") return end
       ---@cast result ForgePullRequestContextResponse
@@ -521,10 +521,10 @@ local function generate_description(cwd, head_commit, context, callback)
   local settings = require("forge.integrations.background_settings")
   local function resolved(snapshot, failure)
     if not snapshot then callback(nil, failure or "Missing Background settings") return end
-    local generation, configuration_failure = client.generation_config()
+    local generation, configuration_failure = client.generation_get_config()
     if not generation then callback(nil, configuration_failure) return end
     local choice = settings.model(snapshot, generation.backend.kind)
-    client.request_generation({
+    client.generation_request({
       operation = "pull_request", workspace = cwd, comparison = "pull_request", head = head_commit,
       input = pr_system_prompt .. "\n\n" .. context,
     }, function(result, request_failure)

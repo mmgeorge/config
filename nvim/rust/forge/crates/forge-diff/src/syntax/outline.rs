@@ -390,7 +390,7 @@ mod tests {
         let outline = handle.outline();
         assert_eq!(
             outline.import,
-            [0..1],
+            std::iter::once(0..1).collect::<Vec<_>>(),
             "{}",
             handle.0.tree[0].root_node().to_sexp()
         );
@@ -449,7 +449,7 @@ mod tests {
                 );
             }
             if language == SyntaxLanguage::C {
-                assert_eq!(outline.import, [0..1]);
+                assert_eq!(outline.import, std::iter::once(0..1).collect::<Vec<_>>());
             }
         }
     }

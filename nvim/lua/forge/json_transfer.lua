@@ -10,6 +10,8 @@ local MAX_COUNTER = 9007199254740991
 ---@field total_bytes? integer
 ---@field parts? string[]
 ---@field finished? boolean
+---@field started_at? integer
+---@field accept_us? integer
 
 local function counter(value, minimum, maximum)
   return type(value) == "number" and value >= minimum and value <= maximum and value == math.floor(value)

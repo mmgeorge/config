@@ -15,7 +15,7 @@ function M.open()
     vim.schedule(function() callback({ ok = true, path = binary }) end)
   end }
   local client = require("forge.client")
-  client._set_launcher_for_test(vim.system)
+  client._host_set_launcher_for_test(vim.system)
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
     harness = { backend = "mock", backends = { mock = { command = { "retained-control" }, selectable = true } } } })
@@ -31,7 +31,7 @@ function M.open()
       vim.api.nvim_buf_delete(buffer, { force = true })
     end
   end
-  client.stop()
+  client.host_stop()
   assert(vim.wait(5000, function() return client._client.process == nil end, 10), "scene host did not stop")
   local directory = data .. "/forge/harness/" .. session_id .. "/checks/scene"
   vim.fn.mkdir(directory, "p")
@@ -98,7 +98,7 @@ function M.open()
   }
   vim.fn.writefile({ vim.json.encode({ version = 4, run = run }) }, directory .. "/record.json")
   local restored, failure
-  client.start_harness(function(value, problem) restored, failure = value, problem end, { session_id = session_id })
+  client.session_initialize(function(value, problem) restored, failure = value, problem end, { session_id = session_id })
   assert(vim.wait(10000, function() return restored or failure end, 10), "scene reload timed out")
   assert(not failure, failure)
   require("forge.views.harness.session_navigation").activate(restored, { interaction_mode = "reconcile", open_mode = "tab" })
@@ -124,7 +124,7 @@ function M.open()
   function scene.close()
     require("forge.views.harness.workspace").release(state)
     state.presentation.close()
-    client.stop()
+    client.host_stop()
     assert(vim.wait(5000, function() return client._client.process == nil end, 10), "scene host was not collected")
     vim.fn.stdpath = original_stdpath
     vim.api.nvim_set_current_dir(root)

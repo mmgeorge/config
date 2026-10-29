@@ -438,7 +438,7 @@ impl Exchange {
                     "{}:compaction:{}:{}",
                     self.id, compaction.thread_id, compaction.id
                 ),
-                compaction: compaction.observed(now_ms),
+                compaction: (compaction.observed(now_ms)).into(),
             });
         }
     }
@@ -579,7 +579,7 @@ impl Exchange {
                     }
                 }
                 let turn_id = turn.id().to_owned();
-                for item in turn.items()[item_count..].to_vec() {
+                for item in turn.items()[item_count..].iter().cloned() {
                     let item_id = match &item {
                         crate::turn::TurnItem::Message { id }
                         | crate::turn::TurnItem::Tool { id } => id,

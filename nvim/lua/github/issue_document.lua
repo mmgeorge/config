@@ -66,13 +66,13 @@ end
 
 local function request(state, operation, params, callback)
   params.operation = operation
-  local generation = require("forge.client").host_generation()
+  local generation = require("forge.client").host_get_generation()
   local delivered = false
   local function receive(result, failure)
     if delivered then return end
     delivered = true
     vim.schedule(function()
-      if generation ~= require("forge.client").host_generation() then
+      if generation ~= require("forge.client").host_get_generation() then
         if state.generation and state.generation ~= generation then return end
         state.host_lost = true
         callback(nil, "Issue host changed before response delivery. Local text remains available in this buffer.")
@@ -81,14 +81,14 @@ local function request(state, operation, params, callback)
   end
   if not runner_for_test and state.generation then
     local client = require("forge.client")
-    if state.generation ~= client.host_generation() or not client.host_accepting() then
+    if state.generation ~= client.host_get_generation() or not client.host_is_accepting() then
       receive(nil, "Issue host was collected. Local text remains available in this buffer.")
       return
     end
   end
   local accepted, failure = pcall(function()
-    if runner_for_test then runner_for_test("issue.document", params, receive)
-    else require("forge.client").request_host("issue.document", params, receive) end
+    if runner_for_test then runner_for_test("github.issue.document", params, receive)
+    else require("forge.client").request({ method = "github.issue.document", params = params }, receive) end
   end)
   if not accepted then receive(nil, tostring(failure)) end
 end
@@ -554,7 +554,7 @@ function M.rebind(state, callback)
     state.replica.editable.suspended = false
     for _, field in pairs(state.replica.editable.region) do field.pending = nil end
     buffer.close(state.replica, { preserve_buffer = true })
-    state.document, state.generation = binding.document, require("forge.client").host_generation()
+    state.document, state.generation = binding.document, require("forge.client").host_get_generation()
     state.host_lost, state.saving, state.view = false, false, {}
     state.retained_buffer, state.restore_capture = retained_buffer, capture
     local current_buffer = vim.api.nvim_win_get_buf(state.window)
@@ -590,7 +590,7 @@ function M.open(options)
     previous.hidden, previous.is_current = false, options.is_current
     previous.on_open = options.on_open
     vim.api.nvim_win_set_buf(window, previous.replica.buffer)
-    if previous.host_lost or previous.generation and previous.generation ~= require("forge.client").host_generation() then
+    if previous.host_lost or previous.generation and previous.generation ~= require("forge.client").host_get_generation() then
       M.rebind(previous)
     elseif options.on_open then options.on_open(previous) end
     return previous
@@ -624,7 +624,7 @@ function M.open(options)
       return
     end
     state.opened = true
-    if not runner_for_test then state.generation = require("forge.client").host_generation() end
+    if not runner_for_test then state.generation = require("forge.client").host_get_generation() end
     adopt_save_state(state, result)
     if state.closing or not current(state) then finish_close(state) return end
     attach(state, result)

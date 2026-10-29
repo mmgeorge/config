@@ -228,7 +228,9 @@ function PickerLayout.build(page, selected_index, width, options)
         end
         segment_offset = segment_offset + #segment[1]
       end
-      for _, span in ipairs(column_spans and column_spans[column] or {}) do
+      ---@type ForgePickerColumnSpan[]
+      local source_spans = column_spans and column_spans[column] or {}
+      for _, span in ipairs(source_spans) do
         local start = math.max(source_offset, span.first)
         local final = math.min(source_offset + retained, span.last)
         if start < final then

@@ -153,7 +153,7 @@ function M.open(options)
     active = true, pending = false, queue = {}, view = {}, count = {}, more = false, hostname = options.hostname or "github.com", origin = vim.api.nvim_win_get_buf(window) }
   current_state = state
   state.notice = options.on_error or function(message) vim.notify(tostring(message), vim.log.levels.ERROR, { title = "GitHub notifications" }) end
-  state.request = options.request or function(params, callback) return require("forge.client").request_host("notifications.document", params, callback) end
+  state.request = options.request or function(params, callback) return require("forge.client").request({ method = "github.notification.document", params = params }, callback) end
   state.open_effect = options.open_effect or function(effect, effect_window, is_current)
     if not is_current() then return end
     if effect.kind == "browse" or not effect.number or effect.number == vim.NIL then

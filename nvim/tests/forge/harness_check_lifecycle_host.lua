@@ -12,11 +12,11 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local function request(method, params)
   local done, result, failure
-  client.request(method, params or {}, function(value, problem) result, failure, done = value, problem, true end)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, problem) result, failure, done = value, problem, true end)
   assert(vim.wait(10000, function() return done end, 10), method .. " timed out")
   assert(not failure, method .. ": " .. tostring(failure))
   return result
@@ -46,7 +46,7 @@ local succeeded, failure = xpcall(function()
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timed out")
   request("session.configure", { shell = "nushell" })
-  local id = request("checks.run", { check = { "slow", "quick-1", "quick-2", "quick-3" } }).run_id
+  local id = request("session.check.run", { check = { "slow", "quick-1", "quick-2", "quick-3" } }).run_id
   assert(vim.wait(5000, function()
     return state.checks_running and state.active_check_run == id
       and rows():find("Check output is streaming", 1, true)
@@ -54,20 +54,20 @@ local succeeded, failure = xpcall(function()
   assert(rows():find("Checking", 1, true) and not rows():find("User requested", 1, true), rows())
   assert(rows():find("3/4 finished", 1, true) and not rows():find("/33 finished", 1, true), rows())
   preview()
-  request("checks.cancel", { run_id = id })
+  request("session.check.cancel", { run_id = id })
   assert(vim.wait(3000, function()
     return not state.checks_running and not rows():find("Checks running", 1, true)
   end, 10), "interrupted check retained live activity")
-  local cancelled = request("checks.status", { run_id = id, wait_for_completion = true, wait_ms = 3000 })
+  local cancelled = request("session.check.status", { run_id = id, wait_for_completion = true, wait_ms = 3000 })
   assert(cancelled.state == "interrupted" and type(cancelled.completed_at_ms) == "number", vim.inspect(cancelled))
   assert(rows():find("Checks interrupted", 1, true), rows())
   preview()
-  local failed = request("checks.run", { check = { "failure" } }).run_id
-  assert(request("checks.status", { run_id = failed, wait_for_completion = true, wait_ms = 3000 }).state == "failed")
-  request("state.get")
+  local failed = request("session.check.run", { check = { "failure" } }).run_id
+  assert(request("session.check.status", { run_id = failed, wait_for_completion = true, wait_ms = 3000 }).state == "failed")
+  request("session.state.get")
   assert(vim.wait(3000, function() return rows():find("1 failed", 1, true) ~= nil end, 10), rows())
 end, debug.traceback)
-client.stop()
+client.host_stop()
 vim.wait(3000, function() return client._client.process == nil end, 10)
 vim.fn.stdpath = original_stdpath
 if not succeeded then error(failure) end

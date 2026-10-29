@@ -10,14 +10,14 @@ local function request(method, params, callback)
   end
   local ok, failure = pcall(function()
     if runner_for_test then runner_for_test(method, params, receive)
-    else require("forge.client").request_host(method, params, receive) end
+    else require("forge.client").request({ method = method, params = params }, receive) end
   end)
   if not ok then receive(nil, tostring(failure)) end
 end
 
 function M.context(directory, callback)
   local hostname = require("github.repo_cache").hostname()
-  request("github.creation.context", { directory = directory }, function(context, failure)
+  request("github.pull_request.creation.context", { directory = directory }, function(context, failure)
     if failure then callback(nil, failure) return end
     if type(context) ~= "table" or type(context.repository) ~= "table"
       or context.repository.hostname ~= hostname or type(context.repository.owner) ~= "string"
@@ -36,7 +36,7 @@ function M.create(directory, context, base, metadata, callback)
     head_commit = context.head_commit, draft = true }
   local resource = { repository = vim.deepcopy(context.repository), kind = "repository", number = 0 }
   local repo = resource.repository.owner .. "/" .. resource.repository.name
-  request("github.review.draft", { resource = resource }, function(stored, read_failure)
+  request("github.review.draft.get", { resource = resource }, function(stored, read_failure)
     if read_failure then callback(nil, read_failure) return end
     stored = type(stored) == "table" and stored or {}
     local previous = type(stored.creation) == "table" and stored.creation.sequence or 0
@@ -44,7 +44,7 @@ function M.create(directory, context, base, metadata, callback)
       callback(nil, "PR creation draft sequence is invalid") return
     end
     local draft = { repo = repo, number = 0, creation = { sequence = previous + 1, mutation = vim.deepcopy(mutation) } }
-    request("github.review.draft.write", { resource = resource, draft = draft }, function(_, write_failure)
+    request("github.review.draft.save", { resource = resource, draft = draft }, function(_, write_failure)
       if write_failure then callback(nil, write_failure) return end
       local function settle()
         return draft

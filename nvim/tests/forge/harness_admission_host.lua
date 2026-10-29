@@ -13,11 +13,11 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local function start(method, params)
   local completion = {}
-  client.request(method, params or {}, function(value, failure, detail)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, failure, detail)
     completion.value, completion.failure, completion.detail, completion.done = value, failure, detail, true
   end)
   return completion
@@ -37,15 +37,15 @@ local success, failure = xpcall(function()
     harness = { backend = "mock", backends = { mock = { command = { "session-blocking" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timeout")
-  request("prompt.submit", { text = "Ask a fixture question." })
-  local before = request("state.get")
+  request("session.prompt.submit", { text = "Ask a fixture question." })
+  local before = request("session.state.get")
   local elicitation = assert(before.active_elicitation).elicitation
   local question_id = elicitation.question_set.questions[1].id
-  local active = start("question.ask", { question_id = question_id, text = "Explain the available choices." })
-  local rejected = finish(start("question.ask", { question_id = question_id, text = "A second clarification." }))
+  local active = start("session.question.ask", { question_id = question_id, text = "Explain the available choices." })
+  local rejected = finish(start("session.question.ask", { question_id = question_id, text = "A second clarification." }))
   assert(rejected.detail and rejected.detail.code == "not_admitted", vim.inspect(rejected))
   assert(not finish(active).failure, tostring(active.failure))
-  local after = request("state.get")
+  local after = request("session.state.get")
   assert(after.status.kind == "awaiting_input", vim.inspect(after.status))
   assert(after.active_elicitation.elicitation.question_set.id == elicitation.question_set.id,
     "admission rejection replaced the pending question")
@@ -64,12 +64,20 @@ local success, failure = xpcall(function()
     controller.task_transition({ action = "permission", change = change })
     assert(vim.wait(10000, function() return not state.task_operation and not state.busy end, 10),
       "permission change did not settle while a question waited")
-    local waiting = request("state.get")
+    local waiting = request("session.state.get")
     assert(waiting.active_elicitation.elicitation.question_set.id == elicitation.question_set.id,
       "permission change replaced the unanswered question")
     assert(#waiting.active_elicitation.elicitation.answer == 0, "permission change answered the question")
     assert(waiting.session.access.write_access == "off", "approval change restored writes")
   end
+  local skipped = request("session.question.skip", { question_id = question_id })
+  assert(skipped.active_elicitation.elicitation.answer[1].response.kind == "skipped")
+  local answered = request("session.question.answer", {
+    question_id = question_id, response = { kind = "other", text = "Use the local fixture" },
+  })
+  assert(answered.active_elicitation.elicitation.answer[1].response.text == "Use the local fixture")
+  local continued = request("session.question.continue")
+  assert(continued.active_elicitation == nil or continued.active_elicitation == vim.NIL)
 end, debug.traceback)
 if vim.g.forge_admission_inspect and success then
   print("harness_admission_host: passed, inspection ready")
@@ -77,7 +85,7 @@ if vim.g.forge_admission_inspect and success then
 end
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(original_directory)
 vim.fn.stdpath = original_stdpath

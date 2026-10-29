@@ -22,13 +22,13 @@ local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback) vim.schedule(function() callback({ ok = true, path = executable }) end) end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors = {}
 vim.notify = function(message, level) if level == vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end end
 local function request(method, params)
   local done, result, failure
-  client.request(method, params or {}, function(value, error_message) result, failure, done = value, error_message, true end)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, error_message) result, failure, done = value, error_message, true end)
   assert(vim.wait(10000, function() return done end, 10), method .. " timed out")
   assert(not failure, failure)
   return result
@@ -42,7 +42,7 @@ local ok, failure = xpcall(function()
   assert(state.presentation.status_view.window == nil)
   vim.api.nvim_set_current_win(state.composer_win)
   local prompt_failure
-  client.request("prompt.submit", { text = "Keep status visible" }, function(_, error_message) prompt_failure = error_message end)
+  client.request({ method = "session.prompt.submit", params = { text = "Keep status visible" }, session_id = assert(require("forge.session").harness.session).id }, function(_, error_message) prompt_failure = error_message end)
   assert(vim.wait(5000, function() return state.presentation.status_view.window ~= nil end, 10), table.concat(errors, "\n"))
   assert(vim.api.nvim_get_current_win() == state.composer_win)
   local view = state.presentation.status_view
@@ -59,7 +59,7 @@ local ok, failure = xpcall(function()
   assert(view.window == nil)
   preview.close()
   assert(view.window ~= nil)
-  request("turn.cancel")
+  request("session.turn.cancel")
   assert(vim.wait(5000, function() return view.snapshot and #view.snapshot.block == 0 end, 10), table.concat(errors, "\n"))
   assert(view.window == nil)
   assert(prompt_failure == nil or prompt_failure:find("cancelled", 1, true))
@@ -67,7 +67,7 @@ local ok, failure = xpcall(function()
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify
 vim.api.nvim_set_current_dir(original_directory)

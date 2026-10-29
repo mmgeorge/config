@@ -10,6 +10,30 @@ pub(crate) struct TaskAuthority {
     permit: TaskPermit,
 }
 
+impl TaskAuthority {
+    pub(crate) fn capture(context: &super::ControlTurnContext) -> Option<Self> {
+        context.task_permit.as_ref().map(|permit| Self {
+            controller: context.task_controller.clone(),
+            permit: permit.clone(),
+        })
+    }
+
+    /// Rejects callbacks whose task was replaced, suspended, cleared, or not acknowledged.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let current = self
+            .controller
+            .as_ref()
+            .context("task callback has no session controller")?
+            .current()?;
+        self.permit.validate(current.as_ref())?;
+        ensure!(
+            current.as_ref().is_some_and(|task| task.entry_accepted()),
+            "task entry has not been acknowledged by the provider"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -52,30 +76,6 @@ mod test {
             3,
         )?;
         pending.validate()?;
-        Ok(())
-    }
-}
-
-impl TaskAuthority {
-    pub(crate) fn capture(context: &super::ControlTurnContext) -> Option<Self> {
-        context.task_permit.as_ref().map(|permit| Self {
-            controller: context.task_controller.clone(),
-            permit: permit.clone(),
-        })
-    }
-
-    /// Rejects callbacks whose task was replaced, suspended, cleared, or not acknowledged.
-    pub(crate) fn validate(&self) -> Result<()> {
-        let current = self
-            .controller
-            .as_ref()
-            .context("task callback has no session controller")?
-            .current()?;
-        self.permit.validate(current.as_ref())?;
-        ensure!(
-            current.as_ref().is_some_and(|task| task.entry_accepted()),
-            "task entry has not been acknowledged by the provider"
-        );
         Ok(())
     }
 }

@@ -58,7 +58,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 package.loaded["forge.views.plan_review"] = require("forge.views.plan_review.native_controller")
 local function await(predicate, message)
@@ -87,8 +87,8 @@ local success, failure = xpcall(function()
     "declaration submission still displays the rendered artifact diff")
   for _, baseline in ipairs({ false, true }) do
     local declaration, declaration_failure
-    client.request_for(state.session.id, "plan.declaration", { plan_id = plan.id, revision = 1,
-      path = "src/change.rs", baseline = baseline }, function(result, failure)
+    client.request({ session_id = state.session.id, method = "session.plan.declaration.get", params = { plan_id = plan.id, revision = 1,
+      path = "src/change.rs", baseline = baseline } }, function(result, failure)
       declaration, declaration_failure = result, failure
     end)
     await(function() return declaration or declaration_failure end, "saved declaration read did not finish")
@@ -119,14 +119,18 @@ local success, failure = xpcall(function()
   assert(document.design.document.objective == "Revise the registry interface.")
   assert(document.design.validation and document.design.validation.fingerprint, "submission did not retain reference validation")
   local projection = bytes(plan.working_path)
-  local original_request = client.request_for
+  local original_request = client.request
   local pending_open
-  client.request_for = function(session_id, method, params, callback)
-    if method == "harness.document" and params.operation == "plan_open" then
-      pending_open = { session_id, method, params, callback }
+  client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.document" and params.operation == "plan_open" then
+      pending_open = { request_specification, callback }
       return
     end
-    return original_request(session_id, method, params, callback)
+    return original_request(request_specification, callback)
   end
   require("forge.views.plan_review").open(plan)
   assert(pending_open, "opening did not request a native snapshot")
@@ -138,7 +142,7 @@ local success, failure = xpcall(function()
   assert(vim.wo[loading.win].winbar:find("PlanReview", 1, true)
     and vim.wo[loading.win].winbar:find("Loading review", 1, true), "pending review omitted its navbar")
   assert(bytes(plan.working_path) == projection, "loading changed the saved plan")
-  client.request_for = original_request
+  client.request = original_request
   original_request(unpack(pending_open))
   await(function() return state.plan_review and state.plan_review.owner.ready end, "declaration review did not open")
   local review = state.plan_review
@@ -316,12 +320,16 @@ local success, failure = xpcall(function()
   toggle(declaration_row("pub(crate) struct MovementInput"))
 
   local held_jump
-  client.request_for = function(session_id, method, params, callback)
-    if method == "harness.document" and params.operation == "plan_action" and params.input.action == "jump_entity" then
-      held_jump = { session_id, method, params, callback }
+  client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.document" and params.operation == "plan_action" and params.input.action == "jump_entity" then
+      held_jump = { request_specification, callback }
       return
     end
-    return original_request(session_id, method, params, callback)
+    return original_request(request_specification, callback)
   end
   local movement_reference = declaration_row("ResMut<MovementInput>")
   local movement_text = vim.api.nvim_buf_get_lines(review.buf, movement_reference - 1, movement_reference, false)[1]
@@ -331,25 +339,29 @@ local success, failure = xpcall(function()
   local sequence = review.owner.view.sequence
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = review.buf })
   assert(review.owner.view.sequence == sequence, "comment focus superseded navigation")
-  client.request_for = original_request
+  client.request = original_request
   original_request(unpack(held_jump))
   await(function() local label = cursor_label() return label:find("pub(crate) struct MovementInput", 1, true) end,
     "delayed navigation did not apply")
 
   held_jump = nil
-  client.request_for = function(session_id, method, params, callback)
-    if method == "harness.document" and params.operation == "plan_action" and params.input.action == "jump_entity" then
-      held_jump = { session_id, method, params, callback }
+  client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.document" and params.operation == "plan_action" and params.input.action == "jump_entity" then
+      held_jump = { request_specification, callback }
       return
     end
-    return original_request(session_id, method, params, callback)
+    return original_request(request_specification, callback)
   end
   vim.api.nvim_win_set_cursor(review.win, { movement_reference, movement_text:find("MovementInput", 1, true) + 3 })
   vim.api.nvim_feedkeys(".", "xt", false)
   assert(held_jump, "stale navigation was not held")
   vim.api.nvim_win_set_cursor(review.win, { reference_row, 0 })
   local retained_cursor = vim.api.nvim_win_get_cursor(review.win)
-  client.request_for = original_request
+  client.request = original_request
   original_request(unpack(held_jump))
   vim.wait(100)
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), retained_cursor), "late navigation moved the cursor")
@@ -386,7 +398,7 @@ local success, failure = xpcall(function()
   public_key()
   await(function() return review.public_only == false end, "hidden-type test did not restore")
   local trace_status
-  client.request_for(review.session_id, "trace.configure", { enabled = true }, function(result, failure)
+  client.request({ session_id = review.session_id, method = "host.trace.configure", params = { enabled = true } }, function(result, failure)
     assert(not failure, tostring(failure))
     trace_status = result
   end)
@@ -715,12 +727,16 @@ local success, failure = xpcall(function()
   review.command_set.action_by_id.close.run({})
   await(function() return state.plan_review == nil end, "review did not close")
   local origin_tab = vim.api.nvim_get_current_tabpage()
-  client.request_for = function(session_id, method, params, callback)
-    if method == "harness.document" and params.operation == "plan_open" then
+  client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.document" and params.operation == "plan_open" then
       vim.schedule(function() callback(nil, "Snapshot unavailable for attachment test") end)
       return
     end
-    return original_request(session_id, method, params, callback)
+    return original_request(request_specification, callback)
   end
   require("forge.views.plan_review").open(plan)
   local failed_tab = state.plan_review.tab
@@ -730,16 +746,20 @@ local success, failure = xpcall(function()
     "failed attachment left an orphan review tab")
   assert(bytes(plan.working_path) == projection, "failed attachment changed the saved plan")
   errors = {}
-  client.request_for = original_request
+  client.request = original_request
   require("forge.views.plan_review").open(plan)
   await(function() return state.plan_review and state.plan_review.owner.ready end, "review did not reopen")
   assert(state.plan_review.public_only == true, "reopening retained All instead of defaulting to Public")
   assert(text(state.plan_review.buf):find("Review the second member", 1, true), "reopening lost the comment")
   assert(bytes(artifact_path) == artifact and bytes(plan.working_path) == projection, "comment reopening rewrote the design")
   local pending_approval
-  client.request_for = function(session_id, method, params, callback)
-    if method == "plan.acceptance.begin" then pending_approval = { session_id, method, params, callback } return end
-    return original_request(session_id, method, params, callback)
+  client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.plan.acceptance.begin" then pending_approval = { request_specification, callback } return end
+    return original_request(request_specification, callback)
   end
   state.plan_review.command_set.action_by_id.accept.run({})
   local decision_win = vim.api.nvim_get_current_win()
@@ -755,7 +775,7 @@ local success, failure = xpcall(function()
     "approval released its document before acknowledgement")
   assert(not vim.bo[state.plan_review.buf].modifiable and not state.plan_review.owner.close(),
     "approval allowed editing or premature document closure")
-  client.request_for = original_request
+  client.request = original_request
   original_request(unpack(pending_approval))
   await(function() return state.plan_review == nil and not state.busy end, "approval did not settle")
   assert(bytes(workspace .. "/src/change.rs") == compact .. "\n", "design approval changed project source")
@@ -764,7 +784,7 @@ local success, failure = xpcall(function()
   assert(state.presentation == nil, "Harness did not release its presentation")
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify
 assert(success and collected, failure or "declaration review host was not collected")

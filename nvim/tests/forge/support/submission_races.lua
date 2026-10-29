@@ -1,9 +1,9 @@
 return function(context)
   local state, controller, client = context.state, context.controller, context.client
   local input = require("forge.views.harness.input_state")
-  local original_request, original_receive = client.request_for, input.receive
+  local original_request, original_receive = client.request, input.receive
   local backend_errors = {}
-  local unsubscribe = client.subscribe(function(event, payload)
+  local unsubscribe = client.session_events_subscribe(function(event, payload)
     if event == "backend_event" and payload.kind == "error" then
       backend_errors[#backend_errors + 1] = payload.text
     end
@@ -20,7 +20,7 @@ return function(context)
     end, "submission did not settle")
   end
   local function exchanges()
-    return context.request("exchange.list", {})
+    return context.request("session.exchange.list", {})
   end
   local function assert_once(prompt)
     local count = 0
@@ -50,15 +50,19 @@ return function(context)
       local prompt = "Late acknowledgement after " .. outcome
       local held = context.mock.hold(state.session.id, "chat")
       local delayed, operation
-      client.request_for = function(session_id, method, parameters, callback)
-        if method == "input.apply" and parameters.action.kind == "submit" and not operation then
+      client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local parameters = request_specification.params or {}
+
+        if method == "session.input.apply" and parameters.action.kind == "submit" and not operation then
           operation = vim.deepcopy(parameters)
-          return original_request(session_id, method, parameters, function(...)
+          return original_request(request_specification, function(...)
             local arguments = { n = select("#", ...), ... }
             delayed = function() callback(unpack(arguments, 1, arguments.n)) end
           end)
         end
-        return original_request(session_id, method, parameters, callback)
+        return original_request(request_specification, callback)
       end
       context.compose_and_press(prompt, "<C-s>")
       assert(held:wait().prompt == prompt)
@@ -70,8 +74,8 @@ return function(context)
       elseif outcome == "cancel" then controller.cancel_turn() settled() end
       delayed()
       delayed()
-      client.request_for = original_request
-      context.request("input.apply", operation)
+      client.request = original_request
+      context.request("session.input.apply", operation)
       assert_once(prompt)
       assert(#state.queue == 0 and #state.pending_submit == 0 and #state.pending_steer == 0,
         "late or duplicate admission revived an accepted message")
@@ -87,23 +91,27 @@ return function(context)
       if owner == state and update.operation_id == lost_operation and lookups == 0 then return end
       return original_receive(owner, update)
     end
-    client.request_for = function(session_id, method, parameters, callback)
-      if method == "input.apply" and parameters.action.kind == "submit" then
+    client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local parameters = request_specification.params or {}
+
+      if method == "session.input.apply" and parameters.action.kind == "submit" then
         submissions = submissions + 1
         lost_operation = parameters.id
-        return original_request(session_id, method, parameters, function()
+        return original_request(request_specification, function()
           callback(nil, "Injected acknowledgement loss", { code = "outcome_unknown" })
         end)
-      elseif method == "input.operation" then
+      elseif method == "session.input.operation.get" then
         lookups = lookups + 1
       end
-      return original_request(session_id, method, parameters, callback)
+      return original_request(request_specification, callback)
     end
     context.compose_and_press("Recover a lost admission acknowledgement", "<C-s>")
     lost_hold:wait()
     await(function() return lookups == 1 and #state.input.pending == 0 end,
       "missing acknowledgement was not reconciled through the operation journal")
-    client.request_for, input.receive = original_request, original_receive
+    client.request, input.receive = original_request, original_receive
     assert(submissions == 1, "unknown delivery was resubmitted instead of reconciled")
     while #context.errors > prior_errors do
       assert(table.remove(context.errors):find("Injected acknowledgement loss", 1, true))
@@ -121,14 +129,18 @@ return function(context)
       end
       return original_receive(owner, update)
     end
-    client.request_for = function(session_id, method, parameters, callback)
-      if method == "input.get" and not delayed_snapshot then
-        return original_request(session_id, method, parameters, function(...)
+    client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local parameters = request_specification.params or {}
+
+      if method == "session.input.get" and not delayed_snapshot then
+        return original_request(request_specification, function(...)
           local arguments = { n = select("#", ...), ... }
           delayed_snapshot = function() callback(unpack(arguments, 1, arguments.n)) end
         end)
       end
-      return original_request(session_id, method, parameters, callback)
+      return original_request(request_specification, callback)
     end
     context.compose_and_press("Recover a missing input delta", "<C-s>")
     assert(held:wait().prompt == "Recover a missing input delta")
@@ -141,7 +153,7 @@ return function(context)
     await(function() return not state.busy end, "provider did not finish during snapshot recovery")
     await(function() return #state.input.confirmed == 0 end, "completed input did not leave the queue")
     local completed_revision = state.input.revision
-    client.request_for, input.receive = original_request, original_receive
+    client.request, input.receive = original_request, original_receive
     delayed_snapshot()
     assert(not state.input.refreshing and state.input.revision == completed_revision,
       "stale snapshot replaced a newer publication")
@@ -195,7 +207,7 @@ return function(context)
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Edited after turn completion" })
     controller.submit()
     assert(edited:wait().prompt == "Edited after turn completion")
-    local stale = context.request("input.apply", { id = "stale-reservation-commit", action = {
+    local stale = context.request("session.input.apply", { id = "stale-reservation-commit", action = {
       kind = "commit", reservation = reserved.reservation, edits = {
         { id = reserved.id, revision = reserved.revision, text = "Must never replace accepted text", attachments = {} },
       },
@@ -232,7 +244,7 @@ return function(context)
     local secondary_id = context.request("session.new", { name = "Independent submission lane" }).session.id
     local secondary = context.mock.hold(secondary_id, "chat")
     local secondary_finished, secondary_error
-    original_request(secondary_id, "prompt.submit", { text = "Independent secondary request" }, function(_, diagnostic)
+    original_request({ session_id = secondary_id, method = "session.prompt.submit", params = { text = "Independent secondary request" } }, function(_, diagnostic)
       secondary_finished, secondary_error = true, diagnostic
     end)
     assert(secondary:wait().prompt == "Independent secondary request")
@@ -249,7 +261,7 @@ return function(context)
     assert(#context.errors == previous_errors, table.concat(context.errors, "\n"))
     print("submission_races: late/duplicate/lost acknowledgements, cancellation, missing events, stale snapshots, failed retries, blocking, reservations, independent sessions passed")
   end, debug.traceback)
-  client.request_for, input.receive = original_request, original_receive
+  client.request, input.receive = original_request, original_receive
   unsubscribe()
   assert(success, failure)
 end

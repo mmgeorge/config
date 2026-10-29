@@ -26,7 +26,7 @@ end
 ---@param path string
 ---@return string
 local function normalize_path(path)
-  return vim.fs.normalize(tostring(path or "")):gsub("\\", "/"):gsub("/+$", "")
+  return (vim.fs.normalize(tostring(path or "")):gsub("\\", "/"):gsub("/+$", ""))
 end
 
 ---@param path string

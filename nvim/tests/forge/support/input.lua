@@ -9,10 +9,10 @@ function M.new(state)
     for index, message in ipairs(host.messages) do if message.id == id then return index end end
   end
   function host.request(method, parameters, callback)
-    if method == "input.get" then
+    if method == "session.input.get" then
       callback({ revision = host.revision, messages = vim.deepcopy(host.messages), suspended = false, execution_busy = false })
-    elseif method == "input.operation" then callback(host.operations[parameters.id])
-    elseif method == "input.apply" then
+    elseif method == "session.input.operation.get" then callback(host.operations[parameters.id])
+    elseif method == "session.input.apply" then
       host.requests[#host.requests + 1] = { parameters = parameters, callback = callback }
     else return false end
     return true

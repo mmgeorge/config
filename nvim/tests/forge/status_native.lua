@@ -22,7 +22,7 @@ local function metadata(target)
 end
 
 status._set_runner_for_test(function(method, params, callback)
-  assert(method == "status")
+  assert(method == "repository.status.document")
   requests[#requests + 1] = params.operation
   if params.operation == "open" then
     callback(fixture.snapshot(params.document))
@@ -39,7 +39,7 @@ status._set_runner_for_test(function(method, params, callback)
       callback(fixture.body(params.input.document, { "row 1" }, { more = true, block = "body1", target = "hunk:1" }))
     else
       callback({ document = params.input.document, file = 1, generation = 1, more = false, state = { state = "ready" },
-        syntax_diagnostic = "Syntax highlighting unavailable: MemoryLimit",
+        syntax_diagnostic = "Syntax highlighting unavailable: parser allocation failed",
         patch = { document = "body:1:1", base = 1, next = 2, base_rows = 1, next_rows = 2, base_blocks = 1, next_blocks = 2,
           text_edit = { { start_row = 1, removed_rows = 0, text = { "row 2" } } },
           block_edit = { { start_block = 1, removed_blocks = 0, inserted = { "body2" } } },
@@ -73,14 +73,17 @@ assert(require("forge.nodes").toggle_heading(state.replica, vim.api.nvim_get_cur
 status.demand(state)
 assert(vim.wait(3000, function() return deliveries == 2 and state.replica.row_count == 6 end, 5), "automatic demand continuation did not complete")
 assert(vim.deep_equal(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, true), { "main abc", "", "Unstaged changes (1):", "Modified source.txt", "row 1", "row 2" }))
-assert(#notices == 0, table.concat(notices, "\n"))
+assert(#notices == 1 and notices[1] == "Syntax highlighting unavailable: parser allocation failed",
+  "Status failed to report its syntax failure while retaining the usable view: " .. table.concat(notices, "\n"))
 assert(not vim.wo.number and vim.wo.wrap and vim.wo.conceallevel == 0 and vim.wo.foldcolumn == "0")
 assert(vim.wo.statuscolumn == "", "Status retained a continuation-line margin")
 assert(require("forge.width").capture(0).columns == vim.api.nvim_win_get_width(0),
   "Status projected rows one column narrower than the legacy view")
 local ordinary = vim.api.nvim_create_buf(true, false)
 vim.api.nvim_win_set_buf(0, ordinary)
-assert(vim.wo.number and not vim.wo.wrap and vim.wo.conceallevel == 2 and vim.wo.foldcolumn == "1", "Status window options leaked into the next buffer")
+assert(vim.wo.number and not vim.wo.wrap and vim.wo.conceallevel == 2 and vim.wo.foldcolumn == "1",
+  "Status window options leaked into the next buffer: " .. vim.inspect({ number = vim.wo.number,
+    wrap = vim.wo.wrap, conceallevel = vim.wo.conceallevel, foldcolumn = vim.wo.foldcolumn }))
 vim.api.nvim_win_set_buf(0, state.replica.buffer)
 status.demand(state)
 assert(vim.wait(1000, function() return not vim.wo.number end))
@@ -141,7 +144,9 @@ config.options.status_open_target = original_open_target
 vim.api.nvim_win_set_buf(status_window, state.replica.buffer)
 status.close(state)
 assert(not state.active and state.replica.status == "Closed")
-assert(vim.wo.number and not vim.wo.wrap and vim.wo.conceallevel == 2 and vim.wo.foldcolumn == "1", "Status close did not restore window presentation")
+assert(vim.wo.number and not vim.wo.wrap and vim.wo.conceallevel == 2 and vim.wo.foldcolumn == "1",
+  "Status close did not restore window presentation: " .. vim.inspect({ number = vim.wo.number,
+    wrap = vim.wo.wrap, conceallevel = vim.wo.conceallevel, foldcolumn = vim.wo.foldcolumn }))
 assert(vim.wait(1000, function() return requests[#requests] == "close" end, 5))
 local source_buffer = vim.api.nvim_get_current_buf()
 vim.bo[source_buffer].buflisted = false

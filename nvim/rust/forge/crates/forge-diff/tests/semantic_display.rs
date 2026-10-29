@@ -327,8 +327,10 @@ async fn structural_gaps_preserve_syntax_and_source_coordinates_across_delivery_
                         0,
                         row,
                         cursor().group(row.group_index).unwrap(),
-                        Some(&old),
-                        Some(&new),
+                        forge_diff::projection::RowSyntax {
+                            old: Some(&old),
+                            new: Some(&new),
+                        },
                         None,
                         0,
                     )

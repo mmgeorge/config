@@ -10,7 +10,7 @@ local function notify(message, level)
 end
 
 ---@param url string
----@return {hostname:string, owner:string, name:string}?, string?
+---@return {hostname:string, owner:string, name:string}?, integer?
 local function parse_issue_url(url)
   local hostname, owner, name, number = url:match("^https?://([^/]+)/([^/]+)/([^/]+)/issues/(%d+)")
   if hostname and owner and name and number then

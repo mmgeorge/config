@@ -15,10 +15,12 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio::time::{Instant, timeout};
 
-use crate::router::{HostRouter, RoutedMethod, validate_initialize};
+use crate::router::{HostRouter, validate_initialize};
 use crate::runtime::{ForgeRuntime, SHUTDOWN_DEADLINE};
 const WRITER_STOP_DEADLINE: Duration = Duration::from_millis(100);
 const RESERVED_CONTROL_REQUESTS: usize = 4;
+
+mod preparation;
 
 struct RequestAdmission {
     ordinary: Arc<Semaphore>,
@@ -39,19 +41,9 @@ impl RequestAdmission {
         &self,
         method: &str,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
-        let control = matches!(
-            method,
-            "initialize"
-                | "harness.initialize"
-                | "trace.configure"
-                | "turn.cancel"
-                | "turn.restart"
-                | "task.transition"
-                | "task.operation"
-                | "health.get"
-                | "approval.resolve"
-                | "shutdown"
-        );
+        let control = forge_protocol::contract::method_policy(method).is_some_and(|policy| {
+            policy.admission == forge_protocol::method_policy::Admission::Control
+        });
         if control {
             Arc::clone(&self.control)
                 .try_acquire_owned()
@@ -72,6 +64,15 @@ pub(crate) struct RoutedRequestEnvelope {
     pub(crate) session_id: Option<String>,
     #[serde(flatten)]
     pub(crate) request: Request,
+}
+
+impl RoutedRequestEnvelope {
+    pub(crate) fn validate_context(&self) -> Result<()> {
+        forge_protocol::contract::method_policy(&self.request.method)
+            .context("unknown Forge method")?
+            .validate_session(self.session_id.as_deref())
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 /// Retains request tasks and their IDs until completion, including after a drain timeout.
@@ -227,7 +228,7 @@ impl ConnectionHost {
         let initialize: RoutedRequestEnvelope =
             serde_json::from_slice(&initialize_line).context("decode Forge initialize request")?;
         ensure!(
-            initialize.request.method == "initialize",
+            initialize.request.method == "host.initialize",
             "first Forge request must initialize the host"
         );
         let initialize_id = initialize.request.id;
@@ -242,7 +243,7 @@ impl ConnectionHost {
             .params
             .get("status_ignored_directory")
             .cloned();
-        let mut response = handshake_response(initialize.request)?;
+        let mut response = handshake_response(initialize)?;
         if response.error().is_none()
             && let Some(directory) = recovery_directory.filter(|value| !value.is_null())
         {
@@ -309,14 +310,17 @@ impl ConnectionHost {
             return Ok(());
         }
 
-        let (sink, stream) = outbound::channel();
-        sink.send(Message::Response(response))?;
         let credit = Arc::new(ReceiveCredit::default());
+        let handshake = outbound::encode(
+            &Message::Response(response),
+            forge_protocol::MAX_FRAME_BYTES,
+        )?;
+        let (sink, stream) = outbound::channel();
         let writer_credit = Arc::clone(&credit);
         let (writer_stop, stopped) = oneshot::channel();
         let mut writer = tokio::spawn(async move {
             tokio::select! {
-                result = write_messages(output, stream, writer_credit) => result,
+                result = write_messages(output, stream, writer_credit, handshake) => result,
                 _ = stopped => anyhow::bail!("Forge writer stopped before output drained"),
             }
         });
@@ -349,6 +353,7 @@ impl ConnectionHost {
         sink: &MessageSender,
     ) -> Result<Option<u64>> {
         let admission = RequestAdmission::new();
+        let preparation_order = Arc::new(preparation::PreparationOrder::default());
         loop {
             let line = tokio::select! {
                 error = sink.failed() => return Err(error.into()),
@@ -373,7 +378,19 @@ impl ConnectionHost {
                     continue;
                 }
             };
-            if envelope.request.method == "transport.consumed" {
+            if matches!(
+                envelope.request.method.as_str(),
+                "host.transport.consumed" | "host.shutdown"
+            ) && let Err(error) = envelope.validate_context()
+            {
+                sink.send_control(Message::Response(Response::failure(
+                    envelope.request.id,
+                    "invalid_request",
+                    format!("{error:#}"),
+                )))?;
+                continue;
+            }
+            if envelope.request.method == "host.transport.consumed" {
                 connection
                     .credit
                     .grant(serde_json::from_value::<Consumption>(
@@ -398,31 +415,26 @@ impl ConnectionHost {
                     continue;
                 }
             };
-            let method = match self.router.prepare(&mut envelope).await {
-                Ok(method) => method,
-                Err(error) => {
-                    let code = if error.is::<forge_harness::broker::RequestNotAdmitted>() {
-                        "not_admitted"
-                    } else {
-                        "request_failed"
-                    };
-                    sink.send(Message::Response(Response::failure(
-                        envelope.request.id,
-                        code,
-                        forge_harness::storage::error_message(&error),
-                    )))?;
-                    continue;
-                }
-            };
-            if matches!(method, RoutedMethod::Shutdown) {
+            if envelope.request.method == "host.shutdown" {
                 return Ok(Some(envelope.request.id));
             }
             let router = Arc::clone(&self.router);
             let sink = sink.clone();
+            let preparation_turn = preparation_order.reserve(&envelope)?;
             self.requests.spawn(envelope.request.id, async move {
                 let _permit = permit;
                 let request_id = envelope.request.id;
-                if let Err(error) = router.route(envelope, method, &sink).await {
+                let outcome = async {
+                    if let Some(turn) = &preparation_turn {
+                        turn.wait().await;
+                    }
+                    let prepared = router.prepare(&mut envelope).await;
+                    drop(preparation_turn);
+                    let method = prepared?;
+                    router.route(envelope, method, &sink).await
+                }
+                .await;
+                if let Err(error) = outcome {
                     let code = if error.is::<forge_harness::broker::RequestNotAdmitted>() {
                         "not_admitted"
                     } else {
@@ -632,7 +644,15 @@ pub(crate) async fn run_nvim(runtime: Arc<ForgeRuntime>) -> NvimRunOutcome {
     )
 }
 
-fn handshake_response(request: Request) -> Result<Response> {
+fn handshake_response(envelope: RoutedRequestEnvelope) -> Result<Response> {
+    if let Err(error) = envelope.validate_context() {
+        return Ok(Response::failure(
+            envelope.request.id,
+            "invalid_request",
+            format!("{error:#}"),
+        ));
+    }
+    let request = envelope.request;
     if request
         .params
         .get("protocol_version")
@@ -674,8 +694,9 @@ fn complete_request(state: &mut RequestTaskState, outcome: TaskOutcome) -> Resul
 
 fn grant_credit(credit: &ReceiveCredit, line: &[u8]) -> Result<()> {
     let envelope: RoutedRequestEnvelope = serde_json::from_slice(line)?;
+    envelope.validate_context()?;
     ensure!(
-        envelope.request.method == "transport.consumed",
+        envelope.request.method == "host.transport.consumed",
         "request arrived after shutdown"
     );
     credit.grant(serde_json::from_value::<Consumption>(
@@ -688,11 +709,11 @@ async fn write_messages<Output: AsyncWrite + Unpin>(
     mut output: Output,
     mut stream: MessageReceiver,
     credit: Arc<ReceiveCredit>,
+    handshake: Vec<u8>,
 ) -> Result<()> {
+    write_frame(&mut output, &credit, &handshake).await?;
     while let Some(frame) = stream.recv().await? {
-        credit.reserve(frame.bytes().len()).await?;
-        output.write_all(frame.bytes()).await?;
-        output.flush().await.context("flush Forge output")?;
+        write_frame(&mut output, &credit, frame.bytes()).await?;
         if frame.is_terminal() {
             break;
         }
@@ -700,29 +721,104 @@ async fn write_messages<Output: AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn write_frame<Output: AsyncWrite + Unpin>(
+    output: &mut Output,
+    credit: &ReceiveCredit,
+    frame: &[u8],
+) -> Result<()> {
+    credit.reserve(frame.len()).await?;
+    output.write_all(frame).await?;
+    output.flush().await.context("flush Forge output")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn handshake_rejects_session_context() {
+        let envelope = serde_json::from_value(json!({
+            "id":1,"method":"host.initialize","session_id":"session",
+            "params":{"protocol_version":forge_protocol::WIRE_VERSION}
+        }))
+        .unwrap();
+        let response = handshake_response(envelope).unwrap();
+        assert!(response.error().is_some());
+    }
+
+    #[tokio::test]
+    async fn control_frames_reject_session_context_without_stopping_the_host() {
+        use tokio::io::AsyncBufReadExt;
+
+        let host = ConnectionHost::new(Arc::new(ForgeRuntime::new().unwrap()));
+        let (client, server) = tokio::io::duplex(4096);
+        let (input, output) = tokio::io::split(server);
+        let running = tokio::spawn(async move { host.run(input, output).await });
+        let mut client = BufReader::new(client);
+        let initialize = json!({"id":1,"method":"host.initialize","params":{"protocol_version":forge_protocol::WIRE_VERSION}});
+        client
+            .get_mut()
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_line(&mut response).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["id"], 1);
+        for (id, method, params) in [
+            (2, "host.transport.consumed", json!({"bytes":0,"frames":0})),
+            (3, "host.shutdown", json!({})),
+        ] {
+            let request = json!({"id":id,"method":method,"session_id":"session","params":params});
+            client
+                .get_mut()
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            response.clear();
+            timeout(Duration::from_secs(1), client.read_line(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            let rejected: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(rejected["id"], id);
+            assert_eq!(rejected["error"]["code"], "invalid_request");
+        }
+        client
+            .get_mut()
+            .write_all(b"{\"id\":4,\"method\":\"host.shutdown\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        response.clear();
+        timeout(Duration::from_secs(1), client.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["result"]["shutdown"],
+            true
+        );
+        running.await.unwrap().unwrap();
+    }
+
+    #[test]
     fn control_requests_share_spare_capacity_and_survive_ordinary_saturation() {
         let admission = RequestAdmission::new();
         let ordinary: Vec<_> = (0..forge_protocol::MAX_ACTIVE_REQUESTS - RESERVED_CONTROL_REQUESTS)
-            .map(|_| admission.acquire("state.get").unwrap())
+            .map(|_| admission.acquire("session.state.get").unwrap())
             .collect();
-        assert!(admission.acquire("state.get").is_err());
+        assert!(admission.acquire("session.state.get").is_err());
         let control: Vec<_> = [
-            "health.get",
-            "task.operation",
-            "turn.cancel",
-            "approval.resolve",
+            "session.health.get",
+            "session.command.operation.get",
+            "session.turn.cancel",
+            "session.approval.resolve",
         ]
         .map(|method| admission.acquire(method).unwrap())
         .into();
-        assert!(admission.acquire("shutdown").is_err());
+        assert!(admission.acquire("host.shutdown").is_err());
         drop(ordinary);
-        let additional = admission.acquire("task.transition").unwrap();
-        assert!(admission.acquire("state.get").is_ok());
+        let additional = admission.acquire("session.command.apply").unwrap();
+        assert!(admission.acquire("session.state.get").is_ok());
         drop(additional);
         drop(control);
         assert_eq!(
@@ -790,7 +886,7 @@ mod tests {
         let host = ConnectionHost::new(Arc::clone(&runtime));
         let (mut sender, input) = tokio::io::duplex(1024);
         let (output, _unread) = tokio::io::duplex(1);
-        sender.write_all(format!("{{\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocol_version\":{}}}}}\n", forge_protocol::WIRE_VERSION).as_bytes()).await.unwrap();
+        sender.write_all(format!("{{\"id\":1,\"method\":\"host.initialize\",\"params\":{{\"protocol_version\":{}}}}}\n", forge_protocol::WIRE_VERSION).as_bytes()).await.unwrap();
         drop(sender);
         let failure = timeout(Duration::from_secs(3), host.run(input, output))
             .await
@@ -816,7 +912,7 @@ mod tests {
         let running = tokio::spawn(async move { host.run(input, output).await });
         let mut client = BufReader::new(client);
         client.get_mut().write_all(format!(
-            "{{\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocol_version\":{}}}}}\n{{\"id\":2,\"method\":\"state.get\",\"params\":{{}}}}\n",
+            "{{\"id\":1,\"method\":\"host.initialize\",\"params\":{{\"protocol_version\":{}}}}}\n{{\"id\":2,\"method\":\"session.state.get\",\"params\":{{}}}}\n",
             forge_protocol::WIRE_VERSION,
         ).as_bytes()).await.unwrap();
         for expected in [1, 2] {
@@ -847,6 +943,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waiting_preparation_does_not_block_an_independent_request() {
+        use tokio::io::AsyncBufReadExt;
+
+        let runtime = Arc::new(ForgeRuntime::new().unwrap());
+        let host = ConnectionHost::new(runtime);
+        let (arrived, waiting) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        *host.router.preparation_hold.lock().unwrap() = Some(crate::router::PreparationHold {
+            request_id: 2,
+            arrived,
+            released,
+        });
+        let (client, server) = tokio::io::duplex(8192);
+        let (input, output) = tokio::io::split(server);
+        let running = tokio::spawn(async move { host.run(input, output).await });
+        let mut client = BufReader::new(client);
+        let initialize = serde_json::json!({"id":1,"method":"host.initialize","params":{"protocol_version":forge_protocol::WIRE_VERSION}});
+        client
+            .get_mut()
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_line(&mut response).await.unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&response)
+                .unwrap()
+                .get("error")
+                .is_none()
+        );
+        client
+            .get_mut()
+            .write_all(b"{\"id\":2,\"method\":\"repository.revision.list\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .get_mut()
+            .write_all(b"{\"id\":3,\"method\":\"repository.revision.list\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        response.clear();
+        timeout(Duration::from_secs(1), client.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["id"], 3);
+        release.send(()).unwrap();
+        response.clear();
+        timeout(Duration::from_secs(1), client.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["id"], 2);
+        client.get_mut().shutdown().await.unwrap();
+        timeout(Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn terminal_shutdown_waits_for_all_connection_requests() {
         use tokio::io::AsyncBufReadExt;
 
@@ -866,19 +1028,22 @@ mod tests {
         let (input, output) = tokio::io::split(server);
         let running = tokio::spawn(async move { host.run(input, output).await });
         let mut client = BufReader::new(client);
-        client.get_mut().write_all(format!("{{\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocol_version\":{}}}}}\n", forge_protocol::WIRE_VERSION).as_bytes()).await.unwrap();
+        client.get_mut().write_all(format!("{{\"id\":1,\"method\":\"host.initialize\",\"params\":{{\"protocol_version\":{}}}}}\n", forge_protocol::WIRE_VERSION).as_bytes()).await.unwrap();
         let mut response = Vec::new();
         client.read_until(b'\n', &mut response).await.unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&response).unwrap()["id"], 1);
         client
             .get_mut()
-            .write_all(b"{\"id\":8,\"method\":\"shutdown\",\"params\":{}}\n")
+            .write_all(b"{\"id\":8,\"method\":\"host.shutdown\",\"params\":{}}\n")
             .await
             .unwrap();
         timeout(Duration::from_secs(1), async {
             while runtime
                 .harness
-                .prepare(None, forge_harness::protocol::HarnessMethod::StateGet)
+                .prepare(
+                    None,
+                    forge_harness::protocol::RuntimeMethod::SessionStateGet,
+                )
                 .await
                 .is_ok()
             {

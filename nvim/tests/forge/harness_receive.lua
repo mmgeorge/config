@@ -8,7 +8,7 @@ local event_count, result, failure
 local ok, error_message = xpcall(function()
   require("forge").setup({ harness = { backend = "mock" }, harness_logging = false })
   builder.ensure = function(callback) callback({ ok = true, path = "injected-forge" }) end
-  client._set_launcher_for_test(function(_, options, on_exit)
+  client._host_set_launcher_for_test(function(_, options, on_exit)
     local published, acknowledged_frames, acknowledged_bytes = {}, 0, 0
     local function emit(message)
       local encoded = vim.json.encode(message) .. "\n"
@@ -18,7 +18,7 @@ local ok, error_message = xpcall(function()
     return {
       write = function(_, payload)
         local request = vim.json.decode(payload)
-        if request.method == "transport.consumed" then
+        if request.method == "host.transport.consumed" then
           assert(request.params.frames > acknowledged_frames and request.params.frames <= #published)
           for index = acknowledged_frames + 1, request.params.frames do
             acknowledged_bytes = acknowledged_bytes + published[index]
@@ -27,11 +27,11 @@ local ok, error_message = xpcall(function()
           assert(request.params.bytes == acknowledged_bytes, "client credit byte total differs")
           return
         end
-        if request.method == "initialize" then
+        if request.method == "host.initialize" then
           emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
-        elseif request.method == "harness.initialize" then
+        elseif request.method == "session.initialize" then
           emit({ id = request.id, result = { session = { id = "receive-test" } } })
-        elseif request.method == "trace.configure" then
+        elseif request.method == "host.trace.configure" then
           emit({ id = request.id, result = { enabled = request.params.enabled } })
         elseif request.method == "receive.test" then
           for sequence = 1, 40 do
@@ -41,22 +41,22 @@ local ok, error_message = xpcall(function()
           options.stderr(nil, string.rep("x", 100000))
           assert(#client._client.stderr == 65536)
           on_exit({ code = 0 })
-        elseif request.method ~= "shutdown" then error("unexpected method: " .. request.method) end
+        elseif request.method ~= "host.shutdown" then error("unexpected method: " .. request.method) end
       end,
       kill = function() end,
     }
   end)
   local started = false
-  client.start_harness(function(_, start_error) assert(not start_error, start_error) started = true end)
+  client.session_initialize(function(_, start_error) assert(not start_error, start_error) started = true end)
   assert(vim.wait(1000, function() return started end, 1))
   event_count = 0
-  client.subscribe(function(event, payload)
+  client.session_events_subscribe(function(event, payload)
     if event == "exchange_updated" then
       event_count = event_count + 1
       assert(payload.sequence == event_count)
     end
   end)
-  client.request_for("receive-test", "receive.test", {}, function(value, request_error)
+  client.request({ session_id = "receive-test", method = "receive.test", params = {} }, function(value, request_error)
     result, failure = value, request_error
     assert(event_count == 40, "response overtook earlier events")
   end)
@@ -69,7 +69,7 @@ local ok, error_message = xpcall(function()
 end, debug.traceback)
 
 builder.ensure = original_ensure
-client._reset_for_test()
+client._host_reset_for_test()
 if not ok then
   vim.api.nvim_err_writeln(error_message)
   vim.cmd("cquit 1")

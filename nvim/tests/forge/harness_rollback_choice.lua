@@ -10,10 +10,13 @@ local history = {
 }
 local recovery = { pending = false }
 local requests, shown = {}, nil
-client.request_for = function(_, method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   requests[#requests + 1] = { method = method, params = params }
-  if method == "exchange.recovery" and not params.action then callback(recovery)
-  elseif method == "exchange.list" then callback(history) end
+  if method == "session.exchange.recovery" and not params.action then callback(recovery)
+  elseif method == "session.exchange.list" then callback(history) end
 end
 require("forge.views.picker").open = function(options) shown = options end
 local function choose(value)
@@ -34,7 +37,7 @@ assert(#requests == count, "cancelling sent a rollback request")
 controller.open_undo_picker()
 choose(history[2])
 choose("conversation")
-assert(requests[#requests].method == "task.transition", "conversation rollback must collect active execution")
+assert(requests[#requests].method == "session.command.apply", "conversation rollback must collect active execution")
 assert(requests[#requests].params.action == "undo")
 assert(requests[#requests].params.rollback.scope == "conversation")
 assert(requests[#requests].params.rollback.exchange_id == "second"
@@ -47,7 +50,7 @@ controller.open_undo_picker()
 choose(history[2])
 assert(#shown.page_list[1].option_list == 3, "checkpointed interactions must offer both rollback scopes")
 choose("workspace")
-assert(requests[#requests].method == "exchange.rollback.prepare", "file rollback must retain its restore preview")
+assert(requests[#requests].method == "session.exchange.rollback.prepare", "file rollback must retain its restore preview")
 recovery = { pending = true }
 controller.open_undo_picker()
 assert(shown.page_list[1].title == "Harness restore", "unfinished file restoration must require recovery")

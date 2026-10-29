@@ -688,7 +688,7 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(exchange.tools().map(|(_, tool)| tool).count(), 4);
+        assert_eq!(exchange.tools().count(), 4);
         let rendered = crate::buffer::projection::project(
             ProjectionSource::Exchange(&exchange),
             &forge_buffer::width::WidthProfile::default(),

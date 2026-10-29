@@ -18,7 +18,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 package.loaded["forge.views.plan_review"] = require("forge.views.plan_review.native_controller")
 local controller = require("forge.views.harness.controller")
@@ -34,7 +34,9 @@ local success, failure = xpcall(function()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan build the feature" })
   controller.submit()
-  await(function() return not state.busy and state.active_plan end, "mock plan did not arrive")
+  await(function() return not state.busy and state.active_plan
+    and state.active_plan.state == "awaiting_review" and state.active_plan.model_revision > 0 end,
+    "mock plan did not reach review")
   local plan = state.active_plan
   local canonical = vim.fn.readfile(plan.working_path, "b")
   local submitted_revision = plan.model_revision
@@ -53,7 +55,7 @@ local success, failure = xpcall(function()
   assert(rendered:find("src/change.rs", 1, true) and rendered:find("requested_change", 1, true))
   local owner, window, tab = review.owner, review.win, review.tab
   local trace_status
-  client.request_for(review.session_id, "trace.configure", { enabled = true }, function(result, failure)
+  client.request({ session_id = review.session_id, method = "host.trace.configure", params = { enabled = true } }, function(result, failure)
     assert(not failure, failure)
     trace_status = result
   end)
@@ -79,7 +81,7 @@ local success, failure = xpcall(function()
   canonical = vim.fn.readfile(plan.working_path, "b")
   assert(table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("reviewed_change", 1, true))
   local trace_path
-  client.request_for(review.session_id, "trace.status", {}, function(result, failure)
+  client.request({ session_id = review.session_id, method = "host.trace.status", params = {} }, function(result, failure)
     assert(not failure, failure)
     trace_path = result.path
   end)
@@ -87,7 +89,7 @@ local success, failure = xpcall(function()
   local phases, operation_id = {}, nil
   for _, line in ipairs(vim.fn.readfile(trace_path)) do
     local record = vim.json.decode(line)
-    if record.event == "plan.edit" and record.payload.method == "plan.entity.rename" then
+    if record.event == "plan.edit" and record.payload.method == "session.plan.entity.rename" then
       local payload = record.payload
       operation_id = operation_id or payload.operation_id
       assert(payload.operation_id == operation_id, "edit trace lost request correlation")
@@ -137,11 +139,25 @@ local success, failure = xpcall(function()
   await(function() return state.plan_review and state.plan_review.owner.ready end, "saved review did not reopen")
   review = state.plan_review
   assert(comments.capture(review.buf)[1].source.body == literal .. "\nsecond line\n")
-  local original_request = client.request_for
+  local source_session = state.session.id
+  vim.api.nvim_win_set_cursor(review.win, { 1, 0 })
+  review.owner.action("question", function(result, failure) assert(result and not failure, failure) end)
+  vim.cmd("stopinsert")
+  local question_row = vim.api.nvim_win_get_cursor(review.win)[1] - 1
+  vim.api.nvim_buf_set_lines(review.buf, question_row, question_row + 1, false, { "Why does this change preserve ownership?" })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = review.buf })
+  vim.cmd("write")
+  await(function() return not review.owner.saving and next(review.owner.reply_by_id) ~= nil end, "review question did not receive its forked answer")
+  assert(state.session.id == source_session, "review answer replaced the source session")
+  local original_request = client.request
   local submitted_capture
-  client.request_for = function(session_id, method, params, callback)
-    if method == "plan.acceptance.begin" then submitted_capture = vim.deepcopy(params) end
-    return original_request(session_id, method, params, callback)
+  client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.plan.acceptance.begin" then submitted_capture = vim.deepcopy(params) end
+    return original_request(request_specification, callback)
   end
   review.owner.saving = true
   review.command_set.action_by_id.accept.run({})
@@ -154,22 +170,26 @@ local success, failure = xpcall(function()
   decision_mapping()
   assert(review.owner.pending_operation and not submitted_capture)
   local original_document = review.owner.document
-  local original_generation = client.host_generation()
-  client.stop()
+  local original_generation = client.host_get_generation()
+  client.host_stop()
   assert(vim.wait(5000, function() return client._client.process == nil end, 10), "old plan host was not collected")
   local restarted
-  client.start_harness(function(snapshot, failure)
+  client.session_initialize(function(snapshot, failure)
     assert(not failure, failure)
     controller.activate_snapshot(snapshot)
     restarted = true
   end)
   await(function() return restarted and state.presentation and state.presentation.ready end,
     "replacement plan host did not initialize")
-  assert(client.host_generation() ~= original_generation)
+  assert(client.host_get_generation() ~= original_generation)
   require("forge.views.plan_review").open(plan)
   await(function() return submitted_capture ~= nil end, "queued acceptance did not resume after document recovery")
   assert(submitted_capture.review.document ~= original_document)
-  assert(submitted_capture.draft_annotation[1].source.body == literal .. "\nsecond line\n")
+  local retained_comment = false
+  for _, annotation in ipairs(submitted_capture.draft_annotation) do
+    retained_comment = retained_comment or annotation.source.body == literal .. "\nsecond line\n"
+  end
+  assert(retained_comment, "acceptance lost the saved comment")
   await(function() return not state.plan_review and not state.busy end, "plan acceptance did not settle")
   await(function() return state.active_plan and state.active_plan.model_revision == submitted_revision + 1 and not state.busy end,
     "final acceptance did not publish the reviewed draft")
@@ -178,12 +198,13 @@ local success, failure = xpcall(function()
   assert(vim.fn.filereadable(revision_directory .. ("/submitted-%04d.json"):format(submitted_revision + 2)) == 0,
     "final acceptance created more than one review revision")
   assert(vim.deep_equal(vim.fn.readfile(submitted_path, "b"), submitted_content), "acceptance overwrote the original revision")
-  client.request_for = original_request
+  client.request = original_request
   assert(vim.deep_equal(vim.fn.readfile(plan.working_path, "b"), canonical))
   require("forge.views.harness.workspace").release(state)
   assert(state.presentation.close())
 end, debug.traceback)
-client.stop()
+require("forge.views.harness.workspace").release(state)
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

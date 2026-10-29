@@ -81,11 +81,11 @@ pub(super) async fn apply_command(
     receipt = store
         .load_task_operation(session_id, &command.operation_id)?
         .context("session command receipt is missing")?;
-    if command.action.admits_entry() {
-        let update = controller
-            .coordinator
-            .submissions
-            .suspend(false, Some(&receipt.id))?;
+    if command.action.admits_entry() || matches!(command.action, SessionAction::Pause) {
+        let update = controller.coordinator.submissions.suspend(
+            matches!(command.action, SessionAction::Pause),
+            Some(&receipt.id),
+        )?;
         controller.publish_input(update, sink).await?;
     }
     let active_elicitation =

@@ -19,7 +19,7 @@ local function selected_rows(session)
     rows[index] = text
     local node = location and session.sequence.node[location.block]
     local concealed = {}
-    if node and vim.wo.conceallevel > 0 and vim.wo.concealcursor:find("v", 1, true) then
+    if location and node and vim.wo.conceallevel > 0 and vim.wo.concealcursor:find("v", 1, true) then
       for _, conceal in ipairs(node.entry.metadata.conceal or {}) do
         if conceal.range.start.row == location.position.row and conceal.range["end"].row == location.position.row then
           concealed[#concealed + 1] = conceal
@@ -54,9 +54,9 @@ local function selected_rows(session)
     else
       rows[index] = visible_text(0, #text)
     end
-    local content = node and location.position.row == 0 and node.entry.metadata.layout
-    local marker = content and require("forge.content_layout").marker(node.entry)
-    if marker and marker ~= vim.NIL and content.indent > 2 then
+    local content = location and node and location.position.row == 0 and node.entry.metadata.layout
+    local marker = content and node and require("forge.content_layout").marker(node.entry)
+    if content and marker and marker ~= vim.NIL and content.indent > 2 then
       local column = content.indent - 4
       rows[index] = rows[index]:sub(1, column) .. marker.text
         .. rows[index]:sub(column + vim.fn.strdisplaywidth(marker.text) + 1)

@@ -100,7 +100,7 @@ function M.client()
     end))
   end)
   if not ok then
-    pcall(vim.api.nvim_err_writeln, "forge.commit (client): " .. tostring(err))
+    pcall(vim.api.nvim_echo, { { "forge.commit (client): " .. tostring(err), "ErrorMsg" } }, true, { err = true })
     vim.cmd("cq")
   end
 end

@@ -20,7 +20,10 @@ local exchange = {
 }
 state.agent = { run = { child }, exchange = { exchange } }
 local calls, reply = {}, nil
-client.request = function(method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   calls[#calls + 1] = { method = method, params = params }
   reply = callback
 end
@@ -28,7 +31,7 @@ local function draft(text) vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1,
 local function text() return vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] end
 draft("review the boundary")
 controller.submit()
-assert(#calls == 1 and calls[1].method == "turn.steer")
+assert(#calls == 1 and calls[1].method == "session.turn.steer")
 assert(calls[1].params.target.thread_id == "thread" and calls[1].params.target.turn_id == "turn")
 assert(text() == "review the boundary", "draft cleared before steering acknowledgement")
 reply(nil, "turn already completed")

@@ -82,7 +82,10 @@ state.timeline = {}
 state.agent = { definition = {}, run = {}, turn = {} }
 
 local deleted_session_id = nil
-client.request = function(method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   if method == "session.list" then
     local result = vim.tbl_filter(function(entry)
       return entry.id ~= deleted_session_id and (params.scope == "all" or entry.workspace == workspace)
@@ -103,7 +106,7 @@ client.request = function(method, params, callback)
     return
   end
 
-  if method == "backend.models" then
+  if method == "session.provider.model.list" then
     callback({})
     return
   end

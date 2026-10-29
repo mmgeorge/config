@@ -8,7 +8,8 @@ M.VERSION = contract.version
 ---@param session_id? string
 ---@return string
 function M.encode_request(id, method, params, session_id)
-  return vim.json.encode({ id = id, method = method, params = params or {}, session_id = session_id }) .. "\n"
+  if params == nil or next(params) == nil then params = vim.empty_dict() end
+  return vim.json.encode({ id = id, method = method, params = params, session_id = session_id }) .. "\n"
 end
 
 ---@param line string

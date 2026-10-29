@@ -161,8 +161,7 @@ return {
             {
               function()
                 local message = require("noice").api.status.message.get()
-                local message_lem = #message
-                local newline = string.find(message, "\n")
+                local message_length = #message
 
                 -- Trim the message to a single line
                 if message then
@@ -180,7 +179,7 @@ return {
                   message = message:sub(1, #message - 1)
                 end
 
-                if #message ~= message_len then
+                if #message ~= message_length then
                   message = message .. "..."
                 end
 

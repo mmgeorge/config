@@ -12,6 +12,7 @@ local dispatch_lifecycle
 local load_actor
 ---@class ForgeReviewSave
 ---@field text table<string, string> Native field values accepted by the latest save action.
+---@field capture? table[]
 ---@type table<string, table>
 local retained = {}
 local CACHE_LIMIT = 8
@@ -48,7 +49,7 @@ local function retain(state)
 end
 
 local function request(state, method, params, callback)
-  local generation = require("forge.client").host_generation()
+  local generation = require("forge.client").host_get_generation()
   local started = vim.uv.hrtime()
   log.write("pr.request", { load_id = state.load_id, document = state.document, method = method })
   local delivered = false
@@ -60,22 +61,22 @@ local function request(state, method, params, callback)
       log.write("pr.response", { load_id = state.load_id, document = state.document, method = method,
         elapsed_us = math.floor((received - started) / 1000), schedule_us = math.floor((vim.uv.hrtime() - received) / 1000),
         failed = failure ~= nil, timing = type(result) == "table" and result.timing or nil })
-      if generation ~= require("forge.client").host_generation() then
+      if generation ~= require("forge.client").host_get_generation() then
         if state.generation and state.generation ~= generation then return end
         state.host_lost = true
         callback(nil, "Review host changed before response delivery. Local drafts remain in this buffer.")
         return
       end
       local current = state.active and (state.shown or not state.is_current or state.is_current())
-      if not current and method ~= "review.close" then
+      if not current and method ~= "github.review.document.close" then
         if state.active then finish_close(state) end
-        if (method == "review.open_pr" or method == "review.open")
+        if (method == "github.review.document.open" or method == "github.review.document.open")
           and type(result) == "table" and type(result.document) == "string" and result.document ~= state.document then
-          request(state, "review.close", { document = result.document }, function() end)
+          request(state, "github.review.document.close", { document = result.document }, function() end)
         end
         return
       end
-      if method ~= "review.close" and not state.explicit_repository
+      if method ~= "github.review.document.close" and not state.explicit_repository
         and require("github.repo_cache").hostname() ~= state.hostname then
         callback(nil, "GitHub hostname changed during review request")
       else callback(result, failure) end
@@ -83,7 +84,7 @@ local function request(state, method, params, callback)
   end
   local ok, failure = pcall(function()
     if runner_for_test then runner_for_test(method, params, receive)
-    else require("forge.client").request_host(method, params, receive) end
+    else require("forge.client").request({ method = method, params = params }, receive) end
   end)
   if not ok then receive(nil, tostring(failure)) end
 end
@@ -100,8 +101,8 @@ local function revalidate(state, initial)
     if pending == 0 then state.revalidating = false M.refresh(state) end
   end
   local params = { document = state.document, directory = state.directory }
-  request(state, "review.header", vim.tbl_extend("force", params, { initial = initial }), complete)
-  request(state, "review.load", params, complete)
+  request(state, "github.review.document.header.load", vim.tbl_extend("force", params, { initial = initial }), complete)
+  request(state, "github.review.document.load", params, complete)
 end
 
 local function failed(state, failure)
@@ -118,7 +119,7 @@ end
 local function load_initial_sections(state)
   if not state.active or state.initial_section_loading then return end
   state.initial_section_loading = true
-  request(state, "review.load", {
+  request(state, "github.review.document.load", {
     document = state.document,
     directory = state.directory,
   }, function(result, failure)
@@ -156,7 +157,7 @@ finish_close = function(state, dispose)
       and vim.api.nvim_buf_is_valid(state.origin) then vim.api.nvim_win_set_buf(state.window, state.origin) end
     if not state.unloading and vim.api.nvim_buf_is_valid(state.replica.buffer) then pcall(vim.api.nvim_buf_delete, state.replica.buffer, { force = true }) end
   end
-  if state.document then request(state, "review.close", { document = state.document }, function(_, failure)
+  if state.document then request(state, "github.review.document.close", { document = state.document }, function(_, failure)
     if failure then state.notice(failure) end
   end) end
 end
@@ -324,7 +325,7 @@ function M.refresh(state, callback)
   state.refresh_pending, state.rendering = false, true
   local save_generation = state.save_generation
   local width = require("forge.width").capture(vim.api.nvim_win_is_valid(state.window) and state.window or vim.api.nvim_get_current_win())
-  request(state, "review.materialize", { document = state.document, width = width }, function(delivery, failure)
+  request(state, "github.review.document.render", { document = state.document, width = width }, function(delivery, failure)
     local apply_started = vim.uv.hrtime()
     state.rendering = false
     if failure or type(delivery) ~= "table" then
@@ -399,7 +400,7 @@ function M.refresh_snapshot(state, snapshot)
   state.pending_snapshot = snapshot
   if not state.shown or state.rendering or state.snapshot_refreshing or state.revalidating then return end
   state.pending_snapshot, state.snapshot_refreshing = nil, true
-  request(state, "review.header", { document = state.document, directory = state.directory, initial = snapshot }, function(_, failure)
+  request(state, "github.review.document.header.load", { document = state.document, directory = state.directory, initial = snapshot }, function(_, failure)
     state.snapshot_refreshing = false
     if failure then failed(state, failure) end
     M.refresh(state)
@@ -409,7 +410,7 @@ end
 function M.resize(state)
   if not state.active or state.rebinding or not state.view then return end
   local width = require("forge.width").capture(state.window)
-  request(state, "review.view", { document = state.document, view = state.view.id, width = width }, function(delivery, failure)
+  request(state, "github.review.document.view.set", { document = state.document, view = state.view.id, width = width }, function(delivery, failure)
     if failure then failed(state, failure) return end
     if type(delivery) == "table" and delivery.patch and delivery.patch ~= vim.NIL then
       local applied = buffer.apply_patch(state.replica, delivery.patch)
@@ -433,7 +434,7 @@ function M.activate(state, action)
   if not captured then if failure then failed(state, failure) end return false end
   if not captured.target and captured.action ~= "browse" then return false end
   state.action_running = true
-  request(state, "review.act", { input = captured, directory = state.directory }, function(delivery, action_failure)
+  request(state, "github.review.document.input.apply", { input = captured, directory = state.directory }, function(delivery, action_failure)
     state.action_running = false
     if action_failure or type(delivery) ~= "table" or type(delivery.patch) ~= "table" then
       failed(state, action_failure or "Missing native review action delivery") return
@@ -477,7 +478,7 @@ dispatch_save = function(state)
   local capture = state.saving.capture
   for _, field in ipairs(capture) do field.base = state.replica.editable.region[field.region].revision end
   state.snapshot_required = true
-  request(state, "review.save", { document = state.document, capture = capture }, function(result, failure)
+  request(state, "github.review.document.save", { document = state.document, capture = capture }, function(result, failure)
     state.saving = nil
     state.save_generation = (state.save_generation or 0) + 1
     local snapshot = type(result) == "table" and type(result.snapshot) == "table" and result.snapshot
@@ -516,7 +517,7 @@ end
 load_actor = function(state)
   if state.actor_loading or not state.repository then return end
   state.actor_loading = true
-  request(state, "github.actor", { directory = state.directory, repository = state.repository }, function(actor, failure)
+  request(state, "github.actor.get", { directory = state.directory, repository = state.repository }, function(actor, failure)
     state.actor_loading = false
     if failure or type(actor) ~= "table" or type(actor.login) ~= "string" or actor.login == "" then
       if state.pending_operation and state.pending_operation.kind == "save" then state.pending_operation = nil end
@@ -536,7 +537,7 @@ function M.reconcile_save(state)
   if not state.active or state.rebinding or state.host_lost or state.save_recovering or state.saving
     or state.comment_running or state.submission_running or state.lifecycle_running then return false end
   state.save_recovering = true
-  request(state, "review.reconcile", { document = state.document }, function(snapshot, failure)
+  request(state, "github.review.document.reconcile", { document = state.document }, function(snapshot, failure)
     state.save_recovering = false
     if failure or type(snapshot) ~= "table" or type(snapshot.field) ~= "table" or snapshot.uncertain then
       state.save_uncertain = true
@@ -610,7 +611,7 @@ function M.transition(state, desired, callback)
   desired = lifecycle_desired[desired] or desired
   if not state.active or type(desired) ~= "string" then return false end
   if desired ~= "DRAFT" and desired ~= "OPEN" and desired ~= "CLOSED" then return false end
-  queue_operation(state, { kind = "lifecycle", method = "review.transition", callback = callback,
+  queue_operation(state, { kind = "lifecycle", method = "github.review.document.transition", callback = callback,
     params = { document = state.document, desired = desired } })
   dispatch_lifecycle(state)
   return true
@@ -618,7 +619,7 @@ end
 
 function M.reconcile_lifecycle(state, callback)
   if not state.active then return false end
-  queue_operation(state, { kind = "lifecycle", method = "review.lifecycle_reconcile", callback = callback,
+  queue_operation(state, { kind = "lifecycle", method = "github.review.document.lifecycle.reconcile", callback = callback,
     params = { document = state.document } })
   dispatch_lifecycle(state)
   return true
@@ -626,7 +627,7 @@ end
 
 function M.resolve_lifecycle(state, operation_id, resolution, callback)
   if not state.active or type(operation_id) ~= "string" or type(resolution) ~= "table" then return false end
-  queue_operation(state, { kind = "lifecycle", method = "review.lifecycle_resolve", callback = callback,
+  queue_operation(state, { kind = "lifecycle", method = "github.review.document.lifecycle.resolve", callback = callback,
     params = { document = state.document, operation_id = operation_id, resolution = vim.deepcopy(resolution) } })
   dispatch_lifecycle(state)
   return true
@@ -635,7 +636,7 @@ end
 function M.begin_batched(state, callback)
   if not state.active or not state.document or state.batched_running then return false end
   state.batched_running = true
-  request(state, "review.begin_batched", { document = state.document }, function(delivery, failure)
+  request(state, "github.review.document.batch.begin", { document = state.document }, function(delivery, failure)
     state.batched_running = false
     if failure or type(delivery) ~= "table" then
       failed(state, failure or "Missing native batched-review delivery")
@@ -653,7 +654,7 @@ end
 function M.set_viewed(state, path, viewed, callback)
   if not state.active or not state.document or state.batched_running or type(path) ~= "string" or type(viewed) ~= "boolean" then return false end
   state.batched_running = true
-  request(state, "review.set_viewed", { document = state.document, path = path, viewed = viewed }, function(delivery, failure)
+  request(state, "github.review.document.file.viewed.set", { document = state.document, path = path, viewed = viewed }, function(delivery, failure)
     state.batched_running = false
     if failure or type(delivery) ~= "table" then
       failed(state, failure or "Missing native viewed-state delivery")
@@ -694,7 +695,7 @@ dispatch_submission = function(state)
     local entry = state.replica.editable.region[field.region]
     if entry then field.base = entry.revision end
   end
-  request(state, "review.submit_batched", { document = state.document, verdict = pending.verdict,
+  request(state, "github.review.document.batch.submit", { document = state.document, verdict = pending.verdict,
     capture = pending.capture, draft_comment = pending.draft_comment }, function(delivery, failure)
     if delivery then editable.saved_capture(state.replica.editable, pending.capture) end
     state.submission_running = false
@@ -737,7 +738,7 @@ function M.recover_batched_submission(state, resolution, callback)
   if not state.active or state.rebinding or state.host_lost or state.save_recovering or state.saving or state.comment_running
     or state.lifecycle_running or state.submission_running or type(operation_id) ~= "string" or type(resolution) ~= "table" then return false end
   state.submission_running = true
-  request(state, "review.submit_batched_recover", {
+  request(state, "github.review.document.batch.recover", {
     document = state.document, operation_id = operation_id, resolution = vim.deepcopy(resolution),
   }, function(delivery, failure)
     state.submission_running = false
@@ -895,7 +896,7 @@ function M.comment(state, command, callback)
     local entry = state.replica.editable.region[field.region]
     if entry then field.base = entry.revision end
   end
-  request(state, "review.comment", { document = state.document, command = pending.command, capture = capture,
+  request(state, "github.review.document.comment", { document = state.document, command = pending.command, capture = capture,
     draft_comment = pending.draft_comment }, function(delivery, failure)
     if delivery then editable.saved_capture(state.replica.editable, capture) end
     state.comment_running = false
@@ -927,7 +928,7 @@ end
 
 function M.read_section(state, section, cursor)
   if not state.active or not state.document then return end
-  request(state, "review.section", {
+  request(state, "github.review.document.section.get", {
     document = state.document, directory = state.directory, section = section, cursor = cursor,
   }, function(_, failure)
     if failure then failed(state, failure) end
@@ -937,7 +938,7 @@ end
 
 function M.read_file(state, path, continuation, callback)
   if not state.active or not state.document or not state.replica or not state.shown then return end
-  local method = continuation and "review.file.more" or "review.file"
+  local method = continuation and "github.review.document.file.page.get" or "github.review.document.file.get"
   local params = { document = state.document, path = path,
     directory = not continuation and state.directory or nil }
   request(state, method, params, function(delivery, failure)
@@ -960,7 +961,7 @@ end
 
 function M.read_thread(state, thread_node_id, cursor, callback)
   if not state.active or not state.document or not state.replica then return end
-  request(state, "review.thread", {
+  request(state, "github.review.document.thread.get", {
     document = state.document, directory = state.directory,
     thread_node_id = thread_node_id, cursor = cursor,
   }, function(delivery, failure)
@@ -990,7 +991,7 @@ end
 
 function M.rebind(state, callback)
   if not state.active or state.rebinding or not state.replica then return false end
-  if not state.host_lost and state.generation == require("forge.client").host_generation()
+  if not state.host_lost and state.generation == require("forge.client").host_get_generation()
     and (state.saving or state.comment_running or state.submission_running or state.lifecycle_running or state.save_recovering) then
     return false
   end
@@ -998,24 +999,24 @@ function M.rebind(state, callback)
   local candidate = { active = true, shown = true, explicit_repository = true, notice = state.notice }
   local function reject(message)
     state.rebinding = false
-    if candidate.document then request(candidate, "review.close", { document = candidate.document }, function() end) end
+    if candidate.document then request(candidate, "github.review.document.close", { document = candidate.document }, function() end) end
     failed(state, message)
     if callback then callback(nil, message) end
   end
-  local method = state.target and "review.open_pr" or "review.open"
+  local method = state.target and "github.review.document.open" or "github.review.document.open"
   local params = state.target and { directory = state.directory, target = vim.deepcopy(state.target) }
     or { directory = state.directory, repository = vim.deepcopy(state.repository), number = state.number }
   request(candidate, method, params, function(opened, failure)
     if failure or type(opened) ~= "table" or type(opened.document) ~= "string" then
       reject(failure or "Missing replacement review identity") return
     end
-    candidate.document, candidate.generation = opened.document, require("forge.client").host_generation()
-    request(candidate, "review.header", { document = candidate.document, directory = state.directory }, function(_, header_failure)
+    candidate.document, candidate.generation = opened.document, require("forge.client").host_get_generation()
+    request(candidate, "github.review.document.header.load", { document = candidate.document, directory = state.directory }, function(_, header_failure)
       if header_failure then reject(header_failure) return end
-      request(candidate, "review.load", { document = candidate.document, directory = state.directory }, function(_, load_failure)
+      request(candidate, "github.review.document.load", { document = candidate.document, directory = state.directory }, function(_, load_failure)
         if load_failure then reject(load_failure) return end
         local function materialize()
-        request(candidate, "review.materialize", { document = candidate.document,
+        request(candidate, "github.review.document.render", { document = candidate.document,
           width = require("forge.width").capture(state.window) }, function(delivery, presentation_failure)
           if not state.active or not vim.api.nvim_buf_is_valid(state.replica.buffer) then
             reject("Review buffer was collected during recovery") return
@@ -1134,7 +1135,7 @@ function M.rebind(state, callback)
         end)
         end
         if state.mode == "batched" then
-          request(candidate, "review.begin_batched", { document = candidate.document }, function(_, mode_failure)
+          request(candidate, "github.review.document.batch.begin", { document = candidate.document }, function(_, mode_failure)
             if mode_failure then reject(mode_failure) else materialize() end
           end)
         else materialize() end
@@ -1166,7 +1167,7 @@ function M.open(options)
     cached.on_open = options.on_open
     if options.on_error then cached.notice = options.on_error end
     vim.api.nvim_win_set_buf(window, cached.replica.buffer)
-    if cached.host_lost or cached.generation ~= require("forge.client").host_generation() then
+    if cached.host_lost or cached.generation ~= require("forge.client").host_get_generation() then
       M.rebind(cached, options.on_open)
       return cached
     end
@@ -1203,7 +1204,7 @@ function M.open(options)
     on_open = options.on_open,
     notice = options.on_error or function(message) vim.notify(message, vim.log.levels.ERROR, { title = "Forge review" }) end,
   }
-  local method = options.target and "review.open_pr" or "review.open"
+  local method = options.target and "github.review.document.open" or "github.review.document.open"
   log.write("pr.open", { load_id = state.load_id, elapsed_us = math.floor((vim.uv.hrtime() - started) / 1000) })
   local params = options.target and { directory = state.directory, target = vim.deepcopy(options.target) }
     or { directory = state.directory, repository = vim.deepcopy(assert(options.repository)), number = assert(options.number), initial = vim.deepcopy(options.initial) }
@@ -1214,10 +1215,10 @@ function M.open(options)
       return
     end
     state.document = opened.document
-    state.generation = require("forge.client").host_generation()
+    state.generation = require("forge.client").host_get_generation()
     state.fields = opened.field
     state.save_uncertain = opened.uncertain == true
-    request(state, "review.header", { document = state.document, directory = state.directory }, function(_, header_failure)
+    request(state, "github.review.document.header.load", { document = state.document, directory = state.directory }, function(_, header_failure)
     if header_failure then
       failed(state, header_failure)
       finish_close(state)

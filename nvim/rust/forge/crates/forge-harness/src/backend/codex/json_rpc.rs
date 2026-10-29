@@ -3416,8 +3416,10 @@ mod test {
         assert!(output.event.iter().all(BackendEvent::message_snapshot));
         let mut delta = Vec::new();
         while let Ok(event) = stream.try_recv() {
-            if event.text.is_some() && !event.message_snapshot() {
-                delta.push((event.text.unwrap(), event.data["params"]["phase"].clone()));
+            if !event.message_snapshot()
+                && let Some(text) = event.text
+            {
+                delta.push((text, event.data["params"]["phase"].clone()));
             }
         }
         assert_eq!(

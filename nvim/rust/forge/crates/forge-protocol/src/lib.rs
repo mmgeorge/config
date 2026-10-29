@@ -8,11 +8,12 @@ pub mod credit;
 pub mod frame;
 pub mod input;
 pub mod message;
+pub mod method_policy;
 pub mod outbound;
 pub mod snapshot;
 pub mod transfer;
 
-pub const WIRE_VERSION: u32 = 28;
+pub const WIRE_VERSION: u32 = 29;
 
 pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 pub const MAX_ACTIVE_REQUESTS: usize = 64;

@@ -33,9 +33,11 @@ assert(timer:is_closing(), "picker timer leaked")
 
 local configured = { id = "timeout-settings", backend = "mock", approval_timeout = { amount = 10, unit = "m" }, answer_timeout = { amount = 10, unit = "m" } }
 local state = { session = configured }
-local original_request, original_configure, original_input = client.request_for, controller.configure, vim.ui.input
-client.request_for = function(_, method, _, callback)
-  assert(method == "trace.status")
+local original_request, original_configure, original_input = client.request, controller.configure, vim.ui.input
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+  assert(method == "host.trace.status")
   callback({ enabled = false })
 end
 controller.configure = function(value, _, completed)
@@ -68,5 +70,5 @@ assert(configured.approval_timeout.amount == 0)
 assert(configured.answer_timeout.amount == 10 and configured.answer_timeout.unit == "m")
 assert(duration.render(configured.approval_timeout, "amount"):find("Off", 1, true))
 picker.close(false)
-client.request_for, controller.configure, vim.ui.input = original_request, original_configure, original_input
+client.request, controller.configure, vim.ui.input = original_request, original_configure, original_input
 print("HARNESS_INPUT_TIMEOUT_PASS")

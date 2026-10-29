@@ -7,13 +7,13 @@ Read [Buffers and rendering](buffers-and-rendering.md) for editable-region appli
 ## Pull request creation context
 
 The creation workflow retains the selected base branch and the head commit captured
-by `github.creation.context`. When `origin` is configured, it fetches only the
+by `github.pull_request.creation.context`. When `origin` is configured, it fetches only the
 selected base branch into its tracking ref and pins that commit before collecting
 the title and diff. Git reads and the fetch have a 30-second deadline. Fetch failures
 stop creation without reusing stale refs. Without
 `origin`, it resolves the local base branch. The first head-only commit supplies the title.
 
-The `context` operation on `repository.generate` compares the merge base of those
+The `context` operation on `repository.generation` compares the merge base of those
 two pinned commits with the captured head. It reads committed objects only, so
 base-only changes and staged, unstaged, or untracked work do not enter the prompt.
 Before reading diff metadata or source excerpts, the native comparison runs
@@ -31,7 +31,7 @@ retain the shared context and omission rules. The formatter receives the remaind
 of the 500,000-byte allowance after the PR instructions and comparison metadata.
 The PR prompt uses its own description instructions without the commit-message header.
 
-The `pull_request` operation on `repository.generate` sends the prepared evidence to
+The `pull_request` operation on `repository.generation` sends the prepared evidence to
 `HarnessService.background`. Lua reads the same saved Background model and thinking
 settings used by commit generation. Both Codex and Copilot default to `gpt-6-luna`
 with `low` thinking. PR descriptions and commits reuse the same persistent provider
@@ -143,7 +143,7 @@ ForgeRuntime now retains the concrete GhClient and includes native gh ownership 
 reporting. Checkout contexts share that single four-request pool instead of allocating independent
 admission budgets. Context creation binds the working directory without launching a process.
 
-The `github.sync` host method accepts a database path, checkout directory, typed SyncRequest, and
+The `github.issue.sync` host method accepts a database path, checkout directory, typed SyncRequest, and
 optional progress flag. It routes through GithubService without initializing Harness. Unknown
 request fields and malformed remote identity fail decoding. The final response reports freshness,
 fetched records, and published page count. Successful sync releases its repository ownership before
@@ -155,7 +155,7 @@ only the latest value. Slow observers can miss intermediate phases. The correlat
 remains authoritative, and no progress is emitted after it. Request events do not require or imply
 a Harness session identity.
 
-The Lua host client accepts an optional progress callback for request_host. It delivers matching
+The Lua client accepts an optional third progress callback for `request(spec, callback, progress)`. It delivers matching
 events only while that request remains pending. Unknown, mismatched, and late request events do not
 reach Harness subscribers. Invalid request-event shapes fail decoding. GitHub host failures no
 longer invalidate unrelated Harness state. Callback failures are reported without completing or
@@ -170,7 +170,7 @@ descendant termination and global allocation accounting remain open.
 
 ## Repository cache deletion through the host
 
-Repository deletion now uses the shared host's `github.issues` delete_cache operation. Rust acquires
+Repository deletion now uses the shared host's `github.issue.list` delete_cache operation. Rust acquires
 exclusive repository ownership and closes database handles before removing repository data. Lua
 retains the loaded issue snapshot while the request is pending or rejected. A successful host result
 invalidates the corresponding local snapshot, including an already-absent repository result.
@@ -824,7 +824,7 @@ and uncertain creation recovery after host replacement.
 
 Editable PR descriptions retain their exact Markdown source rows. Source-preserving Markdown metadata supplies links and structural formatting, and the shared Rust syntax engine supplies Markdown captures and fenced-language injections before publication. The review window conceals presentation markers outside the active cursor line. Accepted description edits request a fresh projection so removed fences and stale syntax decorations do not persist.
 
-Opening a PR retains the current buffer until its title, metadata, and description are ready. Initial loading reads overview, editable fields, and requested reviewers concurrently by repository and PR number. `review.header` consumes the retained overview and reviewer responses without repeating either request. The first visible native presentation contains the complete header and description, with normal heading highlights and dark gray `Loading...` rows in pending sections. Leaving the originating buffer before presentation prevents a late response from replacing the newer buffer.
+Opening a PR retains the current buffer until its title, metadata, and description are ready. Initial loading reads overview, editable fields, and requested reviewers concurrently by repository and PR number. `github.review.document.header.load` consumes the retained overview and reviewer responses without repeating either request. The first visible native presentation contains the complete header and description, with normal heading highlights and dark gray `Loading...` rows in pending sections. Leaving the originating buffer before presentation prevents a late response from replacing the newer buffer.
 
 The Lua adapter retains up to eight PR documents and their native buffers for the Neovim session, keyed by workspace, hostname, repository, and PR number. Reopening a retained PR displays its existing text and loaded sections immediately, then refreshes header and secondary sections concurrently. Clean title, description, and requested-reviewer fields adopt remote changes. Local edits and pending saves remain intact. Explicit buffer deletion releases the retained document.
 
@@ -840,13 +840,13 @@ Editable regions protect their surrounding rows and headings independently of cu
 
 Lua retains one active publication operation and at most one queued explicit action across field saves, comment publication, batched submission, and lifecycle changes. Each action captures its input when invoked. A newer queued action replaces the previous queued action and reports supersession to its callback. Completion dispatches the retained action without recapturing later typing. Unresolved submission recovery holds publication until its outcome is settled. Rust saves title and description together, then applies reviewer additions and removals through the durable mutation queue. Completion adopts confirmed baselines without replacing native text. The queued capture continues to control markers while the earlier request settles. Presentation refresh waits while local drafts remain pending. A deferred refresh does not mark reconciliation as active, and a refresh started before a save completes cannot restore older field baselines.
 
-Rejected and missing save results retain later explicit captures, restore markers against confirmed baselines, and notify the failure. Uncertain field saves start `review.reconcile` without reposting mutations and hold later publication until recovery settles. Rust reads current remote fields or the reviewer set before settling the durable capture. Matching title/body observations verify the submitted operation. Reviewer changes close the unknown operation after observing the current reviewer set because GitHub provides no reviewer-operation identity to link. Differing title/body observations also close the unknown operation. Recovery establishes the observed baseline without claiming that a closed-unknown request succeeded and preserves all locally owned text. Failed observations retain captures, keep native editing enabled, and expose `gR` to retry recovery. An explicit save during recovery retains its capture for later dispatch.
+Rejected and missing save results retain later explicit captures, restore markers against confirmed baselines, and notify the failure. Uncertain field saves start `github.review.document.reconcile` without reposting mutations and hold later publication until recovery settles. Rust reads current remote fields or the reviewer set before settling the durable capture. Matching title/body observations verify the submitted operation. Reviewer changes close the unknown operation after observing the current reviewer set because GitHub provides no reviewer-operation identity to link. Differing title/body observations also close the unknown operation. Recovery establishes the observed baseline without claiming that a closed-unknown request succeeded and preserves all locally owned text. Failed observations retain captures, keep native editing enabled, and expose `gR` to retry recovery. An explicit save during recovery retains its capture for later dispatch.
 
 Uncertain comment snapshots hold later publication without replacing its queued capture. The `gR` recovery picker offers remote observation, a linked confirmed comment ID, not-dispatched rejection, and close-unknown resolution. Cancellation sends no request. Comment recovery bypasses only the comment-uncertainty guard and retains the queued publication action. Successful settlement resumes that action, while failed recovery keeps it held. The same picker presents batched submission resolution through `gB`.
 
 Reviewer completion excludes the authenticated user only in the reviewer input. Ordinary `@` mentions still include that user. Lua validates manually entered reviewer names case-insensitively before dispatch. Rust repeats validation before any field write and again before the reviewer phase, so a self-review request cannot produce a partial title/body save or bypass validation by changing during an earlier write. The buffer enables the shared `@` username and `#` issue completion sources, with metadata refreshed at open and issue queries served from the local index.
 
-After the first presentation, `review.load` starts file, check, conversation, and commit reads concurrently in Rust. Lua requests one presentation refresh after the batch settles. Successful sections survive failures in other sections, and failed sections display diagnostics. The shared GitHub service admits at most sixteen remote jobs, independently of storage-worker admission. Native `gh` execution runs at most four subprocesses concurrently. Additional admitted requests wait asynchronously for native job capacity, and shutdown wakes waiting requests with a closed-pool error. Section updates serialize against presentation capture without blocking editable-field acceptance during analysis.
+After the first presentation, `github.review.document.load` starts file, check, conversation, and commit reads concurrently in Rust. Lua requests one presentation refresh after the batch settles. Successful sections survive failures in other sections, and failed sections display diagnostics. The shared GitHub service admits at most sixteen remote jobs, independently of storage-worker admission. Native `gh` execution runs at most four subprocesses concurrently. Additional admitted requests wait asynchronously for native job capacity, and shutdown wakes waiting requests with a closed-pool error. Section updates serialize against presentation capture without blocking editable-field acceptance during analysis.
 
 ## Native batched-review ownership
 
@@ -854,7 +854,7 @@ ReviewDocument owns an explicit `Overview` or `Batched` mode. Batched mode adds 
 
 A batched submission captures the summary and every local inline draft body with its immutable revision, path, line range, and side. The captured `ReviewMutation::ReviewSubmit` contains those comments in the single review endpoint request. The operation ID and complete mutation capture reach durable draft storage before dispatch. Confirmation advances the summary baseline and hides submitted local drafts. Rejection releases the capture without changing local text. An unknown outcome retains the operation ID and immutable capture across reopen, blocks another submission, and requires an explicit recovery action instead of automatic replay. Recovery validates the retained mutation against the recovery journal before it accepts a linked confirmed review ID, an explicit not-dispatched rejection, or close-unknown. A missing journal cannot establish confirmation.
 
-Lua obtains mode, viewed state, and submission outcomes only through `review.begin_batched`, `review.set_viewed`, and `review.submit_batched`. It opens a compact comment fold before focusing the corresponding editable occurrence. Command specifications retain ownership of the configured review bindings.
+Lua obtains mode, viewed state, and submission outcomes only through `github.review.document.batch.begin`, `github.review.document.file.viewed.set`, and `github.review.document.batch.submit`. It opens a compact comment fold before focusing the corresponding editable occurrence. Command specifications retain ownership of the configured review bindings.
 
 ### Commit-scoped diff expansion
 

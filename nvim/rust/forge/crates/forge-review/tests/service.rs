@@ -4429,16 +4429,17 @@ async fn immutable_file_analysis_uses_merge_base_and_fork_head_sources() {
         "{:?}",
         file.syntax_diagnostic
     );
-    let request = remote.source_request.lock().unwrap();
-    assert_eq!(request.len(), 2);
-    assert_eq!(request[0].commit, "c".repeat(40));
-    assert_eq!(request[0].path, "src/old.rs");
-    assert_eq!(request[1].repository.repository_name(), "fork/project");
-    assert_eq!(request[1].commit, "b".repeat(40));
+    {
+        let request = remote.source_request.lock().unwrap();
+        assert_eq!(request.len(), 2);
+        assert_eq!(request[0].commit, "c".repeat(40));
+        assert_eq!(request[0].path, "src/old.rs");
+        assert_eq!(request[1].repository.repository_name(), "fork/project");
+        assert_eq!(request[1].commit, "b".repeat(40));
+    }
     assert_eq!(diff.usage().active_jobs, 0);
     assert_eq!(diff.analysis_pool().usage().admitted_jobs, 0);
     assert_eq!(syntax.usage().active_jobs, 0);
-    drop(request);
     let rendered = service
         .materialize(
             &opened.document,

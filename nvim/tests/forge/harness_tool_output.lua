@@ -1,9 +1,13 @@
 vim.loader.enable(false)
 local client = require("forge.client")
-local original = client.request_for
+local original = client.request
 local request = {}
-client.request_for = function(session, method, params, callback)
-  assert(session == "tool-test" and method == "harness.document")
+client.request = function(request_specification, callback)
+  local session = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  assert(session == "tool-test" and method == "session.document")
   request[#request + 1] = { params = params, callback = callback }
 end
 local function snapshot(document)
@@ -42,6 +46,6 @@ local success, failure = xpcall(function()
   assert(request[9].params.operation == "close", "late native open was not collected")
 end, debug.traceback)
 if owner and not owner.closed then owner.close() end
-client.request_for = original
+client.request = original
 assert(success, failure)
 print("harness_tool_output: passed")

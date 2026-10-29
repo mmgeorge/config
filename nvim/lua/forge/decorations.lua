@@ -14,7 +14,7 @@ end
 
 ---@class ForgeProjectedDecoration
 ---@field column integer
----@field options {end_row: integer, end_col: integer, hl_group: string, hl_eol: boolean, line_hl_group?: string, priority: integer, ephemeral?: boolean}
+---@field options vim.api.keyset.set_extmark
 
 ---Project an intersecting source span onto one physical row, retaining full-row backgrounds.
 ---@param decoration {range: {start: {row: integer, column: integer}, ["end"]: {row: integer, column: integer}}, capture: string, priority: integer}
@@ -108,7 +108,7 @@ vim.api.nvim_set_decoration_provider(namespace, {
     local location = session.decoration_location and session.decoration_location(row)
       or not session.decoration_location and require("forge.buffer").locate(session, row, 0)
     local node = location and session.sequence.node[location.block]
-    if not node then return end
+    if not location or not node then return end
     local relative = location.position.row
     local prefix = location.display_indent or 0
     local row_layout = node.entry.row_layout[relative]

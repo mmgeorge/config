@@ -3,7 +3,7 @@ local notifications = require("forge.infra.notifications")
 local popup_window = require("forge.infra.popup_window")
 
 local M = {}
-local request_generation = 0
+local generation_request = 0
 
 ---@param popup_buf integer
 ---@param popup_win integer
@@ -13,7 +13,7 @@ local function attach_close_lifecycle(popup_buf, popup_win, source_buf, source_w
   local group = vim.api.nvim_create_augroup("ForgePlanEntityInfo" .. tostring(popup_buf), { clear = true })
   local opening_cursor = vim.api.nvim_win_get_cursor(source_win)
   local function close_popup()
-    request_generation = request_generation + 1
+    generation_request = generation_request + 1
     popup_window.close(popup_win, false)
     pcall(vim.api.nvim_del_augroup_by_id, group)
   end

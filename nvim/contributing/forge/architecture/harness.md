@@ -16,7 +16,7 @@ admission order. A later pause prevents an earlier change from restarting work.
 `forge.command` assigns an immutable command identity to mutations. Rust binds
 that identity to the session, host epoch, method, and arguments. Duplicate
 requests return their recorded response. A response is recorded before transport
-delivery, so a missing acknowledgement can be inspected through `command.status`.
+delivery, so a missing acknowledgement can be inspected through `session.command.status.get`.
 Unknown outcomes remain explicit. Restarting the host never authorizes replay.
 General command receipts last for the controller lifetime. Task operations and
 question-answer receipts have their own durable SQLite records.
@@ -86,7 +86,7 @@ enclosing host request lifecycle on the normal worker stack.
 
 `SessionCoordinator` owns accepted messages through an in-memory `SessionInputQueue`.
 Queue operations atomically update message revisions and retain idempotent
-operation outcomes for that controller's lifetime. `input.apply`, `input.get`, and `input.operation` remain available
+operation outcomes for that controller's lifetime. `session.input.apply`, `session.input.get`, and `session.input.operation.get` remain available
 without acquiring the provider execution lock. The input worker reuses execution
 admission, provider steering, task controls, and the submission journal.
 
@@ -559,8 +559,8 @@ buffer, windows, queue, busy state, and subscriptions inside one real Neovim tab
 
 Lua owns the complete unsent Harness draft. Opening a transcript and typing in HarnessInput never
 transmit draft text or local edit revisions to Rust. Explicit file-path pastes import the selected
-file through `attachment.import`, independently of prompt submission. Ctrl-s captures the complete draft,
-then sends one `prompt.submit` request with separate text and typed attachment fields and a monotonically increasing session token
+file through `session.attachment.import`, independently of prompt submission. Ctrl-s captures the complete draft,
+then sends one `session.prompt.submit` request with separate text and typed attachment fields and a monotonically increasing session token
 paired with the captured transcript document. Rust tracks submission admission without retaining a
 composer document. A `prompt_submission` acceptance clears only the unchanged captured draft.
 Retraction restores its exact rows only while the cleared buffer retains its changedtick.
@@ -766,7 +766,7 @@ receive the same conversion without mutating the transport response or other pro
 The projector consumes `QuestionAnswered` as transition evidence instead of publishing a second feedback row because
 the continuation interaction owns that visible user action. It also nests durable child-agent turns under their
 provider and spawning-interaction identities before projection. Rust retains complete exchanges and
-source output. `state.get` carries compact status and agent summaries, while `document_changed`
+source output. `session.state.get` carries compact status and agent summaries, while `document_changed`
 announces the current source revision without duplicating transcript content in Lua.
 
 The session presentation owns a separate loaded document. Closed folds retain their heading and
@@ -897,7 +897,7 @@ separate mutation owners. Ask preferences are stored per provider and apply only
 to same-provider Plan Review forks. Clearing the override restores inheritance
 from the planning session. Planning owns the plan approval and revision Auto-approve controls.
 Execute exposes the Ask/Deny/Allow approval default without a Defaults row.
-The check-editing toggle uses the independent `checks.editing` control.
+The check-editing toggle uses the independent `session.check.editing.set` control.
 Related values share rows, and the selected field replaces the permanent description
 column. Tools contains Timeouts and separate single-toggle rows for Subagents and LSP, Display owns Thoughts, and the final
 Debug category owns Logging. Background preference publication preserves focus and never changes chat settings.
@@ -912,7 +912,7 @@ Harness resolves and caches backend model metadata when the view activates, then
 the catalog when it opens so persisted model and effort selections remain current during provider work.
 Model, effort, service-tier, backend, and
 access and approval selections continue through their normal mutation owners. Configuration changes
-that affect execution always use `task.transition`, including when Lua currently reports idle.
+that affect execution always use `session.command.apply`, including when Lua currently reports idle.
 The host determines whether execution needs collection, so a delayed busy snapshot cannot route
 a thinking or model change through the settled-session guard. Presentation-only status thoughts
 and input timeouts retain their independent live-update paths. Automatic check timing
@@ -952,7 +952,7 @@ An initialization delay therefore does not consume the terminal query's eight-se
 The `/undo` specialization opens the active session's settled current interactions newest first.
 Selecting a record offers conversation-only rollback or conversation with file restoration when
 a checkpoint exists. Conversation-only rollback leaves files and Git's index untouched and works
-without checkpoints. Its confirmed `task.transition` action `undo` validates the selected history,
+without checkpoints. Its confirmed `session.command.apply` action `undo` validates the selected history,
 collects execution through the normal cancellation and child-quiescence path, and leaves the task
 paused before applying the conversation rollback. The broker rechecks the history after collection.
 File restoration retains its preview and explicit confirmation. Only an
@@ -1059,17 +1059,17 @@ outside product requirements. Incompatible workspace changes use plan revision.
 
 ## Cancellation and mode restart
 
-`turn.cancel` bypasses the broker's serialized request queue so Ctrl-c can interrupt an active
+`session.turn.cancel` bypasses the broker's serialized request queue so Ctrl-c can interrupt an active
 provider turn instead of waiting behind it. Cleanup retains the provider reader until native
 execution is collected, then releases the prompt and either retracts or cancels the interaction.
 Submitting a replacement prompt during checks uses the same ownership order. The editor sends
-`checks.cancel` with `interrupt_execution`, and the service acknowledges it only after native
+`session.check.cancel` with `interrupt_execution`, and the service acknowledges it only after native
 cleanup. Direct prompt admission and check cancellation during a provider turn enforce the
 same boundary. Cancelling a manual run without an active provider affects only that run.
 A pause cancels any active check before waiting for its execution permit, including
 manual checks without a provider cancellation token. If a replacement prompt arrives while
 that pause is pending, Lua retains it until check cleanup and the task operation both settle.
-A newly submitted `prompt.submit` remains retractable only while the provider has produced no assistant
+A newly submitted `session.prompt.submit` remains retractable only while the provider has produced no assistant
 message, tool activity, task update, or workspace delta. Context usage and reasoning status alone
 do not consume that eligibility. Codex maps an eligible retraction to app-server
 `thread/rollback`. Copilot uses the pinned SDK's typed `session.history.truncate` API,
@@ -1105,7 +1105,7 @@ change occurs, the broker finalizes partial timeline state and persists the inte
 cancelled. This split prevents the composer from presenting text that still exists in provider
 history while preserving the quick-regret workflow for a genuinely output-free turn.
 
-Policy changes use the durable `task.transition` lane. Shift-Tab submits a
+Policy changes use the durable `session.command.apply` lane. Shift-Tab submits a
 write-toggle intent, then the coordinator interrupts and collects active provider
 work before applying the new access policy. The winbar retains confirmed access
 and approval while that operation is pending. A resumed exchange retains its
@@ -1142,7 +1142,7 @@ entries retain their full text. Explicit queue navigation resizes the composer
 before positioning the transcript tail, so the status and queue use the resulting
 pane height. Passive staging refreshes preserve the reader's position.
 
-`turn.steer` uses the same out-of-band broker lane without creating another interaction. Explicit steering
+`session.turn.steer` uses the same out-of-band broker lane without creating another interaction. Explicit steering
 preserves queued follow-ups and delegates active-turn admission to the backend even while a task
 transition is pending. It clears HarnessInput only after admitting the text into a pending steering record, then the backend
 delivers it to the active provider turn and acknowledges the request. The Codex backend maps that
@@ -1549,7 +1549,7 @@ from reappearing through a later state snapshot.
 
 `/config` exposes independent approval and answer timeouts, each defaulting to ten minutes.
 Each duration retains an amount and a seconds, minutes, or hours unit. Zero disables expiry.
-The `session.input_timeouts` route persists global portable settings and updates the shared
+The `session.input.timeout.configure` route persists global portable settings and updates the shared
 session settings without interrupting provider execution. Existing deadlines retain their
 original duration. Session and workspace overrides retain their normal precedence.
 
@@ -1835,7 +1835,7 @@ actions operate on the instance identity.
 
 `AgentProfileStore` owns `stdpath("config")/forge/subagents.json`, beside permissions.json.
 The file is the global source of truth across workspaces and providers. `/agents edit` opens a profile
-picker over `agent.profiles.get`, and `/agents edit <profile>` opens the named profile directly.
+picker over `agent.profile.get`, and `/agents edit <profile>` opens the named profile directly.
 The edit picker includes disabled profiles.
 Every fresh spawn and follow-up checks the current profile enablement before admission, including
 follow-ups to existing children. Disabling a profile blocks new tasks without cancelling admitted
@@ -1858,7 +1858,7 @@ The picker updates in place after success, retaining selection. Pending saves bl
 mutations, reload, and form entry. Failed saves retain the displayed value and report the error,
 including attempts to disable the default profile.
 `subagent_selection.lua` owns the tuning choices shared by the picker and full-page editor.
-`agent.models` returns `{models, capability}` from one child adapter, preserving provider model
+`session.agent.model.list` returns `{models, capability}` from one child adapter, preserving provider model
 order. Each editor caches successful catalogs by provider until reload or close. A provider change
 selects its first advertised model. Provider and model changes retain compatible thinking and
 speed, otherwise resetting the field to `default`. Thinking choices follow the selected model,
@@ -1872,7 +1872,7 @@ still match. Save, reload, close, and newer edits invalidate late patches.
 Selection opens a dedicated full-page form through `shared/form.lua`, which reuses `editable.lua`
 for protected native text regions, `picker/field.lua` for choice values, and the shared command
 specification for save, reload, help, and close. Text and choice edits remain local until one
-`agent.profiles.save` submits the complete form. Confirmed saves clear only the submitted values,
+`agent.profile.save` submits the complete form. Confirmed saves clear only the submitted values,
 so edits made while a save is running stay dirty. Failed saves retain all drafts. Reload explicitly
 discards local edits, and closing a dirty form leaves it open. `/config` keeps only the tool toggle.
 Saves validate the complete document,
@@ -2051,7 +2051,7 @@ The notice does not widen filesystem access or bypass saved approval rules. Task
 keep this notice separate from user-authored text and retain their lifecycle heading. Native
 goal resumption delivers the notice to the resumed provider turn without starting another goal.
 
-`task.transition` persists an operation ID on the ordered host input lane before concurrent
+`session.command.apply` persists an operation ID on the ordered host input lane before concurrent
 dispatch or acknowledgement. A compare-and-set claim permits one execution of each intent.
 Pending pause or clear intent takes precedence over stale Running records when settings change.
 Settings received before a new task acquires its identity reject visibly without displacing
@@ -2077,7 +2077,7 @@ mutations retain an execution permit while waiting for that mutex and through re
 Catalog readers and background subscriptions cannot reject admitted work or cause idle goal
 controls to interrupt the provider. Cleanup after the steering receiver has settled is a no-op, while steering input still
 requires an active receiver. The execution permit remains held through finalization and delivery.
-`task.operation` queries the original ID after uncertain acknowledgement and never replays it.
+`session.command.operation.get` queries the original ID after uncertain acknowledgement and never replays it.
 User cancellation remains a cancelled operation across broker and service error boundaries.
 The coordinator associates each settled operation with its exchange while holding execution
 admission. Snapshots show terminal operation status only while that exchange is current,
@@ -2183,7 +2183,7 @@ for a state transition that the observer will discard.
 
 ## Check-editing permission
 
-`checks.editing` persists `check_editing` in the session settings layer and updates
+`session.check.editing.set` persists `check_editing` in the session settings layer and updates
 shared live authority without acquiring provider execution admission. New conversations
 default to off. The broker snapshot supplies the permission for the Harness winbar.
 The winbar appends `ce` after the access and approval suffix in the same gray field,

@@ -344,7 +344,7 @@ function M.wait(workspace, path, receive)
       end
     end
     for _, job in pairs(state.jobs) do
-      if not file_request or source.canonical(job.path) == source.canonical(path) then
+      if not file_request or path and source.canonical(job.path) == source.canonical(path) then
         if not job.done then
           pending = true
           if expired then issue(job.name, job.root, "timeout: " .. job.name .. " initialization exceeded 60 seconds.") end

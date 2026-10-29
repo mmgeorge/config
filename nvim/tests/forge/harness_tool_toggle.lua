@@ -1,10 +1,12 @@
 vim.loader.enable(false)
 local client = require("forge.client")
 local session = require("forge.session")
-local original_request, original_accepting = client.request_for, client.host_accepting
+local original_request, original_accepting = client.request, client.host_is_accepting
 local requests = {}
-client.host_accepting = function() return true end
-client.request_for = function(_, _, params, callback)
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
   callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   if params.operation == "background_terminals" then callback({ supported = false }) return end
   requests[#requests + 1] = { params = params, callback = callback }
@@ -48,6 +50,6 @@ local success, failure = xpcall(function()
 end, debug.traceback)
 if owner then owner.close() end
 session.harness.presentation = nil
-client.request_for, client.host_accepting = original_request, original_accepting
+client.request, client.host_is_accepting = original_request, original_accepting
 assert(success, failure)
 print("harness_tool_toggle: passed")

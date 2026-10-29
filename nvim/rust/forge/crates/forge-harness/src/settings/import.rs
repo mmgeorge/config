@@ -593,7 +593,7 @@ mod test {
             .unwrap();
         assert_eq!(
             preview
-                .select(&preview.fingerprint, &[safe.id.clone()])?
+                .select(&preview.fingerprint, std::slice::from_ref(&safe.id))?
                 .len(),
             1
         );
@@ -602,7 +602,7 @@ mod test {
             .iter()
             .find(|candidate| candidate.name == "secret")
             .unwrap();
-        let selected = preview.select(&preview.fingerprint, &[secret.id.clone()])?;
+        let selected = preview.select(&preview.fingerprint, std::slice::from_ref(&secret.id))?;
         assert!(!serde_json::to_string(&selected)?.contains("private-value"));
         assert_eq!(
             selected[0].server()?.unwrap().native()?["env"]["TOKEN"],
@@ -615,14 +615,14 @@ mod test {
             .unwrap();
         assert!(
             preview
-                .select(&preview.fingerprint, &[invalid.id.clone()])
+                .select(&preview.fingerprint, std::slice::from_ref(&invalid.id))
                 .is_err()
         );
         std::fs::write(&source, r#"{"mcpServers":{"safe":{"command":"changed"}}}"#)?;
         let changed = NativeImport::read(ImportKind::Mcp, &source, "global", root.path())?;
         assert!(
             changed
-                .select(&preview.fingerprint, &[safe.id.clone()])
+                .select(&preview.fingerprint, std::slice::from_ref(&safe.id))
                 .is_err()
         );
         assert_eq!(changed.candidate[0].id, safe.id);
@@ -650,13 +650,15 @@ mod test {
             "claude",
         )?;
         let id = preview.candidate[0].id.clone();
-        let selected = preview.select(&preview.fingerprint, &[id.clone()])?;
+        let selected = preview.select(&preview.fingerprint, std::slice::from_ref(&id))?;
         let receipt = json!({"source":source,"fingerprint":preview.fingerprint});
         let mutation = store.import_operation(
             0,
-            SettingScope::Workspace,
-            &workspace,
-            "session",
+            crate::settings::SettingTarget {
+                scope: SettingScope::Workspace,
+                workspace: &workspace,
+                session: "session",
+            },
             &selected,
             "import-1",
             &receipt,
@@ -666,9 +668,11 @@ mod test {
             store
                 .import_operation(
                     0,
-                    SettingScope::Workspace,
-                    &workspace,
-                    "session",
+                    crate::settings::SettingTarget {
+                        scope: SettingScope::Workspace,
+                        workspace: &workspace,
+                        session: "session"
+                    },
                     &selected,
                     "import-1",
                     &receipt
@@ -680,9 +684,11 @@ mod test {
             store
                 .import_operation(
                     0,
-                    SettingScope::Workspace,
-                    &workspace,
-                    "session",
+                    crate::settings::SettingTarget {
+                        scope: SettingScope::Workspace,
+                        workspace: &workspace,
+                        session: "session"
+                    },
                     &selected,
                     "stale",
                     &receipt
@@ -796,9 +802,11 @@ mod test {
         let selected = preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;
         store.import_operation(
             0,
-            SettingScope::Global,
-            "workspace",
-            "session",
+            crate::settings::SettingTarget {
+                scope: SettingScope::Global,
+                workspace: "workspace",
+                session: "session",
+            },
             &selected,
             "skill-import",
             &json!({"fingerprint":preview.fingerprint}),
@@ -826,9 +834,11 @@ mod test {
         let selected = preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;
         store.import_operation(
             1,
-            SettingScope::Workspace,
-            "workspace",
-            "session",
+            crate::settings::SettingTarget {
+                scope: SettingScope::Workspace,
+                workspace: "workspace",
+                session: "session",
+            },
             &selected,
             "workspace-skill-import",
             &json!({"fingerprint":preview.fingerprint}),

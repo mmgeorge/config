@@ -673,11 +673,6 @@ local function append_verification_result(result, interaction, node, options)
   end
 end
 
---- Appends prompt, segment list, diff summaries, and response blocks for an interaction.
----@param result table Target render collection table.
----@param interaction table Interaction descriptor table.
----@param options table Render options table.
----@param agent_by_id? table<string, table> Lookup map of child agent runs by identifier.
 local function withdrawal_text(node)
   local lines = {}
   for _, answer in ipairs(node.answer or {}) do
@@ -690,6 +685,11 @@ local function withdrawal_text(node)
   return table.concat(lines, "\n")
 end
 
+--- Appends prompt, segment list, diff summaries, and response blocks for an interaction.
+---@param result table Target render collection table.
+---@param interaction table Interaction descriptor table.
+---@param options table Render options table.
+---@param agent_by_id? table<string, table> Lookup map of child agent runs by identifier.
 local function append_interaction(result, interaction, options, agent_by_id)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
   local origin = interaction.origin or { kind = "user" }

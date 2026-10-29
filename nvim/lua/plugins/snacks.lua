@@ -541,6 +541,7 @@ return {
             },
           },
         },
+        actions = { pick_and_jump = { "pick_win", "jump" } },
         previewers = {
           diff = {
             native = true,
@@ -578,7 +579,7 @@ return {
               ["<CR>"] = { "confirm", mode = { "n", "i" } },
               ["<Down>"] = { "list_down", mode = { "i", "n" } },
               ["<Esc>"] = "cancel",
-              ["<S-CR>"] = { { "pick_win", "jump" }, mode = { "n", "i" } },
+              ["<S-CR>"] = { "pick_and_jump", mode = { "n", "i" } },
               ["<S-Tab>"] = { "select_and_prev", mode = { "i", "n" } },
               ["<Tab>"] = { "select_and_next", mode = { "i", "n" } },
               ["<Up>"] = { "list_up", mode = { "i", "n" } },
@@ -634,7 +635,7 @@ return {
               ["<CR>"] = "confirm",
               ["<Down>"] = "list_down",
               ["<Esc>"] = "cancel",
-              ["<S-CR>"] = { { "pick_win", "jump" } },
+              ["<S-CR>"] = { "pick_and_jump" },
               ["<S-Tab>"] = { "select_and_prev", mode = { "n", "x" } },
               ["<Tab>"] = { "select_and_next", mode = { "n", "x" } },
               ["<Up>"] = "list_up",

@@ -1,6 +1,9 @@
 vim.loader.enable(false)
 local calls = {}
-package.loaded["forge.client"] = { request_host = function(route, params, callback)
+package.loaded["forge.client"] = { request = function(request_specification, callback)
+  local route = request_specification.method
+  local params = request_specification.params or {}
+
   calls[#calls + 1] = { route = route, params = vim.deepcopy(params), callback = callback }
 end }
 local draft = require("github.review_draft")
@@ -28,7 +31,7 @@ assert(#calls == 1)
 calls[1].callback({})
 assert(calls[2].params.draft.review_comments[1].body == "newer unsent body")
 calls[2].callback({})
-assert(calls[3].route == "github.recovery.settle_draft")
+assert(calls[3].route == "github.recovery.draft.settle")
 assert(calls[3].params.draft.review_comments[1].body == "newer unsent body")
 assert(not settled)
 calls[3].callback({})
@@ -41,7 +44,7 @@ local loaded
 draft.read(second_view, function(result, failure) assert(not failure) loaded = result end)
 assert(#calls == 5, "second view read bypassed an admitted draft publication")
 calls[5].callback({})
-assert(calls[6].route == "github.review.draft")
+assert(calls[6].route == "github.review.draft.get")
 calls[6].callback({ review_comments = { { body = "newer unsent body", remote_id = 42 } } })
 assert(loaded.review_comments[1].body == "newer unsent body")
 print("review draft publication preserves new edits across durable settlement")

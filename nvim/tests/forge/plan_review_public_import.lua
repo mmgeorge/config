@@ -5,16 +5,19 @@ local client = require("forge.client")
 local session = require("forge.session").harness
 local public_controller = require("forge.views.plan_review")
 local native_controller = require("forge.views.plan_review.native_controller")
-local original_request, original_accepting = client.request_for, client.host_accepting
+local original_request, original_accepting = client.request, client.host_is_accepting
 local directory = vim.fn.tempname()
 assert(vim.fn.mkdir(directory, "p") == 1)
 local path = vim.fs.joinpath(directory, "working.md")
 local source = { "# Physical plan", "", "# Tasks", "", "# Tests", "", "Preserve this source" }
 vim.fn.writefile(source, path)
-client.host_accepting = function() return true end
-client.request_for = function(_, method, params, callback)
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
-  assert(method == "harness.document")
+  assert(method == "session.document")
   if params.operation == "plan_open" then
     local source_row = {}
     for index, text in ipairs(source) do
@@ -56,7 +59,7 @@ local success, failure = xpcall(function()
 end, debug.traceback)
 
 if session.plan_review and session.plan_review.owner then session.plan_review.owner.close() end
-client.request_for, client.host_accepting = original_request, original_accepting
+client.request, client.host_is_accepting = original_request, original_accepting
 vim.fn.delete(path)
 vim.fn.delete(directory, "rf")
 assert(success, failure)

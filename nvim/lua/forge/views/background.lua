@@ -5,13 +5,13 @@ local notifications = require("forge.infra.notifications")
 --- Open a provider-free inspection view of a durable Background conversation.
 ---@param session_id? string
 function M.open(session_id)
-  local generation, failure = client.generation_config()
+  local generation, failure = client.generation_get_config()
   if not generation then notifications.error(failure or "Background configuration unavailable", "Background timeline") return end
   local workspace = vim.fn.getcwd()
   local function request(extra, callback)
-    client.request_host("background.timeline", vim.tbl_extend("force", {
+    client.request({ method = "background.session.document", params = vim.tbl_extend("force", {
       workspace = workspace, data_root = generation.data_root, session_id = session_id,
-    }, extra), callback)
+    }, extra) }, callback)
   end
   request({}, function(snapshot, request_failure)
     if request_failure then notifications.error(request_failure, "Background timeline") return end
@@ -34,7 +34,8 @@ function M.open(session_id)
     vim.api.nvim_buf_set_name(buffer, "ForgeBackground://" .. session_id)
     vim.wo[window].winbar = "Background · " .. snapshot.session.model .. " · c config · H history · q close"
     local owner
-    local timer = vim.uv.new_timer()
+    ---@type uv.uv_timer_t?
+    local timer = assert(vim.uv.new_timer())
     local function alive() return vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_win_is_valid(window) end
     local function notice(message) notifications.error(message, "Background timeline") end
     local function close()
@@ -54,6 +55,7 @@ function M.open(session_id)
     }, function(presentation, failure)
       if failure then close() notice(failure) return end
       owner = presentation
+      if not timer then return end
       timer:start(750, 750, vim.schedule_wrap(function()
         if alive() and owner and vim.api.nvim_get_current_tabpage() == vim.api.nvim_win_get_tabpage(window) then owner.sync() end
       end))

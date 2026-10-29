@@ -1,8 +1,12 @@
 vim.opt.runtimepath:prepend("nvim")
 local request, callback, notices, updates = 0, nil, {}, {}
 local alive = true
-package.loaded["forge.client"] = { request_for = function(session, method, params, receive)
-  assert(session == "session" and method == "harness.document" and params.operation == "background_terminals")
+package.loaded["forge.client"] = { request = function(request_specification, receive)
+  local session = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  assert(session == "session" and method == "session.document" and params.operation == "background_terminals")
   request, callback = request + 1, receive
 end }
 local watch = require("forge.views.harness.terminals").watch({

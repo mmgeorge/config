@@ -100,9 +100,11 @@ impl ReferenceContext {
             super::design_review::project(
                 &document,
                 &WidthProfile::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &source.declaration_syntax,
                 false,
                 None,

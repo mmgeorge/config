@@ -50,7 +50,7 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     if M._states ~= lifetime or (is_current and not is_current()) then return end
     if not snapshot then callback(nil, failure) return end
     local client = require("forge.client")
-    local generation, configuration_failure = client.generation_config()
+    local generation, configuration_failure = client.generation_get_config()
     if not generation then callback(nil, configuration_failure) return end
     local choice = require("forge.integrations.background_settings").model(snapshot, generation.backend.kind)
     local function publish_model(label)
@@ -63,7 +63,7 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
       ignored_paths = ignored or {} }
     if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
     else
-      client.request_generation(params, receive, publish_model, { model = choice.model,
+      client.generation_request(params, receive, publish_model, { model = choice.model,
         reasoning_effort = choice.thinking, service_tier = choice.service_tier,
         auto_compaction = snapshot.settings.auto_compaction })
     end

@@ -21,6 +21,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CHECK_HISTORY_VERSION: u32 = 5;
 
+/// Binds check history to one session, workspace, and storage location.
+pub struct CheckSupervisorContext {
+    pub session_id: String,
+    pub data_root: PathBuf,
+    pub workspace: PathBuf,
+    pub root: PathBuf,
+}
+
+struct CheckPublicationTarget<'target> {
+    sink: Option<&'target BackendEventSink>,
+    publication: &'target CheckPublication,
+}
+
 /// Owns project check admission, durable run history, and process cancellation for one session.
 pub struct CheckSupervisor {
     pub(crate) session_id: String,
@@ -179,15 +192,18 @@ impl CheckSupervisor {
 
     /// Reopens current-format history and marks detached execution interrupted without replaying commands.
     pub fn open(
-        session_id: String,
-        data_root: PathBuf,
-        workspace: PathBuf,
-        root: PathBuf,
+        scope: CheckSupervisorContext,
         presentation: Arc<Mutex<SessionPresentation>>,
         objects: crate::storage::objects::ObjectStore,
         repositories: Arc<forge_git::store::RepositoryStore>,
         trace: Arc<crate::trace::TraceStore>,
     ) -> Result<Arc<Self>> {
+        let CheckSupervisorContext {
+            session_id,
+            data_root,
+            workspace,
+            root,
+        } = scope;
         std::fs::create_dir_all(&root)?;
         let changes = super::changes::CheckChanges::open(&workspace, &root, objects, repositories)?;
         let mut records = BTreeMap::new();
@@ -1068,8 +1084,7 @@ impl CheckSupervisor {
                     run,
                     index,
                     context.clone(),
-                    sink,
-                    publication,
+                    CheckPublicationTarget { sink, publication },
                     cancelled,
                     external_cancelled,
                 )
@@ -1222,11 +1237,11 @@ impl CheckSupervisor {
         run: &mut PreparedCheckRun,
         index: usize,
         mut context: super::model::CheckCommand,
-        sink: Option<&BackendEventSink>,
-        publication: &CheckPublication,
+        target: CheckPublicationTarget<'_>,
         cancelled: &Arc<CheckCancellation>,
         external_cancelled: Option<&Arc<AtomicBool>>,
     ) -> Result<()> {
+        let CheckPublicationTarget { sink, publication } = target;
         let directory = self
             .workspace
             .join(super::config::relative_path(&context.directory)?)

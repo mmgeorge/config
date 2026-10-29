@@ -10,10 +10,14 @@ use sha2::{Digest, Sha256};
 #[derive(Clone)]
 pub struct ObjectStore {
     root: Arc<PathBuf>,
-    cache: Arc<
-        std::sync::Mutex<std::collections::HashMap<(PathBuf, String), (FileStamp, String, bool)>>,
-    >,
+    cache: Arc<std::sync::Mutex<std::collections::HashMap<(PathBuf, String), SourceCapture>>>,
     baseline: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+}
+
+struct SourceCapture {
+    stamp: FileStamp,
+    object_id: String,
+    unchanged: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,16 +104,16 @@ impl ObjectStore {
             .transpose()?
             .unwrap_or_default();
         let cache_key = (source.to_owned(), baseline_key);
-        if let Some((previous, identity, unchanged)) = self
+        if let Some(captured) = self
             .cache
             .lock()
             .map_err(|_| anyhow::anyhow!("checkpoint cache poisoned"))?
             .get(&cache_key)
-            && previous == &stamp
-            && (*unchanged || self.path(identity)?.is_file())
+            && captured.stamp == stamp
+            && (captured.unchanged || self.path(&captured.object_id)?.is_file())
         {
             return Ok(FileCapture {
-                object_id: (!unchanged).then(|| identity.clone()),
+                object_id: (!captured.unchanged).then(|| captured.object_id.clone()),
                 #[cfg(test)]
                 reused: true,
                 stamp: Some(stamp),
@@ -150,7 +154,14 @@ impl ObjectStore {
             cache.clear();
         }
         if reusable {
-            cache.insert(cache_key, (stamp.clone(), identity.clone(), unchanged));
+            cache.insert(
+                cache_key,
+                SourceCapture {
+                    stamp: stamp.clone(),
+                    object_id: identity.clone(),
+                    unchanged,
+                },
+            );
         } else {
             cache.remove(&cache_key);
         }

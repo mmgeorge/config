@@ -8,11 +8,15 @@ local refreshes = 0
 local auth_command = { "node", "-e", "process.exit(0)" }
 local calls = {}
 package.loaded["forge.views.harness.controller"] = { render = function() end }
-package.loaded["forge.client"] = { request_for = function(session_id, method, params, callback)
+package.loaded["forge.client"] = { request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   assert(session_id == "setup-test")
   calls[#calls + 1] = { method = method, params = params }
   vim.schedule(function()
-    if method == "backend.setup" then
+    if method == "session.provider.setup" then
       refreshes = refreshes + 1
       installation = installation or params.install
       callback({ available = installation, managed = installation, installable = true,

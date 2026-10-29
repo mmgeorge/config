@@ -19,7 +19,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local errors = {}
@@ -37,7 +37,7 @@ local success, failure = xpcall(function()
   require("forge").open_harness()
   await(function() return state.ready and state.session end, "Harness did not open")
   local configured
-  client.request("session.configure", { shell = "nushell" }, function(_, problem)
+  client.request({ method = "session.configure", params = { shell = "nushell" }, session_id = assert(require("forge.session").harness.session).id }, function(_, problem)
     assert(not problem, tostring(problem))
     configured = true
   end)
@@ -53,7 +53,7 @@ local success, failure = xpcall(function()
       and not state.task_operation and not state.state_sync_pending
   end, "resumed repair did not settle")
   local catalog
-  client.request("checks.list", {}, function(value, problem)
+  client.request({ method = "session.check.list", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(value, problem)
     assert(not problem, tostring(problem))
     catalog = value
   end)
@@ -62,7 +62,7 @@ local success, failure = xpcall(function()
   assert(#catalog.history == 2, vim.inspect(catalog.history))
   assert(catalog.history[1].state == "failed" and catalog.history[2].state == "failed")
   local exchanges
-  client.request("exchange.list", {}, function(value, problem)
+  client.request({ method = "session.exchange.list", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(value, problem)
     assert(not problem, tostring(problem))
     exchanges = value
   end)
@@ -88,7 +88,7 @@ local success, failure = xpcall(function()
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath

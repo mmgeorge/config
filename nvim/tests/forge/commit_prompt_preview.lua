@@ -2,7 +2,10 @@ vim.loader.enable(false)
 local pending, notices, deferred = {}, {}, {}
 package.loaded["forge"] = { setup = function() end }
 package.loaded["forge.revisions"] = { setup = function() end, values = function() return {} end }
-package.loaded["forge.client"] = { request_host = function(method, params, callback)
+package.loaded["forge.client"] = { request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   pending[#pending + 1] = { method = method, params = params, callback = callback }
 end }
 local original_notify, original_defer = vim.notify, vim.defer_fn
@@ -18,7 +21,7 @@ local success, failure = xpcall(function()
   vim.b.forge_workspace = "fixture-workspace"
   vim.cmd("ForgeDebugCommitPromptPreview")
   local first = vim.api.nvim_get_current_buf()
-  assert(pending[1].method == "repository.generate" and pending[1].params.operation == "preview")
+  assert(pending[1].method == "repository.generation" and pending[1].params.operation == "preview")
   assert(pending[1].params.workspace == "fixture-workspace" and pending[1].params.comparison == "head")
   assert(pending[1].params.model == nil and pending[1].params.generation == nil)
   assert(text(first):find("Preparing prompt", 1, true))

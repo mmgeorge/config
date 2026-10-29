@@ -52,9 +52,11 @@ local ok, failure = xpcall(function()
       state = spec[1], disposition = spec[2], checkpoint_before = "checkpoint",
     }
   end
-  require("forge.client").request_for = function(_, method, _, callback)
-    if method == "exchange.recovery" then callback(nil) return end
-    assert(method == "exchange.list")
+  require("forge.client").request = function(request_specification, callback)
+  local method = request_specification.method
+
+    if method == "session.exchange.recovery" then callback(nil) return end
+    assert(method == "session.exchange.list")
     callback(history)
   end
   local options

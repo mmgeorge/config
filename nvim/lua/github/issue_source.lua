@@ -1,5 +1,4 @@
----@module 'blink.cmp'
----@class blink.cmp.Source
+---@class GithubIssueCompletionSource
 local source = {}
 
 ---@class GithubIssueSourceMatch

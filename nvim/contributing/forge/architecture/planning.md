@@ -477,7 +477,7 @@ produced it and increments the artifact count in the winbar. The delta uses the 
 tree while labeling the canonical plan as an artifact, so revision history stays attached to its
 causal turn instead of creating a sibling `Plan revision created` event or dumping the complete plan
 into the timeline. Harness never opens PlanReview automatically. `op` selects a session artifact
-through the floating no-preview picker and opens its physical working copy through `plan.get`.
+through the floating no-preview picker and opens its physical working copy through `session.plan.get`.
 The picker selects the current task's plan first. Browsing another plan or revision never selects
 a task. Each review document captures its session, plan, and revision digest independently.
 `C` creates an inline annotation at the current source line. Cursor focus expands its editable body,
@@ -605,7 +605,7 @@ Prerequisites must pass before dependent definitions run.
 `auto` defaults to true. The plan's `checks` list explicitly selects enabled
 checks, and `disabled_checks` suppresses checks for that plan even when their
 automatic triggers match. The plan-specific `oc` picker and visual deletion
-submit `plan.checks.update` through the same versioned review-edit path as test
+submit `session.plan.check.update` through the same versioned review-edit path as test
 deletion. Rust expands prerequisite and dependent choices, recomputes the preview,
 retains annotations, and persists the new review digest. The repository check
 configuration remains unchanged. Check rows carry semantic check identities so
@@ -714,7 +714,7 @@ of the active broker lock.
 `CompletionQueue` retains deferred validation and the original change owner across
 queued interactions. The final interaction therefore checks changes from the entire
 batch. If queue editing removes the remaining work, the host input worker invokes
-`checks.complete` under normal execution admission. Failed, paused, or waiting work retains its existing
+`session.check.complete` under normal execution admission. Failed, paused, or waiting work retains its existing
 admission boundaries. Plan Checking and explicitly requested runs remain independent.
 
 One Rust-owned runner serves the automatic gate and `check_run`. Its provider-neutral

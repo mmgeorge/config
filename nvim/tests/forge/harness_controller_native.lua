@@ -2,12 +2,12 @@ vim.loader.enable(false)
 local client = require("forge.client")
 local session = require("forge.session")
 local controller = require("forge.views.harness.controller")
-local original_request, original_subscribe, original_generation = client.request_for, client.subscribe, client.host_generation
-local original_accepting = client.host_accepting
+local original_request, original_subscribe, original_generation = client.request, client.session_events_subscribe, client.host_get_generation
+local original_accepting = client.host_is_accepting
 local original_completion = package.loaded["blink.cmp"]
 local completion_visible = false
 package.loaded["blink.cmp"] = { hide = function() completion_visible = false end }
-client.host_accepting = function() return true end
+client.host_is_accepting = function() return true end
 local state = session.harness
 local generation, submitted, receive, navigated, sync_count = 1, nil, nil, nil, 0
 local initial = {}
@@ -22,29 +22,33 @@ local function snapshot(document, text, composer)
     metadata = { target = {}, decoration = {}, editable_region = composer and { { id = "composer", revision = 0,
       range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = #text } } } } or {} } } } }
 end
-client.host_generation = function() return generation end
-client.subscribe = function(callback) receive = callback return function() end end
-client.request_for = function(session_id, method, params, callback)
+client.host_get_generation = function() return generation end
+client.session_events_subscribe = function(callback) receive = callback return function() end end
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   assert(session_id == "native-controller")
-  if method == "input.get" then
+  if method == "session.input.get" then
     callback({ revision = state.input and state.input.revision or 0, messages = {}, suspended = false, execution_busy = false })
     return
   end
-  if method == "input.apply" then submitted = params submitted_callback = callback return end
+  if method == "session.input.apply" then submitted = params submitted_callback = callback return end
   if method == "session.configure" then
     assert(type(params.status_thoughts) == "boolean")
     status_thought_request[#status_thought_request + 1] = { params = params, callback = callback }
     return
   end
-  if method == "task.transition" then
+  if method == "session.command.apply" then
     goal_request[#goal_request + 1] = { method = method, params = params, callback = callback }
     return
   end
-  if method == "health.get" then callback({ responsive = true }) return end
-  if method == "state.get" then callback({ session = state.session }) return end
-  if method == "history.record" then vim.schedule(function() callback({}) end) return end
-  if method == "backend.models" then callback({}) return end
-  assert(method == "harness.document")
+  if method == "session.health.get" then callback({ responsive = true }) return end
+  if method == "session.state.get" then callback({ session = state.session }) return end
+  if method == "session.prompt.history.record" then vim.schedule(function() callback({}) end) return end
+  if method == "session.provider.model.list" then callback({}) return end
+  assert(method == "session.document")
   if params.operation == "open" then
     initial[#initial + 1] = params
     vim.schedule(function() callback({ transcript = snapshot(params.document, "Native transcript"),
@@ -106,14 +110,16 @@ local success, failure = xpcall(function()
   null_snapshot.session = state.session
   controller.activate_snapshot(null_snapshot)
   assert(state.goal == nil and state.active_elicitation == nil, "startup retained nullable state")
-  local original_state_request = client.request_for
+  local original_state_request = client.request
   local synchronized = false
-  client.request_for = function(_, method, _, callback)
-    if method == "input.get" then
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+    if method == "session.input.get" then
       callback({ revision = 0, messages = {}, suspended = false, execution_busy = false })
       return
     end
-    assert(method == "state.get")
+    assert(method == "session.state.get")
     callback(null_snapshot)
     synchronized = true
   end
@@ -126,12 +132,14 @@ local success, failure = xpcall(function()
     assert(result and not failure)
     completed = completed + 1
   end }
-  client.request_for = function(_, method, _, callback)
-    if method == "input.get" then
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+    if method == "session.input.get" then
       callback({ revision = 0, messages = {}, suspended = false, execution_busy = false })
       return
     end
-    assert(method == "state.get")
+    assert(method == "session.state.get")
     reads[#reads + 1] = callback
   end
   receive("plan_changes_requested", {}, "native-controller")
@@ -144,7 +152,7 @@ local success, failure = xpcall(function()
   reads[2](stale)
   assert(completed == 1 and not state.sync_error, "snapshot reconciliation lost a waiting caller")
   state.runtime_epoch, state.timeline_revision, state.snapshot_revision = nil, 0, 0
-  client.request_for = original_state_request
+  client.request = original_state_request
   assert(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)[1] == "Native transcript")
   local approval_view = require("forge.views.harness.approval")
   local permission = { id = "navigation", item_list = { {
@@ -152,13 +160,17 @@ local success, failure = xpcall(function()
     choice_list = { { id = "allow_once", label = "Allow once" }, { id = "cancel", label = "Reject all" } },
   } } }
   local pending_snapshot
-  local snapshot_request = client.request_for
+  local snapshot_request = client.request
   local function approval_snapshot(pending)
     return { session = state.session, approval = pending, status = { kind = "working" } }
   end
-  client.request_for = function(session_id, method, params, callback)
-    if method == "state.get" then pending_snapshot = callback return end
-    return snapshot_request(session_id, method, params, callback)
+  client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.state.get" then pending_snapshot = callback return end
+    return snapshot_request(request_specification, callback)
   end
   receive("state_invalidated", {}, "native-controller")
   local stale_snapshot = pending_snapshot
@@ -184,7 +196,7 @@ local success, failure = xpcall(function()
   vim.fn.maparg("q", "n", false, true).callback()
   receive("backend_event", { kind = "approval_cancelled", data = { id = permission.id } }, "native-controller")
   assert(#state.approval == 0 and not state.dismissed_approval_id)
-  client.request_for = snapshot_request
+  client.request = snapshot_request
   assert(vim.wo[state.transcript_win].breakindent, "native attachment discarded Harness continuation indentation")
   assert(vim.wo[state.composer_win].winbar == "", "composer still displays key hints")
   state.session.name = "Parser 100% coverage"
@@ -508,16 +520,23 @@ local success, failure = xpcall(function()
   assert(#state.queue == 1 and submitted == nil, "Lua independently dispatched host-owned input")
   state.queue = {}
   local original_plain_request = client.request
-  local child_request_for = client.request_for
-  client.request_for = function(session_id, method, params, callback)
-    if method == "state.get" then return end
-    return child_request_for(session_id,method,params,callback)
+  local child_request_for = client.request
+  client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.state.get" then return end
+    return child_request_for(request_specification,callback)
   end
   local child_request = {}
-  client.request = function(method, params, callback)
-    if method == "history.record" or method == "state.get" then return end
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.prompt.history.record" or method == "session.state.get" then return end
     child_request[#child_request + 1] = { method = method, params = params }
-    if method == "agent.interrupt" then callback({ status = "interrupting" }) end
+    if method == "session.agent.interrupt" then callback({ status = "interrupting" }) end
   end
   state.busy = true
   state.capability.native_steer = true
@@ -529,17 +548,17 @@ local success, failure = xpcall(function()
   state.agent.summary = { child = { state = "running", target = { thread_id = "child-thread", turn_id = "child-turn" } } }
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
   controller.cancel_turn()
-  assert(child_request[1].method == "agent.interrupt" and child_request[1].params.target == "child")
+  assert(child_request[1].method == "session.agent.interrupt" and child_request[1].params.target == "child")
   assert(not state.cancel_requested, "settled child cancellation retained the parent cancellation flag")
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "child instruction" })
   controller.steer_submit()
-  assert(child_request[2].method == "agent.message" and child_request[2].params.target == "child")
+  assert(child_request[2].method == "session.agent.message.send" and child_request[2].params.target == "child")
   state.cancel_requested = false
   child_exchange.state = "complete"
   state.agent.summary.child = { state = "complete" }
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
   controller.cancel_turn()
-  assert(child_request[#child_request].method == "agent.interrupt" and child_request[#child_request].params.target == "child",
+  assert(child_request[#child_request].method == "session.agent.interrupt" and child_request[#child_request].params.target == "child",
     "completed-child interruption must remain scoped to the child")
   state.agent.run[1].task_name = "parser-review"
   state.agent.run[1].created_at_ms = os.time() * 1000
@@ -587,7 +606,7 @@ local success, failure = xpcall(function()
   controller.task_transition = original_transition
   receive("backend_event", {kind="approval_cancelled",data={id=root_permission.id}},"native-controller")
   client.request = original_plain_request
-  client.request_for = child_request_for
+  client.request = child_request_for
   state.busy, state.task_operation, state.task_config = true, nil, nil
   state.subagent_tools = false
   for _, enabled in ipairs({true,false}) do
@@ -679,8 +698,8 @@ local success, failure = xpcall(function()
   controller.configure = original_configure
 end, debug.traceback)
 if state.working_timer then state.working_timer:stop() state.working_timer:close() state.working_timer = nil end
-client.request_for, client.subscribe, client.host_generation = original_request, original_subscribe, original_generation
-client.host_accepting = original_accepting
+client.request, client.session_events_subscribe, client.host_get_generation = original_request, original_subscribe, original_generation
+client.host_is_accepting = original_accepting
 package.loaded["blink.cmp"] = original_completion
 if not success then
   print(failure)

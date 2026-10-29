@@ -76,7 +76,7 @@ function M.attach(state)
     callback = function()
       if vim.fn.getcmdtype() ~= ":" or vim.v.event.abort then return end
       local window = state.transcript_win
-      if not vim.api.nvim_win_is_valid(window)
+      if not window or not vim.api.nvim_win_is_valid(window)
         or vim.api.nvim_get_current_tabpage() ~= vim.api.nvim_win_get_tabpage(window) then return end
       if blocked(vim.fn.getcmdline()) then
         vim.cmd("let v:event.abort = v:true")

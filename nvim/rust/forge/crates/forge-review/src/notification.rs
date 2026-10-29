@@ -45,6 +45,14 @@ struct NotificationLocal {
     unread: HashSet<String>,
     done: VecDeque<NotificationRecord>,
 }
+struct NotificationOperation {
+    record: Option<NotificationRecord>,
+    remote: Arc<dyn NotificationRemote>,
+    workspace: PathBuf,
+    hostname: String,
+    cursor: Option<u32>,
+}
+
 struct NotificationDocument {
     admission: Arc<DocumentAdmission>,
     workspace: PathBuf,
@@ -254,7 +262,17 @@ impl NotificationDocumentService {
         };
         let _busy = NotificationBusy(Arc::clone(&owner));
         let result = self
-            .perform(&owner, &input, record, remote, workspace, hostname, cursor)
+            .perform(
+                &owner,
+                &input,
+                NotificationOperation {
+                    record,
+                    remote,
+                    workspace,
+                    hostname,
+                    cursor,
+                },
+            )
             .await;
         drop(admission);
         result
@@ -263,12 +281,15 @@ impl NotificationDocumentService {
         &self,
         owner: &Arc<Mutex<NotificationDocument>>,
         input: &DocumentInput,
-        record: Option<NotificationRecord>,
-        remote: Arc<dyn NotificationRemote>,
-        workspace: PathBuf,
-        hostname: String,
-        cursor: Option<u32>,
+        operation: NotificationOperation,
     ) -> Result<NotificationUpdate> {
+        let NotificationOperation {
+            record,
+            remote,
+            workspace,
+            hostname,
+            cursor,
+        } = operation;
         let mut recovery = None;
         let mut diagnostic = None;
         if matches!(input.action.as_str(), "refresh" | "more") {

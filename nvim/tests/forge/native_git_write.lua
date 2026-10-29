@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 local client = require("forge.client")
 local writer = require("forge.git.write")
-local original = client.request_host
+local original = client.request
 local perf = require("forge.infra.perf")
 local original_event = perf.event
 local event_list = {}
@@ -10,7 +10,10 @@ perf.event = function(_, event, payload)
 end
 local ok, failure = xpcall(function()
   local acknowledged, operation_list, chunks = false, {}, {}
-  client.request_host = function(method, params, callback, progress)
+  client.request = function(request_specification, callback, progress)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
     assert(method == "repository.write")
     operation_list[#operation_list + 1] = params.operation
     if params.operation == "prepare" then
@@ -37,7 +40,7 @@ local ok, failure = xpcall(function()
   assert(result.ok and result.stderr == "Pushing\r\ndone")
   assert(table.concat(chunks) == "Pushing\ndone" and acknowledged)
   assert(table.concat(operation_list, ",") == "prepare,submit,acknowledge")
-  local expected = { "git.write.prepare.start", "git.write.prepare.complete", "git.write.prepare.native.write_queue", "git.write.submit.start",
+  local expected = { "git.write.prepare.start", "git.write.prepare.complete", "git.write.prepare.native.write_queue", "git.write.prepared", "git.write.submit.start",
     "git.write.progress.first", "git.write.complete", "git.write.acknowledge.start", "git.write.acknowledge.complete" }
   assert(#event_list == #expected, "writer timing count differs")
   for index, event in ipairs(event_list) do
@@ -46,9 +49,11 @@ local ok, failure = xpcall(function()
     assert(event.payload.elapsed_ms >= 0, "writer timing omitted elapsed time")
   end
   assert(event_list[3].payload.ms == 1250, "native timing lost microsecond conversion")
-  assert(event_list[6].payload.operation_id == "1" and event_list[6].payload.code == 0)
+  assert(event_list[7].payload.operation_id == "1" and event_list[7].payload.code == 0)
 
-  client.request_host = function(_, params, callback)
+  client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
     if params.operation == "prepare" then callback({ intent = "uncertain" }, nil)
     elseif params.operation == "submit" then callback({ operation_id = "2", target = { { completion = "outcome_unknown", diagnostic = "connection closed" } } }, nil)
     else error("uncertain result was automatically acknowledged") end
@@ -57,7 +62,9 @@ local ok, failure = xpcall(function()
     assert(not value.ok and value.output:find("connection closed", 1, true))
   end)
 
-  client.request_host = function(_, params, callback)
+  client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
     if params.operation == "prepare" then callback({ intent = "incomplete" }, nil)
     elseif params.operation == "submit" then callback({ operation_id = "3", target = {} }, nil)
     else error("incomplete result was automatically acknowledged") end
@@ -67,7 +74,9 @@ local ok, failure = xpcall(function()
   end)
 
   local cancelled = false
-  client.request_host = function(_, params, callback, progress)
+  client.request = function(request_specification, callback, progress)
+  local params = request_specification.params or {}
+
     if params.operation == "prepare" then callback({ intent = "misordered" }, nil)
     elseif params.operation == "submit" then
       progress({ stream = "stdout", sequence = 2, bytes = vim.base64.encode("bad order") })
@@ -81,7 +90,9 @@ local ok, failure = xpcall(function()
   assert(cancelled, "invalid progress did not cancel its native owner")
 
   operation_list = {}
-  client.request_host = function(_, params, callback)
+  client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
     operation_list[#operation_list + 1] = params.operation
     if params.operation == "prepare" then callback({ intent = "completed" }, nil)
     elseif params.operation == "submit" then
@@ -97,7 +108,9 @@ local ok, failure = xpcall(function()
 
   operation_list = {}
   local prepared_callback
-  client.request_host = function(_, params, callback)
+  client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
     operation_list[#operation_list + 1] = params.operation
     if params.operation == "prepare" then prepared_callback = callback
     elseif params.operation == "cancel" then callback({}, nil)
@@ -115,7 +128,9 @@ local ok, failure = xpcall(function()
 
   operation_list = {}
   local submitted_callback
-  client.request_host = function(_, params, callback)
+  client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
     operation_list[#operation_list + 1] = params.operation
     if params.operation == "prepare" then callback({ intent = "cancel-during-submit" }, nil)
     elseif params.operation == "submit" then submitted_callback = callback
@@ -135,6 +150,6 @@ local ok, failure = xpcall(function()
   assert(not cancelled_during_submit.ok and cancelled_during_submit.output:find("cancel raced with process completion", 1, true))
   assert(table.concat(operation_list, ",") == "prepare,submit,cancel", "uncertain cancellation acknowledged a recoverable outcome")
 end, debug.traceback)
-client.request_host = original
+client.request = original
 perf.event = original_event
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else vim.cmd("qa!") end

@@ -40,7 +40,7 @@ local function request_preview(instance, entry)
   instance.preview_generation = instance.preview_generation + 1
   local generation = instance.preview_generation
   if not entry then return end
-  client.request("session.preview", { session_id = entry.id }, function(result, request_error)
+  client.request({ session_id = entry.id, method = "session.preview", params = { session_id = entry.id } }, function(result, request_error)
     if active ~= instance or generation ~= instance.preview_generation then return end
     if request_error then
       notifications.error(request_error, "Session preview")
@@ -50,14 +50,16 @@ local function request_preview(instance, entry)
   end)
 end
 
----@param instance table
----@param entry table
+---@param left? string
+---@param right? string
 local function same_workspace(left, right)
   if left == right then return true end
   local resolved = left and vim.uv.fs_realpath(left)
   return resolved ~= nil and right ~= nil and resolved == vim.uv.fs_realpath(right)
 end
 
+---@param instance table
+---@param entry table
 local function resume_session(instance, entry)
   local current_session = session.harness.session or {}
   if not same_workspace(entry.workspace, current_session.workspace) then
@@ -82,11 +84,15 @@ local load_session_list
 ---@param entry table
 local function delete_session(instance, entry)
   if not entry then return end
-  if session.harness.session and session.harness.session.id == entry.id then
+  if not instance.owner_session_id then
+    notifications.warn("Wait for the calling session to initialize before deleting saved sessions.", "ForgeSessions")
+    return
+  end
+  if instance.owner_session_id == entry.id then
     notifications.warn("The active session cannot be deleted.", "ForgeSessions")
     return
   end
-  client.request("session.delete", { session_id = entry.id }, function(_, request_error)
+  client.request({ session_id = instance.owner_session_id, method = "session.delete", params = { session_id = entry.id } }, function(_, request_error)
     if active ~= instance then return end
     if request_error then
       notifications.error(request_error, "ForgeSessions")
@@ -168,7 +174,7 @@ end
 load_session_list = function(instance)
   instance.list_generation = instance.list_generation + 1
   local generation = instance.list_generation
-  client.request("session.list", { scope = instance.scope, workspace = vim.fn.getcwd() }, function(result, request_error)
+  client.request({ method = "session.list", params = { scope = instance.scope, workspace = vim.fn.getcwd() } }, function(result, request_error)
     if active ~= instance or generation ~= instance.list_generation then return end
     if request_error then
       notifications.error(request_error, "ForgeSessions")
@@ -200,6 +206,7 @@ function SessionPicker.open(host, options)
   end
   local instance = {
     host = host,
+    owner_session_id = session.harness.session and session.harness.session.id,
     scope = "repo",
     open_mode = "current",
     entry_list = {},

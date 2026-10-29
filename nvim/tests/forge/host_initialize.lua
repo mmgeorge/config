@@ -38,7 +38,7 @@ local function initialize_host(attempt)
       if chunk then stderr = stderr .. chunk end
     end,
   }, function(result) exited = result end)
-  process:write(protocol.encode_request(1, "initialize", {
+  process:write(protocol.encode_request(1, "host.initialize", {
     protocol_version = protocol.VERSION,
     recovery_directory = vim.fs.joinpath(data_root, "forge", "recovery", "github", "v1"),
     status_ignored_directory = vim.fs.joinpath(data_root, "forge", "status-ignored"),
@@ -47,8 +47,8 @@ local function initialize_host(attempt)
     "host initialization timed out on attempt " .. attempt .. ": " .. vim.inspect({ stderr = stderr }))
   assert(initialized and not initialized.error and initialized.result.protocol_version == protocol.VERSION,
     "host initialization failed on attempt " .. attempt .. ": " .. vim.inspect({ initialized = initialized, exited = exited, stderr = stderr }))
-  process:write(protocol.encode_request(0, "transport.consumed", { bytes = received_bytes, frames = received_frames }))
-  process:write(protocol.encode_request(2, "shutdown", {}))
+  process:write(protocol.encode_request(0, "host.transport.consumed", { bytes = received_bytes, frames = received_frames }))
+  process:write(protocol.encode_request(2, "host.shutdown", {}))
   assert(vim.wait(3000, function() return exited ~= nil end, 200),
     "host shutdown timed out on attempt " .. attempt .. ": " .. vim.inspect({ stderr = stderr }))
   assert(process:wait(0).code == 0, "host process was not collected on attempt " .. attempt)

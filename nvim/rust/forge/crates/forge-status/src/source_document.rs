@@ -70,6 +70,12 @@ struct SourceDocument {
     _admission: DocumentAdmission,
 }
 
+struct PreparedSource {
+    source: SourceVersion,
+    syntax: Option<SyntaxHandle>,
+    syntax_diagnostic: Option<String>,
+}
+
 impl SourceDocumentService {
     pub fn new(store: Arc<RepositoryStore>, syntax: Arc<SyntaxEngine>) -> Self {
         Self {
@@ -110,7 +116,17 @@ impl SourceDocumentService {
         let admission = self.admitted.admit(id.clone())?;
         let source = SourceVersion::new(text, forge_diff::source::Representation::Raw)
             .map_err(|error| anyhow::anyhow!("invalid literal source: {error:?}"))?;
-        self.adopt_version(id, title, source, None, None, kind, admission)
+        self.adopt_version(
+            id,
+            title,
+            PreparedSource {
+                source,
+                syntax: None,
+                syntax_diagnostic: None,
+            },
+            kind,
+            admission,
+        )
     }
 
     pub async fn open_version(
@@ -143,9 +159,11 @@ impl SourceDocumentService {
         self.adopt_version(
             id,
             path.display_label(),
-            source,
-            syntax,
-            syntax_diagnostic,
+            PreparedSource {
+                source,
+                syntax,
+                syntax_diagnostic,
+            },
             "captured",
             admission,
         )
@@ -155,12 +173,15 @@ impl SourceDocumentService {
         &self,
         id: DocumentId,
         title: String,
-        source: SourceVersion,
-        syntax: Option<SyntaxHandle>,
-        syntax_diagnostic: Option<String>,
+        prepared: PreparedSource,
         kind: &str,
         admission: DocumentAdmission,
     ) -> Result<SourceOpen> {
+        let PreparedSource {
+            source,
+            syntax,
+            syntax_diagnostic,
+        } = prepared;
         let object = source
             .identity()
             .content_hash

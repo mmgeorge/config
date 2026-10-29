@@ -2,9 +2,12 @@ local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 local pending = {}
-client.host_generation = function() return 1 end
-client.host_accepting = function() return true end
-client.request_for = function(_, method, params, callback)
+client.host_get_generation = function() return 1 end
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
   pending[#pending + 1] = { method = method, params = vim.deepcopy(params), callback = callback }
 end
@@ -48,7 +51,7 @@ owner.action("question", function() end)
 replace_body("Why own this state?")
 assert(text():find("Plan question", 1, true), "question used the ordinary comment heading")
 vim.cmd("write")
-assert(pending[2].method == "plan.questions.answer", "saving did not ask the LLM")
+assert(pending[2].method == "session.plan.question.answer", "saving did not ask the LLM")
 assert(pending[2].params.draft_annotation[1].kind == "question", "question kind was lost in the request")
 assert(text():find("Answering…", 1, true), "request omitted persistent progress")
 leave_and_return("Answering…")
@@ -67,7 +70,7 @@ assert(pending[3].params.operation == "plan_save_annotations", "saving an answer
 pending[3].callback({ saved = true })
 replace_body("Why this interface?")
 vim.cmd("write")
-assert(pending[4].method == "plan.questions.answer", "editing an answered question did not ask again")
+assert(pending[4].method == "session.plan.question.answer", "editing an answered question did not ask again")
 replace_body("Newer unsaved question?")
 pending[4].callback(response("Why this interface?", "This is an older answer."))
 assert(vim.bo[buffer].modified and comments.capture(buffer)[1].source.body == "Newer unsaved question?", "late answer overwrote newer typing")
@@ -77,7 +80,7 @@ pending[5].callback(nil, "Provider unavailable")
 assert(#notices == 1 and notices[1] == "Provider unavailable", "provider failure was not surfaced")
 assert(vim.bo[buffer].modified and not owner.saving, "provider failure lost the draft or blocked retry")
 vim.cmd("write")
-assert(pending[6].method == "plan.questions.answer", "retry did not resubmit the unanswered question")
+assert(pending[6].method == "session.plan.question.answer", "retry did not resubmit the unanswered question")
 pending[6].callback(response("Newer unsaved question?", "The interface establishes the ownership boundary."))
 assert(not vim.bo[buffer].modified and text():find("ownership boundary.", 1, true), "retry did not retain the answer")
 owner.action("toggle_public", function(_, failure) assert(not failure, failure) end)
@@ -103,7 +106,7 @@ local row = vim.api.nvim_win_get_cursor(0)[1] - 1
 vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "Which getter should I use?" })
 vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
 vim.cmd("write")
-assert(pending[8].method == "plan.questions.answer" and pending[8].params.draft_annotation[2].parent_id == "1",
+assert(pending[8].method == "session.plan.question.answer" and pending[8].params.draft_annotation[2].parent_id == "1",
   "question request omitted the follow-up identity")
 local threaded = response("Newer unsaved question?", "The interface establishes the ownership boundary.")
 threaded.annotation[2] = { id = "2", kind = "question", parent_id = "1",

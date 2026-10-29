@@ -23,9 +23,12 @@ local skill_enabled = { walkthrough = true, imagegen = false }
 local mcp_enabled = false
 local request_method_list = {}
 
-client.request = function(method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   request_method_list[#request_method_list + 1] = method
-  if method == "backend.skills" then
+  if method == "session.provider.skill.list" then
     callback({
       {
         name = "walkthrough",
@@ -50,10 +53,10 @@ client.request = function(method, params, callback)
         user_invocable = false,
       },
     })
-  elseif method == "backend.skills.set_enabled" then
+  elseif method == "settings.skill.set_enabled" then
     skill_enabled[params.name] = params.enabled
     callback({ name = params.name, enabled = params.enabled, restart_required = false })
-  elseif method == "backend.mcp" then
+  elseif method == "session.provider.mcp.list" then
     callback({
       {
         name = "github-mcp",
@@ -70,7 +73,7 @@ client.request = function(method, params, callback)
         },
       },
     })
-  elseif method == "backend.mcp.set_enabled" then
+  elseif method == "settings.mcp.set_enabled" then
     mcp_enabled = params.enabled
     callback({ name = params.name, enabled = params.enabled, restart_required = false })
   else
@@ -182,14 +185,16 @@ assert_true(mutation and mutation.enabled, "Space should report the completed MC
 mcp_picker = picker._state_for_test()
 mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
 assert_true(mcp_page.option_list[1].label == "✓ github-mcp", "connected MCPs should use the check icon")
-assert_true(vim.tbl_contains(request_method_list, "backend.mcp.set_enabled"),
+assert_true(vim.tbl_contains(request_method_list, "settings.mcp.set_enabled"),
   "MCP toggles should use the normalized broker operation")
 
 picker.close(false)
 client.request = original_request
 provider_catalog.clear()
 local initial_reply
-client.request = function(_, _, callback) initial_reply = callback end
+client.request = function(request_specification, callback)
+
+   initial_reply = callback end
 provider_picker.open_mcp({ host = host })
 mcp_picker = picker._state_for_test()
 assert_true(mcp_picker.frame.lines[1] ~= nil, "MCP picker must open before inventory arrives")
@@ -206,8 +211,10 @@ assert_true(vim.iter(mcp_picker.frame.lines):any(function(line) return line:find
 picker.close(false)
 local catalog_reads = 0
 local pending_refresh
-client.request = function(method, _, callback)
-  assert_true(method == "backend.mcp", "loading refresh should only query MCP status")
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+  assert_true(method == "session.provider.mcp.list", "loading refresh should only query MCP status")
   catalog_reads = catalog_reads + 1
   if catalog_reads == 1 then
     callback({ { name = "starting-server", enabled = true, status = "loading" } })
@@ -256,7 +263,9 @@ provider_picker.open_mcp({ host = host })
 assert_true(vim.wait(3000, function() return pending_refresh ~= nil end, 20), "second picker should poll")
 picker.close(false)
 local old_refresh = pending_refresh
-client.request = function(_, _, callback)
+client.request = function(request_specification, callback)
+
+
   callback({ { name = "replacement", enabled = true, status = "connected" } })
 end
 provider_picker.open_mcp({ host = host })
@@ -267,8 +276,10 @@ assert_true(mcp_page.option_list[1].id == "replacement", "closed picker response
 picker.close(false)
 mutation = nil
 local fail_refresh = false
-client.request = function(method, _, callback)
-  if method == "backend.mcp.set_enabled" then
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+  if method == "settings.mcp.set_enabled" then
     fail_refresh = true
     callback({ name = "server", enabled = true, restart_required = true })
   elseif fail_refresh then

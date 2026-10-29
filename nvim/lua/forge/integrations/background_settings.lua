@@ -29,15 +29,15 @@ end
 ---@param preferences ForgeBackgroundPreferences?
 ---@param callback fun(snapshot: ForgeBackgroundSettings?, failure: string?)
 function M.request(snapshot, preferences, callback)
-  local generation, failure = client.generation_config()
+  local generation, failure = client.generation_get_config()
   if not generation then callback(nil, failure) return end
   local baseline = defaults()
   baseline.models[generation.backend.kind] = baseline.models[generation.backend.kind]
     or { model = generation.model, thinking = generation.reasoning_effort, service_tier = generation.service_tier }
-  client.request_host("background.settings", {
+  client.request({ method = "background.settings", params = {
     data_root = generation.data_root, defaults = baseline,
     expected_revision = snapshot and snapshot.revision, settings = preferences,
-  }, function(result, request_failure)
+  } }, function(result, request_failure)
     if request_failure then callback(nil, request_failure)
     elseif type(result) ~= "table" or type(result.settings) ~= "table" then callback(nil, "Invalid Background settings response")
     else

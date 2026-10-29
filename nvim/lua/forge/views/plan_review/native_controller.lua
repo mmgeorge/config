@@ -139,7 +139,7 @@ local function action(review, name)
       require("forge.views.plan_review.entity_rename").proposed(review, result.rename, captured, function(name, finish)
         if session.harness.busy then finish() notice("A Harness request is already running") return end
         session.harness.busy = true
-        local queued = review.owner.submit("plan.entity.rename", { symbol = result.rename.symbol, name = name,
+        local queued = review.owner.submit("session.plan.entity.rename", { symbol = result.rename.symbol, name = name,
           expected_version = result.rename.expected_version }, function(renamed, failure)
           session.harness.busy = false
           if failure then finish() notice(failure) return end
@@ -220,7 +220,7 @@ local function submit(review, method, params)
     if not completed.owner.closed then close_review(completed) end
     if result then controller.activate_snapshot(result) end
     controller.render()
-    if method == "plan.acceptance.begin"
+    if method == "session.plan.acceptance.begin"
         and type(vim.tbl_get(result or {}, "active_plan", "acceptance")) == "table" then
       controller.task_transition({ action = "execute", plan_id = review.plan.id, digest = review.plan.review_digest })
     end
@@ -236,7 +236,7 @@ local function update_checks(review, enabled, tests, receive)
   end
   if session.harness.busy then notice("A Harness request is already running") if receive then receive(false) end return end
   session.harness.busy = true
-  local queued = review.owner.submit("plan.checks.update", { enabled = enabled, tests = tests or {}, expected_version = review.owner.version }, function(result, failure)
+  local queued = review.owner.submit("session.plan.check.update", { enabled = enabled, tests = tests or {}, expected_version = review.owner.version }, function(result, failure)
     session.harness.busy = false
     local applied = false
     if failure then notice(failure) else applied = adopt_revision(review, result) end
@@ -268,7 +268,7 @@ local function delete_tests(review)
     if next(checks) then update_checks(review, checks, tests) return end
     if session.harness.busy then notice("A Harness request is already running") return end
     session.harness.busy = true
-    local queued = review.owner.submit("plan.tests.delete", { tests = tests, expected_version = review.owner.version }, function(result, error)
+    local queued = review.owner.submit("session.plan.test.delete", { tests = tests, expected_version = review.owner.version }, function(result, error)
       session.harness.busy = false
       if error then notice(error) return end
       return adopt_revision(review, result)
@@ -292,14 +292,14 @@ local function prompt_decision(review, method, title)
   local plan_id, revision = review.plan.id, review.plan.model_revision
   local view = review.owner.current_view()
   if not view then return end
-  local generation = client.host_generation()
+  local generation = client.host_get_generation()
   review.decision_window = require("forge.views.plan_review.decision").open({
     title = title, parent_win = view.window,
   }, function(comment)
     review.decision_window = nil
     if comment == nil then return end
     if session.harness.plan_review ~= review or review.owner.closed
-      or client.host_generation() ~= generation or not session.harness.session
+      or client.host_get_generation() ~= generation or not session.harness.session
       or session.harness.session.id ~= review.session_id
       or not vim.api.nvim_buf_is_valid(review.buf)
       or tick ~= vim.api.nvim_buf_get_changedtick(review.buf)
@@ -324,13 +324,13 @@ local function commands(review)
   for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function()
-    prompt_decision(review, "plan.acceptance.begin", "Approval comment (optional)")
+    prompt_decision(review, "session.plan.acceptance.begin", "Approval comment (optional)")
   end)
   command_set.register(set, "abort_plan", function()
-    if not review.plan.historical_revision then submit(review, "plan.cancel", {}) end
+    if not review.plan.historical_revision then submit(review, "session.plan.cancel", {}) end
   end)
   command_set.register(set, "request_changes", function()
-    prompt_decision(review, "plan.request_changes", "Request changes comment (optional)")
+    prompt_decision(review, "session.plan.changes.request", "Request changes comment (optional)")
   end)
   command_set.register(set, "close", function() close_review(review) end)
   command_set.register(set, "help", function() keymaps.show_view_help("plan_review", set, "PlanReview") end)
@@ -344,10 +344,10 @@ function M.open(plan)
   if previous and previous.plan.id == plan.id and previous.plan.review_digest == plan.review_digest
     and previous.plan.historical_revision == plan.historical_revision and vim.api.nvim_buf_is_valid(previous.buf) then
     local refresh_execution = plan.state == "accepted" and not vim.bo[previous.buf].modified
-    if refresh_execution and previous.owner.generation == client.host_generation() and previous.owner.attached() then
+    if refresh_execution and previous.owner.generation == client.host_get_generation() and previous.owner.attached() then
       if not close_review(previous) then return end
     end
-    if not refresh_execution and previous.owner.generation == client.host_generation() and not previous.owner.closed and previous.owner.attached() then
+    if not refresh_execution and previous.owner.generation == client.host_get_generation() and not previous.owner.closed and previous.owner.attached() then
       local window = vim.fn.win_findbuf(previous.buf)[1]
       if window then vim.api.nvim_set_current_win(window) else vim.cmd("tabnew") vim.api.nvim_win_set_buf(0, previous.buf) end
       previous.win = vim.api.nvim_get_current_win()
@@ -395,7 +395,7 @@ function M.open(plan)
   keymaps.apply_view_winbar(window, "PlanReview", "plan_review", loading_commands, "Loading review")
   review.owner = require("forge.views.plan_review.document").attach({ plan = plan, session_id = review.session_id,
     buffer = native_buffer, window = window, recovery = recovery, notice = notice,
-    recovery_provider = recovery and function() return previous.owner.recovery() end or nil }, function(owner, failure)
+    recovery_provider = recovery and function() return assert(previous).owner.recovery() end or nil }, function(owner, failure)
     if failure then
       discard_failed_attachment(review)
       if recovery then session.harness.plan_review = previous end

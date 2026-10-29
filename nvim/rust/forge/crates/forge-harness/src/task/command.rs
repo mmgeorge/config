@@ -152,10 +152,10 @@ impl SessionCommand {
     }
 
     pub(crate) fn parse_request(request: &Request) -> Result<Option<Self>> {
-        if request.method == "turn.steer" {
+        if request.method == "session.turn.steer" {
             crate::protocol::validate_root_control(request.params.get("target"))?;
         }
-        if request.method == "input.apply" {
+        if request.method == "session.input.apply" {
             let operation: crate::input::InputOperation =
                 serde_json::from_value(request.params.clone())?;
             return match operation.action {
@@ -172,7 +172,10 @@ impl SessionCommand {
                 _ => Ok(None),
             };
         }
-        if matches!(request.method.as_str(), "prompt.submit" | "turn.steer") {
+        if matches!(
+            request.method.as_str(),
+            "session.prompt.submit" | "session.turn.steer"
+        ) {
             let Some(text) = request.params["text"].as_str() else {
                 return Ok(None);
             };
@@ -183,19 +186,18 @@ impl SessionCommand {
             return Ok(command);
         }
         let action = match request.method.as_str() {
-            "task.transition" => request.params["action"]
+            "session.command.apply" => request.params["action"]
                 .as_str()
                 .context("task action is required")?,
-            "goal.set" => "goal",
-            "goal.pause" => "pause",
-            "goal.resume" => "resume",
-            "goal.clear" => "clear",
-            "goal.continue" => "continue",
-            "plan.accept" => "execute",
-            "plan.acceptance.begin" => "begin_acceptance",
-            "plan.acceptance.cancel" => "cancel_acceptance",
-            "plan.request_changes" => "request_changes",
-            "plan.cancel" => "cancel_plan",
+            "session.goal.set" => "goal",
+            "session.goal.pause" => "pause",
+            "session.goal.resume" => "resume",
+            "session.goal.clear" => "clear",
+            "session.plan.accept" => "execute",
+            "session.plan.acceptance.begin" => "begin_acceptance",
+            "session.plan.acceptance.cancel" => "cancel_acceptance",
+            "session.plan.changes.request" => "request_changes",
+            "session.plan.cancel" => "cancel_plan",
             _ => return Ok(None),
         };
         if !matches!(
@@ -238,7 +240,7 @@ impl SessionCommand {
             .map(serde_json::from_value)
             .transpose()?
             .unwrap_or(
-                if request.method == "plan.accept"
+                if request.method == "session.plan.accept"
                     || matches!(
                         action,
                         "begin_acceptance"
@@ -285,7 +287,7 @@ impl SessionCommand {
         target: Option<(String, String)>,
     ) -> Result<Option<Self>> {
         ensure!(
-            request.method == "question.continue",
+            request.method == "session.question.continue",
             "acceptance continuation requires question.continue"
         );
         if let Some(prior) = prior {
@@ -307,7 +309,7 @@ impl SessionCommand {
             }
             return Self::parse_request(&Request {
                 id: request.id,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params,
             });
         }
@@ -465,11 +467,11 @@ impl SessionAction {
 
     fn method(&self) -> &'static str {
         match self {
-            Self::BeginAcceptance { .. } => "plan.acceptance.begin",
-            Self::CancelAcceptance { .. } => "plan.acceptance.cancel",
-            Self::RequestChanges { .. } => "plan.request_changes",
-            Self::CancelPlan { .. } => "plan.cancel",
-            _ => "task.transition",
+            Self::BeginAcceptance { .. } => "session.plan.acceptance.begin",
+            Self::CancelAcceptance { .. } => "session.plan.acceptance.cancel",
+            Self::RequestChanges { .. } => "session.plan.changes.request",
+            Self::CancelPlan { .. } => "session.plan.cancel",
+            _ => "session.command.apply",
         }
     }
 
@@ -516,55 +518,55 @@ mod tests {
     fn task_aliases_and_slash_commands_have_identical_typed_payloads() -> Result<()> {
         for (method, params, text, canonical) in [
             (
-                "goal.set",
+                "session.goal.set",
                 json!({"objective":"Finish the task"}),
                 "/goal Finish the task",
                 json!({"action":"goal","text":"Finish the task"}),
             ),
             (
-                "goal.pause",
+                "session.goal.pause",
                 json!({}),
                 "/goal pause",
                 json!({"action":"pause"}),
             ),
             (
-                "goal.resume",
+                "session.goal.resume",
                 json!({}),
                 "/goal resume",
                 json!({"action":"resume"}),
             ),
             (
-                "goal.clear",
+                "session.goal.clear",
                 json!({}),
                 "/goal clear",
                 json!({"action":"clear"}),
             ),
             (
-                "goal.continue",
-                json!({}),
+                "session.command.apply",
+                json!({"action":"continue"}),
                 "/goal continue",
                 json!({"action":"continue"}),
             ),
             (
-                "task.transition",
+                "session.command.apply",
                 json!({"action":"plan","text":"Plan the work"}),
                 "/plan Plan the work",
                 json!({"action":"plan","text":"Plan the work"}),
             ),
             (
-                "task.transition",
+                "session.command.apply",
                 json!({"action":"resume"}),
                 "/plan retry",
                 json!({"action":"resume"}),
             ),
             (
-                "task.transition",
+                "session.command.apply",
                 json!({"action":"clear"}),
                 "/plan cancel",
                 json!({"action":"clear"}),
             ),
             (
-                "task.transition",
+                "session.command.apply",
                 json!({"action":"replan","plan_id":"selected","revision":3}),
                 "/replan selected 3",
                 json!({"action":"replan","plan_id":"selected","revision":3}),
@@ -593,7 +595,7 @@ mod tests {
         });
         let alias = SessionCommand::parse_request(&Request {
             id: 1,
-            method: "plan.accept".into(),
+            method: "session.plan.accept".into(),
             params: parameters.clone(),
         })?
         .unwrap();
@@ -601,7 +603,7 @@ mod tests {
         task_parameters["action"] = json!("execute");
         let canonical = SessionCommand::parse_request(&Request {
             id: 2,
-            method: "task.transition".into(),
+            method: "session.command.apply".into(),
             params: task_parameters,
         })?
         .unwrap();
@@ -624,7 +626,7 @@ mod tests {
     fn command_normalization_preserves_receipt_identity_and_metadata() -> Result<()> {
         let request = Request {
             id: 1,
-            method: "prompt.submit".into(),
+            method: "session.prompt.submit".into(),
             params: json!({
                 "text":"/goal Finish", "_command":{"id":"stable-command","source":"rpc"}
             }),
@@ -646,7 +648,7 @@ mod tests {
     fn raw_input_and_steering_parse_before_delivery() -> Result<()> {
         let input = Request {
             id: 1,
-            method: "input.apply".into(),
+            method: "session.input.apply".into(),
             params: json!({
                 "id":"input-command","action":{"kind":"submit","message":{
                     "id":"message","text":"/plan Draft design","intent":"auto","attachments":[],
@@ -662,7 +664,7 @@ mod tests {
         );
         let steering = SessionCommand::parse_request(&Request {
             id: 2,
-            method: "turn.steer".into(),
+            method: "session.turn.steer".into(),
             params: json!({"text":"/goal pause"}),
         })?
         .unwrap();
@@ -670,7 +672,7 @@ mod tests {
         assert!(
             SessionCommand::parse_request(&Request {
                 id: 3,
-                method: "turn.steer".into(),
+                method: "session.turn.steer".into(),
                 params: json!({"text":"/goal pause","target":{"thread_id":"child"}}),
             })
             .is_err()
@@ -682,7 +684,7 @@ mod tests {
     fn acceptance_replay_keeps_original_review_identity() -> Result<()> {
         let request = Request {
             id: 1,
-            method: "question.continue".into(),
+            method: "session.question.continue".into(),
             params: json!({"operation_id":"complete-once"}),
         };
         let command = SessionCommand::question_continue(
@@ -719,10 +721,10 @@ mod tests {
     #[test]
     fn review_aliases_preserve_arguments_and_dedicated_review_methods() -> Result<()> {
         for (method, action) in [
-            ("plan.acceptance.begin", "begin_acceptance"),
-            ("plan.acceptance.cancel", "cancel_acceptance"),
-            ("plan.request_changes", "request_changes"),
-            ("plan.cancel", "cancel_plan"),
+            ("session.plan.acceptance.begin", "begin_acceptance"),
+            ("session.plan.acceptance.cancel", "cancel_acceptance"),
+            ("session.plan.changes.request", "request_changes"),
+            ("session.plan.cancel", "cancel_plan"),
         ] {
             let payload = json!({"operation_id":"review-command","plan_id":"plan","digest":"review-digest",
                 "saved_source_digest":"source-digest","comment":"Keep the existing behavior",
@@ -738,7 +740,7 @@ mod tests {
             canonical["action"] = json!(action);
             let canonical = SessionCommand::parse_request(&Request {
                 id: 2,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: canonical,
             })?
             .unwrap();

@@ -19,6 +19,7 @@ pub(super) async fn answer(
             session_id,
             json!({"name":"Plan Review answers"}),
             None,
+            crate::session::SessionPurpose::PlanReviewAnswer,
             message_sink,
         )
         .await?;

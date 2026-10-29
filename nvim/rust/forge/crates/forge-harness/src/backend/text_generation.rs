@@ -299,8 +299,10 @@ mod tests {
         exchange.turn.push(turn);
         let mut entries = vec![TimelineEntry::Exchange {
             id: "entry".into(),
+
             created_at_ms: 1,
-            exchange,
+            exchange: exchange.into(),
+
             agent_by_id: Default::default(),
         }];
         let captured = history(&entries).unwrap();

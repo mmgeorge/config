@@ -269,13 +269,7 @@ impl BrokerObserver {
             active_wait: broker.active_wait_projection.clone(),
             no_checkpoint: matches!(broker.workspace_kind, WorkspaceKind::Untracked(_)),
         };
-        let mut session = broker.session.clone();
-        let committed = broker
-            .store
-            .load_session(&session.id)?
-            .context("observed session is missing")?;
-        session.name = committed.name;
-        session.active_task = committed.active_task;
+        let session = broker.session_view()?;
         let result = self.build(
             &broker.store,
             &session,
@@ -536,48 +530,39 @@ impl BrokerObserver {
     }
 
     /// Handles session queries and independent metadata writes without a provider turn lock.
-    pub(crate) fn query(&self, method: HarnessMethod, params: Value) -> Result<Option<Value>> {
+    pub(crate) fn query(&self, method: RuntimeMethod, params: Value) -> Result<Option<Value>> {
         let result = match method {
-            HarnessMethod::ChecksEditing => self.set_check_editing(
+            RuntimeMethod::SessionCheckEditingSet => self.set_check_editing(
                 params["enabled"]
                     .as_bool()
                     .context("check editing requires enabled")?,
             )?,
-            HarnessMethod::StateGet => serde_json::to_value(self.snapshot()?)?,
-            HarnessMethod::TaskList => serde_json::to_value(self.snapshot()?.session.active_task)?,
-            HarnessMethod::AgentList => {
-                let store = SqliteStore::read_only(&self.data_root)?;
-                store.read_snapshot(|| {
-                    let run = load_agent_registry(&store, &self.session_id)?.list();
-                    let exchange =
-                        store.list_session_agent_exchange_metadata(&self.session_id, &run)?;
-                    Ok(serde_json::to_value(AgentSnapshot {
-                        summary: agent_summaries(&run, &exchange),
-                        run,
-                        exchange,
-                    })?)
-                })?
+            RuntimeMethod::SessionStateGet => serde_json::to_value(self.snapshot()?)?,
+            RuntimeMethod::SessionTaskGet => {
+                serde_json::to_value(self.snapshot()?.session.active_task)?
             }
-            HarnessMethod::SessionList => self.list_session(params)?.0,
-            HarnessMethod::SessionPreview => self.preview_session(params)?.0,
-            HarnessMethod::SessionRename => self.rename_session(params)?.0,
-            HarnessMethod::SessionDelete => self.delete_session(params)?.0,
-            HarnessMethod::ExchangeCommentSave => self.save_exchange_comment(params)?.0,
-            HarnessMethod::ExchangeRollbackPreview => {
+            RuntimeMethod::SessionList => self.list_session(params)?.0,
+            RuntimeMethod::SessionPreview => self.preview_session(params)?.0,
+            RuntimeMethod::SessionRename => self.rename_session(params)?.0,
+            RuntimeMethod::SessionDelete => self.delete_session(params)?.0,
+            RuntimeMethod::SessionExchangeCommentSave => self.save_exchange_comment(params)?.0,
+            RuntimeMethod::SessionExchangeRollbackPreview => {
                 let store = SqliteStore::read_only(&self.data_root)?;
                 let id = required_text(&params, "preview_id")?;
                 crate::checkpoint::RestorePreview::load(&store.objects, &self.session_id, &id)?
                     .summary(params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize)
             }
-            HarnessMethod::PlanDeclaration => self.read_plan_declaration(params)?.0,
-            HarnessMethod::PlanList => self.list_replanning_choices()?.0,
-            HarnessMethod::PlanGet => self.plan(params)?,
-            HarnessMethod::ExchangeList => serde_json::to_value(self.list_exchange_review()?)?,
-            HarnessMethod::HistoryRecord => {
+            RuntimeMethod::SessionPlanDeclarationGet => self.read_plan_declaration(params)?.0,
+            RuntimeMethod::SessionPlanList => self.list_replanning_choices()?.0,
+            RuntimeMethod::SessionPlanGet => self.plan(params)?,
+            RuntimeMethod::SessionExchangeList => {
+                serde_json::to_value(self.list_exchange_review()?)?
+            }
+            RuntimeMethod::SessionPromptHistoryRecord => {
                 self.record_prompt_history(params, SystemClock.now_ms())?.0
             }
-            HarnessMethod::PermissionsOpen => self.open_permission_document()?.0,
-            HarnessMethod::PermissionsSave => self.save_permission_document(params)?.0,
+            RuntimeMethod::PermissionsDocumentOpen => self.open_permission_document()?.0,
+            RuntimeMethod::PermissionsDocumentSave => self.save_permission_document(params)?.0,
             _ => return Ok(None),
         };
         Ok(Some(result))

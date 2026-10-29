@@ -6,9 +6,13 @@ local picker = require("forge.views.picker")
 local specification, opened, requests = nil, {}, {}
 package.loaded["forge.views.plan_review"] = { open = function(plan) opened[#opened + 1] = plan end }
 picker.open = function(value) specification = value end
-client.host_generation = function() return 1 end
-client.request_for = function(session_id, method, params, callback)
-  assert(method == "plan.get")
+client.host_get_generation = function() return 1 end
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  assert(method == "session.plan.get")
   requests[#requests + 1] = { session_id = session_id, params = params, callback = callback }
 end
 state.session = { id = "browsing", active_task = { revision = "current-task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }

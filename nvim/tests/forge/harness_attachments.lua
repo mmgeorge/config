@@ -7,8 +7,12 @@ vim.uv.fs_stat = function(path, callback)
   if path:match("^/plan") then callback("ENOENT: missing", nil) else callback(nil, { type = "file" }) end
 end
 local requests, failures = {}, {}
-client.request_for = function(session_id, method, params, callback)
-  assert(method == "attachment.import" and session_id == "attachments")
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  assert(method == "session.attachment.import" and session_id == "attachments")
   requests[#requests + 1] = { params = params, callback = callback }
 end
 require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end

@@ -74,9 +74,12 @@ function M.highlight(session, window, row, namespace)
   local location = session.decoration_location and session.decoration_location(row)
     or require("forge.buffer").locate(session, row, 0)
   local node = location and session.sequence.node[location.block]
-  local layout = node and location.position.row == 0 and node.entry.metadata.layout
+  if not location or not node then return end
+  if location.position.row ~= 0 then return end
+  ---@type ForgeContentLayout?
+  local layout = node.entry.metadata.layout
   local marker = layout and require("forge.content_layout").marker(node.entry)
-  if marker and layout.indent > 2 then
+  if layout and marker and layout.indent > 2 then
     vim.api.nvim_buf_set_extmark(session.buffer, namespace, row, 0, {
       virt_text = { { marker.text, "Visual" } }, virt_text_win_col = layout.indent - 4,
       priority = 65535, hl_mode = "replace", ephemeral = true,

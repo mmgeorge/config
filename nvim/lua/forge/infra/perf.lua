@@ -54,7 +54,7 @@ M.sequence = { diff = 0, harness = 0 }
 M.queue = { diff = nil, harness = nil }
 M.flush_pending = { diff = false, harness = false }
 
----@param options? ForgePerfConfig
+---@param options? {diff?: {enabled?: boolean, log_path?: string, slow_threshold_ms?: number, sample_rate?: number, flush_delay_ms?: integer}, harness?: {enabled?: boolean, log_path?: string, slow_threshold_ms?: number, sample_rate?: number, flush_delay_ms?: integer}}
 function M.setup(options)
   M.options = vim.tbl_deep_extend("force", vim.deepcopy(M.options), options or {})
   update_loop_watch()
@@ -224,7 +224,7 @@ end
 update_loop_watch = function()
   if loop_timer then loop_timer:stop() loop_timer:close() loop_timer = nil end
   if not M.enabled("harness") then return end
-  local timer = vim.uv.new_timer()
+  local timer = assert(vim.uv.new_timer())
   loop_timer = timer
   local previous = M.now()
   timer:start(250, 250, vim.schedule_wrap(function()

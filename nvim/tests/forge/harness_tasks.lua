@@ -3,7 +3,11 @@ local task = require("forge.views.harness.task")
 local client = require("forge.client")
 local notifications = require("forge.infra.notifications")
 local requests, timers, failures = {}, {}, {}
-client.request_for = function(session_id, method, params, reply)
+client.request = function(request_specification, reply)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   requests[#requests + 1] = { session_id = session_id, method = method, params = params, reply = reply }
 end
 vim.defer_fn = function(callback) timers[#timers + 1] = callback end
@@ -23,6 +27,8 @@ begin({ action = "configure", config = { effort = "high" } })
 local rejected = requests[#requests]
 task.receive(state, { id = changing.params.operation_id, state = "resuming", revision = 5 })
 rejected.reply(nil, "rejected", { code = "request_failed" })
+assert(#failures == 1 and failures[1]:find("rejected", 1, true),
+  "the task owner did not report the rejected operation")
 assert(background_settled == 1, "rejected setting did not resolve its completion callback")
 assert(state.task_operation.state == "resuming", "rollback restored obsolete task state")
 changing.reply({ state = "accepted", revision = 2 })
@@ -33,7 +39,7 @@ settled, admitted = 0, 0
 
 begin({ action = "plan", text = "Create a plan" })
 local first = requests[1]
-assert(first.method == "task.transition" and first.params.operation_id)
+assert(first.method == "session.command.apply" and first.params.operation_id)
 first.reply({ id = first.params.operation_id, state = "accepted" })
 assert(admitted == 1 and settled == 0)
 begin({ action = "pause" })
@@ -48,7 +54,7 @@ begin({ action = "resume" })
 local original = requests[#requests]
 timers[#timers]()
 local query = requests[#requests]
-assert(query.method == "task.operation" and query.params.operation_id == original.params.operation_id,
+assert(query.method == "session.command.operation.get" and query.params.operation_id == original.params.operation_id,
   "uncertain acknowledgement must query the original operation instead of replaying")
 query.reply({ state = "outcome_unknown", error = "Provider acknowledgement lost" })
 assert(settled == 2 and state.execution_notice:find("Provider acknowledgement lost", 1, true))
@@ -102,7 +108,7 @@ assert(imported.method == "settings.import.apply", "import bypassed its durable 
 imported.reply(nil, "acknowledgement unavailable", { code = "outcome_unknown" })
 timers[#timers]()
 local inspection = requests[#requests]
-assert(inspection.method == "task.operation" and inspection.params.operation_id == imported.params.operation_id,
+assert(inspection.method == "session.command.operation.get" and inspection.params.operation_id == imported.params.operation_id,
   "unknown import acknowledgement replayed the settings mutation")
 inspection.reply({ state = "completed" })
 assert(settled == 6 and state.task_operation == nil)

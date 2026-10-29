@@ -10,7 +10,10 @@ controller.refresh_winbar = function() end
 require("forge.views.harness.prompt_history").record = function() end
 require("forge.infra.notifications").warn = function(message) warnings[#warnings + 1] = message end
 require("forge.infra.notifications").error = function(message) error(message) end
-client.request_for = function(_, method, parameters, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local parameters = request_specification.params or {}
+
   assert(host.request(method, parameters, callback), method)
 end
 state.session = { id = "queued-model", backend = "mock", model = "old" }

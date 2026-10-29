@@ -24,7 +24,7 @@ function M.project(source, selected)
   local file_counts = {}
   for _, row in ipairs(source) do
     if type(row.test_summary) == "table" then
-      if row.block == "plan:section:tests" then counts = vim.deepcopy(row.test_summary)
+      if row.block == "plan:section:tests" then counts = vim.tbl_extend("force", counts, row.test_summary)
       elseif row.test_file then file_counts[row.test_file] = vim.deepcopy(row.test_summary) end
     end
   end

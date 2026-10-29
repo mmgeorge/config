@@ -36,10 +36,9 @@ local namespace = vim.api.nvim_create_namespace("ForgeReviewDraftField")
 ---@field inline_anchor table<string, ForgeReviewCommentAnchor>
 
 ---@param state ForgeReviewCommentOwner
----@param delivery ForgeReviewCommentPresentation
 function M.capture(state)
   if not state.local_comment_view then return nil end
-  local source = state.local_comment_view.source_provider()
+  local source = state.local_comment_view.source_provider(vim.api.nvim_win_get_width(0))
   local annotation = {}
   for _, captured in ipairs(comments.capture(state.replica.buffer)) do
     local comment = state.comment_by_region[captured.id]
@@ -57,6 +56,9 @@ function M.capture(state)
   return { annotation = annotation, sequence = state.replica.editable.sequence }
 end
 
+---@param state ForgeReviewCommentOwner
+---@param delivery ForgeReviewCommentPresentation
+---@param recovery? table
 function M.attach(state, delivery, recovery)
   local replica = state.replica
   local source, annotation, inline_region = {}, {}, {}
@@ -183,8 +185,8 @@ function M.attach(state, delivery, recovery)
       local replacement, previous = {}, nil
       for index, text in ipairs(vim.api.nvim_buf_get_lines(replica.buffer, 0, -1, false)) do
         if not excluded[index - 1] then
-          local row = vim.deepcopy(original[index - 1] or previous)
-          assert(row, "review source identity is missing")
+          local source_row = assert(original[index - 1] or previous, "review source identity is missing")
+          local row = vim.deepcopy(source_row)
           row.text = text
           replacement[#replacement + 1] = row
           previous = row
@@ -329,6 +331,7 @@ function M.add(state, parent)
       if annotation.id == parent.region then line = annotation.end_source_line break end
     end
   end
+  if not line then return false end
   local comment = { region = region, local_draft = true, anchor = anchor and vim.deepcopy(anchor) or nil,
     reply_to = parent and parent.comment or nil, viewer_did_author = true }
   state.comment_by_region[region], state.comment_focus = comment, comment

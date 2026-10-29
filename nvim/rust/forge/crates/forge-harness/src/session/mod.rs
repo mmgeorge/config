@@ -114,9 +114,21 @@ impl fmt::Display for SessionLeaseConflict {
 
 impl std::error::Error for SessionLeaseConflict {}
 
+/// Distinguishes resumable user conversations from internal answer forks.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPurpose {
+    #[default]
+    Conversation,
+    PlanReviewAnswer,
+}
+
 /// Represents one durable conversation and its backend identity.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessSession {
+    /// Controls automatic resumption while retaining explicit access to every session.
+    #[serde(default)]
+    pub purpose: SessionPurpose,
     /// Distinguishes tool-free Background conversations from interactive sessions.
     #[serde(default)]
     pub background: Option<crate::background::BackgroundIdentity>,

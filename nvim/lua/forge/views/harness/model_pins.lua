@@ -28,7 +28,7 @@ end
 ---@param callback fun(pinned_id_set: table<string, boolean>?, failure: string?)
 function ModelPins.refresh(backend, callback)
   local revision = revision_by_backend[backend] or 0
-  client.request("backend.model_pins", { backend = backend }, function(identifier_list, failure)
+  client.request({ method = "provider.model.pin.list", params = { backend = backend } }, function(identifier_list, failure)
     if failure then callback(nil, failure) return end
     if revision == (revision_by_backend[backend] or 0) then install(backend, identifier_list) end
     callback(ModelPins.get(backend))
@@ -44,7 +44,7 @@ end
 function ModelPins.set(backend, model, pinned, callback)
   if pending_by_backend[backend] then return false end
   pending_by_backend[backend] = true
-  client.request("backend.model_pin", { backend = backend, model = model, pinned = pinned }, function(identifier_list, failure)
+  client.request({ method = "provider.model.pin.set", params = { backend = backend, model = model, pinned = pinned } }, function(identifier_list, failure)
     pending_by_backend[backend] = nil
     if failure then callback(nil, failure) return end
     revision_by_backend[backend] = (revision_by_backend[backend] or 0) + 1

@@ -34,7 +34,7 @@ function Shadow:rows() return self.sequence:rows() end
 function Shadow:row(index)
   local node = assert(self.sequence:locate(index), "shadow row is missing")
   local _, start = self.sequence:position(node.id)
-  return node.entry.text[index - start + 1]
+  return assert(node.entry.text, "shadow text is missing")[index - start + 1]
 end
 
 --- Materializes the complete baseline for explicit restoration.
@@ -42,7 +42,8 @@ end
 function Shadow:text()
   local text = {}
   for index = 0, self.sequence:count() - 1 do
-    vim.list_extend(text, self.sequence:at(index).entry.text)
+    local rows = assert(self.sequence:at(index).entry.text, "shadow text is missing")
+    vim.list_extend(text, rows)
   end
   return text
 end
@@ -57,14 +58,16 @@ function Shadow:splice(start, removed, inserted)
     self.sequence:splice(0, 0, chunks(self, inserted))
     return
   end
-  local first = self.sequence:locate(math.min(start, self:rows() - 1))
+  local first = assert(self.sequence:locate(math.min(start, self:rows() - 1)), "shadow start is missing")
   local first_index, first_row = self.sequence:position(first.id)
-  local last = removed > 0 and self.sequence:locate(start + removed - 1) or first
+  local last = assert(removed > 0 and self.sequence:locate(start + removed - 1) or first, "shadow end is missing")
   local last_index, last_row = self.sequence:position(last.id)
   local text = {}
-  for index = 1, start - first_row do text[#text + 1] = first.entry.text[index] end
+  local first_text = assert(first.entry.text, "shadow start text is missing")
+  local last_text = assert(last.entry.text, "shadow end text is missing")
+  for index = 1, start - first_row do text[#text + 1] = first_text[index] end
   vim.list_extend(text, inserted)
-  for index = start + removed - last_row + 1, last.entry.row_count do text[#text + 1] = last.entry.text[index] end
+  for index = start + removed - last_row + 1, last.entry.row_count do text[#text + 1] = last_text[index] end
   self.sequence:splice(first_index, last_index - first_index + 1, chunks(self, text))
 end
 

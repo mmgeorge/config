@@ -30,6 +30,7 @@ end
 ---@param force boolean?
 ---@param callback fun(value: table[]?, error: string?)
 local function request_catalog(cache, method, force, callback)
+  local owner_session_id = session.harness.session and session.harness.session.id
   local key = cache_key()
   local entry = cache[key]
   if not entry or force then
@@ -42,7 +43,7 @@ local function request_catalog(cache, method, force, callback)
   end
   entry.callback_list[#entry.callback_list + 1] = callback
   if #entry.callback_list > 1 then return end
-  client.request(method, {}, function(value, request_error)
+  client.request({ session_id = owner_session_id, method = method, params = {} }, function(value, request_error)
     local callback_list = entry.callback_list
     entry.callback_list = {}
     if not request_error then entry.value = type(value) == "table" and value or {} end
@@ -55,13 +56,13 @@ end
 ---@param force boolean?
 ---@param callback fun(value: table[]?, error: string?)
 function M.skills(force, callback)
-  request_catalog(skill_cache, "backend.skills", force, callback)
+  request_catalog(skill_cache, "session.provider.skill.list", force, callback)
 end
 
 ---@param force boolean?
 ---@param callback fun(value: table[]?, error: string?)
 function M.mcp(force, callback)
-  request_catalog(mcp_cache, "backend.mcp", force, callback)
+  request_catalog(mcp_cache, "session.provider.mcp.list", force, callback)
 end
 
 ---@param force boolean?
@@ -105,7 +106,7 @@ function M.models(force, callback)
     return
   end
   local key = cache_key()
-  request_catalog(model_cache, "backend.models", force, function(value, failure)
+  request_catalog(model_cache, "session.provider.model.list", force, function(value, failure)
     if key ~= cache_key() then return end
     if not failure then
       state.model_backend, state.model_list = backend, vim.deepcopy(value or {})
@@ -115,8 +116,9 @@ function M.models(force, callback)
 end
 
 local function mutate(method, cache, name, enabled, callback, resource_id)
+  local owner_session_id = session.harness.session and session.harness.session.id
   local key = cache_key()
-  client.request(method, { name = name, enabled = enabled, resource_id = resource_id }, function(result, request_error)
+  client.request({ session_id = owner_session_id, method = method, params = { name = name, enabled = enabled, resource_id = resource_id } }, function(result, request_error)
     cache[key] = nil
     if request_error or type(result) ~= "table" or not result.id then
       callback(result, request_error)
@@ -128,7 +130,7 @@ local function mutate(method, cache, name, enabled, callback, resource_id)
         callback(nil, "The selected session changed. Configuration continues in its original session.")
         return
       end
-      client.request("settings.get", {}, function(snapshot, snapshot_error)
+      client.request({ session_id = owner_session_id, method = "settings.get", params = {} }, function(snapshot, snapshot_error)
         if snapshot_error then callback(nil, snapshot_error) return end
         local application = snapshot and snapshot.application or {}
         if application.operation_id == result.id and application.state == "applied" then
@@ -141,7 +143,7 @@ local function mutate(method, cache, name, enabled, callback, resource_id)
           return
         end
         if vim.tbl_contains({ "failed", "cancelled", "outcome_unknown", "superseded" }, application.state) then
-          client.request("task.operation", { operation_id = result.id }, function(operation, operation_error)
+          client.request({ session_id = owner_session_id, method = "session.command.operation.get", params = { operation_id = result.id } }, function(operation, operation_error)
             callback(nil, operation_error or (operation and operation.error) or "Configuration " .. application.state)
           end)
           return
@@ -162,7 +164,7 @@ end
 ---@param callback fun(result: table?, error: string?)
 ---@param resource_id string?
 function M.set_skill_enabled(name, enabled, callback, resource_id)
-  mutate("backend.skills.set_enabled", skill_cache, name, enabled, callback, resource_id)
+  mutate("settings.skill.set_enabled", skill_cache, name, enabled, callback, resource_id)
 end
 
 ---@param name string
@@ -170,7 +172,7 @@ end
 ---@param callback fun(result: table?, error: string?)
 ---@param resource_id string?
 function M.set_mcp_enabled(name, enabled, callback, resource_id)
-  mutate("backend.mcp.set_enabled", mcp_cache, name, enabled, callback, resource_id)
+  mutate("settings.mcp.set_enabled", mcp_cache, name, enabled, callback, resource_id)
 end
 
 function M.clear()

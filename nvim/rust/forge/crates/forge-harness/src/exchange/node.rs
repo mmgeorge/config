@@ -19,7 +19,7 @@ pub enum ExchangeNode {
     /// Retains provider context replacement separately from model text and tool calls.
     Compaction {
         id: String,
-        compaction: crate::backend::Compaction,
+        compaction: Box<crate::backend::Compaction>,
     },
     ImplementationReport {
         id: String,
@@ -132,8 +132,6 @@ pub struct DeclarationRevision {
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub baseline_paths: std::collections::BTreeSet<String>,
 }
-
-/// Retains one child-agent row at the position where the child first spawned.
 
 /// Distinguishes user input that extends an existing exchange.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

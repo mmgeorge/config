@@ -40,8 +40,12 @@ function AgentSummary.label(run)
   return run.task_name or run.nickname or run.definition or "agent"
 end
 
+---@class ForgeInteractionSummary : table[]
+---@field tool_count? integer
+---@field failed_count? integer
+
 --- Computes total and failed tool invocation counts across interactions.
----@param interaction_list table[]? Array of interaction node tables.
+---@param interaction_list ForgeInteractionSummary? Array of interaction nodes with optional retained counts.
 ---@return integer tool_count Total count of tool invocations.
 ---@return integer failed_count Count of failed tool executions.
 function AgentSummary.tool_counts(interaction_list)
@@ -66,7 +70,7 @@ end
 
 --- Formats a status summary string with elapsed duration and tool invocation counts.
 ---@param run table Agent run descriptor table.
----@param interaction_list table[]? Array of interaction node tables.
+---@param interaction_list ForgeInteractionSummary? Array of interaction nodes with optional retained counts.
 ---@param now_ms integer Current epoch timestamp in milliseconds.
 ---@param capitalize? boolean True to capitalize status label prefix.
 ---@param include_zero_tools? boolean True to include tool count when zero.

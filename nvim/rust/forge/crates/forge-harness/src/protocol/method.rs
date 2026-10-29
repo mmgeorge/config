@@ -1,72 +1,66 @@
 use serde::Deserialize;
 
-/// Identifies an accepted Harness operation before session state is accessed.
+/// Identifies an accepted runtime operation before session state is accessed.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-pub enum HarnessMethod {
-    #[serde(rename = "command.status")]
-    CommandStatus,
-    #[serde(rename = "input.apply")]
-    InputApply,
-    #[serde(rename = "input.get")]
-    InputGet,
-    #[serde(rename = "input.operation")]
-    InputOperation,
-    #[serde(rename = "attachment.import")]
-    AttachmentImport,
-    #[serde(rename = "lsp.authorize")]
-    LspAuthorize,
-    #[serde(rename = "lsp.respond")]
-    LspRespond,
-    #[serde(rename = "lsp.analyze")]
-    LspAnalyze,
-    #[serde(rename = "checks.list")]
-    ChecksList,
-    #[serde(rename = "checks.editing")]
-    ChecksEditing,
-    #[serde(rename = "checks.override")]
-    ChecksOverride,
-    #[serde(rename = "checks.run")]
-    ChecksRun,
-    #[serde(rename = "checks.complete")]
-    ChecksComplete,
-    #[serde(rename = "checks.status")]
-    ChecksStatus,
-    #[serde(rename = "checks.cancel")]
-    ChecksCancel,
-    #[serde(rename = "checks.save_defaults")]
-    ChecksSaveDefaults,
-    #[serde(rename = "task.list")]
-    TaskList,
-    #[serde(rename = "task.transition")]
-    TaskTransition,
-    #[serde(rename = "task.operation")]
-    TaskOperation,
-    #[serde(rename = "health.get")]
-    Health,
-    #[serde(rename = "state.get")]
-    StateGet,
+pub enum RuntimeMethod {
+    #[serde(rename = "session.command.status.get")]
+    SessionCommandStatusGet,
+    #[serde(rename = "session.input.apply")]
+    SessionInputApply,
+    #[serde(rename = "session.input.get")]
+    SessionInputGet,
+    #[serde(rename = "session.input.operation.get")]
+    SessionInputOperationGet,
+    #[serde(rename = "session.attachment.import")]
+    SessionAttachmentImport,
+    #[serde(rename = "session.lsp.authorize")]
+    SessionLspAuthorize,
+    #[serde(rename = "session.lsp.respond")]
+    SessionLspRespond,
+    #[serde(rename = "session.lsp.analyze")]
+    SessionLspAnalyze,
+    #[serde(rename = "session.check.list")]
+    SessionCheckList,
+    #[serde(rename = "session.check.editing.set")]
+    SessionCheckEditingSet,
+    #[serde(rename = "session.check.override")]
+    SessionCheckOverride,
+    #[serde(rename = "session.check.run")]
+    SessionCheckRun,
+    #[serde(rename = "session.check.complete")]
+    SessionCheckComplete,
+    #[serde(rename = "session.check.status")]
+    SessionCheckStatus,
+    #[serde(rename = "session.check.cancel")]
+    SessionCheckCancel,
+    #[serde(rename = "session.task.get")]
+    SessionTaskGet,
+    #[serde(rename = "session.command.apply")]
+    SessionCommandApply,
+    #[serde(rename = "session.command.operation.get")]
+    SessionCommandOperationGet,
+    #[serde(rename = "session.health.get")]
+    SessionHealthGet,
+    #[serde(rename = "session.state.get")]
+    SessionStateGet,
     #[serde(rename = "session.list")]
     SessionList,
-    #[serde(rename = "trace.status")]
-    TraceStatus,
-    #[serde(rename = "trace.configure")]
-    TraceConfigure,
-    #[serde(rename = "trace.toggle")]
-    TraceToggle,
-    #[serde(rename = "trace.clear")]
-    TraceClear,
-    #[serde(rename = "trace.session.clear")]
-    TraceSessionClear,
-    #[serde(rename = "backend.models")]
-    BackendModels,
-    #[serde(rename = "backend.mock_response")]
-    BackendMockResponse,
-    #[serde(rename = "backend.capabilities")]
-    BackendCapabilities,
-    #[serde(rename = "backend.authenticate")]
-    BackendAuthenticate,
-    #[serde(rename = "backend.setup")]
-    BackendSetup,
+    #[serde(rename = "host.trace.status")]
+    HostTraceStatus,
+    #[serde(rename = "host.trace.configure")]
+    HostTraceConfigure,
+    #[serde(rename = "session.trace.clear")]
+    SessionTraceClear,
+    #[serde(rename = "session.provider.model.list")]
+    SessionProviderModelList,
+    #[serde(rename = "session.provider.mock_response")]
+    SessionProviderMockResponse,
+    #[serde(rename = "session.provider.capabilities.get")]
+    SessionProviderCapabilitiesGet,
+    #[serde(rename = "session.provider.authenticate")]
+    SessionProviderAuthenticate,
+    #[serde(rename = "session.provider.setup")]
+    SessionProviderSetup,
     #[serde(rename = "settings.get")]
     SettingsGet,
     #[serde(rename = "settings.update")]
@@ -75,110 +69,94 @@ pub enum HarnessMethod {
     SettingsImportPreview,
     #[serde(rename = "settings.import.apply")]
     SettingsImportApply,
-    #[serde(rename = "settings.reset")]
-    SettingsReset,
-    #[serde(rename = "backend.model_pins")]
-    BackendModelPins,
-    #[serde(rename = "backend.model_pin")]
-    BackendModelPin,
-    #[serde(rename = "agent.list")]
-    AgentList,
-    #[serde(rename = "agent.start")]
-    AgentStart,
-    #[serde(rename = "agent.message")]
-    AgentMessage,
-    #[serde(rename = "agent.followup")]
-    AgentFollowup,
-    #[serde(rename = "agent.interrupt")]
-    AgentInterrupt,
-    #[serde(rename = "agent.interrupt_all")]
-    AgentInterruptAll,
-    #[serde(rename = "agent.models")]
-    AgentModels,
-    #[serde(rename = "agent.profiles.get")]
-    AgentProfilesGet,
-    #[serde(rename = "agent.profiles.save")]
-    AgentProfilesSave,
-    #[serde(rename = "permissions.open")]
-    PermissionsOpen,
-    #[serde(rename = "permissions.save")]
-    PermissionsSave,
-    #[serde(rename = "session.permission")]
-    SessionPermission,
-    #[serde(rename = "exchange.resume")]
-    ExchangeResume,
-    #[serde(rename = "prompt.submit")]
-    PromptSubmit,
-    #[serde(rename = "history.record")]
-    HistoryRecord,
-    #[serde(rename = "queue.edit_last")]
-    QueueEditLast,
-    #[serde(rename = "plan.accept")]
-    PlanAccept,
-    #[serde(rename = "plan.acceptance.begin")]
-    PlanAcceptanceBegin,
-    #[serde(rename = "plan.acceptance.cancel")]
-    PlanAcceptanceCancel,
-    #[serde(rename = "plan.entity.rename")]
-    PlanEntityRename,
-    #[serde(rename = "plan.tests.delete")]
-    PlanTestsDelete,
-    #[serde(rename = "plan.checks.update")]
-    PlanChecksUpdate,
-    #[serde(rename = "plan.request_changes")]
-    PlanRequestChanges,
-    #[serde(rename = "plan.questions.answer")]
-    PlanAnswerQuestions,
-    #[serde(rename = "plan.cancel")]
-    PlanCancel,
-    #[serde(rename = "plan.get")]
-    PlanGet,
-    #[serde(rename = "plan.declaration")]
-    PlanDeclaration,
-    #[serde(rename = "plan.list")]
-    PlanList,
-    #[serde(rename = "plan.deviation.resolve")]
-    PlanDeviationResolve,
-    #[serde(rename = "question.answer")]
-    QuestionAnswer,
-    #[serde(rename = "question.skip")]
-    QuestionSkip,
-    #[serde(rename = "question.ask")]
-    QuestionAsk,
-    #[serde(rename = "question.continue")]
-    QuestionContinue,
-    #[serde(rename = "approval.continue")]
-    ApprovalContinue,
-    #[serde(rename = "session.input_timeouts")]
-    InputTimeoutConfigure,
-    #[serde(rename = "goal.set")]
-    GoalSet,
-    #[serde(rename = "goal.pause")]
-    GoalPause,
-    #[serde(rename = "goal.resume")]
-    GoalResume,
-    #[serde(rename = "goal.clear")]
-    GoalClear,
-    #[serde(rename = "goal.continue")]
-    GoalContinue,
-    #[serde(rename = "exchange.list")]
-    ExchangeList,
-    #[serde(rename = "exchange.comment.save")]
-    ExchangeCommentSave,
-    #[serde(rename = "exchange.request_changes")]
-    ExchangeRequestChanges,
-    #[serde(rename = "exchange.rollback.prepare")]
-    ExchangeRollbackPrepare,
-    #[serde(rename = "exchange.rollback.apply")]
-    ExchangeRollbackApply,
-    #[serde(rename = "exchange.rollback.preview")]
-    ExchangeRollbackPreview,
-    #[serde(rename = "exchange.recovery")]
-    ExchangeRecovery,
+    #[serde(rename = "provider.model.pin.list")]
+    ProviderModelPinList,
+    #[serde(rename = "provider.model.pin.set")]
+    ProviderModelPinSet,
+    #[serde(rename = "session.agent.start")]
+    SessionAgentStart,
+    #[serde(rename = "session.agent.message.send")]
+    SessionAgentMessageSend,
+    #[serde(rename = "session.agent.followup")]
+    SessionAgentFollowup,
+    #[serde(rename = "session.agent.interrupt")]
+    SessionAgentInterrupt,
+    #[serde(rename = "session.agent.interrupt_all")]
+    SessionAgentInterruptAll,
+    #[serde(rename = "session.agent.model.list")]
+    SessionAgentModelList,
+    #[serde(rename = "agent.profile.get")]
+    AgentProfileGet,
+    #[serde(rename = "agent.profile.save")]
+    AgentProfileSave,
+    #[serde(rename = "permissions.document.open")]
+    PermissionsDocumentOpen,
+    #[serde(rename = "permissions.document.save")]
+    PermissionsDocumentSave,
+    #[serde(rename = "session.permission.set")]
+    SessionPermissionSet,
+    #[serde(rename = "session.prompt.submit")]
+    SessionPromptSubmit,
+    #[serde(rename = "session.prompt.history.record")]
+    SessionPromptHistoryRecord,
+    #[serde(rename = "session.plan.accept")]
+    SessionPlanAccept,
+    #[serde(rename = "session.plan.acceptance.begin")]
+    SessionPlanAcceptanceBegin,
+    #[serde(rename = "session.plan.acceptance.cancel")]
+    SessionPlanAcceptanceCancel,
+    #[serde(rename = "session.plan.entity.rename")]
+    SessionPlanEntityRename,
+    #[serde(rename = "session.plan.test.delete")]
+    SessionPlanTestDelete,
+    #[serde(rename = "session.plan.check.update")]
+    SessionPlanCheckUpdate,
+    #[serde(rename = "session.plan.changes.request")]
+    SessionPlanChangesRequest,
+    #[serde(rename = "session.plan.question.answer")]
+    SessionPlanQuestionAnswer,
+    #[serde(rename = "session.plan.cancel")]
+    SessionPlanCancel,
+    #[serde(rename = "session.plan.get")]
+    SessionPlanGet,
+    #[serde(rename = "session.plan.declaration.get")]
+    SessionPlanDeclarationGet,
+    #[serde(rename = "session.plan.list")]
+    SessionPlanList,
+    #[serde(rename = "session.question.answer")]
+    SessionQuestionAnswer,
+    #[serde(rename = "session.question.skip")]
+    SessionQuestionSkip,
+    #[serde(rename = "session.question.ask")]
+    SessionQuestionAsk,
+    #[serde(rename = "session.question.continue")]
+    SessionQuestionContinue,
+    #[serde(rename = "session.approval.continue")]
+    SessionApprovalContinue,
+    #[serde(rename = "session.input.timeout.configure")]
+    SessionInputTimeoutConfigure,
+    #[serde(rename = "session.goal.set")]
+    SessionGoalSet,
+    #[serde(rename = "session.goal.pause")]
+    SessionGoalPause,
+    #[serde(rename = "session.goal.resume")]
+    SessionGoalResume,
+    #[serde(rename = "session.goal.clear")]
+    SessionGoalClear,
+    #[serde(rename = "session.exchange.list")]
+    SessionExchangeList,
+    #[serde(rename = "session.exchange.comment.save")]
+    SessionExchangeCommentSave,
+    #[serde(rename = "session.exchange.rollback.prepare")]
+    SessionExchangeRollbackPrepare,
+    #[serde(rename = "session.exchange.rollback.apply")]
+    SessionExchangeRollbackApply,
+    #[serde(rename = "session.exchange.rollback.preview")]
+    SessionExchangeRollbackPreview,
+    #[serde(rename = "session.exchange.recovery")]
+    SessionExchangeRecovery,
     #[serde(rename = "session.new")]
     SessionNew,
-    #[serde(rename = "session.clear")]
-    SessionClear,
     #[serde(rename = "session.preview")]
     SessionPreview,
     #[serde(rename = "session.resume")]
@@ -193,56 +171,53 @@ pub enum HarnessMethod {
     SessionDelete,
     #[serde(rename = "session.fork")]
     SessionFork,
-    #[serde(rename = "shutdown")]
-    Shutdown,
-    #[serde(rename = "turn.cancel")]
-    TurnCancel,
-    #[serde(rename = "turn.restart")]
-    TurnRestart,
-    #[serde(rename = "turn.steer")]
-    TurnSteer,
-    #[serde(rename = "approval.resolve")]
-    ApprovalResolve,
-    #[serde(rename = "backend.skills")]
-    BackendSkills,
-    #[serde(rename = "backend.skills.set_enabled")]
-    BackendSkillsSetEnabled,
-    #[serde(rename = "backend.mcp")]
-    BackendMcp,
-    #[serde(rename = "backend.mcp.set_enabled")]
-    BackendMcpSetEnabled,
+    #[serde(rename = "host.shutdown")]
+    HostShutdown,
+    #[serde(rename = "session.turn.cancel")]
+    SessionTurnCancel,
+    #[serde(rename = "session.turn.restart")]
+    SessionTurnRestart,
+    #[serde(rename = "session.turn.steer")]
+    SessionTurnSteer,
+    #[serde(rename = "session.approval.resolve")]
+    SessionApprovalResolve,
+    #[serde(rename = "session.provider.skill.list")]
+    SessionProviderSkillList,
+    #[serde(rename = "settings.skill.set_enabled")]
+    SettingsSkillSetEnabled,
+    #[serde(rename = "session.provider.mcp.list")]
+    SessionProviderMcpList,
+    #[serde(rename = "settings.mcp.set_enabled")]
+    SettingsMcpSetEnabled,
 }
 
-impl HarnessMethod {
+impl RuntimeMethod {
     /// Decode an exact wire name and return a fixed rejection message.
     pub fn decode(method: &str) -> anyhow::Result<Self> {
         Self::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(method))
-            .map_err(|_| anyhow::anyhow!("unknown Harness broker method"))
+            .map_err(|_| anyhow::anyhow!("unknown runtime method"))
     }
 
     /// Identifies explicit workflow operations whose outcome may settle the selected task.
     pub fn settles_task(self) -> bool {
         matches!(
             self,
-            Self::TaskTransition
-                | Self::PromptSubmit
-                | Self::ExchangeResume
-                | Self::ChecksComplete
-                | Self::PlanAccept
-                | Self::PlanAcceptanceBegin
-                | Self::PlanRequestChanges
-                | Self::QuestionAnswer
-                | Self::QuestionSkip
-                | Self::QuestionAsk
-                | Self::QuestionContinue
-                | Self::ApprovalContinue
-                | Self::GoalSet
-                | Self::GoalPause
-                | Self::GoalResume
-                | Self::GoalClear
-                | Self::GoalContinue
-                | Self::ExchangeRequestChanges
-                | Self::TurnCancel
+            Self::SessionCommandApply
+                | Self::SessionPromptSubmit
+                | Self::SessionCheckComplete
+                | Self::SessionPlanAccept
+                | Self::SessionPlanAcceptanceBegin
+                | Self::SessionPlanChangesRequest
+                | Self::SessionQuestionAnswer
+                | Self::SessionQuestionSkip
+                | Self::SessionQuestionAsk
+                | Self::SessionQuestionContinue
+                | Self::SessionApprovalContinue
+                | Self::SessionGoalSet
+                | Self::SessionGoalPause
+                | Self::SessionGoalResume
+                | Self::SessionGoalClear
+                | Self::SessionTurnCancel
         )
     }
 
@@ -250,14 +225,12 @@ impl HarnessMethod {
     pub fn requires_provider_fork(self) -> bool {
         matches!(
             self,
-            Self::PromptSubmit
-                | Self::ChecksComplete
-                | Self::AgentStart
-                | Self::ExchangeResume
-                | Self::PlanAnswerQuestions
-                | Self::QuestionAsk
-                | Self::QuestionContinue
-                | Self::ExchangeRequestChanges
+            Self::SessionPromptSubmit
+                | Self::SessionCheckComplete
+                | Self::SessionAgentStart
+                | Self::SessionPlanQuestionAnswer
+                | Self::SessionQuestionAsk
+                | Self::SessionQuestionContinue
                 | Self::SessionCompact
         )
     }
@@ -268,32 +241,31 @@ mod test {
     #[test]
     fn check_editing_has_no_guided_setup_operation() {
         assert_eq!(
-            super::HarnessMethod::decode("checks.editing").unwrap(),
-            super::HarnessMethod::ChecksEditing
+            super::RuntimeMethod::decode("session.check.editing.set").unwrap(),
+            super::RuntimeMethod::SessionCheckEditingSet
         );
-        assert!(super::HarnessMethod::decode("checks.setup").is_err());
+        assert!(super::RuntimeMethod::decode("checks.setup").is_err());
     }
 
     #[test]
     fn exchange_methods_replace_interaction_names_without_aliases() {
-        for suffix in [
-            "resume",
-            "list",
-            "comment.save",
-            "request_changes",
-            "rollback.prepare",
-            "rollback.preview",
-            "rollback.apply",
-            "recovery",
+        for (old, renamed) in [
+            ("list", "list"),
+            ("comment.save", "comment.save"),
+            ("rollback.prepare", "rollback.prepare"),
+            ("rollback.preview", "rollback.preview"),
+            ("rollback.apply", "rollback.apply"),
+            ("recovery", "recovery"),
         ] {
-            assert!(super::HarnessMethod::decode(&format!("exchange.{suffix}")).is_ok());
-            assert!(super::HarnessMethod::decode(&format!("interaction.{suffix}")).is_err());
+            assert!(super::RuntimeMethod::decode(&format!("session.exchange.{renamed}")).is_ok());
+            assert!(super::RuntimeMethod::decode(&format!("exchange.{old}")).is_err());
+            assert!(super::RuntimeMethod::decode(&format!("interaction.{old}")).is_err());
         }
     }
 
     #[test]
     fn rejects_independent_child_submission() {
-        assert!(super::HarnessMethod::decode("exchange.rollback").is_err());
-        assert!(super::HarnessMethod::decode("agent.submit").is_err());
+        assert!(super::RuntimeMethod::decode("exchange.rollback").is_err());
+        assert!(super::RuntimeMethod::decode("agent.submit").is_err());
     }
 }

@@ -2,7 +2,7 @@ vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 local source = require("forge.source_document")
 local pending, closed, annotation = {}, {}, 0
 source._set_runner_for_test(function(method, params, callback)
-  if params.operation == "change" then assert(method == "walkthrough") pending[#pending + 1] = { params = params, callback = callback }
+  if params.operation == "change" then assert(method == "repository.walkthrough.document") pending[#pending + 1] = { params = params, callback = callback }
   else if params.operation == "close" then closed[params.document] = true end callback({}) end
 end)
 local origin = vim.api.nvim_get_current_buf()

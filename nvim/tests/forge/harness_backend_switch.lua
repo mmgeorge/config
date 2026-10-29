@@ -13,8 +13,8 @@ require('forge.views.harness.session_navigation').activate = function(result, op
   state.session = result.session
 end
 picker.open = function(spec) lease_picker = spec end
-client.stop = function(_, callback) pending_stop = callback end
-client.start_harness = function(callback, options)
+client.host_stop = function(_, callback) pending_stop = callback end
+client.session_initialize = function(callback, options)
   starts = starts + 1
   pending_start, initialize_options = callback, options
 end

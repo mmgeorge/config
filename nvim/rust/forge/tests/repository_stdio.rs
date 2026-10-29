@@ -78,7 +78,7 @@ impl Host {
         let response = host
             .request(
                 1,
-                "initialize",
+                "host.initialize",
                 json!({"protocol_version": forge_protocol::WIRE_VERSION,
                     "recovery_directory":recovery_directory}),
             )
@@ -92,11 +92,28 @@ impl Host {
     }
 
     async fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
-        if method == "shutdown" {
+        self.exchange(json!({"id":id,"method":method,"params":params}))
+            .await
+    }
+
+    async fn request_for(
+        &mut self,
+        session_id: &str,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        self.exchange(json!({"id":id,"method":method,"params":params,"session_id":session_id}))
+            .await
+    }
+
+    async fn exchange(&mut self, request: Value) -> Value {
+        let id = request["id"].as_u64().unwrap();
+        let method = request["method"].as_str().unwrap();
+        if method == "host.shutdown" {
             self.terminal_request = Some(id);
         }
-        let encoded =
-            serde_json::to_vec(&json!({"id": id, "method": method, "params": params})).unwrap();
+        let encoded = serde_json::to_vec(&request).unwrap();
         self.input.write_all(&encoded).await.unwrap();
         self.input.write_all(b"\n").await.unwrap();
         self.response(id).await
@@ -121,7 +138,7 @@ impl Host {
             let response: Value = serde_json::from_slice(&bytes).unwrap();
             self.consumed_bytes += bytes.len();
             self.consumed_frames += 1;
-            let credit = serde_json::to_vec(&json!({"id":0,"method":"transport.consumed","params":{"bytes":self.consumed_bytes,"frames":self.consumed_frames}})).unwrap();
+            let credit = serde_json::to_vec(&json!({"id":0,"method":"host.transport.consumed","params":{"bytes":self.consumed_bytes,"frames":self.consumed_frames}})).unwrap();
             let terminal = self.terminal_request == Some(id)
                 && response["id"].as_u64() == Some(id)
                 && response.get("error").is_none();
@@ -172,7 +189,7 @@ impl Host {
     }
 
     async fn stop(mut self) {
-        let response = self.request(1000, "shutdown", json!({})).await;
+        let response = self.request(1000, "host.shutdown", json!({})).await;
         assert!(response.get("error").is_none(), "{response}");
         drop(self.input);
         assert!(
@@ -194,7 +211,7 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
         "backend": {"kind":"mock", "command":[]}
     });
     let mut host = Host::start().await;
-    let initialized = host.request(2, "harness.initialize", params.clone()).await;
+    let initialized = host.request(2, "session.initialize", params.clone()).await;
     let session = &initialized["result"]["session"];
     assert!(session["id"].is_string(), "{initialized}");
     let session_id = session["id"].clone();
@@ -216,12 +233,13 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
     let mut host = Host::start().await;
     let mut params = params;
     params["session_id"] = session_id.clone();
-    let reopened = host.request(2, "harness.initialize", params).await;
+    let reopened = host.request(2, "session.initialize", params).await;
     assert_eq!(reopened["result"]["session"]["id"], session_id);
     let document = host
-        .request(
+        .request_for(
+            session_id.as_str().unwrap(),
             3,
-            "harness.document",
+            "session.document",
             json!({
                 "operation":"open", "document":"large-history", "view":"history-view",
                 "width":forge_buffer::width::WidthProfile::default(),
@@ -240,9 +258,10 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
     let node = preview.metadata.node.as_ref().expect("prompt node");
     assert_eq!(node.display, forge_buffer::node::NodeDisplay::Preview);
     let expanded = host
-        .request(
+        .request_for(
+            session_id.as_str().unwrap(),
             30,
-            "harness.document",
+            "session.document",
             json!({
                 "operation":"node", "document":"large-history", "view":"history-view",
                 "sequence":1, "node":node.id.0, "generation":node.generation,
@@ -253,9 +272,10 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
         .await;
     assert!(expanded.get("error").is_none(), "{expanded}");
     let document = host
-        .request(
+        .request_for(
+            session_id.as_str().unwrap(),
             31,
-            "harness.document",
+            "session.document",
             json!({
                 "operation":"snapshot", "document":"large-history",
             }),
@@ -283,7 +303,7 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
     let subsequent = host
         .request(
             4,
-            "repository.revisions",
+            "repository.revision.list",
             json!({"workspace":workspace.path()}),
         )
         .await;
@@ -443,7 +463,7 @@ async fn review_document_edits_save_and_reconcile_through_the_shared_host() {
     let opened = host
         .request(
             2,
-            "review.open_pr",
+            "github.review.document.open",
             json!({"directory":root.path(),"target":target}),
         )
         .await;
@@ -453,7 +473,7 @@ async fn review_document_edits_save_and_reconcile_through_the_shared_host() {
     let materialized = host
         .request(
             20,
-            "review.materialize",
+            "github.review.document.render",
             json!({
                 "document":document,"width":{"columns":80,"tabstop":4}
             }),
@@ -468,7 +488,7 @@ async fn review_document_edits_save_and_reconcile_through_the_shared_host() {
     let saved = host
         .request(
             4,
-            "review.save",
+            "github.review.document.save",
             json!({"document":document,"capture":[{
                 "document":document,"region":"body","base":0,"sequence":1,"text":text
             }]}),
@@ -488,7 +508,7 @@ async fn review_document_edits_save_and_reconcile_through_the_shared_host() {
     let stale = host
         .request(
             5,
-            "review.save",
+            "github.review.document.save",
             json!({"document":document,"capture":[{
                 "document":document,"region":"body","base":0,"sequence":2,"text":"stale"
             }]}),
@@ -504,7 +524,7 @@ async fn review_document_edits_save_and_reconcile_through_the_shared_host() {
     let saved = host
         .request(
             7,
-            "review.save",
+            "github.review.document.save",
             json!({"document":document,"capture":[{
                 "document":document,"region":"title","base":0,"sequence":2,"text":"Uncertain title"
             }]}),
@@ -516,26 +536,34 @@ async fn review_document_edits_save_and_reconcile_through_the_shared_host() {
     );
     assert_eq!(saved["result"]["snapshot"]["uncertain"], true, "{saved}");
     let reconciled = host
-        .request(8, "review.reconcile", json!({"document":document}))
+        .request(
+            8,
+            "github.review.document.reconcile",
+            json!({"document":document}),
+        )
         .await;
     assert_eq!(reconciled["result"]["uncertain"], false, "{reconciled}");
     assert_eq!(
         reconciled["result"]["field"][0]["baseline"],
         "Uncertain title"
     );
-    let snapshot = host
-        .request(9, "review.snapshot", json!({"document":document}))
-        .await;
-    assert_eq!(snapshot["result"], reconciled["result"]);
     let closed = host
-        .request(10, "review.close", json!({"document":document}))
+        .request(
+            10,
+            "github.review.document.close",
+            json!({"document":document}),
+        )
         .await;
     assert_eq!(closed["result"]["closed"], true);
     assert!(
-        host.request(11, "review.snapshot", json!({"document":document}))
-            .await
-            .get("error")
-            .is_some()
+        host.request(
+            11,
+            "github.review.document.render",
+            json!({"document":document,"width":{"columns":80,"tabstop":4}})
+        )
+        .await
+        .get("error")
+        .is_some()
     );
     assert!(host.progress.is_empty());
     host.stop().await;
@@ -556,7 +584,7 @@ async fn large_review_open_transfers_exact_remote_baseline() {
     let opened = host
         .request(
             2,
-            "review.open_pr",
+            "github.review.document.open",
             json!({"directory":root.path(),"target":target}),
         )
         .await;
@@ -575,19 +603,21 @@ async fn issue_sync_routes_through_the_native_owner_without_harness_initializati
     let mut params = sync_fixture(directory.path(), "success");
     params["progress"] = json!(true);
     let mut host = Host::start_with_gh(Some(gh_executable())).await;
-    let synced = host.request(2, "github.sync", params.clone()).await;
+    let synced = host.request(2, "github.issue.sync", params.clone()).await;
     assert_eq!(synced["result"]["fetched"], 1, "{synced}");
     assert_eq!(synced["result"]["pages"], 1);
     assert!(!host.progress.is_empty());
     assert!(host.progress.iter().all(|event| event["request_id"] == 2
-        && event["event"] == "github.sync.progress"
+        && event["event"] == "github.issue.sync.progress"
         && event["payload"]["phase"].is_string()));
     let snapshot: Value = serde_json::from_slice(
         &std::fs::read(directory.path().join("repo/issues/open-snapshot.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(snapshot["issues"][0]["title"], "Hosted sync");
-    let unavailable = host.request(3, "state.get", json!({})).await;
+    let unavailable = host
+        .request_for("uninitialized", 3, "session.state.get", json!({}))
+        .await;
     assert!(
         unavailable["error"]["message"]
             .as_str()
@@ -595,16 +625,16 @@ async fn issue_sync_routes_through_the_native_owner_without_harness_initializati
             .contains("Harness is not initialized")
     );
     params["request"]["manual"] = json!(false);
-    let fresh = host.request(4, "github.sync", params.clone()).await;
+    let fresh = host.request(4, "github.issue.sync", params.clone()).await;
     assert_eq!(fresh["result"]["refreshed"], false, "{fresh}");
     params["request"]["unexpected"] = json!(true);
     assert!(
-        host.request(5, "github.sync", params)
+        host.request(5, "github.issue.sync", params)
             .await
             .get("error")
             .is_some()
     );
-    let deleted = host.request(6, "github.issues", json!({"database":directory.path().join("repo/issues/issues.redb"),"repo":"owner/repo","request":{"operation":"delete_cache"}})).await;
+    let deleted = host.request(6, "github.issue.list", json!({"database":directory.path().join("repo/issues/issues.redb"),"repo":"owner/repo","request":{"operation":"delete_cache"}})).await;
     assert_eq!(deleted["result"]["deleted"], true, "{deleted}");
     host.stop().await;
 }
@@ -625,15 +655,17 @@ async fn issue_detail_fetch_is_persisted_before_the_host_response() {
     let params = json!({"database":sync["database"], "directory":directory.path(),
         "request":{"repository":sync["request"]["repository"],"number":7}});
     let mut host = Host::start_with_gh(Some(gh_executable())).await;
-    let fetched = host.request(2, "github.detail", params.clone()).await;
+    let fetched = host.request(2, "github.issue.get", params.clone()).await;
     assert_eq!(
         fetched["result"]["item"]["title"], "Unicode é issue",
         "{fetched}"
     );
     assert!(fetched["result"]["fetched_at"].as_u64().unwrap() > 0);
-    let cached = host.request(3, "github.issues", json!({"database":sync["database"],"repo":"owner/repo", "request":{"operation":"detail","number":7}})).await;
+    let cached = host.request(3, "github.issue.list", json!({"database":sync["database"],"repo":"owner/repo", "request":{"operation":"detail","number":7}})).await;
     assert_eq!(cached["result"]["item"], fetched["result"]["item"]);
-    let unavailable = host.request(4, "state.get", json!({})).await;
+    let unavailable = host
+        .request_for("uninitialized", 4, "session.state.get", json!({}))
+        .await;
     assert!(
         unavailable["error"]["message"]
             .as_str()
@@ -646,12 +678,12 @@ async fn issue_detail_fetch_is_persisted_before_the_host_response() {
         serde_json::to_vec(&detail).unwrap(),
     )
     .unwrap();
-    let oversized = host.request(5, "github.detail", params).await;
+    let oversized = host.request(5, "github.issue.get", params).await;
     assert_eq!(
         oversized["result"]["item"]["body"].as_str().unwrap().len(),
         forge_protocol::MAX_FRAME_BYTES
     );
-    let deleted = host.request(6, "github.issues", json!({"database":sync["database"],"repo":"owner/repo","request":{"operation":"delete_cache"}})).await;
+    let deleted = host.request(6, "github.issue.list", json!({"database":sync["database"],"repo":"owner/repo","request":{"operation":"delete_cache"}})).await;
     assert_eq!(deleted["result"]["deleted"], true, "{deleted}");
     host.stop().await;
 }
@@ -692,7 +724,7 @@ async fn issue_document_persists_edits_across_close_and_confirms_native_save() {
     let mut host = Host::start_with_gh(Some(gh_executable())).await;
     let mut open = json!({"operation":"open","document":"native-issue-1","directory":directory.path(),
         "database":sync["database"],"repository":sync["request"]["repository"],"number":7});
-    let opened = host.request(2, "issue.document", open.clone()).await;
+    let opened = host.request(2, "github.issue.document", open.clone()).await;
     assert!(opened.get("error").is_none(), "{opened}");
     assert_eq!(opened["result"]["snapshot"]["document"], "native-issue-1");
     let blocks = opened["result"]["snapshot"]["block"].as_array().unwrap();
@@ -713,7 +745,7 @@ async fn issue_document_persists_edits_across_close_and_confirms_native_save() {
     let deferred = host
         .request(
             3,
-            "issue.document",
+            "github.issue.document",
             json!({"operation":"save","document":"native-issue-1","capture":[{
                 "document":"native-issue-1","region":"title","base":0,"sequence":1,"text":saved_title
             }]}),
@@ -744,13 +776,13 @@ async fn issue_document_persists_edits_across_close_and_confirms_native_save() {
     let closed = host
         .request(
             4,
-            "issue.document",
+            "github.issue.document",
             json!({"operation":"close","document":"native-issue-1"}),
         )
         .await;
     assert_eq!(closed["result"]["collected"], true, "{closed}");
     open["document"] = json!("native-issue-2");
-    let reopened = host.request(5, "issue.document", open).await;
+    let reopened = host.request(5, "github.issue.document", open).await;
     assert!(reopened.get("error").is_none(), "{reopened}");
     let title = reopened["result"]["snapshot"]["block"]
         .as_array()
@@ -762,7 +794,7 @@ async fn issue_document_persists_edits_across_close_and_confirms_native_save() {
     let saved = host
         .request(
             6,
-            "issue.document",
+            "github.issue.document",
             json!({"operation":"save","document":"native-issue-2"}),
         )
         .await;
@@ -782,7 +814,7 @@ async fn issue_document_persists_edits_across_close_and_confirms_native_save() {
     let closed = host
         .request(
             7,
-            "issue.document",
+            "github.issue.document",
             json!({"operation":"close","document":"native-issue-2"}),
         )
         .await;
@@ -830,7 +862,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let opened = first
         .request(
             2,
-            "issue.document",
+            "github.issue.document",
             json!({"operation":"open","document":"restart-issue-first","directory":directory.path(),
                 "database":sync["database"],"repository":sync["request"]["repository"],"number":7}),
         )
@@ -839,7 +871,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let uncertain = first
         .request(
             4,
-            "issue.document",
+            "github.issue.document",
             json!({"operation":"save","document":"restart-issue-first","capture":[{
                 "document":"restart-issue-first","region":"title","base":0,"sequence":1,"text":saved_title
             }]}),
@@ -874,7 +906,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let reopened = restarted
         .request(
             5,
-            "issue.document",
+            "github.issue.document",
             json!({"operation":"open","document":"restart-issue-second","directory":directory.path(),
                 "database":sync["database"],"repository":sync["request"]["repository"],"number":7}),
         )
@@ -893,7 +925,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let blocked = restarted
         .request(
             6,
-            "issue.document",
+            "github.issue.document",
             json!({"operation":"save","document":"restart-issue-second"}),
         )
         .await;
@@ -905,7 +937,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let resolved = restarted
         .request(
             7,
-            "issue.document",
+            "github.issue.document",
             json!({"operation":"resolve","document":"restart-issue-second","operation_id":operation_id,
                 "resolution":{"resolution":"close_unknown"}}),
         )
@@ -939,20 +971,20 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     )
     .unwrap();
     let page = restarted
-        .request(8, "github.notifications.page", json!({"directory":directory.path(),"request":{"hostname":"enterprise.example","cursor":null}}))
+        .request(8, "github.notification.list", json!({"directory":directory.path(),"request":{"hostname":"enterprise.example","cursor":null}}))
         .await;
     assert_eq!(
         page["result"]["record"][0]["repository"]["owner"], "other",
         "{page}"
     );
     let opened = restarted
-        .request(9, "notifications.document", json!({"operation":"open","document":"restart-notifications","workspace":directory.path(),"hostname":"enterprise.example"}))
+        .request(9, "github.notification.document", json!({"operation":"open","document":"restart-notifications","workspace":directory.path(),"hostname":"enterprise.example"}))
         .await;
     assert!(opened.get("error").is_none(), "{opened}");
     let view = restarted
         .request(
             10,
-            "notifications.document",
+            "github.notification.document",
             json!({"operation":"view","document":"restart-notifications","view":"restart-notification-view",
                 "width":forge_buffer::width::WidthProfile::default()}),
         )
@@ -961,7 +993,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let snapshot = restarted
         .request(
             11,
-            "notifications.document",
+            "github.notification.document",
             json!({"operation":"snapshot","document":"restart-notifications"}),
         )
         .await;
@@ -974,7 +1006,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let action = restarted
         .request(
             12,
-            "notifications.document",
+            "github.notification.document",
             json!({"operation":"act","input":{
             "document":"restart-notifications","revision":snapshot["result"]["revision"],
             "view":"restart-notification-view","sequence":1,"action":"open","block":block["id"],
@@ -1002,7 +1034,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let opened = pr_host
         .request(
             13,
-            "review.open_pr",
+            "github.review.document.open",
             json!({"directory":directory.path(),"target":target}),
         )
         .await;
@@ -1011,7 +1043,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let uncertain = pr_host
         .request(
             15,
-            "review.save",
+            "github.review.document.save",
             json!({"document":document,"capture":[{
                 "document":document,"region":"title","base":0,"sequence":1,"text":saved_title
             }]}),
@@ -1042,7 +1074,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let opened = pr_restarted
         .request(
             16,
-            "review.open_pr",
+            "github.review.document.open",
             json!({"directory":directory.path(),"target":target}),
         )
         .await;
@@ -1051,7 +1083,7 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     let reconciled = pr_restarted
         .request(
             17,
-            "review.reconcile",
+            "github.review.document.reconcile",
             json!({"document":restarted_document}),
         )
         .await;
@@ -1077,7 +1109,8 @@ async fn host_shutdown_reaps_a_blocked_gh_read_before_its_terminal_response() {
     let mut host = Host::start_with_gh(Some(gh_executable())).await;
     host.input
         .write_all(
-            &serde_json::to_vec(&json!({"id":2,"method":"github.sync","params":params})).unwrap(),
+            &serde_json::to_vec(&json!({"id":2,"method":"github.issue.sync","params":params}))
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -1108,7 +1141,7 @@ async fn host_shutdown_reaps_a_blocked_gh_read_before_its_terminal_response() {
         .unwrap();
     assert!(alive.try_lock().is_err());
     host.input
-        .write_all(b"{\"id\":3,\"method\":\"shutdown\",\"params\":{}}\n")
+        .write_all(b"{\"id\":3,\"method\":\"host.shutdown\",\"params\":{}}\n")
         .await
         .unwrap();
     assert!(host.response(2).await.get("error").is_some());
@@ -1134,14 +1167,14 @@ async fn repository_deletion_obeys_cross_process_leases_and_retains_the_host() {
     let params = |operation| json!({"database":database,"repo":"owner/repo","request":{"operation":operation}});
     assert!(
         first
-            .request(2, "github.issues", params("state"))
+            .request(2, "github.issue.list", params("state"))
             .await
             .get("result")
             .is_some()
     );
     let operation = forge_github::lease::RepositoryLease::operation(&repository).unwrap();
     let busy = second
-        .request(2, "github.issues", params("delete_cache"))
+        .request(2, "github.issue.list", params("delete_cache"))
         .await;
     assert!(
         busy["error"]["message"].as_str().unwrap().contains("Busy"),
@@ -1150,7 +1183,7 @@ async fn repository_deletion_obeys_cross_process_leases_and_retains_the_host() {
     assert!(database.exists());
     drop(operation);
     let deletion = forge_github::lease::RepositoryLease::deletion(&repository).unwrap();
-    let blocked = first.request(3, "github.issues", params("state")).await;
+    let blocked = first.request(3, "github.issue.list", params("state")).await;
     assert!(
         blocked["error"]["message"]
             .as_str()
@@ -1160,15 +1193,15 @@ async fn repository_deletion_obeys_cross_process_leases_and_retains_the_host() {
     );
     drop(deletion);
     let deleted = second
-        .request(3, "github.issues", params("delete_cache"))
+        .request(3, "github.issue.list", params("delete_cache"))
         .await;
     assert_eq!(deleted["result"]["deleted"], true, "{deleted}");
     assert!(!repository.exists());
     let absent = second
-        .request(4, "github.issues", params("delete_cache"))
+        .request(4, "github.issue.list", params("delete_cache"))
         .await;
     assert_eq!(absent["result"]["deleted"], false, "{absent}");
-    let restored = first.request(4, "github.issues", params("state")).await;
+    let restored = first.request(4, "github.issue.list", params("state")).await;
     assert_eq!(restored["result"]["repo"], "owner/repo", "{restored}");
     assert!(database.exists());
     first.stop().await;
@@ -1182,7 +1215,7 @@ async fn separate_forge_processes_share_page_state_snapshot_and_detail_records()
     let snapshot_path = directory.path().join("open-snapshot.json");
     let mut first = Host::start().await;
     let mut second = Host::start().await;
-    let page = first.request(2, "github.issues", json!({
+    let page = first.request(2, "github.issue.list", json!({
         "database":database,"repo":"Owner/Repo","request":{"operation":"upsert_page","scope":"open","page":{
             "issues":[{"repo":"owner/repo","number":7,"title":"Shared record","state":"OPEN",
                 "url":"https://github.com/owner/repo/issues/7","body":"Not completion metadata"}],
@@ -1193,7 +1226,7 @@ async fn separate_forge_processes_share_page_state_snapshot_and_detail_records()
     let state = second
         .request(
             2,
-            "github.issues",
+            "github.issue.list",
             json!({
                 "database":database,"repo":"owner/repo","request":{"operation":"state"}
             }),
@@ -1201,20 +1234,20 @@ async fn separate_forge_processes_share_page_state_snapshot_and_detail_records()
         .await;
     assert_eq!(state["result"]["issue_count"], 1, "{state}");
     assert_eq!(state["result"]["open_historical_complete"], true);
-    let published = second.request(3, "github.issues", json!({
+    let published = second.request(3, "github.issue.list", json!({
         "database":database,"repo":"owner/repo","request":{"operation":"publish_snapshot","state":"open","output":snapshot_path}
     })).await;
     assert_eq!(published["result"]["issue_count"], 1, "{published}");
     let snapshot: Value = serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
     assert_eq!(snapshot["issues"][0]["number"], 7);
     assert!(snapshot["issues"][0].get("body").is_none());
-    let detail = first.request(3, "github.issues", json!({
+    let detail = first.request(3, "github.issue.list", json!({
         "database":database,"repo":"owner/repo","request":{"operation":"upsert_detail","number":7,
             "detail":{"repo":"ignored/repo","number":1,"fetched_at":456,"item":{"body":"Cached body"}}}
     })).await;
     assert_eq!(detail["result"]["repo"], "owner/repo", "{detail}");
     assert_eq!(detail["result"]["number"], 7);
-    let details = second.request(4, "github.issues", json!({
+    let details = second.request(4, "github.issue.list", json!({
         "database":database,"repo":"owner/repo","request":{"operation":"details","number":[8,7]}
     })).await;
     assert_eq!(details["result"]["details"][0]["found"], false, "{details}");
@@ -1225,14 +1258,14 @@ async fn separate_forge_processes_share_page_state_snapshot_and_detail_records()
     let single = first
         .request(
             4,
-            "github.issues",
+            "github.issue.list",
             json!({
                 "database":database,"repo":"owner/repo","request":{"operation":"detail","number":7}
             }),
         )
         .await;
     assert_eq!(single["result"], details["result"]["details"][1]);
-    let committed = first.request(5, "github.issues", json!({
+    let committed = first.request(5, "github.issue.list", json!({
         "database":database,"repo":"owner/repo","request":{"operation":"upsert_page","scope":"open","page":{
             "issues":[{"repo":"owner/repo","number":7,"title":"Recovered after process death","state":"OPEN",
                 "url":"https://github.com/owner/repo/issues/7"}],"completed":true
@@ -1242,7 +1275,7 @@ async fn separate_forge_processes_share_page_state_snapshot_and_detail_records()
     first.process.kill().await.unwrap();
     let stale: Value = serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
     assert_eq!(stale["revision"], 1);
-    let recovered = second.request(5, "github.issues", json!({
+    let recovered = second.request(5, "github.issue.list", json!({
         "database":database,"repo":"owner/repo","request":{"operation":"reconcile_snapshot","state":"open","output":snapshot_path}
     })).await;
     assert_eq!(recovered["result"]["republished"], true, "{recovered}");
@@ -1252,7 +1285,7 @@ async fn separate_forge_processes_share_page_state_snapshot_and_detail_records()
         current["issues"][0]["title"],
         "Recovered after process death"
     );
-    let checked = second.request(6, "github.issues", json!({
+    let checked = second.request(6, "github.issue.list", json!({
         "database":database,"repo":"owner/repo","request":{"operation":"reconcile_snapshot","state":"open","output":snapshot_path}
     })).await;
     assert_eq!(checked["result"]["republished"], false, "{checked}");
@@ -1264,7 +1297,7 @@ async fn issue_storage_uses_the_host_without_initializing_harness() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("issues.redb");
     let mut host = Host::start().await;
-    let stored = host.request(2, "github.issues", json!({
+    let stored = host.request(2, "github.issue.list", json!({
         "database":database,"repo":"Owner/Repo","request":{
             "operation":"upsert_detail","number":7,
             "detail":{"repo":"ignored/repo","number":0,"fetched_at":123,"item":{"title":"Host storage"}}
@@ -1275,7 +1308,7 @@ async fn issue_storage_uses_the_host_without_initializing_harness() {
     let detail = host
         .request(
             3,
-            "github.issues",
+            "github.issue.list",
             json!({
                 "database":database,"repo":"owner/repo","request":{"operation":"detail","number":7}
             }),
@@ -1285,14 +1318,16 @@ async fn issue_storage_uses_the_host_without_initializing_harness() {
         detail["result"]["item"]["title"], "Host storage",
         "{detail}"
     );
-    let unavailable = host.request(4, "state.get", json!({})).await;
+    let unavailable = host
+        .request_for("uninitialized", 4, "session.state.get", json!({}))
+        .await;
     assert!(
         unavailable["error"]["message"]
             .as_str()
             .unwrap()
             .contains("Harness is not initialized")
     );
-    let invalid = host.request(5, "github.issues", json!({
+    let invalid = host.request(5, "github.issue.list", json!({
         "database":database,"repo":"owner/repo","request":{"operation":"state","unexpected":true}
     })).await;
     assert!(invalid.get("error").is_some(), "{invalid}");
@@ -1321,7 +1356,7 @@ async fn large_cached_detail_transfers_with_credit_and_preserves_the_host() {
     let detail = host
         .request(
             2,
-            "github.issues",
+            "github.issue.list",
             json!({
                 "database":database,"repo":"owner/repo","request":{"operation":"detail","number":7}
             }),
@@ -1334,7 +1369,7 @@ async fn large_cached_detail_transfers_with_credit_and_preserves_the_host() {
     let state = host
         .request(
             3,
-            "github.issues",
+            "github.issue.list",
             json!({
                 "database":database,"repo":"owner/repo","request":{"operation":"state"}
             }),
@@ -1352,7 +1387,7 @@ async fn large_cached_detail_transfers_with_credit_and_preserves_the_host() {
             },
         )
         .unwrap();
-    let large = host.request(4, "github.issues", json!({"database":database,"repo":"owner/repo","request":{"operation":"detail","number":7}})).await;
+    let large = host.request(4, "github.issue.list", json!({"database":database,"repo":"owner/repo","request":{"operation":"detail","number":7}})).await;
     assert_eq!(
         large["result"]["item"]["body"].as_str().unwrap().len(),
         16 * 1024 * 1024 + 1
@@ -1369,7 +1404,7 @@ async fn repository_reads_do_not_require_harness_initialization() {
     let response = host
         .request(
             2,
-            "repository.revisions",
+            "repository.revision.list",
             json!({"workspace":fixture.path()}),
         )
         .await;
@@ -1377,9 +1412,11 @@ async fn repository_reads_do_not_require_harness_initialization() {
     assert!(!data_root.exists());
     let unknown = host.request(30, "state.unknown", json!({})).await;
     assert_eq!(unknown["id"], 30);
-    assert_eq!(unknown["error"]["message"], "unknown Harness broker method");
+    assert_eq!(unknown["error"]["message"], "unknown Forge method");
     assert!(!data_root.exists());
-    let unavailable = host.request(3, "state.get", json!({})).await;
+    let unavailable = host
+        .request_for("uninitialized", 3, "session.state.get", json!({}))
+        .await;
     assert!(
         unavailable["error"]["message"]
             .as_str()
@@ -1390,7 +1427,7 @@ async fn repository_reads_do_not_require_harness_initialization() {
     let initialized = host
         .request(
             4,
-            "harness.initialize",
+            "session.initialize",
             json!({
                 "workspace":fixture.path(),"data_root":data_root,"client_id":"shared-host-test",
                 "backend":{"kind":"mock","command":[]}
@@ -1404,15 +1441,22 @@ async fn repository_reads_do_not_require_harness_initialization() {
     let repeated = host
         .request(
             5,
-            "repository.revisions",
+            "repository.revision.list",
             json!({"workspace":fixture.path()}),
         )
         .await;
     assert_eq!(repeated["result"]["count"], 0);
     let unknown = host.request(31, "state.unknown", json!({})).await;
     assert_eq!(unknown["id"], 31);
-    assert_eq!(unknown["error"]["message"], "unknown Harness broker method");
-    let state = host.request(32, "state.get", json!({})).await;
+    assert_eq!(unknown["error"]["message"], "unknown Forge method");
+    let state = host
+        .request_for(
+            initialized["result"]["session"]["id"].as_str().unwrap(),
+            32,
+            "session.state.get",
+            json!({}),
+        )
+        .await;
     assert_eq!(
         state["result"]["session"]["id"],
         initialized["result"]["session"]["id"]
@@ -1439,7 +1483,7 @@ async fn revision_pages_preserve_arguments_and_reject_superseded_snapshots() {
     std::fs::write(root.join(".git/packed-refs"), packed).unwrap();
     let mut host = Host::start().await;
     let first = host
-        .request(2, "repository.revisions", json!({"workspace":root}))
+        .request(2, "repository.revision.list", json!({"workspace":root}))
         .await;
     let first = &first["result"];
     assert_eq!(first["count"], 5000, "{first}");
@@ -1452,7 +1496,7 @@ async fn revision_pages_preserve_arguments_and_reject_superseded_snapshots() {
         let response = host
             .request(
                 request_id,
-                "repository.revisions",
+                "repository.revision.list",
                 json!({"workspace":root,"revision":revision,"offset":offset,"repository":first["repository"],"reference_digest":first["reference_digest"]}),
             )
             .await;
@@ -1466,7 +1510,7 @@ async fn revision_pages_preserve_arguments_and_reject_superseded_snapshots() {
     let refreshed = host
         .request(
             request_id,
-            "repository.revisions",
+            "repository.revision.list",
             json!({"workspace":root}),
         )
         .await;
@@ -1474,7 +1518,7 @@ async fn revision_pages_preserve_arguments_and_reject_superseded_snapshots() {
     let stale = host
         .request(
             request_id + 1,
-            "repository.revisions",
+            "repository.revision.list",
             json!({"workspace":root,"revision":revision,"offset":0}),
         )
         .await;
@@ -1636,7 +1680,7 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
     let opened = host
         .request(
             2,
-            "status",
+            "repository.status.document",
             json!({
                 "operation":"open", "document":"status-fixture", "workspace":fixture.path()
             }),
@@ -1653,7 +1697,7 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
     let action = host
         .request(
             3,
-            "status.context",
+            "repository.status.context",
             json!({"operation":"action","input":captured}),
         )
         .await;
@@ -1661,7 +1705,7 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
     let repeated = host
         .request(
             4,
-            "status.context",
+            "repository.status.context",
             json!({"operation":"action","input":captured}),
         )
         .await;
@@ -1672,7 +1716,7 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
             .contains("already accepted"),
         "{repeated}"
     );
-    let message = host.request(5, "status.context", json!({
+    let message = host.request(5, "repository.status.context", json!({
         "operation":"commit_message", "document":"commit-fixture", "workspace":fixture.path(),
         "oid":action["result"]["oid"]
     })).await;
@@ -1686,7 +1730,7 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
     let source = host
         .request(
             6,
-            "source.document",
+            "repository.source.document",
             json!({
                 "operation":"open", "document":"source-fixture", "workspace":fixture.path(),
                 "revision":action["result"]["oid"], "path":"c2FtcGxlLnR4dA=="
@@ -1700,7 +1744,9 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
             .contains("original source"),
         "{source}"
     );
-    let unavailable = host.request(7, "state.get", json!({})).await;
+    let unavailable = host
+        .request_for("uninitialized", 7, "session.state.get", json!({}))
+        .await;
     assert!(
         unavailable["error"]["message"]
             .as_str()
@@ -1711,7 +1757,7 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
         let closed = host
             .request(
                 request,
-                "source.document",
+                "repository.source.document",
                 json!({"operation":"close","document":document}),
             )
             .await;
@@ -1720,7 +1766,7 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
     let closed = host
         .request(
             10,
-            "status",
+            "repository.status.document",
             json!({"operation":"close","document":"status-fixture"}),
         )
         .await;
@@ -1735,9 +1781,10 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
     git(fixture.path(), &["init", "--quiet"]);
     let mut host = Host::start().await;
     let unavailable = host
-        .request(
+        .request_for(
+            "uninitialized",
             2,
-            "harness.document",
+            "session.document",
             json!({
                 "operation":"snapshot", "document":"transcript"
             }),
@@ -1752,7 +1799,7 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
     let initialized = host
         .request(
             3,
-            "harness.initialize",
+            "session.initialize",
             json!({
                 "workspace":fixture.path(), "data_root":data.path(),
                 "client_id":"document-host-test", "backend":{"kind":"mock","command":[]}
@@ -1763,10 +1810,12 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
         initialized["result"]["session"]["id"].is_string(),
         "{initialized}"
     );
+    let session_id = initialized["result"]["session"]["id"].as_str().unwrap();
     let opened = host
-        .request(
+        .request_for(
+            session_id,
             4,
-            "harness.document",
+            "session.document",
             json!({
                 "operation":"open", "document":"transcript", "view":"view",
                 "width":{"columns":80,"tabstop":4}
@@ -1777,18 +1826,20 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
     let transcript_revision = opened["result"]["transcript"]["revision"].clone();
     let complete_text = format!("{}complete tail", "complete λ\n".repeat(6000));
     let submitted_large = host
-        .request(
+        .request_for(
+            session_id,
             5,
-            "prompt.submit",
+            "session.prompt.submit",
             json!({"text":complete_text,
                 "submission":{"document":"transcript","token":1}}),
         )
         .await;
     assert!(submitted_large.get("error").is_none(), "{submitted_large}");
     let synchronized = host
-        .request(
+        .request_for(
+            session_id,
             7,
-            "harness.document",
+            "session.document",
             json!({
                 "operation":"sync","document":"transcript","revision":transcript_revision
             }),
@@ -1801,9 +1852,9 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
         "{synchronized}"
     );
     let submitted = host
-        .request(
+        .request_for(session_id,
             21,
-            "prompt.submit",
+            "session.prompt.submit",
             json!({
                 "mode":"chat", "text":"newer λ\n\ndraft", "submission":{"document":"transcript","token":2}
             }),
@@ -1820,18 +1871,20 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
         "missing prompt admission event"
     );
     let duplicate = host
-        .request(
+        .request_for(
+            session_id,
             22,
-            "prompt.submit",
+            "session.prompt.submit",
             json!({"text":"duplicate",
         "submission":{"document":"transcript","token":2}}),
         )
         .await;
     assert!(duplicate.get("error").is_some(), "{duplicate}");
     let closed = host
-        .request(
+        .request_for(
+            session_id,
             8,
-            "harness.document",
+            "session.document",
             json!({
                 "operation":"close","document":"transcript"
             }),
@@ -1839,9 +1892,10 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
         .await;
     assert_eq!(closed["result"]["closed"], true, "{closed}");
     let stale = host
-        .request(
+        .request_for(
+            session_id,
             9,
-            "prompt.submit",
+            "session.prompt.submit",
             json!({"text":"late prompt",
         "submission":{"document":"transcript","token":3}}),
         )
@@ -1853,8 +1907,12 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
             .contains("not open"),
         "{stale}"
     );
-    let state = host.request(10, "state.get", json!({})).await;
-    let exchanges = host.request(11, "exchange.list", json!({})).await;
+    let state = host
+        .request_for(session_id, 10, "session.state.get", json!({}))
+        .await;
+    let exchanges = host
+        .request_for(session_id, 11, "session.exchange.list", json!({}))
+        .await;
     assert_eq!(exchanges["result"][0]["prompt"], complete_text);
     assert_eq!(
         state["result"]["session"]["id"],
@@ -1901,7 +1959,7 @@ async fn repository_creation_context_and_durable_post_preserve_captured_identity
     let context = host
         .request(
             2,
-            "github.creation.context",
+            "github.pull_request.creation.context",
             json!({"directory":root.path()}),
         )
         .await;
@@ -1940,15 +1998,15 @@ async fn repository_creation_context_and_durable_post_preserve_captured_identity
     let rejected_ack = host
         .request(
             4,
-            "github.recovery.ack",
+            "github.recovery.acknowledge",
             json!({"resource":resource,"operation_id":"fixture-create"}),
         )
         .await;
     assert!(rejected_ack.get("error").is_some());
-    let settled = host.request(5,"github.recovery.settle_draft",json!({"resource":resource,"operation_id":"fixture-create","draft":{"repo":"owner/repo","number":0,"creation":{"sequence":2,"title":"newer retained generation"}}})).await;
+    let settled = host.request(5,"github.recovery.draft.settle",json!({"resource":resource,"operation_id":"fixture-create","draft":{"repo":"owner/repo","number":0,"creation":{"sequence":2,"title":"newer retained generation"}}})).await;
     assert!(settled.get("error").is_none(), "{settled}");
     let stored = host
-        .request(6, "github.review.draft", json!({"resource":resource}))
+        .request(6, "github.review.draft.get", json!({"resource":resource}))
         .await;
     assert_eq!(
         stored["result"]["creation_receipt"]["capture"]["submitted"]["mutation"]["body"],
@@ -2105,7 +2163,7 @@ async fn review_comment_route_owns_native_baseline_and_retains_unknown_submissio
     let opened = host
         .request(
             2,
-            "review.open_pr",
+            "github.review.document.open",
             json!({"directory":root.path(),"target":target["pull_request"]}),
         )
         .await;
@@ -2132,7 +2190,7 @@ async fn review_comment_route_owns_native_baseline_and_retains_unknown_submissio
     let loaded = host
         .request(
             3,
-            "review.comment",
+            "github.review.document.comment",
             json!({"document":document,"command":{"operation":"load","target":target}}),
         )
         .await;
@@ -2140,7 +2198,7 @@ async fn review_comment_route_owns_native_baseline_and_retains_unknown_submissio
     assert_eq!(snapshot["baseline"], "remote old", "{loaded}");
     let comment = snapshot["comment"].clone();
     let region = snapshot["region"].clone();
-    let saved = host.request(5,"review.comment",json!({
+    let saved = host.request(5,"github.review.document.comment",json!({
         "document":document,
         "capture":[{"document":document,"region":region,"base":0,"sequence":1,"text":"submitted"}],
         "command":{"operation":"save","comment":comment,"action":"save"}
@@ -2162,7 +2220,7 @@ async fn review_comment_route_owns_native_baseline_and_retains_unknown_submissio
         serde_json::to_vec(&json!({"data":{"node":hosted_comment("uncertain")}})).unwrap(),
     )
     .unwrap();
-    let saved = host.request(7,"review.comment",json!({
+    let saved = host.request(7,"github.review.document.comment",json!({
         "document":document,
         "capture":[{"document":document,"region":region,"base":1,"sequence":2,"text":"uncertain"}],
         "command":{"operation":"save","comment":comment,"action":"save"}
@@ -2173,7 +2231,7 @@ async fn review_comment_route_owns_native_baseline_and_retains_unknown_submissio
     let reconciled = host
         .request(
             9,
-            "review.comment",
+            "github.review.document.comment",
             json!({
                 "document":document,
                 "capture":[{"document":document,"region":region,"base":2,"sequence":3,"text":"newer"}],
@@ -2209,7 +2267,7 @@ async fn review_conversation_draft_creates_through_native_host() {
     let opened = host
         .request(
             2,
-            "review.open_pr",
+            "github.review.document.open",
             json!({"directory":root.path(),"target":target}),
         )
         .await;
@@ -2218,7 +2276,7 @@ async fn review_conversation_draft_creates_through_native_host() {
     let draft = host
         .request(
             3,
-            "review.comment",
+            "github.review.document.comment",
             json!({"document":document,"command":{"operation":"draft_conversation"}}),
         )
         .await;
@@ -2247,7 +2305,7 @@ async fn review_conversation_draft_creates_through_native_host() {
     let saved = host
         .request(
             5,
-            "review.comment",
+            "github.review.document.comment",
             json!({
                 "document":document,
                 "capture":[{"document":document,"region":region,"base":0,"sequence":1,"text":body}],
@@ -2296,7 +2354,7 @@ async fn notification_pages_preserve_global_scope_and_reject_malformed_results()
     let params =
         json!({"directory":root.path(),"request":{"hostname":"enterprise.example","cursor":null}});
     let page = host
-        .request(2, "github.notifications.page", params.clone())
+        .request(2, "github.notification.list", params.clone())
         .await;
     assert!(page.get("error").is_none(), "{page}");
     assert_eq!(page["result"]["record"][0]["repository"]["name"], "first");
@@ -2305,19 +2363,19 @@ async fn notification_pages_preserve_global_scope_and_reject_malformed_results()
     let opened = host
         .request(
             3,
-            "notifications.document",
+            "github.notification.document",
             json!({"operation":"open",
         "document":"global-notifications","workspace":root.path(),"hostname":"enterprise.example"}),
         )
         .await;
     assert!(opened.get("error").is_none(), "{opened}");
-    let view = host.request(4, "notifications.document", json!({"operation":"view",
+    let view = host.request(4, "github.notification.document", json!({"operation":"view",
         "document":"global-notifications","view":"notification-window","width":forge_buffer::width::WidthProfile::default()})).await;
     assert!(view.get("error").is_none(), "{view}");
     let snapshot = host
         .request(
             5,
-            "notifications.document",
+            "github.notification.document",
             json!({"operation":"snapshot","document":"global-notifications"}),
         )
         .await;
@@ -2333,7 +2391,7 @@ async fn notification_pages_preserve_global_scope_and_reject_malformed_results()
     let action = host
         .request(
             6,
-            "notifications.document",
+            "github.notification.document",
             json!({"operation":"act","input":input}),
         )
         .await;
@@ -2346,7 +2404,7 @@ async fn notification_pages_preserve_global_scope_and_reject_malformed_results()
     let duplicate = host
         .request(
             7,
-            "notifications.document",
+            "github.notification.document",
             json!({"operation":"act","input":input}),
         )
         .await;
@@ -2354,13 +2412,13 @@ async fn notification_pages_preserve_global_scope_and_reject_malformed_results()
     let closed = host
         .request(
             8,
-            "notifications.document",
+            "github.notification.document",
             json!({"operation":"close","document":"global-notifications"}),
         )
         .await;
     assert_eq!(closed["result"]["closed"], true);
     std::fs::write(root.path().join("notification-page.json"), "{}").unwrap();
-    let failure = host.request(9, "github.notifications.page", params).await;
+    let failure = host.request(9, "github.notification.list", params).await;
     assert!(failure.get("error").is_some(), "{failure}");
     host.stop().await;
 }

@@ -15,7 +15,7 @@ fn repository_discovery_failure_returns_a_correlated_initialize_error() {
     std::fs::write(repository.path().join(".git/config"), "[invalid\n").unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
-    broker.request(json!({"id": 41, "method": "harness.initialize", "params": {
+    broker.request(json!({"id": 41, "method": "session.initialize", "params": {
         "data_root": data.path(), "workspace": repository.path(), "client_id": "invalid-repository",
         "backend": { "kind": "mock", "command": ["mock"] }
     }}));
@@ -42,7 +42,7 @@ fn nested_workspace_initialization_preserves_the_canonical_repository_root() {
     std::fs::create_dir(&nested).unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
-    broker.request(json!({"id": 42, "method": "harness.initialize", "params": {
+    broker.request(json!({"id": 42, "method": "session.initialize", "params": {
         "data_root": data.path(), "workspace": nested, "client_id": "nested-repository",
         "backend": { "kind": "mock", "command": ["mock"] }
     }}));
@@ -54,7 +54,7 @@ fn nested_workspace_initialization_preserves_the_canonical_repository_root() {
         std::fs::canonicalize(workspace).unwrap(),
         std::fs::canonicalize(repository.path()).unwrap()
     );
-    broker.request(json!({"id": 43, "method": "shutdown", "params": {}}));
+    broker.request(json!({"id": 43, "method": "host.shutdown", "params": {}}));
     assert!(
         broker
             .read_response(43)
@@ -79,7 +79,7 @@ async fn rejects_missing_or_mismatched_wire_version_before_initialization() {
             .spawn()
             .unwrap();
         let mut request =
-            json!({"id": 7, "method": "initialize", "params": {"data_root": data_root}});
+            json!({"id": 7, "method": "host.initialize", "params": {"data_root": data_root}});
         if !version.is_null() {
             request["params"]["protocol_version"] = version;
         }
@@ -125,7 +125,7 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
     let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
     send(
         &mut input,
-        json!({"id": 1, "method": "initialize", "params": {
+        json!({"id": 1, "method": "host.initialize", "params": {
             "protocol_version": forge_protocol::WIRE_VERSION,
         }}),
     )
@@ -138,11 +138,11 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
     let initialized: Value = serde_json::from_slice(&line).unwrap();
     assert!(initialized.get("error").is_none(), "{initialized}");
     let mut consumed_bytes = line.len();
-    send(&mut input, json!({"id": 0, "method": "transport.consumed", "params": {"bytes": consumed_bytes, "frames": 1}})).await;
+    send(&mut input, json!({"id": 0, "method": "host.transport.consumed", "params": {"bytes": consumed_bytes, "frames": 1}})).await;
     for request_id in 2..130 {
         send(
             &mut input,
-            json!({"id": request_id, "method": "turn.cancel", "params": {}}),
+            json!({"id": request_id, "method": "session.turn.cancel", "params": {}}),
         )
         .await;
         line.clear();
@@ -156,7 +156,7 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
     }
     send(
         &mut input,
-        json!({"id": 130, "method": "turn.cancel", "params": {}}),
+        json!({"id": 130, "method": "session.turn.cancel", "params": {}}),
     )
     .await;
     line.clear();
@@ -172,7 +172,7 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
         line.is_empty(),
         "writer emitted a partial frame without credit"
     );
-    send(&mut input, json!({"id": 0, "method": "transport.consumed", "params": {"bytes": consumed_bytes, "frames": 129}})).await;
+    send(&mut input, json!({"id": 0, "method": "host.transport.consumed", "params": {"bytes": consumed_bytes, "frames": 129}})).await;
     tokio::time::timeout(Duration::from_secs(5), output.read_until(b'\n', &mut line))
         .await
         .unwrap()
@@ -180,7 +180,7 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
     assert_eq!(serde_json::from_slice::<Value>(&line).unwrap()["id"], 130);
     send(
         &mut input,
-        json!({"id": 131, "method": "shutdown", "params": {}}),
+        json!({"id": 131, "method": "host.shutdown", "params": {}}),
     )
     .await;
     loop {
@@ -269,7 +269,7 @@ impl BrokerProcess {
             consumed_frames: 0,
             next_query_id: 10_000,
         };
-        broker.request(json!({"id": 0, "method": "initialize", "params": {"protocol_version": forge_protocol::WIRE_VERSION}}));
+        broker.request(json!({"id": 0, "method": "host.initialize", "params": {"protocol_version": forge_protocol::WIRE_VERSION}}));
         let handshake = broker.read_response(0);
         assert_eq!(
             handshake.last().unwrap()["result"]["protocol_version"],
@@ -302,6 +302,16 @@ impl BrokerProcess {
         }
     }
 
+    fn capture_session(&mut self, request_id: u64) -> String {
+        let response = self.read_response(request_id).pop().unwrap();
+        let session_id = response["result"]["session"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session initialization failed: {response}"))
+            .to_owned();
+        self.pending_response.insert(request_id, response);
+        session_id
+    }
+
     fn read_message(&mut self) -> Value {
         let line = self
             .stdout
@@ -311,7 +321,7 @@ impl BrokerProcess {
         let message = serde_json::from_str(&line).unwrap();
         self.consumed_bytes += line.len() + 1;
         self.consumed_frames += 1;
-        let credit = json!({"id": 0, "method": "transport.consumed", "params": {
+        let credit = json!({"id": 0, "method": "host.transport.consumed", "params": {
             "bytes": self.consumed_bytes, "frames": self.consumed_frames,
         }});
         let encoded = serde_json::to_string(&credit).unwrap() + "\n";
@@ -322,7 +332,7 @@ impl BrokerProcess {
 
     fn wait_for_exchanges(
         &mut self,
-        turn_request_id: u64,
+        turn_request_id: Option<u64>,
         session_id: Option<&str>,
         ready: impl Fn(&Value) -> bool,
     ) -> Value {
@@ -331,14 +341,16 @@ impl BrokerProcess {
             let query_id = self.next_query_id;
             self.next_query_id += 1;
             self.request(
-                json!({"id":query_id,"session_id":session_id,"method":"exchange.list","params":{}}),
+                json!({"id":query_id,"session_id":session_id,"method":"session.exchange.list","params":{}}),
             );
             let messages = self.read_response(query_id);
-            assert!(
-                !self.pending_response.contains_key(&turn_request_id),
-                "turn settled before the expected live state: {:?}",
-                self.pending_response.get(&turn_request_id)
-            );
+            if let Some(turn_request_id) = turn_request_id {
+                assert!(
+                    !self.pending_response.contains_key(&turn_request_id),
+                    "turn settled before the expected live state: {:?}",
+                    self.pending_response.get(&turn_request_id)
+                );
+            }
             let response = messages.last().unwrap();
             assert!(response.get("error").is_none(), "{response}");
             let snapshot = &response["result"];
@@ -404,13 +416,14 @@ fn chat_reports_provider_start_failure_without_stopping_host() {
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
     broker.request(json!({
-        "id": 1, "method": "harness.initialize", "params": {
+        "id": 1, "method": "session.initialize", "params": {
             "data_root": data.path(), "workspace": repository.path(),
             "client_id": "chat-provider-stack-test",
             "backend": { "kind": "codex", "command": ["forge-unavailable-provider-fixture"] },
             "model": "fixture", "effort": "medium"
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     assert!(
         broker
             .read_response(1)
@@ -419,8 +432,8 @@ fn chat_reports_provider_start_failure_without_stopping_host() {
             .get("error")
             .is_none()
     );
-    broker.request(json!({
-        "id": 2, "method": "prompt.submit", "params": { "text": "Answer the fixture" }
+    broker.request(json!({"session_id": fixture_session_id,
+        "id": 2, "method": "session.prompt.submit", "params": { "text": "Answer the fixture" }
     }));
     let response = broker.read_response(2).pop().unwrap();
     assert!(
@@ -429,7 +442,7 @@ fn chat_reports_provider_start_failure_without_stopping_host() {
             .contains("forge-unavailable-provider-fixture"),
         "{response}"
     );
-    broker.request(json!({ "id": 3, "method": "state.get", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 3, "method": "session.state.get", "params": {} }));
     assert!(
         broker
             .read_response(3)
@@ -438,7 +451,14 @@ fn chat_reports_provider_start_failure_without_stopping_host() {
             .get("error")
             .is_none()
     );
-    broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id, "id": 5, "method": "session.exchange.list", "params": {}}));
+    let failed = broker.read_response(5).pop().unwrap();
+    assert_eq!(failed["result"][0]["state"], "failed", "{failed}");
+    assert!(
+        failed["result"][0]["finalization_error"].is_null(),
+        "{failed}"
+    );
+    broker.request(json!({ "id": 4, "method": "host.shutdown", "params": {} }));
     assert_eq!(
         broker.read_response(4).last().unwrap()["result"]["shutdown"],
         true
@@ -449,11 +469,12 @@ fn chat_reports_provider_start_failure_without_stopping_host() {
 fn planning_task_reports_provider_start_failure_without_stopping_host() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
+    std::fs::write(repository.path().join(".forge.json"), r#"{"checks":{}}"#).unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -463,6 +484,7 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
             "effort": "medium"
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     assert!(
         broker
             .read_response(1)
@@ -471,28 +493,47 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
             .get("error")
             .is_none()
     );
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
-        "method": "task.transition",
+        "method": "session.command.apply",
         "params": { "operation_id": "planning-stack-test", "action": "plan", "text": "Plan a fixture" }
     }));
-    assert_eq!(
-        broker.read_response(2).last().unwrap()["result"]["state"],
-        "accepted"
-    );
+    let mut observed = broker.read_response(2);
+    assert_eq!(observed.last().unwrap()["result"]["state"], "completed");
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let message = broker.read_message();
-        if message["event"] == "task_operation" && message["payload"]["state"] == "failed" {
-            assert!(
-                message["payload"]["error"]
+        if observed.iter().any(|message| {
+            (message["event"] == "backend_event"
+                && message["payload"]["kind"] == "error"
+                && message["payload"]["text"]
                     .as_str()
-                    .unwrap()
-                    .contains("forge-unavailable-provider-fixture")
-            );
+                    .is_some_and(|text| text.contains("forge-unavailable-provider-fixture")))
+                || [
+                    &message["result"]["messages"],
+                    &message["payload"]["upsert"],
+                ]
+                .into_iter()
+                .filter_map(Value::as_array)
+                .flatten()
+                .any(|input| {
+                    input["error"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("forge-unavailable-provider-fixture"))
+                })
+        }) {
             break;
         }
+        assert!(
+            Instant::now() < deadline,
+            "provider failure was not published: {observed:?}"
+        );
+        let request_id = broker.next_query_id;
+        broker.next_query_id += 1;
+        broker.request(json!({"id":request_id,"session_id":fixture_session_id,"method":"session.input.get","params":{}}));
+        observed.extend(broker.read_response(request_id));
+        std::thread::sleep(Duration::from_millis(10));
     }
-    broker.request(json!({ "id": 3, "method": "state.get", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 3, "method": "session.state.get", "params": {} }));
     assert!(
         broker
             .read_response(3)
@@ -501,7 +542,7 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
             .get("error")
             .is_none()
     );
-    broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
+    broker.request(json!({ "id": 4, "method": "host.shutdown", "params": {} }));
     assert_eq!(
         broker.read_response(4).last().unwrap()["result"]["shutdown"],
         true
@@ -509,7 +550,7 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
 }
 
 #[test]
-fn streams_plan_document_changes_before_the_jsonl_response() {
+fn streams_plan_document_changes_after_command_admission() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     std::fs::write(repository.path().join(".forge.json"), br#"{"checks":{}}"#).unwrap();
@@ -525,11 +566,12 @@ fn streams_plan_document_changes_before_the_jsonl_response() {
     std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
     git(repository.path(), &["add", "."]);
     git(repository.path(), &["commit", "-qm", "seed"]);
+    std::fs::write(repository.path().join(".forge.json"), r#"{"checks":{}}"#).unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -540,22 +582,33 @@ fn streams_plan_document_changes_before_the_jsonl_response() {
             "goal_max_turns": 20
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     let initialized = broker.read_response(1);
     assert!(initialized.last().unwrap().get("error").is_none());
 
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "/plan build the feature" }
     }));
-    let planned = broker.read_response(2);
+    let mut planned = broker.read_response(2);
+    assert_eq!(planned.last().unwrap()["result"]["state"], "completed");
+    while !planned
+        .iter()
+        .any(|message| message["event"] == "plan_created")
+        || !planned
+            .iter()
+            .any(|message| message["event"] == "exchange_complete")
+    {
+        planned.push(broker.read_message());
+    }
     let notifications = planned
         .iter()
         .filter(|message| message["event"] == "document_changed")
         .collect::<Vec<_>>();
     assert!(
         !notifications.is_empty(),
-        "plan changes must stream before the response: {planned:?}"
+        "plan changes must stream after admission: {planned:?}"
     );
     let mut previous_revision = 0;
     for notification in notifications {
@@ -580,8 +633,6 @@ fn streams_plan_document_changes_before_the_jsonl_response() {
             .iter()
             .any(|message| message["event"] == "plan_created")
     );
-    let response = planned.last().unwrap();
-    assert!(response.get("error").is_none(), "{response}");
     assert_eq!(
         planned
             .iter()
@@ -592,7 +643,7 @@ fn streams_plan_document_changes_before_the_jsonl_response() {
         Some("awaiting_review")
     );
 
-    broker.request(json!({ "id": 3, "method": "shutdown", "params": {} }));
+    broker.request(json!({ "id": 3, "method": "host.shutdown", "params": {} }));
     let stopped = broker.read_response(3);
     assert_eq!(
         stopped
@@ -613,7 +664,7 @@ fn opens_a_fork_before_provider_preparation_and_queues_only_the_child_prompt() {
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -664,14 +715,14 @@ fn opens_a_fork_before_provider_preparation_and_queues_only_the_child_prompt() {
     broker.request(json!({
         "id": 3,
         "session_id": child_session_id,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "queued child prompt" }
     }));
     let parent_started = Instant::now();
     broker.request(json!({
         "id": 4,
         "session_id": source_session_id,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "independent parent prompt" }
     }));
     let parent_messages = broker.read_response(4);
@@ -703,7 +754,7 @@ fn creates_a_new_session_while_the_source_turn_continues() {
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -727,10 +778,10 @@ fn creates_a_new_session_while_the_source_turn_continues() {
     broker.request(json!({
         "id": 2,
         "session_id": source_session_id,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "keep the source busy" }
     }));
-    broker.wait_for_exchanges(2, Some(&source_session_id), |snapshot| {
+    broker.wait_for_exchanges(Some(2), Some(&source_session_id), |snapshot| {
         snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
     });
 
@@ -777,7 +828,7 @@ fn creates_a_new_session_while_the_source_turn_continues() {
     broker.request(json!({
         "id": 4,
         "session_id": child_session_id,
-        "method": "state.get",
+        "method": "session.state.get",
         "params": {}
     }));
     let child_snapshot = broker.read_response(4);
@@ -811,7 +862,7 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -822,6 +873,7 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             "goal_max_turns": 20
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     assert!(
         broker
             .read_response(1)
@@ -831,12 +883,12 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             .is_none()
     );
 
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "keep working until cancelled" }
     }));
-    broker.request(json!({ "id": 3, "method": "turn.cancel", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 3, "method": "session.turn.cancel", "params": {} }));
 
     let cancellation = broker.read_response(3);
     assert_eq!(
@@ -863,7 +915,7 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             .any(|message| message["event"] == "document_changed")
     );
 
-    broker.request(json!({ "id": 4, "method": "exchange.list", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 4, "method": "session.exchange.list", "params": {} }));
     let snapshot = broker.read_response(4);
     assert_eq!(
         snapshot
@@ -873,7 +925,7 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             .and_then(Value::as_str),
         Some("cancelled")
     );
-    broker.request(json!({ "id": 5, "method": "shutdown", "params": {} }));
+    broker.request(json!({ "id": 5, "method": "host.shutdown", "params": {} }));
     broker.read_response(5);
 }
 
@@ -884,15 +936,18 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
     broker.request(json!({
-        "id":1,"method":"harness.initialize","params":{
+        "id":1,"method":"session.initialize","params":{
             "workspace":workspace.path(),"data_root":data.path(),"client_id":"shutdown-test",
             "backend":{"kind":"mock","command":["visible-blocking"]}
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     let initialized = broker.read_response(1);
     assert!(initialized.last().unwrap().get("error").is_none());
-    broker.request(json!({"id":2,"method":"prompt.submit","params":{"text":"first active turn"}}));
-    broker.wait_for_exchanges(2, None, has_assistant_output);
+    broker.request(
+        json!({"id":2,"session_id":fixture_session_id,"method":"session.prompt.submit","params":{"text":"first active turn"}}),
+    );
+    broker.wait_for_exchanges(Some(2), Some(&fixture_session_id), has_assistant_output);
     broker
         .request(json!({"id":3,"method":"session.new","params":{"name":"second active session"}}));
     let created = broker.read_response(3);
@@ -902,9 +957,9 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
         .pointer("/result/session/id")
         .and_then(Value::as_str)
         .unwrap();
-    broker.request(json!({"id":4,"session_id":child,"method":"prompt.submit","params":{"text":"second active turn"}}));
-    broker.wait_for_exchanges(4, Some(child), has_assistant_output);
-    broker.request(json!({"id":5,"method":"shutdown","params":{}}));
+    broker.request(json!({"id":4,"session_id":child,"method":"session.prompt.submit","params":{"text":"second active turn"}}));
+    broker.wait_for_exchanges(Some(4), Some(child), has_assistant_output);
+    broker.request(json!({"id":5,"method":"host.shutdown","params":{}}));
     let stopped = broker.read_response(5);
     assert_eq!(
         stopped.last().unwrap().pointer("/result/shutdown"),
@@ -944,7 +999,7 @@ fn restarts_a_running_turn_with_updated_permissions_without_creating_another_int
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -955,6 +1010,7 @@ fn restarts_a_running_turn_with_updated_permissions_without_creating_another_int
             "goal_max_turns": 20
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     assert!(
         broker
             .read_response(1)
@@ -964,18 +1020,18 @@ fn restarts_a_running_turn_with_updated_permissions_without_creating_another_int
             .is_none()
     );
 
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "create the requested file" }
     }));
-    broker.wait_for_exchanges(2, None, |snapshot| {
+    broker.wait_for_exchanges(Some(2), Some(&fixture_session_id), |snapshot| {
         snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
     });
 
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 3,
-        "method": "task.transition",
+        "method": "session.command.apply",
         "params": {
             "operation_id": "restart-with-updated-permissions",
             "action": "permission",
@@ -1016,9 +1072,9 @@ fn restarts_a_running_turn_with_updated_permissions_without_creating_another_int
         }
     }
 
-    broker.request(json!({ "id": 6, "method": "state.get", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 6, "method": "session.state.get", "params": {} }));
     let snapshot = broker.read_response(6);
-    broker.request(json!({ "id": 7, "method": "exchange.list", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 7, "method": "session.exchange.list", "params": {} }));
     let exchanges = broker.read_response(7);
     let interaction = exchanges.last().unwrap()["result"].as_array().unwrap();
     assert_eq!(interaction.len(), 1);
@@ -1051,11 +1107,12 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
     std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
     git(repository.path(), &["add", "."]);
     git(repository.path(), &["commit", "-qm", "seed"]);
+    std::fs::write(repository.path().join(".forge.json"), r#"{"checks":{}}"#).unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -1066,6 +1123,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
             "goal_max_turns": 20
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     let initialized = broker.read_response(1);
     assert_eq!(
         initialized
@@ -1076,9 +1134,9 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
         Some(true)
     );
 
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
-        "method": "task.transition",
+        "method": "session.command.apply",
         "params": { "operation_id":"retract-permission-setup", "action":"permission", "change":{"kind":"set_approval","mode":"ask"} }
     }));
     broker.read_response(2);
@@ -1096,17 +1154,31 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
         }
     }
     let prompt = "/plan reconsider this\nbefore doing anything";
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 3,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": prompt }
     }));
-    broker.wait_for_exchanges(3, None, |snapshot| {
+    assert_eq!(
+        broker.read_response(3).last().unwrap()["result"]["state"],
+        "completed"
+    );
+    broker.wait_for_exchanges(None, Some(&fixture_session_id), |snapshot| {
         snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
     });
-    broker.request(json!({
+    broker.request(
+        json!({"session_id":fixture_session_id,"id":8,"method":"session.input.get","params":{}}),
+    );
+    let retained_input = broker.read_response(8).last().unwrap()["result"]["messages"][0].clone();
+    assert!(retained_input["id"].is_string(), "{retained_input}");
+    broker.request(json!({"session_id":fixture_session_id,"id":9,"method":"session.goal.pause","params":{"operation_id":"pause-before-retraction"}}));
+    assert_eq!(
+        broker.read_response(9).last().unwrap()["result"]["state"],
+        "completed"
+    );
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 4,
-        "method": "turn.cancel",
+        "method": "session.turn.cancel",
         "params": { "restore_prompt_if_no_output": true }
     }));
 
@@ -1119,33 +1191,35 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
             .and_then(Value::as_bool),
         Some(true)
     );
-    let retracted = broker.read_response(3);
-    assert_eq!(
-        retracted
-            .last()
-            .unwrap()
-            .pointer("/error/code")
-            .and_then(Value::as_str),
-        Some("turn_retracted")
-    );
-    assert_eq!(
-        retracted
-            .last()
-            .unwrap()
-            .pointer("/error/data/prompt")
-            .and_then(Value::as_str),
-        Some(prompt)
-    );
-    assert!(
-        cancellation
-            .iter()
-            .chain(&retracted)
-            .any(|message| message["event"] == "document_changed")
-    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let request_id = broker.next_query_id;
+        broker.next_query_id += 1;
+        broker.request(json!({"session_id":fixture_session_id,"id":request_id,"method":"session.input.get","params":{}}));
+        let input = broker.read_response(request_id).pop().unwrap();
+        if let Some(message) =
+            input["result"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| {
+                    message["id"] == retained_input["id"] && message["delivery"] == "queued"
+                })
+        {
+            assert_eq!(message["text"], retained_input["text"]);
+            assert_eq!(input["result"]["suspended"], true);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task input was not restored: {input}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
-    broker.request(json!({ "id": 5, "method": "state.get", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 5, "method": "session.state.get", "params": {} }));
     let snapshot = broker.read_response(5);
-    broker.request(json!({ "id": 7, "method": "exchange.list", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 7, "method": "session.exchange.list", "params": {} }));
     let exchanges = broker.read_response(7);
     assert_eq!(
         exchanges.last().unwrap()["result"]
@@ -1163,15 +1237,14 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
         Some("ask")
     );
     assert_eq!(
-        snapshot
-            .last()
-            .unwrap()
-            .pointer("/result/artifact")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(0)
+        snapshot.last().unwrap()["result"]["session"]["active_task"]["kind"],
+        "plan"
     );
-    broker.request(json!({ "id": 6, "method": "shutdown", "params": {} }));
+    assert_eq!(
+        snapshot.last().unwrap()["result"]["session"]["active_task"]["plan"]["paused"],
+        true
+    );
+    broker.request(json!({ "id": 6, "method": "host.shutdown", "params": {} }));
     broker.read_response(6);
 }
 
@@ -1195,7 +1268,7 @@ fn visible_output_prevents_cancelled_turn_retraction() {
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -1206,17 +1279,18 @@ fn visible_output_prevents_cancelled_turn_retraction() {
             "goal_max_turns": 20
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     broker.read_response(1);
 
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "show output before cancellation" }
     }));
-    broker.wait_for_exchanges(2, None, has_assistant_output);
-    broker.request(json!({
+    broker.wait_for_exchanges(Some(2), Some(&fixture_session_id), has_assistant_output);
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 3,
-        "method": "turn.cancel",
+        "method": "session.turn.cancel",
         "params": { "restore_prompt_if_no_output": true }
     }));
     broker.read_response(3);
@@ -1229,13 +1303,13 @@ fn visible_output_prevents_cancelled_turn_retraction() {
             .and_then(Value::as_str),
         Some("turn_cancelled")
     );
-    broker.request(json!({"id": 10, "method":"exchange.list", "params":{}}));
+    broker.request(json!({"session_id": fixture_session_id, "id": 10, "method":"session.exchange.list", "params":{}}));
     let snapshot = broker.read_response(10);
     let snapshot = &snapshot.last().unwrap()["result"];
     assert_eq!(snapshot[0]["state"], "cancelled");
     assert!(has_assistant_output(snapshot));
 
-    broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
+    broker.request(json!({ "id": 4, "method": "host.shutdown", "params": {} }));
     broker.read_response(4);
 }
 
@@ -1259,7 +1333,7 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -1270,14 +1344,15 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
             "goal_max_turns": 20
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     broker.read_response(1);
 
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "change the workspace" }
     }));
-    broker.wait_for_exchanges(2, None, |snapshot| {
+    broker.wait_for_exchanges(Some(2), Some(&fixture_session_id), |snapshot| {
         snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
     });
     let changed_path = repository.path().join("mock-provider-change.txt");
@@ -1286,9 +1361,9 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(changed_path.exists());
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 3,
-        "method": "turn.cancel",
+        "method": "session.turn.cancel",
         "params": { "restore_prompt_if_no_output": true }
     }));
     broker.read_response(3);
@@ -1302,7 +1377,7 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
         Some("turn_cancelled")
     );
 
-    broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
+    broker.request(json!({ "id": 4, "method": "host.shutdown", "params": {} }));
     broker.read_response(4);
 }
 
@@ -1323,11 +1398,12 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
     std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
     git(repository.path(), &["add", "."]);
     git(repository.path(), &["commit", "-qm", "seed"]);
+    std::fs::write(repository.path().join(".forge.json"), r#"{"checks":{}}"#).unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -1338,6 +1414,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
             "goal_max_turns": 20
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     let initialized = broker.read_response(1);
     assert_eq!(
         initialized
@@ -1348,15 +1425,15 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
         Some(true)
     );
 
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "/plan refactor X" }
     }));
-    broker.wait_for_exchanges(2, None, has_assistant_output);
-    broker.request(json!({
+    broker.wait_for_exchanges(None, Some(&fixture_session_id), has_assistant_output);
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 3,
-        "method": "turn.steer",
+        "method": "session.turn.steer",
         "params": { "text": "And be sure to modify Y" }
     }));
     let steered = broker.read_response(3);
@@ -1368,18 +1445,28 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
             .and_then(Value::as_bool),
         Some(true)
     );
-    let snapshot = broker.wait_for_exchanges(2, None, |snapshot| {
-        snapshot
-            .pointer("/0/node_list/1/prompt/text")
-            .and_then(Value::as_str)
-            == Some("And be sure to modify Y")
+    let snapshot = broker.wait_for_exchanges(None, Some(&fixture_session_id), |snapshot| {
+        snapshot[0]["node_list"].as_array().is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node["kind"] == "exchange_input"
+                    && node["prompt"]["text"] == "And be sure to modify Y"
+            })
+        })
     });
-    assert_eq!(snapshot[0]["node_list"][1]["kind"], "exchange_input");
+    let steering = snapshot[0]["node_list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| {
+            node["kind"] == "exchange_input" && node["prompt"]["text"] == "And be sure to modify Y"
+        })
+        .unwrap()
+        .clone();
 
-    broker.request(json!({ "id": 4, "method": "turn.cancel", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 4, "method": "session.turn.cancel", "params": {} }));
     broker.read_response(4);
     broker.read_response(2);
-    broker.request(json!({ "id": 5, "method": "exchange.list", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 5, "method": "session.exchange.list", "params": {} }));
     let snapshot = broker.read_response(5);
     let interaction = snapshot
         .last()
@@ -1388,21 +1475,20 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
         .and_then(Value::as_array)
         .unwrap();
     assert_eq!(interaction.len(), 1);
-    assert_eq!(interaction[0]["prompt"], "/plan refactor X");
-    assert_eq!(
-        interaction[0]
-            .pointer("/node_list/1/prompt/text")
-            .and_then(Value::as_str),
-        Some("And be sure to modify Y")
+    assert!(
+        interaction[0]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("refactor X")
     );
-    assert_eq!(
-        interaction[0]
-            .pointer("/node_list/1/prompt/id")
-            .and_then(Value::as_str),
-        Some(format!("{}:input:1", interaction[0]["id"].as_str().unwrap()).as_str())
+    assert!(
+        interaction[0]["node_list"]
+            .as_array()
+            .unwrap()
+            .contains(&steering)
     );
 
-    broker.request(json!({ "id": 6, "method": "shutdown", "params": {} }));
+    broker.request(json!({ "id": 6, "method": "host.shutdown", "params": {} }));
     broker.read_response(6);
 }
 
@@ -1426,7 +1512,7 @@ fn reports_structured_lease_recovery_and_allows_a_new_session() {
     let initialize = |id: u64, client_id: &str, action: Option<&str>| {
         json!({
             "id": id,
-            "method": "harness.initialize",
+            "method": "session.initialize",
             "params": {
                 "data_root": data.path(),
                 "workspace": repository.path(),
@@ -1451,7 +1537,7 @@ fn reports_structured_lease_recovery_and_allows_a_new_session() {
         .unwrap()
         .to_owned();
     owner.request(
-        json!({ "id": 2, "method": "prompt.submit", "params": { "text": "prime fork support" } }),
+        json!({ "id": 2, "session_id": owner_session_id, "method": "session.prompt.submit", "params": { "text": "prime fork support" } }),
     );
     assert!(
         owner
@@ -1481,9 +1567,9 @@ fn reports_structured_lease_recovery_and_allows_a_new_session() {
         .unwrap();
     assert_ne!(replacement_session_id, owner_session_id);
 
-    replacement.request(json!({ "id": 5, "method": "shutdown", "params": {} }));
+    replacement.request(json!({ "id": 5, "method": "host.shutdown", "params": {} }));
     replacement.read_response(5);
-    owner.request(json!({ "id": 6, "method": "shutdown", "params": {} }));
+    owner.request(json!({ "id": 6, "method": "host.shutdown", "params": {} }));
     owner.read_response(6);
 }
 
@@ -1507,7 +1593,7 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
     let mut broker = BrokerProcess::start();
     broker.request(json!({
         "id": 1,
-        "method": "harness.initialize",
+        "method": "session.initialize",
         "params": {
             "data_root": data.path(),
             "workspace": repository.path(),
@@ -1518,6 +1604,7 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
             "goal_max_turns": 20
         }
     }));
+    let fixture_session_id = broker.capture_session(1);
     assert!(
         broker
             .read_response(1)
@@ -1527,13 +1614,13 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
             .is_none()
     );
 
-    broker.request(json!({
+    broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
-        "method": "prompt.submit",
+        "method": "session.prompt.submit",
         "params": { "text": "keep working until cancelled" }
     }));
     for request_id in 100..164 {
-        broker.request(json!({ "id": request_id, "method": "state.get", "params": {} }));
+        broker.request(json!({"session_id": fixture_session_id,  "id": request_id, "method": "session.state.get", "params": {} }));
     }
     let rejected = broker.read_response(163);
     assert_eq!(
@@ -1544,7 +1631,7 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
             .and_then(Value::as_str),
         Some("busy")
     );
-    broker.request(json!({ "id": 3, "method": "turn.cancel", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 3, "method": "session.turn.cancel", "params": {} }));
 
     let cancellation = broker.read_response(3);
     assert_eq!(
@@ -1571,7 +1658,7 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
             .any(|message| message["event"] == "document_changed")
     );
 
-    broker.request(json!({ "id": 4, "method": "exchange.list", "params": {} }));
+    broker.request(json!({"session_id": fixture_session_id,  "id": 4, "method": "session.exchange.list", "params": {} }));
     let snapshot = broker.read_response(4);
     assert_eq!(
         snapshot
@@ -1581,6 +1668,6 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
             .and_then(Value::as_str),
         Some("cancelled")
     );
-    broker.request(json!({ "id": 5, "method": "shutdown", "params": {} }));
+    broker.request(json!({ "id": 5, "method": "host.shutdown", "params": {} }));
     broker.read_response(5);
 }

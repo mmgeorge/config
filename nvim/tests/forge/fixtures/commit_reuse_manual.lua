@@ -31,7 +31,7 @@ local client = require("forge.client")
 local ai_commit = require("forge.integrations.ai_commit")
 ai_commit.set_backend({ request_async = function(params, callback)
   local native = vim.deepcopy(params)
-  client.request_host("repository.generate", native, function(result, failure)
+  client.request({ method = "repository.generation", params = native }, function(result, failure)
     if failure == "unsupported detached generation provider fixture" then
       forge_reuse.model_calls = forge_reuse.model_calls + 1
       result = { state = "ready", message = params.comparison == "staged" and "refactor: describe staged fixture" or forge_reuse.message }

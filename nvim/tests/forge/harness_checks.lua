@@ -6,7 +6,7 @@ local picker = require("forge.views.picker")
 local picker_state = require("forge.views.picker.state")
 local checks = require("forge.views.harness.checks")
 local session = require("forge.session")
-local original = client.request_for
+local original = client.request
 local notifications = require("forge.infra.notifications")
 local original_error = notifications.error
 local errors = {}
@@ -26,11 +26,14 @@ local calls = {}
 local load_failure
 local output_path = string.rep("path/", 40) .. "result.log"
 catalog.history = {{ id = "pending-run", state = "running", context = {trigger = "Agent requested"}, lifecycle = {{kind = "started", text = "Checks started · Agent requested · 1 selected"}}, commands = {{ command = "runner all", context = { definition_id = "unit" }, state = "pending", started_at_ms = vim.NIL, completed_at_ms = vim.NIL, output = output_path }} }}
-client.request_for = function(_, method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   calls[#calls + 1] = { method = method, params = params }
-  if method == "checks.list" and load_failure then callback(nil, load_failure) return end
-  if method == "checks.override" then catalog.overrides = params end
-  if method == "checks.run" then callback({ run_id = "fixture-run" }) else callback(vim.deepcopy(catalog)) end
+  if method == "session.check.list" and load_failure then callback(nil, load_failure) return end
+  if method == "session.check.override" then catalog.overrides = params end
+  if method == "session.check.run" then callback({ run_id = "fixture-run" }) else callback(vim.deepcopy(catalog)) end
 end
 session.harness.session = { id = "checks-fixture", workspace = "fixture" }
 local window = vim.api.nvim_get_current_win()
@@ -210,7 +213,7 @@ action("toggle")
 action("next")
 assert(#calls == call_count, "error rows must not run or change a previously selected check")
 picker.close(false)
-client.request_for = original
+client.request = original
 notifications.error = original_error
 io.write("harness_checks OK\n")
 vim.cmd("qa!")

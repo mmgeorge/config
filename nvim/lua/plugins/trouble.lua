@@ -132,6 +132,7 @@ return {
       ---@type table<string, trouble.Mode>
       modes = {
         symbols = {
+          source = "lsp.document_symbols",
           desc = "document symbols",
           mode = "lsp_document_symbols",
           focus = false,

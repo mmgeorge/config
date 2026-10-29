@@ -25,6 +25,28 @@ pub(crate) struct PlanReference {
     pub anchor: Option<PlanNavigationAnchor>,
 }
 
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct AlgorithmLocation {
+    path: String,
+    owner: String,
+    line: u32,
+    column: u32,
+}
+
+struct ResolvedAlgorithmReference {
+    symbol: String,
+    length: usize,
+    line_width: usize,
+}
+
+struct ReferenceSite<'site> {
+    path: &'site str,
+    side: &'site str,
+    owner: &'site str,
+    line: u32,
+    column: u32,
+}
+
 /// Indexes reverse usages independently of sorting, folding, and visible diff context.
 #[derive(Default)]
 pub(crate) struct PlanReferenceIndex {
@@ -37,7 +59,7 @@ pub(crate) struct PlanReferenceIndex {
     pub call: BTreeMap<(String, String, String, super::CallKind), String>,
     pub structured: BTreeMap<String, String>,
     pub unresolved: BTreeMap<(String, String, String, super::CallKind), String>,
-    algorithm: BTreeMap<(String, String, u32, u32), (String, usize, usize)>,
+    algorithm: BTreeMap<AlgorithmLocation, ResolvedAlgorithmReference>,
 }
 
 impl PlanReferenceIndex {
@@ -213,9 +235,13 @@ impl PlanReferenceIndex {
                     identity(resolver.at(path, reference.position.line, reference.position.column))
                 } {
                     output.push(
-                        path,
-                        side,
-                        &reference.scope.join("::"),
+                        ReferenceSite {
+                            path,
+                            side,
+                            owner: &reference.scope.join("::"),
+                            line: reference.position.line,
+                            column: reference.position.column,
+                        },
                         &reference.path.join("::"),
                         if index.symbol.iter().any(|symbol| {
                             symbol.parameter
@@ -226,8 +252,6 @@ impl PlanReferenceIndex {
                         } else {
                             "type"
                         },
-                        reference.position.line,
-                        reference.position.column,
                         symbol,
                         None,
                     );
@@ -258,13 +282,15 @@ impl PlanReferenceIndex {
                         &reference.path[..=position],
                     )) {
                         output.push(
-                            path,
-                            side,
-                            &reference.scope.join("::"),
+                            ReferenceSite {
+                                path,
+                                side,
+                                owner: &reference.scope.join("::"),
+                                line: reference.position.line,
+                                column: offset as u32,
+                            },
                             part,
                             "qualifier",
-                            reference.position.line,
-                            offset as u32,
                             symbol,
                             None,
                         );
@@ -286,17 +312,19 @@ impl PlanReferenceIndex {
                         })
                 {
                     output.push(
-                        path,
-                        side,
-                        &import.scope.join("::"),
+                        ReferenceSite {
+                            path,
+                            side,
+                            owner: &import.scope.join("::"),
+                            line: import.position.line,
+                            column: import.position.column,
+                        },
                         &import.path.join("::"),
                         if path.ends_with(".rs") && import.export {
                             "export"
                         } else {
                             "import"
                         },
-                        import.position.line,
-                        import.position.column,
                         symbol,
                         None,
                     );
@@ -350,13 +378,15 @@ impl PlanReferenceIndex {
                         };
                         if let Some(symbol) = target {
                             output.push(
-                                path,
-                                side,
-                                &function.owner,
+                                ReferenceSite {
+                                    path,
+                                    side,
+                                    owner: &function.owner,
+                                    line: position.line,
+                                    column: position.column,
+                                },
                                 &parts[..prefix].join(separator),
                                 "body_qualifier",
-                                position.line,
-                                position.column,
                                 symbol,
                                 None,
                             );
@@ -396,13 +426,15 @@ impl PlanReferenceIndex {
                             symbol.clone(),
                         );
                         output.push(
-                            path,
-                            side,
-                            &function.owner,
+                            ReferenceSite {
+                                path,
+                                side,
+                                owner: &function.owner,
+                                line: position.line,
+                                column: position.column,
+                            },
                             name,
                             kind.label(),
-                            position.line,
-                            position.column,
                             symbol,
                             None,
                         );
@@ -420,12 +452,12 @@ impl PlanReferenceIndex {
                 for reference in forge_diff::syntax::algorithm_references(source)
                     .map_err(|error| anyhow::anyhow!("{error:?}"))?
                 {
-                    let key = (
-                        path.clone(),
-                        body.owner.clone(),
-                        reference.line as u32,
-                        reference.column as u32 - 1,
-                    );
+                    let key = AlgorithmLocation {
+                        path: path.clone(),
+                        owner: body.owner.clone(),
+                        line: reference.line as u32,
+                        column: reference.column as u32 - 1,
+                    };
                     let length = reference.segment.len();
                     let width = lines[reference.line - 1].len();
                     let Ok(Some(super::calls::AlgorithmTarget::Reference(target))) =
@@ -446,7 +478,14 @@ impl PlanReferenceIndex {
                         super::CallKind::Value => resolver.value(path, &body.owner, &target.name),
                     };
                     if let Some(symbol) = identity(resolution) {
-                        output.algorithm.insert(key, (symbol, length, width));
+                        output.algorithm.insert(
+                            key,
+                            ResolvedAlgorithmReference {
+                                symbol,
+                                length,
+                                line_width: width,
+                            },
+                        );
                     }
                 }
             }
@@ -517,16 +556,19 @@ impl PlanReferenceIndex {
 
     fn push(
         &mut self,
-        path: &str,
-        side: &str,
-        owner: &str,
+        site: ReferenceSite<'_>,
         name: &str,
         kind: &str,
-        line: u32,
-        column: u32,
         symbol: String,
         anchor: Option<PlanNavigationAnchor>,
     ) {
+        let ReferenceSite {
+            path,
+            side,
+            owner,
+            line,
+            column,
+        } = site;
         let id = super::digest(
             format!("{side}:{path}:{owner}:{name}:{kind}:{line}:{column}").as_bytes(),
         );
@@ -608,13 +650,15 @@ impl PlanReferenceIndex {
                             continue;
                         }
                         output.push(
-                            anchor.path.as_deref().unwrap_or("plan"),
-                            "proposed",
-                            &anchor.label,
+                            ReferenceSite {
+                                path: anchor.path.as_deref().unwrap_or("plan"),
+                                side: "proposed",
+                                owner: &anchor.label,
+                                line: anchor.line,
+                                column: 0,
+                            },
                             name,
                             "task",
-                            anchor.line,
-                            0,
                             format!("planned:{name}"),
                             Some(anchor.clone()),
                         );
@@ -628,13 +672,15 @@ impl PlanReferenceIndex {
                 .insert(anchor.json_path.clone(), symbol.clone());
             if usage && seen.insert((anchor.json_path.clone(), name.clone())) {
                 output.push(
-                    anchor.path.as_deref().unwrap_or("plan"),
-                    "proposed",
-                    &anchor.label,
+                    ReferenceSite {
+                        path: anchor.path.as_deref().unwrap_or("plan"),
+                        side: "proposed",
+                        owner: &anchor.label,
+                        line: anchor.line,
+                        column: 0,
+                    },
                     &name,
                     "flow",
-                    anchor.line,
-                    0,
                     symbol,
                     Some(anchor.clone()),
                 );
@@ -816,12 +862,12 @@ impl PlanReferenceIndex {
         let mut output = document.clone();
         let mut design = original_design.clone();
         let mut algorithm_edits = BTreeMap::<(String, String), BTreeSet<(u32, u32)>>::new();
-        for ((path, owner, line, column), (target, _, _)) in &self.algorithm {
-            if target == identity {
+        for (location, reference) in &self.algorithm {
+            if reference.symbol == identity {
                 algorithm_edits
-                    .entry((path.clone(), owner.clone()))
+                    .entry((location.path.clone(), location.owner.clone()))
                     .or_default()
-                    .insert((*line, *column));
+                    .insert((location.line, location.column));
             }
         }
         for ((path, owner), positions) in algorithm_edits {
@@ -1118,13 +1164,23 @@ impl PlanReferenceIndex {
         }
         self.algorithm
             .range(
-                (path.clone(), owner.clone(), *offset, 0)
-                    ..=(path.clone(), owner.clone(), *offset, u32::MAX),
+                AlgorithmLocation {
+                    path: path.clone(),
+                    owner: owner.clone(),
+                    line: *offset,
+                    column: 0,
+                }..=AlgorithmLocation {
+                    path: path.clone(),
+                    owner: owner.clone(),
+                    line: *offset,
+                    column: u32::MAX,
+                },
             )
-            .find_map(|((_, _, _, start), (symbol, length, width))| {
-                let selected = column.checked_sub(row.len().checked_sub(*width)?)?;
-                (*start as usize <= selected && selected < *start as usize + length)
-                    .then_some(symbol.as_str())
+            .find_map(|(location, reference)| {
+                let selected = column.checked_sub(row.len().checked_sub(reference.line_width)?)?;
+                (location.column as usize <= selected
+                    && selected < location.column as usize + reference.length)
+                    .then_some(reference.symbol.as_str())
             })
     }
 }

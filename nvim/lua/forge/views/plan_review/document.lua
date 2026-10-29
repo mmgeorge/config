@@ -20,16 +20,16 @@ local perf = require("forge.infra.perf")
 ---@param callback fun(owner: table?, failure: string?)
 ---@return table
 function M.attach(options, callback)
-  local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_generation(), views = {}, pending_operation = {} }
+  local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_get_generation(), views = {}, pending_operation = {} }
   local symbol_namespace = vim.api.nvim_create_namespace("forge.plan_review.symbols")
   local delivery = {}
   local function alive()
-    return not owner.closed and owner.generation == client.host_generation() and client.host_accepting()
+    return not owner.closed and owner.generation == client.host_get_generation() and client.host_is_accepting()
       and vim.api.nvim_buf_is_valid(options.buffer)
   end
   local function request(params, receive)
     if not alive() then receive(nil, "Plan host is unavailable. The local draft remains in its buffer.") return end
-    client.request_for(options.session_id, "harness.document", params, function(result, failure)
+    client.request({ session_id = options.session_id, method = "session.document", params = params }, function(result, failure)
       if owner.closed or not vim.api.nvim_buf_is_valid(options.buffer) then return end
       if not alive() then receive(nil, "Plan host was collected. The local draft remains in its buffer.")
       else receive(result, failure) end
@@ -109,7 +109,7 @@ function M.attach(options, callback)
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     for _, view in pairs(owner.views) do input.close(view) end
     buffer.close(owner.replica, { preserve_buffer = true })
-    client.request_for(options.session_id, "harness.document", { operation = "plan_close", document = owner.document }, function(_, failure)
+    client.request({ session_id = options.session_id, method = "session.document", params = { operation = "plan_close", document = owner.document } }, function(_, failure)
       if failure and options.notice then options.notice(failure) end
     end)
     return true
@@ -190,8 +190,8 @@ function M.attach(options, callback)
     end
     if operation.method then
       owner.submission_pending = true
-      client.request_for(options.session_id, operation.method, operation.params, function(result, failure)
-        if owner.generation ~= client.host_generation() or not client.host_accepting() then
+      client.request({ session_id = options.session_id, method = operation.method, params = operation.params }, function(result, failure)
+        if owner.generation ~= client.host_get_generation() or not client.host_is_accepting() then
           complete(nil, "Plan host is unavailable. The local draft remains in its buffer.")
         else complete(result, failure) end
       end)
@@ -210,12 +210,12 @@ function M.attach(options, callback)
         request({ operation = "plan_save_annotations", document = owner.document,
           saved_source_digest = owner.saved_source_digest, annotation = operation.capture }, complete)
       else
-        local captured, failure = input.capture(owner.replica, owner.current_view(), "plan.questions.answer")
+        local captured, failure = input.capture(owner.replica, owner.current_view(), "session.plan.question.answer")
         if not captured then complete(nil, failure) return end
         for _, update in ipairs(pending) do owner.pending_reply_by_id[tostring(update.id)] = update end
         comments.update(options.buffer, pending)
-        client.request_for(options.session_id, "plan.questions.answer", { review = captured,
-          draft_source_digest = owner.saved_source_digest, draft_annotation = operation.capture }, function(result, error)
+        client.request({ session_id = options.session_id, method = "session.plan.question.answer", params = { review = captured,
+          draft_source_digest = owner.saved_source_digest, draft_annotation = operation.capture } }, function(result, error)
           if not alive() then complete(nil, "Plan host is unavailable. The local draft remains in its buffer.") return end
           for _, update in ipairs(pending) do owner.pending_reply_by_id[tostring(update.id)] = nil end
           if error then
@@ -231,7 +231,7 @@ function M.attach(options, callback)
     if not owner.attached() then receive(nil, "Plan review is not ready") return false end
     local trace_started = perf.now()
     params = vim.deepcopy(params or {})
-    local edit = method == "plan.entity.rename" or method == "plan.tests.delete" or method == "plan.checks.update"
+    local edit = method == "session.plan.entity.rename" or method == "session.plan.test.delete" or method == "session.plan.check.update"
     if edit then params.operation_id = params.operation_id or ("plan-edit:" .. trace_started) end
     local capture = perf.trace("harness", "ui.plan.edit.capture", {
       operation_id = params.operation_id, method = method, document = owner.document,
@@ -239,10 +239,11 @@ function M.attach(options, callback)
     local view = owner.current_view()
     local captured, failure = input.capture(owner.replica, view, method)
     if not captured then receive(nil, failure) return false end
+    ---@cast captured ForgeDocumentInput
     params.review, params.draft_annotation, params.draft_source_digest = captured, capture, owner.saved_source_digest
     local operation = { method = method, params = params, capture = capture, receive = receive,
       trace_started = edit and trace_started or nil }
-    if method == "plan.tests.delete" then
+    if method == "session.plan.test.delete" then
       local previewed, settle = pcall(owner.preview_tests, params.tests, params.operation_id)
       if not previewed then receive(nil, tostring(settle)) return false end
       operation.receive = function(result, failure)
@@ -540,10 +541,6 @@ function M.attach(options, callback)
       if not owner.views[window] then open_view(window) end
     end
   end
-  ---@param captured table
-  ---@param source ForgeWorkspaceDefinition
-  ---@param target ForgeDefinitionLocation
-  ---@param receive fun(result: table?, failure: string?, captured: table)
   ---@param result table
   ---@param captured ForgeDocumentInput
   ---@param view table?
@@ -560,6 +557,10 @@ function M.attach(options, callback)
     return captured
   end
 
+  ---@param captured ForgeDocumentInput
+  ---@param source ForgeWorkspaceDefinition
+  ---@param target ForgeDefinitionLocation
+  ---@param receive fun(result: table?, failure: string?, captured: table)
   function owner.definition(captured, source, target, receive)
     if not owner.is_current(captured) then return end
     if vim.bo[options.buffer].modified then
@@ -602,6 +603,7 @@ function M.attach(options, callback)
       phase = "request", document = owner.document, revision = owner.version, session_id = options.session_id,
     }) end
     request({ operation = "plan_action", input = captured }, function(result, error)
+      ---@cast captured ForgeDocumentInput
       if preview_started then perf.event("harness", "ui.plan.rename_preview", {
         phase = "response", document = owner.document, revision = owner.version, session_id = options.session_id,
         duration_ms = perf.elapsed_ms(preview_started), status = error and "failed" or "completed",

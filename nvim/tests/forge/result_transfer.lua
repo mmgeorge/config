@@ -9,22 +9,22 @@ local received
 
 ---@param method? string
 local function start(method)
-  method = method or "github.issues"
-  client._reset_for_test()
+  method = method or "github.issue.list"
+  client._host_reset_for_test()
   calls, errors, events, received, request_id = 0, 0, 0, nil, nil
   builder.ensure = function(done) done({ ok = true, path = "result-fixture" }) end
   notifications.error = function() end
-  client._set_launcher_for_test(function(_, options, on_exit)
+  client._host_set_launcher_for_test(function(_, options, on_exit)
     emit = function(message) options.stdout(nil, vim.json.encode(message) .. "\n") end
     local exited = false
     return {
       write = function(_, encoded)
         local request = vim.json.decode(encoded)
-        if request.method == "initialize" then
+        if request.method == "host.initialize" then
           emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
         elseif request.method == method then
           request_id = request.id
-        elseif request.method == "shutdown" and not exited then
+        elseif request.method == "host.shutdown" and not exited then
           exited = true
           vim.schedule(function() on_exit({ code = 0, signal = 0 }) end)
         end
@@ -32,10 +32,10 @@ local function start(method)
       kill = function() end,
     }
   end)
-  client.subscribe(function(event)
+  client.session_events_subscribe(function(event)
     if event ~= "host_stopped" then events = events + 1 end
   end)
-  client.request_host(method, {}, function(result, failure)
+  client.request({ method = method, params = {} }, function(result, failure)
     calls = calls + 1
     if failure then errors = errors + 1 else received = result end
   end)
@@ -60,7 +60,7 @@ local function settled()
 end
 
 local ok, failure = xpcall(function()
-  start("review.open_pr")
+  start("github.review.document.open")
   local body = string.rep('日本語 "quote" \\ newline\n', 900000)
   local encoded = vim.json.encode({ id = request_id, result = { body = body } })
   local chunk = 100000
@@ -134,7 +134,7 @@ local ok, failure = xpcall(function()
   start()
   part(0, 2, 4, "{}")
   assert(vim.wait(1000, function() return client._client.transfer_bytes == 4 end, 1))
-  client.stop()
+  client.host_stop()
   settled()
   assert(errors == 1)
 
@@ -148,7 +148,7 @@ local ok, failure = xpcall(function()
   local identity_list = { request_id }
   for _ = 1, 2 do
     local previous_id = request_id
-    client.request_host("github.issues", {}, function(_, request_error)
+    client.request({ method = "github.issue.list", params = {} }, function(_, request_error)
       assert(request_error)
       calls, errors = calls + 1, errors + 1
     end)
@@ -161,6 +161,6 @@ local ok, failure = xpcall(function()
   assert(events == 0 and vim.tbl_isempty(client._client.pending))
 end, debug.traceback)
 
-client._reset_for_test()
+client._host_reset_for_test()
 builder.ensure, notifications.error = original_ensure, original_error
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else vim.cmd("qa!") end

@@ -330,8 +330,10 @@ mod tests {
             );
             let entry = super::super::TimelineEntry::Exchange {
                 id: "exchange".into(),
+
                 created_at_ms: 1,
-                exchange: projected.remove(0),
+                exchange: (projected.remove(0)).into(),
+
                 agent_by_id: HashMap::new(),
             };
             let rendered = crate::buffer::projection::project(

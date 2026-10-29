@@ -34,7 +34,7 @@ pub use execution::{
 pub(crate) use steering::{ActiveSteering, SteerCommand, SteeringLane};
 pub use steering::{SteerTarget, SteeringInput};
 
-mod backend;
-pub use backend::*;
+mod contract;
+pub use contract::*;
 mod capability;
 pub use capability::{CapabilityManifest, UnsupportedCapability};

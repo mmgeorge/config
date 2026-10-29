@@ -218,7 +218,7 @@ unsupported sources retain an inventory entry without a text excerpt.
 The Lua generation owner retains model and request state without displaying progress,
 waiting, completion, empty-result, or cancellation notifications. Generation failures
 produce error notifications even if the editor buffer has closed and never replace an existing draft.
-The `repository.generate` route accepts Harness configuration only. Gemini and direct
+The `repository.generation` route accepts Harness configuration only. Gemini and direct
 HTTP provider selection are absent from this workflow.
 
 `HarnessService.background` owns persistent, tool-free Background conversations independently
@@ -238,7 +238,7 @@ Ownership persists through maintenance and is released after provider shutdown.
 `background.settings` stores revisioned per-provider model/thinking defaults and the Background
 auto-compaction policy in `SettingsStore`. Codex and Copilot default to `gpt-6-luna` with `low`
 thinking. Background compaction defaults to 128,000 retained context tokens. A session override
-uses the ordinary session settings layer. `background.timeline` reads the same durable exchanges
+uses the ordinary session settings layer. `background.session.document` reads the same durable exchanges
 through `SessionPresentation` without acquiring the provider or selecting an interactive chat.
 `:ForgeDebugBackgroundTimeline` opens that inspection view, with prior conversations accessible
 through its history selector. Provider/tool/approval availability is enforced by the Background
@@ -330,7 +330,7 @@ Repository acquisition and comparison failures remain request failures rather th
 being converted into an empty change set.
 
 `ForgeDebugCommitPromptPreview [head|staged|latest_commit]` uses the `preview`
-operation on `repository.generate`. It shares context collection, syntax analysis,
+operation on `repository.generation`. It shares context collection, syntax analysis,
 admission, and the 500,000-byte input limit with generation. The native response
 returns the exact system and user strings with their combined UTF-8 byte count.
 Preview requests reject provider configuration and return before provider dispatch.
@@ -644,14 +644,14 @@ multi-file atomicity.
 
 ## Checkpoint restore preview and recovery
 
-`exchange.rollback.prepare` computes only paths changed between the expected and target
+`session.exchange.rollback.prepare` computes only paths changed between the expected and target
 checkpoints. Unrelated later files remain untouched. It acquires recovery copies of affected
 current files, resolves target objects, and saves an immutable preview outside the worktree.
 A changed HEAD or later edit adds an overwrite warning rather than prohibiting restoration.
 The confirmation has Cancel selected by default and pages warning lists in groups of 50.
 The apply request carries only the preview ID.
 
-`exchange.rollback.apply` revalidates the affected paths and HEAD under repository mutation
+`session.exchange.rollback.apply` revalidates the affected paths and HEAD under repository mutation
 ownership. Staging changes do not invalidate a preview because restoration never writes the
 index. Changed files or HEAD require a new preview and confirmation. Unsafe paths, symlink
 ancestors, missing objects, and unsettled exchanges reject before mutation.
@@ -1121,8 +1121,8 @@ Their old Harness paths are removed, with callers and migration destinations upd
 compatibility decoder. Host startup constructs shared repository/diff owners but does not discover
 a repository, open Harness stores, acquire a Harness session lease, or construct a provider.
 
-`router.rs::HostRouter` handles `repository.revisions` directly through `RepositoryStore`.
-`harness.initialize` lazily constructs the existing Harness runtime and session-controller registry.
+`router.rs::HostRouter` handles `repository.revision.list` directly through `RepositoryStore`.
+`session.initialize` lazily constructs the existing Harness runtime and session-controller registry.
 Harness methods reject requests before that initialization. Opening Harness after repository reads
 reuses the same process. Existing control admission, consumption credit, session routing, and
 terminal shutdown responses remain active. Invalid host handshake parameters produce a correlated

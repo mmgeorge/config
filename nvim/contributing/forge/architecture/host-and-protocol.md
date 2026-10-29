@@ -4,6 +4,13 @@ One local Rust host serves Forge capabilities. Typed requests carry document and
 
 Read [Building and testing](../building-and-testing.md) for executable selection and verification. Protocol version constants and the checked-in contract are authoritative.
 
+The [Lua client API](../api/lua-client.md) has one request-object entry point.
+Each request carries explicit session context according to the shared method policy.
+Shared-service initialization opens no interactive session. The host reader admits
+each request into its own tracked task before waiting for normalization or provider
+preparation. A waiting request therefore retains its admission permit without
+preventing the reader from accepting independent requests or transport credit.
+
 ## Host executable and service ownership
 
 The `forge` package builds a library and a thin executable. `src/main.rs` parses
@@ -33,7 +40,7 @@ identity through that same public route, while browser fallback remains availabl
 PlanReview retains its Lua controller and projects physical source rows through a native document.
 Each test-inventory source row carries its file and case identity. Visual `j` collects
 distinct cases across the selected rows and opens the shared confirmation dialog.
-Confirmation validates the captured view and source version before `plan.tests.delete`
+Confirmation validates the captured view and source version before `session.plan.test.delete`
 updates the saved review draft. The broker removes only selected inventory entries,
 prunes empty file groups, and rejects stale confirmations. Project files remain unchanged.
 Renames and test deletions return an updated projection to the existing native document.
@@ -197,7 +204,7 @@ alone. Limits before decode are 512 KiB per frame, 8 MiB pending encoded data, a
 pending frames. Partial fragments compact after 128 segments.
 
 Consumption accounting occurs after dispatch, allowing future host credit to describe completed
-client work rather than bytes accepted by the pipe. The live client now sends cumulative byte and frame consumption through `transport.consumed`.
+client work rather than bytes accepted by the pipe. The live client now sends cumulative byte and frame consumption through `host.transport.consumed`.
 Overflow or malformed framing stops the connection. Process exit waits behind all admitted complete
 frames, so terminal responses cannot be overtaken by readiness cleanup. Unterminated final data
 fails the connection. Closing the receive owner discards queued old-generation callbacks. Stderr
@@ -235,7 +242,7 @@ The client includes `protocol_version` in initialization parameters. The root ho
 current `forge_protocol::WIRE_VERSION` before feature initialization or provider construction.
 A mismatch returns `protocol_mismatch` and exits. Successful initialization includes the same
 version in the initial result. Lua compares it with `forge.protocol.VERSION` before readiness and
-follow-up requests. Wire version 2 separates the host handshake from `harness.initialize`.
+follow-up requests. Wire version 2 separates the host handshake from `session.initialize`.
 
 The transport accepts one exact version. Missing, older, newer, and nonnumeric versions do not
 select an alternative decoder. Rebuild and restart are the recovery action when local executable

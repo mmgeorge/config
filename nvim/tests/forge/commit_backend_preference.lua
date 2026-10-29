@@ -25,17 +25,17 @@ local function launch_fixture(command, options)
   return {
     write = function(_, encoded)
       local request = vim.json.decode(encoded)
-      if request.method == "transport.consumed" or request.method == "shutdown" then return end
+      if request.method == "host.transport.consumed" or request.method == "host.shutdown" then return end
       local result = {}
-      if request.method == "initialize" then
+      if request.method == "host.initialize" then
         result.protocol_version = require("forge.protocol").VERSION
-      elseif request.method == "harness.initialize" then
+      elseif request.method == "session.initialize" then
         error("Standalone generation initialized a conversation")
-      elseif request.method == "repository.generate" then
+      elseif request.method == "repository.generation" then
         generation = request.params.generation
         generated_session = request.session_id
         result = { state = "ready", message = "fix: use selected provider" }
-      elseif request.method == "trace.configure" then
+      elseif request.method == "host.trace.configure" then
         result.enabled = false
       end
       options.stdout(nil, vim.json.encode({ id = request.id, result = result }) .. "\n")
@@ -46,14 +46,14 @@ end
 
 local succeeded, failure = xpcall(function()
   for _, explicit in ipairs({ false, true }) do
-    client._reset_for_test()
-    client._set_launcher_for_test(launch_fixture)
+    client._host_reset_for_test()
+    client._host_set_launcher_for_test(launch_fixture)
     generation, generated_session = nil, nil
     config.setup(explicit and { harness_logging = false, harness = { backend = "codex" } }
       or { harness_logging = false })
     session.activate_harness(session.new_harness_state())
     local completed = false
-    client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
+    client.generation_request({ operation = "generate", workspace = "fixture", comparison = "staged" },
       function(result, request_error)
         assert(not request_error, request_error)
         assert(result.message == "fix: use selected provider")
@@ -74,7 +74,7 @@ local succeeded, failure = xpcall(function()
       "cold generation created Harness session state")
     session.harness.session = { id = "selected-session", backend = generation.backend.kind, model = "selected-model" }
     completed = false
-    client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
+    client.generation_request({ operation = "generate", workspace = "fixture", comparison = "staged" },
       function(_, request_error)
         assert(not request_error, request_error)
         completed = true
@@ -88,7 +88,7 @@ local succeeded, failure = xpcall(function()
     config.options.background_generation[generation.backend.kind] = { model = "custom-commit-model", reasoning_effort = "medium" }
     local label
     completed = false
-    client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
+    client.generation_request({ operation = "generate", workspace = "fixture", comparison = "staged" },
       function(_, request_error)
         assert(not request_error, request_error)
         completed = true
@@ -99,12 +99,12 @@ local succeeded, failure = xpcall(function()
     assert(label:find("custom-commit-model · thinking medium", 1, true), "notification reported a different model")
     assert(session.harness.session.model == "selected-model", "generation changed the active conversation model")
 
-    client._reset_for_test()
-    client._set_launcher_for_test(launch_fixture)
+    client._host_reset_for_test()
+    client._host_set_launcher_for_test(launch_fixture)
     config.options.harness.backend = "codex"
     session.harness.session.backend = "codex"
     completed = false
-    client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
+    client.generation_request({ operation = "generate", workspace = "fixture", comparison = "staged" },
       function(_, request_error)
         assert(not request_error, request_error)
         completed = true
@@ -116,19 +116,19 @@ local succeeded, failure = xpcall(function()
   session.harness.session = { id = "selected-session", backend = "codex", model = "selected-model" }
   config.options.background_generation.codex = { model = "" }
   local invalid_model
-  client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
+  client.generation_request({ operation = "generate", workspace = "fixture", comparison = "staged" },
     function(_, failure) invalid_model = failure end)
   assert(invalid_model == "Invalid Background-generation model for backend: codex",
     "invalid model silently inherited the active conversation model")
   session.harness.session = { id = "foreign-session", backend = "missing-provider" }
   local request_error
-  client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
+  client.generation_request({ operation = "generate", workspace = "fixture", comparison = "staged" },
     function(_, failure) request_error = failure end)
   assert(request_error == "Unknown Harness backend: missing-provider",
     "invalid provider configuration did not reach the caller")
 end, debug.traceback)
 
-client._reset_for_test()
+client._host_reset_for_test()
 builder.ensure, preference.load = original_ensure, original_load
 config.options, config.harness_backend_explicit = original_options, original_explicit
 session.activate_harness(original_state)

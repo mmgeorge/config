@@ -71,7 +71,7 @@ function Checks.open(state, host)
   local function request(method, params, callback, on_failure)
     if busy then return end
     busy = true
-    client.request_for(session_id, method, params, function(result, failure)
+    client.request({ session_id = session_id, method = method, params = params }, function(result, failure)
       busy = false
       if failure then
         notifications.error(failure, "Harness checks")
@@ -161,7 +161,7 @@ function Checks.open(state, host)
       return
     end
     load_error = nil
-    catalog, definition_list = result, definitions
+    catalog, definition_list = result, assert(definitions)
   end
 
   local function effective(check)
@@ -254,7 +254,7 @@ function Checks.open(state, host)
       overrides.auto = overrides.auto or {}
       overrides.auto[check.id] = not automatic
     end
-    request("checks.override", overrides, function(result) adopt(result) picker.update(build_spec()) end)
+    request("session.check.override", overrides, function(result) adopt(result) picker.update(build_spec()) end)
   end
 
   build_spec = function()
@@ -306,7 +306,7 @@ function Checks.open(state, host)
       on_cancel = function() closed = true stop_poll() end,
       on_confirm = function(result)
         local option = result.option
-        if option.id == "cancel" then request("checks.cancel", { run_id = catalog.active_run }) return false end
+        if option.id == "cancel" then request("session.check.cancel", { run_id = catalog.active_run }) return false end
         return false
       end,
       action_list = {
@@ -317,7 +317,7 @@ function Checks.open(state, host)
   end
 
   refresh = function()
-    request("checks.list", {}, function(result)
+    request("session.check.list", {}, function(result)
       adopt(result)
       if picker.is_open(owner) then picker.update(build_spec()) else picker.open(build_spec()) end
       if type(catalog.active_run) == "string" then poll() end

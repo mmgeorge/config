@@ -7,30 +7,34 @@ local launch_count = 0
 local diagnostics = {}
 builder.ensure = function(callback) callback({ ok = true, path = "transport-fixture" }) end
 notifications.error = function(message) diagnostics[#diagnostics + 1] = message end
-client._reset_for_test()
-client._set_launcher_for_test(function(_, options, on_exit)
+client._host_reset_for_test()
+client._host_set_launcher_for_test(function(_, options, on_exit)
   launch_count = launch_count + 1
   emitted, exited = options.stdout, on_exit
   return {
     write = function(_, encoded)
       local request = vim.json.decode(encoded)
-      if request.method == "initialize" then
+      if request.method == "host.initialize" then
         emitted(nil, vim.json.encode({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } }) .. "\n")
-      elseif request.method == "prompt.submit" then request_id = request.id end
+      elseif request.method == "session.initialize" then
+        emitted(nil, vim.json.encode({ id = request.id, result = { initialized = true } }) .. "\n")
+      elseif request.method == "host.trace.configure" then
+        emitted(nil, vim.json.encode({ id = request.id, result = { enabled = false } }) .. "\n")
+      elseif request.method == "session.state.get" then request_id = request.id end
     end,
     kill = function() end,
   }
 end)
 
 local events, stopped, unresolved = {}, false, false
-client.subscribe(function(event, payload, session_id)
+client.session_events_subscribe(function(event, payload, session_id)
   if event == "host_stopped" then stopped = true return end
   events[#events + 1] = { event = event, payload = payload, session_id = session_id }
 end)
-client.request_host("prompt.submit", {}, function(_, failure, detail)
+client.request({ session_id = "session", method = "session.state.get", params = {} }, function(_, failure, detail)
   assert(stopped, "pending callback ran before the UI learned that the host stopped")
   assert(failure:find("unresolved request", 1, true) and detail.code == "outcome_unknown")
-  client.request_host("state.get", {}, function(_, retry_error)
+  client.request({ session_id = "session", method = "session.state.get", params = {} }, function(_, retry_error)
     assert(retry_error == "Forge host is draining", "failure callback restarted the host")
   end)
   unresolved = true
@@ -57,6 +61,6 @@ exited({ code = 1 })
 assert(vim.wait(1000, function() return unresolved end, 5))
 assert(launch_count == 1 and not client._client.process and vim.tbl_isempty(client._client.pending))
 assert(#diagnostics == 1 and diagnostics[1]:find("exited 1", 1, true))
-client._reset_for_test()
+client._host_reset_for_test()
 print("harness_transport_failure: passed")
 vim.cmd("qa!")

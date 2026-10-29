@@ -40,7 +40,7 @@ local state = {
 
 assert(review.comment(state, { operation = "save", comment = 1, action = "save" }))
 local saved = requests[1]
-assert(saved.method == "review.comment")
+assert(saved.method == "github.review.document.comment")
 assert(#saved.params.capture == 1 and saved.params.capture[1].region == "comment-1/body",
   "saving one comment must capture only that comment")
 assert(saved.params.capture[1].text == "Selected comment\r\n\n",
@@ -54,7 +54,7 @@ assert(state.replica.editable.region["comment-2/body"].pending,
 state.verdict_provider = function(callback) callback("comment") end
 assert(review.submit_batched(state))
 local submitted = requests[2]
-assert(submitted.method == "review.submit_batched")
+assert(submitted.method == "github.review.document.batch.submit")
 assert(#submitted.params.capture == 2, "review submission must capture the summary and remaining comment")
 for _, captured in ipairs(submitted.params.capture) do
   assert(captured.region ~= "title" and captured.region ~= "body" and captured.region ~= "reviewers",
@@ -99,7 +99,7 @@ assert(#requests == 5, "submission overlapped the active comment save")
 editable.record(state.replica.editable, "summary", { "newer unsaved summary" })
 requests[5].callback({})
 assert(vim.wait(1000, function() return #requests == 6 end), "comment completion stranded submission")
-assert(requests[6].method == "review.submit_batched")
+assert(requests[6].method == "github.review.document.batch.submit")
 local captured_summary
 for _, capture in ipairs(requests[6].params.capture) do
   if capture.region == "summary" then captured_summary = capture.text end
@@ -116,7 +116,7 @@ assert(review.transition(state, "draft"))
 assert(#requests == 7, "lifecycle transition overlapped a comment save")
 requests[7].callback({})
 assert(vim.wait(1000, function() return #requests == 8 end))
-assert(requests[8].method == "review.transition" and requests[8].params.desired == "DRAFT")
+assert(requests[8].method == "github.review.document.transition" and requests[8].params.desired == "DRAFT")
 editable.record(state.replica.editable, region, { "captured during lifecycle" })
 assert(review.comment(state, { operation = "save_draft", region = region, action = "save" }))
 assert(#requests == 8, "comment save overlapped a lifecycle transition")
@@ -144,9 +144,9 @@ assert(not review.add_comment(state))
 assert(not review.reply_comment(state))
 assert(#requests == 11, "missing local presentation fell back to host draft creation")
 local client = require("forge.client")
-local original_generation = client.host_generation
+local original_generation = client.host_get_generation
 local generation = original_generation()
-client.host_generation = function() return generation end
+client.host_get_generation = function() return generation end
 editable.record(state.replica.editable, region, { "retained across restart" })
 local accepted_revision = state.replica.editable.region[region].revision
 assert(review.comment(state, { operation = "save_draft", region = region, action = "save" }))
@@ -198,5 +198,5 @@ assert(review.transition(state, "CLOSED"))
 assert(review.comment(state, { operation = "save_draft", region = region, action = "save" }))
 assert(#requests == request_count, "rebinding dispatched a mutation against the obsolete document")
 assert(state.pending_operation.kind == "comment")
-client.host_generation = original_generation
+client.host_get_generation = original_generation
 print("review_capture: comment saves and review submissions preserve unrelated drafts")

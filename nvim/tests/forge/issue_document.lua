@@ -13,7 +13,7 @@ local function metadata(value, accepted)
       range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = #value } } } } }
 end
 adapter._set_runner_for_test(function(method, params, callback)
-  assert(method == "issue.document")
+  assert(method == "github.issue.document")
   if params.operation == "open" then
     captured = vim.deepcopy(params)
     local result = { snapshot = { document = params.document, revision = revision,

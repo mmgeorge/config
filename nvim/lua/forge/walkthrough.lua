@@ -10,7 +10,7 @@ local function request(state, params, callback)
     local item = table.remove(state.queue, 1)
     if not state.active and item.params.operation ~= "close" then pump() return end
     state.pending = true
-    require("forge.client").request_host("walkthrough", item.params, function(result, failure)
+    require("forge.client").request({ method = "repository.walkthrough.document", params = item.params }, function(result, failure)
       vim.schedule(function()
         state.pending = false
         if state.active or item.params.operation == "close" then item.callback(result, failure) end

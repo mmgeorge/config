@@ -18,7 +18,7 @@ local function snapshot(document)
   } }
 end
 adapter._set_runner_for_test(function(method, params, callback)
-  assert(method == "issue.document")
+  assert(method == "github.issue.document")
   if params.operation == "open" then
     callback({ snapshot = snapshot(params.document), fields = {
       { region = "body", revision = revision, sequence = sequence, baseline = body },

@@ -259,7 +259,7 @@ fn inventory_path(root: &Path, filename: &str) -> Result<RepositoryPath> {
         filename.starts_with(&prefix)
     };
     ensure!(matches, "Sem entity is outside the resolved worktree");
-    RepositoryPath::new(filename[prefix.len()..].as_bytes().to_vec())
+    RepositoryPath::new(filename.as_bytes()[prefix.len()..].to_vec())
 }
 
 fn run(

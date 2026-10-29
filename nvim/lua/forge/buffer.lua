@@ -164,7 +164,7 @@ end
 --- after preparation. after_commit runs after view restoration. Both callbacks run without yielding
 --- inside the same publication and must not schedule work.
 ---@param document string
----@param options? {buffer?: integer, physical?: boolean, generated?: boolean, expected_changedtick?: integer, filetype?: string, preserve_view?: boolean, retain_removed_position?: boolean, before_commit?: fun(), after_commit?: fun(), editable?: table, recover?: fun(), notice?: fun(message: string)}
+---@param options? {buffer?: integer, physical?: boolean, generated?: boolean, source_projected?: boolean, expected_changedtick?: integer, filetype?: string, preserve_view?: boolean, retain_removed_position?: boolean, before_commit?: fun(), after_commit?: fun(), editable?: table, recover?: fun(), notice?: fun(message: string)}
 function M.open(document, options)
   options = options or {}
   identity(document)
@@ -558,7 +558,7 @@ local function commit_patch(session, patch)
       local text_started = timing and perf.now()
       M.apply_text_edits(session.buffer, patch.text_edit, session.row_count == 0)
       if timing then
-        timing.buffer_api_ms = perf.elapsed_ms(text_started)
+        timing.buffer_api_ms = perf.elapsed_ms(assert(text_started))
         timing.editable_callback_ms = (session.editable.native and session.editable.native.update_ns or 0) / 1e6
         timing.editable_callback_count = session.editable.native and session.editable.native.update_count or 0
       end
@@ -825,7 +825,7 @@ end
 ---@param session table
 ---@param row integer
 ---@param column integer
----@return {block: string, position: {row: integer, column: integer}, target: string?}?
+---@return {block: string, position: {row: integer, column: integer}, target: string?, display_indent?: integer}?
 function M.locate(session, row, column)
   if session.locate then return session.locate(row, column) end
   local native = session.editable.native
@@ -893,6 +893,8 @@ end
 ---@field fold table
 ---@field fragment true
 ---@field status string
+---@field editable_source? boolean
+---@field region_owner table<string, string>
 
 ---@param snapshot table
 ---@return ForgeBufferFragment

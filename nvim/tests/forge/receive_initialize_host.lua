@@ -18,13 +18,13 @@ local function initialize_host(attempt)
       if message.id == 1 then
         assert(not message.error, vim.inspect(message.error))
         initialized = true
-        process:write(protocol.encode_request(2, "shutdown", {}))
+        process:write(protocol.encode_request(2, "host.shutdown", {}))
         process:write(nil)
       end
     end,
     consumed = function(bytes, frames)
       consumed_bytes, consumed_frames = consumed_bytes + bytes, consumed_frames + frames
-      process:write(protocol.encode_request(0, "transport.consumed", {
+      process:write(protocol.encode_request(0, "host.transport.consumed", {
         bytes = consumed_bytes,
         frames = consumed_frames,
       }))
@@ -41,7 +41,7 @@ local function initialize_host(attempt)
   }, function(result)
     receive.finish(receiver, result)
   end)
-  process:write(protocol.encode_request(1, "initialize", {
+  process:write(protocol.encode_request(1, "host.initialize", {
     protocol_version = protocol.VERSION,
     recovery_directory = vim.fs.joinpath(data_root, "forge", "recovery", "github", "v1"),
     status_ignored_directory = vim.fs.joinpath(data_root, "forge", "status-ignored"),

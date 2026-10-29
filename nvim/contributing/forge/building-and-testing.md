@@ -179,7 +179,7 @@ Benchmarks retain their own check.
 
 Use `nvim/tests/forge/support/mock_provider.lua` when an editor interaction must
 happen after a provider receives a prompt and before it responds. The helper
-controls the real host's `MockBackend` through `backend.mock_response`. Create
+controls the real host's `MockBackend` through `session.provider.mock_response`. Create
 the hold before submitting the prompt, then wait for its arrival before changing
 editor state. The selected session and optional prompt mode identify which next
 request stops. Omitting the mode selects that session's next prompt of any mode.
@@ -317,7 +317,7 @@ nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_chec
 ```
 
 The fixture creates a temporary workspace and invokes the actual host through
-`checks.list`, `checks.run`, and `checks.status`. Declared package and test inputs
+`session.check.list`, `session.check.run`, and `session.check.status`. Declared package and test inputs
 must produce one configured invocation, preserve both values, and capture command
 output. It uses Nushell without installing a test framework.
 Success requires exit status zero and host

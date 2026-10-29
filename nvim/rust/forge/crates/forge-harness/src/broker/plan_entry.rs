@@ -23,10 +23,10 @@ impl HarnessBroker {
         if params.is_null() {
             params = json!({});
         }
-        if params.get("operation_id").is_none() {
-            if let Some(id) = &self.active_operation_id {
-                params["operation_id"] = json!(id);
-            }
+        if params.get("operation_id").is_none()
+            && let Some(id) = &self.active_operation_id
+        {
+            params["operation_id"] = json!(id);
         }
         let request = Request {
             id: 0,
@@ -179,7 +179,13 @@ impl BrokerObserver {
                     effects,
                 });
             }
-            SessionAction::Pause => TaskChange::Pause,
+            SessionAction::Pause => {
+                if current.is_some_and(|task| !task.status().terminal()) {
+                    TaskChange::Pause
+                } else {
+                    TaskChange::Preserve
+                }
+            }
             SessionAction::Clear => TaskChange::Clear,
             SessionAction::Resume { request } => {
                 self.prepare_resume(current.context("session has no active task")?, request)?
@@ -463,6 +469,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn pause_without_active_task_preserves_chat_state() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        for id in 1..=2 {
+            let result = broker
+                .dispatch(Request {
+                    id,
+                    method: "session.command.apply".into(),
+                    params: json!({"operation_id":format!("pause-chat-{id}"),"action":"pause"}),
+                })
+                .await;
+            assert!(
+                result.response.error().is_none(),
+                "{:?}",
+                result.response.error()
+            );
+            assert!(broker.task_controller.current()?.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_acceptance_replay_preserves_replacement_without_provider_execution()
     -> Result<()> {
         let workspace = super::super::test::repository();
@@ -500,7 +530,7 @@ mod tests {
         let result = broker
             .dispatch(Request {
                 id: 77,
-                method: "question.continue".into(),
+                method: "session.question.continue".into(),
                 params: json!({"operation_id":"accepted-review"}),
             })
             .await;
@@ -529,7 +559,7 @@ mod tests {
         let result = broker
             .dispatch(Request {
                 id: 78,
-                method: "turn.steer".into(),
+                method: "session.turn.steer".into(),
                 params: json!({"text":"/goal Change root","target":{"thread_id":"child-thread"}}),
             })
             .await;

@@ -40,7 +40,7 @@ use crate::plan::{
     PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer, PlanQuestionResponse,
     PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState, digest as plan_digest,
 };
-use crate::protocol::HarnessMethod;
+use crate::protocol::RuntimeMethod;
 use crate::session::{
     ApprovalMode, ContextUsage, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
     ProviderForkState, SessionStore,
@@ -239,6 +239,12 @@ pub struct ActiveElicitation {
     pub elicitation: PlanElicitation,
 }
 
+struct ProviderSteering<'turn> {
+    active: &'turn mut crate::backend::ActiveSteering,
+    deferred: &'turn mut std::collections::VecDeque<crate::backend::SteerCommand>,
+    continuation: Option<crate::backend::SteerCommand>,
+}
+
 struct ExchangeRuntime {
     task_permit: Option<crate::task::TaskPermit>,
     checkpoint: Option<crate::checkpoint::CheckpointTask>,
@@ -287,7 +293,8 @@ pub struct BrokerRuntime {
     diff: Arc<forge_diff::engine::DiffEngine>,
     workspace_kind: WorkspaceKind,
     backend: Arc<dyn Backend>,
-    permission_store: Arc<RwLock<PermissionStore>>,
+    pub(crate) permission_store: Arc<RwLock<PermissionStore>>,
+    pub(crate) profiles: Arc<crate::agent::AgentProfileStore>,
     permission_coordinator: Arc<PermissionCoordinator>,
     trace: Arc<TraceStore>,
 }
@@ -312,6 +319,12 @@ impl BrokerRuntime {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("permissions.json"));
+        let profiles = Arc::new(crate::agent::AgentProfileStore::new(
+            permission_file
+                .parent()
+                .unwrap_or(&data_root)
+                .join("subagents.json"),
+        ));
         let permission_store = Arc::new(RwLock::new(PermissionStore::load(
             permission_file,
             &workspace,
@@ -332,6 +345,7 @@ impl BrokerRuntime {
             workspace_kind,
             backend,
             permission_store,
+            profiles,
             permission_coordinator,
             trace,
         }))
@@ -666,7 +680,9 @@ impl HarnessBroker {
                         .list_session(Some(&workspace))?
                         .into_iter()
                         .find(|session| {
-                            session.background.is_none() && session.backend == request.backend.kind
+                            session.background.is_none()
+                                && session.purpose == crate::session::SessionPurpose::Conversation
+                                && session.backend == request.backend.kind
                         })
                 };
                 match latest_session {
@@ -682,6 +698,7 @@ impl HarnessBroker {
                         };
                         let session_id = Uuid::new_v4().to_string();
                         let mut session = HarnessSession {
+                            purpose: crate::session::SessionPurpose::Conversation,
                             primary_agent_id: HarnessSession::primary_agent_id(&session_id),
                             id: session_id,
                             name: requested_new_session_name.unwrap_or_default().to_owned(),
@@ -840,24 +857,18 @@ impl HarnessBroker {
             trace.clone(),
             data_root.clone(),
         );
-        let profile_path = request
-            .permission_file
-            .as_deref()
-            .map(std::path::Path::new)
-            .and_then(std::path::Path::parent)
-            .unwrap_or(&data_root)
-            .join("subagents.json");
-        agent_backend_factory.profiles =
-            Arc::new(crate::agent::AgentProfileStore::new(profile_path));
+        agent_backend_factory.profiles = runtime.profiles.clone();
         agent_coordinator.set_profiles(agent_backend_factory.profiles.clone());
         let presentation = Arc::new(std::sync::Mutex::new(SessionPresentation::new(
             session.id.clone(),
         )));
         let check_runner = crate::checks::CheckSupervisor::open(
-            session.id.clone(),
-            data_root.clone(),
-            PathBuf::from(&session.workspace),
-            data_root.join(&session.id).join("checks"),
+            crate::checks::CheckSupervisorContext {
+                session_id: session.id.clone(),
+                data_root: data_root.clone(),
+                workspace: PathBuf::from(&session.workspace),
+                root: data_root.join(&session.id).join("checks"),
+            },
             Arc::clone(&presentation),
             store.objects.clone(),
             Arc::clone(&runtime.repositories),
@@ -1096,17 +1107,33 @@ impl HarnessBroker {
         self.observer.publish(self)
     }
 
+    fn session_view(&self) -> Result<HarnessSession> {
+        let mut session = self.session.clone();
+        let committed = self
+            .store
+            .load_session(&session.id)?
+            .context("observed session is missing")?;
+        session.name = committed.name;
+        session.active_task = committed.active_task;
+        Ok(session)
+    }
+
     /// Generate one tool-free Background exchange using its durable provider conversation.
     pub(crate) async fn generate_background(
         &mut self,
         input: String,
         identity: crate::background::BackgroundIdentity,
-        model: String,
-        effort: String,
-        service_tier: crate::backend::ServiceTier,
+        config: crate::service::TextGenerationConfig,
         policy: crate::session::AutoCompaction,
         sink: BackendEventSink,
     ) -> Result<String> {
+        let crate::service::TextGenerationConfig {
+            model,
+            reasoning_effort,
+            service_tier,
+            ..
+        } = config;
+        let effort = reasoning_effort.unwrap_or_else(|| "low".into());
         anyhow::ensure!(
             self.session.background.is_some(),
             "Background request requires a Background session"
@@ -1248,7 +1275,7 @@ impl HarnessBroker {
     /// Route one client request through the owning feature boundary.
     pub async fn dispatch(&mut self, request: Request) -> DispatchResult {
         let id = request.id;
-        let method = match HarnessMethod::decode(&request.method) {
+        let method = match RuntimeMethod::decode(&request.method) {
             Ok(method) => method,
             Err(error) => {
                 return DispatchResult {
@@ -1259,9 +1286,9 @@ impl HarnessBroker {
         };
         let edit_trace = matches!(
             method,
-            HarnessMethod::PlanEntityRename
-                | HarnessMethod::PlanTestsDelete
-                | HarnessMethod::PlanChecksUpdate
+            RuntimeMethod::SessionPlanEntityRename
+                | RuntimeMethod::SessionPlanTestDelete
+                | RuntimeMethod::SessionPlanCheckUpdate
         )
         .then(|| {
             crate::plan::edit_trace::PlanEditTrace::new(
@@ -1288,13 +1315,13 @@ impl HarnessBroker {
             "request_received",
             json!({ "request_id": id, "method": request.method }),
         );
-        if method == HarnessMethod::TaskTransition {
+        if method == RuntimeMethod::SessionCommandApply {
             self.active_operation_id = request
                 .params
                 .get("operation_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-        } else if method != HarnessMethod::GoalContinue {
+        } else {
             self.active_operation_id = None;
         }
         let mutation_stage = edit_trace
@@ -1302,17 +1329,16 @@ impl HarnessBroker {
             .map(|trace| trace.stage("broker.mutation"));
         let command = (|| -> Result<_> {
             let mut candidate = request.clone();
-            if candidate.params.get("operation_id").is_none() {
-                if let Some(id) = candidate
+            if candidate.params.get("operation_id").is_none()
+                && let Some(id) = candidate
                     .params
                     .pointer("/_command/id")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                {
-                    candidate.params["operation_id"] = json!(id);
-                }
+            {
+                candidate.params["operation_id"] = json!(id);
             }
-            if method == HarnessMethod::QuestionContinue {
+            if method == RuntimeMethod::SessionQuestionContinue {
                 let prior = candidate.params["operation_id"]
                     .as_str()
                     .map(|id| self.store.load_task_operation(&self.session.id, id))
@@ -1493,42 +1519,38 @@ impl HarnessBroker {
     // Select the handler before polling so unrelated workflow futures do not share a stack frame.
     fn dispatch_inner(
         &mut self,
-        method: HarnessMethod,
+        method: RuntimeMethod,
         params: Value,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(Value, Vec<SessionEvent>)>> + Send + '_>,
-    > {
+    ) -> futures_util::future::BoxFuture<'_, Result<(Value, Vec<SessionEvent>)>> {
         match method {
-            HarnessMethod::ChecksComplete => Box::pin(async move {
+            RuntimeMethod::SessionCheckComplete => Box::pin(async move {
                 let result = (serde_json::to_value(self.snapshot()?)?, Vec::new());
                 self.settle_automatic_checks(result, PromptMode::Chat).await
             }),
-            HarnessMethod::ChecksList
-            | HarnessMethod::ChecksOverride
-            | HarnessMethod::ChecksRun
-            | HarnessMethod::ChecksStatus
-            | HarnessMethod::ChecksCancel
-            | HarnessMethod::ChecksSaveDefaults => Box::pin(self.project_checks(method, params)),
-            HarnessMethod::TaskTransition => self.transition_task(params),
-            HarnessMethod::BackendModels => Box::pin(self.list_backend_model()),
-            HarnessMethod::AgentStart => Box::pin(self.start_agent(params)),
-            HarnessMethod::ExchangeResume => Box::pin(self.resume_exchange(params)),
-            HarnessMethod::PromptSubmit => Box::pin(self.submit_prompt(params)),
-            HarnessMethod::PlanAccept => Box::pin(std::future::ready(
-                self.dispatch_session_command("plan.accept", params),
+            RuntimeMethod::SessionCheckList
+            | RuntimeMethod::SessionCheckOverride
+            | RuntimeMethod::SessionCheckRun
+            | RuntimeMethod::SessionCheckStatus
+            | RuntimeMethod::SessionCheckCancel => Box::pin(self.project_checks(method, params)),
+            RuntimeMethod::SessionCommandApply => self.transition_task(params),
+            RuntimeMethod::SessionProviderModelList => Box::pin(self.list_backend_model()),
+            RuntimeMethod::SessionAgentStart => Box::pin(self.start_agent(params)),
+            RuntimeMethod::SessionPromptSubmit => Box::pin(self.submit_prompt(params)),
+            RuntimeMethod::SessionPlanAccept => Box::pin(std::future::ready(
+                self.dispatch_session_command("session.plan.accept", params),
             )),
-            HarnessMethod::PlanAcceptanceBegin => Box::pin(std::future::ready(
-                self.dispatch_session_command("plan.acceptance.begin", params),
+            RuntimeMethod::SessionPlanAcceptanceBegin => Box::pin(std::future::ready(
+                self.dispatch_session_command("session.plan.acceptance.begin", params),
             )),
-            HarnessMethod::PlanChecksUpdate => Box::pin(self.update_plan_checks(params)),
-            HarnessMethod::PlanRequestChanges => Box::pin(std::future::ready(
-                self.dispatch_session_command("plan.request_changes", params),
+            RuntimeMethod::SessionPlanCheckUpdate => Box::pin(self.update_plan_checks(params)),
+            RuntimeMethod::SessionPlanChangesRequest => Box::pin(std::future::ready(
+                self.dispatch_session_command("session.plan.changes.request", params),
             )),
-            HarnessMethod::PlanAnswerQuestions => Box::pin(async {
+            RuntimeMethod::SessionPlanQuestionAnswer => Box::pin(async {
                 anyhow::bail!("plan review questions must route through the session coordinator")
             }),
-            HarnessMethod::QuestionAsk => Box::pin(self.ask_question(params)),
-            HarnessMethod::QuestionContinue => Box::pin(async move {
+            RuntimeMethod::SessionQuestionAsk => Box::pin(self.ask_question(params)),
+            RuntimeMethod::SessionQuestionContinue => Box::pin(async move {
                 if let Some(target) = params.get("target") {
                     let active = self
                         .snapshot()?
@@ -1560,49 +1582,49 @@ impl HarnessBroker {
                 }
                 self.continue_question().await
             }),
-            HarnessMethod::ApprovalContinue => Box::pin(self.continue_after_approval_timeout()),
-            HarnessMethod::GoalSet => Box::pin(std::future::ready(
-                self.dispatch_session_command("goal.set", params),
-            )),
-            HarnessMethod::GoalPause => Box::pin(std::future::ready(
-                self.dispatch_session_command("goal.pause", json!({})),
-            )),
-            HarnessMethod::GoalResume => Box::pin(std::future::ready(
-                self.dispatch_session_command("goal.resume", json!({})),
-            )),
-            HarnessMethod::GoalClear => Box::pin(std::future::ready(
-                self.dispatch_session_command("goal.clear", json!({})),
-            )),
-            HarnessMethod::GoalContinue => Box::pin(std::future::ready(
-                self.dispatch_session_command("goal.continue", json!({})),
-            )),
-            HarnessMethod::ExchangeRequestChanges => {
-                Box::pin(self.request_exchange_changes(params))
+            RuntimeMethod::SessionApprovalContinue => {
+                Box::pin(self.continue_after_approval_timeout())
             }
-            HarnessMethod::ExchangeRollbackPrepare => Box::pin(self.prepare_rollback(params)),
-            HarnessMethod::ExchangeRollbackApply => Box::pin(self.apply_rollback(params)),
-            HarnessMethod::ExchangeRecovery => Box::pin(self.restore_recovery(params)),
-            HarnessMethod::SessionResume => Box::pin(self.resume_session(params)),
-            HarnessMethod::SessionConfigure => Box::pin(self.configure_session(params)),
-            HarnessMethod::SessionCompact => Box::pin(self.compact_session(true)),
-            HarnessMethod::TurnCancel => Box::pin(self.cancel_settled_execution()),
+            RuntimeMethod::SessionGoalSet => Box::pin(std::future::ready(
+                self.dispatch_session_command("session.goal.set", params),
+            )),
+            RuntimeMethod::SessionGoalPause => Box::pin(std::future::ready(
+                self.dispatch_session_command("session.goal.pause", json!({})),
+            )),
+            RuntimeMethod::SessionGoalResume => Box::pin(std::future::ready(
+                self.dispatch_session_command("session.goal.resume", json!({})),
+            )),
+            RuntimeMethod::SessionGoalClear => Box::pin(std::future::ready(
+                self.dispatch_session_command("session.goal.clear", json!({})),
+            )),
+            RuntimeMethod::SessionExchangeRollbackPrepare => {
+                Box::pin(self.prepare_rollback(params))
+            }
+            RuntimeMethod::SessionExchangeRollbackApply => Box::pin(self.apply_rollback(params)),
+            RuntimeMethod::SessionExchangeRecovery => Box::pin(self.restore_recovery(params)),
+            RuntimeMethod::SessionResume => Box::pin(self.resume_session(params)),
+            RuntimeMethod::SessionConfigure => Box::pin(self.configure_session(params)),
+            RuntimeMethod::SessionCompact => Box::pin(self.compact_session(true)),
+            RuntimeMethod::SessionTurnCancel => Box::pin(self.cancel_settled_execution()),
             _ => Box::pin(self.dispatch_local(method, params)),
         }
     }
 
     async fn dispatch_local(
         &mut self,
-        method: HarnessMethod,
+        method: RuntimeMethod,
         params: Value,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         if !matches!(
             method,
-            HarnessMethod::StateGet | HarnessMethod::SessionList | HarnessMethod::SessionPreview
+            RuntimeMethod::SessionStateGet
+                | RuntimeMethod::SessionList
+                | RuntimeMethod::SessionPreview
         ) {
             self.save_session()?;
         }
         match method {
-            HarnessMethod::ChecksEditing => Ok((
+            RuntimeMethod::SessionCheckEditingSet => Ok((
                 self.observer.set_check_editing(
                     params["enabled"]
                         .as_bool()
@@ -1610,52 +1632,49 @@ impl HarnessBroker {
                 )?,
                 Vec::new(),
             )),
-            HarnessMethod::TaskList => Ok((
+            RuntimeMethod::SessionTaskGet => Ok((
                 serde_json::to_value(self.task_controller.current()?)?,
                 Vec::new(),
             )),
-            HarnessMethod::LspAuthorize
-            | HarnessMethod::AttachmentImport
-            | HarnessMethod::LspRespond
-            | HarnessMethod::LspAnalyze
-            | HarnessMethod::TaskOperation
-            | HarnessMethod::Health => anyhow::bail!("control requires the service coordinator"),
-            HarnessMethod::StateGet => Ok((serde_json::to_value(self.snapshot()?)?, Vec::new())),
-            HarnessMethod::TraceStatus => {
+            RuntimeMethod::SessionLspAuthorize
+            | RuntimeMethod::SessionAttachmentImport
+            | RuntimeMethod::SessionLspRespond
+            | RuntimeMethod::SessionLspAnalyze
+            | RuntimeMethod::SessionCommandOperationGet
+            | RuntimeMethod::SessionHealthGet => {
+                anyhow::bail!("control requires the service coordinator")
+            }
+            RuntimeMethod::SessionStateGet => {
+                Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()))
+            }
+            RuntimeMethod::HostTraceStatus => {
                 Ok((serde_json::to_value(self.trace.status())?, Vec::new()))
             }
-            HarnessMethod::TraceConfigure => self.configure_trace(params),
-            HarnessMethod::TraceToggle => {
-                Ok((serde_json::to_value(self.trace.toggle()?)?, Vec::new()))
-            }
-            HarnessMethod::TraceClear => {
-                Ok((serde_json::to_value(self.trace.clear()?)?, Vec::new()))
-            }
-            HarnessMethod::TraceSessionClear => Ok((
+            RuntimeMethod::HostTraceConfigure => self.configure_trace(params),
+            RuntimeMethod::SessionTraceClear => Ok((
                 serde_json::to_value(self.trace.clear_session(&self.session.id)?)?,
                 Vec::new(),
             )),
-            HarnessMethod::BackendModelPins | HarnessMethod::BackendModelPin => {
+            RuntimeMethod::ProviderModelPinList | RuntimeMethod::ProviderModelPinSet => {
                 anyhow::bail!("model pins require the service coordinator")
             }
-            HarnessMethod::AgentList => {
-                Ok((serde_json::to_value(self.snapshot()?.agent)?, Vec::new()))
-            }
-            HarnessMethod::AgentMessage
-            | HarnessMethod::AgentFollowup
-            | HarnessMethod::AgentInterrupt
-            | HarnessMethod::AgentInterruptAll => {
+            RuntimeMethod::SessionAgentMessageSend
+            | RuntimeMethod::SessionAgentFollowup
+            | RuntimeMethod::SessionAgentInterrupt
+            | RuntimeMethod::SessionAgentInterruptAll => {
                 let target = || required_text(&params, "target");
                 let operation = match method {
-                    HarnessMethod::AgentMessage => crate::agent::AgentOperation::Message {
+                    RuntimeMethod::SessionAgentMessageSend => {
+                        crate::agent::AgentOperation::Message {
+                            target: target()?,
+                            message: required_text(&params, "message")?,
+                        }
+                    }
+                    RuntimeMethod::SessionAgentFollowup => crate::agent::AgentOperation::Followup {
                         target: target()?,
                         message: required_text(&params, "message")?,
                     },
-                    HarnessMethod::AgentFollowup => crate::agent::AgentOperation::Followup {
-                        target: target()?,
-                        message: required_text(&params, "message")?,
-                    },
-                    HarnessMethod::AgentInterrupt => {
+                    RuntimeMethod::SessionAgentInterrupt => {
                         crate::agent::AgentOperation::Interrupt { target: target()? }
                     }
                     _ => crate::agent::AgentOperation::InterruptAll,
@@ -1674,7 +1693,7 @@ impl HarnessBroker {
                     .await?;
                 Ok((result, event))
             }
-            HarnessMethod::AgentModels => {
+            RuntimeMethod::SessionAgentModelList => {
                 let provider =
                     crate::backend::BackendKind::parse(&required_text(&params, "provider")?)?;
                 let model = self
@@ -1689,11 +1708,11 @@ impl HarnessBroker {
                     .await?;
                 Ok((serde_json::to_value(model)?, Vec::new()))
             }
-            HarnessMethod::AgentProfilesGet => Ok((
+            RuntimeMethod::AgentProfileGet => Ok((
                 serde_json::to_value(self.agent_backend_factory.profiles.snapshot()?)?,
                 Vec::new(),
             )),
-            HarnessMethod::AgentProfilesSave => {
+            RuntimeMethod::AgentProfileSave => {
                 let revision = required_text(&params, "expected_revision")?;
                 let document = serde_json::from_value(params["document"].clone())?;
                 Ok((
@@ -1705,83 +1724,80 @@ impl HarnessBroker {
                     Vec::new(),
                 ))
             }
-            HarnessMethod::PermissionsOpen => self.observer.open_permission_document(),
-            HarnessMethod::PermissionsSave => self.observer.save_permission_document(params),
-            HarnessMethod::SessionPermission => {
+            RuntimeMethod::PermissionsDocumentOpen => self.observer.open_permission_document(),
+            RuntimeMethod::PermissionsDocumentSave => {
+                self.observer.save_permission_document(params)
+            }
+            RuntimeMethod::SessionPermissionSet => {
                 let mut action = params;
                 action["action"] = json!("permission");
                 self.transition_task(action).await
             }
-            HarnessMethod::HistoryRecord => self
+            RuntimeMethod::SessionPromptHistoryRecord => self
                 .observer
                 .record_prompt_history(params, self.clock.now_ms()),
-            HarnessMethod::QueueEditLast => {
-                anyhow::bail!("queued edits require input.apply")
+            RuntimeMethod::SessionPlanAcceptanceCancel => {
+                self.dispatch_session_command("session.plan.acceptance.cancel", json!({}))
             }
-            HarnessMethod::PlanAcceptanceCancel => {
-                self.dispatch_session_command("plan.acceptance.cancel", json!({}))
+            RuntimeMethod::SessionPlanEntityRename => self.rename_plan_entity(params),
+            RuntimeMethod::SessionPlanTestDelete => self.delete_plan_tests(params),
+            RuntimeMethod::SessionPlanCancel => {
+                self.dispatch_session_command("session.plan.cancel", params)
             }
-            HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
-            HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
-            HarnessMethod::PlanCancel => self.dispatch_session_command("plan.cancel", params),
-            HarnessMethod::PlanGet => Ok((self.observer.plan(params)?, Vec::new())),
-            HarnessMethod::PlanDeclaration => self.observer.read_plan_declaration(params),
-            HarnessMethod::PlanList => self.observer.list_replanning_choices(),
-            HarnessMethod::PlanDeviationResolve => {
-                anyhow::bail!("task-based deviations are no longer supported")
-            }
-            HarnessMethod::QuestionAnswer => self.answer_question(params),
-            HarnessMethod::QuestionSkip => self.skip_question(params),
-            HarnessMethod::InputTimeoutConfigure => {
+            RuntimeMethod::SessionPlanGet => Ok((self.observer.plan(params)?, Vec::new())),
+            RuntimeMethod::SessionPlanDeclarationGet => self.observer.read_plan_declaration(params),
+            RuntimeMethod::SessionPlanList => self.observer.list_replanning_choices(),
+            RuntimeMethod::SessionQuestionAnswer => self.answer_question(params),
+            RuntimeMethod::SessionQuestionSkip => self.skip_question(params),
+            RuntimeMethod::SessionInputTimeoutConfigure => {
                 anyhow::bail!("input timeout settings require the service coordinator")
             }
-            HarnessMethod::ExchangeList => Ok((
+            RuntimeMethod::SessionExchangeList => Ok((
                 serde_json::to_value(self.observer.list_exchange_review()?)?,
                 Vec::new(),
             )),
-            HarnessMethod::ExchangeCommentSave => self.observer.save_exchange_comment(params),
-            HarnessMethod::ExchangeRollbackPreview => Ok((
+            RuntimeMethod::SessionExchangeCommentSave => {
+                self.observer.save_exchange_comment(params)
+            }
+            RuntimeMethod::SessionExchangeRollbackPreview => Ok((
                 self.observer
-                    .query(HarnessMethod::ExchangeRollbackPreview, params)?
+                    .query(RuntimeMethod::SessionExchangeRollbackPreview, params)?
                     .context("rollback preview observation is unavailable")?,
                 Vec::new(),
             )),
-            HarnessMethod::SessionNew | HarnessMethod::SessionClear => {
-                self.new_session(params).await
-            }
-            HarnessMethod::SessionList => self.observer.list_session(params),
-            HarnessMethod::SessionPreview => self.observer.preview_session(params),
-            HarnessMethod::SessionRename => {
+            RuntimeMethod::SessionNew => self.new_session(params).await,
+            RuntimeMethod::SessionList => self.observer.list_session(params),
+            RuntimeMethod::SessionPreview => self.observer.preview_session(params),
+            RuntimeMethod::SessionRename => {
                 let renamed = self.observer.rename_session(params)?;
                 self.session.name = required_text(&renamed.0, "name")?;
                 Ok(renamed)
             }
-            HarnessMethod::SessionDelete => self.observer.delete_session(params),
-            HarnessMethod::SessionFork => anyhow::bail!(
+            RuntimeMethod::SessionDelete => self.observer.delete_session(params),
+            RuntimeMethod::SessionFork => anyhow::bail!(
                 "session.fork must route through the process-wide session coordinator"
             ),
-            HarnessMethod::Shutdown => {
+            RuntimeMethod::HostShutdown => {
                 self.release_lease()?;
-                Ok((json!({ "shutdown": true }), Vec::new()))
+                Ok((json!({ "host.shutdown": true }), Vec::new()))
             }
-            HarnessMethod::TurnRestart
-            | HarnessMethod::InputApply
-            | HarnessMethod::InputGet
-            | HarnessMethod::InputOperation
-            | HarnessMethod::TurnSteer
-            | HarnessMethod::ApprovalResolve
-            | HarnessMethod::BackendSkills
-            | HarnessMethod::BackendSkillsSetEnabled
-            | HarnessMethod::BackendMcp
-            | HarnessMethod::BackendCapabilities
-            | HarnessMethod::BackendAuthenticate
-            | HarnessMethod::BackendSetup
-            | HarnessMethod::SettingsGet
-            | HarnessMethod::SettingsUpdate
-            | HarnessMethod::SettingsImportPreview
-            | HarnessMethod::SettingsImportApply
-            | HarnessMethod::SettingsReset
-            | HarnessMethod::BackendMcpSetEnabled => {
+            RuntimeMethod::SessionTurnRestart
+            | RuntimeMethod::SessionInputApply
+            | RuntimeMethod::SessionInputGet
+            | RuntimeMethod::SessionInputOperationGet
+            | RuntimeMethod::SessionTurnSteer
+            | RuntimeMethod::SessionApprovalResolve
+            | RuntimeMethod::SessionProviderSkillList
+            | RuntimeMethod::SettingsSkillSetEnabled
+            | RuntimeMethod::SessionProviderMcpList
+            | RuntimeMethod::SessionProviderCapabilitiesGet
+            | RuntimeMethod::SessionProviderAuthenticate
+            | RuntimeMethod::SessionProviderSetup
+            | RuntimeMethod::SettingsGet
+            | RuntimeMethod::SettingsUpdate
+            | RuntimeMethod::SettingsImportPreview
+            | RuntimeMethod::SettingsImportApply
+            | RuntimeMethod::SettingsMcpSetEnabled => {
                 anyhow::bail!("Harness control method requires the process coordinator")
             }
             _ => anyhow::bail!("method requires asynchronous handler routing"),
@@ -1844,17 +1860,7 @@ impl HarnessBroker {
     }
 
     fn current_execution(&self) -> Result<Option<PlanExecutionRecord>> {
-        let Some(task) = self.task_controller.current()? else {
-            return Ok(None);
-        };
-        let crate::task::TaskWorkflow::Execute { execution } = task.workflow else {
-            return Ok(None);
-        };
-        anyhow::ensure!(
-            execution.record.session_id == self.session.id,
-            "execution belongs to another session"
-        );
-        Ok(Some(execution.record))
+        Ok(self.capture_execution()?.map(|capture| capture.record))
     }
 
     fn reserve_execution_continuation(&mut self, completed: crate::task::TaskTurnId) -> Result<()> {
@@ -2010,7 +2016,7 @@ impl HarnessBroker {
             ),
             "resume" | "plan" | "goal" | "execute" | "attach_plan" | "fork" | "replan"
             | "continue" => Box::pin(std::future::ready(
-                self.dispatch_session_command("task.transition", action),
+                self.dispatch_session_command("session.command.apply", action),
             )),
             _ => Box::pin(std::future::ready(Err(anyhow::anyhow!(
                 "unknown task action"
@@ -2034,7 +2040,7 @@ impl HarnessBroker {
 
     async fn transition_pause(&mut self, clear: bool) -> Result<(Value, Vec<SessionEvent>)> {
         self.dispatch_session_command(
-            "task.transition",
+            "session.command.apply",
             json!({"action":if clear { "clear" } else { "pause" }}),
         )
     }
@@ -3144,17 +3150,15 @@ impl HarnessBroker {
             self.save_session()?;
             return Ok(vec![self.event(
                 "session_configured",
-                serde_json::to_value(&self.session)?,
+                serde_json::to_value(self.session_view()?)?,
             )?]);
         }
         Ok(Vec::new())
     }
 
     async fn submit_prompt(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut snapshot_session = self.session.clone();
-        snapshot_session.active_task = self.task_controller.current()?;
         let snapshot = PromptControlSnapshot {
-            session: snapshot_session,
+            session: self.session_view()?,
             goal: self.current_goal()?,
             execution: self.store.list_plan_execution(&self.session.id)?,
             plan: self.store.list_plan(&self.session.id)?,
@@ -4330,7 +4334,7 @@ impl HarnessBroker {
                     *active_deadline = None;
                     return Ok(Some(Request {
                         id: 0,
-                        method: "question.continue".into(),
+                        method: "session.question.continue".into(),
                         params: json!({}),
                     }));
                 }
@@ -4346,7 +4350,7 @@ impl HarnessBroker {
         {
             return Ok(Some(Request {
                 id: 0,
-                method: "approval.continue".into(),
+                method: "session.approval.continue".into(),
                 params: json!({}),
             }));
         }
@@ -5117,9 +5121,11 @@ impl HarnessBroker {
                 interaction,
                 event,
                 &continuation_result,
-                &mut parent_input,
-                &mut deferred_input,
-                continuation_command.take(),
+                ProviderSteering {
+                    active: &mut parent_input,
+                    deferred: &mut deferred_input,
+                    continuation: continuation_command.take(),
+                },
             ))
             .await?;
             for task in continuation_result.drain(..) {
@@ -5353,10 +5359,13 @@ impl HarnessBroker {
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
         attached_result: &[crate::agent::AgentTask],
-        parent_input: &mut crate::backend::ActiveSteering,
-        deferred_input: &mut std::collections::VecDeque<crate::backend::SteerCommand>,
-        continuation_command: Option<crate::backend::SteerCommand>,
+        steering: ProviderSteering<'_>,
     ) -> Result<crate::backend::BackendOutput> {
+        let ProviderSteering {
+            active: parent_input,
+            deferred: deferred_input,
+            continuation: continuation_command,
+        } = steering;
         let turn_task_authority = request
             .control_context
             .as_ref()
@@ -5594,18 +5603,18 @@ impl HarnessBroker {
                                     Err(anyhow::anyhow!("review decision belongs to another plan"))
                                 } else {
                                     match method {
-                                        HarnessMethod::PlanAcceptanceBegin => self.dispatch_session_command("plan.acceptance.begin", params),
-                                        HarnessMethod::PlanRequestChanges => self.dispatch_session_command("plan.request_changes", params),
-                                        HarnessMethod::PlanCancel => self.dispatch_session_command("plan.cancel", params),
-                                        HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
-                                        HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
-                                        HarnessMethod::PlanChecksUpdate => Box::pin(self.update_plan_checks(params)).await,
+                                        RuntimeMethod::SessionPlanAcceptanceBegin => self.dispatch_session_command("session.plan.acceptance.begin", params),
+                                        RuntimeMethod::SessionPlanChangesRequest => self.dispatch_session_command("session.plan.changes.request", params),
+                                        RuntimeMethod::SessionPlanCancel => self.dispatch_session_command("session.plan.cancel", params),
+                                        RuntimeMethod::SessionPlanEntityRename => self.rename_plan_entity(params),
+                                        RuntimeMethod::SessionPlanTestDelete => self.delete_plan_tests(params),
+                                        RuntimeMethod::SessionPlanCheckUpdate => Box::pin(self.update_plan_checks(params)).await,
                                         _ => Err(anyhow::anyhow!("unsupported revision review decision")),
                                     }
                                 };
                                 match result {
                                     Err(error) => { let _ = response.send(Err(error)); }
-                                    Ok(result) if matches!(method, HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate) => {
+                                    Ok(result) if matches!(method, RuntimeMethod::SessionPlanEntityRename | RuntimeMethod::SessionPlanTestDelete | RuntimeMethod::SessionPlanCheckUpdate) => {
                                         let _ = response.send(Ok(result));
                                     }
                                     Ok((_, mut events)) => {
@@ -5847,7 +5856,7 @@ impl HarnessBroker {
             .current_goal()?
             .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
         {
-            let (_, goal_event) = self.dispatch_session_command("goal.pause", json!({}))?;
+            let (_, goal_event) = self.dispatch_session_command("session.goal.pause", json!({}))?;
             event.extend(goal_event);
         }
         if let Some(mut exchange) = self
@@ -7215,7 +7224,7 @@ impl HarnessBroker {
         let trace = crate::plan::edit_trace::PlanEditTrace::new(
             Arc::clone(&self.trace),
             &self.session.id,
-            "plan.tests.delete",
+            "session.plan.test.delete",
             &params,
         );
         let mutation = trace.stage("delete.total");
@@ -7285,7 +7294,7 @@ impl HarnessBroker {
         let trace = crate::plan::edit_trace::PlanEditTrace::new(
             Arc::clone(&self.trace),
             &self.session.id,
-            "plan.checks.update",
+            "session.plan.check.update",
             &params,
         );
         let plan_id = required_text(&params, "plan_id")?;
@@ -7325,8 +7334,10 @@ impl HarnessBroker {
                 &plan.id,
                 expected_version,
                 &expected_digest,
-                &changes,
-                &tests,
+                crate::plan::PlanCheckSelection {
+                    enabled: &changes,
+                    removed_tests: &tests,
+                },
                 Some(&trace),
             )
             .await?;
@@ -7358,7 +7369,7 @@ impl HarnessBroker {
         let trace = crate::plan::edit_trace::PlanEditTrace::new(
             Arc::clone(&self.trace),
             &self.session.id,
-            "plan.entity.rename",
+            "session.plan.entity.rename",
             &params,
         );
         let mutation = trace.stage("rename.total");
@@ -7469,7 +7480,7 @@ impl HarnessBroker {
             .context("active plan has no acceptance state")?;
         let approval_mode = acceptance.approval_mode()?;
         self.dispatch_session_command(
-            "plan.accept",
+            "session.plan.accept",
             json!({
                 "plan_id": plan.id,
                 "digest": acceptance.review_digest,
@@ -7640,35 +7651,6 @@ impl HarnessBroker {
                 status,
             )
             .await
-    }
-
-    async fn request_exchange_changes(
-        &mut self,
-        params: Value,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let exchange_id = required_text(&params, "exchange_id")?;
-        let interaction = self
-            .store
-            .load_exchange(&exchange_id)?
-            .filter(|item| item.session_id == self.session.id)
-            .context("interaction not found")?;
-        let comment = self.store.list_exchange_comment(&interaction.id)?;
-        let prompt = format!(
-            "Address this review of interaction {}. Apply every requested change while preserving unrelated work.\n\nOriginal prompt:\n{}\n\nRecorded diff:\n{}\n\nReview comments:\n{}",
-            interaction.ordinal,
-            interaction.prompt,
-            interaction.checkpoint_diff_text.unwrap_or_default(),
-            serde_json::to_string_pretty(&comment)?
-        );
-        self.run_interaction(
-            prompt,
-            PromptMode::RequestChanges,
-            Some(ExchangeAdmission::chat(format!(
-                "Request changes for interaction {}",
-                interaction.ordinal
-            ))),
-        )
-        .await
     }
 
     async fn prepare_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -8103,7 +8085,10 @@ impl HarnessBroker {
             self.session.native_compact || self.capability.native_compact;
         Ok((
             serde_json::to_value(self.snapshot()?)?,
-            vec![self.event("session_changed", serde_json::to_value(&self.session)?)?],
+            vec![self.event(
+                "session_changed",
+                serde_json::to_value(self.session_view()?)?,
+            )?],
         ))
     }
 
@@ -8566,11 +8551,11 @@ impl HarnessBroker {
             self.backend.cleanup_execution(&self.session.id).await?;
         }
         Ok((
-            serde_json::to_value(&self.session)?,
+            serde_json::to_value(self.session_view()?)?,
             vec![self.event(
                 "session_configured",
                 json!({
-                    "session": self.session,
+                    "session": self.session_view()?,
                     "access_abbreviation": self.session.access.abbreviation(),
                 }),
             )?],
@@ -8665,7 +8650,7 @@ impl HarnessBroker {
                     owner: crate::timeline::TimelineOwner::session(&self.session.id),
                     created_at_ms: now_ms,
                     detail: SessionEventKind::Compaction {
-                        compaction: compaction.observed(now_ms),
+                        compaction: (compaction.observed(now_ms)).into(),
                     },
                 }
             };
@@ -8725,7 +8710,7 @@ impl HarnessBroker {
             owner: crate::timeline::TimelineOwner::session(&self.session.id),
             created_at_ms: now_ms,
             detail: SessionEventKind::Compaction {
-                compaction: compaction.clone(),
+                compaction: (compaction.clone()).into(),
             },
         };
         self.store.save_session_event(&record)?;
@@ -8745,7 +8730,9 @@ impl HarnessBroker {
             Err(error) => {
                 compaction.state = crate::backend::CompactionState::Failed;
                 compaction.result.error = Some(format!("{error:#}"));
-                record.detail = SessionEventKind::Compaction { compaction };
+                record.detail = SessionEventKind::Compaction {
+                    compaction: compaction.into(),
+                };
                 self.store.save_session_event(&record)?;
                 let patch = self.reconcile_timeline()?;
                 self.emit_timeline_patch(patch, &mut event).await?;
@@ -8778,7 +8765,9 @@ impl HarnessBroker {
             .error
             .clone()
             .unwrap_or_else(|| "Provider compaction failed".into());
-        record.detail = SessionEventKind::Compaction { compaction };
+        record.detail = SessionEventKind::Compaction {
+            compaction: compaction.into(),
+        };
         self.store.save_session_event(&record)?;
         self.capability = output.capability.clone();
         self.session.native_fork = output.capability.native_fork;
@@ -9155,11 +9144,6 @@ mod test {
         connection
             .execute_batch("ALTER TABLE prompt_history_record RENAME TO unavailable_history")?;
         let observer = broker.observer.clone();
-        assert!(
-            observer
-                .query(HarnessMethod::AgentList, serde_json::json!({}))?
-                .is_some()
-        );
         assert!(observer.snapshot().is_err());
         Ok(())
     }
@@ -9368,7 +9352,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "checks.complete".into(),
+                method: "session.check.complete".into(),
                 params: json!({}),
             })
             .await;
@@ -9423,7 +9407,7 @@ mod test {
                     let result = broker
                         .dispatch(Request {
                             id: 1,
-                            method: "task.transition".into(),
+                            method: "session.command.apply".into(),
                             params: json!({"action":"permission","change":{"kind":"set_approval","mode":"ask"},"resume":true}),
                         })
                         .await;
@@ -10394,7 +10378,7 @@ mod test {
         let response = broker
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"Explain the current approach"}),
             })
             .await;
@@ -10710,14 +10694,20 @@ mod test {
             .proposed
             .insert(".gitignore".into(), "/target/\n".into());
         document.design = Some(design);
-        broker
+        let mut plan = broker
             .plan_file
-            .write_working_document(&broker.session.id, "check-plan", &document)
-            .unwrap();
+            .prepare_entry(&broker.session.id, "Run checks".into(), Some(document), 1)
+            .unwrap()
+            .record;
         broker
             .plan_file
             .submit_document_revision(&broker.session.id, "check-plan", 1, 1)
             .unwrap();
+        plan.state = PlanState::Accepted;
+        plan.model_revision = 1;
+        plan.accepted_revision = Some(1);
+        plan.submitted_version = Some(plan.document_version);
+        broker.store.save_plan(&plan).unwrap();
         std::fs::write(repository.join(".gitignore"), "/target/\n").unwrap();
         let goal = GoalRecord {
             id: "check-goal".into(),
@@ -10756,6 +10746,22 @@ mod test {
             .unwrap();
         save_check_exchange(&mut broker, "check-exchange", true).unwrap();
         broker
+    }
+
+    #[cfg(windows)]
+    fn update_check_execution(broker: &mut HarnessBroker, record: PlanExecutionRecord) {
+        let task = broker.task_controller.current().unwrap().unwrap();
+        broker
+            .task_controller
+            .update(&mut broker.store, &task.permit(), 100, |task| {
+                let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow else {
+                    anyhow::bail!("check fixture has no selected execution");
+                };
+                anyhow::ensure!(execution.record.id == record.id, "check execution changed");
+                execution.record = record;
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[cfg(windows)]
@@ -10822,7 +10828,7 @@ mod test {
             .unwrap()
             .unwrap();
         execution.baseline_checkpoint = Some(baseline.id.clone());
-        broker.store.save_plan_execution(&execution).unwrap();
+        update_check_execution(&mut broker, execution);
         std::fs::write(
             repository.path().join("extra.rs"),
             "pub fn unplanned() {}\n",
@@ -10891,7 +10897,7 @@ mod test {
         run.commands[0].state = crate::checks::CheckState::Running;
         run.commands[0].output_bytes = 0;
         let output = run.commands[0].output.clone();
-        broker.store.save_plan_execution(&execution).unwrap();
+        update_check_execution(&mut broker, execution);
         broker
             .store
             .interrupt_detached_execution(&broker.session.id)
@@ -10941,7 +10947,7 @@ mod test {
             .unwrap()
             .unwrap();
         assert_eq!(execution.state, PlanExecutionState::Complete);
-        assert_eq!(broker.active_goal().unwrap().state, GoalState::Complete);
+        assert!(broker.task_controller.current().unwrap().is_none());
         assert!(execution.check_runs[0].completed_plan.is_some());
         let exchange = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchange.len(), 1);
@@ -11030,7 +11036,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"/plan add coverage"}),
             })
             .await;
@@ -11079,7 +11085,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"/plan add test coverage"}),
             })
             .await;
@@ -11088,6 +11094,7 @@ mod test {
             "{:?}",
             result.response.error()
         );
+        run_plan_to_input_boundary(&mut broker).await.unwrap();
         let mut plan = broker.snapshot().unwrap().active_plan.unwrap();
         let mut document = broker
             .plan_file
@@ -11114,7 +11121,7 @@ mod test {
             )
             .unwrap();
         plan.review_digest = Some(checksum.clone());
-        broker.store.save_plan(&plan).unwrap();
+        broker.publish_plan(&plan).unwrap();
         let source = broker
             .observer
             .capture_plan_review(&plan.id, &checksum)
@@ -11184,7 +11191,24 @@ mod test {
                 .unwrap(),
             document
         );
-        let (result, _) = broker.delete_plan_tests(params.clone()).unwrap();
+        let request = Request {
+            id: 2,
+            method: "session.plan.test.delete".into(),
+            params: params.clone(),
+        };
+        let envelope = json!({"id":request.id,"method":request.method,"params":request.params,
+            "session_id":broker.session.id});
+        let dispatched = broker.dispatch(request).await;
+        assert!(
+            dispatched.response.error().is_none(),
+            "{:?}",
+            dispatched.response.error()
+        );
+        eprintln!(
+            "API_CAPTURE {}",
+            json!({"request":envelope,"response":dispatched.response})
+        );
+        let result = dispatched.response.result().unwrap().clone();
         let updated = broker
             .plan_file
             .read_working_document(&broker.session.id, &plan.id)
@@ -11280,14 +11304,15 @@ mod test {
         );
         broker.capability.approval_mode_list =
             vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow];
+        broker.snapshot().unwrap();
         broker
             .dispatch_session_command(
-                "plan.acceptance.begin",
+                "session.plan.acceptance.begin",
                 json!({"plan_id":plan.id,"digest":draft.review_digest}),
             )
             .unwrap();
         broker
-            .dispatch_session_command("plan.acceptance.cancel", json!({}))
+            .dispatch_session_command("session.plan.acceptance.cancel", json!({}))
             .unwrap();
         let selected_task =
             serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
@@ -11300,7 +11325,7 @@ mod test {
         let invalid = broker
             .dispatch(Request {
                 id: 2,
-                method: "plan.accept".into(),
+                method: "session.plan.accept".into(),
                 params: json!({"plan_id":plan.id,"digest":"stale","approval_mode":"ask"}),
             })
             .await;
@@ -11320,7 +11345,7 @@ mod test {
             turn: Default::default(),
             revision: plan.model_revision + 1,
         });
-        let accepted = broker.dispatch(Request { id: 3, method: "plan.accept".into(),
+        let accepted = broker.dispatch(Request { id: 3, method: "session.plan.accept".into(),
             params: json!({"plan_id":plan.id,"digest":draft.review_digest,"approval_mode":"ask"}) }).await;
         assert!(
             accepted.response.error().is_none(),
@@ -11430,7 +11455,7 @@ mod test {
                     .context("test plan missing")?;
                 broker.backend = Arc::new(StoppedExecutionBackend { cancelled: true });
                 broker.dispatch_session_command(
-                    "plan.accept",
+                    "session.plan.accept",
                     json!({"plan_id":plan.id,"approval_mode":"ask"}),
                 )?;
             }
@@ -11488,15 +11513,17 @@ mod test {
                 .submit_prompt(json!({"text":"/plan add a reusable API"}))
                 .await
                 .unwrap();
+            run_plan_to_input_boundary(&mut broker).await.unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
             broker.backend = Arc::new(StoppedExecutionBackend { cancelled });
-            let (result, _) = broker
+            broker
                 .dispatch_session_command(
-                    "plan.accept",
+                    "session.plan.accept",
                     json!({"plan_id":plan.id,"approval_mode":"ask"}),
                 )
                 .unwrap();
-            assert_eq!(result["execution_error"].as_str().is_some(), !cancelled);
+            let result = dispatch_pending_task_input(&mut broker).await;
+            assert!(result.is_err(), "stopped provider unexpectedly succeeded");
             let history = broker.store.list_exchange(&broker.session.id).unwrap();
             let stopped = history.last().unwrap();
             assert_eq!(
@@ -11520,13 +11547,15 @@ mod test {
             let stopped_id = stopped.id.clone();
             broker.backend = Arc::new(NoProgressExecutionBackend);
             broker
-                .dispatch_session_command("goal.resume", json!({}))
+                .dispatch_session_command("session.goal.resume", json!({}))
                 .unwrap();
+            dispatch_pending_task_input(&mut broker).await.unwrap();
             let resumed = broker.store.list_exchange(&broker.session.id).unwrap();
             assert_ne!(resumed.last().unwrap().id, stopped_id);
             assert!(matches!(
                 &resumed.last().unwrap().origin,
-                crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+                crate::exchange::ExchangeOrigin::TaskStarted { start }
+                    if start.kind == crate::task::TaskKind::Execute
             ));
             assert_eq!(
                 timeline_text(&broker.snapshot().unwrap())
@@ -11642,7 +11671,7 @@ mod test {
         broker.backend = Arc::new(NoProgressExecutionBackend);
         let (_, first) = broker
             .dispatch_session_command(
-                "plan.accept",
+                "session.plan.accept",
                 json!({"plan_id":plan.id,"approval_mode":"ask"}),
             )
             .unwrap();
@@ -11652,7 +11681,7 @@ mod test {
                 .any(|event| event.event == "goal_continue_requested")
         );
         let (_, second) = broker
-            .dispatch_session_command("goal.continue", json!({}))
+            .dispatch_session_command("session.command.apply", json!({"action":"continue"}))
             .unwrap();
         assert!(
             !second
@@ -11685,7 +11714,7 @@ mod test {
         ));
         assert_eq!(attempts[0].session_id, attempts[1].session_id);
         broker
-            .dispatch_session_command("goal.resume", json!({}))
+            .dispatch_session_command("session.goal.resume", json!({}))
             .unwrap();
         let resumed = active_execution(&broker);
         assert_eq!(resumed.id, stalled.id);
@@ -12148,7 +12177,7 @@ mod test {
                 std::time::Duration::from_secs(5),
                 broker.dispatch(Request {
                     id: 1,
-                    method: "goal.set".into(),
+                    method: "session.goal.set".into(),
                     params: json!({ "objective": "test bounded provider delivery" }),
                 }),
             )
@@ -12205,7 +12234,7 @@ mod test {
             let dispatch = broker.dispatch_stream(
                 Request {
                     id: request_id,
-                    method: "prompt.submit".into(),
+                    method: "session.prompt.submit".into(),
                     params: json!({ "text": "burst then final answer" }),
                 },
                 sink,
@@ -12439,7 +12468,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"/plan Design the change"}),
             })
             .await;
@@ -12481,7 +12510,7 @@ mod test {
             let prompted = broker
                 .dispatch(Request {
                     id: 1,
-                    method: "prompt.submit".into(),
+                    method: "session.prompt.submit".into(),
                     params: json!({"text":if planning {
                         "/plan Design the migration"
                     } else {
@@ -12611,8 +12640,12 @@ mod test {
                 crate::task::TaskChange::Install(Box::new(task)),
                 1,
             )?;
-            broker.session.active_task = broker.task_controller.current()?;
             let before = serde_json::to_value(broker.task_controller.current()?)?;
+            let (configured, events) = broker
+                .configure_session(json!({"effort":"default"}))
+                .await?;
+            assert_eq!(configured["active_task"], before);
+            assert_eq!(events[0].payload["session"]["active_task"], before);
             let provider = Arc::new(RestartBackend {
                 cancellation: broker.turn_cancellation(),
                 invocation: std::sync::atomic::AtomicUsize::new(0),
@@ -12660,6 +12693,38 @@ mod test {
     }
 
     #[tokio::test]
+    async fn automatic_resume_excludes_answer_forks() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let broker = planning_question_broker(repository.path(), data.path(), true);
+        let source_id = broker.session.id.clone();
+        let child = prepare_provider_fork(
+            data.path(),
+            "answer-client",
+            "mock",
+            &broker.capability,
+            &source_id,
+            &json!({"name":"Plan Review answers"}),
+            crate::session::SessionPurpose::PlanReviewAnswer,
+        )?;
+        assert_eq!(
+            child.child.purpose,
+            crate::session::SessionPurpose::PlanReviewAnswer
+        );
+        let mut legacy = serde_json::to_value(&broker.session)?;
+        legacy.as_object_mut().unwrap().remove("purpose");
+        assert_eq!(
+            serde_json::from_value::<HarnessSession>(legacy)?.purpose,
+            crate::session::SessionPurpose::Conversation
+        );
+        drop(broker);
+        let resumed = planning_question_broker(repository.path(), data.path(), true);
+        assert_eq!(resumed.session.id, source_id);
+        assert!(resumed.store.load_session(&child.child.id)?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn permission_change_keeps_idle_questions_waiting_without_provider_work() {
         for planning in [false, true] {
             let repository = repository();
@@ -12668,7 +12733,7 @@ mod test {
             let prompted = broker
                 .dispatch(Request {
                     id: 1,
-                    method: "prompt.submit".into(),
+                    method: "session.prompt.submit".into(),
                     params: json!({"text":if planning {
                         "/plan Design the migration"
                     } else {
@@ -12923,7 +12988,7 @@ mod test {
             .open(repository.path().join("seed.txt"))
             .unwrap();
         let error = broker
-            .dispatch_session_command("goal.resume", json!({}))
+            .dispatch_session_command("session.goal.resume", json!({}))
             .unwrap_err();
         assert!(format!("{error:#}").contains("seed.txt"));
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
@@ -12936,7 +13001,7 @@ mod test {
         broker.turn_cancellation.request(false);
         assert!(
             broker
-                .dispatch_session_command("goal.resume", json!({}))
+                .dispatch_session_command("session.goal.resume", json!({}))
                 .unwrap_err()
                 .downcast_ref::<TurnCancelled>()
                 .is_some()
@@ -12952,7 +13017,7 @@ mod test {
         );
         broker.turn_cancellation.arm(false);
         let (_, event) = broker
-            .dispatch_session_command("goal.resume", json!({}))
+            .dispatch_session_command("session.goal.resume", json!({}))
             .unwrap();
         assert_eq!(event[0].event, "goal_changed");
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
@@ -13843,7 +13908,7 @@ mod test {
             let result = broker
                 .dispatch(Request {
                     id: 1,
-                    method: "plan.get".into(),
+                    method: "session.plan.get".into(),
                     params,
                 })
                 .await;
@@ -13863,10 +13928,10 @@ mod test {
             );
         }
         for (method, params) in [
-            ("plan.get", json!({"plan_id":"missing"})),
+            ("session.plan.get", json!({"plan_id":"missing"})),
             ("session.preview", json!({"session_id":"missing"})),
             (
-                "plan.declaration",
+                "session.plan.declaration.get",
                 json!({"plan_id":"missing","path":"src/lib.rs","revision":1}),
             ),
         ] {
@@ -13911,9 +13976,9 @@ mod test {
         let selected = serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
         for (method, params) in [
             ("session.preview", json!({"session_id":"missing"})),
-            ("plan.get", json!({"plan_id":"missing"})),
+            ("session.plan.get", json!({"plan_id":"missing"})),
             ("session.rename", json!({})),
-            ("exchange.comment.save", json!({})),
+            ("session.exchange.comment.save", json!({})),
         ] {
             let result = broker
                 .dispatch(Request {
@@ -14065,7 +14130,7 @@ mod test {
             revision: snapshot.revision,
             view,
             sequence: InputSequence(1),
-            action: "plan.questions.answer".into(),
+            action: "session.plan.question.answer".into(),
             block: snapshot.block[0].id.clone(),
             position: target.range.start,
             target: Some(target.id),
@@ -15115,6 +15180,7 @@ mod test {
     #[test]
     fn rejects_a_second_live_session_controller() {
         let mut session = HarnessSession {
+            purpose: crate::session::SessionPurpose::Conversation,
             id: "session".into(),
             primary_agent_id: HarnessSession::primary_agent_id("session"),
             name: "name".into(),
@@ -15208,6 +15274,7 @@ mod test {
     pub(super) fn repository() -> tempfile::TempDir {
         let temporary = tempfile::tempdir().unwrap();
         git(temporary.path(), &["init", "-q"]);
+        git(temporary.path(), &["config", "core.autocrlf", "false"]);
         git(
             temporary.path(),
             &["config", "user.email", "harness@example.invalid"],
@@ -15217,6 +15284,74 @@ mod test {
         git(temporary.path(), &["add", "."]);
         git(temporary.path(), &["commit", "-qm", "seed"]);
         temporary
+    }
+
+    async fn dispatch_pending_task_input(
+        broker: &mut HarnessBroker,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
+        let task = broker
+            .task_controller
+            .current()?
+            .context("task is missing")?;
+        let (instruction, purpose) = if let Some(entry) = task.entry.as_ref()
+            && entry.delivery == crate::task::TaskInputDelivery::Pending
+        {
+            anyhow::ensure!(
+                broker.task_controller.acknowledge_entry(
+                    &mut broker.store,
+                    &task.revision,
+                    &entry.id,
+                    broker.clock.now_ms()
+                )?,
+                "task entry was replaced"
+            );
+            (
+                entry.instruction.clone(),
+                crate::input::InputPurpose::TaskEntry {
+                    revision: task.revision.clone(),
+                    id: entry.id.clone(),
+                    start: crate::exchange::TaskStart {
+                        kind: task.kind(),
+                        title: task.title().to_owned(),
+                    },
+                },
+            )
+        } else {
+            let turn = task.turn.as_ref().context("task turn is missing")?;
+            let continuation = turn
+                .continuation
+                .as_ref()
+                .context("task continuation is missing")?;
+            anyhow::ensure!(
+                continuation.delivery == crate::task::TaskInputDelivery::Pending,
+                "task continuation was already delivered"
+            );
+            anyhow::ensure!(
+                broker.task_controller.acknowledge_continuation(
+                    &mut broker.store,
+                    &task.revision,
+                    &continuation.id,
+                    broker.clock.now_ms()
+                )?,
+                "task continuation was replaced"
+            );
+            (
+                continuation.instruction.clone(),
+                crate::input::InputPurpose::TaskContinuation {
+                    revision: task.revision.clone(),
+                    id: continuation.id.clone(),
+                    completed_turn_id: turn.id.clone(),
+                    reason: continuation.reason.clone(),
+                },
+            )
+        };
+        broker.task_controller.admit(task.kind())?;
+        broker.input_purpose = purpose;
+        let result = broker
+            .submit_prompt_inner(json!({"text": instruction}))
+            .await;
+        broker.input_purpose = crate::input::InputPurpose::User;
+        result
     }
 
     async fn run_plan_to_input_boundary(broker: &mut HarnessBroker) -> Result<()> {
@@ -15839,7 +15974,7 @@ mod test {
         let rejected = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"new request"}),
             })
             .await;
@@ -15868,7 +16003,7 @@ mod test {
         let retried = broker
             .dispatch(Request {
                 id: 2,
-                method: "turn.cancel".into(),
+                method: "session.turn.cancel".into(),
                 params: json!({}),
             })
             .await;
@@ -15890,7 +16025,7 @@ mod test {
         let repeated = broker
             .dispatch(Request {
                 id: 3,
-                method: "turn.cancel".into(),
+                method: "session.turn.cancel".into(),
                 params: json!({}),
             })
             .await;
@@ -15911,7 +16046,7 @@ mod test {
         let recorded = first
             .dispatch(Request {
                 id: 1,
-                method: "history.record".into(),
+                method: "session.prompt.history.record".into(),
                 params: json!({ "text": "inspect the architecture" }),
             })
             .await;
@@ -16274,7 +16409,7 @@ mod test {
         let prompted = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "prompt me with a multiple-choice question" }),
             })
             .await;
@@ -16296,7 +16431,7 @@ mod test {
         let answered = broker
             .dispatch(Request {
                 id: 2,
-                method: "question.answer".into(),
+                method: "session.question.answer".into(),
                 params: json!({
                     "question_id": pending.elicitation.current_question().unwrap().id,
                     "response": { "kind": "selected", "option": "Staged" }
@@ -16308,7 +16443,7 @@ mod test {
         let continued = broker
             .dispatch(Request {
                 id: 3,
-                method: "question.continue".into(),
+                method: "session.question.continue".into(),
                 params: json!({}),
             })
             .await;
@@ -16346,7 +16481,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"prompt me with a multiple-choice question"}),
             })
             .await;
@@ -16363,7 +16498,7 @@ mod test {
             .expire_input(&mut deadline)
             .unwrap()
             .expect("overdue request");
-        assert_eq!(request.method, "question.continue");
+        assert_eq!(request.method, "session.question.continue");
         let result = broker.dispatch(request).await;
         assert!(
             result.response.error().is_none(),
@@ -16398,7 +16533,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"First turn"}),
             })
             .await;
@@ -16433,7 +16568,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"Second turn"}),
             })
             .await;
@@ -16448,7 +16583,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 3,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"Third turn"}),
             })
             .await;
@@ -16459,7 +16594,7 @@ mod test {
             owner: crate::timeline::TimelineOwner::session(&broker.session.id),
             created_at_ms: 1,
             detail: SessionEventKind::Compaction {
-                compaction: crate::backend::Compaction {
+                compaction: (crate::backend::Compaction {
                     id: "native-running".into(),
                     thread_id: broker.session.backend_session_id.clone().unwrap(),
                     state: crate::backend::CompactionState::Running,
@@ -16467,7 +16602,8 @@ mod test {
                     started_at_ms: Some(1),
                     completed_at_ms: None,
                     result: Default::default(),
-                },
+                })
+                .into(),
             },
         })?;
         broker.session.context_usage = ContextUsage::reported(50_000, 100_000);
@@ -16511,7 +16647,7 @@ mod test {
         let prompted = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "establish provider context" }),
             })
             .await;
@@ -16990,14 +17126,14 @@ mod test {
         source
             .dispatch(Request {
                 id: 0,
-                method: "session.permission".into(),
+                method: "session.permission.set".into(),
                 params: json!({ "change":{"kind":"set_approval","mode":"ask"} }),
             })
             .await;
         let prompt = source
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "preserve this interaction" }),
             })
             .await;
@@ -17031,6 +17167,7 @@ mod test {
             &fork_controller.capability,
             &fork_controller.session.id,
             &json!({ "session_id": source_session_id, "name": "fork investigation" }),
+            crate::session::SessionPurpose::Conversation,
         )
         .unwrap();
         assert!(matches!(
@@ -17127,6 +17264,7 @@ mod test {
             &fork_controller.capability,
             &fork_controller.session.id,
             &json!({ "session_id": source_session_id }),
+            crate::session::SessionPurpose::Conversation,
         )
         .unwrap();
         let mut failed_initialize = initialize("fork-client", None);
@@ -17154,7 +17292,7 @@ mod test {
         let later_source = source
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "source-only later message" }),
             })
             .await;
@@ -17162,7 +17300,7 @@ mod test {
         let child_prompt = child_controller
             .dispatch(Request {
                 id: 3,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "child-only new message" }),
             })
             .await;
@@ -17203,6 +17341,7 @@ mod test {
             &child_controller.capability,
             &child_session_id,
             &json!({ "session_id": child_session_id }),
+            crate::session::SessionPurpose::Conversation,
         )
         .unwrap();
         let grandchild_history = child_controller
@@ -17317,7 +17456,7 @@ mod test {
         let selected = broker
             .dispatch(Request {
                 id: 0,
-                method: "session.permission".into(),
+                method: "session.permission.set".into(),
                 params: json!({ "change":{"kind":"enable_yolo"} }),
             })
             .await;
@@ -17443,7 +17582,7 @@ mod test {
         let selected = broker
             .dispatch(Request {
                 id: 21,
-                method: "session.permission".into(),
+                method: "session.permission.set".into(),
                 params: json!({ "change":{"kind":"set_approval","mode":"ask"} }),
             })
             .await;
@@ -17667,7 +17806,7 @@ mod test {
         let invalid_mode = broker
             .dispatch(Request {
                 id: 3,
-                method: "session.permission".into(),
+                method: "session.permission.set".into(),
                 params: json!({ "mode": "invalid" }),
             })
             .await;
@@ -17706,7 +17845,7 @@ mod test {
         let prompt = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "preserve preview history" }),
             })
             .await;
@@ -17878,7 +18017,7 @@ mod test {
         let paused = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
@@ -17923,7 +18062,7 @@ mod test {
         let clarified = broker
             .dispatch(Request {
                 id: 2,
-                method: "question.ask".into(),
+                method: "session.question.ask".into(),
                 params: json!({
                     "question_id": question_id,
                     "text": "What compatibility cost does staged migration add?"
@@ -17949,7 +18088,7 @@ mod test {
         let follow_up = broker
             .dispatch(Request {
                 id: 3,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "How long should compatibility remain?" }),
             })
             .await;
@@ -17961,7 +18100,7 @@ mod test {
         let answered = broker
             .dispatch(Request {
                 id: 4,
-                method: "question.answer".into(),
+                method: "session.question.answer".into(),
                 params: json!({
                     "question_id": question_id,
                     "response": {
@@ -17976,7 +18115,7 @@ mod test {
         let completed = broker
             .dispatch(Request {
                 id: 5,
-                method: "question.continue".into(),
+                method: "session.question.continue".into(),
                 params: json!({}),
             })
             .await;
@@ -18081,7 +18220,7 @@ mod test {
         let paused = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
@@ -18093,7 +18232,7 @@ mod test {
         broker
             .dispatch(Request {
                 id: 2,
-                method: "question.answer".into(),
+                method: "session.question.answer".into(),
                 params: json!({
                     "question_id": question_id,
                     "response": {
@@ -18107,7 +18246,7 @@ mod test {
         let completed = broker
             .dispatch(Request {
                 id: 3,
-                method: "question.continue".into(),
+                method: "session.question.continue".into(),
                 params: json!({}),
             })
             .await;
@@ -18167,7 +18306,7 @@ mod test {
         let failed = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
@@ -18179,7 +18318,7 @@ mod test {
         let rejected = broker
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "keep going" }),
             })
             .await;
@@ -18194,7 +18333,7 @@ mod test {
         let retried = broker
             .dispatch(Request {
                 id: 3,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan retry" }),
             })
             .await;
@@ -18216,7 +18355,7 @@ mod test {
         let resumed = broker
             .dispatch(Request {
                 id: 4,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"continue the existing design"}),
             })
             .await;
@@ -18235,7 +18374,7 @@ mod test {
         let resumed = broker
             .dispatch(Request {
                 id: 5,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"/plan retry"}),
             })
             .await;
@@ -18260,7 +18399,7 @@ mod test {
             let planned = broker
                 .dispatch(Request {
                     id: 1,
-                    method: "prompt.submit".into(),
+                    method: "session.prompt.submit".into(),
                     params: json!({"text":"/plan migrate"}),
                 })
                 .await;
@@ -18274,7 +18413,7 @@ mod test {
             let cancelled = broker
                 .dispatch(Request {
                     id: 2,
-                    method: "plan.cancel".into(),
+                    method: "session.plan.cancel".into(),
                     params: json!({"plan_id":plan.id}),
                 })
                 .await;
@@ -18312,7 +18451,7 @@ mod test {
         broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
@@ -18324,7 +18463,7 @@ mod test {
         let cancelled = broker
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan cancel" }),
             })
             .await;
@@ -18350,7 +18489,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
@@ -18370,7 +18509,7 @@ mod test {
         broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
@@ -18379,7 +18518,7 @@ mod test {
         broker
             .dispatch(Request {
                 id: 2,
-                method: "question.answer".into(),
+                method: "session.question.answer".into(),
                 params: json!({
                     "question_id": question.id,
                     "response": { "kind": "selected", "option": "Staged", "feedback": "one release" }
@@ -18420,7 +18559,7 @@ mod test {
             let result = broker
                 .dispatch(Request {
                     id: 1,
-                    method: "prompt.submit".into(),
+                    method: "session.prompt.submit".into(),
                     params: json!({"text": prompt}),
                 })
                 .await;
@@ -18435,7 +18574,7 @@ mod test {
                 .questions[0]
                 .id
                 .clone();
-            let result = broker.dispatch(Request { id: 2, method: "question.answer".into(),
+            let result = broker.dispatch(Request { id: 2, method: "session.question.answer".into(),
                 params: json!({"question_id":question_id, "response":{"kind":"selected","option":"Staged"}}) }).await;
             assert!(result.response.error().is_none());
             assert!(
@@ -18451,7 +18590,7 @@ mod test {
             let result = broker
                 .dispatch(Request {
                     id: 3,
-                    method: "question.ask".into(),
+                    method: "session.question.ask".into(),
                     params: json!({"question_id":question_id,"text":"what do you mean?"}),
                 })
                 .await;
@@ -18501,7 +18640,7 @@ mod test {
         broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
@@ -18516,7 +18655,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "replace the options" }),
             })
             .await;
@@ -18543,14 +18682,14 @@ mod test {
         broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "ask which migration to use" }),
             })
             .await;
         let result = broker
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "use staged" }),
             })
             .await;
@@ -18572,14 +18711,14 @@ mod test {
         broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
         let result = broker
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "use staged" }),
             })
             .await;
@@ -18606,14 +18745,14 @@ mod test {
         broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
         let result = broker
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "this decision is not material" }),
             })
             .await;
@@ -18651,14 +18790,14 @@ mod test {
         broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
         let result = broker
             .dispatch(Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "this decision is not material" }),
             })
             .await;
@@ -18692,7 +18831,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
@@ -18725,7 +18864,7 @@ mod test {
         let paused = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
@@ -18930,7 +19069,10 @@ mod test {
             cancel_continuation: false,
         });
         broker
-            .dispatch_session_command("goal.set", json!({"objective":"complete two native turns"}))
+            .dispatch_session_command(
+                "session.goal.set",
+                json!({"objective":"complete two native turns"}),
+            )
             .unwrap();
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 2);
@@ -18968,17 +19110,20 @@ mod test {
             state: GoalState::Active,
         });
         broker
-            .dispatch_session_command("goal.set", json!({"objective":"complete a continued goal"}))
+            .dispatch_session_command(
+                "session.goal.set",
+                json!({"objective":"complete a continued goal"}),
+            )
             .unwrap();
         broker
-            .dispatch_session_command("goal.continue", json!({}))
+            .dispatch_session_command("session.command.apply", json!({"action":"continue"}))
             .unwrap();
         broker.backend = Arc::new(NativeSettlementBackend {
             inner: broker.backend.clone(),
             state: GoalState::Complete,
         });
         broker
-            .dispatch_session_command("goal.continue", json!({}))
+            .dispatch_session_command("session.command.apply", json!({"action":"continue"}))
             .unwrap();
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 3);
@@ -19070,7 +19215,7 @@ mod test {
         });
         let error = broker
             .dispatch_session_command(
-                "goal.set",
+                "session.goal.set",
                 json!({"objective":"interrupt the second native turn"}),
             )
             .unwrap_err();
@@ -19089,7 +19234,7 @@ mod test {
             state: GoalState::Complete,
         });
         broker
-            .dispatch_session_command("goal.resume", json!({}))
+            .dispatch_session_command("session.goal.resume", json!({}))
             .unwrap();
         let resumed = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(resumed.len(), 3);
@@ -19183,7 +19328,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "goal.set".into(),
+                method: "session.goal.set".into(),
                 params: json!({ "objective": "finish the work" }),
             })
             .await;
@@ -19232,7 +19377,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "answer an ordinary question" }),
             })
             .await;
@@ -19281,7 +19426,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "wait for the explorer" }),
             })
             .await;
@@ -19354,7 +19499,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"create a module"}),
             })
             .await;
@@ -19415,7 +19560,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "create a nested module" }),
             })
             .await;
@@ -19530,7 +19675,7 @@ mod test {
         let result = broker
             .dispatch(Request {
                 id: 1,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({ "text": "change the seed" }),
             })
             .await;

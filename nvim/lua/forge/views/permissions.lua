@@ -32,7 +32,7 @@ local function edit(result, window)
     callback = function()
       local source = table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n") .. "\n"
       local submitted_tick = vim.api.nvim_buf_get_changedtick(buffer)
-      client.request("permissions.save", { source = source }, function(_, request_error)
+      client.request({ method = "permissions.document.save", params = { source = source } }, function(_, request_error)
         if request_error then
           notifications.error(request_error, "ForgePermissions")
           return
@@ -54,19 +54,12 @@ function M.open()
   local function current()
     return vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == origin
   end
-  client.start_harness(function(_, start_error)
-    if start_error then
-      notifications.error(start_error, "ForgePermissions")
+  client.request({ method = "permissions.document.open", params = {} }, function(result, request_error)
+    if request_error then
+      notifications.error(request_error, "ForgePermissions")
       return
     end
-    if not current() then return end
-    client.request("permissions.open", {}, function(result, request_error)
-      if request_error then
-        notifications.error(request_error, "ForgePermissions")
-        return
-      end
-      if current() then edit(result, window) end
-    end)
+    if current() then edit(result, window) end
   end)
 end
 

@@ -24,6 +24,9 @@ local text_snapshot = require("forge.render.text_snapshot")
 ---@field metadata table?
 
 ---@class ForgeRawHunk
+---@field forge_hunk_index? ForgeHunkIndex
+---@field source_id? string
+---@field file_key? string
 ---@field id string
 ---@field diff string
 ---@field patch_text string

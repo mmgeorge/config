@@ -28,7 +28,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors = {}
 vim.notify = function(message, level)
@@ -40,7 +40,7 @@ end
 ---@return table
 local function request(method, params)
   local settled, value, failure
-  client.request(method, params or {}, function(result, error) value, failure, settled = result, error, true end)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, error) value, failure, settled = result, error, true end)
   assert(vim.wait(10000, function() return settled end, 10), method .. " timeout")
   assert(not failure, method .. ": " .. tostring(failure))
   return value
@@ -52,13 +52,13 @@ local succeeded, failure = xpcall(function()
     harness = { backend = "mock", backends = { mock = { command = { "retained-control" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), table.concat(errors, "\n"))
-  assert(request("checks.list").configured)
-  local id = request("checks.run", { check = "package-tests", inputs = {
+  assert(request("session.check.list").configured)
+  local id = request("session.check.run", { check = "package-tests", inputs = {
       package = "first", test = "selected",
   } }).run_id
   local run
   assert(vim.wait(10000, function()
-    run = request("checks.status", { run_id = id })
+    run = request("session.check.status", { run_id = id })
     return run.state ~= "running"
   end, 20), "package checks did not settle")
   assert(run.state == "passed", vim.inspect(run))
@@ -70,7 +70,7 @@ local succeeded, failure = xpcall(function()
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

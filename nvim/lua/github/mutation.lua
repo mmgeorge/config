@@ -20,6 +20,7 @@ local M = {}
 ---@field capture {operation_id:string, actor:string, edit_sequence:integer|nil, submitted:GithubMutationCapture}
 ---@field state {phase:string, result:table|nil, diagnostic:string|nil}
 ---@field draft_acknowledged boolean|nil
+---@field confirmed_steps? table[]
 
 ---@class GithubMutationOptions
 ---@field directory string
@@ -30,7 +31,7 @@ local M = {}
 ---@field edit_sequence integer|nil
 ---@field draft_target string|nil
 ---@field parent_node_id string|nil
----@field settle fun(record:GithubMutationRecord):table|nil
+---@field settle? fun(record:GithubMutationRecord):table|nil
 ---@field settle_async? fun(record:GithubMutationRecord, done:fun(failure:string|nil))
 
 local sequence = 0
@@ -48,7 +49,7 @@ local function request(route, params, callback)
   end
   local ok, failure = pcall(function()
     if runner_for_test then runner_for_test(route, params, receive)
-    else require("forge.client").request_host(route, params, receive) end
+    else require("forge.client").request({ method = route, params = params }, receive) end
   end)
   if not ok then receive(nil, tostring(failure)) end
 end
@@ -73,7 +74,7 @@ function M.submission_context(directory, repo, number, pending_review_id, expect
   local owner, name = tostring(repo):match("^([^/]+)/([^/]+)$")
   if not owner then callback(nil, "Invalid review repository") return end
   local hostname = require("github.repo_cache").hostname()
-  request("github.review.submission_context", {
+  request("github.review.submission.context", {
     directory = directory, repository = { hostname = hostname, owner = owner, name = name },
     number = number, pending_review_id = pending_review_id, expected = expected,
   }, function(context, failure)
@@ -109,7 +110,7 @@ function M.run(options, callback)
     notify(failure)
     callback(record, failure)
   end
-  request("github.actor", { directory = options.directory, repository = repository }, function(actor, failure)
+  request("github.actor.get", { directory = options.directory, repository = repository }, function(actor, failure)
     if failure then fail(failure) return end
     if type(actor) ~= "table" or type(actor.node_id) ~= "string" or actor.node_id == "" then
       fail("Forge returned invalid authenticated GitHub identity")
@@ -149,13 +150,13 @@ function M.run(options, callback)
         return
       end
       local params = { resource = capture.resource, operation_id = capture.operation_id }
-      local route = "github.recovery.ack"
+      local route = "github.recovery.acknowledge"
       if capture.edit_sequence ~= nil then
         if type(options.settle) ~= "function" then fail("Editable mutation requires a durable draft settlement", record) return end
         local settled, draft = pcall(options.settle, record)
         if not settled or type(draft) ~= "table" then fail("Could not settle the captured draft: " .. tostring(draft), record) return end
         params.draft = draft
-        route = "github.recovery.settle_draft"
+        route = "github.recovery.draft.settle"
       end
       request(route, params, function(_, acknowledgement_failure)
         if acknowledgement_failure then fail("GitHub completed but durable settlement failed: " .. acknowledgement_failure, record) return end
@@ -200,7 +201,7 @@ function M.resolve(directory, record, settle, callback, settle_async)
           return
         end
         local params = { resource = record.resource, operation_id = record.capture.operation_id }
-        local route = "github.recovery.ack"
+        local route = "github.recovery.acknowledge"
         if record.capture.edit_sequence ~= nil then
           local settled, draft = pcall(settle, resolved)
           if not settled or type(draft) ~= "table" then
@@ -208,7 +209,7 @@ function M.resolve(directory, record, settle, callback, settle_async)
             notify(diagnostic) callback(resolved, diagnostic) return
           end
           params.draft = draft
-          route = "github.recovery.settle_draft"
+          route = "github.recovery.draft.settle"
         end
         request(route, params, function(_, acknowledgement_failure)
           if acknowledgement_failure then notify(acknowledgement_failure) end

@@ -1286,9 +1286,11 @@ impl ReadOnlyPlanReview {
             let (mut blocks, mut targets) = super::design_review::project(
                 &self.source.document,
                 &self.width,
-                &[],
-                &self.annotation_revision,
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &self.annotation_revision,
+                    focused: None,
+                },
                 &self.source.declaration_syntax,
                 self.source.public_only,
                 self.source.trace.as_ref(),
@@ -3182,7 +3184,7 @@ mod tests {
             revision: snapshot.revision,
             view: ViewId("view".into()),
             sequence: InputSequence(1),
-            action: "plan.questions.answer".into(),
+            action: "session.plan.question.answer".into(),
             block: snapshot.block[0].id.clone(),
             position: target.range.start,
             target: Some(target.id),

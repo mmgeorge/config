@@ -16,26 +16,30 @@ pub struct TranscriptRenderer<'profile> {
     profile: &'profile WidthProfile,
 }
 
+/// Captures a tool heading's presentation independently of its output body.
+#[derive(Clone, Copy)]
+pub struct ToolHeading<'call> {
+    pub kind: &'call str,
+    pub elapsed_ms: Option<u64>,
+    pub failed: bool,
+    pub title: &'call str,
+    pub expanded: bool,
+}
+
 impl<'profile> TranscriptRenderer<'profile> {
     /// Builds the independent command heading without retaining an output body.
     pub(super) fn tool_header(
         &self,
         id: BlockId,
         target: TargetId,
-        kind: &str,
-        elapsed_ms: Option<u64>,
-        failed: bool,
-        title: &str,
-        expanded: bool,
+        heading: ToolHeading<'_>,
     ) -> Result<BufferBlock> {
         let empty = ToolOutputPreview {
             row: Vec::new(),
             hidden_rows: 0,
             total_rows: 0,
         };
-        let mut block = self.tool_preview(
-            id, target, kind, elapsed_ms, failed, title, &empty, expanded,
-        )?;
+        let mut block = self.tool_preview(id, target, heading, &empty)?;
         let rows = block
             .metadata
             .decoration
@@ -169,11 +173,13 @@ impl<'profile> TranscriptRenderer<'profile> {
         let mut block = self.tool_header(
             previous.id.clone(),
             previous.metadata.target[0].id.clone(),
-            kind,
-            elapsed_ms,
-            failed,
-            title,
-            expanded,
+            crate::buffer::transcript::ToolHeading {
+                kind,
+                elapsed_ms,
+                failed,
+                title,
+                expanded,
+            },
         )?;
         block.metadata.layout = previous.metadata.layout.clone();
         block.metadata.fold = previous.metadata.fold.clone();
@@ -375,13 +381,16 @@ impl<'profile> TranscriptRenderer<'profile> {
         &self,
         id: BlockId,
         target: TargetId,
-        kind: &str,
-        elapsed_ms: Option<u64>,
-        failed: bool,
-        title: &str,
+        heading: ToolHeading<'_>,
         output: &ToolOutputPreview<'_>,
-        expanded: bool,
     ) -> Result<BufferBlock> {
+        let ToolHeading {
+            kind,
+            elapsed_ms,
+            failed,
+            title,
+            expanded,
+        } = heading;
         id.validate()?;
         target.validate()?;
         let duration = tool_duration(elapsed_ms);
@@ -814,11 +823,13 @@ mod test {
             let mut block = renderer.tool_header(
                 BlockId("check:tool".into()),
                 TargetId("check:tool".into()),
-                "check",
-                Some(102_000),
-                false,
-                "cargo test --locked --lib controls::tests · Running",
-                expanded,
+                crate::buffer::transcript::ToolHeading {
+                    kind: "check",
+                    elapsed_ms: Some(102_000),
+                    failed: false,
+                    title: "cargo test --locked --lib controls::tests · Running",
+                    expanded,
+                },
             )?;
             TranscriptRenderer::fold_marker(&mut block);
             for elapsed in [102_000, 103_000] {
@@ -899,16 +910,18 @@ mod test {
         let block = renderer.tool_preview(
             BlockId("tool".into()),
             TargetId("tool".into()),
-            "tool_call",
-            Some(2000),
-            false,
-            &format!("sem.sem_context({arguments})"),
+            crate::buffer::transcript::ToolHeading {
+                kind: "tool_call",
+                elapsed_ms: Some(2000),
+                failed: false,
+                title: &format!("sem.sem_context({arguments})"),
+                expanded: true,
+            },
             &ToolOutputPreview {
                 row: vec!["response"],
                 hidden_rows: 0,
                 total_rows: 1,
             },
-            true,
         )?;
         let rows = block.text.wire_rows();
         assert!(rows[0].starts_with("•    2s sem.sem_context({"));
@@ -943,16 +956,18 @@ mod test {
                 let block = renderer.tool_preview(
                     BlockId("tool".into()),
                     TargetId("tool".into()),
-                    "tool_call",
-                    Some(2000),
-                    true,
-                    "plan_read",
+                    crate::buffer::transcript::ToolHeading {
+                        kind: "tool_call",
+                        elapsed_ms: Some(2000),
+                        failed: true,
+                        title: "plan_read",
+                        expanded,
+                    },
                     &ToolOutputPreview {
                         row: vec![response],
                         hidden_rows: 0,
                         total_rows: 1,
                     },
-                    expanded,
                 )?;
                 let rows = block.text.wire_rows();
                 assert!(rows[1].starts_with("└  "));
@@ -1015,16 +1030,18 @@ mod test {
                 let block = renderer.tool_preview(
                     BlockId("tool:duration".into()),
                     TargetId("expand:duration".into()),
-                    "command",
-                    Some(elapsed_ms),
-                    false,
-                    "cargo test",
+                    crate::buffer::transcript::ToolHeading {
+                        kind: "command",
+                        elapsed_ms: Some(elapsed_ms),
+                        failed: false,
+                        title: "cargo test",
+                        expanded,
+                    },
                     &ToolOutputPreview {
                         row: vec![],
                         hidden_rows: 0,
                         total_rows: 0,
                     },
-                    expanded,
                 )?;
                 assert_eq!(
                     block.text.row(0),
@@ -1046,11 +1063,13 @@ mod test {
         let heading = renderer.tool_header(
             BlockId("tool".into()),
             TargetId("tool".into()),
-            "tool_call",
-            Some(300),
-            false,
-            "inspect({})",
-            false,
+            crate::buffer::transcript::ToolHeading {
+                kind: "tool_call",
+                elapsed_ms: Some(300),
+                failed: false,
+                title: "inspect({})",
+                expanded: false,
+            },
         )?;
         assert_eq!(heading.text.row(0), Some("•  0.3s inspect({})"));
         let expanded = TranscriptRenderer::new(&profile)?.refresh_tool_heading(
@@ -1134,11 +1153,13 @@ mod test {
                 let collapsed = renderer.tool_header(
                     BlockId("tool".into()),
                     TargetId("tool".into()),
-                    kind,
-                    Some(400),
-                    false,
-                    title,
-                    false,
+                    crate::buffer::transcript::ToolHeading {
+                        kind,
+                        elapsed_ms: Some(400),
+                        failed: false,
+                        title,
+                        expanded: false,
+                    },
                 )?;
                 let expanded = renderer.refresh_tool_heading(
                     &collapsed,
@@ -1195,11 +1216,13 @@ mod test {
             let header = renderer.tool_header(
                 BlockId("shell".into()),
                 TargetId("shell".into()),
-                "command",
-                Some(100),
-                false,
-                source,
-                false,
+                crate::buffer::transcript::ToolHeading {
+                    kind: "command",
+                    elapsed_ms: Some(100),
+                    failed: false,
+                    title: source,
+                    expanded: false,
+                },
             )?;
             assert!(header.text.row(0).unwrap().ends_with(expected));
             let body = renderer.tool_body(
@@ -1258,11 +1281,13 @@ mod test {
             let running = renderer.tool_header(
                 BlockId("shell".into()),
                 TargetId("shell".into()),
-                "tool_call",
-                Some(100),
-                false,
-                source,
-                false,
+                crate::buffer::transcript::ToolHeading {
+                    kind: "tool_call",
+                    elapsed_ms: Some(100),
+                    failed: false,
+                    title: source,
+                    expanded: false,
+                },
             )?;
             assert_eq!(
                 running.text.row(0),
@@ -1350,11 +1375,13 @@ mod test {
         let header = renderer.tool_header(
             BlockId("call".into()),
             TargetId("call".into()),
-            "tool_call",
-            Some(100),
-            false,
-            source,
-            true,
+            crate::buffer::transcript::ToolHeading {
+                kind: "tool_call",
+                elapsed_ms: Some(100),
+                failed: false,
+                title: source,
+                expanded: true,
+            },
         )?;
         assert!(!header.text.row(0).unwrap().contains("456"));
         let body = renderer.tool_body(
@@ -1420,16 +1447,18 @@ mod test {
         let block = renderer.tool_preview(
             BlockId("tool:1".into()),
             TargetId("expand:1".into()),
-            "command",
-            Some(2000),
-            false,
-            "cargo test --lib parser",
+            crate::buffer::transcript::ToolHeading {
+                kind: "command",
+                elapsed_ms: Some(2000),
+                failed: false,
+                title: "cargo test --lib parser",
+                expanded: false,
+            },
             &ToolOutputPreview {
                 row: vec!["first", "second", "third", "fourth"],
                 hidden_rows: 96,
                 total_rows: 100,
             },
-            false,
         )?;
         assert_eq!(
             block.text.wire_rows(),
@@ -1467,16 +1496,18 @@ mod test {
         let block = renderer.tool_preview(
             BlockId("tool:empty".into()),
             TargetId("expand:empty".into()),
-            "command",
-            Some(2000),
-            false,
-            "cargo check",
+            crate::buffer::transcript::ToolHeading {
+                kind: "command",
+                elapsed_ms: Some(2000),
+                failed: false,
+                title: "cargo check",
+                expanded: false,
+            },
             &ToolOutputPreview {
                 row: vec![],
                 hidden_rows: 0,
                 total_rows: 0,
             },
-            false,
         )?;
 
         assert_eq!(
@@ -1500,12 +1531,14 @@ mod test {
         let block = renderer.tool_preview(
             BlockId("active:tool".into()),
             TargetId("active:tool".into()),
-            "tool_call",
-            Some(2000),
-            true,
-            "docs_lookup(crate, Item)",
+            crate::buffer::transcript::ToolHeading {
+                kind: "tool_call",
+                elapsed_ms: Some(2000),
+                failed: true,
+                title: "docs_lookup(crate, Item)",
+                expanded: false,
+            },
             &output.preview(false)?,
-            false,
         )?;
 
         assert_eq!(
@@ -1559,12 +1592,14 @@ mod test {
             renderer.tool_preview(
                 BlockId("wrapped:tool".into()),
                 TargetId("wrapped:tool".into()),
-                "command",
-                Some(10),
-                false,
-                "inspect",
+                crate::buffer::transcript::ToolHeading {
+                    kind: "command",
+                    elapsed_ms: Some(10),
+                    failed: false,
+                    title: "inspect",
+                    expanded,
+                },
                 &output.preview(expanded)?,
-                expanded,
             )
         };
         let preview = render(false)?;

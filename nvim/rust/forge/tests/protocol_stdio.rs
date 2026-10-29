@@ -32,7 +32,7 @@ impl HostProcess {
             bytes: 0,
             frames: 0,
         };
-        host.send(json!({"id":1,"method":"initialize","params":{"protocol_version":forge_protocol::WIRE_VERSION}})).await;
+        host.send(json!({"id":1,"method":"host.initialize","params":{"protocol_version":forge_protocol::WIRE_VERSION}})).await;
         assert!(host.response(1).await.get("error").is_none());
         host
     }
@@ -63,7 +63,7 @@ impl HostProcess {
         self.frames += 1;
         let message: Value = serde_json::from_slice(&frame).unwrap();
         if return_credit && self.input.is_some() {
-            self.send(json!({"id":0,"method":"transport.consumed","params":{"bytes":self.bytes,"frames":self.frames}})).await;
+            self.send(json!({"id":0,"method":"host.transport.consumed","params":{"bytes":self.bytes,"frames":self.frames}})).await;
         }
         message
     }
@@ -78,14 +78,15 @@ impl HostProcess {
     }
 
     async fn start_turn(&mut self, workspace: &std::path::Path, data: &std::path::Path) {
-        self.send(json!({"id":2,"method":"harness.initialize","params":{
+        self.send(json!({"id":2,"method":"session.initialize","params":{
             "workspace":workspace,"data_root":data,"client_id":"eof-test",
             "backend":{"kind":"mock","command":["visible-blocking"]}
         }}))
         .await;
         let initialized = self.response(2).await;
         assert!(initialized.get("error").is_none(), "{initialized}");
-        self.send(json!({"id":3,"method":"prompt.submit","params":{"text":"remain active until connection closes"}})).await;
+        let session_id = initialized["result"]["session"]["id"].as_str().unwrap();
+        self.send(json!({"id":3,"session_id":session_id,"method":"session.prompt.submit","params":{"text":"remain active until connection closes"}})).await;
         let mut changed = false;
         let mut pending_query = None;
         let mut next_query = 4;
@@ -129,7 +130,7 @@ impl HostProcess {
             if changed && pending_query.is_none() {
                 changed = false;
                 pending_query = Some(next_query);
-                self.send(json!({"id":next_query,"method":"exchange.list","params":{}}))
+                self.send(json!({"id":next_query,"session_id":session_id,"method":"session.exchange.list","params":{}}))
                     .await;
                 next_query += 1;
             }
@@ -190,11 +191,11 @@ async fn eof_cancels_active_producers_before_waiting_for_output_drainage() {
 async fn exhausted_receive_credit_cannot_hold_an_eof_connection_open() {
     let mut host = HostProcess::start().await;
     for id in 2..2 + forge_protocol::MAX_PENDING_FRAMES {
-        host.send(json!({"id":id,"method":"state.get","params":{}}))
+        host.send(json!({"id":id,"method":"session.state.get","params":{}}))
             .await;
         assert_eq!(host.read(false).await["id"].as_u64(), Some(id as u64));
     }
-    host.send(json!({"id":1000,"method":"state.get","params":{}}))
+    host.send(json!({"id":1000,"method":"session.state.get","params":{}}))
         .await;
     let (messages, status, error) = host.finish().await;
     assert!(!status.success());
@@ -214,7 +215,7 @@ async fn duplicate_running_request_ids_close_the_connection_and_cancel_the_owner
     let data = tempfile::tempdir().unwrap();
     let mut host = HostProcess::start().await;
     host.start_turn(workspace.path(), data.path()).await;
-    host.send(json!({"id":3,"method":"state.get","params":{}}))
+    host.send(json!({"id":3,"method":"session.state.get","params":{}}))
         .await;
     let (_, status, error) = host.finish().await;
     assert!(!status.success());
@@ -231,7 +232,7 @@ async fn invalid_consumption_credit_cancels_and_joins_active_requests() {
     let mut host = HostProcess::start().await;
     host.start_turn(workspace.path(), data.path()).await;
     host.send(
-        json!({"id":0,"method":"transport.consumed","params":{"bytes":u64::MAX,"frames":u64::MAX}}),
+        json!({"id":0,"method":"host.transport.consumed","params":{"bytes":u64::MAX,"frames":u64::MAX}}),
     )
     .await;
     let (messages, status, error) = host.finish().await;

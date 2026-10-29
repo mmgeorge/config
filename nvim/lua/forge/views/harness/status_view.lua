@@ -1,10 +1,3 @@
-local StatusView = {}
-StatusView.__index = StatusView
-local replica = require("forge.buffer")
-local position = require("forge.buffer_view")
-local spinner = require("forge.render.harness.timeline_status")
-local hint = require("forge.views.harness.status_hint")
-
 ---@class HarnessStatusView
 ---@field buffer integer
 ---@field window? integer
@@ -25,6 +18,12 @@ local hint = require("forge.views.harness.status_hint")
 ---@field previous_window? integer
 ---@field separator? table
 ---@field details? {window: integer, origin: integer, buffer: integer}
+local StatusView = {}
+StatusView.__index = StatusView
+local replica = require("forge.buffer")
+local position = require("forge.buffer_view")
+local spinner = require("forge.render.harness.timeline_status")
+local hint = require("forge.views.harness.status_hint")
 
 ---@param options {transcript: table, transcript_window: integer, composer_window?: integer, alive: fun(): boolean, notice: fun(message: string), recover: fun(document: table)}
 ---@return HarnessStatusView

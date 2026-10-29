@@ -145,6 +145,7 @@
 ---@field selectable? boolean
 
 ---@class ForgeHarnessConfig
+---@field config_dir? string
 ---@field backend "codex"|"copilot"|"mock"
 ---@field model string
 ---@field effort string

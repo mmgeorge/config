@@ -809,7 +809,7 @@ impl TimelineRenderer<'_> {
                 ..
             } => {
                 if interaction.is_empty() {
-                    self.agent_entry(id, run, "", interaction, agent, None, depth)?;
+                    self.agent_entry(id, run, interaction, agent, None, depth)?;
                 } else {
                     let children = agent
                         .iter()
@@ -1016,7 +1016,6 @@ impl TimelineRenderer<'_> {
         &mut self,
         id: &str,
         run: &crate::agent::Agent,
-        _task: &str,
         interaction: &[Exchange],
         agent: &[TimelineEntry],
         exchange_id: Option<&str>,
@@ -1905,7 +1904,6 @@ impl TimelineRenderer<'_> {
                             self.agent_entry(
                                 &agent.id,
                                 run,
-                                &agent.task,
                                 interaction,
                                 child,
                                 Some(&agent.child_exchange_id),
@@ -2700,11 +2698,13 @@ impl TimelineRenderer<'_> {
         let block = renderer.tool_header(
             BlockId(id),
             target.clone(),
-            &tool.kind,
-            tool.elapsed_ms(self.now_ms),
-            tool.failed,
-            &label,
-            expanded,
+            crate::buffer::transcript::ToolHeading {
+                kind: &tool.kind,
+                elapsed_ms: tool.elapsed_ms(self.now_ms),
+                failed: tool.failed,
+                title: &label,
+                expanded,
+            },
         )?;
         self.action
             .insert(target, TranscriptAction::Tool { call_id });
@@ -3266,8 +3266,10 @@ mod tests {
             let waiting = project_at(
                 &TimelineEntry::Exchange {
                     id: "exchange".into(),
+
                     created_at_ms: 0,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -3288,8 +3290,10 @@ mod tests {
             let projected = project_at(
                 &TimelineEntry::Exchange {
                     id: "exchange".into(),
+
                     created_at_ms: 0,
-                    exchange: restored,
+                    exchange: (restored).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -3345,7 +3349,7 @@ mod tests {
                     owner: crate::timeline::TimelineOwner::session("session"),
                     created_at_ms: 1,
                     detail: SessionEventKind::Compaction {
-                        compaction: Compaction {
+                        compaction: (Compaction {
                             id: "operation".into(),
                             thread_id: "provider".into(),
                             state,
@@ -3356,7 +3360,8 @@ mod tests {
                                 error: Some("Runtime closed".into()),
                                 ..Default::default()
                             },
-                        },
+                        })
+                        .into(),
                     },
                 },
             };
@@ -3392,7 +3397,7 @@ mod tests {
                         owner: crate::timeline::TimelineOwner::session("session"),
                         created_at_ms: 1_000,
                         detail: SessionEventKind::Compaction {
-                            compaction: Compaction {
+                            compaction: (Compaction {
                                 id: "operation".into(),
                                 thread_id: "provider".into(),
                                 state: CompactionState::Completed,
@@ -3404,7 +3409,8 @@ mod tests {
                                     messages_removed,
                                     ..Default::default()
                                 },
-                            },
+                            })
+                            .into(),
                         },
                     },
                 };
@@ -3470,8 +3476,10 @@ mod tests {
         let id = exchange.node_list[0].id().to_owned();
         let running = TimelineEntry::Exchange {
             id: "exchange".into(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: HashMap::new(),
         };
         let projected = project_at(&running, &WidthProfile::default(), 1500)?;
@@ -3495,8 +3503,10 @@ mod tests {
         assert_eq!(restored.node_list[0].id(), id);
         let entry = TimelineEntry::Exchange {
             id: "exchange".into(),
+
             created_at_ms: 0,
-            exchange: restored,
+            exchange: (restored).into(),
+
             agent_by_id: HashMap::new(),
         };
         let projected = project_at(&entry, &WidthProfile::default(), 5000)?;
@@ -3572,8 +3582,10 @@ mod tests {
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -3637,7 +3649,7 @@ mod tests {
                     "diff":"diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn update(input: State);\n+fn update(mut input: State);\n"}]
             }}]
         }))?;
-        let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
+        let exchange: Exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
         let mut display = crate::buffer::identity::DisplayRegistry::default();
         let evidence_id = display.project("earlier-exchange".into()).tool(
             crate::turn::ToolAddress::new("earlier-exchange", "test-tool"),
@@ -3646,8 +3658,10 @@ mod tests {
         let projection = project_at_with_separator(
             ProjectionSource::Entry(&TimelineEntry::Exchange {
                 id: "verify".into(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             }),
             &WidthProfile::default(),
@@ -3717,12 +3731,14 @@ mod tests {
                     "diff_text":"diff --git a/game.rs b/game.rs\n--- a/game.rs\n+++ b/game.rs\n@@ -1 +1 @@\n-old\n+new\n"
                 }}]
             }))?;
-            let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
+            let exchange: Exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
             let projected = project_at(
                 &TimelineEntry::Exchange {
                     id: "verify-result".into(),
+
                     created_at_ms: 0,
-                    exchange,
+                    exchange: exchange.into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -3791,8 +3807,10 @@ mod tests {
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -3816,9 +3834,12 @@ mod tests {
         run.state = crate::agent::AgentState::Ready;
         let entry = crate::timeline::TimelineEntry::AgentLifecycle {
             id: "worker-heading".into(),
+
             created_at_ms: 0,
-            run,
+            run: run.into(),
+
             exchange: vec![],
+
             agent: vec![],
         };
         let width = WidthProfile::default();
@@ -3860,7 +3881,7 @@ mod tests {
 
     #[test]
     fn plan_annotations_have_neutral_hollow_bullets_and_hanging_continuations() {
-        let exchange = serde_json::from_value(json!({
+        let exchange: Exchange = serde_json::from_value(json!({
             "id":"review", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Request plan changes", "kind":"plan_revision", "state":"running",
             "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[{
@@ -3881,8 +3902,10 @@ mod tests {
         let rendered = project_at(
             &TimelineEntry::Exchange {
                 id: "review".into(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile {
@@ -3931,8 +3954,10 @@ mod tests {
                 let rendered = project_at(
                     &TimelineEntry::Exchange {
                         id: "colored".into(),
+
                         created_at_ms: 0,
-                        exchange: restored,
+                        exchange: (restored).into(),
+
                         agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
@@ -3969,7 +3994,7 @@ mod tests {
             }
         }
         for kind in ["plan_draft", "plan_revision"] {
-            let exchange = serde_json::from_value(json!({
+            let exchange: Exchange = serde_json::from_value(json!({
                 "id":"legacy", "session_id":"session", "agent_id":"primary", "ordinal":1,
                 "prompt":"Plan", "kind":kind, "state":"complete", "created_at_ms":0,
                 "completed_at_ms":1000, "attributed_matches_checkpoint":false, "node_list":[]
@@ -3978,8 +4003,10 @@ mod tests {
             let rendered = project_at(
                 &TimelineEntry::Exchange {
                     id: "legacy".into(),
+
                     created_at_ms: 0,
-                    exchange,
+                    exchange: exchange.into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -4105,8 +4132,10 @@ mod tests {
                 project_at(
                     &TimelineEntry::Exchange {
                         id: exchange.id.clone(),
+
                         created_at_ms: 0,
-                        exchange: exchange.clone(),
+                        exchange: (exchange.clone()).into(),
+
                         agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
@@ -4278,8 +4307,10 @@ mod tests {
         exchange.set_awaiting_input(true);
         let source = TimelineEntry::Exchange {
             id: exchange.id.clone(),
+
             created_at_ms: 0,
-            exchange,
+            exchange: exchange.into(),
+
             agent_by_id: HashMap::new(),
         };
         assert!(
@@ -4432,8 +4463,10 @@ mod tests {
                 project_at(
                     &TimelineEntry::Exchange {
                         id: exchange.id.clone(),
+
                         created_at_ms: 0,
-                        exchange,
+                        exchange: exchange.into(),
+
                         agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
@@ -4639,7 +4672,7 @@ mod tests {
         });
         exchange.node_list.push(ExchangeNode::Compaction {
             id: "clarification-compaction".into(),
-            compaction: crate::backend::Compaction {
+            compaction: (crate::backend::Compaction {
                 id: "compaction".into(),
                 thread_id: "thread".into(),
                 state: crate::backend::CompactionState::Completed,
@@ -4647,7 +4680,8 @@ mod tests {
                 started_at_ms: Some(4),
                 completed_at_ms: Some(4),
                 result: Default::default(),
-            },
+            })
+            .into(),
         });
         event.address.as_mut().unwrap().turn_id = "explanation-turn".into();
         event.turn_boundary = Some(TurnBoundary::Started);
@@ -4668,8 +4702,10 @@ mod tests {
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: restored.id.clone(),
+
                 created_at_ms: 0,
-                exchange: restored,
+                exchange: (restored).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -4773,8 +4809,10 @@ mod tests {
         let reloaded = project_at(
             &TimelineEntry::Exchange {
                 id: reloaded.id.clone(),
+
                 created_at_ms: 0,
-                exchange: reloaded,
+                exchange: (reloaded).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -4809,8 +4847,10 @@ mod tests {
         let cancelled = project_at(
             &TimelineEntry::Exchange {
                 id: cancelled.id.clone(),
+
                 created_at_ms: 0,
-                exchange: cancelled,
+                exchange: (cancelled).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -4846,8 +4886,10 @@ mod tests {
         let completed = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -4982,8 +5024,10 @@ mod tests {
             let stored = project_at(
                 &TimelineEntry::Exchange {
                     id: "edits".into(),
+
                     created_at_ms: 0,
-                    exchange: stored,
+                    exchange: (stored).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5013,8 +5057,10 @@ mod tests {
             let rendered = project_at(
                 &TimelineEntry::Exchange {
                     id: "edits".into(),
+
                     created_at_ms: 0,
-                    exchange,
+                    exchange: exchange.into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5146,8 +5192,10 @@ mod tests {
                 let projected = project_at(
                     &TimelineEntry::Exchange {
                         id: "edits".into(),
+
                         created_at_ms: 0,
-                        exchange: exchange.clone(),
+                        exchange: (exchange.clone()).into(),
+
                         agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
@@ -5171,12 +5219,14 @@ mod tests {
         });
         exchange.observe_turn(&event, 70)?;
         exchange.finish(crate::exchange::ExchangeOutcome::Complete, 70)?;
-        let restored = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+        let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: "edits".into(),
+
                 created_at_ms: 0,
-                exchange: restored,
+                exchange: (restored).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -5229,12 +5279,14 @@ mod tests {
             exchange.attributed_diff_text = attributed.map(str::to_owned);
             exchange.checkpoint_diff_text = total.map(str::to_owned);
             exchange.attributed_matches_checkpoint = matches;
-            let restored = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+            let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
             let with_checkpoint = project_at(
                 &TimelineEntry::Exchange {
                     id: "edits".into(),
+
                     created_at_ms: 0,
-                    exchange: restored,
+                    exchange: (restored).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5337,8 +5389,10 @@ mod tests {
             let projected = project_at(
                 &TimelineEntry::Exchange {
                     id: exchange.id.clone(),
+
                     created_at_ms: 0,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5387,8 +5441,10 @@ mod tests {
             let refreshed = super::timing_blocks(
                 &TimelineEntry::Exchange {
                     id: exchange.id.clone(),
+
                     created_at_ms: 0,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5512,8 +5568,10 @@ mod tests {
             project_at(
                 &TimelineEntry::Exchange {
                     id: exchange.id.clone(),
+
                     created_at_ms: 0,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5594,8 +5652,10 @@ mod tests {
             let refreshed = super::timing_blocks(
                 &TimelineEntry::Exchange {
                     id: exchange.id.clone(),
+
                     created_at_ms: 0,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5784,8 +5844,10 @@ mod tests {
             project_at(
                 &TimelineEntry::Exchange {
                     id: exchange.id.clone(),
+
                     created_at_ms: 0,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5944,8 +6006,10 @@ mod tests {
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -6028,8 +6092,10 @@ mod tests {
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -6090,9 +6156,12 @@ mod tests {
             run.id = id.clone();
             child = Some(TimelineEntry::AgentLifecycle {
                 id,
+
                 created_at_ms: 0,
-                run,
+                run: run.into(),
+
                 exchange: vec![exchange],
+
                 agent: child.into_iter().collect(),
             });
         }
@@ -6201,15 +6270,20 @@ mod tests {
             });
         let entry = TimelineEntry::Exchange {
             id: "parent".into(),
+
             created_at_ms: 0,
-            exchange: parent,
+            exchange: (parent).into(),
+
             agent_by_id: HashMap::from([(
                 "nested-agent".into(),
                 TimelineEntry::AgentLifecycle {
                     id: "nested-agent".into(),
+
                     created_at_ms: 0,
-                    run: crate::agent::Agent::pending("session", "Nested", "Inspect", 0),
+                    run: (crate::agent::Agent::pending("session", "Nested", "Inspect", 0)).into(),
+
                     exchange: vec![nested.clone()],
+
                     agent: vec![],
                 },
             )]),
@@ -6502,9 +6576,12 @@ mod tests {
         let inspection = project_at(
             &TimelineEntry::AgentLifecycle {
                 id: "nested-agent".into(),
+
                 created_at_ms: 0,
-                run: crate::agent::Agent::pending("session", "Nested", "Inspect", 0),
+                run: (crate::agent::Agent::pending("session", "Nested", "Inspect", 0)).into(),
+
                 exchange: vec![nested],
+
                 agent: vec![],
             },
             &WidthProfile::default(),
@@ -6571,8 +6648,10 @@ mod tests {
             let projected = project_at(
                 &TimelineEntry::Exchange {
                     id: exchange.id.clone(),
+
                     created_at_ms: 0,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &width,
@@ -6736,8 +6815,10 @@ mod tests {
         let streaming = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 0,
-                exchange: exchange.clone(),
+                exchange: (exchange.clone()).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -6792,8 +6873,10 @@ mod tests {
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 0,
-                exchange: exchange.clone(),
+                exchange: (exchange.clone()).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -6805,8 +6888,10 @@ mod tests {
         let reloaded = project_at(
             &TimelineEntry::Exchange {
                 id: restored.id.clone(),
+
                 created_at_ms: 0,
-                exchange: restored,
+                exchange: (restored).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -6909,8 +6994,10 @@ mod tests {
         let rendered = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -7435,8 +7522,10 @@ mod tests {
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: "continuation".into(),
+
                 created_at_ms: 1000,
-                exchange: interaction,
+                exchange: (interaction).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -7474,8 +7563,10 @@ mod tests {
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: "interaction".into(),
+
                 created_at_ms: 1_000,
-                exchange: interaction,
+                exchange: (interaction).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -7510,8 +7601,10 @@ mod tests {
         let first = project_at(
             &TimelineEntry::Exchange {
                 id: "interaction".into(),
+
                 created_at_ms: 1_000,
-                exchange: interaction.clone(),
+                exchange: (interaction.clone()).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -7524,8 +7617,10 @@ mod tests {
         let projection = project_at_with_separator(
             super::ProjectionSource::Entry(&TimelineEntry::Exchange {
                 id: "interaction".into(),
+
                 created_at_ms: 1_000,
-                exchange: interaction,
+                exchange: (interaction).into(),
+
                 agent_by_id: HashMap::new(),
             }),
             &WidthProfile::default(),
@@ -7702,8 +7797,10 @@ mod tests {
             let projected = project_at(
                 &TimelineEntry::Exchange {
                     id: exchange.id.clone(),
+
                     created_at_ms: 0,
-                    exchange: exchange.clone(),
+                    exchange: (exchange.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &width,
@@ -7855,12 +7952,14 @@ mod tests {
                         String::new()
                     });
                 }
-                let restored = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+                let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
                 let projected = project_at(
                     &TimelineEntry::Exchange {
                         id: "transient".into(),
+
                         created_at_ms: 0,
-                        exchange: restored,
+                        exchange: (restored).into(),
+
                         agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
@@ -7996,8 +8095,10 @@ mod tests {
             let projected = project_at(
                 &TimelineEntry::Exchange {
                     id: "combined".into(),
+
                     created_at_ms: 0,
-                    exchange: restored,
+                    exchange: (restored).into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -8107,8 +8208,10 @@ mod tests {
             }
             let entry = TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 0,
-                exchange,
+                exchange: exchange.into(),
+
                 agent_by_id: HashMap::new(),
             };
             let entry =
@@ -8314,8 +8417,9 @@ mod tests {
         run.state = crate::checks::CheckState::Passed;
         let finished = TimelineEntry::Checks {
             id: run.id.clone(),
+
             created_at_ms: 0,
-            run,
+            run: run.into(),
         };
         assert!(
             super::timing_blocks(
@@ -8435,8 +8539,10 @@ mod tests {
             exchange.set_disposition(disposition).unwrap();
             let entry = TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 1000,
-                exchange: exchange.clone(),
+                exchange: (exchange.clone()).into(),
+
                 agent_by_id: HashMap::new(),
             };
             let projected = project_at(&entry, &WidthProfile::default(), 90_000).unwrap();
@@ -8499,8 +8605,10 @@ mod tests {
         let exchange: Exchange = serde_json::from_value(source)?;
         let entry = TimelineEntry::Exchange {
             id: exchange.id.clone(),
+
             created_at_ms: 1000,
-            exchange,
+            exchange: exchange.into(),
+
             agent_by_id: HashMap::new(),
         };
         let width = WidthProfile::default();
@@ -8630,8 +8738,10 @@ mod tests {
         ] {
             let entry = crate::timeline::TimelineEntry::Exchange {
                 id: exchange.id.clone(),
+
                 created_at_ms: 1000,
-                exchange: exchange.clone(),
+                exchange: (exchange.clone()).into(),
+
                 agent_by_id: HashMap::new(),
             };
             let rendered = project_at(&entry, &WidthProfile::default(), now_ms).unwrap();
@@ -8664,8 +8774,10 @@ mod tests {
         exchange.observe_turn(&event, 5000).unwrap();
         let entry = crate::timeline::TimelineEntry::Exchange {
             id: exchange.id.clone(),
+
             created_at_ms: 1000,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: HashMap::new(),
         };
         let rendered = project_at(&entry, &WidthProfile::default(), 90_000).unwrap();
@@ -8919,12 +9031,14 @@ mod tests {
                 },
                 report: Some(std::sync::Arc::new(report)),
             });
-        let render = |exchange| {
+        let render = |exchange: Exchange| {
             project_at(
                 &TimelineEntry::Exchange {
                     id: "report-exchange".into(),
+
                     created_at_ms: 0,
-                    exchange,
+                    exchange: exchange.into(),
+
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),

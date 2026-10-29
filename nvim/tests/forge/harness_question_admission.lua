@@ -20,9 +20,12 @@ state.active_elicitation = { owner = "interaction", exchange_id = "exchange",
     { id = "choice", question = "Choose?", options = {} },
   } }, answer = {}, current_index = 0 },
 }
-client.request_for = function(_, method, parameters, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local parameters = request_specification.params or {}
+
   if transport.request(method, parameters, callback) then return end
-  assert(method == "state.get", method)
+  assert(method == "session.state.get", method)
   callback({ session = state.session, active_elicitation = state.active_elicitation, status = { kind = "awaiting_input" } })
 end
 input.attach(state, function() end)

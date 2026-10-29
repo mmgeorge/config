@@ -52,5 +52,19 @@ response.snapshot_revision = 4
 response.task_operation = nil
 snapshot.apply(state, response)
 assert(state.execution_notice == "Connection lost", "clearing an old operation hid a newer error")
+local configuration_completions = 0
+state.configuring, state.busy = true, true
+state.configuring_config, state.task_config = { model = "old" }, { model = "old" }
+state.task_operation = { id = "old-configuration", action = "configure" }
+state.configuration_completion = { complete = function(applied)
+  assert(not applied, "switching sessions completed an old configuration as successful")
+  configuration_completions = configuration_completions + 1
+end }
+response.session.id = "replacement-session"
+response.snapshot_revision = 1
+assert(snapshot.apply(state, response))
+assert(not state.configuring and not state.busy and not state.task_operation)
+assert(not state.configuring_config and not state.task_config and not state.configuration_completion)
+assert(configuration_completions == 1, "session replacement did not retire its pending configuration")
 package.loaded["forge.lsp.startup"] = original_startup
 print("harness_snapshot: passed")

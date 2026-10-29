@@ -15,7 +15,7 @@ local original_notify = vim.notify
 local ok, failure = xpcall(function()
   local request_list = {}
   status._set_runner_for_test(function(method, params, callback)
-    assert(method == "status", "public Status must use the native route")
+    assert(method == "repository.status.document", "public Status must use the native route")
     request_list[#request_list + 1] = params.operation
     if params.operation == "open" or params.operation == "snapshot" then callback(snapshot(params.document))
     elseif params.operation == "refresh" or params.operation == "demand" or params.operation == "close_view" then callback(vim.NIL)

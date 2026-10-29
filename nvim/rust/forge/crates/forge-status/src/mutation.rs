@@ -42,6 +42,16 @@ use crate::{
     protocol::file_target,
 };
 
+struct PreparedContext {
+    file_id: u64,
+    generation: u64,
+    analysis: AnalysisHandle,
+    old: Option<SyntaxHandle>,
+    new: Option<SyntaxHandle>,
+    diagnostic: Vec<String>,
+    started: Instant,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StatusUpdate {
     pub document: DocumentId,
@@ -1254,7 +1264,16 @@ impl StatusService {
                 let diagnostic = old_diagnostic.into_iter().chain(new_diagnostic).collect();
                 if let Err(error) = service
                     .adopt_context(
-                        &document, file_id, generation, &analysis, old, new, diagnostic, started,
+                        &document,
+                        PreparedContext {
+                            file_id,
+                            generation,
+                            analysis,
+                            old,
+                            new,
+                            diagnostic,
+                            started,
+                        },
                     )
                     .await
                     && let Ok(snapshot) = service.snapshot(&document).await
@@ -1274,17 +1293,16 @@ impl StatusService {
         }
     }
 
-    async fn adopt_context(
-        &self,
-        id: &DocumentId,
-        file_id: u64,
-        generation: u64,
-        analysis: &AnalysisHandle,
-        old: Option<SyntaxHandle>,
-        new: Option<SyntaxHandle>,
-        diagnostic: Vec<String>,
-        started: Instant,
-    ) -> Result<()> {
+    async fn adopt_context(&self, id: &DocumentId, context: PreparedContext) -> Result<()> {
+        let PreparedContext {
+            file_id,
+            generation,
+            analysis,
+            old,
+            new,
+            diagnostic,
+            started,
+        } = context;
         let Ok(owner) = self.get(id) else {
             return Ok(());
         };

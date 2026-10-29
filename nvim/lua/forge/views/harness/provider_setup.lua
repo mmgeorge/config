@@ -34,7 +34,7 @@ local function terminal_login(command, callback)
   vim.bo[buffer].bufhidden = "wipe"
   local settled = false
   local job
-  local timer = vim.uv.new_timer()
+  local timer = assert(vim.uv.new_timer())
   local function finish(success, failure)
     if settled then return end
     settled = true
@@ -132,7 +132,7 @@ function M.open(options)
           terminal_login(method.command, finished)
         else
           picker.update(spec())
-          client.request_for(options.session_id, "backend.authenticate", { method = method.id }, function(_, error)
+          client.request({ session_id = options.session_id, method = "session.provider.authenticate", params = { method = method.id } }, function(_, error)
             failure = error
             if error then notifications.error(error, "Provider sign-in") end
             finished(not error)
@@ -150,7 +150,7 @@ function M.open(options)
     session.harness.configuring = true
     require("forge.views.harness.controller").render()
     if picker.is_open(owner) then picker.update(spec()) else picker.open(spec()) end
-    client.request_for(options.session_id, "backend.setup", { install = install }, function(result, error)
+    client.request({ session_id = options.session_id, method = "session.provider.setup", params = { install = install } }, function(result, error)
       if requested ~= generation or not current() then return end
       busy, failure = false, error
       session.harness.configuring = false

@@ -392,7 +392,7 @@ impl HarnessBroker {
                 turn_boundary: None,
                 kind: "execution_state".into(),
                 text: None,
-                data: json!({"session":self.session}),
+                data: json!({"session":self.session_view()?}),
                 activity: None,
                 summary: None,
                 checklist_update: None,
@@ -888,7 +888,7 @@ impl HarnessBroker {
             json!({"id": interaction.id, "state": interaction.state()}),
         )?);
         Ok((
-            json!({ "exchange": {"id": interaction.id, "state": interaction.state()}, "session": self.session, "capability": self.capability }),
+            json!({ "exchange": {"id": interaction.id, "state": interaction.state()}, "session": self.session_view()?, "capability": self.capability }),
             event,
         ))
     }

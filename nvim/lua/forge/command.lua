@@ -3,18 +3,7 @@ local notifications = require("forge.infra.notifications")
 local sequence = 0
 local writer = tostring(vim.fn.getpid()) .. ":" .. tostring(vim.uv.hrtime())
 
-local mutation = {}
-for _, method in ipairs({
-  "input.apply", "task.transition", "question.answer", "question.skip", "question.continue",
-  "question.ask", "approval.resolve", "approval.continue", "session.configure", "session.rename",
-  "session.input_timeouts", "session.permission", "settings.update", "settings.reset", "settings.import.apply",
-  "backend.skills.set_enabled", "backend.mcp.set_enabled", "plan.entity.rename", "plan.tests.delete",
-  "plan.checks.update", "plan.accept", "plan.acceptance.begin", "plan.acceptance.cancel",
-  "plan.request_changes", "plan.cancel", "plan.questions.answer", "goal.set", "goal.pause", "goal.resume",
-  "goal.clear", "goal.continue", "turn.cancel", "turn.restart", "turn.steer", "prompt.submit",
-  "exchange.resume", "exchange.request_changes", "exchange.rollback.apply", "agent.start", "agent.message",
-  "agent.followup", "agent.interrupt", "agent.interrupt_all", "checks.run", "checks.cancel", "checks.complete",
-}) do mutation[method] = true end
+local contract = require("forge.event_contract")
 
 ---@return string
 function M.identity()
@@ -29,16 +18,16 @@ end
 ---@param params? table
 ---@param callback function
 function M.dispatch(transport, session_id, method, params, callback)
-  if not mutation[method] then transport(session_id, method, params, callback) return end
+  if contract.method_policy(method).recovery ~= "session_command" then transport(session_id, method, params, callback) return end
   local client = require("forge.client")
-  local state = require("forge.session").harness
-  local generation = client.host_generation()
+  local state = require("forge.session").harness_by_id[session_id]
+  local generation = client.host_get_generation()
   local request = vim.deepcopy(params or {})
   local identity = request._command and request._command.id or request.operation_id
-    or (method == "input.apply" and request.id) or M.identity()
+    or (method == "session.input.apply" and request.id) or M.identity()
   request._command = request._command or { id = identity,
-    runtime_epoch = state.session and state.session.id == session_id and state.runtime_epoch or nil }
-  if method == "question.answer" or method == "question.skip" then
+    runtime_epoch = state and state.runtime_epoch or nil }
+  if method == "session.question.answer" or method == "session.question.skip" then
     request.operation_id = identity
     sequence = sequence + 1
     request.answer_order = request.answer_order or { writer, sequence }
@@ -51,14 +40,14 @@ function M.dispatch(transport, session_id, method, params, callback)
     callback(result, failure, detail)
   end
   local function current()
-    if client.host_generation() == generation then return true end
+    if client.host_get_generation() == generation then return true end
     complete(nil, "Host restarted before the command outcome was confirmed. The original intent was not replayed.",
       { code = "outcome_unknown", operation_id = identity })
     return false
   end
   local function reconcile()
     if finished or not current() then return end
-    transport(session_id, "command.status", { id = identity }, function(result, failure)
+    transport(session_id, "session.command.status.get", { id = identity }, function(result, failure)
       if finished or not current() then return end
       if not failure and result and result.state == "completed" then
         local response = result.response

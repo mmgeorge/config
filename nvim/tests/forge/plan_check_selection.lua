@@ -1,8 +1,8 @@
 local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
-client.host_generation = function() return 1 end
-client.host_accepting = function() return true end
+client.host_get_generation = function() return 1 end
+client.host_is_accepting = function() return true end
 local state = require("forge.session").harness
 state.session = { id = "checks-session" }
 state.transcript_win = vim.api.nvim_get_current_win()
@@ -27,10 +27,13 @@ local function presentation(document)
     checks = {{ id = "tests", name = "Package tests", stage = "test", enabled = enabled, available = true }},
     snapshot = { document = document, revision = version - 1, block = blocks } }
 end
-client.request_for = function(_, method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
-  if method == "plan.checks.update" then pending = { params = params, callback = callback } return end
-  assert(method == "harness.document", method)
+  if method == "session.plan.check.update" then pending = { params = params, callback = callback } return end
+  assert(method == "session.document", method)
   callback(params.operation == "plan_open" and presentation(params.document) or {})
 end
 local native = require("forge.views.plan_review.native_controller")

@@ -35,7 +35,7 @@
 ---@field acquire fun(path: string, callback: fun(lease?: RustSidecarLease, failure?: string)) Acquires an immutable cached image on Windows. Reuses the build output on Unix.
 ---@field _set_crate_dir_for_test fun(crate_dir: string?)
 ---@field _set_artifact_root_for_test fun(artifact_root: string?)
----@field _reset_for_test fun()
+---@field _host_reset_for_test fun()
 
 local M = {}
 
@@ -262,7 +262,7 @@ function M.new(spec)
 
   function builder._set_crate_dir_for_test(crate_dir) crate_dir_for_test = crate_dir end
   function builder._set_artifact_root_for_test(artifact_root) artifact_root_for_test = artifact_root end
-  function builder._reset_for_test()
+  function builder._host_reset_for_test()
     crate_dir_for_test, artifact_root_for_test = nil, nil
     lease_cleanup_started = false
   end

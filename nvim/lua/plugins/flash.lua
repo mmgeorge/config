@@ -1,4 +1,4 @@
-local key = require("../keys").key
+local key = require("keyboard_layout").key
 
 return {
  "folke/flash.nvim",
@@ -48,7 +48,7 @@ return {
       -- behave like `incsearch`
       incremental = false,
       -- Excluded filetypes and custom window filters
-      ---@type (string|fun(win:window))[]
+      ---@type (string|fun(win:integer):boolean)[]
       exclude = {
         "notify",
         "cmp_menu",
@@ -121,11 +121,6 @@ return {
       },
       -- With `format`, you can change how the label is rendered.
       -- Should return a list of `[text, highlight]` tuples.
-      ---@class Flash.Format
-      ---@field state Flash.State
-      ---@field match Flash.Match
-      ---@field hl_group string
-      ---@field after boolean
       ---@type fun(opts:Flash.Format): string[][]
       format = function(opts)
         return { { opts.match.label, opts.hl_group } }
@@ -178,6 +173,7 @@ return {
       char = {
         enabled = true,
         -- dynamic configuration for ftFT motions
+        ---@param opts Flash.Config|{autohide?: boolean, jump_labels?: boolean}
         config = function(opts)
           -- autohide flash when in operator-pending mode
           opts.autohide = opts.autohide or (vim.fn.mode(true):find("no") and vim.v.operator == "y")
@@ -210,7 +206,6 @@ return {
           ["t"] = "w",
           -- ["T"] = "F",
         },
-        ---@alias Flash.CharActions table<string, "next" | "prev" | "right" | "left">
         -- The direction for `prev` and `next` is determined by the motion.
         -- `left` and `right` are always left and right.
         char_actions = function(motion)

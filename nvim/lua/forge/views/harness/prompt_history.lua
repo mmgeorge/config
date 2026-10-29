@@ -83,7 +83,7 @@ function M.record(text)
   if draft.text ~= text then draft = { text = text, attachments = {} } end
   table.insert(harness.prompt_history, 1, draft)
   M.reset_navigation()
-  client.request("history.record", draft, function(result, request_error)
+  client.request({ session_id = harness.session.id, method = "session.prompt.history.record", params = draft }, function(result, request_error)
     if request_error then
       notifications.error(request_error, "Harness prompt history")
       return

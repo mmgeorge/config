@@ -3,7 +3,11 @@ local client = require("forge.client")
 local input = require("forge.views.harness.input_state")
 local submission = require("forge.views.harness.prompt_submission")
 local requests, errors = {}, {}
-client.request_for = function(session_id, method, parameters, callback)
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local parameters = request_specification.params or {}
+
   assert(session_id == "optimistic-input")
   requests[#requests + 1] = { method = method, parameters = parameters, callback = callback }
 end
@@ -11,7 +15,7 @@ require("forge.infra.notifications").error = function(message) errors[#errors + 
 local state = { session = { id = "optimistic-input", active_task = { revision = "task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }, queue = {} }
 local renders = 0
 input.attach(state, function() renders = renders + 1 end)
-assert(requests[1].method == "input.get")
+assert(requests[1].method == "session.input.get")
 requests[1].callback({ revision = 0, suspended = false, execution_busy = true, messages = {} })
 
 state.composer_buf = vim.api.nvim_create_buf(false, true)
@@ -27,7 +31,7 @@ submission.start(state, { text = "first message", context = context }, function(
 assert(text() == "" and #state.queue == 0 and #state.pending_steer == 1,
   "active submission did not enter the separate steering presentation immediately")
 local first = requests[2]
-assert(first.method == "input.apply" and first.parameters.action.kind == "submit")
+assert(first.method == "session.input.apply" and first.parameters.action.kind == "submit")
 assert(first.parameters.action.message.purpose.kind == "user"
   and first.parameters.action.message.task_id == nil, "user input retained workflow ownership")
 local first_id = first.parameters.action.message.id
@@ -96,7 +100,7 @@ vim.defer_fn = original_defer
 state.runtime_epoch = "replacement-host"
 input.refresh(state)
 local replacement = requests[#requests]
-assert(replacement.method == "input.get")
+assert(replacement.method == "session.input.get")
 replacement.callback({ revision = 0, suspended = false, execution_busy = false, messages = {} })
 assert(#state.input.pending == 0 and #state.queue > 0,
   "host restart replayed pending operations or discarded recoverable text")
@@ -151,12 +155,25 @@ input.receive(state, { revision = 8, execution_busy = true, upsert = {}, removed
 assert(not state.execution_busy, "stale input update changed execution state")
 input.receive(state, { revision = 12, upsert = {}, removed = {} })
 assert(state.input.revision == 9, "incomplete delta advanced the confirmed baseline")
-assert(requests[#requests].method == "input.get")
+assert(requests[#requests].method == "session.input.get")
 local recovery = requests[#requests]
 input.receive(state, { revision = 10, execution_busy = true, upsert = {}, removed = {} })
 input.receive(state, { revision = 13, execution_busy = true, upsert = {}, removed = {} })
 assert(state.input.revision == 9 and not state.execution_busy, "delta advanced a replica with a missing baseline")
 recovery.callback({ revision = 13, suspended = false, execution_busy = false, messages = {} })
 assert(state.input.revision == 13 and not state.input.required_revision, "snapshot did not repair the revision gap")
+local previous_errors = #errors
+input.refresh(state)
+local closing_refresh = requests[#requests]
+state.switching_backend = true
+closing_refresh.callback(nil, "Harness session is closing")
+assert(#errors == previous_errors and not state.input.refreshing,
+  "retired input refresh published a provider-switch error")
+local previous_requests = #requests
+input.refresh(state)
+assert(#requests == previous_requests, "input refresh submitted while switching providers")
+state.switching_backend = false
+input.refresh(state)
+requests[#requests].callback({ revision = 13, suspended = false, execution_busy = false, messages = {} })
 print("harness_input_state: passed")
 vim.cmd("qa!")

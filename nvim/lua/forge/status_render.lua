@@ -39,6 +39,9 @@ local section_label = { unstaged = "Unstaged changes", staged = "Staged changes"
 ---@field location table Semantic header identity or validated body-relative position.
 
 ---@class ForgeStatusReplica
+---@field source_entry table<string, table>
+---@field source_fold table
+---@field projection? table
 ---@field document string
 ---@field buffer integer
 ---@field display_cwd? string

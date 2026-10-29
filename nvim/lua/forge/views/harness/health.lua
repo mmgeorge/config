@@ -17,7 +17,7 @@ function M.notice(state)
     or diagnostic.get(state, "connection_error", "info")
     or diagnostic.get(state, "sync_error", "info")
     or state.presentation and diagnostic.get(state.presentation, "sync_failure", "info")
-  if notice then return notice end
+  if notice then return { text = notice.text, animated = notice.animated, failed = notice.failed, waiting = notice.waiting } end
   if not state.status or state.status.kind ~= "idle" or state.checks_running or state.queue_paused
     or state.task_operation or state.active_elicitation or state.aborting_plan then return end
   local submission = state.busy and state.prompt_submission
@@ -32,14 +32,14 @@ end
 function M.watch(state, refresh)
   if not state.session then return end
   local identity = {}
-  local generation = client.host_generation()
+  local generation = client.host_get_generation()
   local session_id = state.session.id
   state.health_owner = identity
   local last_response = vim.uv.now()
   local pending = false
   local connection_notice = "Connection unresponsive — task status unknown"
   local function current()
-    return state.health_owner == identity and client.host_generation() == generation
+    return state.health_owner == identity and client.host_get_generation() == generation
       and not state.host_error and state.session and state.session.id == session_id
   end
   local function tick()
@@ -49,7 +49,7 @@ function M.watch(state, refresh)
     end
     if not pending then
       pending = true
-      client.request_for(session_id, "health.get", {}, function(_, failure)
+      client.request({ session_id = session_id, method = "session.health.get", params = {} }, function(_, failure)
         if not current() then return end
         pending = false
         if not failure then

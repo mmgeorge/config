@@ -1,11 +1,11 @@
 local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
-local original_request, original_accepting = client.request_for, client.host_accepting
-local original_generation = client.host_generation
+local original_request, original_accepting = client.request, client.host_is_accepting
+local original_generation = client.host_get_generation
 local generation = 1
-client.host_generation = function() return generation end
-client.host_accepting = function() return true end
+client.host_get_generation = function() return generation end
+client.host_is_accepting = function() return true end
 local state = require("forge.session").harness
 state.session = { id = "plan-session" }
 state.transcript_win = vim.api.nvim_get_current_win()
@@ -17,13 +17,17 @@ package.loaded["forge.views.harness.controller"] = { refresh_winbar = function()
 local path = vim.fn.tempname() .. ".md"
 vim.fn.writefile({ "# Physical plan" }, path)
 local pending
-client.request_for = function(session_id, method, params, callback)
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
   assert(session_id == "plan-session")
-  if method == "plan.acceptance.begin" or method == "plan.request_changes" then
+  if method == "session.plan.acceptance.begin" or method == "session.plan.changes.request" then
     pending = { method = method, params = params, callback = callback } return
   end
-  assert(method == "harness.document")
+  assert(method == "session.document")
   if params.operation == "plan_open" then
     local opened = { path = path, version = 1, saved_source_digest = "saved", snapshot = { document = params.document, revision = 0,
       block = {
@@ -196,7 +200,7 @@ local success, failure = xpcall(function()
   review = state.plan_review
   review.command_set.action_by_id.request_changes.run({})
   answer_decision("Please revise", "<C-s>")
-  assert(pending.method == "plan.request_changes" and pending.params.comment == "Please revise")
+  assert(pending.method == "session.plan.changes.request" and pending.params.comment == "Please revise")
   assert(state.plan_review == review and not review.owner.closed, "revision closed before its capture completed")
   pending.callback(nil, "revision rejected")
   assert(state.plan_review and state.plan_review.owner.attached(), "failed submission did not restore review")
@@ -218,8 +222,8 @@ local success, failure = xpcall(function()
     "recovered submission completion retained the replacement review")
 end, debug.traceback)
 if state.plan_review and state.plan_review.owner then state.plan_review.owner.close() end
-client.request_for, client.host_accepting = original_request, original_accepting
-client.host_generation = original_generation
+client.request, client.host_is_accepting = original_request, original_accepting
+client.host_get_generation = original_generation
 package.loaded["forge.views.harness.controller"] = original_controller
 vim.fn.delete(path)
 assert(success, failure)

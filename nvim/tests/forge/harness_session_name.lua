@@ -5,8 +5,12 @@ local notifications = require("forge.infra.notifications")
 local state = require("forge.session").harness
 local requests, errors, refreshes = {}, {}, 0
 local generation = 1
-client.host_generation = function() return generation end
-client.request_for = function(id, method, params, callback)
+client.host_get_generation = function() return generation end
+client.request = function(request_specification, callback)
+  local id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   requests[#requests + 1] = { id = id, method = method, params = params, reply = callback }
 end
 notifications.error = function(message) errors[#errors + 1] = message end

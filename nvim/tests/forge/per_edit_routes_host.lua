@@ -10,20 +10,20 @@ local original_directory = vim.fn.getcwd()
 vim.fn.chdir(workspace)
 package.loaded["forge.client"] = nil
 local client = require("forge.client")
-client._set_launcher_for_test(function(command, options, on_exit)
+client._host_set_launcher_for_test(function(command, options, on_exit)
   return vim.system(command, options, on_exit)
 end)
 local success, failure = xpcall(function()
   local ready, startup_failure
-  client.start(function(_, message) ready, startup_failure = true, message end)
+  client.host_start(function(_, message) ready, startup_failure = true, message end)
   assert(vim.wait(10000, function() return ready end, 50), "host startup timed out")
   assert(not startup_failure, startup_failure)
   for _, request in ipairs({
-    { method = "issue.document", params = { operation = "edit", edit = {} }, expected = "unknown variant" },
-    { method = "review.region_edit", params = {}, expected = "unknown" },
+    { method = "github.issue.document", params = { operation = "edit", edit = {} }, expected = "unknown variant" },
+    { method = "review.region_edit", params = {}, expected = "Unknown Forge method" },
   }) do
     local delivered, rejected
-    client.request_host(request.method, request.params, function(result, message)
+    client.request({ method = request.method, params = request.params }, function(result, message)
       assert(result == nil)
       delivered, rejected = true, message
     end)
@@ -31,10 +31,10 @@ local success, failure = xpcall(function()
     assert(type(rejected) == "string" and rejected:find(request.expected, 1, true), tostring(rejected))
   end
 end, debug.traceback)
-client.stop()
+client.host_stop()
 assert(vim.wait(6000, function() return client._client.process == nil end, 50), "host collection timed out")
-client._reset_for_test()
+client._host_reset_for_test()
 vim.fn.chdir(original_directory)
 vim.fn.delete(workspace, "rf")
 assert(success, failure)
-print("per_edit_routes_host: selected host rejects issue and review per-edit transports")
+print("per_edit_routes_host: client and host reject retired per-edit transports")

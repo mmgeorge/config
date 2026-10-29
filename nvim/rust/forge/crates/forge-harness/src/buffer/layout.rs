@@ -52,13 +52,11 @@ impl<'exchange> ExchangeLayout<'exchange> {
                     results.push(*node);
                     false
                 }
-                crate::plan::PlanEventContent::Execution { event }
-                    if matches!(
-                        event,
+                crate::plan::PlanEventContent::Execution {
+                    event:
                         crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
-                            | crate::plan::PlanExecutionLifecycleEvent::Failed { .. }
-                    ) =>
-                {
+                        | crate::plan::PlanExecutionLifecycleEvent::Failed { .. },
+                } => {
                     conclusion.push(*node);
                     false
                 }

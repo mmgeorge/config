@@ -215,8 +215,7 @@ local function get_snippets()
   return snips
 end
 
---- @module 'blink.cmp'
---- @class blink.cmp.Source
+---@class ForgeSnippetSource
 local source = {}
 
 -- `opts` table comes from `sources.providers.your_provider.opts`
@@ -244,7 +243,8 @@ function source:get_completions(ctx, callback)
   local insert_item = function(snippet)
     local executed = snippet.execute();
     if executed ~= nil then
-      ---@type lsp.CompletionItem
+      ---@class ForgeSnippetCompletionItem : lsp.CompletionItem
+      ---@field clear_region? table
       local item = {
         word = snippet.trigger,
         label = snippet.trigger,

@@ -47,7 +47,7 @@ impl SessionController {
     pub(super) async fn input_request(
         &self,
         request: Request,
-        method: HarnessMethod,
+        method: RuntimeMethod,
         sink: &MessageSender,
     ) -> Result<()> {
         let _control = self
@@ -62,7 +62,7 @@ impl SessionController {
             "Harness session is closing"
         );
         let result = match method {
-            HarnessMethod::InputApply => {
+            RuntimeMethod::SessionInputApply => {
                 let operation: InputOperation = crate::codec::from_value(request.params)?;
                 if self
                     .coordinator
@@ -196,14 +196,14 @@ impl SessionController {
                 }
                 serde_json::to_value(update)?
             }
-            HarnessMethod::InputOperation => serde_json::to_value(
+            RuntimeMethod::SessionInputOperationGet => serde_json::to_value(
                 self.coordinator.submissions.operation(
                     request.params["id"]
                         .as_str()
                         .context("input operation identity is required")?,
                 )?,
             )?,
-            HarnessMethod::InputGet => {
+            RuntimeMethod::SessionInputGet => {
                 let mut snapshot = serde_json::to_value(self.coordinator.submissions.snapshot()?)?;
                 snapshot["execution_busy"] =
                     json!(self.coordinator.execution.available_permits() == 0);
@@ -785,7 +785,7 @@ impl SessionController {
             let session_id = controller.catalog_request.read().await.harness_session_id.clone();
             let mut broker = controller.broker.lock().await;
             let result = dispatch_task_attempt(&mut broker, &session_id,
-                Request { id: 0, method: "checks.complete".into(), params: json!({}) },
+                Request { id: 0, method: "session.check.complete".into(), params: json!({}) },
                 &sink, controller.catalog_request.clone()).await;
             drop(broker);
             drop(admission);
@@ -1105,7 +1105,7 @@ impl SessionController {
                             method: if message.text == "/compact" {
                                 "session.compact"
                             } else {
-                                "prompt.submit"
+                                "session.prompt.submit"
                             }
                             .into(),
                             params,

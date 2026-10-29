@@ -27,29 +27,29 @@ local section_request = {}
 local delayed_header, header_request
 local hold_header = true
 adapter._set_runner_for_test(function(method, params, callback)
-  if method == "review.open_pr" then
+  if method == "github.review.document.open" then
     if params.target.number == 8 then delayed_open = callback
     else callback({ document = "review-adapter" }) end
-  elseif method == "github.actor" then callback({ login = "viewer" })
-  elseif method == "review.open" then
+  elseif method == "github.actor.get" then callback({ login = "viewer" })
+  elseif method == "github.review.document.open" then
     discovery_request = params
     if params.number == 9 then delayed_discovery = callback
     else callback({ document = "review-discovered" }) end
-  elseif method == "review.header" then
+  elseif method == "github.review.document.header.load" then
     header_request = params
     if hold_header then hold_header = false delayed_header = callback else callback({ ready = true }) end
-  elseif method == "review.materialize" then
+  elseif method == "github.review.document.render" then
     materialize_count = materialize_count + 1
     if hold_materialize then
       hold_materialize = false
       delayed_materialize = function() callback({ snapshot = snapshot(params.document), patch = vim.NIL }) end
     else callback({ snapshot = snapshot(params.document), patch = vim.NIL }) end
-  elseif method == "review.load" then
+  elseif method == "github.review.document.load" then
     section_request[#section_request + 1] = params.document
     callback({ diagnostic = {} })
   elseif method == "review.region_edit" then error("typing sent a per-edit request")
-  elseif method == "review.view" then callback(vim.NIL)
-  elseif method == "review.thread" then
+  elseif method == "github.review.document.view.set" then callback(vim.NIL)
+  elseif method == "github.review.document.thread.get" then
     local previous = revision
     revision = revision + 1
     callback({ thread = { node_id = params.thread_node_id, loaded_comments = 2, total_comments = 2 },
@@ -60,7 +60,7 @@ adapter._set_runner_for_test(function(method, params, callback)
           target = {}, decoration = {}, visible_decoration = {}, fold = {}, gutter = {}, editable_region = {},
         } } },
         block_edit = { { start_block = 1, removed_blocks = 0, inserted = { "thread-continuation" } } } } })
-  elseif method == "review.act" then
+  elseif method == "github.review.document.input.apply" then
     action_request[#action_request + 1] = params.input
     if hold_action then
       hold_action = false
@@ -70,31 +70,31 @@ adapter._set_runner_for_test(function(method, params, callback)
         callback({ patch = {}, effect = effect, diagnostic = vim.NIL })
       end
     else callback({ patch = {}, effect = vim.NIL, diagnostic = vim.NIL }) end
-  elseif method == "review.transition" then
+  elseif method == "github.review.document.transition" then
     lifecycle_request[#lifecycle_request + 1] = params.desired
     callback({ lifecycle = { state = params.desired == "CLOSED" and "CLOSED" or "OPEN", is_draft = params.desired == "DRAFT" },
       recovery = vim.NIL, fresh_required = false })
-  elseif method == "review.lifecycle_reconcile" then
+  elseif method == "github.review.document.lifecycle.reconcile" then
     lifecycle_request[#lifecycle_request + 1] = "reconcile"
     callback({ lifecycle = { state = "OPEN", is_draft = false }, recovery = vim.NIL, fresh_required = false })
-  elseif method == "review.begin_batched" then
+  elseif method == "github.review.document.batch.begin" then
     callback({ mode = "batched", viewed_file = {}, snapshot = {} })
-  elseif method == "review.set_viewed" then
+  elseif method == "github.review.document.file.viewed.set" then
     callback({ mode = "batched", viewed_file = params.viewed and { params.path } or {}, snapshot = {} })
-  elseif method == "review.submit_batched" then
+  elseif method == "github.review.document.batch.submit" then
     callback({ mode = "batched", viewed_file = {}, snapshot = {}, outcome = "outcome_unknown", operation_id = "submission-1" })
-  elseif method == "review.submit_batched_recover" then
+  elseif method == "github.review.document.batch.recover" then
     assert(params.operation_id == "submission-1")
     callback({ submission = { mode = "batched", viewed_file = {}, snapshot = {}, outcome = "confirmed", operation_id = vim.NIL }, fresh_required = false })
-  elseif method == "review.save" then
+  elseif method == "github.review.document.save" then
     save_count = save_count + 1
     pending[#pending + 1] = { capture = vim.deepcopy(params.capture), callback = callback }
-  elseif method == "review.comment" then
+  elseif method == "github.review.document.comment" then
     comment_request[#comment_request + 1] = params.command
     if params.capture and params.capture[1] then current = params.capture[1].text end
     local parent = params.command.parent
     callback({ snapshot = { comment = parent and 2 or 1, parent = parent, region = "body", text = current }, patch = vim.NIL })
-  elseif method == "review.close" then closed[#closed + 1] = params.document callback({ closed = true })
+  elseif method == "github.review.document.close" then closed[#closed + 1] = params.document callback({ closed = true })
   else error("unexpected route " .. method) end
 end)
 local errors = {}

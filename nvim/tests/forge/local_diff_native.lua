@@ -6,7 +6,7 @@ local status = require("forge.status")
 local local_diff = require("forge.local_diff")
 local opened, held_close, held_open = 0, nil, nil
 status._set_runner_for_test(function(method, params, callback)
-  assert(method == "status")
+  assert(method == "repository.status.document")
   if params.operation == "local" then
     opened = opened + 1
     local function answer()

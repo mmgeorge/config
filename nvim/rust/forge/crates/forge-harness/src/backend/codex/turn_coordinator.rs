@@ -1470,8 +1470,10 @@ mod test {
             } else {
                 None
             };
-            let mut output = BackendOutput::default();
-            output.backend_session_id = Some("parent".into());
+            let mut output = BackendOutput {
+                backend_session_id: Some("parent".into()),
+                ..Default::default()
+            };
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 CodexTurnCoordinator::new(

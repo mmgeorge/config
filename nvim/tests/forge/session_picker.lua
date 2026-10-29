@@ -108,8 +108,11 @@ local ok, failure = pcall(function()
     end
     return nil
   end
-  client.request = function(method, params, callback)
-    request_list[#request_list + 1] = { method = method, params = vim.deepcopy(params) }
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    request_list[#request_list + 1] = { method = method, session_id = request_specification.session_id, params = vim.deepcopy(params) }
     if method == "session.list" then
       local result = vim.tbl_filter(function(entry)
         return not deleted_session_id or entry.id ~= deleted_session_id
@@ -133,8 +136,10 @@ local ok, failure = pcall(function()
     elseif method == "session.resume" then
       local entry = vim.iter(entry_list):find(function(candidate) return candidate.id == params.session_id end)
       callback(snapshot(vim.deepcopy(entry)))
-    elseif method == "backend.models" then
+    elseif method == "session.provider.model.list" then
       callback({})
+    elseif method == "session.input.get" then
+      callback({ revision = 0, messages = {}, suspended = false, execution_busy = false })
     else
       error("unexpected request: " .. method)
     end
@@ -225,8 +230,13 @@ local ok, failure = pcall(function()
   assert_equals(state.session.id, "active", "cross-repository Enter should preserve the active session")
   vim.api.nvim_buf_set_lines(active_picker.search_buf, 0, -1, false, { "gamma" })
   vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active_picker.search_buf })
+  local picker_owner = state.session
+  state.session = vim.tbl_extend("force", picker_owner, { id = "another-active-view" })
   vim.fn.maparg("<C-j>", "i", false, true).callback()
+  state.session = picker_owner
   assert_equals(deleted_session_id, "gamma", "Ctrl-j should delete the filtered session")
+  assert_equals(last_request("session.delete").session_id, "active",
+    "deletion must retain the picker owner's context instead of the deletion target")
   assert_true(picker.is_open("sessions"), "deletion should keep the session search open")
 
   active_picker = picker._state_for_test()

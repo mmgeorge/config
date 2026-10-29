@@ -13,9 +13,9 @@ end
 ---@return string? failure
 local function request(comparison, operation, generation)
   local response, failure, completed
-  client.request_host("repository.generate", { operation = operation or "generate", workspace = fixture, comparison = comparison,
+  client.request({ method = "repository.generation", params = { operation = operation or "generate", workspace = fixture, comparison = comparison,
     model = operation ~= "preview" and not generation and { provider = "fixture", model = "fixture" } or nil,
-    generation = generation }, function(result, error)
+    generation = generation } }, function(result, error)
       response, failure, completed = result, error, true
     end)
   assert(vim.wait(10000, function() return completed end, 10), "generation host did not respond")
@@ -212,7 +212,7 @@ local ok, failure = xpcall(function()
   assert(#preview.prompt.user + #preview.prompt.system == preview.prompt.input_bytes)
   assert(not client._client.harness_ready, "preview command initialized a conversation")
 end, debug.traceback)
-client.stop()
+client.host_stop()
 assert(vim.wait(6000, function() return client._client.process == nil end, 20), "host did not stop")
 vim.fn.delete(fixture, "rf")
 assert(ok, failure)

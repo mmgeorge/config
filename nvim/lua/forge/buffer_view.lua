@@ -127,9 +127,11 @@ function M.capture(session, retained)
   local selecting = mode == "v" or mode == "V" or mode == "\22"
     or mode == "s" or mode == "S" or mode == "\19"
   for _, window in ipairs(vim.fn.win_findbuf(session.buffer)) do
-    local saved = capture_position(session, vim.api.nvim_win_get_cursor(window), retained)
-    saved.window = window
-    saved.view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
+    ---@type ForgeRetainedView
+    local saved = vim.tbl_extend("force", capture_position(session, vim.api.nvim_win_get_cursor(window), retained), {
+      window = window,
+      view = vim.api.nvim_win_call(window, vim.fn.winsaveview),
+    })
     if window == active_window and selecting then
       local position = vim.fn.getpos("v")
       local anchor = capture_position(session, { position[2], position[3] - 1 }, retained)
@@ -184,12 +186,12 @@ function M.restore(session, retained)
       vim.api.nvim_win_call(saved.window, function()
         local mode = vim.fn.mode(1)
         local selection = saved.selection
-        local selecting = selection and active_window == saved.window and mode == selection.mode
+        local selecting = selection ~= nil and active_window == saved.window and mode == selection.mode
         local allow_eol = (active_window == saved.window and mode:match("^[iR]") ~= nil)
           or (selecting and vim.o.selection == "exclusive")
         local row, column, row_count = resolve_position(session, saved, allow_eol)
         local select_mode = selecting and (mode == "s" or mode == "S" or mode == "\19")
-        if selecting then
+        if selection and selecting then
           local anchor_row, anchor_column = resolve_position(session, selection.anchor, allow_eol)
           local offset = anchor_column == selection.anchor.column and selection.anchor.column_offset or 0
           if select_mode then vim.cmd.normal({ args = { "\7" }, bang = true }) end

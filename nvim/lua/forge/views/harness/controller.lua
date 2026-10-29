@@ -40,23 +40,21 @@ local workflow_action = {
 }
 
 ---@param state table
----@param field string
----@return string|boolean
+---@param field "model"|"effort"|"service_tier"
+---@return string
 local function applied_setting(state, field)
   if field == "service_tier" then return (state.session and state.session.service_tier) or "default" end
   return (state.session and state.session[field]) or config.options.harness[field]
 end
 
 ---@param state table
----@param field string
----@return string|boolean
+---@param field "model"|"effort"|"service_tier"
+---@return string
 local function selected_setting(state, field)
   if state.task_config and state.task_config[field] ~= nil then return state.task_config[field] end
   if state.configuring_config and state.configuring_config[field] ~= nil then return state.configuring_config[field] end
   return applied_setting(state, field)
 end
-
----@param state table
 
 ---Parse model configuration separately from its optional queued prompt.
 local function model_command(text)
@@ -337,8 +335,9 @@ function M.render()
     M.refresh_winbar()
     return
   end
+  ---@type HarnessPresentation?
   local owner = state.presentation
-  if owner and (owner.session_id ~= state.session.id or owner.host_generation ~= client.host_generation()) then
+  if owner and (owner.session_id ~= state.session.id or owner.host_generation ~= client.host_get_generation()) then
     if not owner.close({ preserve_buffer = true }) then return end
     state.presentation = nil
     owner = nil
@@ -348,10 +347,10 @@ function M.render()
     state.transcript_win = vim.fn.win_findbuf(state.transcript_buf)[1]
     if not state.transcript_win then return end
   end
-  local opening_session_id, opening_generation = state.session.id, client.host_generation()
+  local opening_session_id, opening_generation = state.session.id, client.host_get_generation()
   local function owns_presentation()
     return not state.switching_backend and state.session and state.session.id == opening_session_id
-      and client.host_generation() == opening_generation
+      and client.host_get_generation() == opening_generation
   end
   state.presentation = require("forge.views.harness.presentation").open({
     startup_trace = state.startup_trace,
@@ -452,11 +451,12 @@ local function reconcile_approval_presentation(state)
   state.presented_approval_id = nil
 end
 
----@param callback? fun(result: table)
+---@param callback? fun(result?: table, failure?: string)
+---@param target_state? table
 local function synchronize_state(callback, target_state)
   local synchronized_state = target_state or harness_state()
   local synchronized_session = synchronized_state.session and synchronized_state.session.id
-  local synchronized_generation = client.host_generation()
+  local synchronized_generation = client.host_get_generation()
   if synchronized_state.host_error then M.render() return end
   if callback then
     synchronized_state.state_sync_callback = synchronized_state.state_sync_callback or {}
@@ -468,9 +468,9 @@ local function synchronize_state(callback, target_state)
   end
   synchronized_state.state_sync_pending = true
   local invalidation = synchronized_state.state_invalidation or 0
-  client.request_for(synchronized_session, "state.get", {}, function(result, request_error, error_detail)
+  client.request({ session_id = synchronized_session, method = "session.state.get", params = {} }, function(result, request_error, error_detail)
     synchronized_state.state_sync_pending = false
-    if client.host_generation() ~= synchronized_generation or not synchronized_state.session
+    if client.host_get_generation() ~= synchronized_generation or not synchronized_state.session
       or synchronized_state.session.id ~= synchronized_session then return end
     if result and invalidation ~= (synchronized_state.state_invalidation or 0) then
       vim.schedule(function() synchronize_state(nil, synchronized_state) end)
@@ -509,7 +509,7 @@ local function synchronize_state(callback, target_state)
       local retry = (synchronized_state.state_sync_retry or 0) + 1
       synchronized_state.state_sync_retry = retry
       vim.defer_fn(function()
-        if harness_state() == synchronized_state and client.host_generation() == synchronized_generation then synchronize_state(nil, synchronized_state) end
+        if harness_state() == synchronized_state and client.host_get_generation() == synchronized_generation then synchronize_state(nil, synchronized_state) end
       end, math.min(8000, 1000 * 2 ^ math.min(retry - 1, 3)))
       return
     end
@@ -554,7 +554,7 @@ local function on_event(event, payload)
   if event == "input_changed" then input_state.receive(state, payload) return end
   if event == "host_stopped" then
     diagnostic.set(state, "host_error", payload.message,
-      { owner = tostring(client.host_generation()), category = "host", severity = payload.expected and "info" or "error",
+      { owner = tostring(client.host_get_generation()), category = "host", severity = payload.expected and "info" or "error",
         recovery = "reconnect", clear_when = "new host generation" })
     state.execution_notice = payload.message .. ". Reopen Harness to reconnect."
     state.cancel_requested = false
@@ -768,10 +768,10 @@ function M.present_approval(reopen)
     window_list = picker_host(state).window_list,
     control_win = picker_host(state).control_win,
     resolve = function(approval_id, answer_list, callback)
-      client.request("approval.resolve", {
+      client.request({ session_id = state.session.id, method = "session.approval.resolve", params = {
         approval_id = approval_id,
         answer_list = answer_list,
-      }, function(_, request_error)
+      } }, function(_, request_error)
         if request_error then
           notifications.error(request_error, "Harness approval")
           synchronize_state()
@@ -825,7 +825,7 @@ function M.present_plan_question(force)
     clarification_draft = draft,
     answer = function(params, callback)
       params.target = question_target
-      client.request_for(session_id, "question.answer", params, function(result, request_error, detail)
+      client.request({ session_id = session_id, method = "session.question.answer", params = params }, function(result, request_error, detail)
         if request_error then
           notifications.error(request_error, "Harness question")
           callback(nil, request_error, detail)
@@ -838,7 +838,7 @@ function M.present_plan_question(force)
     end,
     skip = function(params, callback)
       params.target = question_target
-      client.request_for(session_id, "question.skip", params, function(result, request_error, detail)
+      client.request({ session_id = session_id, method = "session.question.skip", params = params }, function(result, request_error, detail)
         if request_error then
           notifications.error(request_error, "Harness question")
           callback(nil, request_error, detail)
@@ -875,7 +875,7 @@ function M.present_plan_question(force)
       state.plan_question_open = false
       state.execution_notice = nil
       local request_owner = set_busy(true)
-      client.request_for(session_id, "question.continue", { target = question_target }, function(_, request_error, error_detail)
+      client.request({ session_id = session_id, method = "session.question.continue", params = { target = question_target } }, function(_, request_error, error_detail)
         if request_error and error_detail and error_detail.code == "not_admitted" then
           set_busy(false)
           synchronize_state()
@@ -895,7 +895,7 @@ function M.present_plan_question(force)
     closed = function()
       state.plan_question_open = false
       if owner == "plan_acceptance" then
-        client.request("plan.acceptance.cancel", {}, function(result, request_error)
+        client.request({ session_id = state.session.id, method = "session.plan.acceptance.cancel", params = {} }, function(result, request_error)
           if request_error then
             notifications.error(request_error, "Plan acceptance")
             synchronize_state()
@@ -986,8 +986,19 @@ function M.cancel_turn()
     return
   end
   local operation = state.task_operation
-  if operation and operation.action == "pause" then return end
-  M.task_transition({ action = "pause", restore_prompt_if_no_output = true })
+  if state.cancel_requested or operation and operation.action == "pause" then return end
+  local session_id = state.session and state.session.id
+  M.task_transition({ action = "pause" }, nil, function(success)
+    if not success or not session_id or harness_state() ~= state or state.session.id ~= session_id then return end
+    state.cancel_requested = true
+    client.request({ session_id = session_id, method = "session.turn.cancel",
+      params = { restore_prompt_if_no_output = true } }, function(_, failure)
+      if harness_state() ~= state or state.session.id ~= session_id then return end
+      state.cancel_requested = false
+      if failure then notifications.error(failure, "Harness cancellation") end
+      M.render()
+    end)
+  end)
 end
 function M.compact(completed)
   if not (harness_state().capability and harness_state().capability.native_compact) then
@@ -1028,7 +1039,7 @@ function M.fork_session(name)
     ms = perf.elapsed_ms(fork_started),
     source_session_id = active_session.id,
   })
-  client.request_for(active_session.id, "session.fork", params, function(result, request_error)
+  client.request({ session_id = active_session.id, method = "session.fork", params = params }, function(result, request_error)
     if request_error then
       perf.event("harness", "harness.fork.failed", {
         ms = perf.elapsed_ms(fork_started),
@@ -1073,7 +1084,7 @@ function M.open_timeline_entry()
     elseif action.kind == "agent" then M.select_agent(action.run_id)
     elseif action.kind == "url" then vim.ui.open(action.url)
     elseif action.kind == "declaration" then
-      client.request_for(state.session.id, "plan.declaration", action, function(snapshot, failure)
+      client.request({ session_id = state.session.id, method = "session.plan.declaration.get", params = action }, function(snapshot, failure)
         if failure then notifications.error(failure, "Plan declaration") return end
         vim.cmd("tabnew")
         local declaration_buffer = vim.api.nvim_get_current_buf()
@@ -1097,13 +1108,13 @@ function M.open_timeline_entry()
         notifications.warn("Changed file is no longer available: " .. path, "ForgeHarness")
         return
       end
-      local opened, failure = pcall(vim.cmd, "tabedit " .. vim.fn.fnameescape(path))
+      local opened, failure = pcall(vim.api.nvim_cmd, { cmd = "tabedit", args = { path } }, {})
       if not opened then notifications.error(failure, "ForgeHarness") return end
       vim.api.nvim_win_set_cursor(0, { math.max(1, math.min(action.line or 1, vim.api.nvim_buf_line_count(0))), 0 })
     elseif action.kind == "plan" then
-      local session_id, generation = state.session.id, client.host_generation()
-      client.request_for(session_id, "plan.get", { plan_id = action.plan_id, revision = action.revision }, function(plan, failure)
-        if not state.session or state.session.id ~= session_id or client.host_generation() ~= generation then return end
+      local session_id, generation = state.session.id, client.host_get_generation()
+      client.request({ session_id = session_id, method = "session.plan.get", params = { plan_id = action.plan_id, revision = action.revision } }, function(plan, failure)
+        if not state.session or state.session.id ~= session_id or client.host_get_generation() ~= generation then return end
         if failure then notifications.error(failure, "Harness artifact") return end
         require("forge.views.plan_review").open(plan)
       end)
@@ -1122,11 +1133,11 @@ end
 
 function M.open_artifact_picker()
   local state = harness_state()
-  local session_id, generation = state.session.id, client.host_generation()
+  local session_id, generation = state.session.id, client.host_get_generation()
   if state.presentation and state.status and state.status.kind == "awaiting_plan_review" then
     state.presentation.status_action(function(action)
-      client.request_for(session_id, "plan.get", { plan_id = action.plan_id, revision = action.revision }, function(plan, failure)
-        if not state.session or state.session.id ~= session_id or client.host_generation() ~= generation then return end
+      client.request({ session_id = session_id, method = "session.plan.get", params = { plan_id = action.plan_id, revision = action.revision } }, function(plan, failure)
+        if not state.session or state.session.id ~= session_id or client.host_get_generation() ~= generation then return end
         if failure then notifications.error(failure, "Harness artifact") return end
         require("forge.views.plan_review").open(plan)
       end)
@@ -1134,7 +1145,7 @@ function M.open_artifact_picker()
     return
   end
   local function current()
-    return state.session and state.session.id == session_id and client.host_generation() == generation
+    return state.session and state.session.id == session_id and client.host_get_generation() == generation
   end
   local artifact_list = vim.deepcopy(state.artifact or {})
   local current_id = state.active_plan and state.active_plan.id
@@ -1148,7 +1159,7 @@ function M.open_artifact_picker()
     end, artifact_list)
   open_choice_picker(state, "Select Artifact", nil, option_list, function(artifact)
     if not artifact or not current() then return end
-    client.request_for(session_id, "plan.get", { plan_id = artifact.id }, function(plan, request_error)
+    client.request({ session_id = session_id, method = "session.plan.get", params = { plan_id = artifact.id } }, function(plan, request_error)
       if not current() then return end
       if request_error then
         notifications.error(request_error, "Harness artifact")
@@ -1166,7 +1177,7 @@ end
 ---@field state "complete"|"failed"|"cancelled"
 ---@field checkpoint_before string
 
----@param interaction ForgeRollbackInteraction
+---@param text string
 local function restore_composer_prompt(text)
   local state = harness_state()
   set_composer_text(state.composer_buf, text)
@@ -1189,10 +1200,10 @@ end
 ---@param interaction table?
 local function confirm_restore_preview(preview, interaction)
   local state = harness_state()
-  local session_id, generation = state.session.id, client.host_generation()
+  local session_id, generation = state.session.id, client.host_get_generation()
   local function current()
     return harness_state() == state and state.session and state.session.id == session_id
-      and client.host_generation() == generation
+      and client.host_get_generation() == generation
   end
   local description = { tostring(preview.files) .. " files will be restored.", "Git’s index will not change." }
   for _, warning in ipairs(preview.warnings or {}) do description[#description + 1] = warning end
@@ -1206,7 +1217,7 @@ local function confirm_restore_preview(preview, interaction)
   open_choice_picker(state, "Restore checkpoint", table.concat(description, "\n"), choices, function(choice)
     if not current() or choice == "cancel" or not choice then return end
     if choice == "more" then
-      client.request_for(session_id, "exchange.rollback.preview", { preview_id = preview.preview_id, offset = preview.next_offset }, function(page, err)
+      client.request({ session_id = session_id, method = "session.exchange.rollback.preview", params = { preview_id = preview.preview_id, offset = preview.next_offset } }, function(page, err)
         if not current() then return end
         if err then notifications.error(err, "Harness undo") return end
         confirm_restore_preview(page, interaction)
@@ -1216,14 +1227,14 @@ local function confirm_restore_preview(preview, interaction)
     if state.restore_applying or state.busy then return end
     local operation = {}
     state.restore_applying = operation
-    client.request_for(session_id, "exchange.rollback.apply", { preview_id = preview.preview_id }, function(_, err)
+    client.request({ session_id = session_id, method = "session.exchange.rollback.apply", params = { preview_id = preview.preview_id } }, function(_, err)
       if not current() or state.restore_applying ~= operation then return end
       state.restore_applying = nil
       synchronize_state()
       if err then
         notifications.error(err, "Harness undo")
         if err:find("preview is stale", 1, true) and interaction then
-          client.request_for(session_id, "exchange.rollback.prepare", { exchange_id = interaction.id }, function(refreshed, failure)
+          client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = { exchange_id = interaction.id } }, function(refreshed, failure)
             if not current() then return end
             if failure then notifications.error(failure, "Harness undo") return end
             confirm_restore_preview(refreshed, interaction)
@@ -1240,7 +1251,7 @@ end
 ---@param latest_exchange_id string
 local function confirm_rollback(interaction, latest_exchange_id)
   local state = harness_state()
-  local session_id, generation = state.session.id, client.host_generation()
+  local session_id, generation = state.session.id, client.host_get_generation()
   if state.busy or state.restore_applying then return end
   local choices = {
     { label = "Cancel", value = "cancel" },
@@ -1251,12 +1262,12 @@ local function confirm_rollback(interaction, latest_exchange_id)
   end
   open_choice_picker(state, "Rollback interaction", "Choose what to roll back", choices, function(choice)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
-      or client.host_generation() ~= generation then return end
+      or client.host_get_generation() ~= generation then return end
     if not choice or choice == "cancel" or state.busy or state.restore_applying then return end
     if choice == "workspace" then
-      client.request_for(session_id, "exchange.rollback.prepare", { exchange_id = interaction.id }, function(preview, err)
+      client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = { exchange_id = interaction.id } }, function(preview, err)
         if harness_state() ~= state or not state.session or state.session.id ~= session_id
-          or client.host_generation() ~= generation then return end
+          or client.host_get_generation() ~= generation then return end
         if err then notifications.error(err, "Harness undo") return end
         confirm_restore_preview(preview, interaction)
       end)
@@ -1269,7 +1280,7 @@ local function confirm_rollback(interaction, latest_exchange_id)
       scope = "conversation", exchange_id = interaction.id, latest_exchange_id = latest_exchange_id,
     } }, nil, function(applied)
       if harness_state() ~= state or not state.session or state.session.id ~= session_id
-        or client.host_generation() ~= generation or state.restore_applying ~= operation then return end
+        or client.host_get_generation() ~= generation or state.restore_applying ~= operation then return end
       state.restore_applying = nil
       if not applied then return end
       restore_composer_prompt(interaction.prompt or "")
@@ -1284,11 +1295,11 @@ local function open_exchange_undo_picker(recovery)
     notifications.warn("Cancel or finish the active turn before undoing an exchange", "Harness undo")
     return
   end
-  local session_id, generation = state.session and state.session.id, client.host_generation()
+  local session_id, generation = state.session and state.session.id, client.host_get_generation()
   if not session_id then return end
-  client.request_for(session_id, "exchange.list", {}, function(interaction_list, request_error)
+  client.request({ session_id = session_id, method = "session.exchange.list", params = {} }, function(interaction_list, request_error)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
-      or client.host_generation() ~= generation then return end
+      or client.host_get_generation() ~= generation then return end
     if request_error then
       notifications.error(request_error, "Harness undo")
       return
@@ -1320,9 +1331,9 @@ local function open_exchange_undo_picker(recovery)
       option_list,
       function(interaction)
         if interaction.undo_file_restore then
-          client.request_for(session_id, "exchange.recovery", { action = "undo" }, function(preview, err)
+          client.request({ session_id = session_id, method = "session.exchange.recovery", params = { action = "undo" } }, function(preview, err)
             if harness_state() ~= state or not state.session or state.session.id ~= session_id
-              or client.host_generation() ~= generation then return end
+              or client.host_get_generation() ~= generation then return end
             if err then notifications.error(err, "Harness recovery") return end
             confirm_restore_preview(preview)
           end)
@@ -1343,10 +1354,10 @@ function M.open_undo_picker()
     return
   end
   if not state.session then return end
-  local session_id, generation = state.session.id, client.host_generation()
-  client.request_for(session_id, "exchange.recovery", {}, function(recovery, err)
+  local session_id, generation = state.session.id, client.host_get_generation()
+  client.request({ session_id = session_id, method = "session.exchange.recovery", params = {} }, function(recovery, err)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
-      or client.host_generation() ~= generation then return end
+      or client.host_get_generation() ~= generation then return end
     if err then notifications.error(err, "Harness recovery") return end
     if not recovery or recovery == vim.NIL then open_exchange_undo_picker() return end
     if not recovery.pending then open_exchange_undo_picker(recovery) return end
@@ -1355,12 +1366,12 @@ function M.open_undo_picker()
     choices[#choices + 1] = { label = "Restore pre-restore files", value = "undo" }
     open_choice_picker(state, "Harness restore", "An interrupted restore requires recovery.", choices, function(choice)
       if harness_state() ~= state or not state.session or state.session.id ~= session_id
-        or client.host_generation() ~= generation then return end
+        or client.host_get_generation() ~= generation then return end
       if choice ~= "undo" and choice ~= "continue" then return end
       if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
-      client.request_for(session_id, "exchange.recovery", { action = choice }, function(result, failure)
+      client.request({ session_id = session_id, method = "session.exchange.recovery", params = { action = choice } }, function(result, failure)
         if harness_state() ~= state or not state.session or state.session.id ~= session_id
-          or client.host_generation() ~= generation then return end
+          or client.host_get_generation() ~= generation then return end
         if failure then notifications.error(failure, "Harness recovery") synchronize_state() return end
         if choice == "undo" then confirm_restore_preview(result) else synchronize_state() end
       end)
@@ -1393,7 +1404,7 @@ function M.spawn_agent(profile, text)
   local state = harness_state()
   local request = type(profile) == "table" and profile or { profile = profile, text = text }
   if state.presentation then state.presentation.follow_tail() end
-  client.request("agent.start", request, function(result, request_error)
+  client.request({ session_id = state.session.id, method = "session.agent.start", params = request }, function(result, request_error)
     if request_error then notifications.error(request_error, "Harness agent") end
     if result and result.warning then notifications.warn(result.warning, "Subagent profiles") end
     synchronize_state()
@@ -1411,7 +1422,8 @@ function M.agent_action(action, run_id, message)
   if action == "message" or action == "followup" then
     if not message or message:match("^%s*$") then return end
   end
-  client.request("agent." .. action, params, function(_, failure)
+  local method = action == "message" and "session.agent.message.send" or "session.agent." .. action
+  client.request({ session_id = state.session.id, method = method, params = params }, function(_, failure)
     if failure then notifications.error(failure, "Harness child " .. action) return end
     if message and not state.queue_edit and composer_text(state.composer_buf) == message then
       set_composer_text(state.composer_buf, "")
@@ -1437,7 +1449,7 @@ end
 function M.open_spawn_picker(profile)
   local state = harness_state()
   local session_id = state.session and state.session.id
-  client.request("agent.profiles.get", {}, function(snapshot, failure)
+  client.request({ method = "agent.profile.get", params = {} }, function(snapshot, failure)
     if not state.session or state.session.id ~= session_id then return end
     if failure then notifications.error(failure, "Subagent profiles") return end
     if snapshot.error then notifications.warn(snapshot.error, "Subagent profiles") end
@@ -1454,11 +1466,11 @@ end
 ---List provider-owned background shells and terminate only the selected shell.
 function M.open_background_picker()
   local state = harness_state()
-  local session_id, generation = state.session.id, client.host_generation()
+  local session_id, generation = state.session.id, client.host_get_generation()
   local function current()
-    return state.session and state.session.id == session_id and client.host_generation() == generation
+    return state.session and state.session.id == session_id and client.host_get_generation() == generation
   end
-  client.request_for(session_id, "harness.document", { operation = "background_terminals" }, function(inventory, failure)
+  client.request({ session_id = session_id, method = "session.document", params = { operation = "background_terminals" } }, function(inventory, failure)
     if not current() then return end
     if failure then notifications.error(failure, "Select Background Terminal") return end
     if not inventory.supported then
@@ -1471,7 +1483,7 @@ function M.open_background_picker()
     end
     open_choice_picker(state, "Terminate Background Terminal", nil, options, function(id)
       if not current() then return end
-      client.request_for(session_id, "harness.document", { operation = "terminate_terminal", id = id }, function(_, terminate_failure)
+      client.request({ session_id = session_id, method = "session.document", params = { operation = "terminate_terminal", id = id } }, function(_, terminate_failure)
         if not current() then return end
         if terminate_failure then notifications.error(terminate_failure, "Select Background Terminal") end
         if state.presentation and state.presentation.terminals then state.presentation.terminals.refresh() end
@@ -1532,11 +1544,11 @@ function M.submit()
   if text == "" then return end
   if text == "/capabilities" then
     set_composer_text(state.composer_buf, "")
-    require("forge.views.harness.capability_picker").open(picker_host(state))
+    require("forge.views.harness.capability_picker").open(picker_host(state), state.session.id)
     return
   end
   local accepted, admission_failure = require("forge.views.harness.completion.command_source").accepts_prompt(text)
-  if not accepted then notifications.warn(admission_failure, "ForgeHarness") return end
+  if not accepted then notifications.warn(assert(admission_failure), "ForgeHarness") return end
   if text == "/task" or text == "/plan" or text == "/execute" then
     set_composer_text(state.composer_buf, "")
     if text == "/task" then task_control.open(state, picker_host(state), M.task_transition)
@@ -1584,11 +1596,11 @@ function M.submit()
   if model_failure then report_configuration_error(model_failure) return end
   if model_prompt and model_prompt ~= "" then M.queue_submit() return end
   prompt_history.record(text)
-  local goal_control = ({ ["/goal pause"] = "goal.pause", ["/goal clear"] = "goal.clear" })[text]
+  local goal_control = ({ ["/goal pause"] = "session.goal.pause", ["/goal clear"] = "session.goal.clear" })[text]
   if goal_control then
     local session_id = state.session.id
     set_composer_text(state.composer_buf, "")
-    client.request_for(session_id, goal_control, {}, function(result, request_error)
+    client.request({ session_id = session_id, method = goal_control, params = {} }, function(result, request_error)
       if request_error then
         notifications.error(request_error, "Harness goal")
         return
@@ -1642,7 +1654,7 @@ function M.submit()
   if check_editing == "on" or check_editing == "off" then
     set_composer_text(state.composer_buf, "")
     local session_id = state.session.id
-    client.request_for(session_id, "checks.editing", { enabled = check_editing == "on" }, function(result, failure)
+    client.request({ session_id = session_id, method = "session.check.editing.set", params = { enabled = check_editing == "on" } }, function(result, failure)
       if not state.session or state.session.id ~= session_id then return end
       if failure then
         notifications.error(failure, "Harness checks")
@@ -1861,7 +1873,7 @@ function M.queue_submit()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   local accepted, admission_failure = require("forge.views.harness.completion.command_source").accepts_prompt(text)
-  if not accepted then notifications.warn(admission_failure, "ForgeHarness") return end
+  if not accepted then notifications.warn(assert(admission_failure), "ForgeHarness") return end
   if not require("forge.views.harness.completion.command_source").queues_execution(text) then
     M.submit()
     return
@@ -1881,6 +1893,7 @@ function M.edit_queued(direction)
   local draft = composer_text(state.composer_buf)
   local text, failure, attachments = queue_editor.move(state, draft, direction)
   if failure then notifications.warn(failure, "ForgeHarness") return end
+  if not text then return end
   vim.cmd.stopinsert()
   set_composer_text(state.composer_buf, text, attachments)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
@@ -2187,7 +2200,10 @@ function M.resolve_runtime_model()
   end)
 end
 
----@param mode string
+---@param action table
+---@param submitted_text? string
+---@param completed? fun(success: boolean)
+---@param method? string
 function M.task_transition(action, submitted_text, completed, method)
   local state = harness_state()
   if submitted_text then action.attachments = attachment.capture(state.composer_buf).attachments end
@@ -2293,7 +2309,7 @@ function M.configure(next_config, validate_selection, completed)
     local session_id, epoch = state.session.id, state.runtime_epoch
     state.check_settings_request = (state.check_settings_request or 0) + 1
     local revision = state.check_settings_request
-    client.request_for(session_id, "session.configure", next_config, function(result, failure)
+    client.request({ session_id = session_id, method = "session.configure", params = next_config }, function(result, failure)
       if not state.session or state.session.id ~= session_id or state.runtime_epoch ~= epoch then return end
       if state.check_settings_request ~= revision then
         if completed then completed(false) end
@@ -2314,12 +2330,12 @@ function M.configure(next_config, validate_selection, completed)
   end
   if only_field == "status_thoughts" and next(next_config, only_field) == nil then
     local session_id = state.session.id
-    local generation = client.host_generation()
+    local generation = client.host_get_generation()
     state.status_thoughts_request = (state.status_thoughts_request or 0) + 1
     local request_revision = state.status_thoughts_request
-    client.request_for(session_id, "session.configure", next_config, function(result, failure)
+    client.request({ session_id = session_id, method = "session.configure", params = next_config }, function(result, failure)
       if harness_state() ~= state or not state.session or state.session.id ~= session_id
-        or client.host_generation() ~= generation then return end
+        or client.host_get_generation() ~= generation then return end
       if state.status_thoughts_request ~= request_revision then
         if completed then completed(false) end
         return
@@ -2341,7 +2357,7 @@ function M.configure(next_config, validate_selection, completed)
   end
   if timeout_only then
     local session_id = state.session.id
-    client.request_for(session_id, "session.input_timeouts", next_config, function(result, failure)
+    client.request({ session_id = session_id, method = "session.input.timeout.configure", params = next_config }, function(result, failure)
       if failure then
         report_configuration_error(failure)
         if completed then completed(false) end
@@ -2510,14 +2526,14 @@ function M.attach()
   require("forge.views.harness.health").watch(state, function()
     if harness_state() == state then M.render() end
   end)
-  if client.host_accepting() then state.host_error = nil end
+  if client.host_is_accepting() then state.host_error = nil end
   state.command_set = M.command_set()
   M.attach_transcript(state.transcript_buf)
   keymaps.setup_view_keymaps(state.composer_buf, "harness", M.composer_command_set())
   require("forge.views.harness.workspace").attach(state)
   prompt_history.attach(state.composer_buf)
   if state.unsubscribe then state.unsubscribe() end
-  state.unsubscribe = client.subscribe(function(event, payload, event_session_id)
+  state.unsubscribe = client.session_events_subscribe(function(event, payload, event_session_id)
     if state.switching_backend then return end
     if state.session and event_session_id and state.session.id ~= event_session_id then return end
     local active_state = session.harness

@@ -203,7 +203,7 @@ enum PlanLine {
     Blank,
     Content {
         text: String,
-        anchor: PlanNavigationAnchor,
+        anchor: Box<PlanNavigationAnchor>,
     },
 }
 
@@ -260,7 +260,7 @@ impl PlanRenderer {
                 anchor.line = self.line.len() as u32 + 1;
                 self.line.push(PlanLine::Content {
                     text: row.to_owned(),
-                    anchor: anchor.clone(),
+                    anchor: (anchor.clone()).into(),
                 });
             }
         }
@@ -303,7 +303,7 @@ impl PlanRenderer {
         for line in self.line {
             if let PlanLine::Content { text, anchor } = line {
                 markdown.push_str(&text);
-                navigation.anchor.push(anchor);
+                navigation.anchor.push(*anchor);
             }
             markdown.push('\n');
         }
@@ -1111,11 +1111,10 @@ fn diagram_entity_group(
             .unwrap_or(usize::MAX)
     });
     if entity_list.is_empty() {
-        let mut cells = Vec::new();
-        cells.push(DiagramCell {
+        let cells = vec![DiagramCell {
             text: "<none>".into(),
             anchor: object_model_anchor(),
-        });
+        }];
         return cells;
     }
     let longest_path_width = document
@@ -1884,11 +1883,10 @@ mod test {
             wrap_prefixed("", "prefix", "", 9).collect::<Vec<_>>(),
             ["prefix"]
         );
-        let mut cells = Vec::new();
-        cells.push(DiagramCell {
+        let cells = [DiagramCell {
             text: "x".repeat(32 * 1024 * 1024 + 1),
             anchor: object_model_anchor(),
-        });
+        }];
         assert_eq!(cells[0].text.len(), 32 * 1024 * 1024 + 1);
     }
     use super::*;

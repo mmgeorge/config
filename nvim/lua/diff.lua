@@ -1,11 +1,12 @@
 local M = {}
 
 M.show_diff = function (str1, str2)
-  local diff = vim.diff(str1, str2, {
+  local diff = vim.text.diff(str1, str2, {
     result_type = "unified",
     algorithm = "myers",
     ctxlen = 3,
   })
+  assert(type(diff) == "string", "unified diff did not return text")
 
   -- Create a scratch buffer
   local buf = vim.api.nvim_create_buf(false, true)

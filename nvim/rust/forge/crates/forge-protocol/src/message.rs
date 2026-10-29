@@ -259,17 +259,16 @@ mod tests {
 
     #[test]
     fn request_progress_is_distinct_from_responses_and_session_events() {
-        let source =
-            r#"{"request_id":7,"event":"github.sync.progress","payload":{"phase":"reading"}}"#;
+        let source = r#"{"request_id":7,"event":"github.issue.sync.progress","payload":{"phase":"reading"}}"#;
         assert!(matches!(
             serde_json::from_str::<Message>(source).unwrap(),
             Message::RequestEvent(_)
         ));
         assert!(serde_json::from_str::<Response>(source).is_err());
         for source in [
-            r#"{"request_id":7,"event":"github.sync.progress","payload":{},"id":7}"#,
-            r#"{"request_id":7,"event":"github.sync.progress","payload":{},"session_id":"session"}"#,
-            r#"{"request_id":7,"event":"github.sync.progress"}"#,
+            r#"{"request_id":7,"event":"github.issue.sync.progress","payload":{},"id":7}"#,
+            r#"{"request_id":7,"event":"github.issue.sync.progress","payload":{},"session_id":"session"}"#,
+            r#"{"request_id":7,"event":"github.issue.sync.progress"}"#,
         ] {
             assert!(serde_json::from_str::<Message>(source).is_err());
         }

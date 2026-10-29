@@ -37,8 +37,6 @@ local function selected_model(catalog, value, root)
   if selected == "default" then return catalog.models[1] end
 end
 
----@param catalog ForgeSubagentModelCatalog
----@return string[]
 ---@param field string
 ---@param values table<string, string>
 ---@param catalog ForgeSubagentModelCatalog
@@ -109,7 +107,7 @@ function Selection:cycle(values, field, direction, done)
       reasoning_effort = updated.reasoning_effort, service_tier = updated.service_tier })
   end
   if catalog_cache[provider] then apply(catalog_cache[provider])
-  else client.request_for(root.id, "agent.models", { provider = provider }, apply) end
+  else client.request({ session_id = root.id, method = "session.agent.model.list", params = { provider = provider } }, apply) end
 end
 
 return Selection

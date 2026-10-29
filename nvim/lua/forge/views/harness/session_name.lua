@@ -13,7 +13,7 @@ function M.rename(state, name, model, refresh)
     return
   end
   state.rename_revision = (state.rename_revision or 0) + 1
-  local revision, generation = state.rename_revision, client.host_generation()
+  local revision, generation = state.rename_revision, client.host_get_generation()
   local session_id, previous_name = active.id, active.name or ""
   local function progress(text)
     state.rename_status = text
@@ -21,7 +21,7 @@ function M.rename(state, name, model, refresh)
   end
   local function current()
     if state.rename_revision ~= revision then return false end
-    if client.host_generation() ~= generation or not state.session or state.session.id ~= session_id then
+    if client.host_get_generation() ~= generation or not state.session or state.session.id ~= session_id then
       progress(nil)
       return false
     end
@@ -29,9 +29,9 @@ function M.rename(state, name, model, refresh)
   end
   local function save(value, generated)
     if not current() then return end
-    client.request_for(session_id, "session.rename", {
+    client.request({ session_id = session_id, method = "session.rename", params = {
       session_id = session_id, name = value, expected_name = generated and previous_name or nil,
-    }, function(result, failure)
+    } }, function(result, failure)
       if not current() then return end
       state.rename_status = nil
       if failure then
@@ -47,7 +47,7 @@ function M.rename(state, name, model, refresh)
   name = vim.trim(name)
   if name ~= "" then save(name, false) return end
   progress("Generating session name…")
-  client.request_for(session_id, "harness.document", { operation = "session_name", model = model },
+  client.request({ session_id = session_id, method = "session.document", params = { operation = "session_name", model = model } },
     function(result, failure)
       if not current() then return end
       if failure then

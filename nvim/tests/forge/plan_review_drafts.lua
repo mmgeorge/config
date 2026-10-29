@@ -2,14 +2,17 @@ local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 local pending = {}
-local original_request = client.request_for
-local original_generation = client.host_generation
-local original_accepting = client.host_accepting
-client.host_generation = function() return 1 end
-client.host_accepting = function() return true end
-client.request_for = function(_, method, params, callback)
+local original_request = client.request
+local original_generation = client.host_get_generation
+local original_accepting = client.host_is_accepting
+client.host_get_generation = function() return 1 end
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
-  assert(method == "harness.document" or method == "plan.request_changes")
+  assert(method == "session.document" or method == "session.plan.changes.request")
   pending[#pending + 1] = { method = method, params = vim.deepcopy(params), callback = callback }
 end
 local native_buffer = vim.api.nvim_create_buf(false, true)
@@ -65,7 +68,7 @@ local ok, failure = xpcall(function()
   vim.cmd("write")
   assert(#pending == 4)
   local submitted
-  owner.submit("plan.request_changes", { comment = "revise" }, function(result, error_message)
+  owner.submit("session.plan.changes.request", { comment = "revise" }, function(result, error_message)
     assert(not error_message, error_message)
     submitted = result
   end)
@@ -73,7 +76,7 @@ local ok, failure = xpcall(function()
   vim.api.nvim_buf_set_lines(native_buffer, body_row, body_row + 1, false, { "typing after submit" })
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = native_buffer })
   pending[4].callback({ saved = true })
-  assert(#pending == 5 and pending[5].method == "plan.request_changes")
+  assert(#pending == 5 and pending[5].method == "session.plan.changes.request")
   assert(pending[5].params.draft_annotation[1].source.body == "newer unsaved", "queued submission recaptured typing")
   pending[5].callback({ submitted = true })
   assert(submitted.submitted and vim.bo[native_buffer].modified)
@@ -96,7 +99,7 @@ local ok, failure = xpcall(function()
   assert(not vim.wo.number and not vim.wo.relativenumber and vim.wo.statuscolumn == "",
     "reopening the draft restored editor line numbers")
   assert(comments.capture(native_buffer)[1].source.body == "typing after submit", "hide and reopen lost the draft")
-  owner.submit("plan.request_changes", { comment = "reentrant completion" }, function(result, error_message)
+  owner.submit("session.plan.changes.request", { comment = "reentrant completion" }, function(result, error_message)
     assert(result and not error_message, error_message)
     vim.cmd("write")
   end)
@@ -111,8 +114,8 @@ local ok, failure = xpcall(function()
   pending[7].callback({ saved = true })
   assert(not vim.bo[native_buffer].modified)
 end, debug.traceback)
-client.request_for = original_request
-client.host_generation = original_generation
-client.host_accepting = original_accepting
+client.request = original_request
+client.host_get_generation = original_generation
+client.host_is_accepting = original_accepting
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
 print("plan_review_drafts: local creation/focus, exact bytes, final gutter, queued captures, newer typing, hide/reopen passed")

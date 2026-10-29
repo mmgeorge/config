@@ -7,18 +7,24 @@ local keymaps = require("forge.shared.keymaps")
 local transition, errors = {}, {}
 local header = ""
 local header_segments = {}
-client.request = function(method, params, callback)
-  if method == "backend.models" then
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  if method == "session.provider.model.list" then
     callback({ { id = "test", reasoning = { "minimal", "low", "medium", "high" } } })
     return
   end
   error("unexpected request: " .. method)
 end
-client.request_for = function(_, method, params, callback)
-  if method == "state.get" then
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  if method == "session.state.get" then
     callback({ session = state.session, capability = state.capability })
   else
-    assert(method == "task.transition", method)
+    assert(method == "session.command.apply", method)
     transition[#transition + 1] = { params = params, callback = callback }
   end
 end

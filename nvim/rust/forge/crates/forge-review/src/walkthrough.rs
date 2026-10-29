@@ -174,7 +174,10 @@ impl WalkthroughService {
             target: HashMap::new(),
             annotation: HashMap::new(),
         };
-        let (blocks, targets) = project(&document, &WidthProfile::default())?;
+        let WalkthroughProjection {
+            block: blocks,
+            target: targets,
+        } = project(&document, &WidthProfile::default())?;
         document.buffer = BufferDocument::new(id.clone(), blocks)?;
         document.target = targets;
         let result = WalkthroughOpen {
@@ -595,7 +598,7 @@ fn frame_annotation(blocks: &mut Vec<BufferBlock>, width: &WidthProfile) -> Resu
     Ok(())
 }
 fn reflow(document: &mut WalkthroughDocument, width: WidthProfile) -> Result<Option<BufferPatch>> {
-    let (block, target) = project(document, &width)?;
+    let WalkthroughProjection { block, target } = project(document, &width)?;
     let patch = document
         .buffer
         .edit_many(vec![forge_buffer::sequence::SequenceEdit {
@@ -605,10 +608,12 @@ fn reflow(document: &mut WalkthroughDocument, width: WidthProfile) -> Result<Opt
     document.target = target;
     Ok(patch)
 }
-fn project(
-    document: &WalkthroughDocument,
-    width: &WidthProfile,
-) -> Result<(Vec<BufferBlock>, HashMap<TargetId, (usize, usize, usize)>)> {
+struct WalkthroughProjection {
+    block: Vec<BufferBlock>,
+    target: HashMap<TargetId, (usize, usize, usize)>,
+}
+
+fn project(document: &WalkthroughDocument, width: &WidthProfile) -> Result<WalkthroughProjection> {
     let mut block = Vec::new();
     let mut target = HashMap::new();
     push(
@@ -812,7 +817,7 @@ fn project(
         }
         append_fold(&mut block, task_header, task_body, &task_id, false);
     }
-    Ok((block, target))
+    Ok(WalkthroughProjection { block, target })
 }
 fn push(block: &mut Vec<BufferBlock>, id: &str, source: &str, width: &WidthProfile) -> Result<()> {
     block.push(render_block(id, source, width)?);

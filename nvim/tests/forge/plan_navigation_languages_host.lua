@@ -46,7 +46,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local function await(predicate, message)
   assert(vim.wait(30000, function() return #errors > 0 or predicate() end, 10), message .. "\n" .. table.concat(notices, "\n"))
@@ -95,15 +95,19 @@ local success, failure = xpcall(function()
   review.command_set.action_by_id.toggle_public.run({})
   await(function() return review.public_only == false end, "could not expose captured calls")
   local requests, lookups, completions, receipts = 0, {}, {}, {}
-  local original_request = client.request_for
-  client.request_for = function(session, method, params, callback)
-    if method == "harness.document" and params.operation == "plan_definition" then
+  local original_request = client.request
+  client.request = function(request_specification, callback)
+  local session = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.document" and params.operation == "plan_definition" then
       completions[#completions + 1] = params
     end
-    return original_request(session, method, params, function(result, error)
+    return original_request(request_specification, function(result, error)
       if result and result.workspace_definition then lookups[#lookups + 1] = result.workspace_definition end
       callback(result, error)
-      if method == "harness.document" and params.operation == "plan_definition" then
+      if method == "session.document" and params.operation == "plan_definition" then
         receipts[#receipts + 1] = { result = result, failure = error }
       end
     end)
@@ -194,7 +198,7 @@ local success, failure = xpcall(function()
   assert(requests >= #spec.checks and #lookups >= #spec.checks, "navigation bypassed the project language server")
   assert(#vim.lsp.get_clients() == 1 and vim.lsp.get_clients()[1].id == identity, "navigation started another language server")
   assert(vim.fn.filereadable(source_path) == 1)
-  client.request_for = original_request
+  client.request = original_request
   print("plan_navigation_languages_host: " .. language .. " passed, " .. requests .. " definition requests")
 end, debug.traceback)
 if success and vim.g.forge_test_manual then
@@ -204,7 +208,7 @@ if success and vim.g.forge_test_manual then
 end
 if language_client then language_client:stop(true) end
 require("forge.views.harness.workspace").release(state)
-client.stop()
+client.host_stop()
 vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

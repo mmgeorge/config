@@ -153,14 +153,6 @@ impl SqliteStore {
         }
         Ok(owner)
     }
-    /// Loads workflow history for a single conversation.
-
-    /// Persists a workflow checkpoint without changing the selected conversation.
-
-    /// Commits task selection and its lifecycle checkpoint under the session lease.
-
-    /// Publishes acceptance and every execution owner in one commit before provider dispatch.
-
     /// Records an intent before waiting for execution ownership. Duplicate IDs never replay.
     pub fn admit_task_operation(&mut self, operation: &crate::task::TaskOperation) -> Result<bool> {
         let changed = self.connection.execute(
@@ -347,7 +339,7 @@ impl SqliteStore {
             .with_context(|| format!("load Harness session lease {session_id}"))?;
         let mut session = decode_current_session(&payload)?
             .with_context(|| format!("Harness session {session_id} uses an outdated format"))?;
-        validate_session_task_artifacts(&transaction, &mut session)?;
+        validate_session_task_artifacts(&transaction, &session)?;
         session.lease_owner = None;
         session.acquire_lease(client_id)?;
         transaction.execute(
@@ -707,8 +699,6 @@ impl SqliteStore {
         )
     }
 
-    /// Atomically commits execution state, its goal and optional plan, exchange, and lifecycle event.
-
     /// Commit an approved scope change and its reconciled scheduler together.
     pub fn save_plan_transition(
         &mut self,
@@ -1060,12 +1050,6 @@ impl SqliteStore {
         )
     }
 
-    /// Write a goal lifecycle record.
-
-    /// Load a goal by stable Harness identifier.
-
-    /// Remove one provisional goal created by a retracted prompt.
-
     /// Write one immutable workspace checkpoint record.
     pub fn save_checkpoint(&mut self, checkpoint: &CheckpointRecord) -> Result<()> {
         self.save_scoped_payload(
@@ -1245,8 +1229,8 @@ impl SqliteStore {
         let rows = statement.query_map(params, |row| row.get::<_, String>(0))?;
         let mut session_list = Vec::new();
         for row in rows {
-            if let Some(mut session) = decode_current_session(&row?)? {
-                validate_session_task_artifacts(&self.connection, &mut session)?;
+            if let Some(session) = decode_current_session(&row?)? {
+                validate_session_task_artifacts(&self.connection, &session)?;
                 session_list.push(session);
             }
         }
@@ -1788,6 +1772,7 @@ mod test {
 
     pub(super) fn session(id: &str, workspace: &str) -> HarnessSession {
         HarnessSession {
+            purpose: crate::session::SessionPurpose::Conversation,
             id: id.into(),
             primary_agent_id: HarnessSession::primary_agent_id(id),
             name: id.into(),

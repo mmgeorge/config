@@ -1441,6 +1441,8 @@ fn rust_import(
     }
 }
 
+type TypescriptImport = (Vec<String>, Option<String>, bool, bool, DeclarationPosition);
+
 fn typescript_import(
     node: Node<'_>,
     source: &str,
@@ -1455,11 +1457,7 @@ fn typescript_import(
     });
     let export = node.kind() == "export_statement";
     let mut imports = Vec::new();
-    fn gather(
-        node: Node<'_>,
-        source: &str,
-        imports: &mut Vec<(Vec<String>, Option<String>, bool, bool, DeclarationPosition)>,
-    ) {
+    fn gather(node: Node<'_>, source: &str, imports: &mut Vec<TypescriptImport>) {
         match node.kind() {
             "import_specifier" | "export_specifier" => {
                 if let Some(name) = node.child_by_field_name("name") {

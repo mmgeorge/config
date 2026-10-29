@@ -22,17 +22,20 @@ local success, failure = xpcall(function()
     local config = require("forge.infra.config")
     config.setup({})
     local client = require("forge.client")
-    client.host_accepting = function() return true end
-    client.host_generation = function() return 1 end
-    client.subscribe = function() return function() end end
+    client.host_is_accepting = function() return true end
+    client.host_get_generation = function() return 1 end
+    client.session_events_subscribe = function() return function() end end
     _G.open_response = nil
-    client.request_for = function(_, method, params, callback)
+    client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
-      if method == "harness.document" and params.operation == "open" then
+      if method == "session.document" and params.operation == "open" then
         open_response = { document = params.document, callback = callback }
-      elseif method == "harness.document" and params.operation == "background_terminals" then
+      elseif method == "session.document" and params.operation == "background_terminals" then
         callback({ supported = false })
-      elseif method == "health.get" then callback({ responsive = true })
+      elseif method == "session.health.get" then callback({ responsive = true })
       else callback({ patch = {} }) end
     end
     _G.state = require("forge.session").harness

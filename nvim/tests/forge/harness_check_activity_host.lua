@@ -43,7 +43,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   vim.schedule(function() callback({ ok = true, path = executable }) end)
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors, answered = {}, {}
 vim.notify = function(message, level)
@@ -58,7 +58,7 @@ local function answer_permissions()
       for _, item in ipairs(approval.item_list) do
         answers[#answers + 1] = { item_id = item.id, choice_id = "allow_once" }
       end
-      client.request("approval.resolve", { approval_id = approval.id, answer_list = answers }, function(_, failure)
+      client.request({ method = "session.approval.resolve", params = { approval_id = approval.id, answer_list = answers }, session_id = assert(require("forge.session").harness.session).id }, function(_, failure)
         assert(not failure, failure)
       end)
     end
@@ -70,7 +70,7 @@ end
 ---@return table
 local function request(method, params)
   local settled, value, failure
-  client.request(method, params or {}, function(result, message) value, failure, settled = result, message, true end)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, message) value, failure, settled = result, message, true end)
   assert(vim.wait(10000, function() answer_permissions() return settled end, 10), method .. " timed out")
   assert(not failure, method .. ": " .. tostring(failure))
   return value
@@ -98,18 +98,18 @@ local succeeded, failure = xpcall(function()
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), table.concat(errors, "\n"))
   local prompt_failure
-  client.request("prompt.submit", { text = "Read while checks run" }, function(_, message) prompt_failure = message end)
+  client.request({ method = "session.prompt.submit", params = { text = "Read while checks run" }, session_id = assert(require("forge.session").harness.session).id }, function(_, message) prompt_failure = message end)
   assert(vim.wait(3000, function() return presentation_text():find("Working", 1, true) ~= nil end, 10),
     "provider did not start: " .. tostring(prompt_failure) .. "\n" .. presentation_text() .. "\n" .. table.concat(errors, "\n"))
-  request("turn.cancel")
+  request("session.turn.cancel")
   assert(vim.wait(3000, function() return state.presentation and state.presentation.status_view.snapshot and #state.presentation.status_view.snapshot.block == 0 end, 10))
-  local run_id = request("checks.run", { check = { "activity", "empty" } }).run_id
+  local run_id = request("session.check.run", { check = { "activity", "empty" } }).run_id
   assert(vim.wait(3000, function()
     answer_permissions()
     return presentation_text():find("Activity fixture", 1, true) ~= nil
       and presentation_text():find("Checks running", 1, true) ~= nil
   end, 10), "live check did not reach the status area")
-  local snapshot = request("state.get")
+  local snapshot = request("session.state.get")
   assert(snapshot.checks_running and snapshot.active_check_run == run_id)
   assert(snapshot.status.kind == "idle", "check replaced the primary phase")
   local running = presentation_text()
@@ -122,7 +122,7 @@ local succeeded, failure = xpcall(function()
   if hold > 0 then vim.wait(hold, function() vim.cmd("redraw") return false end, 20) end
   local result
   assert(vim.wait(10000, function()
-    result = request("checks.status", { run_id = run_id })
+    result = request("session.check.status", { run_id = run_id })
     return result.state ~= "running"
   end, 20), "check did not finish")
   assert(result.state == "passed", vim.inspect(result))
@@ -130,7 +130,7 @@ local succeeded, failure = xpcall(function()
     return presentation_text():find("Checks finished", 1, true) ~= nil
       and presentation_text():find("Checks running", 1, true) == nil
   end, 10), "completion did not move the result into history")
-  local completed = request("state.get")
+  local completed = request("session.state.get")
   assert(not completed.checks_running and (completed.active_check_run == nil or completed.active_check_run == vim.NIL))
   assert(completed.status.kind == "idle", "completion changed primary work")
   local _, count = presentation_text():gsub("Checks finished", "")
@@ -192,11 +192,11 @@ local succeeded, failure = xpcall(function()
   if hold > 0 then vim.wait(hold, function() vim.cmd("redraw") return false end, 20) end
 
   local session_id = state.session.id
-  local exchange = request("exchange.list")[1]
+  local exchange = request("session.exchange.list")[1]
   assert(exchange and exchange.completed_at_ms, "fixture exchange did not settle")
   require("forge.views.harness.workspace").release(state)
   state.presentation.close()
-  client.stop()
+  client.host_stop()
   assert(vim.wait(5000, function() return client._client.process == nil end, 10), "first host did not stop")
 
   -- Seed the provider-owned persisted form of this actual run before the next host opens it.
@@ -205,7 +205,7 @@ local succeeded, failure = xpcall(function()
   record.run.owner = { kind = "exchange", session_id = session_id, exchange_id = exchange.id, node_count = 0 }
   vim.fn.writefile({ vim.json.encode(record) }, record_path)
   local restored, restore_error
-  client.start_harness(function(value, problem) restored, restore_error = value, problem end, { session_id = session_id })
+  client.session_initialize(function(value, problem) restored, restore_error = value, problem end, { session_id = session_id })
   assert(vim.wait(10000, function() return restored or restore_error end, 10), "history host did not reopen")
   assert(not restore_error, restore_error)
   require("forge.views.harness.session_navigation").activate(restored, {
@@ -216,7 +216,7 @@ local succeeded, failure = xpcall(function()
     "restored exchange hid its check summary inside collapsed activity: " .. presentation_text()
       .. "\nhistory=" .. vim.inspect(vim.tbl_map(function(entry)
         return {id = entry.id, state = entry.state, owner = entry.owner}
-      end, request("checks.list").history))
+      end, request("session.check.list").history))
       .. "\nerrors=" .. vim.inspect(errors))
   local sequence = state.presentation.transcript.sequence
   local function assert_visible_check()
@@ -276,12 +276,12 @@ local succeeded, failure = xpcall(function()
     end
     error("Rust callback command is missing")
   end
-  local streaming_id = request("checks.run", { check = { "rust-stream" }, inputs = { test = "streaming" } }).run_id
+  local streaming_id = request("session.check.run", { check = { "rust-stream" }, inputs = { test = "streaming" } }).run_id
   assert(vim.wait(30000, function()
     answer_permissions()
     return presentation_text():find("    running 1 test", 1, true) ~= nil
   end, 10), "Rust callback buffered output until exit: " .. presentation_text())
-  local active_rust = request("checks.status", { run_id = streaming_id })
+  local active_rust = request("session.check.status", { run_id = streaming_id })
   assert(active_rust.state == "running", "streaming evidence arrived only after Cargo finished")
   local live_text = presentation_text()
   assert(live_text:find("Rust streaming fixture", 1, true), live_text)
@@ -292,7 +292,7 @@ local succeeded, failure = xpcall(function()
   vim.fn.writefile({ "release" }, rust_root .. "/release-check")
   local rust_result
   assert(vim.wait(15000, function()
-    rust_result = request("checks.status", { run_id = streaming_id })
+    rust_result = request("session.check.status", { run_id = streaming_id })
     return rust_result.state ~= "running"
   end, 20), "Rust streaming check did not finish")
   assert(rust_result.state == "passed", vim.inspect(rust_result))
@@ -304,10 +304,10 @@ local succeeded, failure = xpcall(function()
       and presentation_text():find("running 1 test", 1, true) == nil
   end, 10), "completed Rust output did not collapse")
   for _, exact_test in ipairs({ "failure", "missing" }) do
-    local failed_id = request("checks.run", { check = { "rust-stream" }, inputs = { test = exact_test } }).run_id
+    local failed_id = request("session.check.run", { check = { "rust-stream" }, inputs = { test = exact_test } }).run_id
     local failed
     assert(vim.wait(15000, function()
-      failed = request("checks.status", { run_id = failed_id })
+      failed = request("session.check.status", { run_id = failed_id })
       return failed.state ~= "running"
     end, 20), "Rust failure fixture did not finish")
     assert(failed.state == "failed", "streaming converted a failed or unmatched test into success")
@@ -316,7 +316,7 @@ local succeeded, failure = xpcall(function()
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(original_directory)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

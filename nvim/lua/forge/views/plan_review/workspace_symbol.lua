@@ -72,9 +72,9 @@ function M.request(query, current, receive)
   local normalized = query.name:gsub("::", ".")
   local leaf = normalized:match("([^.]+)$")
   pending = #clients
-  deadline = vim.uv.new_timer()
+  deadline = assert(vim.uv.new_timer())
   deadline:start(5000, 0, vim.schedule_wrap(function() finish(nil, "Workspace symbol lookup timed out after five seconds") end))
-  guard = vim.uv.new_timer()
+  guard = assert(vim.uv.new_timer())
   guard:start(50, 50, vim.schedule_wrap(function() if not valid() then finish(nil, nil, "cancelled") end end))
   for _, client in ipairs(clients) do
     local sent, id = client:request("workspace/symbol", { query = leaf }, function(failure, result)

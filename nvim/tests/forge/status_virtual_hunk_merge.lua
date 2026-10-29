@@ -62,7 +62,7 @@ git({ "commit", "--quiet", "-m", "semantic hunk fixture" })
 for _, entry in ipairs(source) do vim.fn.writefile(source_rows(entry, true), fixture .. "/" .. entry.path) end
 
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local github = require("forge.integrations.gh")
 github.prs_for_branch_async = function(_, _, _, callback) vim.schedule(function() callback({ ok = true, prs = {} }) end) end
 github.current_pr_async = function(_, callback) vim.schedule(function() callback({ ok = true }) end) end
@@ -77,7 +77,7 @@ local status = require("forge.status")
 local state = status.open({ workspace = fixture })
 ---@type table<integer, boolean>
 local context_ready = {}
-local unsubscribe = client.subscribe_document(state.document, function(event, payload)
+local unsubscribe = client.document_events_subscribe(state.document, function(event, payload)
   if event == "status.update" and payload.phase == "context" then
     for _, body in ipairs(payload.body or {}) do context_ready[body.file] = true end
   end
@@ -171,7 +171,7 @@ end, debug.traceback)
 
 unsubscribe()
 status.close(state)
-client.stop()
+client.host_stop()
 assert(vim.wait(10000, function() return client._client.process == nil end, 20), "Forge host did not stop")
 vim.notify = original_notify
 if not success then

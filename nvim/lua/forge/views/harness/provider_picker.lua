@@ -272,7 +272,7 @@ function M.open_mcp(options)
       if name then loading_name = name end
       if animation_timer then return end
       animation_index = 1
-      animation_timer = vim.uv.new_timer()
+      animation_timer = assert(vim.uv.new_timer())
       animation_timer:start(120, 120, vim.schedule_wrap(function()
         if closed or not picker.is_open(owner) or (options.is_current and not options.is_current()) then
           stop_animation()

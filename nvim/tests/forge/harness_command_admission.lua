@@ -45,7 +45,10 @@ warnings = {}
 local client = require("forge.client")
 require("forge.views.harness.prompt_history").record = function() end
 local requests = {}
-client.request_for = function(_, method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   requests[#requests + 1] = { method = method, params = params }
   callback({})
 end
@@ -61,7 +64,7 @@ for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
   assert(#state.queue == 0)
 end
-assert(#requests == 2 and requests[1].method == "plan.list" and requests[2].method == "plan.list")
+assert(#requests == 2 and requests[1].method == "session.plan.list" and requests[2].method == "session.plan.list")
 state.busy = true
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan" })
 controller.submit()
@@ -81,10 +84,14 @@ end
 state.busy = true
 local input = require("forge.views.harness.input_state")
 local input_host
-local request = client.request_for
-client.request_for = function(session_id, method, params, callback)
+local request = client.request
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   if input_host and input_host.request(method, params, callback) then return end
-  request(session_id, method, params, callback)
+  request({ session_id = session_id, method = method, params = params }, callback)
 end
 state.presentation = { capture_prompt = function()
   return { document = "composer", buffer = state.composer_buf, is_current = function() return true end }

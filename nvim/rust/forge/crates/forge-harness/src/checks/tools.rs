@@ -664,43 +664,6 @@ impl CheckSupervisor {
         )
     }
 
-    /// Publishes temporary user controls as project defaults and clears only their owning task.
-    pub(crate) async fn save_defaults(
-        &self,
-        task_id: Option<&str>,
-        sink: Option<&BackendEventSink>,
-    ) -> Result<Value> {
-        let catalog = self.catalog(task_id)?;
-        let mut snapshot = ConfigSnapshot::load(&self.workspace)?;
-        let overrides = self.overrides(task_id)?;
-        for definition in &mut snapshot.config.definitions {
-            if let Some(auto) = overrides.auto.get(&definition.id) {
-                definition.auto = *auto;
-            }
-            if let Some(enabled) = overrides.enabled.get(&definition.id) {
-                definition.enabled = *enabled;
-            }
-            if let Some(scope) = overrides.scopes.get(&definition.id) {
-                definition.scope = *scope;
-            }
-        }
-        self.configure(
-            self.session_owner(),
-            ConfigureChecks {
-                expected_revision: catalog["revision"]
-                    .as_str()
-                    .context("configuration revision unavailable")?
-                    .into(),
-                config: snapshot.config,
-                helpers: Vec::new(),
-            },
-            sink,
-            None,
-        )
-        .await?;
-        self.set_overrides(task_id, Default::default())
-    }
-
     /// Validates captured identities before saving settings and opaque helper sources.
     pub(crate) async fn configure(
         &self,

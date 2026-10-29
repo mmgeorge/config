@@ -223,8 +223,10 @@ mod tests {
     fn entry(exchange: Exchange) -> TimelineEntry {
         TimelineEntry::Exchange {
             id: exchange.id.clone(),
+
             created_at_ms: exchange.created_at_ms,
-            exchange,
+            exchange: exchange.into(),
+
             agent_by_id: Default::default(),
         }
     }

@@ -1,4 +1,4 @@
----@module 'blink.cmp'
+---@class ForgeFileCompletionSource
 local FileSource = {}
 
 local cache = {}

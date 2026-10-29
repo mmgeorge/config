@@ -274,7 +274,7 @@ function CommandSource:get_completions(_, callback)
   local spawn_start = prefix:match("^%s*/agents%s+spawn%s+()([^%s]*)$")
   local profile_action, profile_start = edit_start and "edit" or "spawn", edit_start or spawn_start
   if profile_start then
-    client.request("agent.profiles.get", {}, function(snapshot, failure)
+    client.request({ method = "agent.profile.get", params = {} }, function(snapshot, failure)
       if not failure and snapshot and snapshot.document then
         for name, profile in pairs(snapshot.document.profiles) do
           if profile.enabled or profile_action == "edit" then

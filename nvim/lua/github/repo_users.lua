@@ -39,7 +39,7 @@ function M.fetch_async(opts)
   end
   local succeeded, failure = pcall(function()
     if runner_for_test then runner_for_test(params, finish)
-    else require("forge.client").request_host("github.metadata", params, finish) end
+    else require("forge.client").request({ method = "github.repository.metadata", params = params }, finish) end
   end)
   if not succeeded then finish(nil, failure) end
 end

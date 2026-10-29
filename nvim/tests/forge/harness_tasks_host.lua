@@ -12,7 +12,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local state = require("forge.session").harness
@@ -20,7 +20,7 @@ local controller = require("forge.views.harness.controller")
 local task = require("forge.views.harness.task")
 local function latest_exchange(matches)
   local snapshot, failure
-  client.request("exchange.list", {}, function(result, problem) snapshot, failure = result, problem end)
+  client.request({ method = "session.exchange.list", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(result, problem) snapshot, failure = result, problem end)
   assert(vim.wait(5000, function() return snapshot or failure end, 10), "snapshot stalled")
   assert(not failure, failure)
   for index = #snapshot, 1, -1 do
@@ -36,7 +36,7 @@ local function wait_settled()
 end
 local function raw_request(method, params)
   local received, result, failure
-  client.request_for(state.session.id, method, params, function(value, problem)
+  client.request({ session_id = state.session.id, method = method, params = params }, function(value, problem)
     result, failure, received = value, problem, true
   end)
   assert(vim.wait(5000, function() return received end, 10), method .. " did not complete")
@@ -63,7 +63,7 @@ local success, failure = xpcall(function()
   held:wait()
   local original = latest_exchange()
   assert(original.state == "running")
-  assert(raw_request("prompt.submit", { operation_id = "raw-host-goal", text = "/goal Verify canonical raw routing" }).state == "completed")
+  assert(raw_request("session.prompt.submit", { operation_id = "raw-host-goal", text = "/goal Verify canonical raw routing" }).state == "completed")
   assert(vim.wait(5000, function()
     local current = task.current(state)
     return current and current.kind == "goal" and current.entry and current.entry.delivery == "accepted"
@@ -75,14 +75,14 @@ local success, failure = xpcall(function()
   end, 10), "raw goal did not use the canonical task-start presentation")
   local rendered = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(not rendered:find("Steering: /goal", 1, true), "raw command became literal steering")
-  assert(raw_request("goal.pause", { operation_id = "raw-host-pause" }).state == "completed")
+  assert(raw_request("session.goal.pause", { operation_id = "raw-host-pause" }).state == "completed")
   assert(vim.wait(5000, function() return task.status(task.current(state)) == "paused" end, 10))
-  assert(raw_request("goal.resume", { operation_id = "raw-host-resume" }).state == "completed")
+  assert(raw_request("session.goal.resume", { operation_id = "raw-host-resume" }).state == "completed")
   assert(vim.wait(5000, function()
     local current = task.current(state)
     return current and task.status(current) == "running" and current.entry.delivery == "accepted"
   end, 10))
-  assert(raw_request("goal.clear", { operation_id = "raw-host-clear" }).state == "completed")
+  assert(raw_request("session.goal.clear", { operation_id = "raw-host-clear" }).state == "completed")
   assert(vim.wait(5000, function() return task.current(state) == nil end, 10))
   assert(latest_exchange().id == original.id and latest_exchange().state == "running", "raw control cancelled the held provider")
   held:release()
@@ -157,7 +157,7 @@ local success, failure = xpcall(function()
     "transcript retained task routing authority")
 
 end, debug.traceback)
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath

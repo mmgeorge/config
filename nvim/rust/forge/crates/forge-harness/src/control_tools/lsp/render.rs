@@ -158,7 +158,6 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
                 }
                 if arguments.operation != Operation::Diagnostics {
                     if arguments.operation == Operation::Overview {
-                        let mut indent = 0;
                         let previous = super::display_path(&previous_path, workspace);
                         let previous_parts: Vec<_> = previous.split('/').collect();
                         let parts: Vec<_> = display.split('/').collect();
@@ -168,7 +167,7 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
                             {
                                 block.push_str(&format!(
                                     "{}{}{}\n",
-                                    "  ".repeat(indent),
+                                    "  ".repeat(part_index),
                                     part,
                                     if part_index + 1 < parts.len() {
                                         "/"
@@ -177,7 +176,6 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
                                     }
                                 ));
                             }
-                            indent += 1;
                         }
                     } else {
                         block.push_str(&format!(

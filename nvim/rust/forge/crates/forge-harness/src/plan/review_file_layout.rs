@@ -631,11 +631,9 @@ fn rust_edges(
             continue;
         };
         let first = first.as_str();
-        let remainder = if first == "crate" || first == package.name.replace('-', "_") {
-            import.path.get(1..).unwrap_or_default()
-        } else if first == "self" {
-            import.path.get(1..).unwrap_or_default()
-        } else if first == "super" {
+        let remainder = if matches!(first, "crate" | "self" | "super")
+            || first == package.name.replace('-', "_")
+        {
             import.path.get(1..).unwrap_or_default()
         } else {
             continue;

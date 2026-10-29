@@ -4,14 +4,14 @@ local buffer = require("forge.buffer")
 
 function M.open(options)
   local owner = { document = "harness:tool:" .. tostring(vim.uv.hrtime()), closed = false, more = true, pending = false,
-    host_generation = client.host_generation() }
+    host_generation = client.host_get_generation() }
   local window = options.window
   local origin = vim.api.nvim_win_get_buf(window)
   local function notice(message)
     if options.notice then options.notice(message) else vim.notify(message, vim.log.levels.ERROR, { title = "Forge tool output" }) end
   end
   local function alive()
-    return not owner.closed and owner.host_generation == client.host_generation()
+    return not owner.closed and owner.host_generation == client.host_get_generation()
       and owner.replica and vim.api.nvim_buf_is_valid(owner.replica.buffer)
   end
   local function failed(message)
@@ -26,7 +26,7 @@ function M.open(options)
     end
   end
   local function request(params, callback)
-    if owner.host_generation ~= client.host_generation() then
+    if owner.host_generation ~= client.host_get_generation() then
       callback(params.operation == "close" and {} or nil, params.operation ~= "close" and "Harness host generation changed" or nil)
       return
     end
@@ -36,7 +36,7 @@ function M.open(options)
       if completed then return end
       completed = true
       if deadline then deadline:stop() deadline:close() deadline = nil end
-      if owner.host_generation ~= client.host_generation() then
+      if owner.host_generation ~= client.host_get_generation() then
         if not owner.closed then failed("Forge host changed. Reopen tool output to reconnect.") end
         return
       end
@@ -46,7 +46,7 @@ function M.open(options)
     deadline = vim.defer_fn(function()
       receive(nil, "Tool output request timed out; press r to refresh before retrying")
     end, 30000)
-    client.request_for(options.session_id, "harness.document", params, receive)
+    client.request({ session_id = options.session_id, method = "session.document", params = params }, receive)
   end
   function owner.close()
     if owner.closed then return end

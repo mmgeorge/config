@@ -13,7 +13,7 @@ local function metadata(value, accepted)
       range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = #value } } } } }
 end
 adapter._set_runner_for_test(function(method, params, callback)
-  assert(method == "issue.document")
+  assert(method == "github.issue.document")
   if params.operation == "open" then
     captured = vim.deepcopy(params)
     local result = { snapshot = { document = params.document, revision = revision,
@@ -53,9 +53,9 @@ options.repository.name = "changed"
 assert(vim.wait(1000, function() return state.shown end))
 
 local client = require("forge.client")
-local original_generation = client.host_generation
+local original_generation = client.host_get_generation
 local generation = original_generation()
-client.host_generation = function() return generation end
+client.host_get_generation = function() return generation end
 vim.bo[state.replica.buffer].modifiable = true
 vim.api.nvim_buf_set_text(state.replica.buffer, 0, 0, 0, 7, { "retained draft" })
 adapter.save(state)
@@ -70,7 +70,7 @@ assert(state.replica.editable.region.body.revision == accepted)
 assert(editable.capture_draft(state.replica.editable)[1].text == "newer retained draft")
 assert(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false)[1] == "newer retained draft")
 assert(errors[#errors]:find("host changed", 1, true))
-client.host_generation = original_generation
+client.host_get_generation = original_generation
 
 state.fields = { { region = "body", baseline = "initial", revision = 0 } }
 local original_document, original_buffer = state.document, state.replica.buffer

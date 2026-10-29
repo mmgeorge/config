@@ -50,7 +50,7 @@ local function comparison_snapshot(document, file)
 end
 
 status._set_runner_for_test(function(method, params, callback)
-  assert(method == "status", "BranchDiff must use the native status route")
+  assert(method == "repository.status.document", "BranchDiff must use the native status route")
   if params.operation == "comparison" then
     if params.reference == "missingbranch" then
       callback(nil, "Git diff failed: unknown revision or path not in the working tree")
@@ -79,7 +79,7 @@ status._set_runner_for_test(function(method, params, callback)
 end)
 
 source_document._set_runner_for_test(function(method, params, callback)
-  assert(method == "source.document" and params.operation == "open", "BranchDiff must use the native source route")
+  assert(method == "repository.source.document" and params.operation == "open", "BranchDiff must use the native source route")
   callback({
     title = "src/a.txt", object = "bbb2222", revision = "bbb2222", source_row = 1, more = false,
     snapshot = { document = params.document, revision = 0,

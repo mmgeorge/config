@@ -1,4 +1,4 @@
-local k = require("keys")
+local k = require("keyboard_layout")
 local utils = require("utils")
 
 -- vim.g.clipboard = {
@@ -81,6 +81,7 @@ k.keymap({ 'n', 'x' }, 'k', up)
 k.keymap({ 'n', 'x' }, 'l', down)
 
 if vim.g.vscode then
+  ---@type {action: fun(command: string, options?: {args?: table})}
   local vscode = require('vscode')
   k.keymap({'n', 'x'}, 'k', function()
     vscode.action('editorScroll', { args = { to = 'up', by = 'line', value = 10 } })
@@ -260,7 +261,7 @@ end)
 k.keymap({ 'n', 'x' }, 'ou', function() vim.diagnostic.open_float(nil, { focus = false }) end)
 k.keymap('n', 'ou', vim.lsp.buf.hover)
 k.keymap('n', 'oe', function()
-  vim.diagnostic.open_float(0)
+      vim.diagnostic.open_float({ bufnr = 0 })
 end)
 -- keymap('n', 'ot', vim.lsp.buf.type_definition)
 -- k.keymap('n', 'ow', vim.lsp.buf.rename)

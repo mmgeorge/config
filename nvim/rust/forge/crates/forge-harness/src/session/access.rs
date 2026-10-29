@@ -164,8 +164,10 @@ mod tests {
     fn validates_and_deduplicates_directory_identity() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().to_string_lossy().into_owned();
-        let mut policy = AccessPolicy::default();
-        policy.writable_directory = vec![path.clone()];
+        let policy = AccessPolicy {
+            writable_directory: vec![path.clone()],
+            ..Default::default()
+        };
         let policy = policy.validate()?;
         assert_eq!(policy.writable_roots("/workspace").len(), 2);
         let mut duplicate = policy.clone();

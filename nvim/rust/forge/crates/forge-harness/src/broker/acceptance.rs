@@ -108,18 +108,17 @@ impl BrokerObserver {
                 ));
                 effects.plan.push(plan.clone());
                 let clearing=current.is_some_and(|task| matches!(&task.workflow,TaskWorkflow::Plan { plan:active } if active.artifact.id==plan.id));
-                if clearing {
-                    if let Some(mut exchange) = store.latest_exchange(&self.session_id)?
-                        && exchange.state() == ExchangeState::Running
-                        && exchange.execution_started_at_ms().is_none()
-                        && exchange
-                            .turn
-                            .iter()
-                            .all(|turn| turn.state() != crate::turn::TurnState::Running)
-                    {
-                        exchange.finish(crate::exchange::ExchangeOutcome::Cancelled, now_ms)?;
-                        effects.exchange.push(exchange);
-                    }
+                if clearing
+                    && let Some(mut exchange) = store.latest_exchange(&self.session_id)?
+                    && exchange.state() == ExchangeState::Running
+                    && exchange.execution_started_at_ms().is_none()
+                    && exchange
+                        .turn
+                        .iter()
+                        .all(|turn| turn.state() != crate::turn::TurnState::Running)
+                {
+                    exchange.finish(crate::exchange::ExchangeOutcome::Cancelled, now_ms)?;
+                    effects.exchange.push(exchange);
                 }
                 let change = if clearing {
                     TaskChange::Clear

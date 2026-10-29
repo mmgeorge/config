@@ -50,7 +50,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 require("forge.views.harness.controller").resolve_runtime_model = function() end
 ---@type string[]
@@ -58,7 +58,7 @@ local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local function request(method, params)
   local result, failure, completed
-  client.request(method, params or {}, function(value, request_error)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, request_error)
     result, failure, completed = value, request_error, true
   end)
   assert(vim.wait(10000, function() return completed end, 10), method .. " timed out")
@@ -72,10 +72,10 @@ local success, failure = xpcall(function()
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.ready and state.session end, 10))
   request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {}, windows_sandbox = "elevated" } })
-  request("backend.models")
-  request("session.permission", { change = { kind = "enable_yolo" } })
-  request("prompt.submit", { text = "Read the simulated ACP child updates" })
-  local snapshot = request("state.get")
+  request("session.provider.model.list")
+  request("session.permission.set", { change = { kind = "enable_yolo" } })
+  request("session.prompt.submit", { text = "Read the simulated ACP child updates" })
+  local snapshot = request("session.state.get")
   local child, nested, unfinished, unfinished_nested
   for _, agent in pairs(snapshot.agent.run or {}) do
     if agent.provider_thread_id == "child" then child = agent end
@@ -89,7 +89,7 @@ local success, failure = xpcall(function()
   assert(unfinished and unfinished_nested, "unfinished child identities were not retained")
   assert(snapshot.agent.summary[unfinished.id].state == "interrupted")
   assert(snapshot.agent.summary[unfinished_nested.id].state == "interrupted")
-  local main = request("exchange.list")
+  local main = request("session.exchange.list")
   assert(#main == 1 and main[1].state == "complete")
   assert(main[1].turn[1].tool.item["shared-tool-id"].title == "Root check", "child tool fields leaked across session identity")
   local root_text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
@@ -147,7 +147,7 @@ local success, failure = xpcall(function()
   assert(not nested_text:find("CHILD_CONTENT_VERIFIED", 1, true))
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)
-client.stop()
+client.host_stop()
 local collected = vim.wait(6000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath

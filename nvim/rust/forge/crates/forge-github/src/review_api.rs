@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -50,14 +50,6 @@ pub struct ReviewPage {
     pub records: Vec<Value>,
     pub next_cursor: Option<String>,
     pub complete: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ReviewCollection {
-    pub records: Vec<Value>,
-    pub next_cursor: Option<String>,
-    pub complete: bool,
-    pub diagnostic: Option<String>,
 }
 
 pub trait GithubReviewRemote: GithubRemote {
@@ -169,43 +161,5 @@ impl GithubService {
                 .map_err(anyhow::Error::from)
         })
         .await
-    }
-
-    /// Collect metadata through complete, nonrepeating remote pagination.
-    pub async fn review_collection(
-        &self,
-        directory: std::path::PathBuf,
-        remote: Arc<dyn GithubReviewRemote>,
-        mut request: ReviewReadRequest,
-    ) -> Result<ReviewCollection> {
-        request.validate()?;
-        let mut collection = ReviewCollection {
-            records: Vec::new(),
-            next_cursor: request.cursor.clone(),
-            complete: false,
-            diagnostic: None,
-        };
-        let mut visited = std::collections::HashSet::new();
-        loop {
-            let page = self
-                .review_page(directory.clone(), Arc::clone(&remote), request.clone())
-                .await?;
-            ensure!(
-                page.complete == page.next_cursor.is_none(),
-                "remote pagination omitted completion identity"
-            );
-            collection.records.extend(page.records);
-            collection.next_cursor = page.next_cursor.clone();
-            collection.complete = page.complete;
-            if page.complete {
-                return Ok(collection);
-            }
-            let cursor = page.next_cursor.context("incomplete page omitted cursor")?;
-            ensure!(
-                visited.insert(cursor.clone()),
-                "remote document repeated its pagination cursor"
-            );
-            request.cursor = Some(cursor);
-        }
     }
 }

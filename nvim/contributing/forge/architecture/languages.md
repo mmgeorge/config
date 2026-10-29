@@ -67,10 +67,10 @@ plan-specific declaration projection. Native parsing uses the shared syntax
 workers. Extracted declaration lists and query results remain request-scoped.
 The existing exact-source syntax cache is unchanged.
 
-Lua captures authorized live snapshots and calls the correlated `lsp.analyze`
+Lua captures authorized live snapshots and calls the correlated `session.lsp.analyze`
 route. Rust validates the active request scope before native analysis, then checks
 it throughout the await. This route bypasses the busy broker lock, like
-`lsp.authorize` and `lsp.respond`. Rust validates returned paths and renders one
+`session.lsp.authorize` and `session.lsp.respond`. Rust validates returned paths and renders one
 shared location gutter with budgeted source excerpts, or aligned call trees. Snapshot guards cover every
 contributing buffer and disk source, including semantic destinations.
 
@@ -110,7 +110,7 @@ setting generation. It admits at most four requests per host, each with a
 allow 30 seconds after startup. The Rust transport watchdog allows 75 seconds for
 ordinary queries and 105 seconds for path searches, including startup and delivery. Correlated
 `lsp.request` events reach an editor adapter
-independently of the selected view. The `lsp.authorize` and `lsp.respond` routes
+independently of the selected view. The `session.lsp.authorize` and `session.lsp.respond` routes
 bypass the busy broker lock. Target authorization precedes editor reads, and Rust
 checks returned paths again before publishing bounded text. Cancellation drops
 the pending identity and sends `lsp.cancel`. Late replies cannot revive it.
@@ -296,7 +296,7 @@ Rust renders only complete paths within the response budget.
 Explicit agent structural queries use `SyntaxEngine::analyze_full` without a
 source-byte or line cutoff. Rendering continues to use `analyze` with its existing
 line cutoff. Cache keys separate cutoff results from full parsing for large sources.
-The `lsp.analyze` route accepts ordered UTF-8 source chunks, validates the active
+The `session.lsp.analyze` route accepts ordered UTF-8 source chunks, validates the active
 request and read authority for every chunk, and assembles one source under the
 pending request. Cancellation releases unfinished transfer state. Chunking preserves
 the transport frame limit without rejecting large source files.

@@ -5,7 +5,7 @@ local layout = require("forge.views.harness.layout")
 local controller = require("forge.views.harness.controller")
 local state = require("forge.session").harness
 local client = require("forge.client")
-client.subscribe = function() return function() end end
+client.session_events_subscribe = function() return function() end end
 
 vim.keymap.set("n", "gks", "<Cmd>close!<CR>")
 vim.keymap.set("n", "gkb", "<Cmd>bd<CR>")

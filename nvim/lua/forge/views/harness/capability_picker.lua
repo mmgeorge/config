@@ -5,8 +5,8 @@ local picker = require("forge.views.picker")
 local M = {}
 
 ---@param host table
-function M.open(host)
-  client.request("backend.capabilities", {}, function(manifest, request_error)
+function M.open(host, session_id)
+  client.request({ session_id = session_id, method = "session.provider.capabilities.get", params = {} }, function(manifest, request_error)
     if request_error then
       notifications.error(request_error, "Harness capabilities")
       return

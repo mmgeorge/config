@@ -32,6 +32,14 @@ pub enum ExchangeOrigin {
     },
 }
 
+impl ExchangeOrigin {
+    pub fn task_continuation(reason: impl Into<String>) -> Self {
+        Self::TaskContinuation {
+            reason: reason.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,13 +84,5 @@ mod tests {
             )
             .is_err()
         );
-    }
-}
-
-impl ExchangeOrigin {
-    pub fn task_continuation(reason: impl Into<String>) -> Self {
-        Self::TaskContinuation {
-            reason: reason.into(),
-        }
     }
 }

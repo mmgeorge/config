@@ -1,6 +1,6 @@
 local layout = require("forge.views.harness.layout")
 local state = require("forge.session").harness
-require("forge.client").subscribe = function() return function() end end
+require("forge.client").session_events_subscribe = function() return function() end end
 vim.keymap.set("n", "gks", "<Cmd>close!<CR>")
 vim.keymap.set("n", "gkb", "<Cmd>bd<CR>")
 state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =

@@ -20,9 +20,11 @@ store.request = function(snapshot, changed, callback)
   end
   callback({ revision = revision, settings = vim.deepcopy(preferences) })
 end
-client.request_for = function(_, method, _, callback)
-  if method == "trace.status" then callback({ enabled = false })
-  elseif method == "backend.models" then callback({
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+  if method == "host.trace.status" then callback({ enabled = false })
+  elseif method == "session.provider.model.list" then callback({
     { id = "gpt-6-luna", reasoning = { "low", "medium", "high" }, default_reasoning = "low", service_tiers = { "fast" } },
     { id = "second-model", reasoning = { "low", "high" }, default_reasoning = "low", service_tiers = { "fast", "ultrafast" } },
   })

@@ -232,7 +232,7 @@ local function run()
   forge.set_git_backend(backend)
   forge.setup({ about_auto_generate = false })
   status._set_runner_for_test(function(method, params, callback)
-    assert_true(method == "status", "file revision status must use the native route")
+    assert_true(method == "repository.status.document", "file revision status must use the native route")
     if params.operation == "open" then
       callback(native_status_snapshot(params.document))
     elseif params.operation == "demand" then
@@ -272,7 +272,7 @@ local function run()
     end
   end)
   require("forge.source_document")._set_runner_for_test(function(method, params, callback)
-    assert_true(method == "source.document", "revision must use shared native source route")
+    assert_true(method == "repository.source.document", "revision must use shared native source route")
     if params.operation ~= "open" then callback({ closed = true }) return end
     local path = vim.base64.decode(params.path)
     if path == "b.txt" or params.revision == "missingrev" then

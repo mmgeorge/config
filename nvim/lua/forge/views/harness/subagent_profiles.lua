@@ -80,9 +80,9 @@ function Profiles.open(state, host, selected_name)
         elseif document.default_profile == original_name then
           done("Select another default profile before clearing this default") return
         end
-        client.request_for(session_id, "agent.profiles.save", {
+        client.request({ session_id = session_id, method = "agent.profile.save", params = {
           expected_revision = snapshot.revision, document = document,
-        }, function(result, failure)
+        } }, function(result, failure)
           if not current() then done("Harness session changed while saving the profile") return end
           if failure then done(failure) return end
           snapshot, original_name = result, edited.name
@@ -91,7 +91,7 @@ function Profiles.open(state, host, selected_name)
       end,
       reload = function(done)
         if not current() then done(nil, "Harness session changed. Reopen the profile editor") return end
-        client.request_for(session_id, "agent.profiles.get", {}, function(result, failure)
+        client.request({ session_id = session_id, method = "agent.profile.get", params = {} }, function(result, failure)
           if not current() then done(nil, "Harness session changed while reloading the profile") return end
           if failure or result.error then done(nil, failure or result.error) return end
           snapshot = result
@@ -107,9 +107,9 @@ function Profiles.open(state, host, selected_name)
   end
   local function save_list(document)
     saving = true
-    client.request_for(session_id, "agent.profiles.save", {
+    client.request({ session_id = session_id, method = "agent.profile.save", params = {
       expected_revision = snapshot.revision, document = document,
-    }, function(result, failure)
+    } }, function(result, failure)
       saving = false
       if not current() then return end
       if failure then notifications.error(failure, "Subagent profiles") return end
@@ -165,7 +165,7 @@ function Profiles.open(state, host, selected_name)
         { id = "open-config", key = "oc", desc = "Open config file", callback = function()
           if saving then return end
           picker.close()
-          local opened, failure = pcall(vim.cmd, "tabedit " .. vim.fn.fnameescape(snapshot.path))
+          local opened, failure = pcall(vim.api.nvim_cmd, { cmd = "tabedit", args = { snapshot.path } }, {})
           if not opened then notifications.error(failure, "Subagent profiles") end
         end },
         { id = "next-field", key = "<Tab>", callback = function(context)
@@ -188,7 +188,7 @@ function Profiles.open(state, host, selected_name)
         { id = "reload", key = "<C-r>", callback = function()
           if saving then return end
           saving = true
-          client.request_for(session_id, "agent.profiles.get", {}, function(result, failure)
+          client.request({ session_id = session_id, method = "agent.profile.get", params = {} }, function(result, failure)
             saving = false
             if not current() then return end
             if failure then notifications.error(failure, "Subagent profiles") return end
@@ -201,7 +201,7 @@ function Profiles.open(state, host, selected_name)
     }
     if picker.is_open("subagent-profiles") then picker.update(spec) else picker.open(spec) end
   end
-  client.request_for(session_id, "agent.profiles.get", {}, function(result, failure)
+  client.request({ session_id = session_id, method = "agent.profile.get", params = {} }, function(result, failure)
     if not current() then return end
     if failure then notifications.error(failure, "Subagent profiles") return end
     snapshot = result

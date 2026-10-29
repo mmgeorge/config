@@ -9,7 +9,7 @@ local function metadata(target, count)
 end
 status._set_runner_for_test(function(method, params, callback)
   requests[#requests + 1] = params.operation
-  assert(method == "status", method)
+  assert(method == "repository.status.document", method)
   if params.operation == "open" then
     callback({ document = params.document, revision = 0, view = { kind = "status" },
       head = { state = "attached", reference = "main", object = "abc" }, context = vim.NIL,

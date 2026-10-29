@@ -1,4 +1,4 @@
-local key = require("../keys").key
+local key = require("keyboard_layout").key
 
 local colors = {
   red = "#ef3573",

@@ -386,7 +386,7 @@ command and preserves the complete log without imposing a total-content limit.
 Missing logs for started commands, invalid cursors, and decoding failures report
 errors. Unstarted commands with no log return empty text.
 
-The editor's internal `checks.list` and `checks.status` service routes retain
+The editor's internal `session.check.list` and `session.check.status` service routes retain
 their full catalog and run shapes. The agent tools do not serialize those
 snapshots during polling.
 

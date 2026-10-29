@@ -14,7 +14,31 @@ use std::sync::atomic::Ordering;
 const CHECKPOINT_WARNING: &str =
     "Workspace-wide deviation detection is unavailable without a repository checkpoint.";
 
+pub(super) struct ExecutionCapture {
+    pub(super) permit: crate::task::TaskPermit,
+    pub(super) record: PlanExecutionRecord,
+}
+
 impl HarnessBroker {
+    /// Capture the execution record and its update permit from the same selected task revision.
+    pub(super) fn capture_execution(&self) -> Result<Option<ExecutionCapture>> {
+        let Some(task) = self.task_controller.current()? else {
+            return Ok(None);
+        };
+        let permit = task.permit();
+        let crate::task::TaskWorkflow::Execute { execution } = task.workflow else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            execution.record.session_id == self.session.id,
+            "execution belongs to another session"
+        );
+        Ok(Some(ExecutionCapture {
+            permit,
+            record: execution.record,
+        }))
+    }
+
     pub(super) async fn scan_execution_conformance(
         &mut self,
         execution: &PlanExecutionRecord,
@@ -147,14 +171,12 @@ impl HarnessBroker {
     }
 
     pub(super) async fn scan_execution(&mut self, execution_id: &str) -> Result<Value> {
-        let permit = self
-            .task_controller
-            .current()?
-            .context("execution task is missing")?
-            .permit();
-        let mut execution = self
-            .current_execution()?
-            .filter(|execution| execution.id == execution_id)
+        let ExecutionCapture {
+            permit,
+            record: mut execution,
+        } = self
+            .capture_execution()?
+            .filter(|capture| capture.record.id == execution_id)
             .context("execution is missing")?;
         let document = self.plan_file.read_submitted_document(
             &self.session.id,
@@ -749,12 +771,11 @@ impl HarnessBroker {
         interaction: &mut Exchange,
         reason: String,
     ) -> Result<()> {
-        let permit = self
-            .task_controller
-            .current()?
-            .context("execution task is missing")?
-            .permit();
-        let Some(mut execution) = self.current_execution()? else {
+        let Some(ExecutionCapture {
+            permit,
+            record: mut execution,
+        }) = self.capture_execution()?
+        else {
             return Ok(());
         };
         if execution.state == PlanExecutionState::Complete {
@@ -813,12 +834,11 @@ impl HarnessBroker {
     }
 
     pub(super) fn observe_plan_progress(&mut self, interaction: &Exchange) -> Result<bool> {
-        let permit = self
-            .task_controller
-            .current()?
-            .context("execution task is missing")?
-            .permit();
-        let Some(mut execution) = self.current_execution()? else {
+        let Some(ExecutionCapture {
+            permit,
+            record: mut execution,
+        }) = self.capture_execution()?
+        else {
             return Ok(false);
         };
         let document = self.plan_file.read_submitted_document(

@@ -19,7 +19,7 @@ use crate::broker::{
     prepare_provider_fork,
 };
 use crate::command::{CommandAdmission, CommandIdentity, ExecutionPermit, SessionCoordinator};
-use crate::protocol::{HarnessMethod, validate_root_control};
+use crate::protocol::{RuntimeMethod, validate_root_control};
 use crate::session::{ProviderForkState, SessionLeaseConflict, SessionStore};
 use crate::storage::SqliteStore;
 use crate::task::command as session_command;
@@ -28,6 +28,8 @@ use crate::task::command as session_command;
 mod input_delivery;
 #[path = "service/review_questions.rs"]
 mod review_questions;
+#[path = "service/shared.rs"]
+mod shared;
 #[path = "service/task_state.rs"]
 mod task_state;
 
@@ -38,18 +40,22 @@ enum CheckOperation {
     Cancel,
     Override,
     Run,
-    SaveDefaults,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitializationMode {
+    Services,
+    Session,
 }
 
 impl CheckOperation {
-    fn from_method(method: HarnessMethod) -> Option<Self> {
+    fn from_method(method: RuntimeMethod) -> Option<Self> {
         Some(match method {
-            HarnessMethod::ChecksList => Self::List,
-            HarnessMethod::ChecksStatus => Self::Status,
-            HarnessMethod::ChecksCancel => Self::Cancel,
-            HarnessMethod::ChecksOverride => Self::Override,
-            HarnessMethod::ChecksRun => Self::Run,
-            HarnessMethod::ChecksSaveDefaults => Self::SaveDefaults,
+            RuntimeMethod::SessionCheckList => Self::List,
+            RuntimeMethod::SessionCheckStatus => Self::Status,
+            RuntimeMethod::SessionCheckCancel => Self::Cancel,
+            RuntimeMethod::SessionCheckOverride => Self::Override,
+            RuntimeMethod::SessionCheckRun => Self::Run,
             _ => return None,
         })
     }
@@ -161,7 +167,7 @@ impl HarnessService {
     ) -> Result<String> {
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
-        let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
+        let session_id = session_id.context("an explicit session_id is required")?;
         let controller = registry.resolve(&session_id).await?;
         let action = controller
             .presentation
@@ -181,7 +187,7 @@ impl HarnessService {
     ) -> Result<Value> {
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
-        let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
+        let session_id = session_id.context("an explicit session_id is required")?;
         let controller = registry.resolve(&session_id).await?;
         match &request {
             crate::buffer::session::PresentationRequest::Recap { model }
@@ -441,8 +447,27 @@ impl HarnessService {
         initialize: InitializeRequest,
     ) -> Result<Response> {
         let _activity = self.admit().await?;
-        match self.initialize(initialize).await {
+        match self
+            .initialize(initialize, InitializationMode::Session)
+            .await
+        {
             Ok(snapshot) => Ok(Response::success(request_id, snapshot)?),
+            Err(error) => Ok(initialize_failure(request_id, &error)),
+        }
+    }
+
+    /// Initialize shared runtime services without creating or selecting a session.
+    pub async fn initialize_services(
+        &self,
+        request_id: u64,
+        initialize: InitializeRequest,
+    ) -> Result<Response> {
+        let _activity = self.admit().await?;
+        match self
+            .initialize(initialize, InitializationMode::Services)
+            .await
+        {
+            Ok(result) => Ok(Response::success(request_id, result)?),
             Err(error) => Ok(initialize_failure(request_id, &error)),
         }
     }
@@ -454,19 +479,19 @@ impl HarnessService {
     pub async fn prepare(
         &self,
         session_id: Option<&str>,
-        method: HarnessMethod,
+        method: RuntimeMethod,
     ) -> Result<Option<ExecutionPermit>> {
         let _activity = self.admit().await?;
         if method.requires_provider_fork() {
             let registry = self.registry().await?;
-            let session_id = session_id.unwrap_or(&registry.initial_session_id);
+            let session_id = session_id.context("an explicit session_id is required")?;
             let controller = registry.resolve(session_id).await?;
             let _control = Arc::clone(&controller.coordinator.control)
                 .try_acquire_owned()
                 .map_err(|_| {
                     crate::broker::RequestNotAdmitted("Harness cleanup is still running")
                 })?;
-            let interrupted_checks = if method == HarnessMethod::PromptSubmit {
+            let interrupted_checks = if method == RuntimeMethod::SessionPromptSubmit {
                 if let Some(run_id) = controller.checks.active()? {
                     controller.interrupt_checks(session_id, &run_id).await?;
                     true
@@ -494,7 +519,7 @@ impl HarnessService {
             };
             controller
                 .cancellation
-                .arm(method == HarnessMethod::PromptSubmit);
+                .arm(method == RuntimeMethod::SessionPromptSubmit);
             return Ok(Some(execution));
         }
         Ok(None)
@@ -520,36 +545,37 @@ impl HarnessService {
         {
             candidate.params["operation_id"] = json!(id);
         }
-        let command =
-            if HarnessMethod::decode(&candidate.method)? == HarnessMethod::QuestionContinue {
-                let registry = self.registry().await?;
-                let controller = registry
-                    .resolve(session_id.unwrap_or(&registry.initial_session_id))
-                    .await?;
-                let prior = if let Some(id) = candidate.params["operation_id"].as_str() {
-                    SqliteStore::read_only(&controller.data_root)?
-                        .load_task_operation(controller.observer.session_id(), id)?
-                } else {
-                    None
-                };
-                let target = if prior.is_none() {
-                    controller
-                        .task_controller
-                        .current()?
-                        .and_then(|task| match task.workflow {
-                            crate::task::TaskWorkflow::Plan { plan } => plan
-                                .artifact
-                                .acceptance
-                                .map(|acceptance| (plan.artifact.id, acceptance.review_digest)),
-                            _ => None,
-                        })
-                } else {
-                    None
-                };
-                SessionCommand::question_continue(&candidate, prior.as_ref(), target)?
+        let command = if RuntimeMethod::decode(&candidate.method)?
+            == RuntimeMethod::SessionQuestionContinue
+        {
+            let registry = self.registry().await?;
+            let controller = registry
+                .resolve(session_id.context("an explicit session_id is required")?)
+                .await?;
+            let prior = if let Some(id) = candidate.params["operation_id"].as_str() {
+                SqliteStore::read_only(&controller.data_root)?
+                    .load_task_operation(controller.observer.session_id(), id)?
             } else {
-                SessionCommand::parse_request(&candidate)?
+                None
             };
+            let target = if prior.is_none() {
+                controller
+                    .task_controller
+                    .current()?
+                    .and_then(|task| match task.workflow {
+                        crate::task::TaskWorkflow::Plan { plan } => plan
+                            .artifact
+                            .acceptance
+                            .map(|acceptance| (plan.artifact.id, acceptance.review_digest)),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+            SessionCommand::question_continue(&candidate, prior.as_ref(), target)?
+        } else {
+            SessionCommand::parse_request(&candidate)?
+        };
         if let Some(command) = command {
             let identity = request.params.get("_command").cloned();
             *request = command.to_request(request.id)?;
@@ -598,11 +624,11 @@ impl HarnessService {
         }
     }
 
-    /// Persist transition ordering on the host input lane before concurrent execution begins.
+    /// Persist transition ordering before the admitted request begins execution.
     pub async fn prepare_task(&self, session_id: Option<&str>, request: &Request) -> Result<()> {
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
-        let session_id = session_id.unwrap_or(&registry.initial_session_id);
+        let session_id = session_id.context("an explicit session_id is required")?;
         let controller = registry.resolve(session_id).await?;
         let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         let mut request = request.clone();
@@ -642,11 +668,11 @@ impl HarnessService {
             .params
             .as_object_mut()
             .and_then(|params| params.remove("_command"));
-        if request.method == "command.status" {
+        if request.method == "session.command.status.get" {
             let registry = self.registry().await?;
             let session_id = session_id
                 .as_deref()
-                .unwrap_or(&registry.initial_session_id);
+                .context("an explicit session_id is required")?;
             let controller = registry.resolve(session_id).await?;
             let id = request.params["id"]
                 .as_str()
@@ -667,7 +693,7 @@ impl HarnessService {
         let registry = self.registry().await?;
         let owner_id = session_id
             .as_deref()
-            .unwrap_or(&registry.initial_session_id);
+            .context("an explicit session_id is required")?;
         let controller = registry.resolve(owner_id).await?;
         if let Some(epoch) = &identity.runtime_epoch {
             ensure!(
@@ -733,8 +759,8 @@ impl HarnessService {
         sink: &MessageSender,
         mut admission: Option<ExecutionPermit>,
     ) -> Result<()> {
-        let method = HarnessMethod::decode(&request.method)?;
-        if method == HarnessMethod::Shutdown {
+        let method = RuntimeMethod::decode(&request.method)?;
+        if method == RuntimeMethod::HostShutdown {
             let initialized = self.registry.lock().await.is_some();
             self.shutdown(Duration::from_secs(2)).await?;
             let result = if initialized {
@@ -748,8 +774,12 @@ impl HarnessService {
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
         registry.runtime.lsp.attach(sink.clone());
-        let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
-        if method == HarnessMethod::PromptSubmit && request.params["queued"].as_bool() == Some(true)
+        if shared::handles(method) {
+            return shared::dispatch(registry, session_id, request, sink).await;
+        }
+        let session_id = session_id.context("an explicit session_id is required")?;
+        if method == RuntimeMethod::SessionPromptSubmit
+            && request.params["queued"].as_bool() == Some(true)
         {
             ensure!(
                 admission.is_none(),
@@ -757,7 +787,7 @@ impl HarnessService {
             );
             admission = Some(self.prepare_queued_prompt(&session_id).await?);
         }
-        if method == HarnessMethod::AttachmentImport {
+        if method == RuntimeMethod::SessionAttachmentImport {
             registry.resolve(&session_id).await?;
             let root = PathBuf::from(&registry.initialize.data_root);
             let path = PathBuf::from(
@@ -793,9 +823,9 @@ impl HarnessService {
         let mut prompt_admission = None;
         let edit_trace = if matches!(
             method,
-            HarnessMethod::PlanEntityRename
-                | HarnessMethod::PlanTestsDelete
-                | HarnessMethod::PlanChecksUpdate
+            RuntimeMethod::SessionPlanEntityRename
+                | RuntimeMethod::SessionPlanTestDelete
+                | RuntimeMethod::SessionPlanCheckUpdate
         ) {
             let params = request
                 .params
@@ -821,12 +851,12 @@ impl HarnessService {
             .map(|trace| trace.stage("service.capture_submission"));
         if matches!(
             method,
-            HarnessMethod::PlanAcceptanceBegin
-                | HarnessMethod::PlanRequestChanges
-                | HarnessMethod::PlanCancel
-                | HarnessMethod::PlanEntityRename
-                | HarnessMethod::PlanTestsDelete
-                | HarnessMethod::PlanChecksUpdate
+            RuntimeMethod::SessionPlanAcceptanceBegin
+                | RuntimeMethod::SessionPlanChangesRequest
+                | RuntimeMethod::SessionPlanCancel
+                | RuntimeMethod::SessionPlanEntityRename
+                | RuntimeMethod::SessionPlanTestDelete
+                | RuntimeMethod::SessionPlanCheckUpdate
         ) {
             let params = request
                 .params
@@ -837,9 +867,9 @@ impl HarnessService {
                 let input = serde_json::from_value::<forge_buffer::input::DocumentInput>(review)?;
                 if matches!(
                     method,
-                    HarnessMethod::PlanTestsDelete
-                        | HarnessMethod::PlanChecksUpdate
-                        | HarnessMethod::PlanEntityRename
+                    RuntimeMethod::SessionPlanTestDelete
+                        | RuntimeMethod::SessionPlanCheckUpdate
+                        | RuntimeMethod::SessionPlanEntityRename
                 ) {
                     params.insert(
                         "review_document".into(),
@@ -876,7 +906,7 @@ impl HarnessService {
         if let Some(stage) = capture_stage {
             stage.complete(json!({}));
         }
-        if method == HarnessMethod::PromptSubmit {
+        if method == RuntimeMethod::SessionPromptSubmit {
             let params = request
                 .params
                 .as_object_mut()
@@ -922,8 +952,10 @@ impl HarnessService {
             method,
             sink,
             &self.syntax,
-            &mut admission,
-            &mut prompt_admission,
+            RequestAdmission {
+                execution: &mut admission,
+                prompt: &mut prompt_admission,
+            },
         ))
         .await;
         if let Some(stage) = edit_total {
@@ -1055,7 +1087,11 @@ impl HarnessService {
             .context("Harness is not initialized")
     }
 
-    async fn initialize(&self, initialize: InitializeRequest) -> Result<Value> {
+    async fn initialize(
+        &self,
+        initialize: InitializeRequest,
+        mode: InitializationMode,
+    ) -> Result<Value> {
         let startup_started = std::time::Instant::now();
         let mut startup_timing = serde_json::Map::new();
         let mut harness = self.registry.lock().await;
@@ -1063,7 +1099,20 @@ impl HarnessService {
             "registry_ready_ms".into(),
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
         );
-        ensure!(harness.is_none(), "Harness is already initialized");
+        if let Some(registry) = harness.as_ref() {
+            ensure!(
+                registry.initialize.data_root == initialize.data_root
+                    && registry.initialize.workspace == initialize.workspace,
+                "runtime is already initialized for a different workspace or data root"
+            );
+            if mode == InitializationMode::Services {
+                return Ok(json!({"initialized":true}));
+            }
+            ensure!(
+                registry.initial_session_id.is_none(),
+                "Harness is already initialized"
+            );
+        }
         if let Some(root) = &initialize.config_dir {
             crate::settings::SettingsStore::open(PathBuf::from(&initialize.data_root).as_path())?
                 .configure_catalog(PathBuf::from(root).as_path())?;
@@ -1087,16 +1136,25 @@ impl HarnessService {
             .unwrap_or_else(|| {
                 crate::workspace::WorkspaceKind::Untracked(PathBuf::from(&initialize.workspace))
             });
-        let runtime = BrokerRuntime::initialize(
-            &initialize,
-            workspace_kind,
-            Arc::clone(&self.repositories),
-            Arc::clone(&self.diff),
-        )?;
+        let runtime = if let Some(registry) = harness.as_ref() {
+            registry.runtime.clone()
+        } else {
+            BrokerRuntime::initialize(
+                &initialize,
+                workspace_kind,
+                Arc::clone(&self.repositories),
+                Arc::clone(&self.diff),
+            )?
+        };
         startup_timing.insert(
             "runtime_ready_ms".into(),
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
         );
+        if mode == InitializationMode::Services {
+            SqliteStore::open(PathBuf::from(&initialize.data_root).as_path())?;
+            *harness = Some(SessionControllerRegistry::new(None, runtime, initialize));
+            return Ok(json!({"initialized":true,"startup_timing":{"phases":startup_timing}}));
+        }
         let startup_request = initialize.clone();
         let startup_runtime = runtime.clone();
         let (mut broker, snapshot) = tokio::task::spawn_blocking(move || {
@@ -1117,8 +1175,7 @@ impl HarnessService {
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
         );
         *harness = Some(SessionControllerRegistry::new(
-            snapshot.session.id.clone(),
-            SessionController::new(broker)?,
+            Some((snapshot.session.id.clone(), SessionController::new(broker)?)),
             runtime,
             initialize,
         ));
@@ -1408,7 +1465,7 @@ impl SessionController {
                         return Ok(());
                     }
                     if let Some(request) = broker.expire_input(&mut active_deadline)? {
-                        if request.method == "question.continue" {
+                        if request.method == "session.question.continue" {
                             message_sink
                                 .send_event(SessionEvent {
                                     session_id: session_id.clone(),
@@ -1522,7 +1579,7 @@ struct SessionControllerRegistry {
     fork_task: Mutex<JoinSet<()>>,
     runtime: Arc<BrokerRuntime>,
     initialize: InitializeRequest,
-    initial_session_id: String,
+    initial_session_id: Option<String>,
 }
 
 /// Coordinates queued child work with one asynchronous provider fork.
@@ -1561,22 +1618,26 @@ impl ProviderForkGate {
 impl SessionControllerRegistry {
     /// Build the registry with the session selected by broker initialization.
     fn new(
-        initial_session_id: String,
-        controller: Arc<SessionController>,
+        initial: Option<(String, Arc<SessionController>)>,
         runtime: Arc<BrokerRuntime>,
         initialize: InitializeRequest,
     ) -> Arc<Self> {
+        let initial_session_id = initial.as_ref().map(|(id, _)| id.clone());
         Arc::new(Self {
-            controller_by_id: RwLock::new(HashMap::from([(
-                initial_session_id.clone(),
-                controller,
-            )])),
+            controller_by_id: RwLock::new(initial.into_iter().collect()),
             provider_fork_by_id: RwLock::new(HashMap::new()),
             fork_task: Mutex::new(JoinSet::new()),
             runtime,
             initialize,
             initial_session_id,
         })
+    }
+
+    #[cfg(test)]
+    fn initial_session_id(&self) -> &str {
+        self.initial_session_id
+            .as_deref()
+            .expect("test requires an opened session")
     }
 
     /// Resolve an existing controller or resume its durable session into this process.
@@ -1802,24 +1863,34 @@ fn checks_event_sink(
     sink
 }
 
+struct RequestAdmission<'request> {
+    execution: &'request mut Option<ExecutionPermit>,
+    prompt: &'request mut Option<PromptAdmission>,
+}
+
 async fn route_request(
     registry: Arc<SessionControllerRegistry>,
     session_id: String,
     request: Request,
-    method: HarnessMethod,
+    method: RuntimeMethod,
     message_sink: &MessageSender,
     syntax: &Arc<SyntaxEngine>,
-    admission: &mut Option<ExecutionPermit>,
-    prompt_admission: &mut Option<PromptAdmission>,
+    permits: RequestAdmission<'_>,
 ) -> Result<()> {
+    let RequestAdmission {
+        execution: admission,
+        prompt: prompt_admission,
+    } = permits;
     if matches!(
         method,
-        HarnessMethod::LspAuthorize | HarnessMethod::LspRespond | HarnessMethod::LspAnalyze
+        RuntimeMethod::SessionLspAuthorize
+            | RuntimeMethod::SessionLspRespond
+            | RuntimeMethod::SessionLspAnalyze
     ) {
         let id = request.params["id"]
             .as_str()
             .context("LSP response requires id")?;
-        let result = if method == HarnessMethod::LspAuthorize {
+        let result = if method == RuntimeMethod::SessionLspAuthorize {
             registry
                 .runtime
                 .lsp
@@ -1829,7 +1900,7 @@ async fn route_request(
                     serde_json::from_value(request.params["paths"].clone())?,
                 )
                 .await?
-        } else if method == HarnessMethod::LspAnalyze {
+        } else if method == RuntimeMethod::SessionLspAnalyze {
             registry
                 .runtime
                 .lsp
@@ -1871,101 +1942,25 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if matches!(
-        method,
-        HarnessMethod::BackendModelPins | HarnessMethod::BackendModelPin
-    ) {
-        let data_root = PathBuf::from(&registry.initialize.data_root);
-        let parameter = request.params;
-        let identifier_list = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            let backend = parameter
-                .get("backend")
-                .and_then(Value::as_str)
-                .context("model pin request requires backend")?;
-            let mut store = crate::storage::model_pin::ModelPinStore::open(&data_root)?;
-            if method == HarnessMethod::BackendModelPins {
-                store.load(backend)
-            } else {
-                let model = parameter
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .context("backend.model_pin requires model")?;
-                let pinned = parameter
-                    .get("pinned")
-                    .and_then(Value::as_bool)
-                    .context("backend.model_pin requires pinned")?;
-                store.set(backend, model, pinned)
-            }
-        })
-        .await
-        .context("model pin storage task failed")??;
-        message_sink
-            .send_response(Response::success(request.id, identifier_list)?)
-            .await?;
-        return Ok(());
-    }
-    if matches!(
-        method,
-        HarnessMethod::TraceStatus
-            | HarnessMethod::TraceConfigure
-            | HarnessMethod::TraceToggle
-            | HarnessMethod::TraceClear
-            | HarnessMethod::TraceSessionClear
-    ) {
-        let trace = registry.runtime.trace();
-        match method {
-            HarnessMethod::TraceConfigure => {
-                let enabled = request
-                    .params
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .context("trace enabled is required")?;
-                if request.params.get("default_only").and_then(Value::as_bool) == Some(true) {
-                    trace.configure_default(enabled)?;
-                } else {
-                    trace.configure(enabled)?;
-                }
-            }
-            HarnessMethod::TraceToggle => {
-                trace.toggle()?;
-            }
-            HarnessMethod::TraceClear => {
-                trace.clear()?;
-            }
-            HarnessMethod::TraceSessionClear => {
-                trace.clear_session(&session_id)?;
-            }
-            _ => {}
-        }
-        message_sink
-            .send_response(Response::success(
-                request.id,
-                serde_json::to_value(trace.session_status(&session_id))?,
-            )?)
-            .await?;
-        return Ok(());
-    }
-    if method == HarnessMethod::SessionResume {
+    if method == RuntimeMethod::SessionResume {
         return resume_session(registry, request, message_sink).await;
     }
-    if method == HarnessMethod::SessionDelete {
+    if method == RuntimeMethod::SessionDelete {
         return delete_session(registry, &session_id, request, message_sink).await;
     }
-    if method == HarnessMethod::SessionFork {
+    if method == RuntimeMethod::SessionFork {
         start_session_fork(
             registry,
             session_id,
             request.params,
             Some(request.id),
+            crate::session::SessionPurpose::Conversation,
             message_sink,
         )
         .await?;
         return Ok(());
     }
-    if matches!(
-        method,
-        HarnessMethod::SessionNew | HarnessMethod::SessionClear
-    ) {
+    if matches!(method, RuntimeMethod::SessionNew) {
         return route_new_session(registry, session_id, request, message_sink).await;
     }
     let controller = registry.resolve(&session_id).await?;
@@ -1977,17 +1972,19 @@ async fn route_request(
     controller.attach_input(message_sink).await?;
     if matches!(
         method,
-        HarnessMethod::InputApply | HarnessMethod::InputGet | HarnessMethod::InputOperation
+        RuntimeMethod::SessionInputApply
+            | RuntimeMethod::SessionInputGet
+            | RuntimeMethod::SessionInputOperationGet
     ) {
         return controller
             .input_request(request, method, message_sink)
             .await;
     }
-    if method == HarnessMethod::PlanAnswerQuestions {
+    if method == RuntimeMethod::SessionPlanQuestionAnswer {
         return review_questions::answer(registry, controller, session_id, request, message_sink)
             .await;
     }
-    if method == HarnessMethod::SessionConfigure
+    if method == RuntimeMethod::SessionConfigure
         && request
             .params
             .as_object()
@@ -2004,7 +2001,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::BackendMockResponse {
+    if method == RuntimeMethod::SessionProviderMockResponse {
         let control = controller
             .backend
             .mock_response_control()
@@ -2022,7 +2019,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::BackendModels {
+    if method == RuntimeMethod::SessionProviderModelList {
         let catalog = controller.catalog_request.read().await.clone();
         let selected = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?
             .load_session(&session_id)?
@@ -2068,7 +2065,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::SessionConfigure
+    if method == RuntimeMethod::SessionConfigure
         && request.params.as_object().is_some_and(|fields| {
             !fields.is_empty()
                 && fields
@@ -2131,7 +2128,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::SessionConfigure
+    if method == RuntimeMethod::SessionConfigure
         && request
             .params
             .as_object()
@@ -2197,7 +2194,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::InputTimeoutConfigure {
+    if method == RuntimeMethod::SessionInputTimeoutConfigure {
         let catalog = controller.catalog_request.read().await.clone();
         let mut settings = crate::settings::SettingsStore::open(
             PathBuf::from(&registry.initialize.data_root).as_path(),
@@ -2262,188 +2259,9 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if matches!(
-        method,
-        HarnessMethod::SettingsGet
-            | HarnessMethod::SettingsUpdate
-            | HarnessMethod::SettingsReset
-            | HarnessMethod::SettingsImportPreview
-            | HarnessMethod::SettingsImportApply
-            | HarnessMethod::BackendSkillsSetEnabled
-            | HarnessMethod::BackendMcpSetEnabled
-    ) {
-        let catalog = controller.catalog_request.read().await.clone();
-        let mut settings = crate::settings::SettingsStore::open(
-            PathBuf::from(&registry.initialize.data_root).as_path(),
-        )?;
-        if method == HarnessMethod::SettingsGet {
-            let snapshot = settings.catalog(
-                &catalog.workspace,
-                &session_id,
-                &registry.initialize.backend.kind,
-            )?;
-            let mut value = serde_json::to_value(snapshot.settings)?;
-            value["catalog"] = json!({"mcp":snapshot.server,"skill":snapshot.skill});
-            value["layers"] = json!({
-                "global":settings.layer_settings(crate::settings::SettingScope::Global,&catalog.workspace,&session_id)?,
-                "workspace":settings.layer_settings(crate::settings::SettingScope::Workspace,&catalog.workspace,&session_id)?,
-                "session":settings.layer_settings(crate::settings::SettingScope::Session,&catalog.workspace,&session_id)?,
-            });
-            value["application"] = serde_json::to_value(settings.application(&session_id)?)?;
-            message_sink
-                .send_response(Response::success(request.id, value)?)
-                .await?;
-            return Ok(());
-        }
-        if method == HarnessMethod::SettingsImportPreview {
-            let (_, preview) = preview_native_import(
-                settings,
-                &request.params,
-                &catalog,
-                &registry.initialize.backend.kind,
-            )
-            .await?;
-            let result = serde_json::to_value(preview)?;
-            message_sink
-                .send_response(Response::success(request.id, result)?)
-                .await?;
-            return Ok(());
-        }
-        let operation_id = request
-            .params
-            .get("operation_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let receipt = json!({"method":request.method,"params":request.params});
-        let mutation = if let Some(mutation) =
-            settings.operation(&session_id, &operation_id, &receipt)?
-        {
-            mutation
-        } else {
-            let resource_mutation = matches!(
-                method,
-                HarnessMethod::BackendSkillsSetEnabled | HarnessMethod::BackendMcpSetEnabled
-            );
-            let revision = match request.params["expected_revision"].as_u64() {
-                Some(revision) => revision,
-                None if resource_mutation => {
-                    settings
-                        .get(
-                            &catalog.workspace,
-                            &session_id,
-                            &registry.initialize.backend.kind,
-                        )?
-                        .revision
-                }
-                None => anyhow::bail!("settings require expected_revision"),
-            };
-            let default_scope = if method == HarnessMethod::SettingsImportApply {
-                "workspace"
-            } else {
-                "global"
-            };
-            let scope = serde_json::from_value(
-                request
-                    .params
-                    .get("scope")
-                    .cloned()
-                    .unwrap_or(json!(default_scope)),
-            )?;
-            if method == HarnessMethod::SettingsImportApply {
-                let fingerprint = request.params["fingerprint"]
-                    .as_str()
-                    .context("native import preview fingerprint is required")?;
-                let selected: Vec<String> =
-                    serde_json::from_value(request.params["selected"].clone())?;
-                let (restored, preview) = preview_native_import(
-                    settings,
-                    &request.params,
-                    &catalog,
-                    &registry.initialize.backend.kind,
-                )
-                .await?;
-                settings = restored;
-                let resource = preview.select(fingerprint, &selected)?;
-                settings.import_operation(
-                    revision,
-                    scope,
-                    &catalog.workspace,
-                    &session_id,
-                    &resource,
-                    &operation_id,
-                    &receipt,
-                )?
-            } else {
-                let desired = if method == HarnessMethod::SettingsReset {
-                    crate::settings::PortableSettings::default()
-                } else if resource_mutation {
-                    let name = request.params["name"]
-                        .as_str()
-                        .context("resource selection requires name")?;
-                    let requested_id = request.params["resource_id"].as_str();
-                    let enabled = request.params["enabled"]
-                        .as_bool()
-                        .context("resource selection requires enabled")?;
-                    let source = if method == HarnessMethod::BackendSkillsSetEnabled {
-                        settings
-                            .skills(&catalog.workspace)?
-                            .into_iter()
-                            .map(|entry| (entry.id, entry.name))
-                            .collect::<Vec<_>>()
-                    } else {
-                        settings
-                            .servers(&catalog.workspace)?
-                            .into_iter()
-                            .map(|entry| (entry.id, entry.name))
-                            .collect::<Vec<_>>()
-                    };
-                    let matching: Vec<_> = source
-                        .into_iter()
-                        .filter(|(id, candidate)| {
-                            requested_id.map_or(candidate == name, |requested| requested == id)
-                        })
-                        .collect();
-                    let [(id, _)] = matching.as_slice() else {
-                        anyhow::bail!(
-                            "Resource selection requires one canonical source. Import native configuration explicitly or select a resource ID"
-                        );
-                    };
-                    let id = id.clone();
-                    let mut desired =
-                        settings.layer_settings(scope, &catalog.workspace, &session_id)?;
-                    if method == HarnessMethod::BackendSkillsSetEnabled {
-                        desired.skill.insert(id, enabled);
-                    } else {
-                        desired.mcp.insert(id, enabled);
-                    }
-                    desired
-                } else {
-                    serde_json::from_value(request.params["desired"].clone())?
-                };
-                settings.update_operation(
-                    revision,
-                    scope,
-                    &catalog.workspace,
-                    &session_id,
-                    &desired,
-                    &operation_id,
-                    &receipt,
-                )?
-            }
-        };
-        drop(settings);
-        let request = Request {
-            id: request.id,
-            method: "task.transition".into(),
-            params: json!({"operation_id":operation_id,"action":"configure","config":{"settings_revision":mutation.revision,"setting_fields":mutation.field}}),
-        };
-        return route_task_transition(registry, controller, session_id, request, message_sink)
-            .await;
-    }
     let _setup_admission = if matches!(
         method,
-        HarnessMethod::BackendSetup | HarnessMethod::BackendAuthenticate
+        RuntimeMethod::SessionProviderSetup | RuntimeMethod::SessionProviderAuthenticate
     ) {
         let control = Arc::clone(&controller.coordinator.control)
             .try_acquire_owned()
@@ -2455,7 +2273,7 @@ async fn route_request(
     } else {
         None
     };
-    if method == HarnessMethod::BackendSetup {
+    if method == RuntimeMethod::SessionProviderSetup {
         let install = request
             .params
             .get("install")
@@ -2471,7 +2289,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::BackendAuthenticate {
+    if method == RuntimeMethod::SessionProviderAuthenticate {
         let method = request.params["method"]
             .as_str()
             .context("authentication method is required")?
@@ -2489,7 +2307,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::BackendCapabilities {
+    if method == RuntimeMethod::SessionProviderCapabilitiesGet {
         let manifest = tokio::time::timeout(
             Duration::from_secs(30),
             controller
@@ -2503,31 +2321,12 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if matches!(
-        method,
-        HarnessMethod::AgentProfilesGet | HarnessMethod::AgentProfilesSave
-    ) {
-        let profiles = &controller.agent_backend_factory.profiles;
-        let snapshot = if method == HarnessMethod::AgentProfilesSave {
-            let revision = request.params["expected_revision"]
-                .as_str()
-                .context("profile save requires expected_revision")?;
-            profiles.save(
-                revision,
-                serde_json::from_value(request.params["document"].clone())?,
-            )?
-        } else {
-            profiles.snapshot()?
-        };
-        message_sink
-            .send_response(Response::success(request.id, snapshot)?)
-            .await?;
-        return Ok(());
-    }
     if let Some(operation) = CheckOperation::from_method(method) {
         if matches!(
             method,
-            HarnessMethod::ChecksList | HarnessMethod::ChecksRun | HarnessMethod::ChecksOverride
+            RuntimeMethod::SessionCheckList
+                | RuntimeMethod::SessionCheckRun
+                | RuntimeMethod::SessionCheckOverride
         ) {
             controller.checks.refresh_changes().await?;
         }
@@ -2615,20 +2414,13 @@ async fn route_request(
                 let sink = checks_event_sink(message_sink.clone(), session_id.clone());
                 json!({"run_id":controller.checks.start(run,Some(sink),None,Some(admission)).await?})
             }
-            CheckOperation::SaveDefaults => {
-                let sink = checks_event_sink(message_sink.clone(), session_id.clone());
-                controller
-                    .checks
-                    .save_defaults(task_id, Some(&sink))
-                    .await?
-            }
         };
         message_sink
             .send_response(Response::success(request.id, result)?)
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::AgentModels {
+    if method == RuntimeMethod::SessionAgentModelList {
         let provider = request.params["provider"]
             .as_str()
             .context("child model catalog requires provider")?;
@@ -2664,7 +2456,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::Health {
+    if method == RuntimeMethod::SessionHealthGet {
         message_sink
             .send_control_response(Response::success(
                 request.id,
@@ -2673,7 +2465,7 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::TaskOperation {
+    if method == RuntimeMethod::SessionCommandOperationGet {
         let id = request
             .params
             .get("operation_id")
@@ -2690,18 +2482,18 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == HarnessMethod::SessionPermission {
+    if method == RuntimeMethod::SessionPermissionSet {
         let mut request = request;
         request.params["action"] = json!("permission");
         if request.params.get("operation_id").is_none() {
             request.params["operation_id"] =
                 json!(format!("permission:{session_id}:{}", request.id));
         }
-        request.method = "task.transition".into();
+        request.method = "session.command.apply".into();
         return route_task_transition(registry, controller, session_id, request, message_sink)
             .await;
     }
-    if method == HarnessMethod::TaskTransition {
+    if method == RuntimeMethod::SessionCommandApply {
         return route_task_transition(registry, controller, session_id, request, message_sink)
             .await;
     }
@@ -2710,9 +2502,9 @@ async fn route_request(
     {
         if matches!(
             method,
-            HarnessMethod::PlanAcceptanceBegin
-                | HarnessMethod::PlanRequestChanges
-                | HarnessMethod::PlanCancel
+            RuntimeMethod::SessionPlanAcceptanceBegin
+                | RuntimeMethod::SessionPlanChangesRequest
+                | RuntimeMethod::SessionPlanCancel
         ) && let Some((value, events)) = controller
             .revision_review
             .decide(method, request.params.clone())
@@ -2743,9 +2535,9 @@ async fn route_request(
     }
     let edit_trace = matches!(
         method,
-        HarnessMethod::PlanTestsDelete
-            | HarnessMethod::PlanChecksUpdate
-            | HarnessMethod::PlanEntityRename
+        RuntimeMethod::SessionPlanTestDelete
+            | RuntimeMethod::SessionPlanCheckUpdate
+            | RuntimeMethod::SessionPlanEntityRename
     )
     .then(|| {
         crate::plan::edit_trace::PlanEditTrace::new(
@@ -2793,7 +2585,7 @@ async fn route_request(
         }
         Ok::<(), anyhow::Error>(())
     });
-    let shutdown = method == HarnessMethod::Shutdown;
+    let shutdown = method == RuntimeMethod::HostShutdown;
     let mut result = Box::pin(broker.dispatch_stream(request, event_sink)).await;
     event_forwarder.await??;
     for event in result.event.drain(..) {
@@ -2842,34 +2634,6 @@ async fn publish_execution_completion(
         sink.send_response(response).await?;
     }
     Ok(())
-}
-
-async fn preview_native_import(
-    settings: crate::settings::SettingsStore,
-    params: &Value,
-    catalog: &crate::backend::BackendCatalogRequest,
-    backend: &str,
-) -> Result<(
-    crate::settings::SettingsStore,
-    crate::settings::NativeImport,
-)> {
-    let kind = serde_json::from_value(params["kind"].clone())?;
-    let source = PathBuf::from(
-        params["source"]
-            .as_str()
-            .context("native import source is required")?,
-    );
-    let scope = serde_json::from_value(params.get("scope").cloned().unwrap_or(json!("workspace")))?;
-    let workspace = catalog.workspace.clone();
-    let session_id = catalog.harness_session_id.clone();
-    let backend = backend.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let preview =
-            settings.preview_import(kind, &source, scope, &workspace, &session_id, &backend)?;
-        Ok((settings, preview))
-    })
-    .await
-    .context("native import source inspection failed")?
 }
 
 fn admit_task_intent(
@@ -3370,7 +3134,7 @@ async fn execute_task_transition(
     let mut broker = controller.broker.lock().await;
     let request = Request {
         id: 0,
-        method: "task.transition".into(),
+        method: "session.command.apply".into(),
         params: action,
     };
     let outcome = dispatch_task_attempt(
@@ -3519,6 +3283,7 @@ async fn start_session_fork(
     session_id: String,
     params: Value,
     response_id: Option<u64>,
+    purpose: crate::session::SessionPurpose,
     message_sink: &MessageSender,
 ) -> Result<(Arc<SessionController>, Arc<ProviderForkGate>)> {
     let mut task = registry.fork_task.lock().await;
@@ -3538,6 +3303,7 @@ async fn start_session_fork(
         &descriptor.capability,
         &session_id,
         &params,
+        purpose,
     )?;
     let child_session_id = preparation.child.id.clone();
     let child_controller = registry.resolve(&child_session_id).await?;
@@ -3715,7 +3481,7 @@ async fn resume_session(
 
 async fn acquire_request_broker(
     controller: &SessionController,
-    method: HarnessMethod,
+    method: RuntimeMethod,
 ) -> Result<(MutexGuard<'_, HarnessBroker>, Option<ExecutionPermit>)> {
     let admission = if method.requires_provider_fork() {
         None
@@ -3773,7 +3539,7 @@ async fn quiesce_children(controller: &SessionController) -> Result<crate::agent
 async fn route_control_request(
     controller: &SessionController,
     request: &Request,
-    method: HarnessMethod,
+    method: RuntimeMethod,
     message_sink: &MessageSender,
     syntax: &Arc<SyntaxEngine>,
     trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
@@ -3781,12 +3547,12 @@ async fn route_control_request(
 ) -> Result<bool> {
     if matches!(
         method,
-        HarnessMethod::QuestionAnswer | HarnessMethod::QuestionSkip
+        RuntimeMethod::SessionQuestionAnswer | RuntimeMethod::SessionQuestionSkip
     ) && request.params.get("target").is_some()
     {
         let started = Instant::now();
         let mut params = request.params.clone();
-        if method == HarnessMethod::QuestionSkip {
+        if method == RuntimeMethod::SessionQuestionSkip {
             params["response"] = json!({"kind":"skipped"});
         }
         let session_id = controller
@@ -3817,9 +3583,9 @@ async fn route_control_request(
     }
     if matches!(
         method,
-        HarnessMethod::PlanTestsDelete
-            | HarnessMethod::PlanChecksUpdate
-            | HarnessMethod::PlanEntityRename
+        RuntimeMethod::SessionPlanTestDelete
+            | RuntimeMethod::SessionPlanCheckUpdate
+            | RuntimeMethod::SessionPlanEntityRename
     ) {
         let dispatch = trace.map(|trace| trace.stage("service.dispatch_edit"));
         let revision_lane = trace.map(|trace| trace.stage("service.revision_lane"));
@@ -3909,25 +3675,25 @@ async fn route_control_request(
             .with_context(|| format!("{} requires {field}", request.method))
     };
     let operation = match method {
-        HarnessMethod::AgentStart => {
+        RuntimeMethod::SessionAgentStart => {
             let mut arguments = request.params.clone();
             if let Some(arguments) = arguments.as_object_mut() {
                 arguments.remove("operation_id");
             }
             Some(AgentOperation::Spawn(serde_json::from_value(arguments)?))
         }
-        HarnessMethod::AgentMessage => Some(AgentOperation::Message {
+        RuntimeMethod::SessionAgentMessageSend => Some(AgentOperation::Message {
             target: text("target")?,
             message: text("message")?,
         }),
-        HarnessMethod::AgentFollowup => Some(AgentOperation::Followup {
+        RuntimeMethod::SessionAgentFollowup => Some(AgentOperation::Followup {
             target: text("target")?,
             message: text("message")?,
         }),
-        HarnessMethod::AgentInterrupt => Some(AgentOperation::Interrupt {
+        RuntimeMethod::SessionAgentInterrupt => Some(AgentOperation::Interrupt {
             target: text("target")?,
         }),
-        HarnessMethod::AgentInterruptAll => Some(AgentOperation::InterruptAll),
+        RuntimeMethod::SessionAgentInterruptAll => Some(AgentOperation::InterruptAll),
         _ => None,
     };
     if let Some(operation) = operation {
@@ -3951,9 +3717,9 @@ async fn route_control_request(
     }
     if matches!(
         method,
-        HarnessMethod::PlanAcceptanceBegin
-            | HarnessMethod::PlanRequestChanges
-            | HarnessMethod::PlanCancel
+        RuntimeMethod::SessionPlanAcceptanceBegin
+            | RuntimeMethod::SessionPlanChangesRequest
+            | RuntimeMethod::SessionPlanCancel
     ) && let Some((value, events)) = controller
         .revision_review
         .decide(method, request.params.clone())
@@ -3970,9 +3736,9 @@ async fn route_control_request(
     }
     let _control = if matches!(
         method,
-        HarnessMethod::TurnCancel
-            | HarnessMethod::TurnRestart
-            | HarnessMethod::BackendMcpSetEnabled
+        RuntimeMethod::SessionTurnCancel
+            | RuntimeMethod::SessionTurnRestart
+            | RuntimeMethod::SettingsMcpSetEnabled
     ) {
         Some(
             Arc::clone(&controller.coordinator.control)
@@ -3984,7 +3750,7 @@ async fn route_control_request(
     };
     let catalog_request = controller.catalog_request.read().await.clone();
     let response = match method {
-        HarnessMethod::TurnCancel => {
+        RuntimeMethod::SessionTurnCancel => {
             validate_root_control(request.params.get("target"))?;
             {
                 let _child_quiescence = quiesce_children(controller).await?;
@@ -4034,7 +3800,7 @@ async fn route_control_request(
                 json!({ "cancel_requested": true }),
             )?)
         }
-        HarnessMethod::TurnRestart => {
+        RuntimeMethod::SessionTurnRestart => {
             let _child_quiescence = quiesce_children(controller).await?;
             controller.cancellation.begin_cleanup(true, false)?;
             let approval_owner = crate::backend::ExecutionOwner::root(
@@ -4065,7 +3831,7 @@ async fn route_control_request(
                 json!({ "restart_requested": true, "mode": request.params.get("mode") }),
             )?)
         }
-        HarnessMethod::TurnSteer => {
+        RuntimeMethod::SessionTurnSteer => {
             let text = request
                 .params
                 .get("text")
@@ -4104,7 +3870,7 @@ async fn route_control_request(
                 json!({ "steered": true, "delivery": "direct" }),
             )?)
         }
-        HarnessMethod::ApprovalResolve => {
+        RuntimeMethod::SessionApprovalResolve => {
             let approval_id = request
                 .params
                 .get("approval_id")
@@ -4125,7 +3891,7 @@ async fn route_control_request(
                 json!({ "resolved": true, "approval": approval }),
             )?)
         }
-        HarnessMethod::BackendSkills => Some(Response::success(
+        RuntimeMethod::SessionProviderSkillList => Some(Response::success(
             request.id,
             tokio::time::timeout(
                 Duration::from_secs(30),
@@ -4134,7 +3900,7 @@ async fn route_control_request(
             .await
             .context("skill discovery exceeded 30 seconds")??,
         )?),
-        HarnessMethod::BackendMcp => {
+        RuntimeMethod::SessionProviderMcpList => {
             let revision = controller.mcp_revision.load(Ordering::Acquire);
             let mut discovery = controller.mcp_discovery.lock().await;
             if discovery.0 != revision {
@@ -4151,7 +3917,7 @@ async fn route_control_request(
     if let Some(response) = response {
         if matches!(
             method,
-            HarnessMethod::TurnCancel | HarnessMethod::TurnRestart
+            RuntimeMethod::SessionTurnCancel | RuntimeMethod::SessionTurnRestart
         ) {
             message_sink.send_control_response(response).await?;
         } else {
@@ -4196,6 +3962,289 @@ mod tests {
     use forge_diff::cache::CacheLimits;
 
     #[tokio::test]
+    async fn lsp_callbacks_enforce_session_and_request_ownership() -> Result<()> {
+        async fn callback(
+            service: &HarnessService,
+            session_id: &str,
+            request: Request,
+            sink: &MessageSender,
+            output: &mut forge_protocol::outbound::MessageReceiver,
+        ) -> Result<Value> {
+            let envelope = json!({"id":request.id,"method":request.method,
+                "params":request.params,"session_id":session_id});
+            service
+                .dispatch(Some(session_id.into()), request, sink)
+                .await?;
+            let response: Value = serde_json::from_slice(
+                output
+                    .recv()
+                    .await?
+                    .context("LSP callback response missing")?
+                    .bytes(),
+            )?;
+            assert_eq!(response["id"], envelope["id"]);
+            assert!(response.get("error").is_none(), "{response}");
+            eprintln!(
+                "API_CAPTURE {}",
+                json!({"request":envelope,"response":response})
+            );
+            Ok(response["result"].clone())
+        }
+
+        let fixture = tempfile::tempdir()?;
+        let source = "pub fn callback_source() {}\n";
+        let path = fixture.path().join("source.rs");
+        std::fs::write(&path, source)?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        registry.runtime.lsp.attach(sink.clone());
+        registry.runtime.lsp.set_enabled(&session_id, true);
+        let policy = Arc::new(
+            crate::permissions::matcher::CompiledPermissionDocument::compile(
+                crate::permissions::document::default_permission_document(),
+                fixture.path(),
+            ),
+        );
+        let (scope, lease) = registry.runtime.lsp.scope(
+            session_id.clone(),
+            "callback-interaction".into(),
+            fixture.path().into(),
+            policy,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let work = tokio::spawn(async move {
+            scope
+                .invoke(
+                    "lsp_context",
+                    json!({"path":"source.rs","line":1,"column":1}),
+                )
+                .await
+        });
+        let event: Value = serde_json::from_slice(
+            output
+                .recv()
+                .await?
+                .context("LSP editor request missing")?
+                .bytes(),
+        )?;
+        let editor_request_id = event["payload"]["id"]
+            .as_str()
+            .context("LSP editor identity missing")?;
+        let authorization = Request {
+            id: 2,
+            method: "session.lsp.authorize".into(),
+            params: json!({"id":editor_request_id,"paths":[path]}),
+        };
+        assert!(
+            service
+                .dispatch(
+                    Some("unrelated-session".into()),
+                    authorization.clone(),
+                    &sink
+                )
+                .await
+                .is_err()
+        );
+        let authorized = callback(&service, &session_id, authorization, &sink, &mut output).await?;
+        assert_eq!(authorized[path.to_string_lossy().as_ref()], true);
+        let analyzed = callback(
+            &service,
+            &session_id,
+            Request {
+                id: 3,
+                method: "session.lsp.analyze".into(),
+                params: json!({"id":editor_request_id,"path":path,"source":source}),
+            },
+            &sink,
+            &mut output,
+        )
+        .await?;
+        assert!(
+            analyzed["declarations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|declaration| declaration["name"] == "callback_source")
+        );
+        let response = Request {
+            id: 4,
+            method: "session.lsp.respond".into(),
+            params: json!({"id":editor_request_id,"result":{"rows":[{"path":path,
+                "line":1,"column":8,"text":"pub fn callback_source()","modified":false}],"source":"buffer"}}),
+        };
+        assert_eq!(
+            callback(&service, &session_id, response.clone(), &sink, &mut output).await?["accepted"],
+            true
+        );
+        assert!(work.await??.contains("callback_source"));
+        assert!(
+            service
+                .dispatch(Some(session_id), response, &sink)
+                .await
+                .is_err()
+        );
+        drop(lease);
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_requests_work_before_any_session_exists() -> Result<()> {
+        async fn shared_response(
+            service: &HarnessService,
+            method: &str,
+            params: Value,
+        ) -> Result<Value> {
+            let (sink, mut output) = forge_protocol::outbound::channel();
+            service
+                .dispatch(
+                    None,
+                    Request {
+                        id: 42,
+                        method: method.into(),
+                        params,
+                    },
+                    &sink,
+                )
+                .await?;
+            loop {
+                let frame = output.recv().await?.context("shared response missing")?;
+                let value: Value = serde_json::from_slice(frame.bytes())?;
+                if value["id"] == 42 {
+                    ensure!(
+                        value.get("error").is_none(),
+                        "shared request failed: {value}"
+                    );
+                    return Ok(value["result"].clone());
+                }
+            }
+        }
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let response = service
+            .initialize_services(1, initialize(&fixture, "mock"))
+            .await?;
+        assert!(response.error().is_none());
+        assert_eq!(
+            shared_response(&service, "session.list", json!({})).await?,
+            json!([])
+        );
+        let settings = shared_response(&service, "settings.get", json!({})).await?;
+        let saved = shared_response(&service, "settings.update", json!({
+            "expected_revision":settings["revision"],"scope":"global","operation_id":"shared-setting",
+            "desired":{"plan_compact":true}
+        })).await?;
+        assert_eq!(saved["state"], "saved");
+        assert!(
+            shared_response(
+                &service,
+                "settings.update",
+                json!({
+                    "expected_revision":saved["revision"],"scope":"session","desired":{}
+                })
+            )
+            .await
+            .is_err()
+        );
+        let profiles = shared_response(&service, "agent.profile.get", json!({})).await?;
+        assert!(profiles["document"].is_object());
+        let permissions = shared_response(&service, "permissions.document.open", json!({})).await?;
+        assert!(permissions["source"].is_string());
+        let tracing =
+            shared_response(&service, "host.trace.configure", json!({"enabled":true})).await?;
+        assert_eq!(tracing["enabled"], true);
+        assert!(
+            tracing["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("harness-trace.jsonl")
+        );
+        assert_eq!(
+            shared_response(
+                &service,
+                "provider.model.pin.list",
+                json!({"backend":"mock"})
+            )
+            .await?,
+            json!([])
+        );
+        assert!(
+            service
+                .registry()
+                .await?
+                .controller_by_id
+                .read()
+                .await
+                .is_empty()
+        );
+        let created =
+            shared_response(&service, "session.new", json!({"name":"Explicit creation"})).await?;
+        let id = created["session"]["id"]
+            .as_str()
+            .context("new session ID missing")?;
+        let inherited = shared_response(
+            &service,
+            "session.new",
+            json!({"source_session_id":id,"name":"Explicit inheritance"}),
+        )
+        .await?;
+        assert_ne!(inherited["session"]["id"], created["session"]["id"]);
+        assert_eq!(
+            shared_response(&service, "session.list", json!({}))
+                .await?
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_initialization_does_not_create_or_select_a_session() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let request = initialize(&fixture, "mock");
+        let response = service.initialize_services(1, request.clone()).await?;
+        assert!(response.error().is_none(), "{:?}", response.error());
+        assert!(response.result().unwrap().get("session").is_none());
+        let registry = service.registry().await?;
+        assert!(registry.initial_session_id.is_none());
+        assert!(registry.controller_by_id.read().await.is_empty());
+        let database = rusqlite::Connection::open(fixture.path().join("data/harness.sqlite3"))?;
+        let count: i64 =
+            database.query_row("SELECT count(*) FROM session_record", [], |row| row.get(0))?;
+        assert_eq!(count, 0);
+        drop(registry);
+        let opened = service.open_session(2, request.clone()).await?;
+        assert!(opened.error().is_none(), "{:?}", opened.error());
+        let id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let response = service.initialize_services(3, request).await?;
+        assert!(response.error().is_none());
+        assert_eq!(
+            service.registry().await?.initial_session_id.as_deref(),
+            Some(id.as_str())
+        );
+        let count: i64 =
+            database.query_row("SELECT count(*) FROM session_record", [], |row| row.get(0))?;
+        assert_eq!(count, 1);
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn plan_review_questions_fork_without_changing_the_main_timeline() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         std::fs::write(fixture.path().join(".forge.json"), r#"{"checks":{}}"#)?;
@@ -4214,7 +4263,7 @@ mod tests {
             let result = broker
                 .dispatch(Request {
                     id: 2,
-                    method: "prompt.submit".into(),
+                    method: "session.prompt.submit".into(),
                     params: json!({"text":"/plan explain the interface"}),
                 })
                 .await;
@@ -4261,13 +4310,13 @@ mod tests {
                 serde_json::from_slice(output.recv().await.unwrap().unwrap().bytes())?;
             assert!(configured.error().is_none());
             let before_child = registry.controller_by_id.read().await.len();
-            service.dispatch(Some(session_id.clone()), Request { id: 4, method: "plan.questions.answer".into(),
+            service.dispatch(Some(session_id.clone()), Request { id: 4, method: "session.plan.question.answer".into(),
                 params: json!({"draft_source_digest":projection["saved_source_digest"],
                     "draft_annotation":[{"id":format!("question-{iteration}"),"kind":"question","source":{
                         "start_line":row["source_line"],"end_line":row["source_line"],"body":"Why this interface?"}}],
                     "review":{"document":"ask-review","view":"ask-view","sequence":iteration+1,
                         "revision":projection["snapshot"]["revision"],"block":row["block"],"position":row["position"],
-                        "target":row["target"],"action":"plan.questions.answer"}}) }, &sink).await?;
+                        "target":row["target"],"action":"session.plan.question.answer"}}) }, &sink).await?;
             let response = loop {
                 let value: Value =
                     serde_json::from_slice(output.recv().await.unwrap().unwrap().bytes())?;
@@ -4368,18 +4417,26 @@ mod tests {
         .await?;
         assert_eq!(text, "fix: preserve drafts\n\nKeep existing text.");
         assert!(backend.shutdown.load(Ordering::Acquire));
-        let requests = backend.request.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        for (request, purpose, model, effort, input) in requests.iter() {
-            assert_eq!(request.harness_session_id, "generation-fixture");
-            assert_eq!(request.workspace, "commit-workspace");
-            assert!(request.backend_session_id.is_none());
-            assert_eq!(*purpose, TextGeneration::CommitMessage);
-            assert_eq!(model, "selected-model");
-            assert_eq!(effort.as_deref(), Some("low"));
-            assert_eq!(input, "Staged diff:\n+change");
+        {
+            let requests = backend.request.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            for GenerationCall {
+                request,
+                purpose,
+                model,
+                effort,
+                input,
+            } in requests.iter()
+            {
+                assert_eq!(request.harness_session_id, "generation-fixture");
+                assert_eq!(request.workspace, "commit-workspace");
+                assert!(request.backend_session_id.is_none());
+                assert_eq!(*purpose, TextGeneration::CommitMessage);
+                assert_eq!(model, "selected-model");
+                assert_eq!(effort.as_deref(), Some("low"));
+                assert_eq!(input, "Staged diff:\n+change");
+            }
         }
-        drop(requests);
         let unsupported = SteeringBackend {
             request: Mutex::new(Vec::new()),
         };
@@ -4540,7 +4597,7 @@ mod tests {
             .controller_by_id
             .write()
             .await
-            .remove(&registry.initial_session_id)
+            .remove(registry.initial_session_id())
             .unwrap();
         let backend = Arc::new(TerminalInventoryBackend::default());
         Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
@@ -4548,12 +4605,12 @@ mod tests {
             .controller_by_id
             .write()
             .await
-            .insert(registry.initial_session_id.clone(), controller.clone());
+            .insert(registry.initial_session_id().to_owned(), controller.clone());
         let mut store = SqliteStore::open(&controller.data_root)?;
         let mut operation = crate::task::TaskOperation {
             revision: 0,
             id: "terminal-config".into(),
-            session_id: registry.initial_session_id.clone(),
+            session_id: registry.initial_session_id().to_owned(),
             action: json!({"action":"configure"}),
             permission_selection: None,
             state: "applying".into(),
@@ -4591,16 +4648,16 @@ mod tests {
         Ok(())
     }
 
+    struct GenerationCall {
+        request: BackendCatalogRequest,
+        purpose: TextGeneration,
+        model: String,
+        effort: Option<String>,
+        input: String,
+    }
+
     struct GenerationBackend {
-        request: std::sync::Mutex<
-            Vec<(
-                BackendCatalogRequest,
-                TextGeneration,
-                String,
-                Option<String>,
-                String,
-            )>,
-        >,
+        request: std::sync::Mutex<Vec<GenerationCall>>,
         shutdown: AtomicBool,
         fail: bool,
     }
@@ -4615,13 +4672,13 @@ mod tests {
             reasoning_effort: Option<&str>,
             input: &str,
         ) -> Result<String> {
-            self.request.lock().unwrap().push((
+            self.request.lock().unwrap().push(GenerationCall {
                 request,
                 purpose,
-                model.into(),
-                reasoning_effort.map(str::to_owned),
-                input.into(),
-            ));
+                model: model.into(),
+                effort: reasoning_effort.map(str::to_owned),
+                input: input.into(),
+            });
             ensure!(!self.fail, "fixture generation failure");
             Ok("```text\nfix: preserve drafts\n\nKeep existing text.\n```".into())
         }
@@ -4680,7 +4737,7 @@ mod tests {
             let generated = broker
                 .dispatch(Request {
                     id: 2,
-                    method: "prompt.submit".into(),
+                    method: "session.prompt.submit".into(),
                     params: json!({"text":"/plan add test coverage"}),
                 })
                 .await;
@@ -4707,7 +4764,7 @@ mod tests {
         for (index, enabled) in [false, true].into_iter().enumerate() {
             assert_eq!(projection["checks"][0]["enabled"], !enabled);
             let row = projection["source_row"][0].clone();
-            service.dispatch(Some(session_id.clone()), Request { id:3, method:"plan.checks.update".into(),
+            service.dispatch(Some(session_id.clone()), Request { id:3, method:"session.plan.check.update".into(),
                 params:json!({"enabled":{"format":enabled}, "expected_version":projection["version"],
                     "draft_source_digest":projection["saved_source_digest"],
                     "draft_annotation":[{"id":"retained", "source":{"start_line":annotation_line,"end_line":annotation_line,"body":"Keep this feedback."}}],
@@ -4752,7 +4809,7 @@ mod tests {
                 config
             );
         }
-        let stale = controller.broker.lock().await.dispatch(Request { id:4, method:"plan.checks.update".into(),
+        let stale = controller.broker.lock().await.dispatch(Request { id:4, method:"session.plan.check.update".into(),
             params:json!({"plan_id":plan.id,"digest":projection["saved_source_digest"], "expected_version":0, "enabled":{"format":false}}) }).await;
         assert!(stale.response.error().is_some());
         Ok(())
@@ -4777,7 +4834,7 @@ mod tests {
             let generated = broker
                 .dispatch(Request {
                     id: 2,
-                    method: "prompt.submit".into(),
+                    method: "session.prompt.submit".into(),
                     params: json!({"text":"/plan add test coverage"}),
                 })
                 .await;
@@ -4831,7 +4888,7 @@ mod tests {
                 .unwrap();
             let previous_revision = projection["snapshot"]["revision"].as_u64().unwrap();
             let previous_version = projection["version"].as_u64().unwrap();
-            service.dispatch(Some(session_id.clone()), Request { id: 3, method: "plan.tests.delete".into(),
+            service.dispatch(Some(session_id.clone()), Request { id: 3, method: "session.plan.test.delete".into(),
                 params: json!({"tests":[{"file":"tests/config.rs","name":name}],
                     "expected_version":projection["version"], "draft_annotation":[],
                     "draft_source_digest":projection["saved_source_digest"],
@@ -4900,7 +4957,7 @@ mod tests {
         let annotation = json!([{"id":"rename-feedback","source":{"start_line":row["source_line"],
             "end_line":row["source_line"],"body":"Keep this comment attached after rename."}}]);
         input["sequence"] = json!(4);
-        service.dispatch(Some(session_id.clone()), Request { id:4, method:"plan.entity.rename".into(),
+        service.dispatch(Some(session_id.clone()), Request { id:4, method:"session.plan.entity.rename".into(),
             params:json!({"review":input,"symbol":selected["rename"]["symbol"],"name":"reviewed_name",
                 "expected_version":projection["version"],"draft_annotation":annotation,
                 "draft_source_digest":projection["saved_source_digest"]}) }, &sink).await?;
@@ -4951,7 +5008,7 @@ mod tests {
         );
         {
             let mut broker = controller.broker.lock().await;
-            let rejected = broker.dispatch(Request { id: 99, method: "plan.request_changes".into(),
+            let rejected = broker.dispatch(Request { id: 99, method: "session.plan.changes.request".into(),
                 params: json!({"plan_id":plan.id,"digest":"stale-review-digest","comment":"x".repeat(65537)}) }).await;
             assert!(
                 rejected
@@ -4966,7 +5023,7 @@ mod tests {
                     .is_err()
             );
         }
-        service.dispatch(Some(session_id.clone()), Request { id:5, method:"plan.request_changes".into(),
+        service.dispatch(Some(session_id.clone()), Request { id:5, method:"session.plan.changes.request".into(),
             params:json!({"plan_id":plan.id,"digest":renamed["result"]["plan"]["review_digest"],
                 "comment":"Retain the manual edits while revising the plan."}) }, &sink).await?;
         loop {
@@ -5026,7 +5083,7 @@ mod tests {
         let broker = controller.broker.lock().await;
         let (sink, _output) = forge_protocol::outbound::channel();
         tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()), Request {
-            id:2, method:"session.input_timeouts".into(),
+            id:2, method:"session.input.timeout.configure".into(),
             params:json!({"approval_timeout":{"amount":2,"unit":"s"},"answer_timeout":{"amount":0,"unit":"m"}}),
         }, &sink)).await??;
         let (approval, answer) = controller.permission.input_timeouts(&session_id)?;
@@ -5068,7 +5125,7 @@ mod tests {
         for (index, enabled) in [true, false, true].into_iter().enumerate() {
             assert!(
                 service
-                    .prepare(Some(&session_id), HarnessMethod::ChecksEditing)
+                    .prepare(Some(&session_id), RuntimeMethod::SessionCheckEditingSet)
                     .await?
                     .is_none()
             );
@@ -5078,7 +5135,7 @@ mod tests {
                     Some(session_id.clone()),
                     Request {
                         id: index as u64 + 2,
-                        method: "checks.editing".into(),
+                        method: "session.check.editing.set".into(),
                         params: json!({"enabled": enabled}),
                     },
                     &sink,
@@ -5278,7 +5335,7 @@ mod tests {
         let (sink, _output) = forge_protocol::outbound::channel();
         let answer = "retained answer ".repeat(forge_protocol::outbound::MAX_CONTROL_BYTES);
         tokio::time::timeout(Duration::from_secs(1), service.dispatch_admitted(
-            Some(session_id.clone()), Request { id: 2, method: "question.answer".into(), params: json!({
+            Some(session_id.clone()), Request { id: 2, method: "session.question.answer".into(), params: json!({
                 "_command":{"id":"answer"}, "operation_id":"answer",
                 "target":{"owner":"interaction","id":"question-exchange","set_id":"set","revision":1},
                 "question_id":"choice","response":{"kind":"other","text":answer}
@@ -5321,7 +5378,7 @@ mod tests {
             .enumerate()
         {
             operation.push(admit_task_intent(&controller, &session_id, &Request {
-                id: index as u64 + 2, method: "task.transition".into(),
+                id: index as u64 + 2, method: "session.command.apply".into(),
                 params: json!({"operation_id":format!("configure-{index}"),"action":"configure","config":config}),
             }, &mut store)?);
         }
@@ -5407,7 +5464,7 @@ mod tests {
             for (index, change) in changes.into_iter().enumerate() {
                 let request = Request {
                     id: index as u64 + 2,
-                    method: "task.transition".into(),
+                    method: "session.command.apply".into(),
                     params: json!({"operation_id":format!("permission-{index}"),"action":"permission","change":change}),
                 };
                 let operation = admit_task_intent(&controller, &session_id, &request, &mut store)?;
@@ -5470,7 +5527,7 @@ mod tests {
         let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         let request = |id: &str, action: &str| Request {
             id: 2,
-            method: "task.transition".into(),
+            method: "session.command.apply".into(),
             params: json!({"operation_id":id,"action":action,"config":{}}),
         };
         let mut idle = admit_task_intent(
@@ -5525,7 +5582,7 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let session_id = registry.initial_session_id.clone();
+        let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
         let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         let mut task = crate::task::ActiveTask::goal(
@@ -5557,7 +5614,7 @@ mod tests {
         let status_thoughts = !controller.observer.snapshot()?.status_thoughts;
         let request = Request {
             id: 2,
-            method: "task.transition".into(),
+            method: "session.command.apply".into(),
             params: json!({"operation_id":"idle-running-goal-config","action":"configure",
                 "config":{"status_thoughts":status_thoughts}}),
         };
@@ -5619,7 +5676,7 @@ mod tests {
                     Some(controller.coordinator.execution.acquire().await?),
                 )
             };
-            for method in ["backend.setup", "backend.authenticate"] {
+            for method in ["session.provider.setup", "session.provider.authenticate"] {
                 let error = service
                     .dispatch(
                         Some(session_id.clone()),
@@ -5666,7 +5723,7 @@ mod tests {
                 Some(session_id.clone()),
                 Request {
                     id: 2,
-                    method: "backend.mock_response".into(),
+                    method: "session.provider.mock_response".into(),
                     params: json!({"operation":"hold","mode":"chat"}),
                 },
                 &sink,
@@ -5709,7 +5766,7 @@ mod tests {
                     Some(session_id.clone()),
                     Request {
                         id: request_id,
-                        method: "backend.mock_response".into(),
+                        method: "session.provider.mock_response".into(),
                         params: json!({"operation":operation,"id":hold_id}),
                     },
                     &sink,
@@ -5769,7 +5826,7 @@ mod tests {
             Some(session_id),
             Request {
                 id: 2,
-                method: "backend.mock_response".into(),
+                method: "session.provider.mock_response".into(),
                 params: json!({"operation":"wait", "id":held["id"]}),
             },
             &sink,
@@ -5803,10 +5860,10 @@ mod tests {
         let (sink, mut output) = forge_protocol::outbound::channel();
         for (method, parameter) in [
             (
-                "backend.model_pin",
+                "provider.model.pin.set",
                 json!({"backend":"copilot", "model":"pinned-model", "pinned":true}),
             ),
-            ("backend.model_pins", json!({"backend":"copilot"})),
+            ("provider.model.pin.list", json!({"backend":"copilot"})),
         ] {
             tokio::time::timeout(
                 Duration::from_secs(2),
@@ -5862,7 +5919,7 @@ mod tests {
         let (sink, mut output) = forge_protocol::outbound::channel();
         for (method, params) in [
             (
-                "history.record",
+                "session.prompt.history.record",
                 json!({"text":"prompt recorded during execution"}),
             ),
             (
@@ -5870,14 +5927,14 @@ mod tests {
                 json!({"session_id":session_id,"name":"active rename"}),
             ),
             ("session.delete", json!({"session_id":inactive.id})),
-            ("state.get", json!({})),
-            ("task.list", json!({})),
-            ("plan.list", json!({})),
-            ("agent.list", json!({})),
-            ("exchange.list", json!({})),
+            ("session.state.get", json!({})),
+            ("session.task.get", json!({})),
+            ("session.plan.list", json!({})),
+            ("session.agent.list", json!({})),
+            ("session.exchange.list", json!({})),
             ("session.list", json!({"scope":"all"})),
             ("session.preview", json!({"session_id":session_id})),
-            ("permissions.open", json!({})),
+            ("permissions.document.open", json!({})),
         ] {
             tokio::time::timeout(
                 Duration::from_secs(2),
@@ -5898,7 +5955,7 @@ mod tests {
             let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
             assert_eq!(value["id"], 2, "{method}: {value}");
             assert!(value["error"].is_null(), "{method}: {value}");
-            if method == "state.get" {
+            if method == "session.state.get" {
                 assert_eq!(value["result"]["session"]["name"], "active rename");
                 assert_eq!(
                     value["result"]["prompt_history"][0]["text"],
@@ -5930,7 +5987,7 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(broker.snapshot().unwrap().session.name, "active rename");
-        for (offset, method) in ["session.new", "session.clear"].into_iter().enumerate() {
+        for (offset, method) in ["session.new"].into_iter().enumerate() {
             let request_id = 10 + offset as u64;
             tokio::time::timeout(
                 Duration::from_secs(2),
@@ -5987,7 +6044,7 @@ mod tests {
                 Some(session_id),
                 Request {
                     id: 2,
-                    method: "attachment.import".into(),
+                    method: "session.attachment.import".into(),
                     params: json!({"path":source, "number":3}),
                 },
                 &sink,
@@ -6038,7 +6095,7 @@ mod tests {
         let discovery = controller.mcp_discovery.lock().await;
         let (sink, mut output) = forge_protocol::outbound::channel();
         let configuring = service.dispatch(Some(session_id.clone()), Request {
-            id: 2, method: "task.transition".into(),
+            id: 2, method: "session.command.apply".into(),
             params: json!({"operation_id":"configure-responsive","action":"configure","config":{"effort":"low"}}),
         }, &sink);
         tokio::pin!(configuring);
@@ -6093,7 +6150,7 @@ mod tests {
                 Some(session_id.clone()),
                 Request {
                     id: 2,
-                    method: "backend.models".into(),
+                    method: "session.provider.model.list".into(),
                     params: json!({}),
                 },
                 &sink,
@@ -6152,7 +6209,7 @@ mod tests {
                 Some(session_id.clone()),
                 Request {
                     id: 2,
-                    method: "backend.models".into(),
+                    method: "session.provider.model.list".into(),
                     params: json!({}),
                 },
                 &sink,
@@ -6210,7 +6267,7 @@ mod tests {
                 Some(session_id.clone()),
                 Request {
                     id: 2,
-                    method: "agent.models".into(),
+                    method: "session.agent.model.list".into(),
                     params: json!({"provider":"mock"}),
                 },
                 &sink,
@@ -6260,12 +6317,12 @@ mod tests {
         let mut review = controller.revision_review.open().unwrap();
         let (sink, mut output) = forge_protocol::outbound::channel();
         for method in [
-            HarnessMethod::PlanAcceptanceBegin,
-            HarnessMethod::PlanRequestChanges,
-            HarnessMethod::PlanCancel,
-            HarnessMethod::PlanEntityRename,
-            HarnessMethod::PlanTestsDelete,
-            HarnessMethod::PlanChecksUpdate,
+            RuntimeMethod::SessionPlanAcceptanceBegin,
+            RuntimeMethod::SessionPlanChangesRequest,
+            RuntimeMethod::SessionPlanCancel,
+            RuntimeMethod::SessionPlanEntityRename,
+            RuntimeMethod::SessionPlanTestDelete,
+            RuntimeMethod::SessionPlanCheckUpdate,
         ] {
             let request = Request {
                 id: 2,
@@ -6334,7 +6391,7 @@ mod tests {
             Some(session_id.clone()),
             Request {
                 id: 2,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"stop-once","action":"pause"}),
             },
             &sink,
@@ -6354,7 +6411,7 @@ mod tests {
                 Some(session_id.clone()),
                 Request {
                     id: 3,
-                    method: "health.get".into(),
+                    method: "session.health.get".into(),
                     params: json!({}),
                 },
                 &sink,
@@ -6546,10 +6603,10 @@ mod tests {
                 &controller,
                 &Request {
                     id: 2,
-                    method: "approval.resolve".into(),
+                    method: "session.approval.resolve".into(),
                     params: json!({"approval_id":approval_id,"answer_list":answers})
                 },
-                HarnessMethod::ApprovalResolve,
+                RuntimeMethod::SessionApprovalResolve,
                 &sink,
                 &service.syntax,
                 None,
@@ -6598,7 +6655,7 @@ mod tests {
             &session_id,
             &Request {
                 id: 3,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"clear-child","action":"clear"}),
             },
             &mut store,
@@ -6646,7 +6703,7 @@ mod tests {
                 &session_id,
                 &Request {
                     id: 2,
-                    method: "task.transition".into(),
+                    method: "session.command.apply".into(),
                     params: json!({"operation_id":"change-permission","action":"permission","change":{"kind":"set_approval","mode":mode}}),
                 },
                 &mut store,
@@ -6702,7 +6759,7 @@ mod tests {
             &session_id,
             &Request {
                 id: 2,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"idle-pause","action":"pause"}),
             },
             &mut store,
@@ -6755,7 +6812,7 @@ mod tests {
         let execution = controller.coordinator.execution.acquire().await?;
         let mut request = Request {
             id: 2,
-            method: "task.transition".into(),
+            method: "session.command.apply".into(),
             params: json!({
                 "operation_id":"undo-latest", "action":"undo", "rollback":{
                     "scope":"conversation", "exchange_id":"latest", "latest_exchange_id":"stale"
@@ -6804,7 +6861,7 @@ mod tests {
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
         let execution = service
-            .prepare(Some(&session_id), HarnessMethod::PromptSubmit)
+            .prepare(Some(&session_id), RuntimeMethod::SessionPromptSubmit)
             .await?
             .unwrap();
         let maintenance = controller.broker.lock().await;
@@ -6816,7 +6873,7 @@ mod tests {
                     Some(session_id.clone()),
                     Request {
                         id: 2,
-                        method: "prompt.submit".into(),
+                        method: "session.prompt.submit".into(),
                         params: json!({"text":"Configure project checks."}),
                     },
                     &sink,
@@ -6829,7 +6886,7 @@ mod tests {
             Some(session_id.clone()),
             Request {
                 id: 3,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"interrupt-check-setup","action":"pause"}),
             },
             &sink,
@@ -6890,7 +6947,7 @@ mod tests {
             .to_owned();
         let registry = service.registry().await?;
         let execution = service
-            .prepare(Some(&session_id), HarnessMethod::PromptSubmit)
+            .prepare(Some(&session_id), RuntimeMethod::SessionPromptSubmit)
             .await?
             .unwrap();
         let (sink, mut output) = forge_protocol::outbound::channel();
@@ -6901,7 +6958,7 @@ mod tests {
                     Some(session_id.clone()),
                     Request {
                         id: 2,
-                        method: "prompt.submit".into(),
+                        method: "session.prompt.submit".into(),
                         params: json!({"text":"Restore this exact prompt"}),
                     },
                     &sink,
@@ -6914,7 +6971,7 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             service.dispatch(Some(session_id.clone()), Request {
-                id: 3, method: "task.transition".into(),
+                id: 3, method: "session.command.apply".into(),
                 params: json!({"operation_id":"retract-prompt","action":"pause","restore_prompt_if_no_output":true}),
             }, &sink).await
         };
@@ -6962,21 +7019,21 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let session_id = registry.initial_session_id.clone();
+        let session_id = registry.initial_session_id().to_owned();
         let previous = service
-            .prepare(Some(&session_id), HarnessMethod::PromptSubmit)
+            .prepare(Some(&session_id), RuntimeMethod::SessionPromptSubmit)
             .await?;
         let (sink, mut output) = forge_protocol::outbound::channel();
         let mut queued = Box::pin(service.dispatch_admitted(
             Some(session_id.clone()),
-            Request { id: 2, method: "prompt.submit".into(),
+            Request { id: 2, method: "session.prompt.submit".into(),
                 params: json!({"text":"Queued after finalization","queued":true,"submission":{"token":42}}) },
             &sink, None,
         ));
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
         assert!(
             service
-                .prepare(Some(&session_id), HarnessMethod::StateGet)
+                .prepare(Some(&session_id), RuntimeMethod::SessionStateGet)
                 .await?
                 .is_none()
         );
@@ -7024,9 +7081,9 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let controller = registry.resolve(registry.initial_session_id()).await?;
         let cleanup = controller.coordinator.control.acquire().await?;
-        let mut queued = Box::pin(service.prepare_queued_prompt(&registry.initial_session_id));
+        let mut queued = Box::pin(service.prepare_queued_prompt(registry.initial_session_id()));
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
         let execution = controller
             .coordinator
@@ -7050,9 +7107,9 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let controller = registry.resolve(registry.initial_session_id()).await?;
         let execution = controller.coordinator.execution.acquire().await?;
-        let mut queued = Box::pin(service.prepare_queued_prompt(&registry.initial_session_id));
+        let mut queued = Box::pin(service.prepare_queued_prompt(registry.initial_session_id()));
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
         controller.cancellation.request(false);
         drop(execution);
@@ -7105,13 +7162,15 @@ mod tests {
         service
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
-        let first = service.prepare(None, HarnessMethod::PromptSubmit).await?;
+        let first = service
+            .prepare(None, RuntimeMethod::SessionPromptSubmit)
+            .await?;
         let (sink, mut output) = forge_protocol::outbound::channel();
         let dispatch = service.dispatch_admitted(
             None,
             Request {
                 id: 2,
-                method: "prompt.submit".into(),
+                method: "session.prompt.submit".into(),
                 params: json!({"text":"First request"}),
             },
             &sink,
@@ -7126,7 +7185,9 @@ mod tests {
                 let message: Value = serde_json::from_slice(frame.bytes())?;
                 if message["id"] == 2 {
                     assert!(message.get("error").is_none(), "{message}");
-                    return service.prepare(None, HarnessMethod::PromptSubmit).await;
+                    return service
+                        .prepare(None, RuntimeMethod::SessionPromptSubmit)
+                        .await;
                 }
             }
         };
@@ -7148,7 +7209,7 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let controller = registry.resolve(registry.initial_session_id()).await?;
         let (sink, _output) = forge_protocol::outbound::channel();
         controller.attach_timeout(&sink).await?;
         let broker = controller.broker.lock().await;
@@ -7216,10 +7277,10 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let controller = registry.resolve(registry.initial_session_id()).await?;
         let mut store = SqliteStore::open(&controller.data_root)?;
         let mut exchange = crate::exchange::Exchange::agent_admission(
-            &registry.initial_session_id,
+            registry.initial_session_id(),
             1,
             "Await an answer".into(),
             0,
@@ -7261,13 +7322,13 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await??;
-        let resolved = store.list_exchange(&registry.initial_session_id)?;
+        let resolved = store.list_exchange(registry.initial_session_id())?;
         assert!(resolved.iter().all(|exchange| !exchange.awaiting_input()));
         let count = resolved.len();
         controller.broker.lock().await.refresh_input_schedule()?;
         tokio::task::yield_now().await;
         assert_eq!(
-            store.list_exchange(&registry.initial_session_id)?.len(),
+            store.list_exchange(registry.initial_session_id())?.len(),
             count
         );
         assert_eq!(controller.coordinator.execution.available_permits(), 1);
@@ -7288,34 +7349,34 @@ mod tests {
                 .is_some()
         );
         let execution = service
-            .prepare(None, HarnessMethod::PromptSubmit)
+            .prepare(None, RuntimeMethod::SessionPromptSubmit)
             .await
             .unwrap()
             .unwrap();
         assert!(
             service
-                .prepare(None, HarnessMethod::GoalResume)
+                .prepare(None, RuntimeMethod::SessionGoalResume)
                 .await
                 .unwrap_err()
                 .is::<crate::broker::RequestNotAdmitted>()
         );
         assert!(
             service
-                .prepare(None, HarnessMethod::TurnCancel)
+                .prepare(None, RuntimeMethod::SessionTurnCancel)
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
             service
-                .prepare(None, HarnessMethod::StateGet)
+                .prepare(None, RuntimeMethod::SessionStateGet)
                 .await
                 .unwrap()
                 .is_none()
         );
         let registry = service.registry().await.unwrap();
         let controller = registry
-            .resolve(&registry.initial_session_id)
+            .resolve(registry.initial_session_id())
             .await
             .unwrap();
         let cleanup = Arc::clone(&controller.coordinator.control)
@@ -7324,32 +7385,32 @@ mod tests {
         drop(execution);
         assert!(
             service
-                .prepare(None, HarnessMethod::ExchangeResume)
+                .prepare(None, RuntimeMethod::SessionCompact)
                 .await
                 .unwrap_err()
                 .is::<crate::broker::RequestNotAdmitted>()
         );
         drop(cleanup);
         let resumed = service
-            .prepare(None, HarnessMethod::ExchangeResume)
+            .prepare(None, RuntimeMethod::SessionCompact)
             .await
             .unwrap()
             .unwrap();
         drop(resumed);
         let prompt = service
-            .prepare(None, HarnessMethod::PromptSubmit)
+            .prepare(None, RuntimeMethod::SessionPromptSubmit)
             .await
             .unwrap()
             .unwrap();
         assert!(
             service
-                .prepare(None, HarnessMethod::PromptSubmit)
+                .prepare(None, RuntimeMethod::SessionPromptSubmit)
                 .await
                 .is_err()
         );
         assert!(
             service
-                .prepare(None, HarnessMethod::ExchangeResume)
+                .prepare(None, RuntimeMethod::SessionCompact)
                 .await
                 .is_err()
         );
@@ -7358,7 +7419,7 @@ mod tests {
             .expect("chat must not retain cleanup admission while its model runs");
         assert!(
             service
-                .prepare(None, HarnessMethod::ChecksEditing)
+                .prepare(None, RuntimeMethod::SessionCheckEditingSet)
                 .await
                 .unwrap()
                 .is_none(),
@@ -7366,7 +7427,7 @@ mod tests {
         );
         assert!(
             service
-                .prepare(None, HarnessMethod::TurnCancel)
+                .prepare(None, RuntimeMethod::SessionTurnCancel)
                 .await
                 .unwrap()
                 .is_none()
@@ -7441,7 +7502,7 @@ mod tests {
                 .controller_by_id
                 .write()
                 .await
-                .remove(&registry.initial_session_id)
+                .remove(registry.initial_session_id())
                 .unwrap();
             let backend = Arc::new(CheckCleanupBackend {
                 started: tokio::sync::Notify::new(),
@@ -7453,7 +7514,7 @@ mod tests {
                 .controller_by_id
                 .write()
                 .await
-                .insert(registry.initial_session_id.clone(), controller.clone());
+                .insert(registry.initial_session_id().to_owned(), controller.clone());
             let (sink, mut output) = forge_protocol::outbound::channel();
             let drain =
                 tokio::spawn(async move { while output.recv().await.ok().flatten().is_some() {} });
@@ -7462,7 +7523,7 @@ mod tests {
                     None,
                     Request {
                         id: 2,
-                        method: "checks.run".into(),
+                        method: "session.check.run".into(),
                         params: json!({"check":"waiting"}),
                     },
                     &sink,
@@ -7492,13 +7553,13 @@ mod tests {
             assert_eq!(snapshot.active_check_run.as_deref(), Some(run_id.as_str()));
             assert!(
                 service
-                    .prepare(None, HarnessMethod::StateGet)
+                    .prepare(None, RuntimeMethod::SessionStateGet)
                     .await?
                     .is_none()
             );
             assert!(
                 service
-                    .prepare(None, HarnessMethod::GoalResume)
+                    .prepare(None, RuntimeMethod::SessionGoalResume)
                     .await
                     .is_err()
             );
@@ -7509,11 +7570,13 @@ mod tests {
             let mut preparation = Box::pin(async {
                 if let Some(interrupt_execution) = interrupt_execution {
                     service.dispatch(None, Request {
-                        id: 3, method: "checks.cancel".into(),
+                        id: 3, method: "session.check.cancel".into(),
                         params: json!({"run_id":run_id,"interrupt_execution":interrupt_execution}),
                     }, &sink).await?;
                 }
-                service.prepare(None, HarnessMethod::PromptSubmit).await
+                service
+                    .prepare(None, RuntimeMethod::SessionPromptSubmit)
+                    .await
             });
             tokio::select! {
                 result = &mut preparation => panic!("prompt admitted before provider cleanup: {result:?}"),
@@ -7551,19 +7614,19 @@ mod tests {
             .await
             .unwrap();
         let execution = service
-            .prepare(None, HarnessMethod::PromptSubmit)
+            .prepare(None, RuntimeMethod::SessionPromptSubmit)
             .await
             .unwrap()
             .unwrap();
         let registry = service.registry().await.unwrap();
         let controller = registry
-            .resolve(&registry.initial_session_id)
+            .resolve(registry.initial_session_id())
             .await
             .unwrap();
         let maintenance = controller.broker.lock().await;
         let mut acquisition = Box::pin(acquire_request_broker(
             &controller,
-            HarnessMethod::PromptSubmit,
+            RuntimeMethod::SessionPromptSubmit,
         ));
         assert!(
             futures_util::poll!(acquisition.as_mut()).is_pending(),
@@ -7588,7 +7651,7 @@ mod tests {
             request: Mutex::new(Vec::new()),
         });
         Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
-        for method in [HarnessMethod::SessionConfigure] {
+        for method in [RuntimeMethod::SessionConfigure] {
             let maintenance = controller.broker.lock().await;
             let mut acquisition = Box::pin(acquire_request_broker(&controller, method));
             assert!(futures_util::poll!(acquisition.as_mut()).is_pending());
@@ -7654,10 +7717,10 @@ mod tests {
         let owner = controller.broker.lock().await;
         let (sink, mut output) = forge_protocol::outbound::channel();
         for (id, method, params) in [
-            (2, "trace.configure", json!({"enabled":true})),
-            (3, "trace.status", json!({})),
-            (4, "trace.session.clear", json!({})),
-            (5, "trace.configure", json!({"enabled":false})),
+            (2, "host.trace.configure", json!({"enabled":true})),
+            (3, "host.trace.status", json!({})),
+            (4, "session.trace.clear", json!({})),
+            (5, "host.trace.configure", json!({"enabled":false})),
         ] {
             tokio::time::timeout(
                 Duration::from_secs(1),
@@ -7748,7 +7811,7 @@ mod tests {
                 None,
                 Request {
                     id: 4,
-                    method: "history.record".into(),
+                    method: "session.prompt.history.record".into(),
                     params: json!({"text":"still alive"}),
                 },
                 &sink,
@@ -7791,7 +7854,7 @@ mod tests {
         assert!(service.registry.lock().await.is_some());
         assert!(
             service
-                .prepare(None, HarnessMethod::PromptSubmit)
+                .prepare(None, RuntimeMethod::SessionPromptSubmit)
                 .await
                 .is_err()
         );
@@ -7853,7 +7916,7 @@ mod tests {
             )?;
             let request = Request {
                 id: index as u64 + 1,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":format!("locked-{action}"),"action":action}),
             };
             assert!(
@@ -7903,7 +7966,7 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let controller = registry.resolve(registry.initial_session_id()).await?;
         let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         let task = controller
             .task_controller
@@ -7999,7 +8062,7 @@ mod tests {
                 .open_session(1, initialize(&fixture, "mock"))
                 .await?;
             let registry = service.registry().await?;
-            let session_id = registry.initial_session_id.clone();
+            let session_id = registry.initial_session_id().to_owned();
             let controller = registry.resolve(&session_id).await?;
             let broker = controller.broker.lock().await;
             let running = controller
@@ -8011,7 +8074,7 @@ mod tests {
             let (sink, _output) = forge_protocol::outbound::channel();
             let request = Request {
                 id: 2,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"promote","action":action,"text":"Finish the work"}),
             };
             service.prepare_task(Some(&session_id), &request).await?;
@@ -8031,7 +8094,7 @@ mod tests {
             assert!(!*controller.cancellation.subscribe().borrow());
             let clear = Request {
                 id: 3,
-                method: "task.transition".into(),
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":"clear","action":"clear"}),
             };
             task_state::apply(&controller, &session_id, &clear, 20, &sink).await?;
@@ -8051,18 +8114,18 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let controller = registry.resolve(registry.initial_session_id()).await?;
         let (sink, _output) = forge_protocol::outbound::channel();
         let result = controller.input_request(Request {
             id: 2,
-            method: "input.apply".into(),
+            method: "session.input.apply".into(),
             params: json!({
                 "id":"forged-continuation", "action":{"kind":"submit", "message":{
                     "id":"forged-message", "text":"Continue automatically",
                     "purpose":{"kind":"task_continuation", "revision":"untrusted", "completed_turn_id":"turn", "reason":"forged"}
                 }}
             }),
-        }, HarnessMethod::InputApply, &sink).await;
+        }, RuntimeMethod::SessionInputApply, &sink).await;
         assert!(
             result
                 .unwrap_err()
@@ -8091,8 +8154,8 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let controller = registry.resolve(&registry.initial_session_id).await?;
-        let session_id = registry.initial_session_id.clone();
+        let controller = registry.resolve(registry.initial_session_id()).await?;
+        let session_id = registry.initial_session_id().to_owned();
         let control = controller.backend.mock_response_control().unwrap();
         let held = control
             .dispatch(
@@ -8302,8 +8365,8 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let controller = registry.resolve(&registry.initial_session_id).await?;
-        let session_id = registry.initial_session_id.clone();
+        let controller = registry.resolve(registry.initial_session_id()).await?;
+        let session_id = registry.initial_session_id().to_owned();
         let (sink, mut output) = forge_protocol::outbound::channel();
         let reader = tokio::spawn(async move {
             while output.recv().await?.is_some() {}
@@ -8332,10 +8395,10 @@ mod tests {
                 .input_request(
                     Request {
                         id,
-                        method: "input.apply".into(),
+                        method: "session.input.apply".into(),
                         params: params.clone(),
                     },
-                    HarnessMethod::InputApply,
+                    RuntimeMethod::SessionInputApply,
                     &sink,
                 )
                 .await?;
@@ -8388,9 +8451,9 @@ mod tests {
             Some("lost acknowledgement".into()),
         )?;
         drop(control);
-        let failure = controller.input_request(Request { id:4, method:"input.apply".into(),
+        let failure = controller.input_request(Request { id:4, method:"session.input.apply".into(),
             params:json!({"id":"retry-uncertain","action":{"kind":"retry","id":"uncertain-message","revision":uncertain.upsert[0].revision}})
-        }, HarnessMethod::InputApply, &sink).await.unwrap_err();
+        }, RuntimeMethod::SessionInputApply, &sink).await.unwrap_err();
         assert!(format!("{failure:#}").contains("unconfirmed"));
         assert_eq!(
             controller.coordinator.submissions.snapshot()?.messages[0].delivery,
@@ -8512,7 +8575,7 @@ mod tests {
                 Some(session.clone()),
                 Request {
                     id: 2,
-                    method: "history.record".into(),
+                    method: "session.prompt.history.record".into(),
                     params: json!({"text":"blocked write"}),
                 },
                 &sink,
@@ -8528,7 +8591,7 @@ mod tests {
                 Some(session),
                 Request {
                     id: 3,
-                    method: "history.record".into(),
+                    method: "session.prompt.history.record".into(),
                     params: json!({"text":"successful retry"}),
                 },
                 &sink,

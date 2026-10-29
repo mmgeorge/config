@@ -5,16 +5,16 @@ local notifications = require("forge.infra.notifications")
 local original_ensure, original_error = builder.ensure, notifications.error
 local notices, received = {}, {}
 local emit
-client._reset_for_test()
+client._host_reset_for_test()
 builder.ensure = function(callback) callback({ ok = true, path = "document-event-fixture" }) end
 notifications.error = function(message) notices[#notices + 1] = tostring(message) end
-client._set_launcher_for_test(function(_, options, on_exit)
+client._host_set_launcher_for_test(function(_, options, on_exit)
   emit = function(message) options.stdout(nil, vim.json.encode(message) .. "\n") end
   return { write = function(_, encoded)
     local request = vim.json.decode(encoded)
-    if request.method == "initialize" then emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } }) end
+    if request.method == "host.initialize" then emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } }) end
     if request.method == "repository.write" then emit({ id = request.id, result = {} }) end
-    if request.method == "shutdown" then vim.schedule(function() on_exit({ code = 0 }) end) end
+    if request.method == "host.shutdown" then vim.schedule(function() on_exit({ code = 0 }) end) end
   end, kill = function() end }
 end)
 
@@ -25,10 +25,10 @@ end
 
 local ok, failure = xpcall(function()
   local ready = false
-  client.start(function(_, failure) assert(not failure) ready = true end)
+  client.host_start(function(_, failure) assert(not failure) ready = true end)
   await(function() return ready end)
-  client.subscribe_document("other", function() error("document crossed ownership") end)
-  local unsubscribe = client.subscribe_document("status", function(event, payload, generation)
+  client.document_events_subscribe("other", function() error("document crossed ownership") end)
+  local unsubscribe = client.document_events_subscribe("status", function(event, payload, generation)
     received[#received + 1] = { event = event, payload = payload, generation = generation }
   end)
   local update = { document = "status", event = "status.update", payload = { operation_id = 0, phase = "accepted", diagnostic = {}, content = string.rep("x", 600000) } }
@@ -57,7 +57,7 @@ local ok, failure = xpcall(function()
   await(function() return client._client.pending and next(client._client.pending) == nil end)
   assert(#received == 4, "closed document received another event")
 end, debug.traceback)
-client._reset_for_test()
+client._host_reset_for_test()
 builder.ensure, notifications.error = original_ensure, original_error
 if not ok then error(failure) end
 print("status document events: passed")

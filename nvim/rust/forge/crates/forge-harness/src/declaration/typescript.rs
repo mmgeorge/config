@@ -51,7 +51,7 @@ impl DeclarationResolver {
                 }
                 return self.ts_member(
                     &file.path,
-                    &joined(&symbol.scope, &[symbol.name.clone()]),
+                    &joined(&symbol.scope, std::slice::from_ref(&symbol.name)),
                     &reference.path[1..],
                     reference.value_namespace,
                     false,
@@ -258,7 +258,7 @@ impl DeclarationResolver {
             }
             return self.ts_member(
                 path,
-                &joined(scope, &[name.clone()]),
+                &joined(scope, std::slice::from_ref(name)),
                 &names[1..],
                 value,
                 exported,

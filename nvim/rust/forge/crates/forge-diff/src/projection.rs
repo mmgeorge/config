@@ -338,13 +338,18 @@ pub(crate) fn append_change_row(
 }
 
 /// Projects source coordinates, change styling, syntax, and intraline emphasis.
+/// Syntax trees for both sides of a projected diff row.
+pub struct RowSyntax<'syntax> {
+    pub old: Option<&'syntax SyntaxHandle>,
+    pub new: Option<&'syntax SyntaxHandle>,
+}
+
 pub fn append_display_row(
     metadata: &mut BlockMetadata,
     row: usize,
     display: &DisplayRow,
     group: &DisplayHunk,
-    old_syntax: Option<&SyntaxHandle>,
-    new_syntax: Option<&SyntaxHandle>,
+    syntax: RowSyntax<'_>,
     change: Option<crate::presentation::RowChange>,
     indent: usize,
 ) -> Result<(), ContractError> {
@@ -414,9 +419,9 @@ pub fn append_display_row(
         });
     }
     let (syntax, coordinate) = if display.kind() == RowKind::Removed {
-        (old_syntax, display.old_coordinate())
+        (syntax.old, display.old_coordinate())
     } else {
-        (new_syntax, display.new_coordinate())
+        (syntax.new, display.new_coordinate())
     };
     if let (Some(syntax), Some(coordinate)) = (syntax, coordinate) {
         append_syntax_row(metadata, syntax, coordinate.line, row, &display.text)?;
@@ -645,7 +650,7 @@ mod tests {
                 new_line: 6,
             }),
             raw_id: None,
-            emphasis: vec![0..2],
+            emphasis: std::iter::once(0..2).collect(),
             emphasis_fallback: None,
         };
         let mut metadata = BlockMetadata::default();
@@ -655,7 +660,19 @@ mod tests {
             new_lines: 0..7,
             raw_range: 0..1,
         };
-        append_display_row(&mut metadata, 0, &row, &group, None, None, None, 0).unwrap();
+        append_display_row(
+            &mut metadata,
+            0,
+            &row,
+            &group,
+            crate::projection::RowSyntax {
+                old: None,
+                new: None,
+            },
+            None,
+            0,
+        )
+        .unwrap();
         assert_eq!(row.text, "λnew");
         assert_eq!(
             metadata.gutter[0]
@@ -670,17 +687,19 @@ mod tests {
         assert_eq!(metadata.visible_decoration[0].capture, "ForgeInlineAddBg");
         assert_eq!(metadata.visible_decoration[0].range.end.column, 2);
         let mut invalid = row.clone();
-        invalid.emphasis = vec![1..2];
+        invalid.emphasis = std::iter::once(1..2).collect();
         assert!(
             append_display_row(
                 &mut BlockMetadata::default(),
                 0,
                 &invalid,
                 &group,
+                crate::projection::RowSyntax {
+                    old: None,
+                    new: None
+                },
                 None,
-                None,
-                None,
-                0,
+                0
             )
             .is_err()
         );
@@ -719,7 +738,21 @@ mod tests {
             new_lines: 0..1,
             raw_range: 0..1,
         };
-        assert!(append_display_row(&mut metadata, 0, &row, &group, None, None, None, 0).is_ok());
+        assert!(
+            append_display_row(
+                &mut metadata,
+                0,
+                &row,
+                &group,
+                crate::projection::RowSyntax {
+                    old: None,
+                    new: None
+                },
+                None,
+                0
+            )
+            .is_ok()
+        );
         assert!(metadata.decoration.len() + metadata.visible_decoration.len() > 8192);
     }
 
@@ -752,7 +785,19 @@ mod tests {
                 emphasis_fallback: None,
             };
             let mut metadata = BlockMetadata::default();
-            append_display_row(&mut metadata, 0, &row, &group, None, None, None, 0).unwrap();
+            append_display_row(
+                &mut metadata,
+                0,
+                &row,
+                &group,
+                crate::projection::RowSyntax {
+                    old: None,
+                    new: None,
+                },
+                None,
+                0,
+            )
+            .unwrap();
             assert_eq!(metadata.gutter[0].chunk[0].text.len(), 4);
             assert_eq!(metadata.gutter[0].chunk[2].text.len(), 3);
             assert_eq!(metadata.gutter[0].chunk[4].capture, number);

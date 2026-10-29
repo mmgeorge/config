@@ -13,7 +13,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local harness = require("forge.views.harness")
 local controller = require("forge.views.harness.controller")
 local session = require("forge.session")
@@ -34,7 +34,7 @@ write_source("node")
 vim.ui.input = function(_, callback) callback(source) end
 local function request(method, params)
   local result, failure, completed
-  client.request(method, params or {}, function(value, request_error)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, request_error)
     result, failure, completed = value, request_error, true
   end)
   assert(vim.wait(10000, function() return completed end, 10), method .. " did not complete")
@@ -84,50 +84,55 @@ local success, failure = xpcall(function()
   assert(not table.concat(rendered, "\n"):find("IMPORT_LITERAL", 1, true), "preview exposed native values")
   write_source("changed-command")
   confirm("apply")
-  assert(vim.wait(10000, function() return #errors > 0 and not state.busy and preview_ready() end, 10), "source-change rejection did not recover")
+  assert(vim.wait(10000, function() return #errors > 0 and not state.busy and preview_ready() end, 10),
+    "source-change rejection did not recover: " .. vim.inspect({ errors = errors, busy = state.busy,
+      preview_ready = preview_ready(), operation = state.task_operation }))
   assert(errors[1]:find("source changed", 1, true), errors[1])
   local unchanged = request("settings.get")
   assert(unchanged.revision == 0 and #unchanged.catalog.mcp == 0, "stale preview mutated settings")
   errors = {}
   confirm("portable")
   confirm("apply")
+  local import_operation = assert(state.task_operation).id
   assert(vim.wait(30000, function() return not state.busy and not picker.is_open("harness-native-import") end, 10),
     "native import application did not settle: " .. vim.inspect({ errors = errors, operation = state.task_operation }))
   assert(#errors == 0, table.concat(errors, "\n"))
   local imported = request("settings.get")
   assert(imported.revision == 1 and #imported.catalog.mcp == 1)
   assert(imported.catalog.mcp[1].id == imported_id and imported.desired.mcp[imported_id] == false)
-  local imported_server = request("backend.mcp")[1]
+  local imported_server = request("session.provider.mcp.list")[1]
   assert(imported_server.scope == "workspace", "native import lost its source scope")
   assert(vim.fs.normalize(imported_server.source_path):lower() == vim.fs.normalize(source):lower(),
     "native import lost its source configuration path")
   assert(imported.application.applied_revision == imported.revision, "import did not pass application verification")
   assert(state.session.id == identity, "configuration import replaced the Forge conversation")
-  assert(vim.wait(5000, function()
-    for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-      if line:find("Settings completed:", 1, true) and line:find("mcp_definition", 1, true) then return true end
-    end
-    return false
-  end, 10), "native import omitted its configuration timeline event")
+  local receipt = request("session.command.operation.get", { operation_id = import_operation })
+  assert(receipt.state == "completed", "native import did not retain its completed operation")
+  local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+  assert(not transcript:find("Settings completed:", 1, true), "routine configuration leaked into the timeline")
   local preserved = table.concat(vim.fn.readfile(source), "\n")
   assert(preserved:find("IMPORT_LITERAL$VALUE", 1, true) and preserved:find("IMPORT_AUTHENTICATION_VALUE", 1, true),
     "import changed native source or authentication")
   for _, backend in ipairs({ "copilot", "claude", "antigravity" }) do
+    assert(vim.wait(10000, harness.backend_switch_available, 10), "settings did not release provider switching")
     harness.switch_backend(backend, { kind = "new" })
     assert(vim.wait(10000, function()
       return session.harness.ready and not session.harness.switching_backend and session.harness.session.backend == backend
-    end, 10), "provider switch did not settle")
+    end, 10), "provider switch did not settle: " .. vim.inspect({ backend = backend,
+      session = session.harness.session, switching = session.harness.switching_backend,
+      ready = session.harness.ready, errors = errors, warnings = warnings, busy = session.harness.busy,
+      operation = session.harness.task_operation }))
     local transferred = request("settings.get")
     assert(transferred.catalog.mcp[1].id == imported_id and transferred.desired.mcp[imported_id] == false,
       "provider switch lost imported identity or enabled it")
-    local server = request("backend.mcp")[1]
+    local server = request("session.provider.mcp.list")[1]
     assert(server.scope == "workspace" and server.source_path == imported_server.source_path,
       "provider switch lost source metadata")
   end
 end, debug.traceback)
 if success and vim.g.forge_native_import_inspect then return end
 picker.close(false)
-client.stop()
+client.host_stop()
 local collected = vim.wait(6000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath, vim.ui.input = original_stdpath, original_input

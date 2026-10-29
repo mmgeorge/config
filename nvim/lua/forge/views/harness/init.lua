@@ -59,7 +59,7 @@ local function finish_start(state, result, start_error, error_detail, callback)
       on_confirm = function(result)
         confirmed = true
         local action = result.option.value
-        client.resolve_lease_conflict(action, conflict, function(next_result, next_error, next_detail)
+        client.session_resolve_lease_conflict(action, conflict, function(next_result, next_error, next_detail)
           finish_start(state, next_result, next_error, next_detail, callback)
         end)
       end,
@@ -108,8 +108,8 @@ function M.open()
   controller.attach()
   controller.render()
   startup.mark("layout.ready")
-  local transcript_buffer = state.transcript_buf
-  client.start_harness(function(result, start_error, error_detail)
+  local transcript_buffer = assert(state.transcript_buf)
+  client.session_initialize(function(result, start_error, error_detail)
     if state.transcript_buf ~= transcript_buffer or not vim.api.nvim_buf_is_valid(transcript_buffer)
       or not valid_window(state.composer_win) then startup.finish("closed_before_ready") return end
     finish_start(state, result, start_error, error_detail)
@@ -158,9 +158,9 @@ function M.switch_backend(backend, destination)
   local initialize_options = destination.kind == "new" and { new_session_name = "" }
     or { session_id = destination.session_id }
   state.switching_backend = true
-  client.stop(nil, function()
+  client.host_stop(nil, function()
     config.options.harness.backend = backend
-    client.start_harness(function(result, start_error, error_detail)
+    client.session_initialize(function(result, start_error, error_detail)
       finish_start(state, result, start_error, error_detail, {
         open_mode = "current",
         on_ready = function()
@@ -177,8 +177,8 @@ function M.switch_backend(backend, destination)
         on_error = function(switch_error)
           notifications.error("Failed to switch Harness backend: " .. switch_error, "Harness backend")
           config.options.harness.backend = previous_backend
-          client.stop(nil, function()
-            client.start_harness(function(previous_result, previous_error, previous_detail)
+          client.host_stop(nil, function()
+            client.session_initialize(function(previous_result, previous_error, previous_detail)
               state.switching_backend = false
               finish_start(state, previous_result, previous_error, previous_detail)
             end, { session_id = previous_session_id })
@@ -193,7 +193,7 @@ end
 function M.new_session(name)
   local source_session_id = session.harness.session and session.harness.session.id or nil
   local pending = session_navigation.begin_new(name)
-  client.create_session(source_session_id, name, function(result, request_error)
+  client.session_create({ source_session_id = source_session_id, name = name }, function(result, request_error)
     if request_error then
       pending.error = request_error
       session_navigation.render_pending(pending)

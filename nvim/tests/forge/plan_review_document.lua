@@ -1,15 +1,18 @@
 local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
-local original_request, original_accepting = client.request_for, client.host_accepting
-local original_generation = client.host_generation
+local original_request, original_accepting = client.request, client.host_is_accepting
+local original_generation = client.host_get_generation
 local generation = 1
-client.host_generation = function() return generation end
-client.host_accepting = function() return true end
+client.host_get_generation = function() return generation end
+client.host_is_accepting = function() return true end
 local requests = {}
-client.request_for = function(_, method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
-  assert(method == "harness.document" or method == "plan.entity.rename")
+  assert(method == "session.document" or method == "session.plan.entity.rename")
   requests[#requests + 1] = { method = method, params = params, callback = callback }
 end
 local path = vim.fn.tempname() .. ".md"
@@ -84,7 +87,7 @@ local success, failure = xpcall(function()
   local settled = {}
   local before = #requests
   for _, name in ipairs({ "first", "second", "third" }) do
-    assert(owner.submit("plan.entity.rename", { name = name }, function(_, problem)
+    assert(owner.submit("session.plan.entity.rename", { name = name }, function(_, problem)
       assert(not problem, problem)
       settled[#settled + 1] = name
     end))
@@ -152,8 +155,8 @@ local success, failure = xpcall(function()
   assert(vim.api.nvim_buf_is_valid(native_buffer) and vim.api.nvim_buf_get_lines(native_buffer, 0, 1, false)[1] == "new " .. previous_text)
 end, debug.traceback)
 if owner then owner.close() end
-client.request_for, client.host_accepting = original_request, original_accepting
-client.host_generation = original_generation
+client.request, client.host_is_accepting = original_request, original_accepting
+client.host_get_generation = original_generation
 vim.fn.delete(path)
 assert(success, failure)
 print("plan_review_document: passed")

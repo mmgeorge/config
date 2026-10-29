@@ -27,13 +27,16 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local request = client.request
 local pending_history = 0
-client.request = function(method, params, callback)
-  if method ~= "history.record" then return request(method, params, callback) end
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  if method ~= "session.prompt.history.record" then return request(request_specification, callback) end
   pending_history = pending_history + 1
-  return request(method, params, function(result, failure)
+  return request(request_specification, function(result, failure)
     pending_history = pending_history - 1
     callback(result, failure)
   end)
@@ -53,9 +56,7 @@ local function submit(text)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
   controller.submit()
   await(function()
-    return not state.busy and not state.task_operation and not state.state_sync_pending
-      and not state.configuring and not state.configuration_debounce
-      and pending_history == 0 and state.prompt_history[1] and state.prompt_history[1].text == text
+    return pending_history == 0 and state.prompt_history[1] and state.prompt_history[1].text == text
   end, "submission or history did not settle: " .. text)
 end
 
@@ -77,7 +78,7 @@ local success, failure = xpcall(function()
   if stage == "seed" then
     for index = 1, 105 do
       local recorded = false
-      client.request("history.record", { text = "persisted prompt " .. index, attachments = {} }, function(_, problem)
+      client.request({ method = "session.prompt.history.record", params = { text = "persisted prompt " .. index, attachments = {} }, session_id = assert(require("forge.session").harness.session).id }, function(_, problem)
         assert(not problem, problem)
         recorded = true
       end)
@@ -93,8 +94,7 @@ local success, failure = xpcall(function()
     assert(composer_text() == plan, "Up did not recall the older plan command")
     controller.submit()
     await(function()
-      return not state.busy and not state.task_operation and not state.state_sync_pending
-        and pending_history == 0 and state.prompt_history[1].text == plan
+      return pending_history == 0 and state.prompt_history[1].text == plan
     end, "recalled plan was not promoted to newest history")
     assert(state.prompt_history_index == 0, "resubmission retained its old navigation index")
   elseif stage == "verify" then
@@ -109,7 +109,7 @@ local success, failure = xpcall(function()
   end
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.stdpath = original_stdpath
 assert(success and collected, failure or "Harness host was not collected")

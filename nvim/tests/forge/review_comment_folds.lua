@@ -15,12 +15,12 @@ local function comment_fold()
     ["end"] = { block = "comments", position = { row = 5, column = 0 } }, closed = true }
 end
 review._set_runner_for_test(function(method, params, callback)
-  if method == "review.open" then callback({ document = "comment-folds" })
-  elseif method == "github.actor" then callback({ login = "viewer" })
-  elseif method == "review.header" then callback({ ready = true })
-  elseif method == "review.view" then callback(vim.NIL)
-  elseif method == "review.load" then complete_load = callback
-  elseif method == "review.materialize" then
+  if method == "github.review.document.open" then callback({ document = "comment-folds" })
+  elseif method == "github.actor.get" then callback({ login = "viewer" })
+  elseif method == "github.review.document.header.load" then callback({ ready = true })
+  elseif method == "github.review.document.view.set" then callback(vim.NIL)
+  elseif method == "github.review.document.load" then complete_load = callback
+  elseif method == "github.review.document.render" then
     local folds = { comments_fold() }
     if loaded then folds[2] = comment_fold() end
     local rows = loaded and { "Comments (1):", "author", "first line", "second line", "last line" }
@@ -35,7 +35,7 @@ review._set_runner_for_test(function(method, params, callback)
       text_edit = { { start_row = 1, removed_rows = 2, text = rows } },
       metadata_edit = { { block = "comments", row_count = 5, metadata = metadata(folds) } },
     } or vim.NIL })
-  elseif method == "review.close" then callback({ closed = true })
+  elseif method == "github.review.document.close" then callback({ closed = true })
   else error("Unexpected request: " .. method) end
 end)
 local options = { directory = vim.fn.getcwd(), repository = { hostname = "github.com", owner = "owner", name = "repo" },

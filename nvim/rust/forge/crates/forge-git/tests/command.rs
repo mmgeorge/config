@@ -183,9 +183,10 @@ fn command_child_descendant() {
     let marker = std::path::PathBuf::from(std::env::var_os("FORGE_TEST_MARKER").unwrap());
     let mut descendant = fixture("command_descendant_marker");
     descendant.env("FORGE_TEST_MARKER", &marker);
-    descendant.spawn().unwrap();
+    let mut descendant = descendant.spawn().unwrap();
     std::fs::write(marker.with_extension("ready"), b"ready").unwrap();
     std::thread::sleep(Duration::from_secs(10));
+    descendant.wait().unwrap();
 }
 
 #[test]
@@ -195,6 +196,8 @@ fn command_child_descendant_exits() {
     let mut descendant = fixture("command_descendant_marker");
     descendant.env("FORGE_TEST_MARKER", &marker);
     descendant.spawn().unwrap();
+    // This fixture exits while its child retains the output pipes, exercising orphan collection.
+    std::process::exit(0);
 }
 
 #[test]
@@ -214,7 +217,16 @@ fn command_owner_abort() {
     command.env("FORGE_TEST_MARKER", &marker);
     let _ = read_command(&mut command, limits(), || {
         if marker.with_extension("ready").exists() {
-            std::process::abort();
+            // Terminate without unwinding or waiting for Windows crash-report processing.
+            // SAFETY: the pseudo-handle identifies this isolated fixture process.
+            unsafe {
+                windows::Win32::System::Threading::TerminateProcess(
+                    windows::Win32::System::Threading::GetCurrentProcess(),
+                    1,
+                )
+            }
+            .expect("terminate command owner fixture");
+            unreachable!("owner termination returned");
         }
         Ok(())
     });

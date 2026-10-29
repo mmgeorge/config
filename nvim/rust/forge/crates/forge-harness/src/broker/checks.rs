@@ -9,10 +9,9 @@ impl HarnessBroker {
             "child execution must settle before running verification checks. Wait for or interrupt active children first"
         );
         let permit = self
-            .task_controller
-            .current()?
+            .capture_execution()?
             .context("execution task is missing")?
-            .permit();
+            .permit;
         let result = self.run_checks_inner(&permit).await;
         if let Err(error) = &result {
             if permit
@@ -300,7 +299,7 @@ impl HarnessBroker {
         execution.generation += 1;
         goal.updated_at_ms = self.clock.now_ms();
         Self::save_run(&mut execution, &run);
-        self.persist_check_execution(&execution, &permit)?;
+        self.persist_check_execution(&execution, permit)?;
         if execution.state == PlanExecutionState::Complete {
             let task = self
                 .task_controller

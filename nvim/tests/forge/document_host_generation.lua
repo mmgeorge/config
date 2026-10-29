@@ -6,20 +6,23 @@ local subscription = {}
 local delayed
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
 package.loaded["forge.client"] = {
-  host_generation = function() return generation end,
-  host_accepting = function() return accepting end,
-  subscribe_document = function(document, callback)
+  host_get_generation = function() return generation end,
+  host_is_accepting = function() return accepting end,
+  document_events_subscribe = function(document, callback)
     subscription[document] = callback
     return function() subscription[document] = nil end
   end,
-  request_host = function(method, params, callback)
+  request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
     assert(accepting, "document request resurrected a stopped host")
     requests[#requests + 1] = { method, params.operation }
     if params.operation == "open" then
       local snapshot = { document = params.document, revision = 1, block = {
         { id = "source", text = { "captured source" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
       } }
-      if method == "status" then callback(fixture.snapshot(params.document, { revision = 1 }))
+      if method == "repository.status.document" then callback(fixture.snapshot(params.document, { revision = 1 }))
       else callback({ title = "HEAD", object = "HEAD", revision = "HEAD", snapshot = snapshot, more = false }) end
     elseif params.operation == "refresh" then delayed = callback
     elseif params.operation == "close_view" then callback(nil)

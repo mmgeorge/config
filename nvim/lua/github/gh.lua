@@ -92,7 +92,6 @@
 ---@class GithubGhModule
 ---@field _backend GithubGhBackend?
 
----@type GithubGhModule
 local M = {}
 
 

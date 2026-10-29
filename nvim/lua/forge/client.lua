@@ -5,6 +5,7 @@ local backend_preference = require("forge.harness.backend_preference")
 local config = require("forge.infra.config")
 local notifications = require("forge.infra.notifications")
 local protocol = require("forge.protocol")
+local contract = require("forge.event_contract")
 local session = require("forge.session")
 local receive = require("forge.receive")
 local json_transfer = require("forge.json_transfer")
@@ -12,18 +13,7 @@ local perf = require("forge.infra.perf")
 
 local launcher_for_test = nil
 local shutdown_autocmd = false
-local RESERVED_METHOD = {
-  initialize = true,
-  ["harness.initialize"] = true,
-  ["trace.configure"] = true,
-  ["turn.cancel"] = true,
-  ["turn.restart"] = true,
-  ["task.transition"] = true,
-  ["task.operation"] = true,
-  ["health.get"] = true,
-  ["approval.resolve"] = true,
-  shutdown = true,
-}
+local send_request
 
 ---@alias ForgeCallback fun(result?: any, error?: string, error_detail?: table)
 ---@alias ForgeSubscriber fun(event: string, payload: any, session_id?: string)
@@ -42,18 +32,28 @@ local RESERVED_METHOD = {
 ---@field auto_compaction? {enabled: boolean, threshold_tokens: integer}
 ---@field data_root string
 
+---@class ForgePendingRequest
+---@field method string
+---@field callback ForgeCallback
+---@field progress? fun(payload: table)
+---@field session_id? string
+---@field timing? table
+
 ---@class ForgeClient
 ---@field process table?
 ---@field generation integer
 ---@field launch_token integer
 ---@field next_id integer
----@field pending table<integer, { method: string, callback: ForgeCallback, progress?: fun(payload: table) }>
+---@field pending table<integer, ForgePendingRequest>
 ---@field transfer table<integer, ForgeJsonTransfer>
 ---@field transfer_bytes integer
 ---@field subscriber table<integer, ForgeSubscriber>
+---@field document_subscriber table<integer, {document: string, callback: fun(event: string, update: table, generation: integer)}>
+---@field completed_status_operation table<string, boolean>
+---@field completed_status_order string[]
 ---@field next_subscriber integer
 ---@field receiver table?
----@field shutdown_timer uv_timer_t?
+---@field shutdown_timer uv.uv_timer_t?
 ---@field shutdown_timer_token integer?
 ---@field taskkill_process table?
 ---@field stderr string
@@ -68,6 +68,9 @@ local RESERVED_METHOD = {
 ---@field harness_initialize_callback ForgeCallback[]
 ---@field harness_ready boolean
 ---@field harness_starting boolean
+---@field runtime_ready boolean
+---@field runtime_starting boolean
+---@field runtime_initialize_callback ForgeCallback[]
 ---@field snapshot_by_id table<string, table>
 ---@field snapshot table?
 
@@ -75,7 +78,7 @@ local RESERVED_METHOD = {
 M._client = nil
 
 ---@return ForgeClient
-local function state()
+local function host_state()
   if M._client then return M._client end
   M._client = {
     process = nil,
@@ -105,6 +108,9 @@ local function state()
     harness_ready = false,
     harness_starting = false,
     harness_initialize_callback = {},
+    runtime_ready = false,
+    runtime_starting = false,
+    runtime_initialize_callback = {},
   }
   return M._client
 end
@@ -115,7 +121,7 @@ local function protect_consumer(callback, context)
     if not succeeded then
       local diagnostic = "Forge " .. context .. " callback failed: " .. tostring(failure)
       require("forge.startup_log").write("host.callback.failed", { context = context, error = tostring(failure) })
-      if not pcall(notifications.error, diagnostic, "Forge") then pcall(vim.api.nvim_err_writeln, diagnostic) end
+      if not pcall(notifications.error, diagnostic, "Forge") then pcall(vim.api.nvim_echo, { { diagnostic, "ErrorMsg" } }, true, { err = true }) end
     end
   end
 end
@@ -123,15 +129,15 @@ end
 ---@param method string
 ---@param callback ForgeCallback
 ---@return integer?
-local function admit_request(method, callback)
-  local client = state()
+local function host_admit_request(method, callback)
+  local client = host_state()
   if client.draining then callback(nil, "Forge host is draining", { code = "not_admitted" }) return nil end
   local count, ordinary = 0, 0
   for _, pending in pairs(client.pending) do
     count = count + 1
-    if not RESERVED_METHOD[pending.method] then ordinary = ordinary + 1 end
+    if contract.method_policy(pending.method).admission ~= "control" then ordinary = ordinary + 1 end
   end
-  if count >= 64 or (not RESERVED_METHOD[method] and ordinary >= 60) or client.next_id >= 9007199254740991 then
+  if count >= 64 or (contract.method_policy(method).admission ~= "control" and ordinary >= 60) or client.next_id >= 9007199254740991 then
     callback(nil, "Forge request admission is full", { code = "not_admitted" })
     return nil
   end
@@ -144,10 +150,10 @@ end
 ---@param method string
 ---@param params table
 ---@param session_id? string
-local function write_request(id, method, params, session_id)
+local function host_write_request(id, method, params, session_id)
   require("forge.startup_log").write("host.request.send", { id = id, method = method, operation = params and params.operation,
     document = params and params.document })
-  local client = state()
+  local client = host_state()
   if not client.pending[id] then return end
   local ok, failure = pcall(function()
     local encoded = protocol.encode_request(id, method, params, session_id)
@@ -162,7 +168,7 @@ local function write_request(id, method, params, session_id)
 end
 
 ---@return ForgeHarnessBackendDescriptor
-local function backend_descriptor()
+local function session_backend_descriptor()
   local harness_config = config.options.harness
   local backend = harness_config.backend
   local configured = harness_config.backends[backend]
@@ -178,8 +184,8 @@ end
 ---@param result? any
 ---@param start_error? string
 ---@param error_detail? table
-local function finish_start(callback, result, start_error, error_detail)
-  local client = state()
+local function host_finish_start(callback, result, start_error, error_detail)
+  local client = host_state()
   require("forge.startup_log").write("host.initialize.finished", { error = start_error,
     elapsed_ms = client.start_started and math.floor((vim.uv.hrtime() - client.start_started) / 1e6) or nil })
   client.start_started = nil
@@ -195,22 +201,32 @@ end
 ---@param result? any
 ---@param start_error? string
 ---@param error_detail? table
-local function finish_harness_start(callback, result, start_error, error_detail)
-  local client = state()
-  client.harness_starting = false
-  local queued = client.harness_initialize_callback
-  client.harness_initialize_callback = {}
+local function session_finish_initialize(mode, callback, result, start_error, error_detail)
+  local client = host_state()
+  client[mode .. "_starting"] = false
+  local queued = client[mode .. "_initialize_callback"]
+  client[mode .. "_initialize_callback"] = {}
   callback(result, start_error, error_detail)
   for _, waiting in ipairs(queued) do waiting(result, start_error, error_detail) end
 end
 
-local function ensure_shutdown_autocmd()
+local function session_fail_initialization(client, failure)
+  for _, mode in ipairs({ "runtime", "harness" }) do
+    client[mode .. "_ready"] = false
+    client[mode .. "_starting"] = false
+    local waiting = client[mode .. "_initialize_callback"]
+    client[mode .. "_initialize_callback"] = {}
+    for _, callback in ipairs(waiting) do callback(nil, failure, { code = "outcome_unknown" }) end
+  end
+end
+
+local function host_ensure_shutdown_autocmd()
   if shutdown_autocmd then return end
   shutdown_autocmd = true
   local group = vim.api.nvim_create_augroup("ForgeClient", { clear = true })
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = group,
-    callback = function() M.stop() end,
+    callback = function() M.host_stop() end,
   })
 end
 
@@ -218,7 +234,7 @@ end
 ---@param message table
 ---@return table? response
 ---@return string? failure
-local function receive_result(client, message)
+local function host_receive_transfer(client, message)
   local document = message.document
   local session_id = message.session_id
   local envelope = message.payload
@@ -288,10 +304,11 @@ local function receive_result(client, message)
   return response, nil
 end
 
+---@param client ForgeClient
 ---@param process table
 ---@param still_running fun(): boolean
----@param finished fun(): nil
-local function force_collect_process(client, process, still_running, finished)
+---@param finished fun(result: table)
+local function host_collect_process(client, process, still_running, finished)
   if vim.fn.has("win32") ~= 1 then
     pcall(process.kill, process, 9)
     vim.defer_fn(function()
@@ -337,7 +354,7 @@ end
 
 ---@param client ForgeClient
 ---@param launch_token integer
-local function cancel_shutdown_timer(client, launch_token)
+local function host_cancel_shutdown_timer(client, launch_token)
   if client.shutdown_timer_token ~= launch_token then return end
   local timer = client.shutdown_timer
   client.shutdown_timer = nil
@@ -349,17 +366,17 @@ local function cancel_shutdown_timer(client, launch_token)
 end
 
 ---@param message table
-local function dispatch_message(message, timing)
-  local client = state()
+local function host_dispatch_message(message, timing)
+  local client = host_state()
   if message.event == "event.part" or message.event == "event.complete" then
-    local assembled, failure = receive_result(client, message)
+    local assembled, failure = host_receive_transfer(client, message)
     if failure then error("Forge event transfer failed: " .. failure) end
     if not assembled then return end
     message = assembled
   end
   if message.document ~= nil then
     if message.event == "document.part" or message.event == "document.complete" then
-      local assembled, failure = receive_result(client, message)
+      local assembled, failure = host_receive_transfer(client, message)
       if failure then
         local key = "document:" .. message.document
         local transfer = client.transfer[key]
@@ -395,7 +412,7 @@ local function dispatch_message(message, timing)
   if measured and timing then
     measured.timing = measured.timing or { frames = 0, bytes = 0, decode_us = 0, maximum_queue_wait_us = 0,
       first_frame_us = math.floor(timing.received_at / 1000) }
-    local aggregate = measured.timing
+    local aggregate = assert(measured.timing)
     aggregate.frames = aggregate.frames + 1
     aggregate.bytes = aggregate.bytes + timing.bytes
     aggregate.decode_us = aggregate.decode_us + timing.decode_us
@@ -404,7 +421,7 @@ local function dispatch_message(message, timing)
   if message.request_id then
     local pending = client.pending[message.request_id]
     if pending and (message.event == "result.part" or message.event == "result.complete") then
-      local result, failure = receive_result(client, message)
+      local result, failure = host_receive_transfer(client, message)
       if failure then error("Forge result transfer failed: " .. failure) end
       if not result then return end
       message = result
@@ -413,7 +430,7 @@ local function dispatch_message(message, timing)
         local ok, failure = pcall(pending.progress, message.payload)
         if not ok then
           local diagnostic = "Forge request progress callback failed: " .. tostring(failure)
-          if not pcall(notifications.error, diagnostic, "Forge") then pcall(vim.api.nvim_err_writeln, diagnostic) end
+          if not pcall(notifications.error, diagnostic, "Forge") then pcall(vim.api.nvim_echo, { { diagnostic, "ErrorMsg" } }, true, { err = true }) end
         end
       end
       return
@@ -430,7 +447,8 @@ local function dispatch_message(message, timing)
   if message.event then
     local event_snapshot = client.snapshot_by_id[message.session_id]
     if event_snapshot and (message.event == "plan_question" or message.event == "plan_question_updated") then
-      event_snapshot.active_plan = vim.deepcopy(message.payload and message.payload.plan or nil)
+      local plan = message.payload and message.payload.plan
+        event_snapshot.active_plan = plan and vim.deepcopy(plan) or nil
     elseif event_snapshot and (message.event == "question" or message.event == "question_updated") then
       event_snapshot.active_elicitation = vim.deepcopy(message.payload)
     elseif event_snapshot and message.event == "question_answered" then
@@ -464,33 +482,10 @@ local function dispatch_message(message, timing)
       tostring(message.error.message or message.error.code or "Harness request failed"),
       message.error
     )
-    if pending.method ~= "initialize"
-      and pending.method ~= "harness.initialize"
-      and pending.method ~= "repository.revisions"
-      and pending.method:sub(1, 11) ~= "repository."
-      and pending.method ~= "github.sync"
-      and pending.method ~= "github.issues"
-      and pending.method ~= "github.detail"
-          and pending.method ~= "github.metadata"
-          and pending.method ~= "github.pull_request"
-          and pending.method ~= "github.comment"
-      and pending.method:sub(1, 7) ~= "review."
-      and pending.method ~= "state.get"
-      and pending.method ~= "session.configure"
-      and pending.method ~= "session.permission"
-    then
-      for _, subscriber in pairs(client.subscriber) do
-        local ok, err = pcall(subscriber, "state_invalidated", { method = pending.method })
-        if not ok then notifications.error("Harness event subscriber failed: " .. tostring(err), "ForgeHarness") end
-      end
-    end
   else
-    if pending.method == "state.get" then
-      client.snapshot = message.result
-      local result_session_id = message.result and message.result.session and message.result.session.id
-      if result_session_id then client.snapshot_by_id[result_session_id] = message.result end
-    elseif pending.method == "history.record" and client.snapshot then
-      client.snapshot.prompt_history = vim.deepcopy(message.result or {})
+    if pending.method == "session.prompt.history.record" then
+      local snapshot = pending.session_id and client.snapshot_by_id[pending.session_id]
+      if snapshot then snapshot.prompt_history = vim.deepcopy(message.result or {}) end
     end
     local result_session_id = message.result and message.result.session and message.result.session.id
     if result_session_id then client.snapshot_by_id[result_session_id] = message.result end
@@ -500,44 +495,46 @@ end
 
 ---@param chunk string?
 ---@param generation integer
-local function consume_stdout(chunk, generation)
-  local client = state()
+local function host_consume_stdout(chunk, generation)
+  local client = host_state()
   if generation ~= client.generation or not chunk or not client.receiver then return end
   receive.push(client.receiver, chunk)
 end
 
 ---@param callback fun(result?: any, error?: string, error_detail?: table)
-local function send_harness_initialize(callback, initialize_options, startup)
-  local client = state()
+local function session_send_initialize(callback, initialize_options, startup)
+  local client = host_state()
+  local mode = initialize_options and initialize_options.services_only and "runtime" or "harness"
   local harness_config = config.options.harness
   if not config.harness_backend_explicit and not session.harness.session then
     harness_config.backend = backend_preference.load(harness_config.backends, harness_config.backend)
   end
-  local descriptor = backend_descriptor()
+  local descriptor = session_backend_descriptor()
   local function initialized(result, request_error, error_detail)
     if startup then startup.mark("harness.initialize.received", { error = request_error,
       session_id = result and result.session and result.session.id,
       rust = result and result.startup_timing }) end
     if request_error then
-      client.harness_ready = false
-      finish_harness_start(callback, nil, request_error, error_detail)
+      client[mode .. "_ready"] = false
+      session_finish_initialize(mode, callback, nil, request_error, error_detail)
       return
     end
-    client.snapshot = result
+    client.runtime_ready = true
+    if mode == "harness" then client.snapshot = result end
     local initialized_session_id = result and result.session and result.session.id
     if initialized_session_id then client.snapshot_by_id[initialized_session_id] = result end
-    client.harness_ready = true
-    session.harness.ready = true
-    M.request_host("trace.configure", { enabled = config.options.harness_logging == true, default_only = true }, function(status, failure)
+    client[mode .. "_ready"] = true
+    if mode == "harness" then session.harness.ready = true end
+    send_request(nil, "host.trace.configure", { enabled = config.options.harness_logging == true, default_only = true }, function(status, failure)
       if startup then startup.mark("trace.configure.received", { error = failure }) end
       if failure then
-        client.harness_ready = false
-        session.harness.ready = false
-        finish_harness_start(callback, nil, failure)
+        client[mode .. "_ready"] = false
+        if mode == "harness" then session.harness.ready = false end
+        session_finish_initialize(mode, callback, nil, failure)
         return
       end
-      require("forge.views.harness.settings").adopt(status)
-      finish_harness_start(callback, result, nil)
+      if mode == "harness" then require("forge.views.harness.settings").adopt(status) end
+      session_finish_initialize(mode, callback, result, nil)
     end)
   end
   local backend_launch_by_provider = {}
@@ -559,23 +556,24 @@ local function send_harness_initialize(callback, initialize_options, startup)
     lease_conflict_action = initialize_options and initialize_options.lease_conflict_action or nil,
     session_id = initialize_options and initialize_options.session_id or nil,
     new_session_name = initialize_options and initialize_options.new_session_name or nil,
+    services_only = mode == "runtime",
   }
   if startup then startup.mark("harness.initialize.requested") end
-  M.request_host("harness.initialize", params, initialized)
+  send_request(nil, "session.initialize", params, initialized)
 
 end
 
 ---@param callback ForgeCallback
-local function send_initialize(callback)
-  local client = state()
+local function host_send_initialize(callback)
+  local client = host_state()
   client.next_id = client.next_id + 1
   local id = client.next_id
-  client.pending[id] = { method = "initialize", callback = function(result, failure, detail)
-    if failure then finish_start(callback, nil, failure, detail) return end
+  client.pending[id] = { method = "host.initialize", callback = function(result, failure, detail)
+    if failure then host_finish_start(callback, nil, failure, detail) return end
     if type(result) ~= "table" or result.protocol_version ~= protocol.VERSION then
       local mismatch = "Forge client and host wire versions differ. Rebuild Forge and restart the client."
-      finish_start(callback, nil, mismatch)
-      M.stop(mismatch)
+      host_finish_start(callback, nil, mismatch)
+      M.host_stop(mismatch)
       return
     end
     if type(result.git_config_cache) == "table" then
@@ -583,9 +581,9 @@ local function send_initialize(callback)
       if result.git_config_cache.warning then notifications.error(result.git_config_cache.warning, "Forge") end
     end
     client.ready = not client.draining
-    finish_start(callback, { generation = client.generation }, nil)
+    host_finish_start(callback, { generation = client.generation }, nil)
   end }
-  local ok, failure = pcall(client.process.write, client.process, protocol.encode_request(id, "initialize", {
+  local ok, failure = pcall(client.process.write, client.process, protocol.encode_request(id, "host.initialize", {
     protocol_version = protocol.VERSION,
     recovery_directory = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "recovery", "github", "v1"),
     status_ignored_directory = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "status-ignored"),
@@ -593,7 +591,7 @@ local function send_initialize(callback)
   }))
   if not ok then
     client.pending[id] = nil
-    finish_start(callback, nil, "Failed to initialize Forge host: " .. tostring(failure))
+    host_finish_start(callback, nil, "Failed to initialize Forge host: " .. tostring(failure))
   end
 end
 
@@ -601,8 +599,8 @@ end
 ---@param callback fun(result?: any, error?: string, error_detail?: table)
 ---@param launch_token integer
 ---@param lease? RustSidecarLease
-local function spawn(binary, callback, launch_token, lease)
-  local client = state()
+local function host_spawn(binary, callback, launch_token, lease)
+  local client = host_state()
   if M._client ~= client or client.launch_token ~= launch_token or client.start_callback ~= callback then return end
   client.generation = client.generation + 1
   local generation = client.generation
@@ -626,11 +624,11 @@ local function spawn(binary, callback, launch_token, lease)
         require("forge.startup_log").write("host.first_stdout", {
           generation = generation, elapsed_ms = (vim.uv.hrtime() - spawn_started) / 1e6, bytes = #data })
       end
-      consume_stdout(data, generation)
+      host_consume_stdout(data, generation)
     end,
     stderr = function(_, data)
       if data then require("forge.startup_log").write("host.stderr", { text = data:sub(-8192), generation = generation }) end
-      if data and generation == state().generation then client.stderr = (client.stderr .. data:sub(-65536)):sub(-65536) end
+      if data and generation == host_state().generation then client.stderr = (client.stderr .. data:sub(-65536)):sub(-65536) end
     end,
   }
   local receiver
@@ -640,13 +638,14 @@ local function spawn(binary, callback, launch_token, lease)
       if not released then notifications.error(tostring(failure), "Forge") end
       lease = nil
     end
-    local current = state()
+    local current = host_state()
     if generation ~= current.generation or launch_token ~= current.launch_token then return end
-    cancel_shutdown_timer(current, launch_token)
+    host_cancel_shutdown_timer(current, launch_token)
     current.process = nil
     if current.receiver == receiver then current.receiver = nil end
     current.ready = false
     current.harness_ready = false
+    current.runtime_ready = false
     current.snapshot = nil
     current.starting = false
     current.draining = true
@@ -669,6 +668,7 @@ local function spawn(binary, callback, launch_token, lease)
         code = "outcome_unknown", request_id = id, method = pending.method,
       })
     end
+    session_fail_initialization(current, stop_reason)
     current.draining = false
     current.stop_reason = nil
     local stopped = current.stop_callback or {}
@@ -677,19 +677,19 @@ local function spawn(binary, callback, launch_token, lease)
   end
   local consumed_bytes, consumed_frames = 0, 0
   receiver = receive.new({
-    active = function() return generation == state().generation end,
+    active = function() return generation == host_state().generation end,
     decode = protocol.decode_message,
-    dispatch = dispatch_message,
+    dispatch = host_dispatch_message,
     consumed = function(bytes, frames)
       consumed_bytes, consumed_frames = consumed_bytes + bytes, consumed_frames + frames
-      if generation ~= state().generation or not client.process then return end
-      client.process:write(protocol.encode_request(0, "transport.consumed", {
+      if generation ~= host_state().generation or not client.process then return end
+      client.process:write(protocol.encode_request(0, "host.transport.consumed", {
         bytes = consumed_bytes, frames = consumed_frames,
       }))
     end,
     failed = function(message)
-      M.stop()
-      if not pcall(notifications.error, message, "ForgeHarness") then pcall(vim.api.nvim_err_writeln, message) end
+      M.host_stop()
+      if not pcall(notifications.error, message, "ForgeHarness") then pcall(vim.api.nvim_echo, { { message, "ErrorMsg" } }, true, { err = true }) end
     end,
     finished = finish_exit,
   })
@@ -717,23 +717,23 @@ local function spawn(binary, callback, launch_token, lease)
   local ok, process_or_error = pcall(process_launcher, command, options, on_exit)
   if not ok then
     if lease then pcall(lease.release) end
-    finish_start(callback, nil, "Failed to start Harness broker: " .. tostring(process_or_error))
+    host_finish_start(callback, nil, "Failed to start Harness broker: " .. tostring(process_or_error))
     return
   end
   process = process_or_error
   client.process = process
   require("forge.startup_log").write("host.spawned", { pid = process.pid, generation = generation,
     elapsed_ms = math.floor((vim.uv.hrtime() - spawn_started) / 1e6) })
-  ensure_shutdown_autocmd()
-  send_initialize(callback)
+  host_ensure_shutdown_autocmd()
+  host_send_initialize(callback)
 end
 
 ---@param binary string
 ---@param callback fun(result?: any, error?: string, error_detail?: table)
 ---@param launch_token integer
-local function launch(binary, callback, launch_token)
-  if launcher_for_test then spawn(binary, callback, launch_token) return end
-  local client = state()
+local function host_launch(binary, callback, launch_token)
+  if launcher_for_test then host_spawn(binary, callback, launch_token) return end
+  local client = host_state()
   local lease_started = vim.uv.hrtime()
   builder.acquire(binary, function(lease, failure)
     require("forge.startup_log").write("host.lease.finished", { error = failure,
@@ -749,16 +749,16 @@ local function launch(binary, callback, launch_token)
       end
       return
     end
-    if not lease then finish_start(callback, nil, failure) return end
-    spawn(lease.path, callback, launch_token, lease)
+    if not lease then host_finish_start(callback, nil, failure) return end
+    host_spawn(lease.path, callback, launch_token, lease)
   end)
 end
 
 ---@param callback fun(result?: any, error?: string, error_detail?: table)
-local function start_process(callback)
+local function host_start_process(callback)
   require("forge.startup_log").write("host.start")
   local host_started = vim.uv.hrtime()
-  local client = state()
+  local client = host_state()
   client.start_started = host_started
   client.starting = true
   client.start_callback = callback
@@ -770,19 +770,19 @@ local function start_process(callback)
     local function launch_ready()
       if M._client ~= client or client.launch_token ~= launch_token or client.start_callback ~= callback then return end
       if not executable_result.ok or not executable_result.path then
-        finish_start(callback, nil, executable_result.message or "Forge executable is unavailable")
+        host_finish_start(callback, nil, executable_result.message or "Forge executable is unavailable")
         return
       end
-      launch(executable_result.path, callback, launch_token)
+      host_launch(executable_result.path, callback, launch_token)
     end
     if vim.in_fast_event() then vim.schedule(launch_ready) else launch_ready() end
   end)
 end
 
----@param callback fun(result?: any, error?: string, error_detail?: table)
-function M.start(callback)
+---@param callback? fun(result?: any, error?: string, error_detail?: table)
+function M.host_start(callback)
   callback = protect_consumer(callback or function() end, "startup")
-  local client = state()
+  local client = host_state()
   if client.draining then callback(nil, "Forge host is draining") return end
   if client.ready and client.process then
     local generation = client.generation
@@ -798,62 +798,54 @@ function M.start(callback)
     client.initialize_callback[#client.initialize_callback + 1] = callback
     return
   end
-  start_process(callback)
+  host_start_process(callback)
 end
 
 ---@param callback? ForgeCallback
 ---@param initialize_options? table
 ---@param startup? ForgeHarnessStartupTrace
-function M.start_harness(callback, initialize_options, startup)
+function M.session_initialize(callback, initialize_options, startup)
   callback = protect_consumer(callback or function() end, "Harness startup")
-  local client = state()
-  if client.harness_ready and client.process then
+  local client = host_state()
+  local mode = initialize_options and initialize_options.services_only and "runtime" or "harness"
+  if client[mode .. "_ready"] and client.process then
+    if mode == "harness" and initialize_options then
+      if initialize_options.new_session_name ~= nil or initialize_options.lease_conflict_action == "new" then
+        M.session_create({ name = initialize_options.new_session_name }, callback)
+        return
+      end
+      local target = initialize_options.session_id
+      if target then
+        M.request({ method = "session.resume", session_id = target, params = { session_id = target } }, callback)
+        return
+      end
+    end
     if startup then startup.mark("host.reused") end
     local generation = client.generation
     vim.schedule(function()
-      if generation ~= client.generation or not client.harness_ready or not client.process then
+      if generation ~= client.generation or not client[mode .. "_ready"] or not client.process then
         callback(nil, "Forge host generation changed during Harness startup", { code = "not_admitted" })
-      else callback(client.snapshot or {}, nil) end
+      else callback(mode == "runtime" and { initialized = true } or client.snapshot or {}, nil) end
     end)
     return
   end
-  if client.harness_starting then
-    if #client.harness_initialize_callback >= 64 then callback(nil, "Harness startup admission is full") return end
-    client.harness_initialize_callback[#client.harness_initialize_callback + 1] = callback
-    return
-  end
-  client.harness_starting = true
-  if startup then startup.mark("host.requested") end
-  M.start(function(_, failure, detail)
-    if startup then startup.mark("host.ready", { error = failure }) end
-    if failure then finish_harness_start(callback, nil, failure, detail) return end
-    send_harness_initialize(callback, initialize_options, startup)
-  end)
-end
-
----@param method string
----@param params table
----@param callback ForgeCallback
----@param progress? fun(payload: table)
-function M.request_host(method, params, callback, progress)
-  callback = protect_consumer(callback, method)
-  local id = admit_request(method, callback)
-  if not id then return end
-  state().pending[id].progress = progress
-  M.start(function(_, failure)
-    local client = state()
-    if not client.pending[id] then return end
-    if failure then
-      client.pending[id] = nil
-      callback(nil, failure)
-      return
+  if client[mode .. "_starting"] then
+    if #client[mode .. "_initialize_callback"] >= 64 then callback(nil, "Harness startup admission is full") return end
+    client[mode .. "_initialize_callback"][#client[mode .. "_initialize_callback"] + 1] = function(result, failure, detail)
+      if failure or mode == "runtime" or not initialize_options then
+        callback(result, failure, detail)
+      else
+        M.session_initialize(callback, initialize_options, startup)
+      end
     end
-    local generation = client.generation
-    vim.schedule(function()
-      local current = state()
-      if current.generation ~= generation or not current.pending[id] then return end
-      write_request(id, method, params)
-    end)
+    return
+  end
+  client[mode .. "_starting"] = true
+  if startup then startup.mark("host.requested") end
+  M.host_start(function(_, failure, detail)
+    if startup then startup.mark("host.ready", { error = failure }) end
+    if failure then session_finish_initialize(mode, callback, nil, failure, detail) return end
+    session_send_initialize(callback, initialize_options, startup)
   end)
 end
 
@@ -861,7 +853,7 @@ end
 ---@param selection? ForgeBackgroundSelection
 ---@return ForgeTextGenerationConfig? generation
 ---@return string? failure
-function M.generation_config(selection)
+function M.generation_get_config(selection)
   local harness_config = config.options.harness
   local selected = session.harness.session
   local backend = selected and selected.backend or harness_config.backend
@@ -890,15 +882,15 @@ end
 ---@param callback ForgeCallback
 ---@param on_model? fun(model: string) Receives the configured generation model before request dispatch.
 ---@param selection? ForgeBackgroundSelection
-function M.request_generation(params, callback, on_model, selection)
-  local generation, failure = M.generation_config(selection)
+function M.generation_request(params, callback, on_model, selection)
+  local generation, failure = M.generation_get_config(selection)
   if not generation then callback(nil, failure) return end
   if on_model then
     local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
     on_model(generation.model .. effort .. " (" .. generation.backend.kind .. ")")
   end
   local label = generation.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
-  M.request_host("repository.generate", vim.tbl_extend("force", params, { generation = generation }), callback, function(progress)
+  M.request({ method = "repository.generation", params = vim.tbl_extend("force", params, { generation = generation }) }, callback, function(progress)
     local event = progress.event
     if not on_model or type(event) ~= "table" then return end
     if event.kind == "runtime_resolved" and event.data and event.data.model then
@@ -915,38 +907,30 @@ end
 ---@param action string
 ---@param conflict { session_id: string }
 ---@param callback? ForgeCallback
-function M.resolve_lease_conflict(action, conflict, callback)
+function M.session_resolve_lease_conflict(action, conflict, callback)
   callback = callback or function() end
-  if state().harness_ready then
+  if host_state().harness_ready then
     if action == "new" then
-      M.request("session.new", {}, callback)
+      M.request({ method = "session.new", params = {} }, callback)
     elseif action == "retry" then
-      M.request("session.resume", { session_id = conflict.session_id }, callback)
+      M.request({ method = "session.resume", session_id = conflict.session_id, params = { session_id = conflict.session_id } }, callback)
     elseif action == "fork" then
-      M.request("session.fork", { session_id = conflict.session_id }, callback)
+      M.request({ method = "session.fork", session_id = conflict.session_id, params = { session_id = conflict.session_id } }, callback)
     else callback(nil, "Unknown Harness lease recovery action") end
     return
   end
   local initialize_options = action ~= "retry" and { lease_conflict_action = "new" }
     or { session_id = conflict.session_id }
-  M.start_harness(function(result, start_error, error_detail)
+  M.session_initialize(function(result, start_error, error_detail)
     if start_error or action ~= "fork" then callback(result, start_error, error_detail) return end
-    M.request("session.fork", { session_id = conflict.session_id }, callback)
+    M.request({ method = "session.fork", session_id = conflict.session_id, params = { session_id = conflict.session_id } }, callback)
   end, initialize_options)
-end
-
----@param method string
----@param params? table
----@param callback? fun(result?: any, error?: string, error_detail?: table)
-function M.request(method, params, callback)
-  local active_session_id = session.harness.session and session.harness.session.id or nil
-  M.request_for(active_session_id, method, params, callback)
 end
 
 ---@param request_state ForgeHarnessPresentationState
 ---@param callback fun(result?: any, error?: string, error_detail?: table)
 ---@return fun(result?: any, error?: string, error_detail?: table)
-local function scope_callback(request_state, callback)
+local function session_scope_callback(request_state, callback)
   local deliver = protect_consumer(callback, "session request")
   return function(result, request_error, error_detail)
     local active_state = session.harness
@@ -956,53 +940,79 @@ local function scope_callback(request_state, callback)
   end
 end
 
----@param session_id? string
----@param name? string
+---@param options? {source_session_id?: string, name?: string}
 ---@param callback? fun(result?: any, error?: string, error_detail?: table)
-function M.create_session(session_id, name, callback)
-  callback = callback or function() end
-  local client = state()
-  if client.harness_ready then
-    M.request_for(session_id, "session.new", { name = name }, callback)
-    return
-  end
-  M.start_harness(scope_callback(session.harness, callback), { new_session_name = name or "" })
+function M.session_create(options, callback)
+  options = options or {}
+  M.request({ method = "session.new", params = {
+    name = options.name, source_session_id = options.source_session_id,
+  } }, callback)
 end
 
 ---@param session_id? string
 ---@param method string
 ---@param params? table
 ---@param callback? fun(result?: any, error?: string, error_detail?: table)
-local function send_session_request(session_id, method, params, callback, sending)
+send_request = function(session_id, method, params, callback, sending, progress)
+  local owner = session_id and session.harness_by_id[session_id]
   callback = callback or function() end
-  local session_callback = scope_callback(session.harness, callback)
-  local id = admit_request(method, session_callback)
+  local receive = owner and session_scope_callback(owner, callback) or protect_consumer(callback, method)
+  local id = host_admit_request(method, receive)
   if not id then return end
-  M.start_harness(function(_, start_error, error_detail)
-    local client = state()
+  host_state().pending[id].progress = progress
+  host_state().pending[id].session_id = session_id
+  local function ready(_, failure, detail)
+    local client = host_state()
     if not client.pending[id] then return end
-    if start_error then
+    if failure then
       client.pending[id] = nil
-      session_callback(nil, start_error, error_detail)
+      receive(nil, failure, detail)
       return
     end
-    if sending then sending(client.generation) end
-    write_request(id, method, params or {}, session_id)
-  end)
+    local generation = client.generation
+    vim.schedule(function()
+      if host_state() ~= client or client.generation ~= generation or not client.pending[id] then return end
+      if sending then sending(generation) end
+      host_write_request(id, method, params or {}, session_id)
+    end)
+  end
+  if method == "session.initialize" or contract.method_policy(method).readiness == "host" then
+    M.host_start(ready)
+  else
+    M.session_initialize(ready, { services_only = true })
+  end
 end
 
----@param session_id? string
----@param method string
----@param params? table
+---@class ForgeRequestSpec
+---@field method string Exact method from the shared contract.
+---@field params? table Method-owned parameters.
+---@field session_id? string Explicit target required by session operations.
+
+---Dispatch one request while preserving its target and transport correlation.
+---@param spec ForgeRequestSpec
 ---@param callback? ForgeCallback
-function M.request_for(session_id, method, params, callback)
-  require("forge.command").dispatch(send_session_request, session_id, method, params, callback or function() end)
+---@param progress? fun(payload: table)
+function M.request(spec, callback, progress)
+  callback = callback or function() end
+  local valid, policy = pcall(contract.validate_request, spec)
+  if not valid then
+    protect_consumer(callback, "request validation")(nil, tostring(policy), { code = "invalid_request" })
+    return
+  end
+  local function transport(session_id, method, params, receive, sending)
+    send_request(session_id, method, params, receive, sending, progress)
+  end
+  if policy.recovery == "session_command" and spec.session_id then
+    require("forge.command").dispatch(transport, spec.session_id, spec.method, spec.params, callback)
+  else
+    transport(spec.session_id, spec.method, spec.params, callback)
+  end
 end
 
 ---@param callback ForgeSubscriber
 ---@return fun()
-function M.subscribe(callback)
-  local client = state()
+function M.session_events_subscribe(callback)
+  local client = host_state()
   client.next_subscriber = client.next_subscriber + 1
   local subscriber_id = client.next_subscriber
   client.subscriber[subscriber_id] = callback
@@ -1012,8 +1022,8 @@ end
 ---@param document string
 ---@param callback fun(event: string, update: table, generation: integer)
 ---@return fun()
-function M.subscribe_document(document, callback)
-  local client = state()
+function M.document_events_subscribe(document, callback)
+  local client = host_state()
   client.next_subscriber = client.next_subscriber + 1
   local subscriber_id = client.next_subscriber
   client.document_subscriber[subscriber_id] = { document = document, callback = protect_consumer(callback, "document event") }
@@ -1023,22 +1033,23 @@ end
 ---Drain admitted requests and notify completion after the host process is collected.
 ---@param reason string?
 ---@param on_stopped fun()?
-function M.stop(reason, on_stopped)
+function M.host_stop(reason, on_stopped)
   if package.loaded["forge.lsp.bridge"] then require("forge.lsp.bridge").close() end
   reason = reason or "Forge host stopped"
-  local client = state()
+  local client = host_state()
   if on_stopped then
     client.stop_callback = client.stop_callback or {}
     client.stop_callback[#client.stop_callback + 1] = protect_consumer(on_stopped, "shutdown")
   end
   local process = client.process
   if client.draining then return end
+  client.draining = true
   client.stop_reason = reason
   client.ready = false
   client.harness_ready = false
+  client.runtime_ready = false
   session.harness.ready = false
   if process then
-    client.draining = true
     local generation = client.generation
     local launch_token = client.launch_token
     local function still_running()
@@ -1047,9 +1058,9 @@ function M.stop(reason, on_stopped)
         and client.launch_token == launch_token
         and client.process == process
     end
-    local sent, failure = pcall(process.write, process, protocol.encode_request(0, "shutdown", {}))
+    local sent, failure = pcall(process.write, process, protocol.encode_request(0, "host.shutdown", {}))
     if not sent then notifications.error("Forge shutdown request failed: " .. tostring(failure), "Forge") end
-    local shutdown_timer = vim.uv.new_timer()
+    local shutdown_timer = assert(vim.uv.new_timer(), "Unable to create Forge shutdown timer")
     client.shutdown_timer = shutdown_timer
     client.shutdown_timer_token = launch_token
     shutdown_timer:start(3000, 0, vim.schedule_wrap(function()
@@ -1064,7 +1075,7 @@ function M.stop(reason, on_stopped)
       if not still_running() then return end
       notifications.error("Forge drain deadline exceeded. Unresolved requests retain unknown outcomes until process collection.", "Forge")
       pcall(process.kill, process, 15)
-      force_collect_process(client, process, still_running, function(collected)
+      host_collect_process(client, process, still_running, function(collected)
         if not still_running() then return end
         if collected and client.receiver then receive.finish(client.receiver, collected) end
       end)
@@ -1077,6 +1088,7 @@ function M.stop(reason, on_stopped)
   client.process = nil
   client.ready = false
   client.harness_ready = false
+  client.runtime_ready = false
   client.snapshot = nil
   client.starting = false
   session.harness.ready = false
@@ -1085,30 +1097,32 @@ function M.stop(reason, on_stopped)
   client.transfer = {}
   client.transfer_bytes = 0
   for _, pending in pairs(pending_list) do pending.callback(nil, reason) end
-  if client.start_callback then finish_start(client.start_callback, nil, reason) end
+  if client.start_callback then host_finish_start(client.start_callback, nil, reason) end
   local callback_list = client.initialize_callback
   client.initialize_callback = {}
   for _, callback in ipairs(callback_list) do callback(nil, reason) end
+  session_fail_initialization(client, reason)
+  client.draining = false
   local stopped = client.stop_callback or {}
   client.stop_callback = {}
   for _, finished in ipairs(stopped) do finished() end
 end
 
-function M.host_generation()
-  return state().generation
+function M.host_get_generation()
+  return host_state().generation
 end
 
 
-function M.host_accepting()
-  local client = state()
+function M.host_is_accepting()
+  local client = host_state()
   return client.process ~= nil and not client.draining
 end
 
-function M._set_launcher_for_test(launcher) launcher_for_test = launcher end
-function M._reset_for_test()
+function M._host_set_launcher_for_test(launcher) launcher_for_test = launcher end
+function M._host_reset_for_test()
   local client = M._client
-  M.stop()
-  if client then cancel_shutdown_timer(client, client.launch_token) end
+  M.host_stop()
+  if client then host_cancel_shutdown_timer(client, client.launch_token) end
   M._client = nil
   launcher_for_test = nil
   shutdown_autocmd = false

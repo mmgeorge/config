@@ -68,7 +68,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 require("forge.views.harness.controller").resolve_runtime_model = function() end
 ---@type string[]
@@ -76,7 +76,7 @@ local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local function request(method, params, expected_failure)
   local value, failure, finished
-  client.request(method, params or {}, function(result, request_error)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, request_error)
     value, failure, finished = result, request_error, true
   end)
   assert(vim.wait(10000, function() return finished end, 10), method .. " timed out")
@@ -86,7 +86,7 @@ end
 local function settle(count)
   local exchanges
   assert(vim.wait(10000, function()
-    exchanges = request("exchange.list")
+    exchanges = request("session.exchange.list")
     return #exchanges == count and (exchanges[count].state == "complete" or exchanges[count].state == "failed")
   end, 10), "exchange did not settle: " .. vim.inspect(exchanges) .. " " .. table.concat(errors, " | "))
   return exchanges[count]
@@ -98,11 +98,11 @@ local success, failure = xpcall(function()
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.ready and state.session end, 10), table.concat(errors, " | "))
   request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {}, windows_sandbox = "elevated" } })
-  request("session.permission", { change = { kind = "enable_yolo" } })
-  request("prompt.submit", { text = "FIRST_SUBMISSION_MARKER" }, lost)
+  request("session.permission.set", { change = { kind = "enable_yolo" } })
+  request("session.prompt.submit", { text = "FIRST_SUBMISSION_MARKER" }, lost)
   local first = settle(1)
   assert(first.state == (lost and "failed" or "complete"), vim.inspect(first))
-  local _, second_error = request("prompt.submit", { text = "SECOND_SUBMISSION_MARKER" }, lost)
+  local _, second_error = request("session.prompt.submit", { text = "SECOND_SUBMISSION_MARKER" }, lost)
   local second = settle(2)
   assert(second.state == (lost and "failed" or "complete"), vim.inspect(second))
   local native = vim.fn.readfile(sent)
@@ -174,7 +174,7 @@ local success, failure = xpcall(function()
     assert(visible:find("ACP_SUBMISSION_ACCEPTED", 1, true), "activity collapse hid the final response")
   end
 end, debug.traceback)
-client.stop()
+client.host_stop()
 local collected = vim.wait(6000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath

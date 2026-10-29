@@ -9,7 +9,7 @@ local catalog = require("forge.views.harness.provider_catalog")
 local notifications = require("forge.infra.notifications")
 local original_submit, original_drain = controller.submit, controller.drain
 local original_configure, original_record = controller.configure, history.record
-local original_request, original_request_for = client.request, client.request_for
+local original_request = client.request
 local original_transition = controller.task_transition
 local original_error = notifications.error
 local composer = vim.api.nvim_create_buf(false, true)
@@ -32,9 +32,14 @@ local success, failure = xpcall(function()
     assert(#state.queue == 0, command .. " waited behind active work")
   end
   controller.submit, controller.drain = original_submit, original_drain
-  client.request_for = function(_, method, _, callback)
-    assert(method == "trace.status", method)
-    callback({ enabled = false })
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+    if method == "host.trace.status" then callback({ enabled = false })
+    elseif method == "background.settings" then
+      callback({ revision = 0, settings = request_specification.params.defaults })
+    elseif method == "session.provider.model.list" then callback({})
+    else error(method) end
   end
   controller.configure = function(params, _, completed)
     configured[#configured + 1] = { params = params, completed = completed }
@@ -68,9 +73,11 @@ local success, failure = xpcall(function()
   vim.api.nvim_win_set_buf(state.composer_win, composer)
   state.model_list, state.model_backend = nil, nil
   local model_response
-  client.request = function(method, _, callback)
-    if method == "backend.model_pins" then callback({})
-    elseif method == "backend.models" then model_response = callback
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+    if method == "provider.model.pin.list" then callback({})
+    elseif method == "session.provider.model.list" then model_response = callback
     else error(method) end
   end
   controller.select_model()
@@ -114,10 +121,13 @@ local success, failure = xpcall(function()
     "successive idle configuration edits lost their completion callbacks")
   local resource_picker = require("forge.views.harness.provider_picker")
   local mutations = {}
-  client.request = function(method, params, callback)
-    if method == "backend.skills" then
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    if method == "session.provider.skill.list" then
       callback({ { name = "first", enabled = true }, { name = "second", enabled = true } })
-    elseif method == "backend.mcp" then
+    elseif method == "session.provider.mcp.list" then
       callback({ { name = "first", enabled = true, status = "connected" },
         { name = "second", enabled = true, status = "connected" } })
     else
@@ -146,7 +156,7 @@ local success, failure = xpcall(function()
 end, debug.traceback)
 controller.submit, controller.drain = original_submit, original_drain
 controller.configure, history.record = original_configure, original_record
-client.request, client.request_for = original_request, original_request_for
+client.request = original_request
 controller.task_transition = original_transition
 notifications.error = original_error
 if picker.is_open() then picker.close() end

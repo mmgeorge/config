@@ -845,6 +845,12 @@ pub struct PlanAnnotation {
     pub body: String,
 }
 
+/// Selects enabled checks and removed test declarations in one plan edit.
+pub(crate) struct PlanCheckSelection<'selection> {
+    pub enabled: &'selection std::collections::BTreeMap<String, bool>,
+    pub removed_tests: &'selection [DesignTestSelection],
+}
+
 /// Owns physical plan files and immutable revision history.
 pub struct PlanFileStore {
     review_cache: review_cache::ReviewCache,
@@ -1270,7 +1276,11 @@ impl PlanFileStore {
             design_review::replace_test_inventory(&before, &document)
         })?;
         self.persist_annotated_edit(
-            session_id, plan_id, document, rendered, &before, annotation, trace,
+            session_id,
+            PlanReviewRevision::new(plan_id, document, rendered)?,
+            &before,
+            annotation,
+            trace,
         )
     }
 
@@ -1281,10 +1291,13 @@ impl PlanFileStore {
         plan_id: &str,
         expected_version: u64,
         expected_digest: &str,
-        changes: &std::collections::BTreeMap<String, bool>,
-        tests: &[DesignTestSelection],
+        selection: PlanCheckSelection<'_>,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let PlanCheckSelection {
+            enabled: changes,
+            removed_tests: tests,
+        } = selection;
         let mut document = self.read_working_document(session_id, plan_id)?;
         anyhow::ensure!(
             document.version == expected_version,
@@ -1321,26 +1334,27 @@ impl PlanFileStore {
             .context("plan version exhausted")?;
         let rendered = design_review::render(&document)?;
         self.persist_annotated_edit(
-            session_id, plan_id, document, rendered, &before, annotation, trace,
+            session_id,
+            PlanReviewRevision::new(plan_id, document, rendered)?,
+            &before,
+            annotation,
+            trace,
         )
     }
 
     fn persist_annotated_edit(
         &self,
         session_id: &str,
-        plan_id: &str,
-        document: PlanDocument,
-        rendered: RenderedPlan,
+        revision: PlanReviewRevision,
         before: &RenderedPlan,
         annotation: Vec<ReviewAnnotation>,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        let path = self.plan_dir(session_id, plan_id).join("working.json");
-        let (document, rendered, checksum) = self.persist_review_draft(
-            session_id,
-            PlanReviewRevision::new(plan_id, document, rendered)?,
-            trace,
-        )?;
+        let path = self
+            .plan_dir(session_id, &revision.document.plan_id)
+            .join("working.json");
+        let (document, rendered, checksum) =
+            self.persist_review_draft(session_id, revision, trace)?;
         let reanchor = trace.map(|trace| trace.stage("delete.reanchor_annotations"));
         let mut retained = Vec::new();
         for mut item in annotation {
@@ -1866,9 +1880,11 @@ mod test {
         let (rows, targets) = design_review::project(
             &submitted,
             &Default::default(),
-            &[],
-            &Default::default(),
-            None,
+            crate::plan::design_review::ReviewAnnotationView {
+                annotation: &[],
+                revision: &Default::default(),
+                focused: None,
+            },
             &Default::default(),
             true,
             None,
@@ -2003,9 +2019,11 @@ mod test {
             let (rows, targets) = design_review::project(
                 &submitted,
                 &Default::default(),
-                &[],
-                &Default::default(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &Default::default(),
+                    focused: None,
+                },
                 &Default::default(),
                 public_only,
                 None,

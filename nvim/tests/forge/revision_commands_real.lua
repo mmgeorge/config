@@ -52,15 +52,15 @@ local ok, failure = xpcall(function()
   }))
   assert(client._client.ready and not client._client.harness_ready)
   local process = client._client.process
-  client.stop()
+  client.host_stop()
   local exit = process:wait(2000)
   assert(exit.code == 0, "shared host did not shut down cleanly")
 end, debug.traceback)
 
 builder.ensure = original_ensure
-builder._reset_for_test()
+builder._host_reset_for_test()
 vim.notify = original_notify
-client._reset_for_test()
+client._host_reset_for_test()
 vim.cmd.cd(vim.fn.fnameescape(original_directory))
 if owned_root and vim.uv.fs_realpath(root) == owned_root then vim.fn.delete(root, "rf") end
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else vim.cmd("qa!") end

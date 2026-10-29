@@ -37,6 +37,7 @@
 ---@field authoredDate? string
 
 ---@class ForgeGhPR
+---@field snapshot? table
 ---@field id? string
 ---@field number integer
 ---@field title string

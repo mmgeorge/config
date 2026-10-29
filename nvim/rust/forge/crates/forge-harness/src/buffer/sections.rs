@@ -18,6 +18,24 @@ struct PageQuota {
     width: Option<WidthProfile>,
 }
 
+pub(super) struct SectionRequest<'request> {
+    pub view: ViewId,
+    pub sequence: u64,
+    pub id: &'request str,
+    pub expanded: bool,
+    pub more: bool,
+    pub page: Option<(usize, WidthProfile)>,
+}
+
+#[derive(Clone, Copy)]
+struct SectionSource<'source> {
+    blocks: &'source [&'source BufferBlock],
+    revision: u64,
+    intent: &'source HashMap<String, bool>,
+    quota: &'source HashMap<String, PageQuota>,
+    position: &'source HashMap<&'source BlockId, usize>,
+}
+
 impl PageQuota {
     fn bytes(bytes: usize) -> Self {
         Self {
@@ -628,13 +646,16 @@ impl SectionProjection {
     pub fn set(
         &mut self,
         source: &mut TranscriptDocument,
-        view: ViewId,
-        sequence: u64,
-        id: &str,
-        expanded: bool,
-        more: bool,
-        page: Option<(usize, WidthProfile)>,
+        request: SectionRequest<'_>,
     ) -> Result<()> {
+        let SectionRequest {
+            view,
+            sequence,
+            id,
+            expanded,
+            more,
+            page,
+        } = request;
         let last = self.view.get_mut(&view).context("section view is closed")?;
         ensure!(
             sequence <= forge_buffer::MAX_COUNTER,
@@ -877,13 +898,15 @@ fn project(
         .collect();
     let mut output = Vec::new();
     render(
-        &entry.block,
+        SectionSource {
+            blocks: &entry.block,
+            revision,
+            intent,
+            quota,
+            position: &position,
+        },
         0,
         entry.block.len(),
-        revision,
-        intent,
-        quota,
-        &position,
         &mut output,
         PageQuota::bytes(usize::MAX),
         false,
@@ -896,18 +919,21 @@ fn project(
 }
 
 fn render(
-    source: &[&BufferBlock],
+    context: SectionSource<'_>,
     mut cursor: usize,
     end: usize,
-    revision: u64,
-    intent: &HashMap<String, bool>,
-    quota: &HashMap<String, PageQuota>,
-    position: &HashMap<&BlockId, usize>,
     output: &mut Vec<BufferBlock>,
     mut budget: PageQuota,
     within_file: bool,
     parent_file: Option<&str>,
 ) -> Result<bool> {
+    let SectionSource {
+        blocks: source,
+        revision,
+        intent,
+        quota,
+        position,
+    } = context;
     while cursor < end {
         if budget.exhausted() && source[cursor].text.row_count() > 0 {
             return Ok(true);
@@ -983,13 +1009,9 @@ fn render(
             };
             let more = expanded
                 && (render(
-                    source,
+                    context,
                     child_start,
                     after,
-                    revision,
-                    intent,
-                    quota,
-                    position,
                     output,
                     child_budget,
                     within_file || file,
@@ -1276,12 +1298,14 @@ mod tests {
         for (sequence, expanded) in [(1, true), (2, false), (3, true)] {
             visible.set(
                 &mut source,
-                view.clone(),
-                sequence,
-                "tools",
-                expanded,
-                false,
-                None,
+                crate::buffer::sections::SectionRequest {
+                    view: view.clone(),
+                    sequence,
+                    id: "tools",
+                    expanded,
+                    more: false,
+                    page: None,
+                },
             )?;
             visible.refresh(&mut source)?;
             let snapshot = visible.document.snapshot()?;
@@ -1357,7 +1381,17 @@ mod tests {
                 .is_none()
         );
         assert!(serde_json::to_vec(&visible.document.snapshot()?)?.len() < 2048);
-        visible.set(&mut source, first.clone(), 1, "tools", true, false, None)?;
+        visible.set(
+            &mut source,
+            crate::buffer::sections::SectionRequest {
+                view: first.clone(),
+                sequence: 1,
+                id: "tools",
+                expanded: true,
+                more: false,
+                page: None,
+            },
+        )?;
         visible.refresh(&mut source)?;
         assert!(
             visible
@@ -1376,8 +1410,28 @@ mod tests {
                 .byte_count()
                 <= PAGE_BYTES
         );
-        visible.set(&mut source, second.clone(), 1, "tools", true, false, None)?;
-        visible.set(&mut source, first.clone(), 2, "tools", false, false, None)?;
+        visible.set(
+            &mut source,
+            crate::buffer::sections::SectionRequest {
+                view: second.clone(),
+                sequence: 1,
+                id: "tools",
+                expanded: true,
+                more: false,
+                page: None,
+            },
+        )?;
+        visible.set(
+            &mut source,
+            crate::buffer::sections::SectionRequest {
+                view: first.clone(),
+                sequence: 2,
+                id: "tools",
+                expanded: false,
+                more: false,
+                page: None,
+            },
+        )?;
         visible.refresh(&mut source)?;
         assert!(
             visible
@@ -1395,12 +1449,32 @@ mod tests {
                 .block(&BlockId("body".into()))
                 .is_none()
         );
-        visible.set(&mut source, first.clone(), 1, "tools", true, false, None)?;
+        visible.set(
+            &mut source,
+            crate::buffer::sections::SectionRequest {
+                view: first.clone(),
+                sequence: 1,
+                id: "tools",
+                expanded: true,
+                more: false,
+                page: None,
+            },
+        )?;
         assert!(visible.refresh(&mut source)?.is_empty());
         visible.close(&mut source, &first);
         assert!(
             visible
-                .set(&mut source, first, 3, "tools", true, false, None)
+                .set(
+                    &mut source,
+                    crate::buffer::sections::SectionRequest {
+                        view: first,
+                        sequence: 3,
+                        id: "tools",
+                        expanded: true,
+                        more: false,
+                        page: None
+                    }
+                )
                 .is_err()
         );
         Ok(())
@@ -1428,12 +1502,14 @@ mod tests {
         visible.register(view.clone());
         visible.set(
             &mut source,
-            view.clone(),
-            1,
-            "outer-fold",
-            true,
-            false,
-            None,
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 1,
+                id: "outer-fold",
+                expanded: true,
+                more: false,
+                page: None,
+            },
         )?;
         visible.refresh(&mut source)?;
         assert!(
@@ -1450,7 +1526,17 @@ mod tests {
                 .block(&BlockId("body".into()))
                 .is_none()
         );
-        visible.set(&mut source, view.clone(), 2, "tools", true, false, None)?;
+        visible.set(
+            &mut source,
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 2,
+                id: "tools",
+                expanded: true,
+                more: false,
+                page: None,
+            },
+        )?;
         visible.refresh(&mut source)?;
         let assert_parent_endpoint = |visible: &SectionProjection| -> Result<()> {
             let snapshot = visible.document.snapshot()?;
@@ -1482,7 +1568,17 @@ mod tests {
             .text
             .byte_count();
         assert!(first <= PAGE_BYTES);
-        visible.set(&mut source, view.clone(), 3, "tools", true, true, None)?;
+        visible.set(
+            &mut source,
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 3,
+                id: "tools",
+                expanded: true,
+                more: true,
+                page: None,
+            },
+        )?;
         visible.refresh(&mut source)?;
         assert_parent_endpoint(&visible)?;
         let second = visible
@@ -1508,12 +1604,14 @@ mod tests {
         for (sequence, expanded) in [(4, false), (5, true)] {
             visible.set(
                 &mut source,
-                view.clone(),
-                sequence,
-                "tools",
-                expanded,
-                false,
-                None,
+                crate::buffer::sections::SectionRequest {
+                    view: view.clone(),
+                    sequence,
+                    id: "tools",
+                    expanded,
+                    more: false,
+                    page: None,
+                },
             )?;
             visible.refresh(&mut source)?;
             assert_parent_endpoint(&visible)?;
@@ -1551,15 +1649,27 @@ mod tests {
         let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;
         let view = ViewId("view".into());
         visible.register(view.clone());
-        visible.set(&mut source, view.clone(), 1, "changes", true, false, None)?;
         visible.set(
             &mut source,
-            view.clone(),
-            2,
-            "changes:file:0",
-            true,
-            false,
-            Some((12, width.clone())),
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 1,
+                id: "changes",
+                expanded: true,
+                more: false,
+                page: None,
+            },
+        )?;
+        visible.set(
+            &mut source,
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 2,
+                id: "changes:file:0",
+                expanded: true,
+                more: false,
+                page: Some((12, width.clone())),
+            },
         )?;
         visible.refresh(&mut source)?;
         let first = visible.document.snapshot()?;
@@ -1614,21 +1724,25 @@ mod tests {
         visible.register(second.clone());
         visible.set(
             &mut source,
-            second,
-            1,
-            "changes:file:0",
-            true,
-            false,
-            Some((12, width.clone())),
+            crate::buffer::sections::SectionRequest {
+                view: second,
+                sequence: 1,
+                id: "changes:file:0",
+                expanded: true,
+                more: false,
+                page: Some((12, width.clone())),
+            },
         )?;
         visible.set(
             &mut source,
-            view.clone(),
-            3,
-            "changes:file:0",
-            true,
-            true,
-            Some((16, width.clone())),
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 3,
+                id: "changes:file:0",
+                expanded: true,
+                more: true,
+                page: Some((16, width.clone())),
+            },
         )?;
         visible.refresh(&mut source)?;
         let next = visible.document.snapshot()?;
@@ -1645,12 +1759,14 @@ mod tests {
         );
         visible.set(
             &mut source,
-            view.clone(),
-            4,
-            "changes:file:0:hunk:0",
-            false,
-            false,
-            None,
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 4,
+                id: "changes:file:0:hunk:0",
+                expanded: false,
+                more: false,
+                page: None,
+            },
         )?;
         visible.refresh(&mut source)?;
         assert!(
@@ -1664,21 +1780,25 @@ mod tests {
         );
         visible.set(
             &mut source,
-            view.clone(),
-            5,
-            "changes:file:0",
-            false,
-            false,
-            Some((12, width.clone())),
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 5,
+                id: "changes:file:0",
+                expanded: false,
+                more: false,
+                page: Some((12, width.clone())),
+            },
         )?;
         visible.set(
             &mut source,
-            view.clone(),
-            6,
-            "changes:file:0",
-            true,
-            true,
-            Some((12, width.clone())),
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 6,
+                id: "changes:file:0",
+                expanded: true,
+                more: true,
+                page: Some((12, width.clone())),
+            },
         )?;
         visible.refresh(&mut source)?;
         assert!(
@@ -1691,12 +1811,14 @@ mod tests {
         );
         visible.set(
             &mut source,
-            view,
-            7,
-            "changes:file:0",
-            true,
-            false,
-            Some((12, width)),
+            crate::buffer::sections::SectionRequest {
+                view,
+                sequence: 7,
+                id: "changes:file:0",
+                expanded: true,
+                more: false,
+                page: Some((12, width)),
+            },
         )?;
         visible.refresh(&mut source)?;
         let reopened = visible.document.snapshot()?;
@@ -1740,12 +1862,14 @@ mod tests {
         };
         visible.set(
             &mut source,
-            view.clone(),
-            1,
-            "tools",
-            true,
-            false,
-            Some((12, width.clone())),
+            crate::buffer::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 1,
+                id: "tools",
+                expanded: true,
+                more: false,
+                page: Some((12, width.clone())),
+            },
         )?;
         visible.refresh(&mut source)?;
         let first = visible
@@ -1760,7 +1884,17 @@ mod tests {
             6,
             "wrapped rows count against display budget"
         );
-        visible.set(&mut source, view, 2, "tools", true, true, Some((8, width)))?;
+        visible.set(
+            &mut source,
+            crate::buffer::sections::SectionRequest {
+                view,
+                sequence: 2,
+                id: "tools",
+                expanded: true,
+                more: true,
+                page: Some((8, width)),
+            },
+        )?;
         visible.refresh(&mut source)?;
         let next = visible
             .document
@@ -1778,12 +1912,14 @@ mod tests {
         let view = ViewId("view".into());
         visible.set(
             &mut source,
-            view,
-            3,
-            "tools",
-            true,
-            true,
-            Some((20, narrow)),
+            crate::buffer::sections::SectionRequest {
+                view,
+                sequence: 3,
+                id: "tools",
+                expanded: true,
+                more: true,
+                page: Some((20, narrow)),
+            },
         )?;
         visible.refresh(&mut source)?;
         let resized = visible

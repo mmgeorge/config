@@ -5,12 +5,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use forge_git::RepositoryPath;
 use forge_git::command::{CommandProgress, CommandStream};
 use forge_git::mutation::OperationId;
 use forge_git::store::RepositoryStore;
 use forge_git::writer::{
-    DiscardSource, GitWriteAction, GitWriteIntent, GitWriteService, TargetCompletion, WriteOutcome,
+    GitWriteAction, GitWriteIntent, GitWriteService, TargetCompletion, WriteOutcome,
 };
 use forge_protocol::message::{Message, RequestEvent};
 use forge_protocol::outbound::MessageSender;
@@ -37,29 +36,13 @@ pub(crate) enum WriteRequest {
         intent: Option<String>,
         operation_id: Option<u64>,
     },
-    Outcome {
-        operation_id: u64,
-    },
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WriteAction {
-    Stage {
-        paths: Vec<String>,
-    },
-    Unstage {
-        paths: Vec<String>,
-    },
-    Discard {
-        paths: Vec<String>,
-        source: DiscardBase,
-    },
     CreateBranch {
         name: String,
-    },
-    Commit {
-        message: String,
     },
     CommitEditor {
         command: String,
@@ -73,13 +56,6 @@ pub(crate) enum WriteAction {
         head: Option<String>,
     },
     Pull,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum DiscardBase {
-    Index,
-    Head,
 }
 
 #[derive(Default)]
@@ -213,13 +189,6 @@ impl RepositoryWriteGateway {
                 }
                 Ok(json!({"cancellation_requested":true}))
             }
-            WriteRequest::Outcome { operation_id } => {
-                let outcome = self
-                    .writer
-                    .outcome(OperationId::from_value(operation_id)?)
-                    .context("Git operation has no collected outcome")?;
-                Ok(outcome_value(&outcome))
-            }
         }
     }
 }
@@ -227,21 +196,7 @@ impl RepositoryWriteGateway {
 impl WriteAction {
     fn into_action(self) -> Result<GitWriteAction> {
         Ok(match self {
-            Self::Stage { paths } => GitWriteAction::Stage {
-                path: decode_repository_paths(paths)?,
-            },
-            Self::Unstage { paths } => GitWriteAction::Unstage {
-                path: decode_repository_paths(paths)?,
-            },
-            Self::Discard { paths, source } => GitWriteAction::Discard {
-                path: decode_repository_paths(paths)?,
-                source: match source {
-                    DiscardBase::Index => DiscardSource::Index,
-                    DiscardBase::Head => DiscardSource::Head,
-                },
-            },
             Self::CreateBranch { name } => GitWriteAction::CreateBranch { name },
-            Self::Commit { message } => GitWriteAction::Commit { message },
             Self::CommitEditor {
                 command,
                 nvim_server,
@@ -259,16 +214,6 @@ impl WriteAction {
             Self::Pull => GitWriteAction::Pull,
         })
     }
-}
-
-fn decode_repository_paths(paths: Vec<String>) -> Result<Vec<RepositoryPath>> {
-    paths
-        .into_iter()
-        .map(|path| {
-            let path = STANDARD.decode(path)?;
-            RepositoryPath::new(path)
-        })
-        .collect()
 }
 
 pub(crate) fn outcome_value(outcome: &WriteOutcome) -> Value {
@@ -297,23 +242,4 @@ pub(crate) fn outcome_value(outcome: &WriteOutcome) -> Value {
         "settlement_diagnostic":outcome.settlement_diagnostic,
         "requires_refresh":outcome.settled.is_none(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn path_admission_preserves_complete_collections_and_validates_paths() {
-        let accepted = (0..10_001)
-            .map(|index| STANDARD.encode(format!("source-{index}.rs")))
-            .collect();
-        assert_eq!(decode_repository_paths(accepted).unwrap().len(), 10_001);
-        let path = vec![b'x'; 1024 * 1024 + 1];
-        assert_eq!(
-            decode_repository_paths(vec![STANDARD.encode(&path)]).unwrap()[0].raw(),
-            path
-        );
-        assert!(decode_repository_paths(vec![STANDARD.encode("../outside")]).is_err());
-    }
 }

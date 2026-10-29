@@ -8,8 +8,10 @@ perf.event = function(_, event, fields)
   if event == "ui.buffer.patch" then measured_patch = perf.payload(fields) end
 end
 local requests, notices = {}, {}
-client.host_accepting = function() return true end
-client.request_for = function(_, _, params, callback)
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
   callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   requests[#requests + 1] = { params = params, callback = callback }
 end
@@ -74,13 +76,13 @@ local success, failure = xpcall(function()
   batch = {}
   for revision = 0, 49 do batch[#batch + 1] = patch(revision) end
   requests[#requests].callback({ patch = batch })
-  local replaced_revision, previous_generation = owner.transcript.revision, client.host_generation
-  local replaced_generation = client.host_generation() + 1
-  client.host_generation = function() return replaced_generation end
+  local replaced_revision, previous_generation = owner.transcript.revision, client.host_get_generation
+  local replaced_generation = client.host_get_generation() + 1
+  client.host_get_generation = function() return replaced_generation end
   assert(vim.wait(1000, function() return not owner.applying end, 1), "replaced host retained an update job")
   assert(owner.transcript.revision == replaced_revision, "old host patches reached the replacement view")
   owner.close()
-  client.host_generation = previous_generation
+  client.host_get_generation = previous_generation
 
   open()
   owner.sync()

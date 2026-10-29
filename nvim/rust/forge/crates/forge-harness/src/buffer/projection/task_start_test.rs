@@ -22,8 +22,10 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
     let idle = project_at(
         &TimelineEntry::Exchange {
             id: idle.id.clone(),
+
             created_at_ms: 0,
-            exchange: idle,
+            exchange: (idle).into(),
+
             agent_by_id: HashMap::new(),
         },
         &WidthProfile::default(),
@@ -102,8 +104,10 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
         let active = project_at(
             &TimelineEntry::Exchange {
                 id: active.id.clone(),
+
                 created_at_ms: 0,
-                exchange: active,
+                exchange: (active).into(),
+
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),

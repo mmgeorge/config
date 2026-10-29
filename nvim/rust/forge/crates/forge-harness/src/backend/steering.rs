@@ -152,10 +152,6 @@ impl SteeringLane {
             } else {
                 ActiveTurnOperation::PauseGoal
             },
-            String::new(),
-            None,
-            false,
-            Vec::new(),
             None,
             None,
         )
@@ -183,42 +179,21 @@ impl SteeringLane {
 
     /// Delivers input to the active turn and publishes only acknowledged user additions.
     pub async fn steer(&self, input: SteeringInput) -> Result<()> {
-        let publish_input = !matches!(input, SteeringInput::AgentResult(_));
-        self.submit(
-            ActiveTurnOperation::Steer,
-            input.text().to_owned(),
-            None,
-            publish_input,
-            input.attachments().to_vec(),
-            input.submission(),
-            input.task_start().cloned(),
-        )
-        .await
+        self.submit(ActiveTurnOperation::Steer, Some(input), None)
+            .await
     }
 
     /// Interrupt the parent and descendants and wait for terminal provider evidence.
     pub async fn cleanup_execution(&self) -> Result<()> {
-        self.submit(
-            ActiveTurnOperation::CleanupExecution,
-            String::new(),
-            None,
-            false,
-            Vec::new(),
-            None,
-            None,
-        )
-        .await
+        self.submit(ActiveTurnOperation::CleanupExecution, None, None)
+            .await
     }
 
     async fn submit(
         &self,
         operation: ActiveTurnOperation,
-        text: String,
+        input: Option<SteeringInput>,
         target: Option<SteerTarget>,
-        publish_input: bool,
-        attachments: Vec<crate::attachment::InputAttachment>,
-        submission: Option<Arc<super::submission::Submission>>,
-        task_start: Option<crate::exchange::TaskStart>,
     ) -> Result<()> {
         let sender = self
             .state
@@ -244,6 +219,19 @@ impl SteeringLane {
         .try_acquire_owned()
         .context("active turn control admission is full")?;
         let (completion, response) = oneshot::channel();
+        let publish_input = input
+            .as_ref()
+            .is_some_and(|input| !matches!(input, SteeringInput::AgentResult(_)));
+        let text = input
+            .as_ref()
+            .map(|input| input.text().to_owned())
+            .unwrap_or_default();
+        let attachments = input
+            .as_ref()
+            .map(|input| input.attachments().to_vec())
+            .unwrap_or_default();
+        let submission = input.as_ref().and_then(SteeringInput::submission);
+        let task_start = input.as_ref().and_then(SteeringInput::task_start).cloned();
         sender
             .sender
             .try_send(SteerCommand {
@@ -530,28 +518,13 @@ mod test {
         );
         let first = active.receive().await.unwrap();
         assert!(lane.steer("still full".into()).await.is_err());
-        let mut interrupt = Box::pin(lane.submit(
-            super::ActiveTurnOperation::Interrupt,
-            String::new(),
-            None,
-            false,
-            Vec::new(),
-            None,
-            None,
-        ));
+        let mut interrupt =
+            Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt, None, None));
         assert!(futures_util::poll!(interrupt.as_mut()).is_pending());
         assert!(
-            lane.submit(
-                super::ActiveTurnOperation::Interrupt,
-                String::new(),
-                None,
-                false,
-                Vec::new(),
-                None,
-                None
-            )
-            .await
-            .is_err()
+            lane.submit(super::ActiveTurnOperation::Interrupt, None, None)
+                .await
+                .is_err()
         );
         for sequence in 1..super::MAX_STEERING_REQUESTS {
             let command = active.receive().await.unwrap();
@@ -581,15 +554,15 @@ mod test {
         let target = "target".repeat(4097);
         let mut request = Box::pin(lane.submit(
             super::ActiveTurnOperation::Steer,
-            text.clone(),
+            Some(super::SteeringInput::User {
+                text: text.clone(),
+                attachments: Vec::new(),
+                submission: None,
+            }),
             Some(super::SteerTarget {
                 thread_id: target.clone(),
                 turn_id: "turn".into(),
             }),
-            true,
-            Vec::new(),
-            None,
-            None,
         ));
         assert!(futures_util::poll!(request.as_mut()).is_pending());
         let command = active.receive().await.unwrap();

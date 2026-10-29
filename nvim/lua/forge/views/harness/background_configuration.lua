@@ -69,7 +69,7 @@ function BackgroundConfiguration:load_models()
     end
     self.options.changed()
   end
-  client.request_for(self.options.session_id, "backend.models", {}, accept)
+  client.request({ session_id = self.options.session_id, method = "session.provider.model.list", params = {} }, accept)
 end
 
 function BackgroundConfiguration:model()

@@ -1,10 +1,19 @@
 local M = {}
 
+---@class ForgeStateReplica
+---@field view fun(): table
+---@field begin fun(id: string, intent: table)
+---@field remove fun(id: string): table?
+---@field replace fun(value: table, next_revision: integer): boolean
+---@field patch fun(base_revision: integer, next_revision: integer, update: fun(value: table)): boolean
+---@field pending fun(): integer
+---@field needs_snapshot fun(): boolean
+
 ---Keep confirmed state private and recompute predictions after every acknowledgement.
 ---@param initial table
 ---@param revision integer
 ---@param project fun(value: table, intent: table)
----@return table
+---@return ForgeStateReplica
 function M.new(initial, revision, project)
   local confirmed, current_revision = vim.deepcopy(initial), revision
   local pending, recovering = {}, false

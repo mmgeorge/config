@@ -59,8 +59,10 @@ local function deliver(params, callback)
   else callback({}) end
 end
 
-client.host_accepting = function() return true end
-client.request_for = function(_, _, params, callback)
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
   callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   if params.operation == "background_terminals" then callback({ supported = false })
   elseif params.operation == "open" then

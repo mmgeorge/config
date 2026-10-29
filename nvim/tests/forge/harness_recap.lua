@@ -3,9 +3,13 @@ local client = require("forge.client")
 local notifications = require("forge.infra.notifications")
 local recap = require("forge.views.harness.recap")
 local pending, errors, rendered = {}, {}, 0
-client.host_generation = function() return 1 end
-client.request_for = function(id, method, params, callback)
-  assert(id == "session" and method == "harness.document" and params.operation == "recap")
+client.host_get_generation = function() return 1 end
+client.request = function(request_specification, callback)
+  local id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  assert(id == "session" and method == "session.document" and params.operation == "recap")
   assert(params.model == "default", "recap must preserve auto/default selection instead of replaying a provider-resolved alias")
   pending[#pending + 1] = callback
 end

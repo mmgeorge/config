@@ -29,12 +29,12 @@ function M.open(options, callback)
   ---@class HarnessPresentation
   ---@field status_view HarnessStatusView
   local owner = { document = identity, closed = false, syncing = false, pending = false, output = {},
-    session_id = options.session_id, host_generation = client.host_generation(), views = {},
+    session_id = options.session_id, host_generation = client.host_get_generation(), views = {},
     timeline_key = "main", timeline_view = {}, epoch = 0,
     staging = { queue = {}, steering = {} }, applied_staging = { queue = {}, steering = {} } }
   local function alive()
-    return not owner.closed and owner.host_generation == client.host_generation()
-      and client.host_accepting() and options.is_alive()
+    return not owner.closed and owner.host_generation == client.host_get_generation()
+      and client.host_is_accepting() and options.is_alive()
   end
   local function notice(message)
     if options.notice then options.notice(message) end
@@ -177,13 +177,13 @@ function M.open(options, callback)
       if completed then return end
       receive(nil, "Presentation response is delayed", { code = "outcome_unknown" })
     end, 30000)
-    if owner.host_generation ~= client.host_generation() or not client.host_accepting() then
+    if owner.host_generation ~= client.host_get_generation() or not client.host_is_accepting() then
       receive(current.params.operation == "close" and {} or nil, current.params.operation ~= "close" and "Harness host generation changed" or nil)
     elseif options.request then options.request(current.params, receive)
-    else client.request_for(options.session_id, "harness.document", current.params, receive) end
+    else client.request({ session_id = options.session_id, method = "session.document", params = current.params }, receive) end
   end
   local function request(params, done, valid, cancel)
-    if owner.host_generation ~= client.host_generation() or not client.host_accepting() then
+    if owner.host_generation ~= client.host_get_generation() or not client.host_is_accepting() then
       done(params.operation == "close" and {} or nil, params.operation ~= "close" and "Harness host generation changed" or nil)
       return
     end
@@ -300,8 +300,8 @@ function M.open(options, callback)
   end
 
   ---Replace transient staged messages without changing the composer or durable history.
-  ---@param queue (string|{text: string})[]?
-  ---@param steering {text: string}[]?
+  ---@param queue (string|{id?: string, text: string, failed?: boolean})[]?
+  ---@param steering {id?: string, text: string, failed?: boolean}[]?
   function owner.set_staging(queue, steering)
     if not alive() then return end
     local staged = { queue = {}, steering = {} }
@@ -689,7 +689,7 @@ function M.open(options, callback)
             local closed = -1
             local located = replica.locate(owner.transcript, row - 1, 0)
             local block = located and owner.transcript.block[located.block]
-            if block and not visited[located.block] then
+            if located and block and not visited[located.block] then
               visited[located.block] = true
               for _, section in ipairs(block.metadata.section or {}) do
                 if admitted >= 8 then return end
@@ -731,7 +731,7 @@ function M.open(options, callback)
     if (not node or node == vim.NIL) and block and block.metadata.content_node then
       node = section_state(block.metadata.content_node)
     end
-    if not node or node == vim.NIL then return false end
+    if not block or not node or node == vim.NIL then return false end
     if #(block.metadata.fold or {}) == 0
       and (node.kind == "message" or node.kind == "thought" and node.default_display == "full") then
       return false
@@ -937,7 +937,7 @@ function M.open(options, callback)
     if owner.closed then return true end
     if startup then startup.finish("closed_before_redraw") end
     cancel_staging_reveal()
-    local collected = owner.host_generation ~= client.host_generation()
+    local collected = owner.host_generation ~= client.host_get_generation()
       or not vim.api.nvim_buf_is_valid(options.composer_buffer) or not vim.api.nvim_buf_is_valid(options.transcript_buffer)
     owner.closed = true
     owner.selection.close()
@@ -963,7 +963,7 @@ function M.open(options, callback)
       vim.api.nvim_buf_delete(options.composer_buffer, { force = true })
     end
     request({ operation = "close", document = identity }, function(_, failure)
-      if failure and owner.host_generation == client.host_generation() and client.host_accepting() then notice(failure) end
+      if failure and owner.host_generation == client.host_get_generation() and client.host_is_accepting() then notice(failure) end
     end)
     return true
   end

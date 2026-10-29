@@ -108,7 +108,7 @@ mod tests {
         let trace = PlanEditTrace::new(
             Arc::clone(&store),
             "session",
-            "plan.tests.delete",
+            "session.plan.test.delete",
             &json!({"operation_id":"edit-1","plan_id":"plan","expected_version":3,
                 "draft_annotation":[{"body":"must not be logged"}]}),
         );

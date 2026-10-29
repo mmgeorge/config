@@ -357,11 +357,14 @@ impl TimelineStream {
                     {
                         return Ok(TimelineEntry::Exchange {
                             id: id.clone(),
+
                             created_at_ms: *created_at_ms,
-                            exchange: crate::plan::event::replacement_exchange(
+                            exchange: (crate::plan::event::replacement_exchange(
                                 exchange,
                                 interaction,
-                            )?,
+                            )?)
+                            .into(),
+
                             agent_by_id: agent_by_id.clone(),
                         });
                     }
@@ -372,8 +375,10 @@ impl TimelineStream {
                 }
                 Ok(TimelineEntry::Exchange {
                     id: interaction.id.clone(),
+
                     created_at_ms: interaction.created_at_ms,
-                    exchange: interaction.clone(),
+                    exchange: (interaction.clone()).into(),
+
                     agent_by_id: HashMap::new(),
                 })
             })
@@ -530,8 +535,9 @@ impl TimelineStream {
             } else {
                 let entry = TimelineEntry::Checks {
                     id: run.id.clone(),
+
                     created_at_ms: run.started_at_ms,
-                    run: run.clone(),
+                    run: (run.clone()).into(),
                 };
                 let insertion = self
                     .entry_list
@@ -970,8 +976,10 @@ mod test {
         }))?;
         let entry = TimelineEntry::Exchange {
             id: exchange.id.clone(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: Default::default(),
         };
         let mut run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
@@ -1053,8 +1061,10 @@ mod test {
         let mut stream = TimelineStream::new("session".into());
         stream.initialize(vec![TimelineEntry::Exchange {
             id: exchange.id.clone(),
+
             created_at_ms: 0,
-            exchange: exchange.clone(),
+            exchange: (exchange.clone()).into(),
+
             agent_by_id: Default::default(),
         }])?;
         let activity = event.activity.as_mut().unwrap();

@@ -21,8 +21,23 @@ use super::{
     PlanDocument, PlanNavigationAnchor, PlanNavigationIndex, PlanReviewTarget, RenderedPlan,
 };
 
+pub(super) struct ReviewAnnotationView<'view> {
+    pub(super) annotation: &'view [ReviewAnnotation],
+    pub(super) revision: &'view HashMap<String, (RegionRevision, EditSequence)>,
+    pub(super) focused: Option<&'view str>,
+}
+
+struct DesignReviewRows {
+    block: Vec<BufferBlock>,
+    navigation: PlanNavigationIndex,
+    hidden: HashSet<BlockId>,
+    contextual: HashSet<BlockId>,
+}
+
 pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
-    let (block, navigation, _, _) = rows(
+    let DesignReviewRows {
+        block, navigation, ..
+    } = rows(
         document,
         &HashMap::new(),
         false,
@@ -117,16 +132,23 @@ pub(super) fn test_source_range(rendered: &RenderedPlan) -> Result<(usize, usize
 pub(super) fn project(
     document: &PlanDocument,
     width: &WidthProfile,
-    annotation: &[ReviewAnnotation],
-    revision: &HashMap<String, (RegionRevision, EditSequence)>,
-    focused: Option<&str>,
+    annotations: ReviewAnnotationView<'_>,
     syntax: &HashMap<(String, String), super::review_source::ReviewSyntax>,
     public_only: bool,
     trace: Option<&ReviewTrace>,
     revealed: &HashSet<(String, String, u32)>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
-    let (source, navigation, mut hidden, contextual) =
-        rows(document, syntax, public_only, true, trace, revealed)?;
+    let ReviewAnnotationView {
+        annotation,
+        revision,
+        focused,
+    } = annotations;
+    let DesignReviewRows {
+        block: source,
+        navigation,
+        mut hidden,
+        contextual,
+    } = rows(document, syntax, public_only, true, trace, revealed)?;
     // Parse the complete generated section so code-fence context survives per-row projection.
     let flow_rows = super::design_flows::rows(
         &document
@@ -350,12 +372,7 @@ fn rows(
     inspection: bool,
     trace: Option<&ReviewTrace>,
     revealed: &HashSet<(String, String, u32)>,
-) -> Result<(
-    Vec<BufferBlock>,
-    PlanNavigationIndex,
-    HashSet<BlockId>,
-    HashSet<BlockId>,
-)> {
+) -> Result<DesignReviewRows> {
     let design = document
         .design
         .as_ref()
@@ -910,7 +927,12 @@ fn rows(
     navigation.anchor.extend(section_anchor);
     block = overview;
     navigation.anchor.sort_by_key(|anchor| anchor.line);
-    Ok((block, navigation, hidden, contextual_block))
+    Ok(DesignReviewRows {
+        block,
+        navigation,
+        hidden,
+        contextual: contextual_block,
+    })
 }
 
 fn review_checks(
@@ -1806,9 +1828,11 @@ mod tests {
             let (blocks, targets) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &syntax,
                 false,
                 None,
@@ -1980,12 +2004,11 @@ mod tests {
     #[test]
     fn configured_checks_show_scoped_commands_and_keep_repeated_stages() {
         let mut document = crate::plan::document::test_fixture("checks", "Checks");
-        let mut design = super::super::DeclarationDesign::default();
-        design.check_configuration = Some(serde_json::from_value(serde_json::json!({
+        let design = super::super::DeclarationDesign { check_configuration: Some(serde_json::from_value(serde_json::json!({
             "digest": "checks",
             "helper_digest": {},
             "config": {"format-internal":{"trigger":{"auto":true,"paths":["src/**"],"exclude":["private/**"]},"action":{"command":"format-all","label":"Format","category":"format"}},"unit-internal":{"trigger":{"auto":true},"action":{"command":"unit-all","label":"Unit","category":"test","after":["format-internal"],"input":true}},"integration-internal":{"trigger":{"auto":false},"action":{"command":"integration-files","label":"Integration","category":"test","after":["unit-internal"],"input":true}},"optional-internal":{"trigger":{"auto":false},"action":{"command":"optional-all","label":"Optional","category":"test"}}}
-        })).unwrap());
+        })).unwrap()), ..Default::default() };
         document.design = Some(design);
         let original = serde_json::to_vec(&document).unwrap();
         let rendered = render(&document).unwrap();
@@ -2018,9 +2041,11 @@ mod tests {
         let (blocks, _) = project(
             &document,
             &WidthProfile::default(),
-            &[],
-            &HashMap::new(),
-            None,
+            crate::plan::design_review::ReviewAnnotationView {
+                annotation: &[],
+                revision: &HashMap::new(),
+                focused: None,
+            },
             &HashMap::new(),
             false,
             None,
@@ -2044,9 +2069,11 @@ mod tests {
             let (blocks, _) = project(
                 &document,
                 &profile,
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 false,
                 None,
@@ -2139,9 +2166,11 @@ mod tests {
         let (blocks, _) = project(
             &document,
             &Default::default(),
-            &[],
-            &HashMap::new(),
-            None,
+            crate::plan::design_review::ReviewAnnotationView {
+                annotation: &[],
+                revision: &HashMap::new(),
+                focused: None,
+            },
             &HashMap::new(),
             true,
             None,
@@ -2191,9 +2220,11 @@ mod tests {
             let (blocks, _) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -2223,9 +2254,11 @@ mod tests {
             let (blocks, _) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -2294,9 +2327,11 @@ mod tests {
             let (blocks, _) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &syntax,
                 public_only,
                 None,
@@ -2370,9 +2405,11 @@ mod tests {
             let (blocks, targets) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -2515,9 +2552,11 @@ mod tests {
             let (blocks, _) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &syntax,
                 public_only,
                 None,
@@ -2656,9 +2695,11 @@ mod tests {
             let (blocks, _) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -2818,9 +2859,11 @@ mod tests {
             let (blocks, _) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -2882,9 +2925,11 @@ mod tests {
             let (blocks, targets) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -2982,9 +3027,11 @@ mod tests {
             let (block, target) = project(
                 &document,
                 &width,
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -3194,9 +3241,11 @@ mod tests {
             let (block, target) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -3300,9 +3349,11 @@ mod tests {
             let (block, target) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -3390,9 +3441,11 @@ mod tests {
             let (block, _) = project(
                 &document,
                 &Default::default(),
-                &[],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -3495,9 +3548,11 @@ mod tests {
                     columns,
                     ..WidthProfile::default()
                 },
-                &[annotation.clone()],
-                &HashMap::new(),
-                None,
+                crate::plan::design_review::ReviewAnnotationView {
+                    annotation: std::slice::from_ref(&annotation),
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
                 &HashMap::new(),
                 public_only,
                 None,
@@ -3583,9 +3638,11 @@ mod tests {
         let (block, target) = project(
             &document,
             &WidthProfile::default(),
-            &[annotation],
-            &HashMap::new(),
-            None,
+            crate::plan::design_review::ReviewAnnotationView {
+                annotation: &[annotation],
+                revision: &HashMap::new(),
+                focused: None,
+            },
             &HashMap::new(),
             true,
             None,
@@ -3623,9 +3680,11 @@ mod tests {
         let (block, target) = project(
             &document,
             &WidthProfile::default(),
-            &[],
-            &HashMap::new(),
-            None,
+            crate::plan::design_review::ReviewAnnotationView {
+                annotation: &[],
+                revision: &HashMap::new(),
+                focused: None,
+            },
             &HashMap::new(),
             true,
             None,
@@ -3740,9 +3799,11 @@ mod tests {
         let (block, target) = project(
             &document,
             &WidthProfile::default(),
-            &[comment],
-            &HashMap::new(),
-            Some("review"),
+            crate::plan::design_review::ReviewAnnotationView {
+                annotation: &[comment],
+                revision: &HashMap::new(),
+                focused: Some("review"),
+            },
             &HashMap::new(),
             false,
             None,
@@ -3824,7 +3885,7 @@ mod tests {
         let reopened: PlanDocument =
             serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap();
         let rendered = render(&reopened).unwrap();
-        let (block, _, _, _) = rows(
+        let DesignReviewRows { block, .. } = rows(
             &reopened,
             &HashMap::new(),
             false,
@@ -3872,7 +3933,7 @@ mod tests {
         design
             .proposed
             .insert("0.ts".into(), "export type Zero = number;\n".into());
-        let (block, _, _, _) = rows(
+        let DesignReviewRows { block, .. } = rows(
             &document,
             &HashMap::new(),
             false,

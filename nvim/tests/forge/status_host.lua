@@ -15,7 +15,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local status = require("forge.status")
 local state, notices
 local phase = "setup"
@@ -66,6 +66,7 @@ end
 local ok, failure = xpcall(function()
   record_phase("setup repository")
   git({ "init", "--quiet" })
+  git({ "config", "core.autocrlf", "false" })
   git({ "config", "user.name", "Forge Fixture" })
   git({ "config", "user.email", "forge@example.test" })
   vim.fn.writefile({ "local value = 1", "return value" }, fixture .. "/tracked file.lua")
@@ -88,6 +89,8 @@ local ok, failure = xpcall(function()
     return settled() and next(state.done) ~= nil
       and table.concat(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false), "\n"):find("@@", 1, true)
   end)
+  status.navigate(state, true)
+  await_phase("native hunk navigation", 10000, function() return not state.navigation and settled() end)
   local hunk_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false)) do
     if line:find("@@", 1, true) then hunk_row = row break end
@@ -110,7 +113,7 @@ local ok, failure = xpcall(function()
   state = nil
 end, debug.traceback)
 if state then status.close(state) end
-client.stop()
+client.host_stop()
 record_phase("collect native host")
 local collected = vim.wait(6000, function() return client._client.process == nil end, 200)
 record_phase("cleanup")

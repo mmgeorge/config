@@ -2,8 +2,11 @@ vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 local closed = false
 local close_view = 0
 require("forge.infra.config").setup({ walkthrough_inventory = false })
-package.loaded["forge.client"] = { request_host = function(method, params, callback)
-  assert(method == "walkthrough")
+package.loaded["forge.client"] = { request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  assert(method == "repository.walkthrough.document")
   if params.operation == "open" then
     callback({ inventory_state = params.inventory and "unavailable" or "disabled",
       inventory_diagnostic = params.inventory and "Sem fixture failure" or nil,

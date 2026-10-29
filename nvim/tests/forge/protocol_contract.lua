@@ -11,6 +11,9 @@ local function reject(value)
 end
 
 local ok, failure = xpcall(function()
+  for _, frame in ipairs({ protocol.encode_request(1, "host.shutdown"), protocol.encode_request(1, "host.shutdown", {}) }) do
+    assert(frame:find('"params":{}', 1, true), "empty request parameters must encode as an object")
+  end
   assert(decode({ id = 1, result = vim.NIL }).result == nil)
   local result = decode({ id = 1, result = { optional = vim.NIL, list = { vim.NIL, "second" } } }).result
   assert(result.optional == nil and result.list[1] == vim.NIL and result.list[2] == "second")

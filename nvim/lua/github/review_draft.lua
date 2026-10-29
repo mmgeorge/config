@@ -25,19 +25,19 @@ local function advance(queue)
     advance(queue)
   end
   local params = { resource = queue.resource }
-  local route = "github.review.draft"
+  local route = "github.review.draft.get"
   if not item.read then
     local built, payload = pcall(item.build)
     if not built or type(payload) ~= "table" then finish(nil, tostring(payload)) return end
     params.draft = payload
-    route = "github.review.draft.write"
+    route = "github.review.draft.save"
     if item.record then
       params.resource = item.record.resource
       params.operation_id = item.record.capture.operation_id
-      route = "github.recovery.settle_draft"
+      route = "github.recovery.draft.settle"
     end
   end
-  local admitted, failure = pcall(function() require("forge.client").request_host(route, params, finish) end)
+  local admitted, failure = pcall(function() require("forge.client").request({ method = route, params = params }, finish) end)
   if not admitted then finish(nil, failure) end
 end
 

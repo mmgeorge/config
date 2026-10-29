@@ -78,7 +78,7 @@ pub(crate) enum SourceProjection {
     Loading(Arc<AtomicBool>),
     Loaded {
         analysis: AnalysisHandle,
-        cursor: DisplayCursor,
+        cursor: Box<DisplayCursor>,
         complete: bool,
     },
     Unavailable(String),
@@ -123,7 +123,7 @@ impl SourceProjection {
     pub fn loaded(analysis: AnalysisHandle, cursor: DisplayCursor) -> Self {
         Self::Loaded {
             analysis,
-            cursor,
+            cursor: Box::new(cursor),
             complete: false,
         }
     }

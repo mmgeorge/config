@@ -20,9 +20,12 @@ local current = true
 state.presentation = { capture_prompt = function()
   return { buffer = state.composer_buf, document = "original", is_current = function() return current end }
 end }
-client.request_for = function(_, method, parameters, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local parameters = request_specification.params or {}
+
   if host.request(method, parameters, callback) then return end
-  if method == "state.get" then
+  if method == "session.state.get" then
     callback({ session = state.session, capability = state.capability,
       status = { kind = "idle" }, runtime_epoch = state.runtime_epoch })
     return
@@ -54,9 +57,12 @@ current = true
 
 controller.cancel_turn()
 local pause = controls[#controls]
-assert(pause.method == "task.transition" and pause.parameters.action == "pause")
+assert(pause.method == "session.command.apply" and pause.parameters.action == "pause")
 assert(pause.parameters.text == nil and state.queue_paused and #state.queue == 2)
 pause.callback({ state = "completed" })
+local cancellation = controls[#controls]
+assert(cancellation.method == "session.turn.cancel" and cancellation.parameters.restore_prompt_if_no_output)
+cancellation.callback({ cancel_requested = true })
 local count = #host.requests
 controller.render()
 assert(#host.requests == count and composer_text() == "newer draft", "pause drained queued input or overwrote typing")
@@ -84,8 +90,10 @@ assert(host.requests[#host.requests].parameters.action.message.text == "replace 
 compose("draft after cancellation")
 controller.cancel_turn()
 local replacement_pause = controls[#controls]
-assert(replacement_pause.method == "task.transition")
+assert(replacement_pause.method == "session.command.apply")
 replacement_pause.callback({ state = "completed" })
+assert(controls[#controls].method == "session.turn.cancel")
+controls[#controls].callback({ cancel_requested = true })
 assert(state.queue_paused and composer_text() == "draft after cancellation")
 host.flush()
 assert(state.pending_steer[#state.pending_steer].text == "replace check")

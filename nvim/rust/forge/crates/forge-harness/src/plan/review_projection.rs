@@ -91,9 +91,11 @@ pub(crate) fn project(
         let result = super::design_review::project(
             &source.document,
             width,
-            annotation,
-            revision,
-            focused,
+            crate::plan::design_review::ReviewAnnotationView {
+                annotation,
+                revision,
+                focused,
+            },
             &source.declaration_syntax,
             source.public_only,
             source.trace.as_ref(),
@@ -212,8 +214,10 @@ pub(crate) fn project(
             .text
             .row(row)
             .context("rendered plan row is missing")?;
-        let mut metadata = BlockMetadata::default();
-        metadata.decoration = row_decoration.remove(&row).unwrap_or_default();
+        let mut metadata = BlockMetadata {
+            decoration: row_decoration.remove(&row).unwrap_or_default(),
+            ..Default::default()
+        };
         if let Some(syntax) = &source.syntax {
             metadata.decoration.clear();
             forge_diff::projection::append_source_syntax_row(&mut metadata, syntax, row, 0, text)?;
@@ -1443,8 +1447,10 @@ mod tests {
                 body: "literal **comment**\n".into(),
             },
         };
-        let mut width = WidthProfile::default();
-        width.columns = 20;
+        let width = WidthProfile {
+            columns: 20,
+            ..Default::default()
+        };
         let (block, target) = project(
             &source,
             &width,

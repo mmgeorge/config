@@ -13,13 +13,16 @@ vim.notify = function(message) notices[#notices + 1] = message end
 local original_auto = config.options.about_auto_generate
 local original_lookup, original_lookup_delay = config.options.pr_lookup_mode, config.options.pr_mock_delay_ms
 assert(config.options.about_auto_generate ~= false, "automatic About must be enabled by default")
-local original_request, original_ai, original_clear, original_pr = client.request_host, ai.ensure, ai.clear, gh.current_pr_async
+local original_request, original_ai, original_clear, original_pr = client.request, ai.ensure, ai.clear, gh.current_pr_async
 local ok, failure = xpcall(function()
   local updates, generation, pull_request, presentation = {}, {}, {}, {}
   local about_source = { head = "old-head", file = { { id = 1, generation = 1, section = "unstaged" } } }
   local cleared = 0
-  client.request_host = function(method, params, callback)
-    assert(method == "status.context")
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    assert(method == "repository.status.context")
     updates[#updates + 1] = { params = params, callback = callback }
   end
   ai.ensure = function(_, options, callback)
@@ -119,7 +122,7 @@ local ok, failure = xpcall(function()
   generation[generation_count + 1]({ state = "ready", message = "late message" })
   assert(owner.about == closed_about, "closed context adopted generation")
 end, debug.traceback)
-client.request_host, ai.ensure, ai.clear, gh.current_pr_async = original_request, original_ai, original_clear, original_pr
+client.request, ai.ensure, ai.clear, gh.current_pr_async = original_request, original_ai, original_clear, original_pr
 notifications.error = original_error
 vim.notify = original_notify
 config.options.about_auto_generate = original_auto

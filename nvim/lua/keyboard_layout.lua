@@ -42,7 +42,7 @@ local apt3 = {
   'z', ';', ',', '.', '/'
 }
 
-function indexOf(array, value)
+local function index_of(array, value)
   for i, v in ipairs(array) do
     if v == value then
       return i
@@ -63,7 +63,7 @@ provides.key = function(key)
   local out = ''
   for i = 1, #key do 
     local c = key:sub(i, i)
-    local index = indexOf(qwerty, string.lower(c))
+    local index = index_of(qwerty, string.lower(c))
     if c == 'C' or c == 'S' then 
       out = out .. c
     elseif index then 

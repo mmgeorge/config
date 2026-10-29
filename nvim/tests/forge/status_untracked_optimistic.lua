@@ -97,7 +97,7 @@ local ok, failure = xpcall(function()
 end, debug.traceback)
 status.apply_update = apply_update
 status.close(state)
-client.stop()
+client.host_stop()
 assert(vim.wait(6000, function() return client._client.process == nil end, 20), "host did not exit")
 vim.fn.chdir(config)
 assert(ok, failure)

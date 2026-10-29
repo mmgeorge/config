@@ -49,12 +49,14 @@ local ok, failure = xpcall(function()
   }
   session.harness.model_backend = "codex"
   session.harness.model_list = { { id = "fixture-model", reasoning = { "low", "high" } } }
-  client.request = function(method, _, callback)
-    if method == "backend.model_pins" then callback({}) return end
-    if method == "agent.profiles.get" then callback({document={profiles={
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+    if method == "provider.model.pin.list" then callback({}) return end
+    if method == "agent.profile.get" then callback({document={profiles={
       reviewer={enabled=true,description="Review code"}, disabled={enabled=false},
     }}}) return end
-    assert(method == "backend.skills", "unexpected completion request " .. method)
+    assert(method == "session.provider.skill.list", "unexpected completion request " .. method)
     vim.schedule(function()
       callback({ { name = "fixture-skill", enabled = true, user_invocable = true } })
     end)

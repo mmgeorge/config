@@ -98,8 +98,10 @@ press("<Down>")
 expect("between")
 
 local response
-client.request = function(method, _, callback)
-  assert(method == "history.record")
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+
+  assert(method == "session.prompt.history.record")
   response = callback
 end
 history.record("submitted")

@@ -48,10 +48,10 @@ local success, failure = xpcall(function()
   end
   require("forge").setup({ harness = { backend = "mock", model = "mock-model" },
     background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
-  local request_generation = client.request_generation
+  local generation_request = client.generation_request
   local function generate_commit()
     local result, failure, done
-    request_generation({ operation = "generate", workspace = fixture, comparison = "latest_commit" },
+    generation_request({ operation = "generate", workspace = fixture, comparison = "latest_commit" },
       function(value, error) result, failure, done = value, error, true end)
     assert(vim.wait(15000, function() return done end, 10), "shared commit generation timed out")
     assert(not failure, failure)
@@ -59,7 +59,7 @@ local success, failure = xpcall(function()
   end
   local first_commit = generate_commit()
   local stale_failure, stale_done
-  request_generation({ operation = "pull_request", comparison = "pull_request", workspace = fixture,
+  generation_request({ operation = "pull_request", comparison = "pull_request", workspace = fixture,
     head = string.rep("0", 40), input = "Stale PR evidence" }, function(_, failure)
       stale_failure, stale_done = failure, true
     end)
@@ -67,10 +67,10 @@ local success, failure = xpcall(function()
   assert(stale_failure and stale_failure:find("HEAD changed", 1, true), "stale PR HEAD was accepted")
   notices = {}
   local pr_session
-  client.request_generation = function(params, callback, on_model, selection)
+  client.generation_request = function(params, callback, on_model, selection)
     generated = params
     assert(selection.model == "mock-model" and selection.reasoning_effort == "low")
-    return request_generation(params, function(result, failure)
+    return generation_request(params, function(result, failure)
       pr_session = result and result.session_id
       callback(result, failure)
     end, on_model, selection)
@@ -130,10 +130,13 @@ local success, failure = xpcall(function()
   generated, created, published, opened = nil, nil, nil, nil
   notices = {}
   local context_response
-  local request_host = client.request_host
-  client.request_host = function(method, params, callback, ...)
-    return request_host(method, params, function(response, request_failure)
-      if method == "repository.generate" then context_response = response end
+  local request_host = client.request
+  client.request = function(request_specification, callback, ...)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    return request_host({ method = method, params = params }, function(response, request_failure)
+      if method == "repository.generation" then context_response = response end
       callback(response, request_failure)
     end, ...)
   end
@@ -151,9 +154,9 @@ local success, failure = xpcall(function()
   assert(git({ "status", "--porcelain=v2" }) == status_before, "conflict check changed repository state")
   assert(git({ "diff", "--cached", "--binary" }) == index_before, "conflict check changed the index")
   assert(git({ "diff", "--binary" }) == worktree_before, "conflict check changed the worktree")
-  client.request_host = request_host
+  client.request = request_host
 end, debug.traceback)
-client.stop()
+client.host_stop()
 assert(vim.wait(10000, function() return client._client.process == nil end, 20))
 vim.notify = original_notify
 vim.fn.delete(fixture, "rf")

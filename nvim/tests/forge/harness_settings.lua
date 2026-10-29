@@ -28,7 +28,7 @@ local configured_session = {
   id = "settings-session", backend = "codex", model = "mock-model", effort = "medium",
   plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
 }
-local original_request = client.request_for
+local original_request = client.request
 local commit_settings = require("forge.integrations.background_settings")
 local original_commit_request = commit_settings.request
 commit_settings.request = function(_, _, callback)
@@ -36,18 +36,24 @@ commit_settings.request = function(_, _, callback)
     settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 }, models = { codex = { model = "mock-model", thinking = "low" },
       copilot = { model = "mock-model", thinking = "low" } } } })
 end
-client.request_for = function(session_id, method, params, callback)
-  assert(session_id == "settings-session")
-  assert(method == "trace.status" or method == "trace.configure" or method == "trace.session.clear"
-    or method == "session.configure" or method == "backend.models" or method == "checks.editing")
-  if method == "backend.models" then
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  local context = require("forge.event_contract").method_policy(method).session_context
+  assert(context == "required" and session_id == "settings-session"
+    or context ~= "required" and (session_id == nil or session_id == "settings-session"))
+  assert(method == "host.trace.status" or method == "host.trace.configure" or method == "session.trace.clear"
+    or method == "session.configure" or method == "session.provider.model.list" or method == "session.check.editing.set")
+  if method == "session.provider.model.list" then
     callback({
       { id = "mock-model", reasoning = { "low", "medium", "high" }, default_reasoning = "medium", service_tiers = { "fast", "ultrafast" } },
       { id = "other-model", reasoning = { "low", "high" }, default_reasoning = "low", service_tiers = { "fast", "ultrafast" } },
     })
     return
   end
-  if method == "checks.editing" then callback({ check_editing = params.enabled }) return end
+  if method == "session.check.editing.set" then callback({ check_editing = params.enabled }) return end
   if method == "session.configure" then
     if params.ask_model then
       state.ask_model = vim.deepcopy(params.ask_model)
@@ -70,12 +76,12 @@ client.request_for = function(session_id, method, params, callback)
     if params.session_tools ~= nil then state.session_tools = params.session_tools end
     return
   end
-  if method == "trace.configure" then enabled = params.enabled end
-  if method == "trace.session.clear" then vim.fn.writefile({}, path) end
+  if method == "host.trace.configure" then enabled = params.enabled end
+  if method == "session.trace.clear" then vim.fn.writefile({}, path) end
   callback({ enabled = enabled, path = path })
 end
 controller.configure = function(params, _, completed)
-  client.request_for("settings-session", "session.configure", params, function(result)
+  client.request({ session_id = "settings-session", method = "session.configure", params = params }, function(result)
     state.session = result
     if params.status_thoughts ~= nil then state.status_thoughts = params.status_thoughts end
     if params.check_timing then state.check_timing = params.check_timing end
@@ -282,7 +288,7 @@ local success, failure = xpcall(function()
 end, debug.traceback)
 controller.configure = original_configure
 package.loaded["mini.clue"] = original_clue
-client.request_for = original_request
+client.request = original_request
 commit_settings.request = original_commit_request
 vim.fn.delete(path)
 if not success then error(failure) end

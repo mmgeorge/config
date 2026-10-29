@@ -20,7 +20,7 @@ local function receive(record, diagnostic)
   result, failure, completed = record, diagnostic, (completed or 0) + 1
 end
 mutation.run(options, receive)
-assert(route == "github.actor")
+assert(route == "github.actor.get")
 options.mutation.body = "newer unsent text"
 pending({ login = "viewer", node_id = "ACTOR" })
 assert(route == "github.review.mutate")
@@ -31,7 +31,7 @@ local record = { version = 1, resource = capture.resource,
   state = { phase = "confirmed", result = { id = 1 } } }
 local mutation_reply = pending
 pending(record)
-assert(route == "github.recovery.settle_draft" and params.draft.review_comment_text == "newer unsent text")
+assert(route == "github.recovery.draft.settle" and params.draft.review_comment_text == "newer unsent text")
 assert(completed == nil)
 pending({})
 assert(completed == 1 and result == record and failure == nil)
@@ -94,7 +94,7 @@ resolve()
 vim.api.nvim_feedkeys("c", "x", false)
 assert(recovery_requests[1].route == "github.recovery.resolve")
 assert(recovery_requests[1].params.resolution.resolution == "not_dispatched")
-assert(recovery_requests[2].route == "github.recovery.ack" and recovery_result == recovery)
+assert(recovery_requests[2].route == "github.recovery.acknowledge" and recovery_result == recovery)
 recovery.state.phase = "outcome_unknown"
 resolve()
 assert(vim.api.nvim_buf_get_lines(0, 2, 3, false)[1] == "  [l]  Link an existing remote result")
@@ -104,6 +104,6 @@ recovery.state.phase = "confirmed"
 resolve()
 assert(vim.api.nvim_buf_get_lines(0, 2, 3, false)[1] == "  [r]  Retry durable settlement")
 vim.api.nvim_feedkeys("r", "x", false)
-assert(#recovery_requests == 3 and recovery_requests[3].route == "github.recovery.ack")
+assert(#recovery_requests == 3 and recovery_requests[3].route == "github.recovery.acknowledge")
 mutation._set_runner_for_test(nil)
 print("github mutation capture and durable acknowledgement tests passed")

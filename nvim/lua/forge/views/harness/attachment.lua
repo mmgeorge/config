@@ -171,7 +171,7 @@ local function pump(owner)
     end
     owner.number = owner.number + 1
     item.number = owner.number
-    client.request_for(owner.session_id, "attachment.import", { path = item.path, number = item.number }, complete)
+    client.request({ session_id = owner.session_id, method = "session.attachment.import", params = { path = item.path, number = item.number } }, complete)
   end))
 end
 
@@ -321,6 +321,8 @@ local function install_paste()
     vim.schedule(finish_register_paste)
   end, namespace)
   local previous = vim.paste
+  -- Neovim exposes this function as the supported override for bracketed paste handling.
+  ---@diagnostic disable-next-line: duplicate-set-field
   vim.paste = function(lines, phase)
     if phase == -1 or phase == 1 then
       paste_owner = owner_by_buffer[vim.api.nvim_get_current_buf()]
@@ -366,7 +368,9 @@ function M.attach(buffer, session_id)
   vim.api.nvim_create_autocmd("TextYankPost", {
     buffer = buffer,
     callback = function()
-      local copied = table.concat(vim.v.event.regcontents, "\n")
+      local contents = vim.v.event.regcontents
+      assert(type(contents) == "table", "yank event has no register rows")
+      local copied = table.concat(contents, "\n")
       if vim.v.event.regtype == "V" then copied = copied .. "\n" end
       local selected
       do

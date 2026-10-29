@@ -15,20 +15,23 @@ package.loaded["forge.views.status.status_context"] = { attach = function()
   return { refresh = function() end, close = function() end }
 end, producer_handlers = function() return {} end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local status, history = require("forge.status"), require("forge.status_history")
 local state, notices = nil, {}
-local request_host = client.request_host
+local request_host = client.request
 local demand_count = 0
-client.request_host = function(method, params, callback, progress)
-  if method == "status" and params.operation == "demand" then
+client.request = function(request_specification, callback, progress)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  if method == "repository.status.document" and params.operation == "demand" then
     demand_count = demand_count + 1
     if demand_count > 64 then
       callback(nil, "Repeated demand: " .. vim.inspect(params))
       return
     end
   end
-  return request_host(method, params, callback, progress)
+  return request_host({ method = method, params = params }, callback, progress)
 end
 vim.notify = function(message, level)
   if level == vim.log.levels.ERROR then notices[#notices + 1] = tostring(message) end
@@ -121,10 +124,10 @@ end, debug.traceback)
 local function cleanup()
   if state then status.close(state) end
   vim.wait(3000, function() return not state or not state.request_active end, 10)
-  client.stop()
+  client.host_stop()
   vim.wait(3000, function() return client._client.process == nil end, 10)
   vim.fn.stdpath, vim.notify = original_stdpath, original_notify
-  client.request_host = request_host
+  client.request = request_host
   vim.fn.chdir(root)
   vim.fn.delete(workspace, "rf")
   vim.fn.delete(data_directory, "rf")

@@ -83,9 +83,12 @@ end
 
 ---@param item GithubGhItem
 ---@param body string?
----@return GithubIssueRendered
+---@return GithubIssuePreview
 local function render_issue_preview(item, body)
-  local preview_item = vim.deepcopy(item or {})
+  local preview_item = vim.tbl_extend("force", {
+    body = "", created_at = "", labels = {}, assignees = {}, milestone = "",
+    projects = {}, subscription = "", comments = {},
+  }, item)
   preview_item.kind = preview_item.kind or "issue"
   if body ~= nil then preview_item.body = body end
   return issue_preview.render(preview_item, { folds = {} })
@@ -121,7 +124,7 @@ end
 
 ---@param ctx table
 ---@param title string
----@param rendered GithubIssueRendered
+---@param rendered GithubIssuePreview
 local function set_preview_rendered(ctx, title, rendered)
   if not (ctx and ctx.preview) then return end
   pcall(function()

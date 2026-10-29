@@ -76,7 +76,7 @@ result, which uses saved checkpoint evidence even when a provider report is inco
 
 `MockBackend` implements the same provider boundary with deterministic responses.
 Its `backend/mock_response.rs` control stores session-scoped, one-response holds.
-The `backend.mock_response` host route handles hold, wait, release, and cancel
+The `session.provider.mock_response` host route handles hold, wait, release, and cancel
 without taking the broker execution lock, so a test can control a response while
 its real Harness turn owns that lock. The route rejects providers that do not
 expose mock response control. Holds match the next prompt in the selected session
@@ -404,7 +404,7 @@ the original catalog unchanged so unpinning restores provider order exactly.
 
 Rust's `ModelPinStore` persists backend-wide membership in the `model_pin` table of the Harness
 SQLite database, independently of workspace preferences, session leases, and session formats.
-`backend.model_pins` reads membership, and `backend.model_pin` sets one explicit pin state
+`provider.model.pin.list` reads membership, and `provider.model.pin.set` sets one explicit pin state
 idempotently. The service runs pin storage outside the provider broker lock, allowing changes
 during active execution without configuring or contacting the provider. Unavailable model IDs
 remain pinned in storage but produce no synthetic catalog entries.

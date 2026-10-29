@@ -62,10 +62,10 @@ local function fake_launcher(_, options, _)
   local process = {}
   function process:write(payload)
     local request = vim.json.decode(vim.trim(payload))
-    if request.method == "transport.consumed" then return end
-    if request.method == "initialize" then
+    if request.method == "host.transport.consumed" then return end
+    if request.method == "host.initialize" then
       emit(options, { id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
-    elseif request.method == "harness.initialize" then
+    elseif request.method == "session.initialize" then
       initialize_count = initialize_count + 1
       initialize_request = request
       local initialized = snapshot(request.params.new_session_name)
@@ -77,9 +77,9 @@ local function fake_launcher(_, options, _)
       else
         emit(options, { id = request.id, result = snapshot(request.params.name) })
       end
-    elseif request.method == "trace.configure" then
+    elseif request.method == "host.trace.configure" then
       emit(options, { id = request.id, result = { enabled = request.params.enabled } })
-    elseif request.method == "shutdown" then
+    elseif request.method == "host.shutdown" then
       emit(options, { id = request.id, result = { shutdown = true } })
     else
       error("unexpected Harness request: " .. request.method)
@@ -95,7 +95,7 @@ local test_success, failure = pcall(function()
   builder._set_artifact_root_for_test(vim.fs.joinpath(test_root, "artifacts"))
   vim.fn.mkdir(vim.fs.dirname(builder.binary_path()), "p")
   vim.fn.writefile({ "fake" }, builder.binary_path())
-  client._set_launcher_for_test(fake_launcher)
+  client._host_set_launcher_for_test(fake_launcher)
 
   local baseline_tab_count = vim.fn.tabpagenr("$")
   require("forge.views.harness").new_session()
@@ -143,8 +143,8 @@ local test_success, failure = pcall(function()
     "a failed ForgeHarnessNew should preserve the previously active timeline")
 end)
 
-client._reset_for_test()
-builder._reset_for_test()
+client._host_reset_for_test()
+builder._host_reset_for_test()
 pcall(vim.fn.delete, test_root, "rf")
 
 if not test_success then

@@ -34,7 +34,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local received, errors = {}, {}
 local original_notify = vim.notify
@@ -42,17 +42,17 @@ vim.notify = function(message, level)
   if level == vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end
   original_notify(message, level)
 end
-local unsubscribe = client.subscribe(function(event, payload)
+local unsubscribe = client.session_events_subscribe(function(event, payload)
   if event == "backend_event" and payload.kind == "assistant_message" then received[#received + 1] = payload.text end
 end)
 local function request(method, params)
   local deadline = vim.uv.now() + 20000
   repeat
     local complete, value, failure
-    client.request(method, params or {}, function(result, error) value, failure, complete = result, error, true end)
+    client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, error) value, failure, complete = result, error, true end)
     assert(vim.wait(20000, function() return complete end, 10), method .. " timed out: " .. table.concat(errors, "\n"))
     if not failure then return value end
-    assert(method == "prompt.submit" and tostring(failure):find("no permits available", 1, true), method .. ": " .. tostring(failure))
+    assert(method == "session.prompt.submit" and tostring(failure):find("no permits available", 1, true), method .. ": " .. tostring(failure))
     vim.wait(20, function() return false end, 5)
   until vim.uv.now() >= deadline
   error(method .. ": execution permit did not become available")
@@ -65,7 +65,7 @@ local function query(arguments)
   for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
     if line:find(prompt_marker, 1, true) then before = before + 1 end
   end
-  request("prompt.submit", { text = "LSP " .. vim.json.encode(arguments) })
+  request("session.prompt.submit", { text = "LSP " .. vim.json.encode(arguments) })
   local output
   assert(vim.wait(75000, function()
     local lines = vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)
@@ -89,7 +89,7 @@ local function query(arguments)
   assert(vim.wait(5000, function()
     if not pending then
       pending = true
-      client.request("state.get", {}, function(snapshot)
+      client.request({ method = "session.state.get", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(snapshot)
         pending = false
         settled = snapshot and snapshot.status and snapshot.status.kind == "idle"
       end)
@@ -121,10 +121,10 @@ local success, failure = xpcall(function()
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "Harness did not start")
   assert(#vim.lsp.get_clients({ name = "fixture-" .. language }) == 0, "opening Harness started a server")
-  assert(request("state.get").lsp_tools == false)
+  assert(request("session.state.get").lsp_tools == false)
   assert(query({ tool = "lsp_status" }):find("disabled", 1, true), "disabled tool call was admitted")
   request("session.configure", { lsp_tools = true })
-  assert(request("state.get").lsp_tools == true)
+  assert(request("session.state.get").lsp_tools == true)
   assert(query({ tool = "lsp_status" }):find("No project language servers", 1, true), "status started a server")
   if language == "typescript" then
     buffer = vim.fn.bufadd(workspace .. "/" .. spec.file)
@@ -252,7 +252,7 @@ end
 unsubscribe()
 if identity then vim.lsp.get_client_by_id(identity):stop(true) end
 require("forge.views.harness.workspace").release(state)
-client.stop()
+client.host_stop()
 vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

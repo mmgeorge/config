@@ -366,10 +366,12 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
     let mut presentation = crate::buffer::session::SessionPresentation::new("checks-test".into());
     presentation.initialize(Vec::new()).unwrap();
     CheckSupervisor::open(
-        "checks-test".into(),
-        data.into(),
-        workspace.into(),
-        data.into(),
+        super::CheckSupervisorContext {
+            session_id: "checks-test".into(),
+            data_root: data.into(),
+            workspace: workspace.into(),
+            root: data.into(),
+        },
         Arc::new(Mutex::new(presentation)),
         crate::storage::objects::ObjectStore::open(data).unwrap(),
         Arc::new(forge_git::store::RepositoryStore::default()),
@@ -1053,7 +1055,6 @@ async fn direct_file_arguments_do_not_become_shell_source() -> Result<()> {
                     inputs: BTreeMap::from([("file".into(), serde_json::json!(path))]),
                 },
             )]),
-            ..Default::default()
         }),
         None,
         crate::session::CheckShell::Nushell,

@@ -9,13 +9,13 @@ local window_presentation = require("forge.window_presentation")
 local function host_current(state)
   if runner_for_test or not state.host_generation then return true end
   local client = require("forge.client")
-  return state.host_generation == client.host_generation() and client.host_accepting()
+  return state.host_generation == client.host_get_generation() and client.host_is_accepting()
 end
 
 local function request(state, params, callback)
   local function receive(result, failure)
     if result and not failure and not runner_for_test and not state.host_generation then
-      state.host_generation = require("forge.client").host_generation()
+      state.host_generation = require("forge.client").host_get_generation()
     end
     vim.schedule(function()
       if not host_current(state) then
@@ -27,11 +27,11 @@ local function request(state, params, callback)
   end
   if not host_current(state) then receive(nil) return end
   local ok, failure = pcall(function()
-    local method = params.operation == "change" and "walkthrough" or params.operation == "open_diff" and "harness.document"
-      or (params.operation == "commit_message" or params.operation == "about_message") and "status.context" or "source.document"
+    local method = params.operation == "change" and "repository.walkthrough.document" or params.operation == "open_diff" and "session.document"
+      or (params.operation == "commit_message" or params.operation == "about_message") and "repository.status.context" or "repository.source.document"
     if runner_for_test then runner_for_test(method, params, receive)
-    elseif params.operation == "open_diff" then require("forge.client").request_for(state.session_id, method, params, receive)
-    else require("forge.client").request_host(method, params, receive) end
+    elseif params.operation == "open_diff" then require("forge.client").request({ session_id = state.session_id, method = method, params = params }, receive)
+    else require("forge.client").request({ method = method, params = params }, receive) end
   end)
   if not ok then receive(nil, tostring(failure)) end
 end

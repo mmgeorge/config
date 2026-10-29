@@ -86,7 +86,7 @@ async fn initialize_real_codex_broker(
     let model_response = broker
         .dispatch(Request {
             id: 1,
-            method: "backend.models".into(),
+            method: "session.provider.model.list".into(),
             params: Value::Null,
         })
         .await;
@@ -153,7 +153,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
         Duration::from_secs(120),
         broker.dispatch(Request {
             id: 3,
-            method: "prompt.submit".into(),
+            method: "session.prompt.submit".into(),
             params: json!({
                 "text": "/plan add a Testing section to README.md without changing any files. Your first action must call harness_plan_question with exactly one question asking which test type the section should describe. Give exactly two options named Unit tests and Integration tests. Do not call any plan create, edit, or submit tool until I answer."
             }),
@@ -184,7 +184,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
         Duration::from_secs(120),
         broker.dispatch(Request {
             id: 4,
-            method: "prompt.submit".into(),
+            method: "session.prompt.submit".into(),
             params: json!({
                 "text": "Replace the pending question with exactly two options named Unit tests and Integration tests. Keep one question and do not choose an answer for me."
             }),
@@ -221,7 +221,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     let answered = broker
         .dispatch(Request {
             id: 5,
-            method: "question.answer".into(),
+            method: "session.question.answer".into(),
             params: json!({
                 "question_id": question_id,
                 "response": {
@@ -242,7 +242,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
         Duration::from_secs(120),
         broker.dispatch(Request {
             id: 6,
-            method: "question.continue".into(),
+            method: "session.question.continue".into(),
             params: Value::Null,
         }),
     )
@@ -296,7 +296,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     let write_mode = broker
         .dispatch(Request {
             id: 8,
-            method: "session.permission".into(),
+            method: "session.permission.set".into(),
             params: json!({ "change":{"kind":"set_approval","mode":"ask"} }),
         })
         .await;
@@ -305,7 +305,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
         Duration::from_secs(120),
         broker.dispatch(Request {
             id: 9,
-            method: "prompt.submit".into(),
+            method: "session.prompt.submit".into(),
             params: json!({
                 "text": "Create mode-write-proof.txt in the workspace with exactly this content: `Harness native Write mode verified`. Do not change any other file."
             }),
@@ -361,7 +361,7 @@ async fn geoparquet_prompt_reaches_plan_review_after_scope_feedback() {
         GEOPARQUET_PLAN_TURN_TIMEOUT,
         broker.dispatch(Request {
             id: 3,
-            method: "prompt.submit".into(),
+            method: "session.prompt.submit".into(),
             params: json!({
                 "text": "/plan turn this into cli tool for geoparquet inspection use datafusion"
             }),
@@ -415,7 +415,7 @@ async fn geoparquet_prompt_reaches_plan_review_after_scope_feedback() {
                 let answered = broker
                     .dispatch(Request {
                         id: next_request_id,
-                        method: "question.answer".into(),
+                        method: "session.question.answer".into(),
                         params: json!({
                             "question_id": question_id,
                             "response": {
@@ -436,7 +436,7 @@ async fn geoparquet_prompt_reaches_plan_review_after_scope_feedback() {
                     GEOPARQUET_PLAN_TURN_TIMEOUT,
                     broker.dispatch(Request {
                         id: next_request_id,
-                        method: "question.continue".into(),
+                        method: "session.question.continue".into(),
                         params: Value::Null,
                     }),
                 )

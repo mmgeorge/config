@@ -45,6 +45,7 @@ local function select_branch_pr(prs)
 end
 
 function M.producer_handlers(options)
+  ---@type table|false
   local remote_active = false
   local function refresh()
     if options.is_alive() then options.refresh_status() end
@@ -162,7 +163,7 @@ end
 
 function M.attach(options)
   local context_request = options.request or function(params, callback)
-    client.request_host("status.context", params, callback)
+    client.request({ method = "repository.status.context", params = params }, callback)
   end
   assert(type(options.document_id) == "string" and type(options.workspace) == "string", "missing Status context identity")
   assert(type(options.present) == "function" and type(options.is_alive) == "function", "missing Status context owner")
@@ -288,7 +289,7 @@ function M.attach(options)
       create()
       return
     end
-    local pr = owner.pr
+    local pr = assert(owner.pr)
     local function open()
       if not current() then return end
       vim.api.nvim_win_call(target_window, function()
@@ -409,7 +410,7 @@ function M.attach(options)
       end
       if type(outcome) ~= "table" or not outcome.success then notifications.error("Issues save failed, repository refresh is required") end
       if known and outcome.operation_id then
-        client.request_host("repository.write", { operation = "acknowledge", operation_id = outcome.operation_id }, function(_, acknowledge_error)
+        client.request({ method = "repository.write", params = { operation = "acknowledge", operation_id = outcome.operation_id } }, function(_, acknowledge_error)
           if acknowledge_error then notifications.error("Issues receipt acknowledgement failed: " .. acknowledge_error) end
         end)
       end

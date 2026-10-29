@@ -1108,9 +1108,11 @@ mod test {
                 preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;
             settings.import_operation(
                 revision,
-                SettingScope::Workspace,
-                &workspace,
-                "session",
+                crate::settings::SettingTarget {
+                    scope: SettingScope::Workspace,
+                    workspace: &workspace,
+                    session: "session",
+                },
                 &selected,
                 &format!("import-{revision}"),
                 &json!({"fingerprint":preview.fingerprint}),

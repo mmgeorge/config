@@ -1,6 +1,6 @@
 mod method;
 
-pub use method::HarnessMethod;
+pub use method::RuntimeMethod;
 
 pub(crate) fn validate_root_control(value: Option<&serde_json::Value>) -> anyhow::Result<()> {
     anyhow::ensure!(

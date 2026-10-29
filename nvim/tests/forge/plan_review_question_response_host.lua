@@ -18,7 +18,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local harness = require("forge.views.harness")
 local controller = require("forge.views.harness.controller")
@@ -297,7 +297,7 @@ for _, case in ipairs(cases) do
   pcall(function() require("forge.views.harness.workspace").release(state) end)
   pcall(function() if state.presentation then state.presentation.close() end end)
 end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

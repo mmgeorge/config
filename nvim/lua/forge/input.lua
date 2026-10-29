@@ -54,12 +54,15 @@ end
 ---@field scrolloff? integer Minimum context rows around the cursor.
 ---@field fold_markers boolean Whether the status column displays window-local timeline markers.
 ---@field virtualedit string Virtual cursor movement allowed by this view.
----@field columns table<string, boolean|string> Column options inherited from the invoking window.
+---@field columns table<string, boolean|string|number> Column options inherited from the invoking window.
 ---@field conceal? {level: integer, cursor: string} Source concealment options retained by this view.
 ---@field wrapping? {indent: boolean, options: string} Source continuation indentation retained by this view.
 ---@field session table
 ---@field baseline table<string, string|boolean|number>
 ---@field cursor? integer[]
+---@field changedtick? integer
+---@field header? string
+---@field issue_winbar? {previous: string, value?: string}
 
 ---Update owned continuation options without replacing the view or its input identity.
 ---@param view ForgeInputView
@@ -81,7 +84,7 @@ end
 
 ---@param session table
 ---@param window integer
----@param options? {exact_source?: boolean, margin?: integer, scrolloff?: integer, fold_markers?: boolean, virtualedit?: string, columns?: table<string, boolean|string>, conceal?: {level: integer, cursor: string}, wrapping?: {indent: boolean, options: string}} Source presentation options retained for this view.
+---@param options? {exact_source?: boolean, margin?: integer, scrolloff?: integer, fold_markers?: boolean, virtualedit?: string, columns?: table<string, boolean|string|number>, conceal?: {level: integer, cursor: string}, wrapping?: {indent: boolean, options: string}} Source presentation options retained for this view.
 ---@return ForgeInputView
 function M.open(session, window, options)
   if window == 0 then window = vim.api.nvim_get_current_win() end

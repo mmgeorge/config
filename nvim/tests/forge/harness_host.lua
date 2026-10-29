@@ -18,7 +18,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local success, failure = xpcall(function()
@@ -79,7 +79,9 @@ local success, failure = xpcall(function()
   end
   local function request(method, params, expected_error)
     local done, value, failure = false
-    client.request_for(state.session.id, method, params, function(result, error)
+    local context = require("forge.event_contract").method_policy(method).session_context
+    local session_id = context == "required" and state.session.id or nil
+    client.request({ session_id = session_id, method = method, params = params }, function(result, error)
       value, failure, done = result, error, true
     end)
     assert(vim.wait(3000, function() return done end, 10), method .. " waited for execution")
@@ -115,19 +117,19 @@ local success, failure = xpcall(function()
   request("session.rename", { session_id = state.session.id, name = "stale generated name",
     expected_name = "old name" }, "changed during generation")
   request("session.delete", { session_id = state.session.id }, "cannot delete the active session")
-  local exchanges = request("exchange.list", {})
+  local exchanges = request("session.exchange.list", {})
   local reviewed = assert(exchanges[1], "no exchange available for comment regression")
-  local comment = request("exchange.comment.save", { id = "active-review-comment",
+  local comment = request("session.exchange.comment.save", { id = "active-review-comment",
     exchange_id = reviewed.id, file_path = "example.rs", new_line = 1,
     body = "Comment while the provider is active", created_at_ms = 0 })
   assert(comment.body == "Comment while the provider is active")
-  request("exchange.comment.save", { id = "foreign-comment", exchange_id = "missing-exchange",
+  request("session.exchange.comment.save", { id = "foreign-comment", exchange_id = "missing-exchange",
     file_path = "example.rs", new_line = 1, body = "invalid", created_at_ms = 0 },
     "does not belong to the active session")
-  request("plan.declaration", { plan_id = "missing-plan", path = "plan.json", revision = 1 },
+  request("session.plan.declaration.get", { plan_id = "missing-plan", path = "plan.json", revision = 1 },
     "plan artifact not found")
-  request("exchange.rollback.preview", {}, "preview_id is required")
-  local snapshot = request("state.get", {})
+  request("session.exchange.rollback.preview", {}, "preview_id is required")
+  local snapshot = request("session.state.get", {})
   assert(snapshot.session.name == renamed, "durable snapshot lost active rename")
   compose_and_press(first_queued, "<C-q>")
   assert(vim.wait(5000, function()
@@ -169,7 +171,7 @@ local success, failure = xpcall(function()
     request = request, compose_and_press = compose_and_press,
   })
   local log_status
-  client.request("trace.status", {}, function(result, error)
+  client.request({ method = "host.trace.status", params = {}, session_id = state.session.id }, function(result, error)
     assert(not error, error)
     log_status = result
   end)
@@ -181,7 +183,7 @@ local success, failure = xpcall(function()
   end
   assert(prompt_record, "session trace lost prompt body")
   local cleared_status
-  client.request("trace.session.clear", {}, function(result, error)
+  client.request({ method = "session.trace.clear", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(result, error)
     assert(not error, error)
     cleared_status = result
   end)
@@ -189,7 +191,7 @@ local success, failure = xpcall(function()
   assert(cleared_status.enabled and cleared_status.path == log_status.path)
   assert(not vim.tbl_contains(vim.fn.readfile(log_status.path), prompt_record), "prior session trace survived clear")
   local compaction_status = {}
-  local unsubscribe_compaction = client.subscribe(function(event, payload, session_id)
+  local unsubscribe_compaction = client.session_events_subscribe(function(event, payload, session_id)
     if event == "document_changed" and session_id == state.session.id and payload.status then
       compaction_status[#compaction_status + 1] = payload.status.kind
     end
@@ -243,18 +245,18 @@ local success, failure = xpcall(function()
   local restart_message_id = pending_message("Recover queued text after host replacement").id
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "draft survives collected host" })
   local state_settled, state_error = false, nil
-  client.request("state.get", {}, function(_, request_error)
+  client.request({ method = "session.state.get", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(_, request_error)
     state_error = request_error
     state_settled = true
   end)
   assert(vim.wait(3000, function() return state_settled and not state.state_sync_pending end, 10),
     "Harness state did not settle before host collection")
   assert(not state_error, state_error)
-  local old_generation = client.host_generation()
-  client.stop()
+  local old_generation = client.host_get_generation()
+  client.host_stop()
   assert(vim.wait(5000, function() return client._client.process == nil end, 10), "old Harness host was not collected")
   local restarted = false
-  client.start_harness(function(snapshot, restart_error)
+  client.session_initialize(function(snapshot, restart_error)
     if restart_error then if not cleaning then errors[#errors + 1] = restart_error end return end
     controller.activate_snapshot(snapshot)
     restarted = true
@@ -273,7 +275,7 @@ local success, failure = xpcall(function()
   local recovery = state.input.rejected[1]
   assert(recovery.id == restart_message_id and recovery.delivery == "unknown" and recovery.local_only,
     "host replacement made unresolved queued text executable")
-  for _, exchange in ipairs(request("exchange.list", {})) do
+  for _, exchange in ipairs(request("session.exchange.list", {})) do
     assert(exchange.prompt ~= recovery.text, "host replacement automatically replayed queued text")
   end
   require("forge.views.harness.input_state").discard_rejected(state, recovery.id)
@@ -295,7 +297,7 @@ end, debug.traceback)
 cleaning = true
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

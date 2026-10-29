@@ -60,7 +60,7 @@ end
 function M.transition(state, action, refresh, settled, admitted, method)
   if state.host_error then notifications.error(state.host_error, "Harness task") return end
   local session_id = state.session.id
-  local generation = client.host_generation()
+  local generation = client.host_get_generation()
   operation_sequence = operation_sequence + 1
   local identity = ("%s:%s:%s"):format(vim.fn.getpid(), vim.uv.hrtime(), operation_sequence)
   action = vim.deepcopy(action)
@@ -82,7 +82,7 @@ function M.transition(state, action, refresh, settled, admitted, method)
   state.execution_notice_operation = nil
   local function current()
     return state.session and state.session.id == session_id and registry[identity] == operation
-      and client.host_generation() == generation
+      and client.host_get_generation() == generation
   end
   local function remove()
     registry[identity] = nil
@@ -107,7 +107,7 @@ function M.transition(state, action, refresh, settled, admitted, method)
       end
       vim.defer_fn(function()
         if current() and not operation.admitted then
-          client.request_for(session_id, method or "task.transition", action, receive)
+          client.request({ session_id = session_id, method = method or "session.command.apply", params = action }, receive)
         end
       end, 1000)
       return
@@ -127,6 +127,7 @@ function M.transition(state, action, refresh, settled, admitted, method)
         end
       elseif detail and detail.code ~= "outcome_unknown" and detail.code ~= "not_admitted" then
         remove()
+        notifications.error(failure, "Harness task")
         settled(failure, true)
       end
       return
@@ -136,6 +137,7 @@ function M.transition(state, action, refresh, settled, admitted, method)
         remove()
         diagnostic.set(state, "execution_notice", "Not submitted: " .. failure,
           { owner = identity, category = "admission", severity = "warning", recovery = "resubmit" })
+        notifications.error(state.execution_notice, "Harness task")
         if state.task_operation then
           state.task_config = state.task_operation.config
           if state.task_operation.poll then state.task_operation.poll() end
@@ -185,13 +187,13 @@ function M.transition(state, action, refresh, settled, admitted, method)
     end
   end
   operation.receive = receive
-  client.request_for(session_id, method or "task.transition", action, receive)
+  client.request({ session_id = session_id, method = method or "session.command.apply", params = action }, receive)
   local function poll(owner)
     if operation.poll_owner ~= owner then return end
     if not current() or state.host_error then return end
     if not operation.poll_pending then
       operation.poll_pending = true
-      client.request_for(session_id, "task.operation", { operation_id = identity }, function(result, failure)
+      client.request({ session_id = session_id, method = "session.command.operation.get", params = { operation_id = identity } }, function(result, failure)
         operation.poll_pending = false
         if not current() then return end
         if failure then
@@ -266,7 +268,7 @@ end
 ---@param transition fun(action: table)
 function M.plans(state, host, execute, transition)
   local session_id = state.session.id
-  client.request_for(session_id, "plan.list", {}, function(result, failure)
+  client.request({ session_id = session_id, method = "session.plan.list", params = {} }, function(result, failure)
     if failure then notifications.error(failure, "Harness plans") return end
     if not state.session or state.session.id ~= session_id then return end
     local options = {}

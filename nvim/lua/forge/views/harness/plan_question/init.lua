@@ -6,6 +6,15 @@ local picker = require("forge.views.picker")
 
 local active_elicitation = nil
 local active_host = nil
+---@class ForgePlanQuestionSubmission
+---@field replica ForgeStateReplica
+---@field revision integer
+---@field by_question table<string, string>
+---@field failed table<string, string>
+---@field continue_requested? boolean
+---@field continued? boolean
+
+---@type ForgePlanQuestionSubmission?
 local active_submission = nil
 
 local function continue_if_ready(submission, host)
@@ -57,7 +66,7 @@ local function question_page_list(elicitation, host)
     local answer = model.answer_for(elicitation, question.id)
     local selected_entry = entries[selected_index]
     local operation = active_submission and active_submission.by_question[question.id]
-    local failure = operation and active_submission.failed[operation]
+    local failure = active_submission and operation and active_submission.failed[operation]
     page_list[#page_list + 1] = {
       id = question.id,
       title = question.header or question.question or "Answer Question",
@@ -104,7 +113,7 @@ local function review_page(elicitation)
 end
 
 local function build_spec(elicitation, host)
-  local submission = active_submission
+  local submission = assert(active_submission, "question picker has no submission owner")
   local question = model.current_question(elicitation)
   local pages = question and question_page_list(elicitation, host) or { review_page(elicitation) }
   local initial_page = question and math.min((elicitation.current_index or 0) + 1, #pages) or 1

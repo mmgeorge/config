@@ -329,10 +329,9 @@ pub(super) fn recover_active_task(
             .continuation
             .as_ref()
             .is_some_and(|input| input.delivery == crate::task::TaskInputDelivery::Pending)
+        && completed_task_turn(connection, session_id, &turn.id)?
     {
-        if completed_task_turn(connection, session_id, &turn.id)? {
-            return Ok(());
-        }
+        return Ok(());
     }
     match &mut active.workflow {
         TaskWorkflow::Goal { goal } => {

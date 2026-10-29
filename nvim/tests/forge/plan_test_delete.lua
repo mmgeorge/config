@@ -1,8 +1,8 @@
 local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
-client.host_generation = function() return 1 end
-client.host_accepting = function() return true end
+client.host_get_generation = function() return 1 end
+client.host_is_accepting = function() return true end
 local state = require("forge.session").harness
 state.session = { id = "tests-session" }
 state.active_plan = { id = "unrelated-current-plan" }
@@ -42,12 +42,15 @@ local function presentation(document)
   return { version = version, saved_source_digest = "saved:" .. version, annotation = {}, source_row = source,
     snapshot = { document = document, revision = version - 1, block = blocks } }
 end
-client.request_for = function(_, method, params, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
-  if method == "plan.tests.delete" or method == "plan.entity.rename" then
+  if method == "session.plan.test.delete" or method == "session.plan.entity.rename" then
     pending = { method = method, params = params, callback = callback } return
   end
-  assert(method == "harness.document")
+  assert(method == "session.document")
   if params.operation == "plan_action" then
     callback({ rename = { symbol = "tests", name = heading, expected_version = version,
       preview = { { block = heading, column = 0, length = #heading } } } }) return
@@ -144,7 +147,7 @@ local ok, failure = xpcall(function()
   end
   review.command_set.action_by_id.rename_entity.run({})
   popup.incremental_input = previous_input
-  assert(pending and pending.method == "plan.entity.rename" and pending.params.name == "ReviewedTests")
+  assert(pending and pending.method == "session.plan.entity.rename" and pending.params.name == "ReviewedTests")
   local namespace = vim.api.nvim_create_namespace("ForgePlanRename")
   local function rename_marks() return vim.api.nvim_buf_get_extmarks(review.buf, namespace, 0, -1, { details = true }) end
   assert(#rename_marks() == 1 and rename_marks()[1][4].virt_text[1][1] == "ReviewedTests",

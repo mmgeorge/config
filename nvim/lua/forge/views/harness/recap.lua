@@ -20,15 +20,15 @@ end
 ---@param render fun()
 function M.request(state, render)
   if state.recap and state.recap.loading then return end
-  local session_id, generation = state.session.id, client.host_generation()
+  local session_id, generation = state.session.id, client.host_get_generation()
   local request = { loading = true, render = render }
   state.recap = request
   render()
-  client.request_for(session_id, "harness.document", {
+  client.request({ session_id = session_id, method = "session.document", params = {
     operation = "recap", model = state.session.model or "default",
-  }, function(result, failure)
+  } }, function(result, failure)
     if state.recap ~= request or not state.session or state.session.id ~= session_id
-      or client.host_generation() ~= generation then return end
+      or client.host_get_generation() ~= generation then return end
     if failure then
       state.recap = nil
       notifications.error(failure, "Harness recap")

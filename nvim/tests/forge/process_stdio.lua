@@ -13,7 +13,7 @@ end
 local ok, failure = xpcall(function()
   local opened = 0
   status._set_runner_for_test(function(method, params, callback)
-    assert(method == "status", "public Status must use the native host route")
+    assert(method == "repository.status.document", "public Status must use the native host route")
     if params.operation == "snapshot" then callback(empty_snapshot(params.document))
     elseif params.operation == "open" then
       opened = opened + 1

@@ -36,7 +36,7 @@ local function request_candidates(identity, generation, done)
       done(nil, "Forge host generation changed during revision refresh")
       return
     end
-    client.request_host("repository.revisions", { workspace = identity, revision = revision, offset = offset, repository = repository, reference_digest = reference_digest }, function(page, failure)
+    client.request({ method = "repository.revision.list", params = { workspace = identity, revision = revision, offset = offset, repository = repository, reference_digest = reference_digest } }, function(page, failure)
       if failure then done(nil, failure) return end
       if type(page) ~= "table" or not counter(page.revision, 9007199254740991) or page.revision == 0
           or not counter(page.total_bytes, 9007199254740991) or not counter(page.count, 9007199254740991)
@@ -89,7 +89,7 @@ local function prepare()
   preparing = true
   local identity = workspace
   vim.schedule(function()
-    client.start(function(host, failure)
+    client.host_start(function(host, failure)
       preparing = false
       if failure then
         retry_at = vim.uv.now() + 1000

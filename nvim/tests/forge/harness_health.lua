@@ -10,9 +10,11 @@ local success, failure = xpcall(function()
   vim.uv.now = function() return clock end
   vim.defer_fn = function(callback) tick = callback end
   package.loaded["forge.client"] = {
-    host_generation = function() return generation end,
-    request_for = function(_, method, _, callback)
-      assert(method == "health.get")
+    host_get_generation = function() return generation end,
+    request = function(request_specification, callback)
+  local method = request_specification.method
+
+      assert(method == "session.health.get")
       if responsive then callback({}, nil) end
     end,
   }

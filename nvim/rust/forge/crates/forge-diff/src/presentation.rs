@@ -258,8 +258,10 @@ impl DiffPresenter {
             0,
             row,
             group,
-            None,
-            None,
+            crate::projection::RowSyntax {
+                old: None,
+                new: None,
+            },
             Some(change),
             self.options.indent,
         )?;
@@ -289,8 +291,7 @@ impl DiffPresenter {
                 index,
                 row,
                 group,
-                old,
-                new,
+                crate::projection::RowSyntax { old, new },
                 None,
                 self.options.indent,
             )?;

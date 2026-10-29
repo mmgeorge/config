@@ -8,17 +8,17 @@ local ok, failure = xpcall(function()
   require("forge").setup({ harness = { backend = "mock" }, harness_logging = false })
   builder.ensure = function(callback) callback({ ok = true, path = "injected-forge" }) end
   for _, version in ipairs({ 0, 2, 4, 5, "6", false }) do
-    client._reset_for_test()
+    client._host_reset_for_test()
     local initialize_requests, shutdown_requests, method_list = 0, 0, {}
-    client._set_launcher_for_test(function(_, options)
+    client._host_set_launcher_for_test(function(_, options)
       return {
         write = function(_, payload)
           local request = vim.json.decode(payload)
           method_list[#method_list + 1] = request.method
-          if request.method == "shutdown" then shutdown_requests = shutdown_requests + 1 return end
-          if request.method == "transport.consumed" then return end
+          if request.method == "host.shutdown" then shutdown_requests = shutdown_requests + 1 return end
+          if request.method == "host.transport.consumed" then return end
           initialize_requests = initialize_requests + 1
-          assert(request.method == "initialize" and request.params.protocol_version == require("forge.protocol").VERSION)
+          assert(request.method == "host.initialize" and request.params.protocol_version == require("forge.protocol").VERSION)
           local result = { session = { id = "mismatched" } }
           if version ~= false then result.protocol_version = version end
           options.stdout(nil, vim.json.encode({ id = request.id, result = result }) .. "\n")
@@ -27,7 +27,7 @@ local ok, failure = xpcall(function()
       }
     end)
     local completed, received_error, completion_count = false, nil, 0
-    client.start_harness(function(result, error)
+    client.session_initialize(function(result, error)
       completion_count = completion_count + 1
       assert(not result)
       received_error = error
@@ -43,7 +43,7 @@ local ok, failure = xpcall(function()
 end, debug.traceback)
 
 builder.ensure = original_ensure
-client._reset_for_test()
+client._host_reset_for_test()
 if not ok then
   vim.api.nvim_err_writeln(failure)
   vim.cmd("cquit 1")

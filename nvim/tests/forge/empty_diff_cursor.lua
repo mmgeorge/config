@@ -16,7 +16,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local status = require("forge.status")
 local state, notices
 notices = {}
@@ -129,7 +129,7 @@ local ok, failure = xpcall(function()
   assert(#notices == 0, table.concat(notices, "\n"))
 end, debug.traceback)
 if state then status.close(state) end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

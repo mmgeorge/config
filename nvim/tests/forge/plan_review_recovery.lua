@@ -2,15 +2,18 @@ local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 local pending = {}
-local original_request = client.request_for
-local original_generation = client.host_generation
-local original_accepting = client.host_accepting
+local original_request = client.request
+local original_generation = client.host_get_generation
+local original_accepting = client.host_is_accepting
 local generation = 1
-client.host_generation = function() return generation end
-client.host_accepting = function() return true end
-client.request_for = function(_, method, params, callback)
+client.host_get_generation = function() return generation end
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
-  assert(method == "harness.document" or method == "plan.request_changes")
+  assert(method == "session.document" or method == "session.plan.changes.request")
   pending[#pending + 1] = { method = method, params = vim.deepcopy(params), callback = callback }
 end
 local native_buffer = vim.api.nvim_create_buf(false, true)
@@ -94,7 +97,7 @@ print("plan_review_recovery: conflicts preserve retained text and ownership")
 generation = 2
 replacement.owner.saving = true
 local submitted
-replacement.owner.submit("plan.request_changes", { comment = "Revision requested" }, function(result, failure)
+replacement.owner.submit("session.plan.changes.request", { comment = "Revision requested" }, function(result, failure)
   assert(result and not failure, failure)
   submitted = true
 end)
@@ -107,7 +110,7 @@ local submission_owner = harness.plan_review.owner
 local reopened = vim.deepcopy(response)
 reopened.snapshot.document = pending[5].params.document
 pending[5].callback(reopened)
-assert(#pending == 6 and pending[6].method == "plan.request_changes")
+assert(#pending == 6 and pending[6].method == "session.plan.changes.request")
 local recovered_submission = pending[6].params
 assert(recovered_submission.review.document == submission_owner.document)
 assert(recovered_submission.review.view == submission_owner.view.id)

@@ -12,13 +12,13 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = debug.traceback(message, 2) end
 local function request(method, params)
   local done, result, failure
-  client.request(method, params or {}, function(value, problem) result, failure, done = value, problem, true end)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, problem) result, failure, done = value, problem, true end)
   assert(vim.wait(10000, function() return done end, 10), method .. " timed out")
   assert(not failure, method .. ": " .. tostring(failure))
   return result
@@ -33,7 +33,7 @@ local function press(key)
   mapping.callback()
 end
 local function start_check()
-  local run_id = request("checks.run", { check = { "slow" } }).run_id
+  local run_id = request("session.check.run", { check = { "slow" } }).run_id
   assert(vim.wait(5000, function()
     return state.checks_running and state.active_check_run == run_id and rows():find("Shortcut check is running", 1, true)
   end, 10), "check did not become active")
@@ -62,7 +62,7 @@ local succeeded, failure = xpcall(function()
   press("<C-c>")
   assert(vim.wait(3000, function() return not state.checks_running end, 10),
     "Ctrl-C did not stop the check: " .. vim.inspect({ operation = state.task_operation, notice = state.execution_notice }))
-  assert(request("checks.status", {run_id = run_id}).state == "interrupted", "Ctrl-C did not interrupt check history")
+  assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-C did not interrupt check history")
   assert(vim.wait(3000, settled, 10), "Ctrl-C did not settle its pause")
   for _, pause_first in ipairs({ false, true }) do
     run_id = start_check()
@@ -79,16 +79,16 @@ local succeeded, failure = xpcall(function()
     assert(vim.wait(5000, function() return settled() and rows():find(text, 1, true) end, 10),
       "Ctrl-S did not complete its replacement: " .. vim.inspect({ operation = state.task_operation,
         pending = state.input.pending, notice = state.execution_notice, busy = state.busy,
-        pause_first = pause_first, input = request("input.get"), queue = state.queue,
+        pause_first = pause_first, input = request("session.input.get"), queue = state.queue,
         steering = state.pending_steer, submitting = state.pending_submit, errors = errors,
         transcript = rows() }))
-    assert(request("checks.status", {run_id = run_id}).state == "interrupted", "Ctrl-S did not interrupt check history")
+    assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-S did not interrupt check history")
     assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "Ctrl-S left the submitted draft")
   end
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.stdpath = original_stdpath
 assert(succeeded and collected, failure or "host did not stop")

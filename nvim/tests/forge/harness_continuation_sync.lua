@@ -4,7 +4,7 @@ local session = require("forge.session")
 local controller = require("forge.views.harness.controller")
 local question = require("forge.views.harness.plan_question")
 local state = session.harness
-local request_for, subscribe = client.request_for, client.subscribe
+local request_for, subscribe = client.request, client.session_events_subscribe
 local render, refresh_winbar, open = controller.render, controller.refresh_winbar, question.open
 local receive, host, continuation, state_reply, submitted
 local goal_requests, snapshot_requests = 0, 0
@@ -18,20 +18,23 @@ question.open = function(elicitation, value)
   host = value
   host.elicitation = elicitation
 end
-client.subscribe = function(callback) receive = callback return function() end end
-client.request_for = function(_, method, params, callback)
-  if method == "question.continue" then continuation = callback
-  elseif method == "question.ask" then question_requests = callback
-  elseif method == "state.get" then
+client.session_events_subscribe = function(callback) receive = callback return function() end end
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  if method == "session.question.continue" then continuation = callback
+  elseif method == "session.question.ask" then question_requests = callback
+  elseif method == "session.state.get" then
     snapshot_requests = snapshot_requests + 1
     state_reply = callback
-  elseif method == "goal.continue" then goal_requests = goal_requests + 1
-  elseif method == "prompt.submit" then submitted = params.text
-  elseif method == "history.record" then callback({})
-  elseif method == "agent.start" then continuation = callback
-  elseif method == "input.get" then
+  elseif method == "session.command.apply" and params.action == "continue" then goal_requests = goal_requests + 1
+  elseif method == "session.prompt.submit" then submitted = params.text
+  elseif method == "session.prompt.history.record" then callback({})
+  elseif method == "session.agent.start" then continuation = callback
+  elseif method == "session.input.get" then
     callback({ revision = input_revision, messages = queued, suspended = false, execution_busy = false })
-  elseif method == "input.apply" then
+  elseif method == "session.input.apply" then
     assert(params.action.kind == "submit", "unexpected input operation")
     question_requests = function()
       input_revision = input_revision + 1
@@ -173,7 +176,7 @@ end, debug.traceback)
 if state.working_timer then state.working_timer:stop() state.working_timer:close() end
 if state.unsubscribe then state.unsubscribe() end
 require("forge.views.harness.workspace").release(state)
-client.request_for, client.subscribe = request_for, subscribe
+client.request, client.session_events_subscribe = request_for, subscribe
 controller.render, controller.refresh_winbar, question.open = render, refresh_winbar, open
 assert(success, failure)
 print("harness_continuation_sync: passed")

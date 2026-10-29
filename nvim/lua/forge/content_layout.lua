@@ -28,6 +28,9 @@ local M = {}
 ---@field layout? ForgeContentLayout
 ---@field gutter? table[]
 ---@field source_overlay? table[]
+---@field decoration? table[]
+---@field visible_decoration? table[]
+---@field source_highlight? table[]
 
 ---@class ForgeLayoutEntry
 ---@field row_count integer

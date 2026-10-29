@@ -24,7 +24,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors, approvals = {}, {}
 vim.notify = function(message, level)
@@ -32,10 +32,10 @@ vim.notify = function(message, level)
 end
 local function request(method, parameter)
   local settled, result, failure
-  client.request(method, parameter or {}, function(value, error)
+  client.request({ method = method, params = parameter or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, error)
     result, failure, settled = value, error, true
   end)
-  assert(vim.wait(method == "prompt.submit" and 90000 or 15000, function()
+  assert(vim.wait(method == "session.prompt.submit" and 90000 or 15000, function()
     for _, approval in ipairs(state.approval or {}) do approvals[approval.id] = true end
     return settled
   end, 10), method .. " timed out: " .. vim.inspect(errors))
@@ -51,18 +51,18 @@ local succeeded, failure = xpcall(function()
   assert(state.session, table.concat(errors, "\n"))
   request("session.configure", { access = { sandbox = false, write_access = "workspace",
     writable_directory = {}, windows_sandbox = "elevated" } })
-  request("trace.configure", { enabled = true })
+  request("host.trace.configure", { enabled = true })
   local source = bundle .. "/SKILL.md"
   local read = vim.fn.has("win32") == 1 and ("Get-Content -LiteralPath '" .. source .. "'")
     or ("cat '" .. source .. "'")
   local script = "python '" .. bundle .. "/scripts/check.py'"
-  request("prompt.submit", { text = "For this verification, use shell tools to run exactly these commands in order: "
+  request("session.prompt.submit", { text = "For this verification, use shell tools to run exactly these commands in order: "
     .. read .. " then " .. read .. " then " .. script .. ". Read the skill file twice using tools. "
     .. "Do not invoke the skill as a slash command. Do not inspect other paths, run other commands, write files, "
     .. "or call MCP tools. Reply exactly SKILL_READ_VERIFIED after the script prints SKILL_SCRIPT_VERIFIED." })
   assert(next(approvals) == nil, "selected skill access opened approval: " .. vim.inspect(approvals))
   assert(#errors == 0, table.concat(errors, "\n"))
-  local snapshot = request("state.get")
+  local snapshot = request("session.state.get")
   local transcript = state.presentation.transcript
   for index = 0, transcript.sequence:count() - 1 do
     local node = transcript.sequence:at(index)
@@ -88,7 +88,7 @@ local succeeded, failure = xpcall(function()
     return false
   end
   local script_verified = false
-  for _, line in ipairs(vim.fn.readfile(request("trace.status").path)) do
+  for _, line in ipairs(vim.fn.readfile(request("host.trace.status").path)) do
     local record = vim.json.decode(line)
     if script_output(record.payload) then script_verified = true break end
   end
@@ -110,7 +110,7 @@ local succeeded, failure = xpcall(function()
   print("HARNESS_SKILL_READ_PASS " .. backend .. " diamonds=" .. diamonds .. " approvals=0")
 end, debug.traceback)
 local stopped = false
-client.stop(nil, function() stopped = true end)
+client.host_stop(nil, function() stopped = true end)
 vim.wait(10000, function() return stopped end, 10)
 vim.fn.stdpath = original_stdpath
 if not succeeded then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end

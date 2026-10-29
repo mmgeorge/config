@@ -30,7 +30,7 @@ function M.open(state, host)
   local session_id = state.session.id
   local kind, scope, source
   local loading = false
-  local request_generation = 0
+  local generation_request = 0
   ---@type ForgeNativeImportPreview?
   local preview
   local owner = "harness-native-import"
@@ -98,12 +98,12 @@ function M.open(state, host)
   end
   refresh = function()
     if not current() then return end
-    request_generation = request_generation + 1
-    local generation = request_generation
+    generation_request = generation_request + 1
+    local generation = generation_request
     loading = true
     if picker.is_open(owner) then picker.update(review()) else picker.open(review()) end
-    client.request_for(session_id, "settings.import.preview", { kind = kind, scope = scope, source = source }, function(value, failure)
-      if generation ~= request_generation or not current() then return end
+    client.request({ session_id = session_id, method = "settings.import.preview", params = { kind = kind, scope = scope, source = source } }, function(value, failure)
+      if generation ~= generation_request or not current() then return end
       loading = false
       if failure then
         notifications.error(failure, "Import configuration")

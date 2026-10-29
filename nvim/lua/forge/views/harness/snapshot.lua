@@ -19,10 +19,17 @@ function HarnessSnapshot.apply(state, result)
   if state.session and result.session and state.session.id == result.session.id
     and state.runtime_epoch == result.runtime_epoch
     and (result.snapshot_revision or 0) < (state.snapshot_revision or 0) then return false end
-  if state.runtime_epoch and state.runtime_epoch ~= result.runtime_epoch then
+  local session_changed = state.session and result.session and state.session.id ~= result.session.id
+  if session_changed or state.runtime_epoch and state.runtime_epoch ~= result.runtime_epoch then
+    local configuration = state.configuration_completion
+    state.configuration_completion, state.configuring_config, state.task_config = nil, nil, nil
+    state.configuring, state.configuration_debounce, state.pending_config = false, nil, nil
+    if configuration then configuration.complete(false) end
     state.task_operation_by_id = nil
+    state.task_operation_scope = nil
     state.task_operation, state.busy, state.restore_applying = nil, false, nil
     state.request_busy, state.execution_busy = false, false
+    state.cancel_requested = false
     state.check_interrupt_pending = nil
     if state.presentation and state.presentation.transcript then
       state.presentation.status_view:resize()

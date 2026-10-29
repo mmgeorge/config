@@ -5,9 +5,12 @@ local harness = require("forge.session").harness
 local pending = {}
 local notice = {}
 vim.notify = function(message) notice[#notice + 1] = tostring(message) end
-client.host_generation = function() return 1 end
-client.host_accepting = function() return true end
-client.request_for = function(_, method, params, callback)
+client.host_get_generation = function() return 1 end
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   callback = encode_delivery(callback)
   pending[#pending + 1] = { method = method, params = params, callback = callback }
 end
@@ -57,7 +60,7 @@ for _, action in ipairs({ "request_changes", "accept", "abort_plan" }) do
   review.command_set.action_by_id[action].run({})
   if action ~= "abort_plan" then submit_decision("") end
   local request = pending[#pending]
-  assert(request.method == (action == "accept" and "plan.acceptance.begin" or action == "abort_plan" and "plan.cancel" or "plan.request_changes"))
+  assert(request.method == (action == "accept" and "session.plan.acceptance.begin" or action == "abort_plan" and "session.plan.cancel" or "session.plan.changes.request"))
   assert(request.params.draft_annotation[1].source.body == "Preserve this feedback")
   assert(#vim.fn.win_findbuf(review.buf) == 0, action .. " kept the review visible while awaiting its response")
   assert(vim.api.nvim_get_current_win() == harness.transcript_win)

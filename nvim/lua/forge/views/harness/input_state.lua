@@ -10,6 +10,9 @@ local sequence = 0
 ---@field sent? boolean
 
 ---@class ForgeInputViewState
+---@field session_id string
+---@field runtime_epoch? string
+---@field host_generation integer
 ---@field revision integer
 ---@field confirmed table[]
 ---@field pending ForgeInputOperation[]
@@ -28,6 +31,15 @@ end
 
 local function index_of(entries, id)
   for index, entry in ipairs(entries) do if entry.id == id then return index end end
+end
+
+---@param state table
+---@param input ForgeInputViewState
+---@return boolean
+local function owns_input(state, input)
+  return state.input == input and not state.switching_backend and not state.host_error
+    and state.session and state.session.id == input.session_id and state.runtime_epoch == input.runtime_epoch
+    and client.host_get_generation() == input.host_generation
 end
 
 local function apply(entries, action)
@@ -163,7 +175,7 @@ end
 
 send_next = function(state)
   local input = state.input
-  if not input or input.sending or input.refreshing or input.required_revision or state.host_error then return end
+  if not input or not owns_input(state, input) or input.sending or input.refreshing or input.required_revision then return end
   local operation = input.pending[1]
   if not operation then return end
   input.sending = operation
@@ -180,14 +192,14 @@ send_next = function(state)
     operation.sent = true
   end
   local session_id = state.session.id
-  local sent, send_failure = pcall(client.request_for, session_id, "input.apply", { id = operation.id, action = operation.action,
-    control_revision = operation.control_revision, after_control = operation.after_control }, function(result, failure, detail)
-    if state.input ~= input or state.session.id ~= session_id then return end
+  local sent, send_failure = pcall(client.request, { session_id = session_id, method = "session.input.apply", params = { id = operation.id, action = operation.action,
+    control_revision = operation.control_revision, after_control = operation.after_control } }, function(result, failure, detail)
+    if not owns_input(state, input) then return end
     if not failure and result then M.receive(state, result) return end
     if input.sending ~= operation then return end
     if detail and detail.code == "not_admitted" then
       vim.defer_fn(function()
-        if state.input ~= input or state.host_error or input.sending ~= operation then return end
+        if not owns_input(state, input) or input.sending ~= operation then return end
         input.sending = nil
         send_next(state)
       end, 500)
@@ -202,9 +214,9 @@ send_next = function(state)
     -- Retrying the same operation cannot duplicate a delivery already owned by Rust.
     notifications.error(failure or "Input acknowledgement is missing", "Harness message")
     vim.defer_fn(function()
-      if state.input ~= input or state.host_error or input.sending ~= operation then return end
-      client.request_for(session_id, "input.operation", { id = operation.id }, function(outcome, lookup_failure)
-        if state.input ~= input or input.sending ~= operation then return end
+      if not owns_input(state, input) or input.sending ~= operation then return end
+      client.request({ session_id = session_id, method = "session.input.operation.get", params = { id = operation.id } }, function(outcome, lookup_failure)
+        if not owns_input(state, input) or input.sending ~= operation then return end
         input.sending = nil
         if lookup_failure then notifications.error(lookup_failure, "Harness message recovery") return end
         if type(outcome) == "table" then M.receive(state, outcome)
@@ -229,6 +241,7 @@ function M.attach(state, changed)
     return
   end
   state.input = { session_id = state.session.id, runtime_epoch = state.runtime_epoch,
+    host_generation = client.host_get_generation(),
     revision = 0, control_revision = 0, confirmed = {}, pending = {}, rejected = {},
     entry_by_id = {}, direct_submission = {}, accepted = {}, retraction = {}, suspended = false, changed = changed }
   M.refresh(state)
@@ -237,8 +250,8 @@ end
 ---@param state table
 function M.refresh(state)
   local input = state.input
-  if not input then return end
-  if input.runtime_epoch ~= state.runtime_epoch then
+  if not input or state.switching_backend or state.host_error then return end
+  if input.runtime_epoch ~= state.runtime_epoch or input.host_generation ~= client.host_get_generation() then
     local changed = input.changed
     local recovered = vim.deepcopy(input.confirmed)
     for _, operation in ipairs(input.pending) do apply(recovered, operation.action) end
@@ -267,18 +280,19 @@ function M.refresh(state)
   if input.refreshing then return end
   input.refreshing = true
   local session_id = state.session.id
-  client.request_for(session_id, "input.get", {}, function(result, failure)
-    if state.input ~= input or state.session.id ~= session_id then return end
+  client.request({ session_id = session_id, method = "session.input.get", params = {} }, function(result, failure)
+    if state.input ~= input then return end
     input.refreshing = false
+    if not owns_input(state, input) then return end
     if failure or not result then
       notifications.error(failure or "Input state is missing", "Harness messages")
       if input.required_revision then
-        vim.defer_fn(function() if state.input == input then M.refresh(state) end end, 500)
+        vim.defer_fn(function() if owns_input(state, input) then M.refresh(state) end end, 500)
       end
       return
     end
     if result.revision < (input.required_revision or 0) then
-      vim.schedule(function() if state.input == input then M.refresh(state) end end)
+      vim.schedule(function() if owns_input(state, input) then M.refresh(state) end end)
       return
     end
     if result.revision >= input.revision then

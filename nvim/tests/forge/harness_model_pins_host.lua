@@ -29,7 +29,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local state = require("forge.session").harness
@@ -71,7 +71,7 @@ local success, failure = xpcall(function()
   end
   assert(state.session.model == active_model, "pinning changed the active model")
   picker.close()
-  client.stop()
+  client.host_stop()
 end, debug.traceback)
 if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
 print("harness_model_pins_host " .. stage .. ": passed")

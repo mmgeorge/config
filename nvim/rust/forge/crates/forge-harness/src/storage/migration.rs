@@ -203,15 +203,13 @@ fn migrate_exchange(value: &mut Value) -> Result<()> {
     if object
         .get("origin")
         .is_none_or(|origin| origin["kind"] == "user")
+        && let Some(marker) = object.get("lifecycle").and_then(Value::as_str)
+        && marker.ends_with(" continued")
     {
-        if let Some(marker) = object.get("lifecycle").and_then(Value::as_str) {
-            if marker.ends_with(" continued") {
-                object.insert(
-                    "origin".into(),
-                    json!({"kind":"task_continuation","reason":marker}),
-                );
-            }
-        }
+        object.insert(
+            "origin".into(),
+            json!({"kind":"task_continuation","reason":marker}),
+        );
     }
     let execution = object.get("kind").and_then(Value::as_str) == Some("plan_execution");
     let phase = object.get("execution_phase").cloned();
@@ -419,22 +417,21 @@ fn anchor(exchange: &Value, time: i64) -> Value {
     if exchange["created_at_ms"]
         .as_i64()
         .is_some_and(|created| time > created)
+        && let Some(nodes) = exchange["node_list"].as_array()
     {
-        if let Some(nodes) = exchange["node_list"].as_array() {
-            for node in nodes {
-                if node["kind"] == "plan_event" || node["kind"] == "timeline_event" {
-                    continue;
-                }
-                if node["kind"] == "exchange_input"
-                    && node["prompt"]["intent"] == "clarification"
-                    && node["prompt"]["created_at_ms"]
-                        .as_i64()
-                        .is_some_and(|created| created >= time)
-                {
-                    break;
-                }
-                count += 1;
+        for node in nodes {
+            if node["kind"] == "plan_event" || node["kind"] == "timeline_event" {
+                continue;
             }
+            if node["kind"] == "exchange_input"
+                && node["prompt"]["intent"] == "clarification"
+                && node["prompt"]["created_at_ms"]
+                    .as_i64()
+                    .is_some_and(|created| created >= time)
+            {
+                break;
+            }
+            count += 1;
         }
     }
     json!({"exchange_id":exchange["id"],"node_count":count})

@@ -39,16 +39,16 @@ local function snapshot()
 end
 local save_callback, reconcile_callback
 adapter._set_runner_for_test(function(method, params, callback)
-  if method == "review.open" then callback({ document = "editing", field = vim.deepcopy(field) })
-  elseif method == "github.actor" then callback({ login = "viewer" })
-  elseif method == "review.reconcile" then reconcile_callback = callback
-  elseif method == "review.header" then callback({ ready = true })
-  elseif method == "review.materialize" then callback({ snapshot = snapshot(), field = vim.deepcopy(field) })
-  elseif method == "review.view" or method == "review.close" then callback({})
-  elseif method == "review.load" then callback({ diagnostic = {} })
-  elseif method == "review.act" then actions = actions + 1 error("editable text dispatched an action")
+  if method == "github.review.document.open" then callback({ document = "editing", field = vim.deepcopy(field) })
+  elseif method == "github.actor.get" then callback({ login = "viewer" })
+  elseif method == "github.review.document.reconcile" then reconcile_callback = callback
+  elseif method == "github.review.document.header.load" then callback({ ready = true })
+  elseif method == "github.review.document.render" then callback({ snapshot = snapshot(), field = vim.deepcopy(field) })
+  elseif method == "github.review.document.view.set" or method == "github.review.document.close" then callback({})
+  elseif method == "github.review.document.load" then callback({ diagnostic = {} })
+  elseif method == "github.review.document.input.apply" then actions = actions + 1 error("editable text dispatched an action")
   elseif method == "review.region_edit" then error("typing sent a per-edit request")
-  elseif method == "review.save" then
+  elseif method == "github.review.document.save" then
     saves = saves + 1
     assert(#(params.capture or {}) > 0, "explicit save omitted its field capture")
     local before_capture = vim.deepcopy(field)

@@ -21,7 +21,7 @@ pub(super) struct TranscriptSource<'source> {
 
 pub enum TranscriptChange {
     Block {
-        block: BufferBlock,
+        block: Box<BufferBlock>,
     },
     ToolBody {
         owner: String,
@@ -428,7 +428,7 @@ impl TranscriptDocument {
                 self.entry[index].blocks = self.entry[index].blocks - removed + inserted;
                 Ok(patch)
             }
-            TranscriptChange::Block { block } => Ok(self.document.replace_block(block)?),
+            TranscriptChange::Block { block } => Ok(self.document.replace_block(*block)?),
             TranscriptChange::Insert { index, entry } => {
                 validate_entry(&entry)?;
                 ensure!(

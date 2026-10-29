@@ -3,7 +3,7 @@ vim.loader.enable(false)
 local client = require("forge.client")
 local picker = require("forge.views.picker")
 local form = require("forge.shared.form")
-local original_request, original_open, original_notify = client.request_for, form.open, vim.notify
+local original_request, original_open, original_notify = client.request, form.open, vim.notify
 local current_form, pending_save, pending_models
 local delayed_save, delayed_models = false, false
 local errors, saves = {}, 0
@@ -31,10 +31,14 @@ snapshot.document.profiles.disabled = vim.tbl_extend("force", snapshot.document.
 local state = { session = { id = "profiles", backend = "codex", model = "fixture-model", effort = "high", service_tier = "fast" } }
 vim.notify = function(message) errors[#errors + 1] = message end
 form.open = function(options) current_form = original_open(options) return current_form end
-client.request_for = function(session_id, method, params, callback)
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   assert(session_id == "profiles")
-  if method == "agent.profiles.get" then callback(vim.deepcopy(snapshot))
-  elseif method == "agent.profiles.save" then
+  if method == "agent.profile.get" then callback(vim.deepcopy(snapshot))
+  elseif method == "agent.profile.save" then
     assert(params.expected_revision == snapshot.revision, "editor lost its revision")
     local function complete(failure)
       if failure then callback(nil, failure) return end
@@ -48,7 +52,7 @@ client.request_for = function(session_id, method, params, callback)
       callback(vim.deepcopy(snapshot))
     end
     if delayed_save then pending_save = complete else complete() end
-  elseif method == "agent.models" then
+  elseif method == "session.agent.model.list" then
     if delayed_models then pending_models = callback
     else callback(vim.deepcopy(catalog_by_provider[params.provider]), model_failure) end
   else error("unexpected profile request: " .. method) end
@@ -355,7 +359,7 @@ local succeeded, failure = xpcall(function()
   vim.fn.delete(config_path)
 end, debug.traceback)
 if succeeded and vim.g.forge_profile_form_interactive then return end
-client.request_for, form.open, vim.notify = original_request, original_open, original_notify
+client.request, form.open, vim.notify = original_request, original_open, original_notify
 if not succeeded then
   vim.api.nvim_err_writeln(failure)
   vim.cmd("cquit 1")

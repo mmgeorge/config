@@ -236,7 +236,7 @@ end
 function M.resume(session_id, options)
   local existing = state_by_session_id[session_id] or session.harness_by_id[session_id]
   if existing and focus_state(existing) then return end
-  client.request("session.resume", { session_id = session_id }, function(result, request_error)
+  client.request({ session_id = session_id, method = "session.resume", params = { session_id = session_id } }, function(result, request_error)
     if request_error then
       notifications.error(request_error, "Harness session")
       return

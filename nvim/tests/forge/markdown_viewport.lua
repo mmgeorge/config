@@ -2,8 +2,10 @@ vim.loader.enable(false)
 require("render-markdown").setup(require("plugins.markdown")[1].opts())
 local client = require("forge.client")
 local requests = {}
-client.host_accepting = function() return true end
-client.request_for = function(_, _, params, callback)
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
   callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   requests[#requests + 1] = { params = params, callback = callback }
 end

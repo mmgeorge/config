@@ -19,9 +19,11 @@ end
 local client = require("forge.client")
 local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 local request
-client.host_generation = function() return 1 end
-client.host_accepting = function() return true end
-client.request_for = function(_, _, params, receive) request = { params = params, receive = encode_delivery(receive) } end
+client.host_get_generation = function() return 1 end
+client.host_is_accepting = function() return true end
+client.request = function(request_specification, receive)
+  local params = request_specification.params or {}
+   request = { params = params, receive = encode_delivery(receive) } end
 local buffer = vim.api.nvim_get_current_buf()
 local window = vim.api.nvim_get_current_win()
 local owner = require("forge.views.plan_review.document").attach({ session_id = "wrapping", buffer = buffer,

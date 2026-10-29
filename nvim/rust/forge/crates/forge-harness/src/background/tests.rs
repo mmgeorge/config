@@ -104,7 +104,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
             owner: crate::timeline::TimelineOwner::session(&first.session_id),
             created_at_ms: 1,
             detail: crate::timeline::SessionEventKind::Compaction {
-                compaction: crate::backend::Compaction {
+                compaction: (crate::backend::Compaction {
                     id: "interrupted-compaction".into(),
                     thread_id: "provider".into(),
                     state: crate::backend::CompactionState::Running,
@@ -112,7 +112,8 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
                     started_at_ms: Some(1),
                     completed_at_ms: None,
                     result: Default::default(),
-                },
+                })
+                .into(),
             },
         })?;
     }

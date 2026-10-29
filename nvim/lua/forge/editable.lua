@@ -227,14 +227,14 @@ local function reject_edit(state, message, start, finish)
         end
       end
       vim.bo[native.buffer].modifiable = true
-      vim.api.nvim_buf_call(native.buffer, function() pcall(vim.cmd, "undojoin") end)
+      vim.api.nvim_buf_call(native.buffer, function() pcall(vim.api.nvim_cmd, { cmd = "undojoin" }, {}) end)
       vim.api.nvim_buf_set_lines(native.buffer, 0, -1, false, native.shadow:text())
       for _, mark in ipairs(marks) do
-        local details = mark[4]
+        local details = assert(mark[4])
         local namespace = details.ns_id
-        details.ns_id, details.invalid = nil, nil
-        details.id = mark[1]
-        vim.api.nvim_buf_set_extmark(native.buffer, namespace, mark[2], mark[3], details)
+        local options = vim.tbl_extend("force", details, { id = mark[1] })
+        options.ns_id, options.invalid = nil, nil
+        vim.api.nvim_buf_set_extmark(native.buffer, namespace, mark[2], mark[3], options)
       end
       for window, position in pairs(cursor) do
         if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == native.buffer then
@@ -331,7 +331,10 @@ function M.attach(state, buffer, region_ranges, options)
   }
   state.native = native
   local attached = vim.api.nvim_buf_attach(buffer, false, {
+    ---@return boolean? detach
     on_changedtick = function()
+      -- :help api-lua-detach permits true, although the generated callback type omits it.
+      ---@diagnostic disable-next-line: redundant-return-value
       if not native.active then return true end
       if not native.applying and not native.rejecting and native.restored then native.restored() end
     end,
@@ -367,7 +370,7 @@ function M.attach(state, buffer, region_ranges, options)
         end
       end
       if not owner then
-        reject_edit(state, message, start, finish)
+        reject_edit(state, assert(message), start, finish)
         return
       end
       retain_rows()
@@ -392,8 +395,11 @@ function M.attach(state, buffer, region_ranges, options)
         return
       end
     end,
+    ---@return boolean? detach
     on_reload = function()
       if not native.active then
+        -- :help api-lua-detach permits returning true from this callback.
+        ---@diagnostic disable-next-line: redundant-return-value
         return true
       end
       native_fault(state, "native buffer reloaded and requires explicit reconciliation")

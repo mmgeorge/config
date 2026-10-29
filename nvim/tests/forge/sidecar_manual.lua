@@ -29,7 +29,7 @@ local succeeded, failure = xpcall(function()
   assert(vim.fn.readfile(builder.binary_path())[1] == "Unix build output", "Unix release removed the build output")
   lease = nil
   vim.uv.fs_copyfile = original_copyfile
-  builder._reset_for_test()
+  builder._host_reset_for_test()
   vim.fn.has = function(feature) return feature == "win32" and 1 or original_has(feature) end
   vim.system = function(command, _, callback)
     if command[1] ~= "tasklist" then error("startup invoked a compiler") end

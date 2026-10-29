@@ -27,7 +27,7 @@ function M.validate(sequence, changed, retired, state)
       local previous = state and state.block_node[owner]
       if previous then add_children(previous) end
       for id in pairs(state and state.fold and state.fold.endpoint[owner] or {}) do
-        local record = state.fold.record[id]
+        local record = assert(state).fold.record[id]
         if not retired[record.owner] then
           affected[record.owner] = true
           local node = sequence.node[record.owner].entry.metadata.node
@@ -40,7 +40,7 @@ function M.validate(sequence, changed, retired, state)
     local owner = incoming[id] or state and state.node_owner[id]
     local entry = owner and not retired[owner] and sequence.node[owner]
     local node = entry and entry.entry.metadata.node
-    assert(node and node ~= vim.NIL and node.id == id, "document node parent is absent: " .. id)
+    assert(entry and node and node ~= vim.NIL and node.id == id, "document node parent is absent: " .. id)
     return owner, entry.entry, node
   end
   local function endpoint(owner, entry, id)

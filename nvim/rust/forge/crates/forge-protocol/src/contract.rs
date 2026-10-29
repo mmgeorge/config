@@ -17,6 +17,14 @@ struct RequiredField {
 include!(concat!(env!("OUT_DIR"), "/event_contract.rs"));
 const _: () = assert!(CONTRACT_VERSION == crate::WIRE_VERSION);
 
+/// Return the transport policy of an exact accepted wire name.
+pub fn method_policy(name: &str) -> Option<&'static crate::method_policy::MethodPolicy> {
+    METHODS
+        .binary_search_by_key(&name, |(name, _)| name)
+        .ok()
+        .map(|index| &METHODS[index].1)
+}
+
 /// Selects only normalized backend events consumed by the editor.
 pub fn backend_visible(kind: &str) -> bool {
     BACKEND.iter().any(|event| event.name == kind)

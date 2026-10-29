@@ -37,7 +37,7 @@ return {
       -- tsx = { "trim_whitespace" },
       formatters_by_ft  = {
         -- Run trim_whitespace first, rustfmt can run into issues.
-        ["*"] = { "trim_whitespace", lsp_format },
+        ["*"] = { "trim_whitespace" },
         ["rust"] = { "trim_whitespace",  "rustfmt" },
         ["slang"] = { "trim_whitespace" },
       }

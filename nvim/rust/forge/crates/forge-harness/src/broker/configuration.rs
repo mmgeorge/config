@@ -113,7 +113,7 @@ impl HarnessBroker {
                 turn_boundary: None,
                 kind: "configuration_applied".into(),
                 text: None,
-                data: json!({"session":self.session,"access_abbreviation":self.session.access.abbreviation(),"operation_id":self.active_operation_id,
+                data: json!({"session":self.session_view()?,"access_abbreviation":self.session.access.abbreviation(),"operation_id":self.active_operation_id,
                 "catalog":self.backend_catalog_request()}),
                 activity: None,
                 summary: None,

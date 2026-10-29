@@ -52,6 +52,14 @@ pub enum SettingScope {
     Session,
 }
 
+/// Identifies the preference layer and its workspace and session boundaries.
+#[derive(Clone, Copy)]
+pub(crate) struct SettingTarget<'scope> {
+    pub scope: SettingScope,
+    pub workspace: &'scope str,
+    pub session: &'scope str,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Retains portable choices without copying provider authentication or native files.
@@ -525,9 +533,11 @@ impl SettingsStore {
         Ok(self
             .write_layer(
                 expected_revision,
-                scope,
-                workspace,
-                session,
+                crate::settings::SettingTarget {
+                    scope,
+                    workspace,
+                    session,
+                },
                 setting,
                 None,
                 &[],
@@ -598,13 +608,25 @@ impl SettingsStore {
         let Some((owner, payload)) = saved else {
             return Ok(None);
         };
-        let Some(receipt) = SettingsRecord::<SettingsReceipt>::decode(&payload)? else {
+        let Some(mut receipt) = SettingsRecord::<SettingsReceipt>::decode(&payload)? else {
             return Ok(None);
         };
         ensure!(
             owner == session,
             "settings operation belongs to another session"
         );
+        // Version-one receipts retain wire names from before the interface rename.
+        if let Some(method) = receipt.request.get_mut("method") {
+            match method.as_str() {
+                Some("backend.mcp.set_enabled") => {
+                    *method = serde_json::json!("settings.mcp.set_enabled")
+                }
+                Some("backend.skills.set_enabled") => {
+                    *method = serde_json::json!("settings.skill.set_enabled")
+                }
+                _ => {}
+            }
+        }
         ensure!(
             receipt.request == *request,
             "settings operation ID was reused with a different request"
@@ -616,18 +638,14 @@ impl SettingsStore {
     pub(crate) fn update_operation(
         &mut self,
         expected_revision: u64,
-        scope: SettingScope,
-        workspace: &str,
-        session: &str,
+        target: SettingTarget<'_>,
         setting: &PortableSettings,
         operation: &str,
         request: &Value,
     ) -> Result<SettingsMutation> {
         self.write_layer(
             expected_revision,
-            scope,
-            workspace,
-            session,
+            target,
             setting,
             Some((operation, request)),
             &[],
@@ -638,13 +656,16 @@ impl SettingsStore {
     pub(crate) fn import_operation(
         &mut self,
         expected_revision: u64,
-        scope: SettingScope,
-        workspace: &str,
-        session: &str,
+        target: SettingTarget<'_>,
         resource: &[super::ImportedResource],
         operation: &str,
         request: &Value,
     ) -> Result<SettingsMutation> {
+        let SettingTarget {
+            scope,
+            workspace,
+            session,
+        } = target;
         ensure!(
             !matches!(scope, SettingScope::Session),
             "Resource imports require global or workspace scope"
@@ -667,9 +688,11 @@ impl SettingsStore {
         }
         self.write_layer(
             expected_revision,
-            scope,
-            workspace,
-            session,
+            crate::settings::SettingTarget {
+                scope,
+                workspace,
+                session,
+            },
             &setting,
             Some((operation, request)),
             resource,
@@ -679,13 +702,16 @@ impl SettingsStore {
     fn write_layer(
         &mut self,
         expected_revision: u64,
-        scope: SettingScope,
-        workspace: &str,
-        session: &str,
+        target: SettingTarget<'_>,
         setting: &PortableSettings,
         receipt: Option<(&str, &Value)>,
         imported: &[super::ImportedResource],
     ) -> Result<SettingsMutation> {
+        let SettingTarget {
+            scope,
+            workspace,
+            session,
+        } = target;
         if let Some(policy) = &setting.auto_compaction {
             policy.validate(None)?;
         }
@@ -1097,9 +1123,11 @@ mod test {
         let request = serde_json::json!({"settings": current});
         let mutation = store.update_operation(
             revision,
-            SettingScope::Session,
-            "workspace",
-            "source",
+            crate::settings::SettingTarget {
+                scope: SettingScope::Session,
+                workspace: "workspace",
+                session: "source",
+            },
             &current,
             "current",
             &request,
@@ -1287,6 +1315,39 @@ mod test {
     }
 
     #[test]
+    fn renamed_resource_method_recovers_existing_receipt_without_replay() {
+        let fixture = tempfile::tempdir().unwrap();
+        let old_request = serde_json::json!({"method":"backend.skills.set_enabled","params":{"name":"review","enabled":true}});
+        let new_request = serde_json::json!({"method":"settings.skill.set_enabled","params":{"name":"review","enabled":true}});
+        let mut store = SettingsStore::open(fixture.path()).unwrap();
+        store
+            .update_operation(
+                0,
+                crate::settings::SettingTarget {
+                    scope: SettingScope::Global,
+                    workspace: "workspace",
+                    session: "session",
+                },
+                &PortableSettings::default(),
+                "existing",
+                &old_request,
+            )
+            .unwrap();
+        drop(store);
+        let store = SettingsStore::open(fixture.path()).unwrap();
+        assert_eq!(
+            store
+                .operation("session", "existing", &new_request)
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+        let changed = serde_json::json!({"method":"settings.skill.set_enabled","params":{"name":"review","enabled":false}});
+        assert!(store.operation("session", "existing", &changed).is_err());
+    }
+
+    #[test]
     fn committed_operation_recovers_after_restart_without_reapplying_or_overwriting() {
         let fixture = tempfile::tempdir().unwrap();
         let request = serde_json::json!({"expected_revision":0,"desired":{"plan_compact":true}});
@@ -1298,9 +1359,11 @@ mod test {
         let accepted = first
             .update_operation(
                 0,
-                SettingScope::Global,
-                "workspace",
-                "session",
+                crate::settings::SettingTarget {
+                    scope: SettingScope::Global,
+                    workspace: "workspace",
+                    session: "session",
+                },
                 &setting,
                 "operation",
                 &request,
@@ -1313,9 +1376,11 @@ mod test {
         let replay = reopened
             .update_operation(
                 0,
-                SettingScope::Global,
-                "workspace",
-                "session",
+                crate::settings::SettingTarget {
+                    scope: SettingScope::Global,
+                    workspace: "workspace",
+                    session: "session",
+                },
                 &setting,
                 "operation",
                 &request,
@@ -1343,9 +1408,11 @@ mod test {
             reopened
                 .update_operation(
                     0,
-                    SettingScope::Global,
-                    "workspace",
-                    "session",
+                    crate::settings::SettingTarget {
+                        scope: SettingScope::Global,
+                        workspace: "workspace",
+                        session: "session"
+                    },
                     &PortableSettings::default(),
                     "stale-operation",
                     &request

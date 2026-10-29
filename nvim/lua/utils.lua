@@ -77,6 +77,7 @@ M.get_visual_selection = function()
   if cerow < csrow then csrow, cerow = cerow, csrow end
   if cecol < cscol then cscol, cecol = cecol, cscol end
   local lines = vim.fn.getline(csrow, cerow)
+  assert(type(lines) == "table", "line range did not return rows")
   -- local n = cerow-csrow+1
   local n = tbl_length(lines)
   if n <= 0 then return "" end
@@ -210,7 +211,10 @@ function M.detect_selection_mode(query_string, keymap_mode)
   local method = keymap_to_method[keymap_mode]
 
   local config = configs.get_module "textobjects.select"
-  local selection_modes = val_or_return(config.selection_modes, { query_string = query_string, method = method })
+  local selection_modes = config.selection_modes
+  if type(selection_modes) == "function" then
+    selection_modes = selection_modes({ query_string = query_string, method = method })
+  end
   local selection_mode
   if type(selection_modes) == "table" then
     selection_mode = selection_modes[query_string] or "v"
@@ -484,7 +488,9 @@ end
 
 
 M.get_definition_location = function()
-  local params = vim.lsp.util.make_position_params()
+  local function params(client)
+    return vim.lsp.util.make_position_params(0, client.offset_encoding)
+  end
   vim.lsp.buf_request(0, "textDocument/definition", params, function(err, result, _, _)
     if err then
       vim.notify("LSP request error: " .. vim.inspect(err), vim.log.levels.ERROR)

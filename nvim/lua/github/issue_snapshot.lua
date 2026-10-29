@@ -42,7 +42,7 @@ local pump
 local function report(failure)
   if failure and failure ~= "Snapshot load invalidated" then
     local ok, notification_failure = pcall(vim.notify, "GitHub issue snapshot: " .. failure, vim.log.levels.ERROR)
-    if not ok then pcall(vim.api.nvim_err_writeln, tostring(notification_failure)) end
+    if not ok then pcall(vim.api.nvim_echo, { { tostring(notification_failure), "ErrorMsg" } }, true, { err = true }) end
   end
 end
 

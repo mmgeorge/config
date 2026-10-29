@@ -13,7 +13,7 @@ local ok, failure = xpcall(function()
   local plugin = dofile("nvim/lua/plugins/forge.lua")[1]
   plugin.config(nil, { harness = { backend = "mock" }, harness_logging = false, diff_logging = false })
   builder.ensure = function(done) done({ ok = true, path = "injected-forge" }) end
-  client._set_launcher_for_test(function(_, options)
+  client._host_set_launcher_for_test(function(_, options)
     host_count = host_count + 1
     local function emit(id, result)
       options.stdout(nil, vim.json.encode({ id = id, result = result }) .. "\n")
@@ -21,12 +21,12 @@ local ok, failure = xpcall(function()
     return {
       write = function(_, bytes)
         local request = vim.json.decode(bytes)
-        if request.method == "transport.consumed" or request.method == "shutdown" then return end
-        if request.method == "initialize" then
+        if request.method == "host.transport.consumed" or request.method == "host.shutdown" then return end
+        if request.method == "host.initialize" then
           assert(request.params.protocol_version == require("forge.protocol").VERSION)
           assert(request.params.backend == nil and request.params.data_root == nil)
           emit(request.id, { protocol_version = require("forge.protocol").VERSION })
-        elseif request.method == "repository.revisions" then
+        elseif request.method == "repository.revision.list" then
           page_count = page_count + 1
           local offset = request.params.offset or 0
           local next_offset = math.min(offset + 128 * 1024, #packed)
@@ -35,7 +35,7 @@ local ok, failure = xpcall(function()
             revision = 1, offset = offset, next_offset = next_offset, total_bytes = #packed,
             count = #expected, truncated = false, data = vim.base64.encode(packed:sub(offset + 1, next_offset)),
           })
-        elseif request.method == "harness.initialize" then
+        elseif request.method == "session.initialize" then
           harness_count = harness_count + 1
           emit(request.id, { session = { id = "shared-host" } })
         else error("unexpected shared-host method " .. request.method) end
@@ -65,7 +65,7 @@ local ok, failure = xpcall(function()
   end
   table.sort(sample)
   print(vim.json.encode({ completion_values = #expected, samples = #sample, p95_ms = sample[475], maximum_ms = sample[500] }))
-  client.start_harness(function(_, start_error)
+  client.session_initialize(function(_, start_error)
     assert(not start_error, start_error)
     initialized = true
   end)
@@ -75,7 +75,7 @@ end, debug.traceback)
 
 vim.fn.systemlist = original_systemlist
 builder.ensure = original_ensure
-client._reset_for_test()
+client._host_reset_for_test()
 if not ok then
   vim.api.nvim_err_writeln(failure)
   vim.cmd("cquit 1")

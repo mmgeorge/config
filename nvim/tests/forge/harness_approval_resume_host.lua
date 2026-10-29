@@ -13,12 +13,12 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors = {}
 local approval_requests = 0
 local resolution_list = {}
-client.subscribe(function(event, payload)
+client.session_events_subscribe(function(event, payload)
   if event == "backend_event" and payload.kind == "approval_requested" then
     approval_requests = approval_requests + 1
   elseif event == "backend_event" and payload.kind == "approval_resolved" then
@@ -30,7 +30,7 @@ vim.notify = function(message, level)
 end
 local function request(method, params)
   local settled, value, failure
-  client.request(method, params or {}, function(result, error) value, failure, settled = result, error, true end)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, error) value, failure, settled = result, error, true end)
   assert(vim.wait(10000, function() return settled end, 10), method .. " timeout")
   assert(not failure, method .. ": " .. tostring(failure))
   return value
@@ -58,7 +58,7 @@ local succeeded, failure = xpcall(function()
   local controller = require("forge.views.harness.controller")
   local permission_path = vim.fs.joinpath(data, "forge", "permissions.json")
   local permission_before = vim.fn.readfile(permission_path)
-  request("session.input_timeouts", {
+  request("session.input.timeout.configure", {
     approval_timeout = { amount = 1, unit = "s" }, answer_timeout = { amount = 0, unit = "s" },
   })
   for iteration = 1, 2 do
@@ -90,24 +90,24 @@ local succeeded, failure = xpcall(function()
     assert(text:find("Automatically rejected because the approval timeout expired", 1, true), text)
     assert(text:find("The requested operation was not executed", 1, true), text)
     assert(text:find("Continuing with permitted work", 1, true), text)
-    local snapshot = request("state.get", {})
+    local snapshot = request("session.state.get", {})
     assert(snapshot.status.kind == "idle" and #snapshot.approval == 0)
-    local history = request("exchange.list", {})
+    local history = request("session.exchange.list", {})
     local exchange_count = #history
     assert(history[exchange_count].state == "complete", "expired approval did not settle")
     vim.wait(1500, function() return false end, 10)
-    local stable = request("state.get", {})
-    assert(stable.status.kind == "idle" and #request("exchange.list", {}) == exchange_count,
+    local stable = request("session.state.get", {})
+    assert(stable.status.kind == "idle" and #request("session.exchange.list", {}) == exchange_count,
       "answered timeout scheduled a duplicate continuation")
     assert(approval_requests == before + 1, "timeout retried the rejected operation")
     assert(vim.deep_equal(vim.fn.readfile(permission_path), permission_before), "timeout saved a permission rule")
   end
-  request("session.input_timeouts", {
+  request("session.input.timeout.configure", {
     approval_timeout = { amount = 0, unit = "s" }, answer_timeout = { amount = 0, unit = "s" },
   })
   for iteration, choice in ipairs({ "allow_once", "deny_once", "allow_once" }) do
     local settled, result, problem
-    client.request("prompt.submit", { text = "Resume after approval " .. iteration }, function(value, error)
+    client.request({ method = "session.prompt.submit", params = { text = "Resume after approval " .. iteration }, session_id = assert(require("forge.session").harness.session).id }, function(value, error)
       settled, result, problem = true, value, error
     end)
     assert(vim.wait(10000, function()
@@ -119,7 +119,7 @@ local succeeded, failure = xpcall(function()
     local approval = state.approval[1]
     local answers = {}
     for _, item in ipairs(approval.item_list) do answers[#answers + 1] = { item_id = item.id, choice_id = choice } end
-    request("approval.resolve", { approval_id = approval.id, answer_list = answers })
+    request("session.approval.resolve", { approval_id = approval.id, answer_list = answers })
     assert(vim.wait(1500, function()
       local current = status()
       return #(state.approval or {}) == 0 and current and current.animated and current.hint == "working"
@@ -146,7 +146,7 @@ local succeeded, failure = xpcall(function()
     end, 10), "approval selection did not settle")
     local held = mock.hold(state.session.id, "chat")
     local settled, result, problem
-    client.request("prompt.submit", { text = "Automatic approval decision: " .. mode }, function(value, error)
+    client.request({ method = "session.prompt.submit", params = { text = "Automatic approval decision: " .. mode }, session_id = assert(require("forge.session").harness.session).id }, function(value, error)
       settled, result, problem = true, value, error
     end)
     held:wait()
@@ -171,7 +171,7 @@ local succeeded, failure = xpcall(function()
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.stop()
+client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify

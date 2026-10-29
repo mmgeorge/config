@@ -435,8 +435,10 @@ mod tests {
         );
         let fields = issue_fields(&detail);
         let wide = project(&detail, fields.clone(), &WidthProfile::default()).unwrap();
-        let mut narrow_width = WidthProfile::default();
-        narrow_width.columns = 12;
+        let narrow_width = WidthProfile {
+            columns: 12,
+            ..WidthProfile::default()
+        };
         let narrow = project(&detail, fields.clone(), &narrow_width).unwrap();
         let expected = [
             "First **raw** row",
@@ -558,8 +560,10 @@ mod tests {
         let detail = issue_with_comment(
             "The source identity must remain stable. This second paragraph stays behind the fold.",
         );
-        let mut width = WidthProfile::default();
-        width.columns = 48;
+        let mut width = WidthProfile {
+            columns: 48,
+            ..WidthProfile::default()
+        };
         let projection = project(&detail, issue_fields(&detail), &width).unwrap();
         let heading = projection
             .block

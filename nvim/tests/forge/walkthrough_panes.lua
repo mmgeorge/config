@@ -9,7 +9,9 @@ local function snapshot(document, text, target)
     { id = "body", text = text, metadata = { decoration = {}, editable_region = {}, target = target or {} } },
   } }
 end
-package.loaded["forge.client"] = { request_host = function(_, params, callback)
+package.loaded["forge.client"] = { request = function(request_specification, callback)
+  local params = request_specification.params or {}
+
   if params.operation == "open" then
     callback({ inventory_state = "disabled", snapshot = snapshot(params.document, { "Annotated change" }, {
       { id = "change", range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = 16 } } },

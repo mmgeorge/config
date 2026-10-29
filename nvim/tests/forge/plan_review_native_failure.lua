@@ -2,16 +2,19 @@ vim.loader.enable(false)
 
 local client = require("forge.client")
 local session = require("forge.session").harness
-local original_request, original_accepting = client.request_for, client.host_accepting
-client.host_accepting = function() return true end
+local original_request, original_accepting = client.request, client.host_is_accepting
+client.host_is_accepting = function() return true end
 local path = vim.fn.tempname() .. ".md"
 vim.fn.writefile({ "# Physical plan" }, path)
 local source_window, source_tab = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_tabpage()
 local success, failure = xpcall(function()
   session.session = { id = "plan-native-failure" }
   session.transcript_win = source_window
-  client.request_for = function(_, method, params, callback)
-    assert(method == "harness.document")
+  client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+    assert(method == "session.document")
     if params.operation == "plan_open" then callback(nil, "host rejected plan attachment")
     else callback({}) end
   end
@@ -24,7 +27,7 @@ local success, failure = xpcall(function()
   assert(vim.deep_equal(vim.fn.readfile(path), { "# Physical plan" }), "failed native attachment changed physical plan text")
 end, debug.traceback)
 if session.plan_review and session.plan_review.owner then session.plan_review.owner.close() end
-client.request_for, client.host_accepting = original_request, original_accepting
+client.request, client.host_is_accepting = original_request, original_accepting
 vim.fn.delete(path)
 assert(success, failure)
 print("plan_review_native_failure: passed")

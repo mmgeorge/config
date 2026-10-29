@@ -10,7 +10,10 @@ require("forge.infra.notifications").warn = function(message) warnings[#warnings
 require("forge.views.harness.prompt_history").record = function() end
 controller.render = function() end
 controller.refresh_winbar = function() end
-client.request_for = function(_, method, parameters, callback)
+client.request = function(request_specification, callback)
+  local method = request_specification.method
+  local parameters = request_specification.params or {}
+
   assert(host.request(method, parameters, callback), method)
 end
 state.session = { id = "queue-edit", backend = "mock", active_task = { revision = "task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }

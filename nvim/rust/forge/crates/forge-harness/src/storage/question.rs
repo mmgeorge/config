@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 use super::SqliteStore;
 use crate::plan::{PlanElicitation, PlanQuestionResponse};
 
+const ACCEPTANCE_ELICITATION_PATH: &str = "$.acceptance.elicitation";
+
 pub(super) fn preserve_answers(
     transaction: &rusqlite::Transaction<'_>,
     table: &str,
@@ -25,7 +27,7 @@ pub(super) fn preserve_answers(
     }
     for (pointer, path) in [
         ("/elicitation", "$.elicitation"),
-        ("/acceptance/elicitation", "$.acceptance.elicitation()"),
+        ("/acceptance/elicitation", ACCEPTANCE_ELICITATION_PATH),
     ] {
         let Some(proposed) = incoming
             .pointer_mut(pointer)
@@ -455,6 +457,72 @@ mod tests {
         assert!(reopened.answer_question_command("session", &stale).is_err());
         Ok(())
     }
+
+    #[test]
+    fn acceptance_answer_survives_stale_plan_publication_and_reopen() -> Result<()> {
+        let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let acceptance = crate::plan::PlanAcceptance::new(
+            "review-digest".into(),
+            &[
+                crate::session::ApprovalMode::Ask,
+                crate::session::ApprovalMode::Deny,
+            ],
+        )?;
+        let plan: crate::plan::PlanRecord = serde_json::from_value(json!({
+            "id":"plan", "session_id":"session", "request":"Review the change",
+            "state":"awaiting_review", "working_path":"", "model_revision":1,
+            "user_revision":0, "created_at_ms":1, "updated_at_ms":1,
+            "review_digest":"review-digest", "acceptance":acceptance
+        }))?;
+        let previous = controller.current()?.unwrap();
+        controller.change(
+            &mut store,
+            Some(&previous.revision),
+            crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::plan(
+                plan.clone(),
+                1,
+            ))),
+            1,
+        )?;
+        let request = json!({
+            "operation_id":"acceptance-answer",
+            "target":{"owner":"plan_acceptance","id":"plan","set_id":"plan-acceptance","revision":1},
+            "question_id":"acceptance-execution-mode",
+            "response":{"kind":"selected","option":"ask"}
+        });
+        let receipt = store.answer_question_command("session", &request)?;
+        assert_eq!(
+            receipt["active_elicitation"]["elicitation"]["answer"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        store.save_plan(&plan)?;
+        let saved = store.load_plan("plan")?.unwrap();
+        assert_eq!(
+            saved.acceptance.unwrap().approval_mode()?,
+            crate::session::ApprovalMode::Ask
+        );
+        drop(store);
+        let mut reopened = SqliteStore::open(root.path())?;
+        assert_eq!(
+            reopened.answer_question_command("session", &request)?,
+            receipt
+        );
+        assert_eq!(
+            reopened
+                .load_plan("plan")?
+                .unwrap()
+                .acceptance
+                .unwrap()
+                .elicitation
+                .answer
+                .len(),
+            1
+        );
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -521,7 +589,7 @@ impl SqliteStore {
             ),
             QuestionOwner::PlanAcceptance => (
                 "plan_record",
-                "$.acceptance.elicitation()",
+                ACCEPTANCE_ELICITATION_PATH,
                 "json_extract(payload,'$.state')='awaiting_review'",
                 "plan_acceptance",
             ),

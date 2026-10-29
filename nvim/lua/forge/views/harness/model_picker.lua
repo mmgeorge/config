@@ -133,7 +133,7 @@ end
 ---@field current_model? string
 ---@field is_current? fun(): boolean
 ---@field on_close? fun()
----@field on_confirm fun(config: {model: string, effort: string?, context_window: string|userdata})
+---@field on_confirm fun(config: {model: string, effort: string?, context_window: string|vim.NIL})
 
 ---@param options ForgeHarnessModelPickerOptions
 function ModelPicker.open(options)

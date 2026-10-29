@@ -27,7 +27,7 @@ require("forge").setup({ harness = { backend = "mock" },
   background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
 vim.fn.chdir(workspace)
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local picker = require("forge.views.picker")
 local settings = require("forge.views.harness.settings")
@@ -64,9 +64,9 @@ end
 assert(state.session.model == before.model and state.session.effort == before.effort, "Commit settings changed the chat")
 assert(state.session.service_tier == before.service_tier, "Background speed changed the chat")
 local generator = require("forge.integrations.ai_commit")
-local original_generation_request = client.request_generation
-client.request_generation = function(_, callback, _, selection)
-  local generation = assert(client.generation_config(selection))
+local original_generation_request = client.generation_request
+client.generation_request = function(_, callback, _, selection)
+  local generation = assert(client.generation_get_config(selection))
   assert(generation.service_tier == "fast", "saved Background speed did not reach generation")
   callback({ state = "ready", message = "test: use saved preferences" })
 end
@@ -74,9 +74,9 @@ local generated
 generator.ensure(workspace, { ref = "HEAD", force = true }, function(result) generated = result end)
 wait(function() return generated ~= nil end, "Generation did not read saved settings")
 assert(generated.state == "ready" and generated.model == "mock-model · thinking medium", vim.inspect(generated))
-client.request_generation = original_generation_request
+client.generation_request = original_generation_request
 picker.close(false)
-client.stop()
+client.host_stop()
 assert(vim.wait(5000, function() return not client._client.process end, 10), "Host did not stop")
 print("commit settings " .. stage .. " passed")
 vim.cmd("qa!")

@@ -71,7 +71,9 @@ function M.bind_commands(buf, group, specs, handlers, options)
       local keys = M.view_keys_for(spec.keymap or group, spec.id, options.keymaps)
       if #keys > 0 then
         owner.binding[#owner.binding + 1] = { spec = spec, keys = keys }
-        local modes = type(spec.modes) == "table" and spec.modes or { spec.modes or "n" }
+        local modes = spec.modes
+        if type(modes) == "string" then modes = { modes } end
+        modes = modes or { "n" }
         if vim.tbl_contains(modes, "n") then vim.list_extend(normal_keys, keys) end
       end
     end

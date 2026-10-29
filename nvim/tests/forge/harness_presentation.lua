@@ -1,16 +1,20 @@
 vim.loader.enable(false)
 local client = require("forge.client")
-local original_request = client.request_for
-local original_accepting = client.host_accepting
+local original_request = client.request
+local original_accepting = client.host_is_accepting
 local markdown = require("forge.render.harness.markdown")
 local original_markdown_render = markdown.render
 local original_defer = vim.defer_fn
-client.host_accepting = function() return true end
+client.host_is_accepting = function() return true end
 local requests = {}
 local input_state = require("forge.views.harness.input_state")
 local session_state = { session = { id = "test-session" } }
 local host = dofile("nvim/tests/forge/support/input.lua").new(session_state)
-client.request_for = function(session, method, params, callback)
+client.request = function(request_specification, callback)
+  local session = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
   local receive = callback
   callback = function(result, failure, detail)
     if type(result) == "table" and (params.operation == "open" or params.operation == "sync") then
@@ -20,7 +24,7 @@ client.request_for = function(session, method, params, callback)
   end
   assert(session == "test-session")
   if host.request(method, params, callback) then return end
-  assert(method == "harness.document")
+  assert(method == "session.document")
   if params.operation == "background_terminals" then callback({ supported = false }) return end
   requests[#requests + 1] = { method = method, params = params, callback = callback }
 end
@@ -424,7 +428,7 @@ local ok, failure = xpcall(function()
   assert(#staged_request == 7, "closed presentation published delayed steering")
 end, debug.traceback)
 vim.defer_fn = original_defer
-client.request_for = original_request
-client.host_accepting = original_accepting
+client.request = original_request
+client.host_is_accepting = original_accepting
 markdown.render = original_markdown_render
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else print("harness_presentation OK") vim.cmd("qa!") end

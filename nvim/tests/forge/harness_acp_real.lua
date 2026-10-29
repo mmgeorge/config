@@ -79,7 +79,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
 end }
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local notifications = {}
 vim.notify = function(message, level)
   if level == vim.log.levels.ERROR then notifications[#notifications + 1] = tostring(message) end
@@ -88,18 +88,18 @@ local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 
 local function request(method, parameter, target_session)
-  if method ~= "task.operation" then print("ACP request: " .. backend .. " " .. method) end
+  if method ~= "session.command.operation.get" then print("ACP request: " .. backend .. " " .. method) end
   local settled, value, failure
   local function receive(result, error)
     value, failure, settled = result, error, true
   end
-  if target_session then client.request_for(target_session, method, parameter or {}, receive)
-  else client.request(method, parameter or {}, receive) end
-  local timeout = method == "backend.setup" and 120000
-    or ((method == "prompt.submit" or method == "goal.set" or method == "session.compact" or method == "question.continue") and 90000 or 30000)
+  if target_session then client.request({ session_id = target_session, method = method, params = parameter or {} }, receive)
+  else client.request({ method = method, params = parameter or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, receive) end
+  local timeout = method == "session.provider.setup" and 120000
+    or ((method == "session.prompt.submit" or method == "session.goal.set" or method == "session.compact" or method == "session.question.continue") and 90000 or 30000)
   local answered = {}
   assert(vim.wait(timeout, function()
-    if method == "goal.set" or (method == "prompt.submit" and (vim.g.forge_acp_test_resources or vim.g.forge_acp_test_questions)) then
+    if method == "session.goal.set" or (method == "session.prompt.submit" and (vim.g.forge_acp_test_resources or vim.g.forge_acp_test_questions)) then
       for _, approval in ipairs(state.approval or {}) do
         if not answered[approval.id] then
           answered[approval.id] = true
@@ -107,7 +107,7 @@ local function request(method, parameter, target_session)
           for _, item in ipairs(approval.item_list or {}) do
             answer_list[#answer_list + 1] = { item_id = item.id, choice_id = "allow_once" }
           end
-          client.request("approval.resolve", { approval_id = approval.id, answer_list = answer_list }, function(_, approval_error)
+          client.request({ method = "session.approval.resolve", params = { approval_id = approval.id, answer_list = answer_list }, session_id = assert(require("forge.session").harness.session).id }, function(_, approval_error)
             assert(not approval_error, approval_error)
           end)
         end
@@ -123,14 +123,14 @@ local function request(method, parameter, target_session)
     data_root = data,
   }))
   assert(not failure, method .. ": " .. tostring(failure))
-  if method ~= "task.operation" then print("ACP response: " .. backend .. " " .. method) end
+  if method ~= "session.command.operation.get" then print("ACP response: " .. backend .. " " .. method) end
   return value
 end
 
 local function settle(operation)
   local observed
   assert(vim.wait(30000, function()
-    observed = request("task.operation", { operation_id = operation.id })
+    observed = request("session.command.operation.get", { operation_id = operation.id })
     return observed.state == "completed" or observed.state == "failed"
   end, 100), "configuration did not settle")
   assert(observed.state == "completed", vim.inspect(observed))
@@ -154,7 +154,7 @@ local succeeded, failure = xpcall(function()
       ready = require("forge.session").harness.ready, host_error = require("forge.session").harness.host_error }))
   assert(state.session,table.concat(notifications,"\n"))
   if vim.g.forge_acp_test_setup then
-    local installed = request("backend.setup", { install = true })
+    local installed = request("session.provider.setup", { install = true })
     assert(installed.available and installed.managed, "managed ACP installation did not become available")
     assert(#installed.auth_methods > 0, "provider omitted sign-in methods")
     local oauth = false
@@ -165,15 +165,15 @@ local succeeded, failure = xpcall(function()
     print("ACP managed runtime and OAuth discovery passed: " .. backend .. " " .. installed.supported_version)
   end
   if vim.g.forge_acp_test_trace then
-    print("ACP trace: " .. vim.json.encode(request("trace.configure", { enabled = true })))
+    print("ACP trace: " .. vim.json.encode(request("host.trace.configure", { enabled = true })))
     print("ACP data root: " .. data)
   end
   request("session.configure", { access = { sandbox = false, write_access = "workspace",
     writable_directory = {}, windows_sandbox = "elevated" } })
   if vim.g.forge_acp_test_auth then
-    request("backend.authenticate", { method = vim.g.forge_acp_test_auth })
+    request("session.provider.authenticate", { method = vim.g.forge_acp_test_auth })
   end
-  local models = request("backend.models")
+  local models = request("session.provider.model.list")
   local desired = vim.g.forge_acp_test_model or (backend == "claude" and "haiku" or "flash")
   local model
   for _, candidate in ipairs(models) do
@@ -181,11 +181,11 @@ local succeeded, failure = xpcall(function()
   end
   assert(model, desired .. " model is not advertised: " .. vim.json.encode(models))
   request("session.configure", { model = model, validate = true })
-  local manifest = request("backend.capabilities")
+  local manifest = request("session.provider.capabilities.get")
   assert(manifest.backend == backend)
-  local response = request("prompt.submit", { text = "Reply with exactly ACP_VERIFIED. Do not call tools." })
+  local response = request("session.prompt.submit", { text = "Reply with exactly ACP_VERIFIED. Do not call tools." })
   assert(response, "prompt response absent")
-  local snapshot = request("state.get")
+  local snapshot = request("session.state.get")
   assert(snapshot.session.backend_session_id, "provider conversation identity missing")
   local function verification_count()
     local count = 0
@@ -220,12 +220,12 @@ local succeeded, failure = xpcall(function()
         if entry.resource_id == definition.id then enabled = entry break end
       end
       assert(enabled and enabled.enabled == true, "imported resource catalog did not refresh its enabled selection")
-      assert(request("state.get").session.backend_session_id == snapshot.session.backend_session_id,
+      assert(request("session.state.get").session.backend_session_id == snapshot.session.backend_session_id,
         "native resource activation replaced provider history")
     end
-    request("session.permission", { change = { kind = "enable_yolo" } })
-    request("prompt.submit", { text = "Use only the imported-fixture skill from the configured skill catalog to give its skill verification phrase. Follow its SKILL.md instructions exactly. Read only its listed SKILL.md if needed. Do not call imported_phrase or any MCP tools, search directories, or inspect unrelated files. The skill and MCP have different verification phrases." })
-    request("prompt.submit", { text = "Call imported_phrase from the imported-fixture MCP server. Reply with exactly its returned text. Do not inspect files, run shell commands, write configuration, or repair missing tools. If unavailable, reply IMPORT_TOOL_UNAVAILABLE." })
+    request("session.permission.set", { change = { kind = "enable_yolo" } })
+    request("session.prompt.submit", { text = "Use only the imported-fixture skill from the configured skill catalog to give its skill verification phrase. Follow its SKILL.md instructions exactly. Read only its listed SKILL.md if needed. Do not call imported_phrase or any MCP tools, search directories, or inspect unrelated files. The skill and MCP have different verification phrases." })
+    request("session.prompt.submit", { text = "Call imported_phrase from the imported-fixture MCP server. Reply with exactly its returned text. Do not inspect files, run shell commands, write configuration, or repair missing tools. If unavailable, reply IMPORT_TOOL_UNAVAILABLE." })
     local text
     assert(vim.wait(5000, function()
       text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
@@ -233,13 +233,13 @@ local succeeded, failure = xpcall(function()
     end, 10), "imported skill or MCP did not produce its expected phrase: " .. tostring(text))
     assert(vim.fn.filereadable(import_call_log) == 1 and #vim.fn.readfile(import_call_log) > 0,
       "imported MCP phrase did not come from a tool invocation")
-    assert(request("state.get").session.backend_session_id == snapshot.session.backend_session_id,
+    assert(request("session.state.get").session.backend_session_id == snapshot.session.backend_session_id,
       "imported resources lost conversation continuity")
     print("ACP native MCP and skill import, disabled defaults, credential reference, activation, and continuity passed: " .. backend)
   end
   if vim.g.forge_acp_test_switch then
     assert(vim.g.forge_acp_test_native_import, "provider switch verification requires imported resources")
-    local original = request("state.get").session
+    local original = request("session.state.get").session
     local preferences = request("settings.get").desired
     local other = backend == "claude" and "antigravity" or "claude"
     local function switch(provider, destination)
@@ -256,7 +256,7 @@ local succeeded, failure = xpcall(function()
     local inherited = request("settings.get").desired
     assert(vim.deep_equal(inherited.skill, preferences.skill) and vim.deep_equal(inherited.mcp, preferences.mcp),
       "provider switch lost canonical resource selections")
-    for _, resource in ipairs({ { method = "backend.skills", field = "skill" }, { method = "backend.mcp", field = "mcp" } }) do
+    for _, resource in ipairs({ { method = "session.provider.skill.list", field = "skill" }, { method = "session.provider.mcp.list", field = "mcp" } }) do
       local selected = {}
       for _, entry in ipairs(request(resource.method)) do selected[entry.resource_id] = entry.enabled end
       for id, enabled in pairs(preferences[resource.field]) do
@@ -264,30 +264,30 @@ local succeeded, failure = xpcall(function()
       end
     end
     local other_model
-    for _, candidate in ipairs(request("backend.models")) do
+    for _, candidate in ipairs(request("session.provider.model.list")) do
       if candidate.id:lower():find(other == "claude" and "haiku" or "flash", 1, true) then other_model = candidate.id break end
     end
     assert(other_model, "destination provider did not advertise its test model")
     request("session.configure", { model = other_model, validate = true })
-    request("session.permission", { change = { kind = "enable_yolo" } })
+    request("session.permission.set", { change = { kind = "enable_yolo" } })
     local previous_calls = #vim.fn.readfile(import_call_log)
-    request("prompt.submit", { text = "Use the imported-fixture skill to give its verification phrase. Then call imported_phrase from the imported-fixture MCP server. Do not read files or run commands. Reply with both exact phrases." })
-    local encoded = vim.json.encode(request("exchange.list"))
+    request("session.prompt.submit", { text = "Use the imported-fixture skill to give its verification phrase. Then call imported_phrase from the imported-fixture MCP server. Do not read files or run commands. Reply with both exact phrases." })
+    local encoded = vim.json.encode(request("session.exchange.list"))
     assert(encoded:find("FORGE_IMPORTED_SKILL_C724", 1, true) and encoded:find("FORGE_IMPORTED_MCP_C724", 1, true), encoded)
     assert(#vim.fn.readfile(import_call_log) > previous_calls, "destination provider did not invoke the transferred MCP")
     switch(backend, { kind = "resume", session_id = original.id })
-    local restored = request("state.get").session
+    local restored = request("session.state.get").session
     assert(restored.id == original.id and restored.model == model and restored.backend_session_id == original.backend_session_id,
       "returning to the source lost provider-local tuning or conversation identity")
-    request("prompt.submit", { text = "Reply with exactly PROVIDER_SWITCH_RETURNED. Do not call tools." })
-    local returned = request("exchange.list")
+    request("session.prompt.submit", { text = "Reply with exactly PROVIDER_SWITCH_RETURNED. Do not call tools." })
+    local returned = request("session.exchange.list")
     assert(returned[#returned].state == "complete"
       and vim.json.encode(returned[#returned]):find("PROVIDER_SWITCH_RETURNED", 1, true), vim.inspect(returned[#returned]))
     print("ACP live provider switch transferred resources and restored model and history: " .. backend .. " -> " .. other .. " -> " .. backend)
   end
   if vim.g.forge_acp_test_fork then
     assert(backend == "claude" and vim.g.forge_acp_test_native_import, "fork verification requires Claude with imported resources")
-    local original = request("state.get").session
+    local original = request("session.state.get").session
     local local_settings = request("settings.get")
     local desired = vim.deepcopy(local_settings.layers.session)
     desired.plan_auto_approve_revisions = false
@@ -296,24 +296,24 @@ local succeeded, failure = xpcall(function()
     assert(fork.id ~= original.id)
     local inherited = request("settings.get", {}, fork.id)
     assert(inherited.desired.plan_auto_approve_revisions == false, "fork lost conversation-scoped preferences")
-    request("session.permission", { change = { kind = "enable_yolo" } }, fork.id)
+    request("session.permission.set", { change = { kind = "enable_yolo" } }, fork.id)
     local previous_calls = #vim.fn.readfile(import_call_log)
-    request("prompt.submit", { text = "Use the imported-fixture skill to give its verification phrase. Then call imported_phrase from the imported-fixture MCP server. Do not read files or run commands. Reply with both exact phrases." }, fork.id)
-    local fork_history = request("exchange.list", {}, fork.id)
+    request("session.prompt.submit", { text = "Use the imported-fixture skill to give its verification phrase. Then call imported_phrase from the imported-fixture MCP server. Do not read files or run commands. Reply with both exact phrases." }, fork.id)
+    local fork_history = request("session.exchange.list", {}, fork.id)
     local encoded = vim.json.encode(fork_history)
     assert(encoded:find("FORGE_IMPORTED_SKILL_C724", 1, true) and encoded:find("FORGE_IMPORTED_MCP_C724", 1, true), encoded)
-    local forked = request("state.get", {}, fork.id).session
+    local forked = request("session.state.get", {}, fork.id).session
     assert(forked.backend_session_id ~= original.backend_session_id, "native fork reused the source conversation")
-    assert(request("state.get", {}, original.id).session.backend_session_id == original.backend_session_id, "fork replaced the source conversation")
+    assert(request("session.state.get", {}, original.id).session.backend_session_id == original.backend_session_id, "fork replaced the source conversation")
     assert(#vim.fn.readfile(import_call_log) > previous_calls, "fork did not invoke the inherited MCP binding")
     print("ACP native fork preserved selected resources, private preference scope, and independent history: " .. backend)
   end
   if vim.g.forge_acp_test_raw_output then
-    request("session.permission", { change = { kind = "enable_yolo" } })
+    request("session.permission.set", { change = { kind = "enable_yolo" } })
     local command_text = "echo ACP_RAW_OUTPUT_VERIFIED"
-    request("prompt.submit", { text = "Run exactly one shell command: " .. command_text ..
+    request("session.prompt.submit", { text = "Run exactly one shell command: " .. command_text ..
       ". Do not create files, repair configuration, or start agents. Reply SHELL_OUTPUT_DONE after it finishes." })
-    local exchanges = request("exchange.list")
+    local exchanges = request("session.exchange.list")
     local reported = false
     for _, turn in ipairs(exchanges[#exchanges].turn) do
       for _, tool in pairs(turn.tool.item) do
@@ -327,10 +327,10 @@ local succeeded, failure = xpcall(function()
     print("ACP completed shell output persistence passed: " .. backend)
   end
   if vim.g.forge_acp_test_setup then
-    local refreshed = request("backend.setup", { install = false })
+    local refreshed = request("session.provider.setup", { install = false })
     assert(refreshed.available and refreshed.managed, "setup refresh lost the managed runtime")
-    request("prompt.submit", { text = "Reply with exactly AFTER_SETUP_REFRESH. Do not call tools." })
-    local resumed = request("state.get")
+    request("session.prompt.submit", { text = "Reply with exactly AFTER_SETUP_REFRESH. Do not call tools." })
+    local resumed = request("session.state.get")
     assert(resumed.session.backend_session_id == snapshot.session.backend_session_id,
       "provider setup refresh replaced conversation history")
     assert(vim.wait(5000, function()
@@ -341,10 +341,10 @@ local succeeded, failure = xpcall(function()
     print("ACP setup refresh and conversation continuity passed: " .. backend)
   end
   if vim.g.forge_acp_test_diffs then
-    request("session.permission", { change = { kind = "enable_yolo" } })
-    request("prompt.submit", { text = "Create acp-diff-test.txt containing ACP_DIFF_VERIFIED using a file-edit tool. Do not use a shell." })
+    request("session.permission.set", { change = { kind = "enable_yolo" } })
+    request("session.prompt.submit", { text = "Create acp-diff-test.txt containing ACP_DIFF_VERIFIED using a file-edit tool. Do not use a shell." })
     assert(vim.fn.readfile(workspace .. "/acp-diff-test.txt")[1] == "ACP_DIFF_VERIFIED", "diff fixture file was not created")
-    local exchange = request("exchange.list")
+    local exchange = request("session.exchange.list")
     local reported = false
     for _, turn in ipairs(exchange[#exchange].turn) do
       for _, tool in pairs(turn.tool.item) do
@@ -380,7 +380,7 @@ local succeeded, failure = xpcall(function()
   if vim.g.forge_acp_test_resources then
     local settings = request("settings.get")
     assert(#settings.catalog.skill == 1 and #settings.catalog.mcp == (vim.g.forge_acp_test_live_mcp and 2 or 1), "global Rulesync fixture was not discovered")
-    request("prompt.submit", { text = "Use the forge-fixture-skill skill to give the Forge skill verification phrase. Follow its instructions exactly." })
+    request("session.prompt.submit", { text = "Use the forge-fixture-skill skill to give the Forge skill verification phrase. Follow its instructions exactly." })
     assert(vim.wait(5000, function()
       for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
         if line == "FORGE_SKILL_8C46B2" then return true end
@@ -390,7 +390,7 @@ local succeeded, failure = xpcall(function()
       if backend == "claude" or backend == "antigravity" then return end
       local runtime_catalog
       assert(vim.wait(15000, function()
-        runtime_catalog = request("backend.mcp")
+        runtime_catalog = request("session.provider.mcp.list")
         for _, server in ipairs(runtime_catalog) do
           if server.name == "forge-fixture-live" and server.status == "connected" then
             for _, tool in ipairs(server.tools or {}) do if tool.name == "verification_phrase" then return true end end
@@ -401,7 +401,7 @@ local succeeded, failure = xpcall(function()
     end
     if vim.g.forge_acp_test_live_mcp then
       verify_mcp_ready()
-      request("prompt.submit", { text = "Call the verification_phrase tool from forge-fixture-live and reply with only the phrase it returns." })
+      request("session.prompt.submit", { text = "Call the verification_phrase tool from forge-fixture-live and reply with only the phrase it returns." })
       assert(vim.wait(5000, function()
         for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
           if line == "FORGE_MCP_53F128" then return true end
@@ -420,7 +420,7 @@ local succeeded, failure = xpcall(function()
       local operation
       assert(vim.wait(timeout or 30000, function()
         local settled
-        client.request("task.operation", { operation_id = changed.id }, function(value, error)
+        client.request({ method = "session.command.operation.get", params = { operation_id = changed.id }, session_id = assert(require("forge.session").harness.session).id }, function(value, error)
           assert(not error, error)
           operation, settled = value, true
         end)
@@ -435,7 +435,7 @@ local succeeded, failure = xpcall(function()
     assert(disabled.desired.skill[settings.catalog.skill[1].id] == false)
     for _, definition in ipairs(settings.catalog.mcp) do assert(disabled.desired.mcp[definition.id] == false) end
     assert(disabled.application.state == "applied")
-    assert(request("state.get").session.backend_session_id == snapshot.session.backend_session_id,
+    assert(request("session.state.get").session.backend_session_id == snapshot.session.backend_session_id,
       "resource restart replaced provider history")
     if vim.g.forge_acp_test_toggle_back then
       for _, resource in ipairs(resources) do
@@ -443,7 +443,7 @@ local succeeded, failure = xpcall(function()
       end
       verify_mcp_ready()
       local calls_before = #vim.fn.readfile(mcp_call_log)
-      request("prompt.submit", { text = "Call verification_phrase from forge-fixture-live again and reply with only the phrase returned by the tool." })
+      request("session.prompt.submit", { text = "Call verification_phrase from forge-fixture-live again and reply with only the phrase returned by the tool." })
       assert(vim.wait(5000, function()
         local count = 0
         for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
@@ -452,13 +452,13 @@ local succeeded, failure = xpcall(function()
         return count >= 2
       end, 10), "re-enabled MCP tool did not execute")
       assert(#vim.fn.readfile(mcp_call_log) > calls_before, "re-enabled MCP response reused prior text without a tool call")
-      assert(request("state.get").session.backend_session_id == snapshot.session.backend_session_id,
+      assert(request("session.state.get").session.backend_session_id == snapshot.session.backend_session_id,
         "re-enabling resources replaced provider history")
     end
     if vim.g.forge_acp_test_active_settings then
       if not vim.g.forge_acp_test_toggle_back then set_resource(resources[1], true) end
-      local before = request("state.get")
-      local before_exchange = request("exchange.list")
+      local before = request("session.state.get")
+      local before_exchange = request("session.exchange.list")
       local function completed_settings_count()
         local count = 0
         for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
@@ -469,13 +469,13 @@ local succeeded, failure = xpcall(function()
       assert(completed_settings_count() == 0, "successful settings changes leaked into the timeline")
       local settled, failure, detail = false, nil, nil
       local phase = {}
-      local unsubscribe = client.subscribe(function(event, payload)
+      local unsubscribe = client.session_events_subscribe(function(event, payload)
         if event == "task_operation" then
           phase[payload.id] = phase[payload.id] or {}
           phase[payload.id][payload.state] = true
         end
       end)
-      client.request("prompt.submit", { text = "Begin your reply with ACTIVE_SETTINGS_STARTED on its own plain line, then write a detailed 3000-word explanation of asynchronous state machines. Do not use tools. If Forge interrupts this response to change settings and asks you to continue, reply with exactly SETTINGS_RESUMED instead of continuing the explanation." },
+      client.request({ method = "session.prompt.submit", params = { text = "Begin your reply with ACTIVE_SETTINGS_STARTED on its own plain line, then write a detailed 3000-word explanation of asynchronous state machines. Do not use tools. If Forge interrupts this response to change settings and asks you to continue, reply with exactly SETTINGS_RESUMED instead of continuing the explanation." }, session_id = assert(require("forge.session").harness.session).id },
         function(_, request_error, request_detail) failure, detail, settled = request_error, request_detail, true end)
       assert(vim.wait(30000, function()
         for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
@@ -487,9 +487,9 @@ local succeeded, failure = xpcall(function()
       local operation_id = set_resource(resources[1], false, 90000)
       assert(vim.wait(10000, function() return settled end, 10), "interrupted request did not settle")
       assert(not failure or detail and (detail.code == "turn_cancelled" or detail.code == "turn_retracted"), tostring(failure))
-      local after = request("state.get")
+      local after = request("session.state.get")
       assert(after.session.backend_session_id == before.session.backend_session_id, "active configuration replaced provider history")
-      local resumed_exchange = request("exchange.list")
+      local resumed_exchange = request("session.exchange.list")
       assert(#resumed_exchange == #before_exchange + 1, "active configuration replaced the interrupted exchange")
       local resumed = resumed_exchange[#resumed_exchange]
       assert(resumed.state == "complete" and #resumed.turn >= 2,
@@ -518,7 +518,7 @@ local succeeded, failure = xpcall(function()
     local operation
     assert(vim.wait(30000, function()
       local settled
-      client.request("task.operation", { operation_id = configured.id }, function(value, request_error)
+      client.request({ method = "session.command.operation.get", params = { operation_id = configured.id }, session_id = assert(require("forge.session").harness.session).id }, function(value, request_error)
         assert(not request_error, request_error)
         operation, settled = value, true
       end)
@@ -530,18 +530,18 @@ local succeeded, failure = xpcall(function()
     assert(applied.application.state == "applied", vim.inspect(applied))
     assert(applied.application.applied_revision == applied.revision)
     assert(applied.application.effective.plan_compact == (backend == "claude"))
-    local restarted = request("state.get")
+    local restarted = request("session.state.get")
     assert(restarted.session.backend_session_id == snapshot.session.backend_session_id, "restart changed provider conversation")
-    request("prompt.submit", { text = "What was your very first assistant reply at the start of this conversation, before any skill requests? Reply with that string only. Do not call tools." })
+    request("session.prompt.submit", { text = "What was your very first assistant reply at the start of this conversation, before any skill requests? Reply with that string only. Do not call tools." })
     assert(vim.wait(5000, function() return verification_count() == 2 end, 10), "provider did not retain the first verification response: " ..
       table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n"))
-    local continued = request("state.get")
+    local continued = request("session.state.get")
     assert(continued.session.backend_session_id == snapshot.session.backend_session_id, "continuation replaced provider history")
-    request("session.permission", { change = { kind = "set_approval", mode = "ask" } })
-    assert(request("state.get").session.approval_mode == "ask", "approval fixture must use Read permission")
+    request("session.permission.set", { change = { kind = "set_approval", mode = "ask" } })
+    assert(request("session.state.get").session.approval_mode == "ask", "approval fixture must use Read permission")
     print("ACP settings restart and history continuity passed: " .. backend)
     local settled, prompt_error, answered = false, nil, {}
-    client.request("prompt.submit", { text = "Create approval-test.txt containing APPROVED_ONCE using a file-edit tool. Do not use a shell. Then reply APPROVAL_VERIFIED." }, function(_, request_error)
+    client.request({ method = "session.prompt.submit", params = { text = "Create approval-test.txt containing APPROVED_ONCE using a file-edit tool. Do not use a shell. Then reply APPROVAL_VERIFIED." }, session_id = assert(require("forge.session").harness.session).id }, function(_, request_error)
       prompt_error, settled = request_error, true
     end)
     assert(vim.wait(90000, function()
@@ -552,7 +552,7 @@ local succeeded, failure = xpcall(function()
           for _, item in ipairs(approval.item_list or {}) do
             answer_list[#answer_list + 1] = { item_id = item.id, choice_id = "allow_once" }
           end
-          client.request("approval.resolve", { approval_id = approval.id, answer_list = answer_list }, function(_, approval_error)
+          client.request({ method = "session.approval.resolve", params = { approval_id = approval.id, answer_list = answer_list }, session_id = assert(require("forge.session").harness.session).id }, function(_, approval_error)
             assert(not approval_error, approval_error)
           end)
         end
@@ -566,28 +566,28 @@ local succeeded, failure = xpcall(function()
     }))
     assert(vim.fn.readfile(workspace .. "/approval-test.txt")[1] == "APPROVED_ONCE", "approved file edit was not applied")
     print("ACP once-only approval workflow passed: " .. backend)
-    request("session.permission", { change = { kind = "enable_yolo" } })
-    request("prompt.submit", { text = "Create yolo-test.txt containing YOLO_VERIFIED using a file-edit tool. Do not use a shell." })
+    request("session.permission.set", { change = { kind = "enable_yolo" } })
+    request("session.prompt.submit", { text = "Create yolo-test.txt containing YOLO_VERIFIED using a file-edit tool. Do not use a shell." })
     assert(vim.fn.readfile(workspace .. "/yolo-test.txt")[1] == "YOLO_VERIFIED", "Yolo file edit did not finish")
     assert(not next(state.approval or {}), "ordinary Yolo work unexpectedly requested approval")
     print("ACP Yolo file workflow passed: " .. backend)
   end
   if vim.g.forge_acp_test_lifecycle then
     local settled, failure_detail = false, nil
-    client.request("prompt.submit", { text = "Write a detailed 2000-word explanation of asynchronous state machines. Do not use tools." }, function(_, error, detail)
+    client.request({ method = "session.prompt.submit", params = { text = "Write a detailed 2000-word explanation of asynchronous state machines. Do not use tools." }, session_id = assert(require("forge.session").harness.session).id }, function(_, error, detail)
       failure_detail, settled = error and detail, true
     end)
     vim.wait(1000, function() return settled end, 10)
     assert(not settled, "cancellation fixture completed before interruption")
-    request("turn.cancel")
+    request("session.turn.cancel")
     assert(vim.wait(10000, function() return settled end, 10), "cancelled provider turn did not settle")
     assert(failure_detail and failure_detail.code == "turn_cancelled", vim.inspect(failure_detail))
-    request("prompt.submit", { text = "Reply with exactly AFTER_CANCEL. Do not call tools." })
-    local resumed = request("state.get")
+    request("session.prompt.submit", { text = "Reply with exactly AFTER_CANCEL. Do not call tools." })
+    local resumed = request("session.state.get")
     assert(resumed.session.backend_session_id == snapshot.session.backend_session_id, "cancellation replaced provider history")
     if backend == "claude" then
       request("session.compact")
-      local compacted = request("state.get")
+      local compacted = request("session.state.get")
       assert(vim.wait(5000, function()
         for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
           if line:find("Context compacted", 1, true) then return true end
@@ -599,30 +599,30 @@ local succeeded, failure = xpcall(function()
     print("ACP cancellation and compaction lifecycle passed: " .. backend)
   end
   if vim.g.forge_acp_test_control then
-    request("goal.set", { objective = "Verify the Harness control connection by calling goal_complete with a short summary. No files or shell commands are needed. Complete this goal only through that tool." })
-    local completed = request("state.get")
+    request("session.goal.set", { objective = "Verify the Harness control connection by calling goal_complete with a short summary. No files or shell commands are needed. Complete this goal only through that tool." })
+    local completed = request("session.state.get")
     assert(completed.session.active_task == nil or completed.session.active_task == vim.NIL,
       "control tool did not clear the completed Goal task: " .. vim.inspect(completed.session.active_task))
     print("ACP Harness control workflow passed: " .. backend)
   end
   if vim.g.forge_acp_test_questions then
-    request("prompt.submit", { text = "Call question_ask with one question, id fixture_choice, header Choice, question 'Choose the verification option', and options Alpha / Verify Alpha, Beta / Verify Beta. Set allow_freeform false. Do not call any other tools or start agents. End the turn after the tool. When the user answers later, reply with exactly QUESTION_ANSWER_ALPHA and do not ask another question." })
-    local pending = request("state.get").active_elicitation
+    request("session.prompt.submit", { text = "Call question_ask with one question, id fixture_choice, header Choice, question 'Choose the verification option', and options Alpha / Verify Alpha, Beta / Verify Beta. Set allow_freeform false. Do not call any other tools or start agents. End the turn after the tool. When the user answers later, reply with exactly QUESTION_ANSWER_ALPHA and do not ask another question." })
+    local pending = request("session.state.get").active_elicitation
     assert(pending and pending.owner == "interaction", vim.inspect(pending))
-    local history = request("exchange.list")
+    local history = request("session.exchange.list")
     local exchange_id = history[#history].id
     assert(history[#history].completed_at_ms == nil, "question completed its exchange before an answer")
     local question = pending.elicitation.question_set.questions[1]
-    request("question.answer", { question_id = question.id, response = { kind = "selected", option = "Alpha" } })
-    request("question.continue")
+    request("session.question.answer", { question_id = question.id, response = { kind = "selected", option = "Alpha" } })
+    request("session.question.continue")
     require("forge.views.picker").close(false)
-    local completed = request("exchange.list")
+    local completed = request("session.exchange.list")
     assert(completed[#completed].id == exchange_id and completed[#completed].state == "complete", vim.inspect(completed[#completed]))
     assert(vim.json.encode(completed[#completed]):find("QUESTION_ANSWER_ALPHA", 1, true), "question continuation lost the supplied answer")
     print("ACP structured question and answer completed the same exchange: " .. backend)
   end
   if vim.g.forge_acp_test_queue then
-    controller.activate_snapshot(request("state.get"))
+    controller.activate_snapshot(request("session.state.get"))
     assert(vim.wait(5000, function() return not state.busy and not state.configuring and not state.task_operation end, 10))
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Reply with exactly QUEUE_FIRST_VERIFIED. Do not call tools." })
     controller.queue_submit()
@@ -639,15 +639,15 @@ local succeeded, failure = xpcall(function()
       sync_error = state.sync_error, pending_steer = state.pending_steer, switching_backend = state.switching_backend,
       configuration_debounce = state.configuration_debounce, aborting_plan = state.aborting_plan,
       transcript = vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false) }))
-    local history = request("exchange.list")
+    local history = request("session.exchange.list")
     assert(vim.json.encode(history[#history - 1]):find("QUEUE_FIRST_VERIFIED", 1, true))
     assert(vim.json.encode(history[#history]):find("QUEUE_SECOND_VERIFIED", 1, true))
     assert(history[#history - 1].state == "complete" and history[#history].state == "complete")
     print("ACP queued prompts completed in separate ordered exchanges: " .. backend)
   end
   if vim.g.forge_acp_test_plan then
-    request("prompt.submit", { text = "/plan Change example.json so message becomes ACP_PLAN_VERIFIED. Keep the complete JSON proposal. Only create a plan and submit it through plan_submit. Do not implement the change, run builds, tests, shell commands, or start agents. No questions are needed. Keep verification and checks empty for this fixture." })
-    local planned = request("state.get")
+    request("session.prompt.submit", { text = "/plan Change example.json so message becomes ACP_PLAN_VERIFIED. Keep the complete JSON proposal. Only create a plan and submit it through plan_submit. Do not implement the change, run builds, tests, shell commands, or start agents. No questions are needed. Keep verification and checks empty for this fixture." })
+    local planned = request("session.state.get")
     assert(planned.active_plan and planned.active_plan.state == "awaiting_review", vim.inspect(planned.active_plan))
     assert(vim.fn.readfile(workspace .. "/example.json")[1] == '{"message":"before"}', "planning changed the workspace")
     assert(planned.active_plan.working_path and vim.fn.filereadable(planned.active_plan.working_path) == 1,
@@ -671,7 +671,7 @@ if succeeded and vim.g.forge_acp_test_inspect then
 end
 
 local stopped = false
-client.stop(nil, function() stopped = true end)
+client.host_stop(nil, function() stopped = true end)
 vim.wait(10000, function() return stopped end, 10)
 vim.fn.stdpath = original_stdpath
 if not succeeded then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end

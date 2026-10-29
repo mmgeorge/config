@@ -43,7 +43,7 @@ local original_builder_ensure = builder.ensure
 local ok, failure = xpcall(function()
   measure("status.open_demand_close", function()
     status._set_runner_for_test(function(method, params, callback)
-      assert_true(method == "status", "status did not use its native route")
+      assert_true(method == "repository.status.document", "status did not use its native route")
       if params.operation == "open" then
         callback(fixture.snapshot(params.document))
       elseif params.operation == "demand" then callback(fixture.body(params.input.document, { "changed line" }))
@@ -77,13 +77,13 @@ local ok, failure = xpcall(function()
 
   measure("review.open_close", function()
     review._set_runner_for_test(function(method, params, callback)
-      if method == "review.open" or method == "review.open_pr" then callback({ document = "performance-review" })
-      elseif method == "review.materialize" then
+      if method == "github.review.document.open" or method == "github.review.document.open" then callback({ document = "performance-review" })
+      elseif method == "github.review.document.render" then
         callback({ snapshot = { document = params.document, revision = 0,
           block = { { id = "review", text = { "review" }, metadata = metadata("review") } } }, patch = vim.NIL })
-      elseif method == "review.section" then callback({ complete = true })
-      elseif method == "review.view" or method == "review.close_view" then callback(nil)
-      elseif method == "review.close" then callback({ closed = true })
+      elseif method == "github.review.document.section.get" then callback({ complete = true })
+      elseif method == "github.review.document.view.set" or method == "review.close_view" then callback(nil)
+      elseif method == "github.review.document.close" then callback({ closed = true })
       else error("unexpected review route " .. method) end
     end)
     local state = review.open({ directory = vim.fn.getcwd(), target = { number = 1 } })
@@ -93,38 +93,38 @@ local ok, failure = xpcall(function()
   end)
 
   measure("host.initialize_shutdown", function()
-    client._reset_for_test()
+    client._host_reset_for_test()
     builder.ensure = function(callback)
       callback({ ok = true, path = "fixture-forge" })
       return function() end
     end
-    client._set_launcher_for_test(function(_, options, on_exit)
+    client._host_set_launcher_for_test(function(_, options, on_exit)
       local process = {}
       function process:write(frame)
         local request = vim.json.decode(frame)
-        if request.method == "initialize" then
+        if request.method == "host.initialize" then
           vim.schedule(function()
             options.stdout(nil, vim.json.encode({ id = request.id, result = { protocol_version = protocol.VERSION } }) .. "\n")
           end)
-        elseif request.method == "shutdown" then vim.schedule(function() on_exit({ code = 0 }) end) end
+        elseif request.method == "host.shutdown" then vim.schedule(function() on_exit({ code = 0 }) end) end
       end
       function process:wait() return { code = 0 } end
       function process:kill() on_exit({ code = 0 }) end
       return process
     end)
     local started = false
-    client.start(function(_, start_error) started = start_error == nil end)
+    client.host_start(function(_, start_error) started = start_error == nil end)
     assert_true(vim.wait(1000, function() return started end, 5), "host initialize did not settle")
-    client.stop()
+    client.host_stop()
     assert_true(vim.wait(1000, function() return client._client.process == nil end, 5), "host shutdown did not collect")
-    client._reset_for_test()
+    client._host_reset_for_test()
   end)
 end, debug.traceback)
 
 status._set_runner_for_test(nil)
 review._set_runner_for_test(nil)
 builder.ensure = original_builder_ensure
-client._reset_for_test()
+client._host_reset_for_test()
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
 io.write("FORGE_PERFORMANCE_METRICS=" .. vim.json.encode({ version = 1, metrics = metrics }) .. "\n")
 vim.cmd("qa!")

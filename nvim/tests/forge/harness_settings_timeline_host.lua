@@ -17,7 +17,7 @@ require("forge").setup({ harness_logging = true, harness = { backend = "mock",
   background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
 vim.fn.chdir(workspace)
 local client = require("forge.client")
-client._set_launcher_for_test(vim.system)
+client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
@@ -35,7 +35,7 @@ wait(function() return configured ~= nil end, "Service tier validation did not f
 assert(configured, "Service tier validation failed")
 wait(function() return state.session.service_tier == "fast" end, "Service tier was not applied")
 local snapshot
-client.request("session.preview", { session_id = state.session.id }, function(result, failure)
+client.request({ method = "session.preview", params = { session_id = state.session.id }, session_id = assert(require("forge.session").harness.session).id }, function(result, failure)
   assert(not failure, failure)
   snapshot = result
 end)
@@ -47,7 +47,7 @@ local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1
 assert(not text:find("Settings completed", 1, true), "Completed settings appeared in the transcript")
 local function request(method, params)
   local complete, value, failure
-  client.request(method, params or {}, function(result, diagnostic)
+  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, diagnostic)
     complete, value, failure = true, result, diagnostic
   end)
   wait(function() return complete end, method .. " did not complete")
@@ -62,7 +62,7 @@ local function query(tool, arguments)
     if row:find(marker, 1, true) then before = before + 1 end
   end
   local input = vim.tbl_extend("force", arguments or {}, { tool = tool })
-  request("prompt.submit", { text = "CONTROL " .. vim.json.encode(input) })
+  request("session.prompt.submit", { text = "CONTROL " .. vim.json.encode(input) })
   local response
   wait(function()
     local rows = vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)
@@ -161,7 +161,7 @@ assert(query("harness_session_status").items[1].access.write_access == "off")
 request("session.configure", { access = original_access })
 
 local large_prompt = "Large recall marker " .. string.rep("retained snow ", 12000)
-request("prompt.submit", { text = large_prompt })
+request("session.prompt.submit", { text = large_prompt })
 local pages = query("harness_session_exchange_list", { __collect_pages = true }).pages
 assert(#pages > 1, "large exchange history did not use continuations")
 local fragments, found_large = "", false
@@ -180,7 +180,7 @@ end
 assert(found_large and fragments == "", "native paging lost the complete oversized question")
 local expired = query("harness_session_exchange_list", { cursor = pages[1].next_cursor })
 assert(expired.error:find("another interaction", 1, true), "expired inspection cursor was reused")
-client.stop()
+client.host_stop()
 assert(vim.wait(5000, function() return not client._client.process end, 10), "Host did not stop")
 print("harness_settings_timeline_host: validated speed, all eight inspection tools, live toggle and complete history paging")
 vim.cmd("qa!")

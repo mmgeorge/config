@@ -5,7 +5,7 @@ use forge_protocol::message::SessionEvent;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::protocol::HarnessMethod;
+use crate::protocol::RuntimeMethod;
 
 /// Routes review reads and decisions to the broker retaining a provider tool call.
 #[derive(Default)]
@@ -67,7 +67,7 @@ impl RevisionReview {
     /// Commit one explicit decision through the waiting turn's persistence owner.
     pub(crate) async fn decide(
         &self,
-        method: HarnessMethod,
+        method: RuntimeMethod,
         params: Value,
     ) -> Result<Option<(Value, Vec<SessionEvent>)>> {
         let Some(sender) = self.sender()? else {
@@ -117,7 +117,7 @@ pub(crate) enum RevisionReviewRequest {
         response: oneshot::Sender<Result<super::review_source::PlanReviewSource>>,
     },
     Decide {
-        method: HarnessMethod,
+        method: RuntimeMethod,
         params: Value,
         response: oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
     },
@@ -133,10 +133,11 @@ mod tests {
         let mut wait = review.open().unwrap();
         assert!(review.open().is_err());
         let caller = Arc::clone(&review);
-        let pending =
-            tokio::spawn(
-                async move { caller.decide(HarnessMethod::PlanCancel, Value::Null).await },
-            );
+        let pending = tokio::spawn(async move {
+            caller
+                .decide(RuntimeMethod::SessionPlanCancel, Value::Null)
+                .await
+        });
         let request = wait.receiver.recv().await.unwrap();
         drop(wait);
         drop(request);
@@ -144,7 +145,7 @@ mod tests {
         assert!(error.to_string().contains("interrupted"));
         assert!(
             review
-                .decide(HarnessMethod::PlanCancel, Value::Null)
+                .decide(RuntimeMethod::SessionPlanCancel, Value::Null)
                 .await
                 .unwrap()
                 .is_none()

@@ -3081,8 +3081,10 @@ mod test {
             let rendered = crate::buffer::projection::project(
                 &crate::timeline::TimelineEntry::Exchange {
                     id: exchange.id.clone(),
+
                     created_at_ms: 0,
-                    exchange,
+                    exchange: exchange.into(),
+
                     agent_by_id: std::collections::HashMap::new(),
                 },
                 &forge_buffer::width::WidthProfile::default(),

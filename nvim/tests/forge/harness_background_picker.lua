@@ -5,9 +5,13 @@ local controller = require("forge.views.harness.controller")
 local picker = require("forge.views.picker")
 local notifications = require("forge.infra.notifications")
 local requests, messages, opened, refreshed = {}, {}, nil, 0
-client.host_generation = function() return 1 end
-client.request_for = function(session_id, method, params, callback)
-  assert(session_id == "background-test" and method == "harness.document")
+client.host_get_generation = function() return 1 end
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  assert(session_id == "background-test" and method == "session.document")
   requests[#requests + 1] = { params = params, callback = callback }
 end
 picker.open = function(spec) opened = spec end

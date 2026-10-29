@@ -67,7 +67,7 @@ local function vitest_adapter()
     end
 
     local screenshot_review = require("screenshot_review")
-    local failures = screenshot_review.extract_failures_from_results(results, { cwd = spec.cwd or review.cwd or vim.uv.cwd() })
+    local failures = screenshot_review.extract_failures_from_results(results, { cwd = assert(spec.cwd or review.cwd or vim.uv.cwd()) })
 
     if phase == "complete" then
       screenshot_review.emit_run_complete(review, failures)

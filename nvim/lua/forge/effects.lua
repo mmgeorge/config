@@ -102,10 +102,12 @@ function M.apply(session, view, effect)
       assert(command, "invalid file opening layout")
       view.effect[effect.id] = true
       local destination
+      local presentation = require("forge.window_presentation")
+      local inherited = presentation.capture_inheritance(view.window)
       vim.api.nvim_win_call(view.window, function()
         vim.api.nvim_cmd({ cmd = command, args = { effect.path } }, {})
         destination = vim.api.nvim_get_current_win()
-        require("forge.nodes").restore_inherited(view.window, vim.api.nvim_get_current_win())
+        presentation.restore_inheritance(destination, inherited)
         local target = vim.api.nvim_get_current_buf()
         row = math.min(row, vim.api.nvim_buf_line_count(target) - 1)
         local text = vim.api.nvim_buf_get_lines(target, row, row + 1, true)[1]

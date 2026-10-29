@@ -446,11 +446,13 @@ impl TimelineRenderer<'_> {
         self.push(renderer.tool_header(
             BlockId(format!("{call_id}:tool")),
             TargetId(format!("{call_id}:tool")),
-            "check",
-            elapsed,
-            failed,
-            &title,
-            expanded,
+            crate::buffer::transcript::ToolHeading {
+                kind: "check",
+                elapsed_ms: elapsed,
+                failed,
+                title: &title,
+                expanded,
+            },
         )?)?;
         self.action.insert(
             TargetId(format!("{call_id}:tool")),
@@ -563,8 +565,9 @@ mod tests {
         let projected = project(
             &TimelineEntry::Checks {
                 id: "run".into(),
+
                 created_at_ms: 1,
-                run: run.clone(),
+                run: (run.clone()).into(),
             },
             &WidthProfile::default(),
             false,
@@ -684,8 +687,9 @@ mod tests {
         let failed_projection = project(
             &TimelineEntry::Checks {
                 id: "run".into(),
+
                 created_at_ms: 1,
-                run: failed_run,
+                run: (failed_run).into(),
             },
             &WidthProfile::default(),
             false,

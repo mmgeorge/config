@@ -50,9 +50,9 @@ end
 require("forge").setup({ about_auto_generate = false })
 forge_manual.state = require("forge.views.commands").open()
 vim.api.nvim_create_user_command("ForgeFixtureCompare", function()
-  require("forge.client").request_host("repository.generate", {
+  require("forge.client").request({ method = "repository.generation", params = {
     operation = "fingerprint", workspace = fixture, comparison = "head",
-  }, function(result, failure)
+  } }, function(result, failure)
     forge_manual.comparison = { result = result, failure = failure }
     if failure then vim.notify(failure, vim.log.levels.ERROR) end
   end)
