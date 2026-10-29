@@ -411,6 +411,7 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     );
     exchange.resume(0)?;
     let mut event = BackendEvent {
+        message: None,
         received_at_ms: None,
         address: Some(ProviderAddress {
             owner: None,
@@ -430,6 +431,11 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     event.kind = "assistant_message".into();
     event.text = Some("progress excluded".into());
     event.data = json!({"phase":"commentary"});
+    crate::turn::test_support::set_message(
+        &mut event,
+        "progress",
+        crate::backend::MessageRole::Commentary,
+    );
     exchange.observe_turn(&event, 1)?;
     exchange.append_input(
         crate::exchange::InputIntent::Steering,
@@ -438,10 +444,16 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     )?;
     event.text = Some("Final answer".into());
     event.data = json!({"phase":"final_answer"});
+    crate::turn::test_support::set_message(
+        &mut event,
+        "answer",
+        crate::backend::MessageRole::Response,
+    );
     exchange.observe_turn(&event, 3)?;
     event.text = None;
     event.data = Value::Null;
     event.kind = "tool".into();
+    event.message = None;
     let output = format!("{}NEEDLE\0{}", "x".repeat(15998), "\u{96ea}".repeat(20000));
     event.activity = Some(ToolActivity {
         id: "reused".into(),
@@ -449,7 +461,7 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
         title: "inspect".into(),
         output: Some(output.clone()),
         output_delta: false,
-        status: Some("completed".into()),
+        status: Some(crate::backend::ToolStatus::Succeeded),
         change: Default::default(),
     });
     exchange.observe_turn(&event, 4)?;

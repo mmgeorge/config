@@ -36,7 +36,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 53;
+const SESSION_FORMAT_VERSION: u32 = 54;
 const PREFERENCE_FORMAT_VERSION: u32 = 41;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.
@@ -1576,6 +1576,7 @@ mod test {
         };
         exchange.start_turn(address.clone(), 1)?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -1589,7 +1590,7 @@ mod test {
                 kind: ToolActivityKind::Command,
                 title: "read".into(),
                 output: None,
-                status: Some("inProgress".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: Default::default(),
                 output_delta: false,
             }),
@@ -1647,7 +1648,7 @@ mod test {
         );
         event.activity.as_mut().unwrap().output_delta = false;
         event.activity.as_mut().unwrap().output = Some("authoritative λ\n".into());
-        event.activity.as_mut().unwrap().status = Some("completed".into());
+        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
         exchange.observe_turn(&event, 4)?;
         store.connection.execute_batch("CREATE TRIGGER reject_chunk BEFORE INSERT ON tool_output_chunk BEGIN SELECT RAISE(ABORT,'storage failure'); END;")?;
         assert!(store.save_exchange(&exchange).is_err());

@@ -1,12 +1,12 @@
 use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
 use crate::backend::{
-    BackendEvent, BackendEventSink, BackendOutput, ChecklistStatus, ProviderChangeKind,
-    ProviderChangeSet, ProviderChecklistEntry, ProviderChecklistUpdate, ProviderFileChange,
-    ToolActivity, ToolActivityKind,
+    BackendEvent, BackendEventSink, BackendOutput, ChecklistStatus, MessageId, MessageRole,
+    MessageUpdate, ProviderChangeKind, ProviderChangeSet, ProviderChecklistEntry,
+    ProviderChecklistUpdate, ProviderFileChange, ProviderMessage, ToolActivity, ToolActivityKind,
 };
 use crate::session::ContextUsage;
 use github_copilot_sdk::SessionEvent;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// Normalizes stable Copilot SDK session events into the Harness interaction protocol.
 #[derive(Default)]
@@ -32,7 +32,19 @@ impl CopilotEventDecoder {
             publish(output.runtime.resolved_event(), output, event_sink).await;
         }
         match provider_event.event_type.as_str() {
+            "assistant.message_start" => {
+                self.publish_text(
+                    "assistant_message",
+                    None,
+                    provider_event,
+                    output,
+                    event_sink,
+                )
+                .await;
+            }
             "assistant.idle" | "session.idle" if provider_event.agent_id.is_none() => {
+                Self::classify_pending(output, event_sink, provider_event, MessageRole::Response)
+                    .await;
                 let unfinished = output
                     .event
                     .iter()
@@ -62,6 +74,7 @@ impl CopilotEventDecoder {
                 for address in unfinished {
                     publish(
                         BackendEvent {
+                            message: None,
                             received_at_ms: None,
                             address: Some(address),
                             turn_boundary: Some(crate::backend::TurnBoundary::Finished {
@@ -173,8 +186,18 @@ impl CopilotEventDecoder {
                 publish(event, output, event_sink).await;
             }
             "assistant.turn_start" | "assistant.turn_end" => {
+                if provider_event.event_type == "assistant.turn_end" {
+                    Self::classify_pending(
+                        output,
+                        event_sink,
+                        provider_event,
+                        MessageRole::Response,
+                    )
+                    .await;
+                }
                 publish(
                     BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: Some(
@@ -247,6 +270,15 @@ impl CopilotEventDecoder {
             | "tool.execution_partial_result"
             | "tool.execution_progress"
             | "tool.execution_complete" => {
+                if provider_event.event_type == "tool.execution_start" {
+                    Self::classify_pending(
+                        output,
+                        event_sink,
+                        provider_event,
+                        MessageRole::Commentary,
+                    )
+                    .await;
+                }
                 output.evidence.tool_called = true;
                 let mut activity = tool_activity(provider_event, output);
                 if let Some(activity) = activity.as_mut()
@@ -277,6 +309,7 @@ impl CopilotEventDecoder {
                 if let Some(activity) = activity {
                     publish(
                         BackendEvent {
+                            message: None,
                             received_at_ms: None,
                             address: None,
                             turn_boundary: None,
@@ -302,6 +335,7 @@ impl CopilotEventDecoder {
                     output.metrics.context_usage = Some(context_usage.clone());
                     publish(
                         BackendEvent {
+                            message: None,
                             received_at_ms: None,
                             address: None,
                             turn_boundary: None,
@@ -333,6 +367,7 @@ impl CopilotEventDecoder {
                     cumulative_total: None,
                 };
                 let mut event = BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -352,6 +387,7 @@ impl CopilotEventDecoder {
             "subagent.started" | "subagent.completed" | "subagent.failed" => {
                 publish(
                     BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,
@@ -403,6 +439,7 @@ impl CopilotEventDecoder {
         };
         publish(
             BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -427,39 +464,80 @@ impl CopilotEventDecoder {
         output: &mut BackendOutput,
         event_sink: Option<&BackendEventSink>,
     ) {
-        let Some(text) = text.filter(|text| !text.is_empty()) else {
-            return;
+        let data = serde_json::to_value(provider_event).unwrap_or(Value::Null);
+        let message = if matches!(kind, "assistant_message" | "reasoning_summary") {
+            let identity = if kind == "reasoning_summary" {
+                "reasoningId"
+            } else {
+                "messageId"
+            };
+            let Some(id) = provider_event.data.get(identity).and_then(Value::as_str) else {
+                publish(
+                    Self::error_event(format!(
+                        "Copilot {} omitted {identity}",
+                        provider_event.event_type
+                    )),
+                    output,
+                    event_sink,
+                )
+                .await;
+                return;
+            };
+            let address = provider_address(&data, output);
+            let previous = output.event.iter().rev().find_map(|event| {
+                let message = event.message.as_ref()?;
+                (message.id.0 == id && event.address == address)
+                    .then_some(message.role)
+                    .flatten()
+            });
+            let role = if kind == "reasoning_summary" {
+                Some(MessageRole::ThoughtSummary)
+            } else if let Some(phase) = provider_event.data.get("phase").and_then(Value::as_str) {
+                match MessageRole::from_phase(phase) {
+                    Ok(role) => Some(role),
+                    Err(error) => {
+                        publish(Self::error_event(error.to_string()), output, event_sink).await;
+                        return;
+                    }
+                }
+            } else if provider_event
+                .data
+                .get("toolRequests")
+                .and_then(Value::as_array)
+                .is_some_and(|requests| !requests.is_empty())
+            {
+                Some(MessageRole::Commentary)
+            } else {
+                previous
+            };
+            let update = match provider_event.event_type.as_str() {
+                "assistant.message_start" => MessageUpdate::Started,
+                "assistant.message" | "assistant.reasoning" => MessageUpdate::Completed {
+                    text: text.clone().unwrap_or_default(),
+                },
+                _ => MessageUpdate::Delta {
+                    text: text.clone().unwrap_or_default(),
+                },
+            };
+            Some(ProviderMessage {
+                id: MessageId(id.to_owned()),
+                role,
+                update,
+            })
+        } else {
+            if text.as_deref().is_none_or(str::is_empty) {
+                return;
+            }
+            None
         };
-        let mut data = serde_json::to_value(provider_event).unwrap_or(Value::Null);
-        if kind == "assistant_message" {
-            let final_answer = provider_event.event_type == "assistant.message"
-                && provider_event
-                    .data
-                    .get("toolRequests")
-                    .and_then(Value::as_array)
-                    .is_none_or(|requests| requests.is_empty());
-            data["phase"] = json!(if final_answer { "final" } else { "commentary" });
-        }
-        if let Some(id) = provider_event
-            .data
-            .get("reasoningId")
-            .and_then(Value::as_str)
-        {
-            data["provider_message_id"] = json!(id);
-        }
-        if matches!(
-            provider_event.event_type.as_str(),
-            "assistant.message" | "assistant.reasoning"
-        ) {
-            data["message_update"] = json!("snapshot");
-        }
         publish(
             BackendEvent {
+                message,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: kind.into(),
-                text: Some(text),
+                text,
                 data,
                 activity: None,
                 summary: None,
@@ -470,6 +548,92 @@ impl CopilotEventDecoder {
         )
         .await;
     }
+
+    fn error_event(text: String) -> BackendEvent {
+        BackendEvent {
+            message: None,
+            received_at_ms: None,
+            address: None,
+            turn_boundary: None,
+            kind: "error".into(),
+            text: Some(text),
+            data: Value::Null,
+            activity: None,
+            summary: None,
+            checklist_update: None,
+        }
+    }
+
+    async fn classify_pending(
+        output: &mut BackendOutput,
+        sink: Option<&BackendEventSink>,
+        provider_event: &SessionEvent,
+        last_role: MessageRole,
+    ) {
+        let thread = provider_event
+            .agent_id
+            .as_ref()
+            .or(output.backend_session_id.as_ref());
+        let target = provider_address(
+            &serde_json::to_value(provider_event).expect("SDK event is serializable"),
+            output,
+        );
+        let mut pending = Vec::new();
+        for event in &output.event {
+            let Some(message) = event.message.as_ref().filter(|message| {
+                message.role.is_none()
+                    && event.address.as_ref().map(|address| &address.thread_id) == thread
+                    && (matches!(
+                        provider_event.event_type.as_str(),
+                        "assistant.idle" | "session.idle"
+                    ) || event.address == target)
+            }) else {
+                continue;
+            };
+            if !pending.iter().any(
+                |(address, id): &(Option<crate::backend::ProviderAddress>, MessageId)| {
+                    address == &event.address && id == &message.id
+                },
+            ) {
+                pending.push((event.address.clone(), message.id.clone()));
+            }
+        }
+        let count = pending.len();
+        for (index, (address, id)) in pending.into_iter().enumerate() {
+            let role = if index + 1 == count {
+                last_role
+            } else {
+                MessageRole::Commentary
+            };
+            for event in &mut output.event {
+                if event.address == address
+                    && let Some(message) = &mut event.message
+                    && message.id == id
+                {
+                    message.role = Some(role);
+                }
+            }
+            let event = BackendEvent {
+                message: Some(ProviderMessage {
+                    id,
+                    role: Some(role),
+                    update: MessageUpdate::Classified,
+                }),
+                received_at_ms: None,
+                address,
+                turn_boundary: None,
+                kind: "assistant_message".into(),
+                text: None,
+                data: Value::Null,
+                activity: None,
+                summary: None,
+                checklist_update: None,
+            };
+            if let Some(sink) = sink {
+                let _ = sink.send_wait(event).await;
+            }
+        }
+    }
 }
 
 fn address_event(event: &mut BackendEvent, output: &BackendOutput) {
@@ -477,64 +641,69 @@ fn address_event(event: &mut BackendEvent, output: &BackendOutput) {
         return;
     }
     if event.address.is_none() {
-        let thread_id = event
-            .data
-            .get("agentId")
-            .or_else(|| event.data.get("agent_id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| output.backend_session_id.clone());
-        if let Some(thread_id) = thread_id {
-            let native_turn_id = event.data.pointer("/data/turnId").and_then(Value::as_str);
-            let turn_id = native_turn_id
-                .map(|native| {
-                    if let Some(interaction) = event
-                        .data
-                        .pointer("/data/interactionId")
-                        .and_then(Value::as_str)
-                    {
-                        return format!("{interaction}:{native}");
-                    }
-                    output
-                        .event
-                        .iter()
-                        .rev()
-                        .find(|previous| {
-                            previous.kind == "turn_started"
-                                && previous
-                                    .data
-                                    .pointer("/data/turnId")
-                                    .and_then(Value::as_str)
-                                    == Some(native)
-                                && previous
-                                    .address
-                                    .as_ref()
-                                    .is_some_and(|address| address.thread_id == thread_id)
-                        })
-                        .and_then(|previous| {
-                            previous
+        event.address = provider_address(&event.data, output);
+    }
+}
+
+fn provider_address(
+    data: &Value,
+    output: &BackendOutput,
+) -> Option<crate::backend::ProviderAddress> {
+    let thread_id = data
+        .get("agentId")
+        .or_else(|| data.get("agent_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| output.backend_session_id.clone());
+    if let Some(thread_id) = thread_id {
+        let native_turn_id = data.pointer("/data/turnId").and_then(Value::as_str);
+        let turn_id = native_turn_id
+            .map(|native| {
+                if let Some(interaction) =
+                    data.pointer("/data/interactionId").and_then(Value::as_str)
+                {
+                    return format!("{interaction}:{native}");
+                }
+                output
+                    .event
+                    .iter()
+                    .rev()
+                    .find(|previous| {
+                        previous.kind == "turn_started"
+                            && previous
+                                .data
+                                .pointer("/data/turnId")
+                                .and_then(Value::as_str)
+                                == Some(native)
+                            && previous
                                 .address
                                 .as_ref()
-                                .map(|address| address.turn_id.clone())
-                        })
-                        .unwrap_or_else(|| native.to_owned())
-                })
-                .or_else(|| {
-                    output.event.iter().rev().find_map(|previous| {
+                                .is_some_and(|address| address.thread_id == thread_id)
+                    })
+                    .and_then(|previous| {
                         previous
                             .address
                             .as_ref()
-                            .filter(|address| address.thread_id == thread_id)
                             .map(|address| address.turn_id.clone())
                     })
-                });
-            event.address = turn_id.map(|turn_id| crate::backend::ProviderAddress {
-                owner: None,
-                thread_id,
-                turn_id,
+                    .unwrap_or_else(|| native.to_owned())
+            })
+            .or_else(|| {
+                output.event.iter().rev().find_map(|previous| {
+                    previous
+                        .address
+                        .as_ref()
+                        .filter(|address| address.thread_id == thread_id)
+                        .map(|address| address.turn_id.clone())
+                })
             });
-        }
+        return turn_id.map(|turn_id| crate::backend::ProviderAddress {
+            owner: None,
+            thread_id,
+            turn_id,
+        });
     }
+    None
 }
 
 pub(super) fn session_error(event: &SessionEvent, session_id: Option<&str>) -> String {
@@ -622,13 +791,28 @@ async fn publish(
         && previous.message_id() == event.message_id()
         && previous.activity.is_none()
     {
-        if event.message_snapshot() {
+        let snapshot = event.message_snapshot();
+        if snapshot {
             previous.text = event.text;
         } else {
             previous
                 .text
                 .get_or_insert_with(String::new)
                 .push_str(event.text.as_deref().unwrap_or_default());
+        }
+        if let Some(message) = &mut previous.message {
+            message.role = event.message.as_ref().and_then(|message| message.role);
+            message.update = if snapshot {
+                MessageUpdate::Completed {
+                    text: previous.text.clone().unwrap_or_default(),
+                }
+            } else {
+                MessageUpdate::Delta {
+                    text: previous.text.clone().unwrap_or_default(),
+                }
+            };
+        } else {
+            previous.message = event.message;
         }
         previous.data = event.data;
         return;
@@ -645,9 +829,13 @@ fn merge_activity(previous: &mut BackendEvent, incoming: BackendEvent) {
     };
     // Background output can arrive after the tool has returned its final result.
     if matches!(
-        existing.status.as_deref(),
-        Some("completed" | "failed" | "denied")
-    ) && update.status.as_deref() == Some("in_progress")
+        existing.status,
+        Some(
+            crate::backend::ToolStatus::Succeeded
+                | crate::backend::ToolStatus::Failed
+                | crate::backend::ToolStatus::Denied
+        )
+    ) && update.status == Some(crate::backend::ToolStatus::Running)
     {
         return;
     }
@@ -712,14 +900,14 @@ fn tool_activity(provider_event: &SessionEvent, output: &BackendOutput) -> Optio
         .and_then(|arguments| ToolActivity::call_title(&title, arguments))
         .unwrap_or(title);
     let (status, output, output_delta) = match provider_event.event_type.as_str() {
-        "tool.execution_start" => (Some("in_progress".into()), None, false),
+        "tool.execution_start" => (Some(crate::backend::ToolStatus::Running), None, false),
         "tool.execution_partial_result" => (
-            Some("in_progress".into()),
+            Some(crate::backend::ToolStatus::Running),
             string_field(data, &["partialOutput"]),
             true,
         ),
         "tool.execution_progress" => (
-            Some("in_progress".into()),
+            Some(crate::backend::ToolStatus::Running),
             string_field(data, &["progressMessage"]),
             false,
         ),
@@ -735,16 +923,13 @@ fn tool_activity(provider_event: &SessionEvent, output: &BackendOutput) -> Optio
                 .and_then(Value::as_str)
                 .map(strip_ansi_escapes::strip_str);
             (
-                Some(
-                    if success {
-                        "completed"
-                    } else if super::rejection::is_denied(data) {
-                        "denied"
-                    } else {
-                        "failed"
-                    }
-                    .into(),
-                ),
+                Some(if success {
+                    crate::backend::ToolStatus::Succeeded
+                } else if super::rejection::is_denied(data) {
+                    crate::backend::ToolStatus::Denied
+                } else {
+                    crate::backend::ToolStatus::Failed
+                }),
                 output,
                 false,
             )
@@ -898,8 +1083,11 @@ mod test {
         let mut address = Vec::new();
         for interaction in ["first-prompt", "second-prompt"] {
             let mut output = BackendOutput {
-                backend_session_id: Some("same-session".into()),
-                ..Default::default()
+                event: Vec::new(),
+                completion: crate::backend::BackendCompletion {
+                    backend_session_id: Some("same-session".into()),
+                    ..Default::default()
+                },
             };
             CopilotEventDecoder::default()
                 .decode(
@@ -956,6 +1144,191 @@ mod test {
     use serde_json::json;
 
     #[tokio::test]
+    async fn unphased_stream_resolves_before_turn_completion_without_duplicate_entries()
+    -> anyhow::Result<()> {
+        use crate::buffer::session::SessionPresentation;
+        use crate::exchange::Exchange;
+        use crate::timeline::TimelineEntry;
+        use forge_buffer::identity::{DocumentId, ViewId};
+        use forge_buffer::width::WidthProfile;
+
+        let decoder = CopilotEventDecoder::default();
+        let mut output = BackendOutput {
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("session".into()),
+                ..Default::default()
+            },
+        };
+        let (sink, mut stream) = crate::backend::events::channel();
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"exchange","session_id":"session","agent_id":"primary","ordinal":1,
+            "prompt":"Create a project","state":"running","created_at_ms":0,
+            "attributed_matches_checkpoint":false,"node_list":[]
+        }))?;
+        let entry = |exchange: &Exchange| TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange: Box::new(exchange.clone()),
+            agent_by_id: Default::default(),
+        };
+        let mut presentation = SessionPresentation::new("session".into());
+        presentation.initialize(vec![entry(&exchange)])?;
+        let document = DocumentId("unphased-stream".into());
+        let opened = presentation.open(
+            document.clone(),
+            ViewId("view".into()),
+            WidthProfile::default(),
+        )?;
+        for (index, (kind, data)) in [
+            ("assistant.turn_start", json!({"turnId":"turn"})),
+            ("assistant.message_start", json!({"messageId":"answer"})),
+            (
+                "assistant.message_delta",
+                json!({"messageId":"answer","deltaContent":"Visible draft"}),
+            ),
+            (
+                "assistant.message",
+                json!({"messageId":"answer","content":"Complete answer"}),
+            ),
+            ("assistant.turn_end", json!({"turnId":"turn"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            decoder
+                .decode(&event(kind, data), &mut output, Some(&sink))
+                .await;
+            while let Some(update) = stream.try_next()? {
+                assert!(exchange.observe_turn(&update, index as i64)?);
+                presentation.reconcile(vec![entry(&exchange)])?;
+            }
+            if kind == "assistant.message_delta" {
+                assert_eq!(exchange.turn[0].messages()[0].role(), None);
+                assert!(
+                    presentation
+                        .snapshot(&document)?
+                        .block
+                        .iter()
+                        .flat_map(|block| block.text.wire_rows())
+                        .any(|row| row.contains("Visible draft"))
+                );
+            }
+        }
+        let message = &exchange.turn[0].messages()[0];
+        assert_eq!(exchange.turn[0].messages().len(), 1);
+        assert_eq!(message.role(), Some(MessageRole::Response));
+        assert_eq!(message.state(), crate::turn::MessageState::Completed);
+        assert_eq!(message.text(), "Complete answer");
+        presentation.sync(&document, opened.transcript.revision)?;
+        assert_eq!(
+            presentation
+                .snapshot(&document)?
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .filter(|row| row.contains("Complete answer"))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_final_snapshot_keeps_one_transcript_block() -> anyhow::Result<()> {
+        use crate::buffer::session::SessionPresentation;
+        use crate::exchange::Exchange;
+        use crate::timeline::TimelineEntry;
+        use forge_buffer::identity::{DocumentId, ViewId};
+        use forge_buffer::width::WidthProfile;
+
+        let decoder = CopilotEventDecoder::default();
+        let mut output = BackendOutput {
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("session".into()),
+                ..Default::default()
+            },
+        };
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Create a Bevy project", "kind":"chat", "state":"running",
+            "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        for (kind, data) in [
+            ("assistant.turn_start", json!({"turnId":"turn"})),
+            (
+                "assistant.message_start",
+                json!({"messageId":"answer","phase":"final_answer"}),
+            ),
+            (
+                "assistant.message_delta",
+                json!({"messageId":"answer", "deltaContent":"Plan submitted for review."}),
+            ),
+        ] {
+            decoder.decode(&event(kind, data), &mut output, None).await;
+            assert!(exchange.observe_turn(output.event.last().unwrap(), 1)?);
+        }
+        let entry = |exchange: &Exchange| TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange: Box::new(exchange.clone()),
+            agent_by_id: Default::default(),
+        };
+        let mut presentation = SessionPresentation::new("session".into());
+        presentation.initialize(vec![entry(&exchange)])?;
+        let document = DocumentId("streamed-final".into());
+        let opened = presentation.open(
+            document.clone(),
+            ViewId("view".into()),
+            WidthProfile::default(),
+        )?;
+
+        decoder
+            .decode(
+                &event(
+                    "assistant.message",
+                    json!({"messageId":"answer", "content":"Plan submitted for review."}),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
+        assert!(exchange.observe_turn(output.event.last().unwrap(), 2)?);
+        assert_eq!(exchange.turn[0].messages().len(), 1);
+        assert_eq!(
+            exchange.turn[0].messages()[0].delivery(),
+            crate::turn::MessageDelivery::Final
+        );
+        presentation.reconcile(vec![entry(&exchange)])?;
+        let synchronized = presentation.sync(&document, opened.transcript.revision);
+        let mut reopened = SessionPresentation::new("session".into());
+        reopened.initialize(vec![entry(&exchange)])?;
+        let reconstructed = reopened.open(
+            DocumentId("reopened-final".into()),
+            ViewId("reopened-view".into()),
+            WidthProfile::default(),
+        );
+        assert!(
+            synchronized.is_ok() && reconstructed.is_ok(),
+            "final snapshot must remain renderable: sync={:?}, reopen={:?}",
+            synchronized.err(),
+            reconstructed.err()
+        );
+        let snapshot = presentation.snapshot(&document)?;
+        assert_eq!(
+            snapshot
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .filter(|row| row.contains("Plan submitted for review."))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn session_errors_retain_identity_code_and_missing_detail_diagnostics() {
         for data in [
             json!({"message":"quota exhausted","errorType":"quota"}),
@@ -964,8 +1337,11 @@ mod test {
         ] {
             let provider_event = event("session.error", data.clone());
             let mut output = BackendOutput {
-                backend_session_id: Some("native-session".into()),
-                ..Default::default()
+                event: Vec::new(),
+                completion: crate::backend::BackendCompletion {
+                    backend_session_id: Some("native-session".into()),
+                    ..Default::default()
+                },
             };
             CopilotEventDecoder::default()
                 .decode(&provider_event, &mut output, None)
@@ -993,8 +1369,11 @@ mod test {
     -> anyhow::Result<()> {
         let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
-            backend_session_id: Some("session".into()),
-            ..Default::default()
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("session".into()),
+                ..Default::default()
+            },
         };
         for provider_event in [
             event("assistant.turn_start", json!({"turnId":"turn"})),
@@ -1065,8 +1444,11 @@ mod test {
             workspace: "/Users/me/project".into(),
         };
         let mut output = BackendOutput {
-            backend_session_id: Some("root".into()),
-            ..Default::default()
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("root".into()),
+                ..Default::default()
+            },
         };
         let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
             "id":"patches", "session_id":"session", "agent_id":"primary", "ordinal":1,
@@ -1283,8 +1665,11 @@ mod test {
     async fn compaction_retains_summary_failure_and_identity_across_replays() {
         let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
-            backend_session_id: Some("root".into()),
-            ..Default::default()
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("root".into()),
+                ..Default::default()
+            },
         };
         let start = event(
             "session.compaction_start",
@@ -1343,7 +1728,25 @@ mod test {
         );
     }
 
-    fn event(event_type: &str, data: Value) -> SessionEvent {
+    fn event(event_type: &str, mut data: Value) -> SessionEvent {
+        if matches!(
+            event_type,
+            "assistant.message_delta" | "assistant.message" | "assistant.message_start"
+        ) {
+            data.as_object_mut()
+                .unwrap()
+                .entry("messageId")
+                .or_insert(json!("message"));
+        }
+        if matches!(
+            event_type,
+            "assistant.reasoning_delta" | "assistant.reasoning"
+        ) {
+            data.as_object_mut()
+                .unwrap()
+                .entry("reasoningId")
+                .or_insert(json!("reasoning"));
+        }
         SessionEvent {
             id: format!("{event_type}-id"),
             timestamp: "2026-07-16T00:00:00Z".into(),
@@ -1361,11 +1764,14 @@ mod test {
     async fn publishes_root_model_before_turn_and_ignores_child_model() {
         let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
-            runtime: crate::backend::BackendRuntime {
-                provider: "Copilot CLI".into(),
-                model: None,
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                runtime: crate::backend::BackendRuntime {
+                    provider: "Copilot CLI".into(),
+                    model: None,
+                },
+                ..Default::default()
             },
-            ..BackendOutput::default()
         };
         decoder
             .decode(
@@ -1397,8 +1803,11 @@ mod test {
     async fn reports_every_model_call_and_addresses_late_child_usage() {
         let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
-            backend_session_id: Some("parent".into()),
-            ..BackendOutput::default()
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("parent".into()),
+                ..Default::default()
+            },
         };
         decoder
             .decode(
@@ -1445,8 +1854,11 @@ mod test {
     async fn retains_tool_identity_across_turns_and_ignores_late_background_output() {
         let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
-            backend_session_id: Some("session".into()),
-            ..BackendOutput::default()
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("session".into()),
+                ..Default::default()
+            },
         };
         for (kind, data) in [
             ("assistant.turn_start", json!({"turnId":"one"})),
@@ -1539,8 +1951,11 @@ mod test {
     async fn normalizes_provider_turn_boundaries_without_counting_context_as_usage() {
         let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
-            backend_session_id: Some("session".into()),
-            ..BackendOutput::default()
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("session".into()),
+                ..Default::default()
+            },
         };
         decoder
             .decode(
@@ -1623,7 +2038,15 @@ mod test {
                 None,
             )
             .await;
-        assert_eq!(output.metrics.context_usage.unwrap().remaining_percent, 80);
+        assert_eq!(
+            output
+                .completion
+                .metrics
+                .context_usage
+                .unwrap()
+                .remaining_percent,
+            80
+        );
         assert!(output.event[1].checklist_update.as_ref().unwrap().complete);
         let lifecycle: AgentLifecycleEvent =
             serde_json::from_value(output.event[2].data.clone()).unwrap();

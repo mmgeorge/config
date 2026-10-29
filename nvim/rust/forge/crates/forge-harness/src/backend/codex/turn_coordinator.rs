@@ -875,6 +875,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         if let Some(event_sink) = self.event_sink.as_ref() {
             let _ = event_sink
                 .send_wait(BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -1305,8 +1306,11 @@ mod test {
         let lane = crate::backend::steering::SteeringLane::default();
         let mut steering = lane.activate(None)?;
         let mut output = BackendOutput {
-            backend_session_id: Some("parent".into()),
-            ..Default::default()
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("parent".into()),
+                ..Default::default()
+            },
         };
         let observed = vec![
             json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn","status":"inProgress"}}}),
@@ -1471,8 +1475,11 @@ mod test {
                 None
             };
             let mut output = BackendOutput {
-                backend_session_id: Some("parent".into()),
-                ..Default::default()
+                event: Vec::new(),
+                completion: crate::backend::BackendCompletion {
+                    backend_session_id: Some("parent".into()),
+                    ..Default::default()
+                },
             };
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),

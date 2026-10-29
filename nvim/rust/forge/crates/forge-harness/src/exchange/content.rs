@@ -1,5 +1,6 @@
 use super::{Exchange, ExchangeNode, InputIntent};
-use crate::turn::{MessageDelivery, MessageKind, ToolCall, ToolStore, TurnItem};
+use crate::backend::MessageRole;
+use crate::turn::{ToolCall, ToolStore, TurnItem};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,25 @@ pub struct ToolCounter {
 }
 
 impl Exchange {
+    pub(crate) fn commentary_is_eligible(&self, commentary: &Commentary) -> bool {
+        match &commentary.source {
+            CommentarySource::Initial { .. } => true,
+            CommentarySource::Provider {
+                turn_id,
+                message_id,
+            } => self
+                .turn
+                .iter()
+                .find(|turn| turn.id() == turn_id)
+                .and_then(|turn| {
+                    turn.messages()
+                        .iter()
+                        .find(|message| message.id() == message_id)
+                })
+                .is_some_and(|message| message.role() == Some(MessageRole::Commentary)),
+        }
+    }
+
     pub(crate) fn rebuild_tool_counter(&mut self) {
         let mut counter = ToolCounter::default();
         for (_, tool) in self.tools() {
@@ -121,6 +141,56 @@ impl Exchange {
         let previous_entry_count = self.entry.len();
         self.entry
             .retain(|entry| entry.anchor() == self.id || positions.contains_key(entry.anchor()));
+        self.entry.retain_mut(|entry| {
+            let Some(ExchangeNode::TurnContent {
+                turn_id,
+                item: TurnItem::Message { id: message_id },
+                ..
+            }) = self.node_list.iter().find(|node| node.id() == entry.id())
+            else {
+                return true;
+            };
+            let role = self
+                .turn
+                .iter()
+                .find(|turn| turn.id() == turn_id)
+                .and_then(|turn| {
+                    turn.messages()
+                        .iter()
+                        .find(|message| message.id() == message_id)
+                })
+                .and_then(|message| message.role());
+            if matches!(entry, ExchangeEntry::Commentary { commentary }
+                if !commentary.tool.is_empty() || !commentary.check.is_empty())
+            {
+                return true;
+            }
+            match role {
+                Some(MessageRole::Commentary) => {
+                    if !matches!(entry, ExchangeEntry::Commentary { .. }) {
+                        *entry = ExchangeEntry::Commentary {
+                            commentary: Commentary {
+                                id: entry.id().to_owned(),
+                                source: CommentarySource::Provider {
+                                    turn_id: turn_id.clone(),
+                                    message_id: message_id.clone(),
+                                },
+                                tool: Vec::new(),
+                                check: Vec::new(),
+                            },
+                        };
+                    }
+                    true
+                }
+                Some(MessageRole::Response) => {
+                    *entry = ExchangeEntry::Response {
+                        id: entry.id().to_owned(),
+                    };
+                    true
+                }
+                _ => false,
+            }
+        });
         if self.entry.len() != previous_entry_count {
             self.rebuild_tool_counter();
         }
@@ -149,12 +219,9 @@ impl Exchange {
                                 .find(|message| message.id() == message_id)
                         })
                         .context("entry references a missing provider message")?;
-                    if message.kind() != MessageKind::Assistant {
-                        continue;
-                    }
-                    if message.delivery() == MessageDelivery::Final {
+                    if message.role() == Some(MessageRole::Response) {
                         ExchangeEntry::Response { id: id.clone() }
-                    } else {
+                    } else if message.role() == Some(MessageRole::Commentary) {
                         ExchangeEntry::Commentary {
                             commentary: Commentary {
                                 id: id.clone(),
@@ -166,6 +233,8 @@ impl Exchange {
                                 check: Vec::new(),
                             },
                         }
+                    } else {
+                        continue;
                     }
                 }
                 ExchangeNode::TurnContent { .. } => continue,
@@ -231,7 +300,7 @@ impl Exchange {
             .map(ExchangeNode::id)
             .collect();
         let owner = self.entry.iter().rposition(|entry| {
-            matches!(entry, ExchangeEntry::Commentary { .. })
+            matches!(entry, ExchangeEntry::Commentary { commentary } if self.commentary_is_eligible(commentary))
                 && (entry.anchor() == self.id || anchors.contains(entry.anchor()))
         });
         let owner = owner.unwrap_or_else(|| {
@@ -366,10 +435,17 @@ impl Exchange {
                                         | ExchangeNode::ExchangeInput { .. }
                                 )
                         }),
-                        _ => true,
+                        ExchangeEntry::Commentary { commentary } => self.commentary_is_eligible(commentary)
+                            || matches!(&commentary.source, CommentarySource::Provider { turn_id, message_id }
+                                if self.turn.iter().find(|turn| turn.id() == turn_id)
+                                    .and_then(|turn| turn.messages().iter().find(|message| message.id() == message_id))
+                                    .is_some_and(|message| message.role() == Some(MessageRole::Response))),
+                        ExchangeEntry::Response { .. } => true,
                     }
             });
-            if let Some((owner, ExchangeEntry::Commentary { .. })) = candidate {
+            if let Some((owner, ExchangeEntry::Commentary { commentary })) = candidate
+                && self.commentary_is_eligible(commentary)
+            {
                 owner
             } else {
                 self.entry.push(ExchangeEntry::Commentary {
@@ -472,6 +548,118 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn typed_classification_preserves_activity_without_duplicate_message_blocks() -> Result<()> {
+        use crate::backend::{MessageId, MessageUpdate, ProviderMessage};
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"classification", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Work", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        let address = ProviderAddress {
+            owner: None,
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        exchange.start_turn(address.clone(), 0)?;
+        let mut event = BackendEvent {
+            message: Some(ProviderMessage {
+                id: MessageId("answer".into()),
+                role: None,
+                update: MessageUpdate::Delta {
+                    text: "Canonical answer".into(),
+                },
+            }),
+            received_at_ms: None,
+            address: Some(address),
+            turn_boundary: None,
+            kind: "not_a_message_hint".into(),
+            text: Some("Noncanonical mirror".into()),
+            data: json!({"phase":"commentary","params":{"itemId":"wrong"}}),
+            activity: None,
+            summary: None,
+            checklist_update: None,
+        };
+        exchange.observe_turn(&event, 1)?;
+        assert!(exchange.entry.is_empty());
+        event.message.as_mut().unwrap().role = Some(MessageRole::Commentary);
+        event.message.as_mut().unwrap().update = MessageUpdate::Classified;
+        exchange.observe_turn(&event, 2)?;
+        let mut tool = event.clone();
+        tool.message = None;
+        tool.activity = Some(ToolActivity {
+            id: "original".into(),
+            title: "inspect".into(),
+            kind: ToolActivityKind::Command,
+            output: None,
+            output_delta: false,
+            status: Some(crate::backend::ToolStatus::Running),
+            change: Default::default(),
+        });
+        exchange.observe_turn(&tool, 3)?;
+        let provider_owner = exchange.entry[0].id().to_owned();
+        event.message.as_mut().unwrap().role = Some(MessageRole::Response);
+        event.message.as_mut().unwrap().update = MessageUpdate::Completed {
+            text: "Canonical final answer".into(),
+        };
+        exchange.observe_turn(&event, 4)?;
+        exchange.observe_turn(&event, 5)?;
+        let mut restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
+        assert_eq!(restored.turn[0].messages().len(), 1);
+        assert_eq!(
+            restored.turn[0].messages()[0].role(),
+            Some(MessageRole::Response)
+        );
+        tool.activity.as_mut().unwrap().id = "later".into();
+        restored.observe_turn(&tool, 6)?;
+        let original = restored
+            .entry
+            .iter()
+            .find(|entry| entry.id() == provider_owner)
+            .unwrap();
+        assert!(matches!(original, ExchangeEntry::Commentary { commentary }
+            if commentary.tool[0].store.get("original").is_some()
+            && commentary.tool[0].store.get("later").is_none()));
+        assert_eq!(restored.tool_counter.total, 2);
+        let rendered = crate::buffer::projection::project(
+            crate::buffer::projection::ProjectionSource::Exchange(&restored),
+            &Default::default(),
+            false,
+            &Default::default(),
+            &Default::default(),
+            &mut Default::default(),
+        )?;
+        assert_eq!(
+            rendered
+                .entry
+                .block
+                .iter()
+                .filter(|block| block
+                    .text
+                    .wire_rows()
+                    .join("")
+                    .contains("Canonical final answer"))
+                .count(),
+            1
+        );
+        assert!(!rendered.entry.block.iter().any(|block| {
+            block
+                .text
+                .wire_rows()
+                .join("")
+                .contains("Noncanonical mirror")
+        }));
+        let mut block_id = std::collections::HashSet::new();
+        assert!(
+            rendered
+                .entry
+                .block
+                .iter()
+                .all(|block| block_id.insert(&block.id))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn initial_commentary_owns_tools_once_across_steering_reload_and_late_updates() -> Result<()> {
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"ownership", "session_id":"session", "agent_id":"primary", "ordinal":1,
@@ -485,6 +673,7 @@ mod tests {
         };
         exchange.start_turn(address.clone(), 0)?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -497,7 +686,7 @@ mod tests {
                 kind: ToolActivityKind::Command,
                 output: None,
                 output_delta: false,
-                status: Some("running".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: Default::default(),
             }),
             summary: None,
@@ -518,8 +707,10 @@ mod tests {
         event.activity = None;
         event.text = Some("Now check results".into());
         event.data = json!({"provider_message_id":"commentary", "phase":"commentary"});
+        crate::turn::test_support::set_message(&mut event, "commentary", MessageRole::Commentary);
         exchange.observe_turn(&event, 4)?;
         event.kind = "tool".into();
+        event.message = None;
         event.text = None;
         event.data = json!(null);
         event.activity = Some(ToolActivity {
@@ -528,7 +719,7 @@ mod tests {
             kind: ToolActivityKind::Command,
             output: Some("complete".into()),
             output_delta: false,
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: Default::default(),
         });
         exchange.observe_turn(&event, 5)?;
@@ -595,7 +786,7 @@ mod tests {
                 .all(|fold| fold.end.block != steering.id)
         );
         event.activity.as_mut().unwrap().id = "failed-call".into();
-        event.activity.as_mut().unwrap().status = Some("failed".into());
+        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Failed);
         exchange.observe_turn(&event, 7)?;
         exchange.observe_turn(&event, 8)?;
         assert_eq!(exchange.tool_counter.total, 3);

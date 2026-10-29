@@ -108,6 +108,7 @@ impl AcpChildren {
             status: state,
         };
         let lifecycle = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,
@@ -119,6 +120,7 @@ impl AcpChildren {
             checklist_update: None,
         };
         let boundary = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: Some(boundary),
@@ -176,6 +178,7 @@ impl AcpChildren {
         let mut events = Vec::new();
         for (_, id, child) in pending {
             events.push(BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(child.address.clone()),
                 turn_boundary: Some(TurnBoundary::Finished {
@@ -189,6 +192,7 @@ impl AcpChildren {
                 checklist_update: None,
             });
             events.push(BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -269,6 +273,7 @@ mod test {
         assert!(lifecycle.starts_child);
         assert_eq!(lifecycle.provider_thread_id.as_deref(), Some("child"));
         let mut content = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,

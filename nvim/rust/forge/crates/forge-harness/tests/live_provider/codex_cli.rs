@@ -166,8 +166,9 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
                 "What is this repo? Answer in one sentence after reading README.md.",
             )
         },
-        Some(answer_event_sink),
+        answer_event_sink,
     ));
+    let mut answer_events = Vec::new();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             tokio::select! {
@@ -179,16 +180,40 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
                     if event.kind == "assistant_message"
                         && event.text.as_deref().is_some_and(|text| !text.trim().is_empty())
                     {
+                        answer_events.push(event);
                         break;
                     }
+                    answer_events.push(event);
                 }
             }
         }
     })
     .await
     .expect("Codex did not stream assistant output within 30 seconds");
-    let answered = answer_future.await.unwrap();
-    assert!(answered.event.iter().any(|event| {
+    let answered = tokio::time::timeout(Duration::from_secs(90), async {
+        let mut stream_open = true;
+        loop {
+            tokio::select! {
+                output = &mut answer_future => break output.unwrap(),
+                event = answer_event_stream.recv(), if stream_open => {
+                    if let Some(event) = event.expect("event delivery failed") {
+                        answer_events.push(event);
+                    } else {
+                        stream_open = false;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("Codex response did not complete within 90 seconds");
+    while let Some(event) = answer_event_stream
+        .try_next()
+        .expect("final event delivery failed")
+    {
+        answer_events.push(event);
+    }
+    assert!(answer_events.iter().any(|event| {
         event.kind == "assistant_message"
             && event
                 .text
@@ -204,7 +229,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
             .is_some_and(|model| model != "default" && !model.is_empty())
     );
     assert!(
-        answered.event.iter().any(|event| event.kind == "usage"
+        answer_events.iter().any(|event| event.kind == "usage"
             && event
                 .data
                 .pointer("/usage/output")
@@ -267,7 +292,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let (event_sink, mut event_stream) = forge_harness::backend::events::channel();
     let executed = tokio::time::timeout(
         Duration::from_secs(90),
-        backend.prompt_stream(execute.clone(), Some(event_sink)),
+        backend.prompt_stream(execute.clone(), event_sink),
     )
     .await
     .expect("Codex execution prompt timed out after provider-side completion")

@@ -17,6 +17,7 @@ fn output_exchange(text: &str) -> Result<(Exchange, BackendEvent)> {
     };
     exchange.start_turn(address.clone(), 1)?;
     let event = BackendEvent {
+        message: None,
         received_at_ms: None,
         address: Some(address),
         turn_boundary: None,
@@ -30,7 +31,7 @@ fn output_exchange(text: &str) -> Result<(Exchange, BackendEvent)> {
             kind: ToolActivityKind::Command,
             title: "read".into(),
             output: Some(text.into()),
-            status: Some("inProgress".into()),
+            status: Some(crate::backend::ToolStatus::Running),
             change: Default::default(),
             output_delta: false,
         }),

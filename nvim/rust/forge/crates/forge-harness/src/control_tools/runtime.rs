@@ -783,7 +783,7 @@ mod test {
         assert!(serialized.get("task_permit").is_none());
         let mut output = BackendOutput::default();
         apply_invocation(&accepted, &mut output).unwrap();
-        let permit = output.goal_control.unwrap().permit;
+        let permit = output.completion.goal_control.unwrap().permit;
         permit.validate(Some(&goal)).unwrap();
         let replacement = controller
             .change(
@@ -807,7 +807,7 @@ mod test {
                     exchange_ordinal: 1,
                     turn_ordinal: 1,
                 },
-                output.evidence,
+                output.completion.evidence,
                 5,
             )
             .unwrap_err();
@@ -1161,11 +1161,11 @@ mod test {
         );
         let accepted = runtime.invoke(submit(2)).await.unwrap();
         apply_invocation(&accepted.invocation.unwrap(), &mut output).unwrap();
-        let submission = output.plan_submit.unwrap();
+        let submission = output.completion.plan_submit.unwrap();
         assert_eq!(submission.expected_version, 2);
         assert!(!runtime.terminal);
         let mut replayed = initial;
-        for patch in output.design_patch {
+        for patch in output.completion.design_patch {
             replayed = replayed.patch_design(&workspace, patch).unwrap();
         }
         let files = crate::plan::PlanFileStore::new(workspace.join("data"), &workspace);

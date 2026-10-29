@@ -92,12 +92,109 @@ impl AcpSessionState {
         if !self.children.lock().await.route(session_id, &mut event) {
             return Ok(());
         }
+        if matches!(event.kind.as_str(), "assistant_message" | "reasoning") {
+            let output = self.output.lock().await;
+            let previous = output
+                .event
+                .iter()
+                .rev()
+                .find(|previous| previous.address == event.address);
+            let id = previous
+                .filter(|previous| previous.kind == event.kind)
+                .and_then(|previous| previous.message_id())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{session_id}:message:{}", output.event.len()));
+            event.message = Some(ProviderMessage {
+                id: MessageId(id),
+                role: (event.kind == "reasoning").then_some(MessageRole::Thought),
+                update: MessageUpdate::Delta {
+                    text: event.text.clone().unwrap_or_default(),
+                },
+            });
+        }
+        if event.activity.is_some() {
+            self.classify_messages(event.address.as_ref(), MessageRole::Commentary)
+                .await?;
+        }
         self.emit(event).await
     }
 
+    async fn classify_messages(
+        &self,
+        address: Option<&ProviderAddress>,
+        last_role: MessageRole,
+    ) -> Result<()> {
+        let updates = {
+            let mut output = self.output.lock().await;
+            let mut pending = Vec::new();
+            for event in &output.event {
+                if event.address.as_ref() == address
+                    && let Some(message) = event.message.as_ref()
+                    && message.role.is_none()
+                    && !pending.contains(&message.id)
+                {
+                    pending.push(message.id.clone());
+                }
+            }
+            let count = pending.len();
+            pending
+                .into_iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    let role = if index + 1 == count {
+                        last_role
+                    } else {
+                        MessageRole::Commentary
+                    };
+                    for event in &mut output.event {
+                        if event.address.as_ref() == address
+                            && let Some(message) = &mut event.message
+                            && message.id == id
+                        {
+                            message.role = Some(role);
+                        }
+                    }
+                    BackendEvent {
+                        message: Some(ProviderMessage {
+                            id,
+                            role: Some(role),
+                            update: MessageUpdate::Classified,
+                        }),
+                        received_at_ms: None,
+                        address: address.cloned(),
+                        turn_boundary: None,
+                        kind: "assistant_message".into(),
+                        text: None,
+                        data: Value::Null,
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for update in updates {
+            self.emit(update).await?;
+        }
+        Ok(())
+    }
+
     /// Close observed children and release callback state even when delivery fails.
-    pub(super) async fn finish(&self) -> Result<()> {
+    pub(super) async fn finish(&self, outcome: crate::turn::TurnOutcome) -> Result<()> {
         let result = async {
+            let addresses = {
+                let output = self.output.lock().await;
+                let mut addresses = Vec::new();
+                for event in &output.event {
+                    if event.message.is_some() && !addresses.contains(&event.address) {
+                        addresses.push(event.address.clone());
+                    }
+                }
+                addresses
+            };
+            for address in addresses {
+                self.finish_messages(address.as_ref(), outcome).await?;
+            }
             let events = self.children.lock().await.finish()?;
             for event in events {
                 self.emit(event).await?;
@@ -109,6 +206,83 @@ impl AcpSessionState {
         *self.active.write().await = None;
         self.tool.lock().await.clear();
         result
+    }
+
+    async fn finish_messages(
+        &self,
+        address: Option<&ProviderAddress>,
+        outcome: crate::turn::TurnOutcome,
+    ) -> Result<()> {
+        if outcome == crate::turn::TurnOutcome::Completed {
+            self.classify_messages(address, MessageRole::Response)
+                .await?;
+        }
+        let updates = {
+            let output = self.output.lock().await;
+            let mut messages: Vec<ProviderMessage> = Vec::new();
+            for event in &output.event {
+                if event.address.as_ref() != address {
+                    continue;
+                }
+                let Some(message) = &event.message else {
+                    continue;
+                };
+                let index = messages
+                    .iter()
+                    .position(|previous| previous.id == message.id)
+                    .unwrap_or_else(|| {
+                        messages.push(ProviderMessage {
+                            id: message.id.clone(),
+                            role: message.role,
+                            update: MessageUpdate::Delta {
+                                text: String::new(),
+                            },
+                        });
+                        messages.len() - 1
+                    });
+                let previous = &mut messages[index];
+                previous.role = message.role.or(previous.role);
+                match (&mut previous.update, &message.update) {
+                    (MessageUpdate::Delta { text }, MessageUpdate::Delta { text: delta }) => {
+                        text.push_str(delta)
+                    }
+                    (_, MessageUpdate::Completed { .. } | MessageUpdate::Interrupted) => {
+                        previous.update = message.update.clone()
+                    }
+                    _ => {}
+                }
+            }
+            messages
+                .into_iter()
+                .filter_map(|mut message| {
+                    let MessageUpdate::Delta { text } = message.update else {
+                        return None;
+                    };
+                    message.update = if outcome == crate::turn::TurnOutcome::Completed {
+                        MessageUpdate::Completed { text }
+                    } else {
+                        MessageUpdate::Interrupted
+                    };
+                    let text = message.text().map(str::to_owned);
+                    Some(BackendEvent {
+                        message: Some(message),
+                        received_at_ms: None,
+                        address: address.cloned(),
+                        turn_boundary: None,
+                        kind: "assistant_message".into(),
+                        text,
+                        data: Value::Null,
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for update in updates {
+            self.emit(update).await?;
+        }
+        Ok(())
     }
 
     /// Revoke callback authority before collecting an active tool without its runtime lock.
@@ -328,6 +502,10 @@ impl AcpHandler for AcpSessionState {
         let lifecycle = self.children.lock().await.lifecycle(session_id, update)?;
         if let Some(events) = lifecycle {
             for event in events {
+                if let Some(TurnBoundary::Finished { outcome }) = event.turn_boundary {
+                    self.finish_messages(event.address.as_ref(), outcome)
+                        .await?;
+                }
                 self.emit(event).await?;
             }
             return Ok(());
@@ -390,7 +568,7 @@ impl AcpHandler for AcpSessionState {
                     },
                     title: update["title"].as_str().unwrap_or("Tool").into(),
                     output: tool_output(update)?,
-                    status: Some(status.into()),
+                    status: Some(ToolStatus::parse(status)?),
                     change: file_changes(update),
                     output_delta: false,
                 });
@@ -637,6 +815,7 @@ async fn ensure_active(active: &RwLock<Option<ActiveTurn>>) -> Result<()> {
 
 fn event(kind: &str, text: Option<String>, data: Value) -> BackendEvent {
     BackendEvent {
+        message: None,
         kind: kind.into(),
         text,
         data,
@@ -652,6 +831,51 @@ fn event(kind: &str, text: Option<String>, data: Value) -> BackendEvent {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[tokio::test]
+    async fn message_chunks_complete_with_one_identity_and_preserve_interruption() -> Result<()> {
+        for outcome in [
+            crate::turn::TurnOutcome::Completed,
+            crate::turn::TurnOutcome::Cancelled,
+        ] {
+            let fixture = tempfile::tempdir()?;
+            let state = AcpSessionState::new(
+                BackendKind::Claude,
+                PermissionCoordinator::transient(fixture.path())?,
+            );
+            let (sink, mut stream) = crate::backend::events::channel();
+            *state.active.write().await = Some(ActiveTurn {
+                task_authority: None,
+                owner: ExecutionOwner::root("test"),
+                mode: ApprovalMode::Ask,
+                sink: Some(sink),
+            });
+            for text in ["First ", "answer"] {
+                state.notification("session/update", json!({"update":{
+                    "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}
+                }})).await?;
+            }
+            state.finish(outcome).await?;
+            let mut messages = Vec::new();
+            while let Some(update) = stream.try_next()? {
+                if let Some(message) = update.message {
+                    messages.push(message);
+                }
+            }
+            assert!(messages.iter().all(|message| message.id == messages[0].id));
+            let last = messages.last().unwrap();
+            if outcome == crate::turn::TurnOutcome::Completed {
+                assert_eq!(last.role, Some(MessageRole::Response));
+                assert!(
+                    matches!(&last.update, MessageUpdate::Completed { text } if text == "First answer")
+                );
+            } else {
+                assert_eq!(last.role, None);
+                assert!(matches!(last.update, MessageUpdate::Interrupted));
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn cleanup_cancels_tool_waits_for_both_acp_providers() -> Result<()> {
@@ -832,7 +1056,7 @@ mod test {
                 .await
                 .is_err()
         );
-        state.finish().await?;
+        state.finish(crate::turn::TurnOutcome::Completed).await?;
         assert!(state.active.read().await.is_none());
         let output = state.output.lock().await;
         assert_eq!(output.event.last().unwrap().data["status"], "interrupted");
@@ -1147,7 +1371,7 @@ mod test {
                 .await
                 .contains_key(&("other".into(), "edit".into()))
         );
-        state.finish().await?;
+        state.finish(crate::turn::TurnOutcome::Completed).await?;
         assert!(state.tool.lock().await.is_empty());
         Ok(())
     }

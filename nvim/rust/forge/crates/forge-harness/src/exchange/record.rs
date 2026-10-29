@@ -559,24 +559,8 @@ impl Exchange {
                     });
                     turn.admit_tool(&tool.id)?;
                 }
-                if let Some(text) = event.text.as_deref() {
-                    let kind = match event.kind.as_str() {
-                        "assistant_message" => Some(crate::turn::MessageKind::Assistant),
-                        "reasoning" => Some(crate::turn::MessageKind::Reasoning),
-                        "reasoning_summary" => Some(crate::turn::MessageKind::ReasoningSummary),
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
-                        let provider_id = event.message_id().map(str::to_owned);
-                        let delivery = backend_message_delivery(event.message_phase(), kind);
-                        turn.record_provider_text(
-                            kind,
-                            text,
-                            provider_id,
-                            delivery,
-                            event.message_snapshot(),
-                        )?;
-                    }
+                if let Some(message) = &event.message {
+                    turn.record_message(message)?;
                 }
                 let turn_id = turn.id().to_owned();
                 for item in turn.items()[item_count..].iter().cloned() {
@@ -1033,22 +1017,6 @@ impl Exchange {
     }
 }
 
-fn backend_message_delivery(
-    phase: Option<&str>,
-    kind: crate::turn::MessageKind,
-) -> crate::turn::MessageDelivery {
-    if phase.is_some_and(|phase| phase.eq_ignore_ascii_case("commentary")) {
-        crate::turn::MessageDelivery::Commentary
-    } else if phase.is_some_and(|phase| {
-        phase.eq_ignore_ascii_case("final") || phase.eq_ignore_ascii_case("final_answer")
-    }) || kind == crate::turn::MessageKind::Assistant
-    {
-        crate::turn::MessageDelivery::Final
-    } else {
-        crate::turn::MessageDelivery::Commentary
-    }
-}
-
 /// Represents whether an interaction can still receive backend turns.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1208,6 +1176,7 @@ mod test {
             retry_at_ms: Some(2000),
         };
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address.clone()),
             turn_boundary: None,
@@ -1253,6 +1222,7 @@ mod test {
         };
         exchange.start_turn(address.clone(), 1000).unwrap();
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -1264,7 +1234,7 @@ mod test {
                 kind: ToolActivityKind::ToolCall,
                 title: "command".into(),
                 output: None,
-                status: Some("running".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: Default::default(),
                 output_delta: false,
             }),
@@ -1279,15 +1249,15 @@ mod test {
             Some(1000)
         );
         exchange.resume(90000).unwrap();
-        event.activity.as_mut().unwrap().status = Some("completed".into());
+        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
         exchange.observe_turn(&event, 92000).unwrap();
         assert_eq!(exchange.elapsed(93000), 5000);
         assert_eq!(exchange.metrics.response_ms(5000), Some(2000));
-        event.activity.as_mut().unwrap().status = Some("running".into());
+        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Running);
         exchange.observe_turn(&event, 93000).unwrap();
         assert_eq!(exchange.metrics.response_ms(6000), Some(3000));
         event.activity.as_mut().unwrap().id = "missing-start".into();
-        event.activity.as_mut().unwrap().status = Some("completed".into());
+        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
         exchange.observe_turn(&event, 94000).unwrap();
         assert_eq!(exchange.metrics.response_ms(6000), None);
     }
@@ -1303,6 +1273,7 @@ mod test {
         };
         exchange.start_turn(address.clone(), 10).unwrap();
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -1313,17 +1284,34 @@ mod test {
             summary: None,
             checklist_update: None,
         };
+        crate::turn::test_support::set_message(
+            &mut event,
+            "one",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 11).unwrap();
         exchange
             .append_input(InputIntent::Steering, "Also tests".into(), 12)
             .unwrap();
         event.text = Some("Done".into());
         event.data = serde_json::json!({"params":{"itemId":"two","phase":"final_answer"}});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "two",
+            crate::backend::MessageRole::Response,
+        );
         exchange.observe_turn(&event, 13).unwrap();
         event.text = Some("Checking files.".into());
         event.data = serde_json::json!({"message_update":"snapshot", "params":{
             "item":{"id":"one","phase":"commentary"}
         }});
+        event.message = Some(crate::backend::ProviderMessage {
+            id: crate::backend::MessageId("one".into()),
+            role: Some(crate::backend::MessageRole::Commentary),
+            update: crate::backend::MessageUpdate::Completed {
+                text: "Checking files.".into(),
+            },
+        });
         exchange.observe_turn(&event, 14).unwrap();
         exchange.observe_turn(&event, 15).unwrap();
         assert_eq!(exchange.node_list.len(), 3);
@@ -1342,6 +1330,9 @@ mod test {
             .finish(crate::turn::TurnOutcome::Completed, 16)
             .unwrap();
         event.text = Some("Late correction".into());
+        event.message.as_mut().unwrap().update = crate::backend::MessageUpdate::Completed {
+            text: "Late correction".into(),
+        };
         assert!(!exchange.observe_turn(&event, 17).unwrap());
         assert_eq!(exchange.turn[0].messages()[0].text(), "Checking files.");
     }
@@ -1357,6 +1348,7 @@ mod test {
         };
         exchange.start_turn(address.clone(), 10).unwrap();
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -1367,10 +1359,20 @@ mod test {
             summary: None,
             checklist_update: None,
         };
+        crate::turn::test_support::set_message(
+            &mut event,
+            "reasoning:summary:0",
+            crate::backend::MessageRole::Thought,
+        );
         exchange.observe_turn(&event, 11).unwrap();
         event.kind = "reasoning".into();
         event.text = Some("private chain of thought".into());
         event.data = serde_json::json!({"params":{"itemId":"reasoning"}});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "reasoning",
+            crate::backend::MessageRole::Thought,
+        );
         exchange.observe_turn(&event, 12).unwrap();
 
         assert_eq!(
@@ -1449,6 +1451,7 @@ mod test {
             turn_id: "first".into(),
         };
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address.clone()),
             turn_boundary: Some(TurnBoundary::Started),
@@ -1466,6 +1469,11 @@ mod test {
         event.data = serde_json::json!({
             "params": { "item": { "id": "message-one", "phase": "commentary" } }
         });
+        crate::turn::test_support::set_message(
+            &mut event,
+            "message-one",
+            crate::backend::MessageRole::Commentary,
+        );
         assert!(exchange.observe_turn(&event, 10).unwrap());
         exchange
             .append_input(
@@ -1478,6 +1486,11 @@ mod test {
         event.data = serde_json::json!({
             "params": { "item": { "id": "message-two", "phase": "final_answer" } }
         });
+        crate::turn::test_support::set_message(
+            &mut event,
+            "message-two",
+            crate::backend::MessageRole::Response,
+        );
         assert!(exchange.observe_turn(&event, 11).unwrap());
         assert_eq!(exchange.turn[0].messages().len(), 2);
         assert_eq!(
@@ -1499,6 +1512,7 @@ mod test {
         );
         event.text = None;
         assert_eq!(exchange.turn.len(), 1);
+        event.message = None;
         let first_id = exchange.turn[0].id().to_owned();
         event.turn_boundary = None;
         event.activity = Some(crate::backend::ToolActivity {
@@ -1507,7 +1521,7 @@ mod test {
             title: "edit".into(),
             output: None,
             output_delta: false,
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: crate::backend::ProviderChangeSet {
                 file: vec![crate::backend::ProviderFileChange {
                     path: "owned.rs".into(),

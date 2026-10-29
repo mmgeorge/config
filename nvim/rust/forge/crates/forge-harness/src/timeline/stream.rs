@@ -116,18 +116,15 @@ impl TimelineStream {
         let Some(source) = exchange.turn.iter().find(|turn| turn.provider() == address) else {
             return Ok(None);
         };
-        let kind = match event.kind.as_str() {
-            "assistant_message" => crate::turn::MessageKind::Assistant,
-            "reasoning" => crate::turn::MessageKind::Reasoning,
-            "reasoning_summary" => crate::turn::MessageKind::ReasoningSummary,
-            _ => return Ok(None),
+        let Some(update) = &event.message else {
+            return Ok(None);
         };
-        let Some(message) = source.messages().iter().rev().find(|message| {
-            message.kind() == kind
-                && event
-                    .message_id()
-                    .is_none_or(|id| message.provider_id() == Some(id))
-        }) else {
+        let Some(message) = source
+            .messages()
+            .iter()
+            .rev()
+            .find(|message| message.provider_id() == Some(update.id.0.as_str()))
+        else {
             return Ok(None);
         };
         let entry_id = self.entry_list[index].id();
@@ -138,7 +135,7 @@ impl TimelineStream {
         if !target.turn.iter().any(|turn| {
             turn.provider() == address
                 && turn.messages().iter().any(|existing| {
-                    existing.id() == message.id() && existing.delivery() == message.delivery()
+                    existing.id() == message.id() && existing.role() == message.role()
                 })
         }) {
             return Ok(None);
@@ -1039,6 +1036,7 @@ mod test {
         };
         exchange.start_turn(address.clone(), 0)?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -1053,7 +1051,7 @@ mod test {
                 title: "file changes".into(),
                 output: None,
                 output_delta: false,
-                status: Some("running".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: Default::default(),
             }),
         };
@@ -1070,7 +1068,7 @@ mod test {
         let activity = event.activity.as_mut().unwrap();
         activity.output = Some("Patch context did not match".into());
         activity.output_delta = true;
-        activity.status = Some("failed".into());
+        activity.status = Some(crate::backend::ToolStatus::Failed);
         exchange.observe_turn(&event, 2)?;
         assert!(stream.append_tool_output(&exchange, &event)?.is_none());
         assert_eq!(stream.revision(), 1);

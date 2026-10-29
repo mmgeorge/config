@@ -42,6 +42,39 @@ The worker-stack regression test retains its one-megabyte limit.
 
 ## Backend contracts and ACP runtime
 
+`Backend::prompt_stream` requires an ordered event sink and returns
+`BackendCompletion`, which contains provider metadata and control results but no
+event history. `Backend::prompt` collects that same stream for non-streaming
+callers. The broker binds the sink to the admitted execution and drains accepted
+updates before settling that exchange. Provider turn completion does not admit a
+new Harness exchange or finish an exchange awaiting user input.
+
+`ProviderMessage` carries a scoped message identity, optional typed role, and
+`MessageUpdate`. Start, delta, complete snapshot, classification, and interruption
+update one message. A complete snapshot replaces its accumulated text. Thought,
+thought summary, commentary, and response are semantic roles rather than
+streaming states. Unclassified text remains visible without becoming a commentary
+owner. `ToolActivity` carries normalized tool kind, typed `ToolStatus`, output
+append/replacement semantics, and reported changes. Shared consumers never decode
+provider JSON to discover message identity, role, or snapshot semantics.
+
+Copilot consumes `assistant.message_start` metadata before deltas and reconciles
+the matching `assistant.message` snapshot. When no phase is supplied, tool
+admission resolves preceding unclassified text as commentary, and provider turn
+completion resolves the remaining last message as the response. Codex retains the
+phase from `item/started` for matching deltas and complete snapshots. ACP assigns
+message identities within its execution, classifies text at tool and execution
+boundaries, and completes accumulated text before publishing terminal execution
+events. Cancelled or failed ACP work interrupts messages instead.
+
+Adapters do not assign tools or Harness checks to commentary. `Exchange` captures
+each activity's owner at admission and retains that owner across later commentary,
+provider turns, and persistence. Tools without eligible commentary receive
+synthetic initial commentary. The renderer owns its display label. Message roles
+remain authoritative, and entry reconciliation cannot render a reclassified
+message twice. Current-format storage retains role and message lifecycle together.
+Older private session formats remain invisible rather than being migrated.
+
 Attachment objects resolve against the Harness data root during request admission and
 remain separate from `BackendInput` text. Provider adapters never discover attachments
 from text. Initial prompts, queued follow-ups, and steering use the same typed objects.

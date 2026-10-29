@@ -34,7 +34,10 @@ end
 local function close_review(review)
   if not review.owner.close() then notice("Plan review has an explicit operation in progress") return false end
   hide_review(review)
-  if session.harness.plan_review == review and not vim.bo[review.buf].modified then session.harness.plan_review = nil end
+  if session.harness.plan_review == review
+    and (not vim.api.nvim_buf_is_valid(review.buf) or not vim.bo[review.buf].modified) then
+    session.harness.plan_review = nil
+  end
   return true
 end
 

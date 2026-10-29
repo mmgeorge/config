@@ -272,7 +272,6 @@ def --wrapped co [...args] {
         # --disable-builtin-mcps
         # --allow-all-urls
         --add-dir '/Users/matt9222/Developer'
-        --add-dir '/Users/matt9222/datasets'
         --add-dir '/Users/matt9222/.cargo'
         --add-dir '/Users/matt9222/Developer/webgis/screenshots/'
         --add-dir '/Users/matt9222/config'

@@ -79,22 +79,32 @@ impl Backend for TaskStartEventBackend {
     async fn prompt_stream(
         &self,
         request: BackendRequest,
-        sink: Option<crate::backend::BackendEventSink>,
-    ) -> Result<crate::backend::BackendOutput> {
-        let sink = sink.context("task start fixture requires an event sink")?;
-        let start = crate::exchange::TaskStart {
-            kind: crate::task::TaskKind::Goal,
-            title: "Reduce startup time".into(),
-        };
-        let mut event =
-            BackendEvent::task_started(start, "Complete startup work.\nVerify the result.".into());
-        event.data["input_message_id"] = json!("task-entry");
-        sink.send_wait(event.clone()).await?;
-        if self.conflicting_replay {
-            event.text = Some("Conflicting instruction".into());
+        sink: crate::backend::BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion> {
+        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+            let sink = Some(sink);
+            let sink = sink.context("task start fixture requires an event sink")?;
+            let start = crate::exchange::TaskStart {
+                kind: crate::task::TaskKind::Goal,
+                title: "Reduce startup time".into(),
+            };
+            let mut event = BackendEvent::task_started(
+                start,
+                "Complete startup work.\nVerify the result.".into(),
+            );
+            event.data["input_message_id"] = json!("task-entry");
+            sink.send_wait(event.clone()).await?;
+            if self.conflicting_replay {
+                event.text = Some("Conflicting instruction".into());
+            }
+            sink.send_wait(event).await?;
+            self.inner
+                .prompt_stream(request, sink)
+                .await
+                .map(crate::backend::BackendCompletion::into_output)
         }
-        sink.send_wait(event).await?;
-        self.inner.prompt_stream(request, Some(sink)).await
+        .await;
+        Ok(output?.into_completion())
     }
 }
 
@@ -317,54 +327,67 @@ impl Backend for BoundarySteeringBackend {
     async fn prompt_stream(
         &self,
         request: BackendRequest,
-        sink: Option<crate::backend::BackendEventSink>,
-    ) -> Result<crate::backend::BackendOutput> {
-        let text = request.input.text();
-        self.input.lock().unwrap().push(text.clone());
-        let continuation = text == "boundary correction";
-        if continuation {
-            self.continuation_started.add_permits(1);
-            self.continuation_accept.acquire().await?.forget();
-        }
-        let submission = request
-            .submission
-            .as_ref()
-            .context("missing tracked submission")?;
-        submission.sending(crate::backend::submission::SubmissionTarget::Codex {
-            thread_id: "boundary-thread".into(),
-        })?;
-        submission.accepted("boundary provider receipt".into())?;
-        if continuation {
-            self.continuation_release.acquire().await?.forget();
-            if self
-                .fail_response
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                anyhow::bail!("Turn cancelled by user");
+        sink: crate::backend::BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion> {
+        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+            let sink = Some(sink);
+            let text = request.input.text();
+            self.input.lock().unwrap().push(text.clone());
+            let continuation = text == "boundary correction";
+            if continuation {
+                self.continuation_started.add_permits(1);
+                self.continuation_accept.acquire().await?.forget();
             }
-        } else {
-            self.initial_started.add_permits(1);
-            self.initial_release.acquire().await?.forget();
-        }
-        if let Some(sink) = sink {
-            sink.send_wait(BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "assistant_message".into(),
-                text: Some(format!("handled {text}")),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
+            let submission = request
+                .submission
+                .as_ref()
+                .context("missing tracked submission")?;
+            submission.sending(crate::backend::submission::SubmissionTarget::Codex {
+                thread_id: "boundary-thread".into(),
+            })?;
+            submission.accepted("boundary provider receipt".into())?;
+            if continuation {
+                self.continuation_release.acquire().await?.forget();
+                if self
+                    .fail_response
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    anyhow::bail!("Turn cancelled by user");
+                }
+            } else {
+                self.initial_started.add_permits(1);
+                self.initial_release.acquire().await?.forget();
+            }
+            if let Some(sink) = sink {
+                sink.send_wait(BackendEvent {
+                    message: Some(completed_message(
+                        "handled-response",
+                        crate::backend::MessageRole::Response,
+                        format!("handled {text}"),
+                    )),
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "assistant_message".into(),
+                    text: Some(format!("handled {text}")),
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    checklist_update: None,
+                })
+                .await?;
+            }
+            Ok(crate::backend::BackendOutput {
+                event: Vec::new(),
+                completion: crate::backend::BackendCompletion {
+                    backend_session_id: Some("boundary-thread".into()),
+                    capability: self.descriptor().capability,
+                    ..Default::default()
+                },
             })
-            .await?;
         }
-        Ok(crate::backend::BackendOutput {
-            backend_session_id: Some("boundary-thread".into()),
-            capability: self.descriptor().capability,
-            ..Default::default()
-        })
+        .await;
+        Ok(output?.into_completion())
     }
 }
 

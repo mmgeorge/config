@@ -2455,6 +2455,7 @@ impl HarnessBroker {
         let snapshot = self.snapshot()?;
         self.emit_backend_event(
             BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -2507,6 +2508,7 @@ impl HarnessBroker {
             }
             self.emit_backend_event(
                 BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -3201,6 +3203,7 @@ impl HarnessBroker {
                 if let Some(transition) = transition {
                     Box::pin(self.emit_backend_event(
                         BackendEvent {
+                            message: None,
                             received_at_ms: None,
                             address: None,
                             turn_boundary: None,
@@ -3241,6 +3244,7 @@ impl HarnessBroker {
         if let Some(transition) = transition {
             self.emit_backend_event(
                 BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -4707,6 +4711,7 @@ impl HarnessBroker {
             if let Some(reason) = &automatic.blocked {
                 self.emit_backend_event(
                     BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,
@@ -4790,6 +4795,7 @@ impl HarnessBroker {
         self.active_wait_projection = None;
         self.emit_live_interaction(
             BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -5150,44 +5156,62 @@ impl HarnessBroker {
                 .or(request.backend_session_id);
             aggregate = Some(if let Some(mut aggregate) = aggregate {
                 aggregate.event.extend(output.event.clone());
-                aggregate.backend_session_id = output
+                let output = output.completion;
+                aggregate.completion.backend_session_id = output
                     .backend_session_id
                     .clone()
-                    .or(aggregate.backend_session_id);
-                aggregate.provider_checkpoint_id = output
+                    .or(aggregate.completion.backend_session_id);
+                aggregate.completion.provider_checkpoint_id = output
                     .provider_checkpoint_id
-                    .or(aggregate.provider_checkpoint_id);
-                aggregate.plan_edit.extend(output.plan_edit);
-                aggregate.design_patch.extend(output.design_patch);
-                aggregate.plan_deviation.extend(output.plan_deviation);
-                aggregate.plan_task_report.extend(output.plan_task_report);
-                aggregate.plan_read = output.plan_read.or(aggregate.plan_read);
-                aggregate.question_answer = output.question_answer.or(aggregate.question_answer);
-                aggregate.question_withdrawal =
-                    output.question_withdrawal.or(aggregate.question_withdrawal);
-                aggregate.structured_plan |= output.structured_plan;
-                aggregate.evidence.workspace_changed |= output.evidence.workspace_changed;
-                aggregate.evidence.tool_called |= output.evidence.tool_called;
-                aggregate.evidence.native_state = output
+                    .or(aggregate.completion.provider_checkpoint_id);
+                aggregate.completion.plan_edit.extend(output.plan_edit);
+                aggregate
+                    .completion
+                    .design_patch
+                    .extend(output.design_patch);
+                aggregate
+                    .completion
+                    .plan_deviation
+                    .extend(output.plan_deviation);
+                aggregate
+                    .completion
+                    .plan_task_report
+                    .extend(output.plan_task_report);
+                aggregate.completion.plan_read =
+                    output.plan_read.or(aggregate.completion.plan_read);
+                aggregate.completion.question_answer = output
+                    .question_answer
+                    .or(aggregate.completion.question_answer);
+                aggregate.completion.question_withdrawal = output
+                    .question_withdrawal
+                    .or(aggregate.completion.question_withdrawal);
+                aggregate.completion.structured_plan |= output.structured_plan;
+                aggregate.completion.evidence.workspace_changed |=
+                    output.evidence.workspace_changed;
+                aggregate.completion.evidence.tool_called |= output.evidence.tool_called;
+                aggregate.completion.evidence.native_state = output
                     .evidence
                     .native_state
-                    .or(aggregate.evidence.native_state);
-                aggregate.evidence.structured_complete |= output.evidence.structured_complete;
-                aggregate.evidence.structured_blocked |= output.evidence.structured_blocked;
-                aggregate.goal_control = output.goal_control.or(aggregate.goal_control);
-                aggregate.metrics.context_usage = output
+                    .or(aggregate.completion.evidence.native_state);
+                aggregate.completion.evidence.structured_complete |=
+                    output.evidence.structured_complete;
+                aggregate.completion.evidence.structured_blocked |=
+                    output.evidence.structured_blocked;
+                aggregate.completion.goal_control =
+                    output.goal_control.or(aggregate.completion.goal_control);
+                aggregate.completion.metrics.context_usage = output
                     .metrics
                     .context_usage
-                    .or(aggregate.metrics.context_usage);
-                aggregate.metrics.native_compact_update = output
+                    .or(aggregate.completion.metrics.context_usage);
+                aggregate.completion.metrics.native_compact_update = output
                     .metrics
                     .native_compact_update
-                    .or(aggregate.metrics.native_compact_update);
-                aggregate.capability = output.capability;
-                aggregate.runtime = output.runtime.clone();
-                aggregate.plan_question = output.plan_question;
-                aggregate.plan_submit = output.plan_submit;
-                aggregate.control_error = output.control_error;
+                    .or(aggregate.completion.metrics.native_compact_update);
+                aggregate.completion.capability = output.capability;
+                aggregate.completion.runtime = output.runtime.clone();
+                aggregate.completion.plan_question = output.plan_question;
+                aggregate.completion.plan_submit = output.plan_submit;
+                aggregate.completion.control_error = output.control_error;
                 aggregate
             } else {
                 output
@@ -5332,6 +5356,7 @@ impl HarnessBroker {
             );
             self.emit_backend_event(
                 BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -5639,7 +5664,7 @@ impl HarnessBroker {
                                 Ok(progress) => {
                                     let patch = self.reconcile_live_interaction(Some(interaction), None)?;
                                     self.emit_timeline_patch(patch, event).await?;
-                                    self.emit_backend_event(BackendEvent {
+                                    self.emit_backend_event(BackendEvent { message: None,
             received_at_ms: None,
                                     address: None, turn_boundary: None, kind: "plan_execution_progress".into(), text: None,
                                     data: progress, activity: None, summary: None, checklist_update: None,
@@ -5809,6 +5834,7 @@ impl HarnessBroker {
                 self.exchange_runtime.take();
                 self.emit_live(
                     BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,
@@ -5828,6 +5854,7 @@ impl HarnessBroker {
             Err(error) => {
                 self.emit_live(
                     BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,
@@ -6130,6 +6157,7 @@ impl HarnessBroker {
                 self.session.active_task = self.task_controller.current()?;
                 self.emit_backend_event(
                     BackendEvent {
+                        message: None,
                         address: None,
                         turn_boundary: None,
                         received_at_ms: None,
@@ -6482,6 +6510,7 @@ impl HarnessBroker {
                 )?;
                 self.emit_live_interaction(
                     BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,
@@ -6520,6 +6549,7 @@ impl HarnessBroker {
                 self.store.save_exchange(interaction)?;
                 self.emit_live_interaction(
                     BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,
@@ -6599,6 +6629,7 @@ impl HarnessBroker {
                 self.store.save_exchange(interaction)?;
                 self.emit_live_interaction(
                     BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,
@@ -6855,6 +6886,7 @@ impl HarnessBroker {
         *interaction = continuation;
         self.emit_live_interaction(
             BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -6881,6 +6913,7 @@ impl HarnessBroker {
         self.active_wait_projection = runtime.active_wait.clone();
         self.emit_live_interaction(
             BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -6992,6 +7025,7 @@ impl HarnessBroker {
         if let Some(event_sink) = self.event_sink.as_ref() {
             let delivery = event_sink
                 .send_wait(BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -7159,6 +7193,7 @@ impl HarnessBroker {
             self.store.save_exchange(&previous)?;
             self.emit_live_interaction(
                 BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -8116,6 +8151,7 @@ impl HarnessBroker {
         };
         self.emit_backend_event(
             BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -8769,10 +8805,10 @@ impl HarnessBroker {
         self.capability = output.capability.clone();
         self.session.native_fork = output.capability.native_fork;
         self.session.native_compact = output.capability.native_compact;
-        if let Some(backend_session_id) = output.backend_session_id {
+        if let Some(backend_session_id) = output.completion.backend_session_id {
             self.session.backend_session_id = Some(backend_session_id);
         }
-        if let Some(context_usage) = output.metrics.context_usage {
+        if let Some(context_usage) = output.completion.metrics.context_usage {
             let size = self
                 .session
                 .context_usage
@@ -8780,11 +8816,11 @@ impl HarnessBroker {
                 .map_or(context_usage.size, |current| current.size);
             self.session.context_usage = ContextUsage::reported(context_usage.used, size);
         }
-        if !output.runtime.provider.is_empty() {
-            self.session.provider_label = output.runtime.provider;
+        if !output.completion.runtime.provider.is_empty() {
+            self.session.provider_label = output.completion.runtime.provider;
         }
-        if output.runtime.model.is_some() {
-            self.session.resolved_model = output.runtime.model;
+        if output.completion.runtime.model.is_some() {
+            self.session.resolved_model = output.completion.runtime.model;
         }
         self.save_session()?;
         let snapshot = self.snapshot()?;
@@ -8951,9 +8987,7 @@ fn admit_addressless_turn(
     event: &mut BackendEvent,
     now_ms: i64,
 ) -> Result<()> {
-    let owns_content = event.activity.is_some()
-        || matches!(event.kind.as_str(), "assistant_message" | "reasoning")
-            && event.text.as_deref().is_some_and(|text| !text.is_empty());
+    let owns_content = event.activity.is_some() || event.message.is_some();
     if event.address.is_some() || !owns_content {
         return Ok(());
     }
@@ -9112,6 +9146,18 @@ fn default_goal_max_turns() -> u32 {
 
 #[cfg(test)]
 mod test {
+    fn completed_message(
+        id: impl Into<String>,
+        role: crate::backend::MessageRole,
+        text: impl Into<String>,
+    ) -> crate::backend::ProviderMessage {
+        crate::backend::ProviderMessage {
+            id: crate::backend::MessageId(id.into()),
+            role: Some(role),
+            update: crate::backend::MessageUpdate::Completed { text: text.into() },
+        }
+    }
+
     fn active_execution(broker: &HarnessBroker) -> crate::plan::PlanExecutionRecord {
         match broker.task_controller.current().unwrap().unwrap().workflow {
             crate::task::TaskWorkflow::Execute { execution } => execution.record,
@@ -9184,87 +9230,108 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            if let Some(checkpoint) = request
-                .control_context
-                .as_ref()
-                .and_then(|context| context.checkpoint.as_ref())
-            {
-                checkpoint.wait().await?;
-            }
-            let turn = self.turns.fetch_add(1, Ordering::SeqCst);
-            if turn == 0 || self.repair {
-                std::fs::write(
-                    Path::new(&request.workspace).join("seed.txt"),
-                    if turn > 0 { "fixed" } else { "broken" },
-                )?;
-            }
-            if turn == 0 && self.explicit {
-                let context = request.control_context.as_ref().unwrap();
-                let advertised = crate::control_tools::ControlToolRegistry
-                    .definition_list_for_context(Some(context), true);
-                assert!(advertised.iter().any(|tool| tool.name == "check_run"));
-                assert!(
-                    !crate::control_tools::ControlToolRegistry
-                        .definition_list_for_context(Some(context), false)
-                        .iter()
-                        .any(|tool| tool.name.starts_with("check_"))
-                );
-                let scope = request
+            sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let sink = Some(sink);
+                if let Some(checkpoint) = request
                     .control_context
                     .as_ref()
-                    .unwrap()
-                    .checks
-                    .as_ref()
-                    .unwrap();
-                let started: Value = serde_json::from_str(
-                    &scope.invoke("check_run", json!({"check":"verify"})).await?,
-                )?;
-                loop {
-                    let run: Value = serde_json::from_str(
-                        &scope
-                            .invoke(
-                                "check_status",
-                                json!({"run_id":started["run_id"],"wait_ms":30000}),
-                            )
-                            .await?,
+                    .and_then(|context| context.checkpoint.as_ref())
+                {
+                    checkpoint.wait().await?;
+                }
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 || self.repair {
+                    std::fs::write(
+                        Path::new(&request.workspace).join("seed.txt"),
+                        if turn > 0 { "fixed" } else { "broken" },
                     )?;
-                    if run["state"] != "running" {
-                        break;
+                }
+                if turn == 0 && self.explicit {
+                    let context = request.control_context.as_ref().unwrap();
+                    let advertised = crate::control_tools::ControlToolRegistry
+                        .definition_list_for_context(Some(context), true);
+                    assert!(advertised.iter().any(|tool| tool.name == "check_run"));
+                    assert!(
+                        !crate::control_tools::ControlToolRegistry
+                            .definition_list_for_context(Some(context), false)
+                            .iter()
+                            .any(|tool| tool.name.starts_with("check_"))
+                    );
+                    let scope = request
+                        .control_context
+                        .as_ref()
+                        .unwrap()
+                        .checks
+                        .as_ref()
+                        .unwrap();
+                    let started: Value = serde_json::from_str(
+                        &scope.invoke("check_run", json!({"check":"verify"})).await?,
+                    )?;
+                    loop {
+                        let run: Value = serde_json::from_str(
+                            &scope
+                                .invoke(
+                                    "check_status",
+                                    json!({"run_id":started["run_id"],"wait_ms":30000}),
+                                )
+                                .await?,
+                        )?;
+                        if run["state"] != "running" {
+                            break;
+                        }
                     }
                 }
-            }
-            if let Some(sink) = sink {
-                let address = crate::backend::ProviderAddress {
-                    owner: Some(request.owner()?),
-                    thread_id: "automatic-check-stream".into(),
-                    turn_id: turn.to_string(),
-                };
-                for (kind, boundary, text) in [
-                    (
-                        "turn_started",
-                        Some(crate::backend::TurnBoundary::Started),
-                        None,
-                    ),
-                    ("assistant_message", None, Some("")),
-                    ("assistant_message", None, Some("Check repair response")),
-                    (
-                        "turn_completed",
-                        Some(crate::backend::TurnBoundary::Finished {
-                            outcome: crate::turn::TurnOutcome::Completed,
-                        }),
-                        None,
-                    ),
-                ] {
-                    sink.send_wait(BackendEvent {
-                        received_at_ms: None, address: Some(address.clone()), turn_boundary: boundary,
-                        kind: kind.into(), text: text.map(str::to_owned), data: json!({"provider_message_id":"repair-message","provider_message_phase":"commentary"}),
-                        activity: None, summary: None, checklist_update: None,
-                    }).await?;
+                if let Some(sink) = sink {
+                    let address = crate::backend::ProviderAddress {
+                        owner: Some(request.owner()?),
+                        thread_id: "automatic-check-stream".into(),
+                        turn_id: turn.to_string(),
+                    };
+                    for (kind, boundary, text) in [
+                        (
+                            "turn_started",
+                            Some(crate::backend::TurnBoundary::Started),
+                            None,
+                        ),
+                        ("assistant_message", None, Some("")),
+                        ("assistant_message", None, Some("Check repair response")),
+                        (
+                            "turn_completed",
+                            Some(crate::backend::TurnBoundary::Finished {
+                                outcome: crate::turn::TurnOutcome::Completed,
+                            }),
+                            None,
+                        ),
+                    ] {
+                        sink.send_wait(BackendEvent {
+                            message: text.map(|text| crate::backend::ProviderMessage {
+                                id: crate::backend::MessageId("repair-message".into()),
+                                role: Some(crate::backend::MessageRole::Commentary),
+                                update: if text.is_empty() {
+                                    crate::backend::MessageUpdate::Started
+                                } else {
+                                    crate::backend::MessageUpdate::Completed { text: text.into() }
+                                },
+                            }),
+                            received_at_ms: None,
+                            address: Some(address.clone()),
+                            turn_boundary: boundary,
+                            kind: kind.into(),
+                            text: text.map(str::to_owned),
+                            data: Value::Null,
+                            activity: None,
+                            summary: None,
+                            checklist_update: None,
+                        })
+                        .await?;
+                    }
                 }
+                Ok(crate::backend::BackendOutput::default())
             }
-            Ok(crate::backend::BackendOutput::default())
+            .await;
+            Ok(output?.into_completion())
         }
     }
 
@@ -9578,24 +9645,29 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            self.active.fetch_add(1, Ordering::SeqCst);
-            let _active = ActiveProviderProbe(Arc::clone(&self.active));
-            self.started.notify_one();
-            request
-                .control_context
-                .as_ref()
-                .and_then(|context| context.checkpoint.as_ref())
-                .context("fixture requires a checkpoint barrier")?
-                .wait()
-                .await?;
-            self.tool_ran.store(true, Ordering::SeqCst);
-            std::fs::write(
-                Path::new(&request.workspace).join("seed.txt"),
-                "tool changed workspace\n",
-            )?;
-            Ok(crate::backend::BackendOutput::default())
+            _sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let _sink = Some(_sink);
+                self.active.fetch_add(1, Ordering::SeqCst);
+                let _active = ActiveProviderProbe(Arc::clone(&self.active));
+                self.started.notify_one();
+                request
+                    .control_context
+                    .as_ref()
+                    .and_then(|context| context.checkpoint.as_ref())
+                    .context("fixture requires a checkpoint barrier")?
+                    .wait()
+                    .await?;
+                self.tool_ran.store(true, Ordering::SeqCst);
+                std::fs::write(
+                    Path::new(&request.workspace).join("seed.txt"),
+                    "tool changed workspace\n",
+                )?;
+                Ok(crate::backend::BackendOutput::default())
+            }
+            .await;
+            Ok(output?.into_completion())
         }
     }
 
@@ -10126,8 +10198,10 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
+            sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+let sink = Some(sink);
             let turn = self.turn.fetch_add(1, Ordering::AcqRel);
             if turn == 0 {
                 let scope = request
@@ -10154,19 +10228,19 @@ mod test {
                 );
             }
             if let Some(sink) = sink {
-                sink.send_wait(BackendEvent {
+                let response = if turn == 0 {
+                    "Waiting for child"
+                } else {
+                    "SYNTHESIZED_RESULT"
+                };
+                sink.send_wait(BackendEvent { message: Some(completed_message(
+                    "root-response", crate::backend::MessageRole::Response, response,
+                )),
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "assistant_message".into(),
-                    text: Some(
-                        if turn == 0 {
-                            "Waiting for child"
-                        } else {
-                            "SYNTHESIZED_RESULT"
-                        }
-                        .into(),
-                    ),
+                    text: Some(response.into()),
                     data: Value::Null,
                     activity: None,
                     summary: None,
@@ -10174,11 +10248,10 @@ mod test {
                 })
                 .await?;
             }
-            Ok(crate::backend::BackendOutput {
-                backend_session_id: Some("parent-history".into()),
-                capability: self.descriptor().capability,
-                ..Default::default()
-            })
+            Ok(crate::backend::BackendOutput { event: Vec::new(), completion: crate::backend::BackendCompletion { backend_session_id: Some("parent-history".into()), capability: self.descriptor().capability, ..Default::default() } })
+
+        }.await;
+            Ok(output?.into_completion())
         }
     }
 
@@ -11415,12 +11488,16 @@ mod test {
         async fn prompt_stream(
             &self,
             _: BackendRequest,
-            _: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            if self.cancelled {
-                return Err(anyhow::Error::new(TurnCancelled));
+            _: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                if self.cancelled {
+                    return Err(anyhow::Error::new(TurnCancelled));
+                }
+                anyhow::bail!("provider connection lost")
             }
-            anyhow::bail!("provider connection lost")
+            .await;
+            Ok(output?.into_completion())
         }
         async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
             anyhow::bail!("test backend cannot fork")
@@ -11596,36 +11673,43 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let context = request.control_context.unwrap();
-            let plan_id = context.plan_document.as_ref().unwrap().plan_id.clone();
-            let mut runtime = crate::control_tools::ControlToolRuntime::new(context);
-            runtime
-                .invoke(crate::control_tools::ControlToolInvocation {
-                    task_permit: None,
-                    name: "plan_read".into(),
-                    arguments: json!({"plan_id":plan_id}),
-                })
-                .await?;
-            assert!(
+            _: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let context = request.control_context.unwrap();
+                let plan_id = context.plan_document.as_ref().unwrap().plan_id.clone();
+                let mut runtime = crate::control_tools::ControlToolRuntime::new(context);
                 runtime
                     .invoke(crate::control_tools::ControlToolInvocation {
                         task_permit: None,
-                        name: "goal_complete".into(),
-                        arguments: json!({"summary":"premature"})
+                        name: "plan_read".into(),
+                        arguments: json!({"plan_id":plan_id}),
                     })
-                    .await
-                    .is_err()
-            );
-            Ok(crate::backend::BackendOutput {
-                evidence: crate::goal::TurnEvidence {
-                    tool_called: true,
-                    structured_complete: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
+                    .await?;
+                assert!(
+                    runtime
+                        .invoke(crate::control_tools::ControlToolInvocation {
+                            task_permit: None,
+                            name: "goal_complete".into(),
+                            arguments: json!({"summary":"premature"})
+                        })
+                        .await
+                        .is_err()
+                );
+                Ok(crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        evidence: crate::goal::TurnEvidence {
+                            tool_called: true,
+                            structured_complete: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                })
+            }
+            .await;
+            Ok(output?.into_completion())
         }
         async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
             anyhow::bail!("test backend cannot fork")
@@ -11758,8 +11842,10 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
+            sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+let sink = Some(sink);
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
             let address = crate::backend::ProviderAddress {
@@ -11769,7 +11855,7 @@ mod test {
             };
             sink.as_ref()
                 .unwrap()
-                .send_wait(BackendEvent {
+                .send_wait(BackendEvent { message: None,
                     received_at_ms: None,
                     address: Some(address.clone()),
                     turn_boundary: Some(crate::backend::TurnBoundary::Started),
@@ -11820,7 +11906,7 @@ mod test {
                 let id = format!("check-{turn}");
                 sink.as_ref()
                     .unwrap()
-                    .send_wait(BackendEvent {
+                    .send_wait(BackendEvent { message: None,
                         received_at_ms: None,
                         address: Some(address.clone()),
                         turn_boundary: None,
@@ -11839,7 +11925,7 @@ mod test {
                                 }
                                 .into(),
                             ),
-                            status: Some("completed".into()),
+                            status: Some(crate::backend::ToolStatus::Succeeded),
                             change: Default::default(),
                             output_delta: false,
                         }),
@@ -11926,7 +12012,7 @@ mod test {
             );
             sink.as_ref()
                 .unwrap()
-                .send_wait(BackendEvent {
+                .send_wait(BackendEvent { message: None,
                     received_at_ms: None,
                     address: Some(address.clone()),
                     turn_boundary: None,
@@ -11942,7 +12028,7 @@ mod test {
                 .await?;
             sink.as_ref()
                 .unwrap()
-                .send_wait(BackendEvent {
+                .send_wait(BackendEvent { message: None,
                     received_at_ms: None,
                     address: Some(address),
                     turn_boundary: Some(crate::backend::TurnBoundary::Finished {
@@ -11956,14 +12042,13 @@ mod test {
                     checklist_update: None,
                 })
                 .await?;
-            Ok(crate::backend::BackendOutput {
-                backend_session_id: Some("semantic-execution".into()),
-                capability: crate::backend::BackendCapability {
+            Ok(crate::backend::BackendOutput { event: Vec::new(), completion: crate::backend::BackendCompletion { backend_session_id: Some("semantic-execution".into()), capability: crate::backend::BackendCapability {
                     approval_mode_list: vec![ApprovalMode::Ask],
                     ..Default::default()
-                },
-                ..Default::default()
-            })
+                }, ..Default::default() } })
+
+        }.await;
+            Ok(output?.into_completion())
         }
         async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
             anyhow::bail!("test backend cannot fork")
@@ -12095,32 +12180,42 @@ mod test {
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
-            event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let event_sink = event_sink.unwrap();
-            for sequence in 0..384 {
-                let event = BackendEvent {
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "assistant_message".into(),
-                    text: Some(sequence.to_string()),
-                    data: Value::Null,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                };
-                if self.wait_for_capacity {
-                    event_sink.send_wait(event).await?;
+            event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let event_sink = Some(event_sink);
+                let event_sink = event_sink.unwrap();
+                for sequence in 0..384 {
+                    let event = BackendEvent {
+                        message: Some(crate::turn::test_support::message(
+                            "saturated-message",
+                            Some(crate::backend::MessageRole::Response),
+                            sequence.to_string(),
+                        )),
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "assistant_message".into(),
+                        text: Some(sequence.to_string()),
+                        data: Value::Null,
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    };
+                    if self.wait_for_capacity {
+                        event_sink.send_wait(event).await?;
+                    } else {
+                        let _ = event_sink.send(event);
+                    }
+                }
+                if self.completed {
+                    Ok(crate::backend::BackendOutput::default())
                 } else {
-                    let _ = event_sink.send(event);
+                    std::future::pending().await
                 }
             }
-            if self.completed {
-                Ok(crate::backend::BackendOutput::default())
-            } else {
-                std::future::pending().await
-            }
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -12325,64 +12420,73 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let invocation = self.invocation.fetch_add(1, Ordering::SeqCst);
-            let mut event = BackendEvent {
-                received_at_ms: None,
-                address: Some(crate::backend::ProviderAddress {
-                    owner: None,
-                    thread_id: "restart-thread".into(),
-                    turn_id: format!("turn-{invocation}"),
-                }),
-                turn_boundary: Some(crate::backend::TurnBoundary::Started),
-                kind: "turn_started".into(),
-                text: None,
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            };
-            let sink = event_sink.context("restart test requires event delivery")?;
-            sink.send(event.clone())?;
-            if invocation == 0 {
-                self.cancellation.request_restart();
-                return std::future::pending().await;
-            }
-            assert_eq!(
-                request.backend_session_id.as_deref(),
-                Some("restart-thread")
-            );
-            assert_eq!(request.approval_mode, ApprovalMode::Allow);
-            if self.clarification {
-                assert!(
-                    request
-                        .input
-                        .text()
-                        .contains("Why choose staged migration?")
+            event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let event_sink = Some(event_sink);
+                let invocation = self.invocation.fetch_add(1, Ordering::SeqCst);
+                let mut event = BackendEvent {
+                    message: None,
+                    received_at_ms: None,
+                    address: Some(crate::backend::ProviderAddress {
+                        owner: None,
+                        thread_id: "restart-thread".into(),
+                        turn_id: format!("turn-{invocation}"),
+                    }),
+                    turn_boundary: Some(crate::backend::TurnBoundary::Started),
+                    kind: "turn_started".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    checklist_update: None,
+                };
+                let sink = event_sink.context("restart test requires event delivery")?;
+                sink.send(event.clone())?;
+                if invocation == 0 {
+                    self.cancellation.request_restart();
+                    return std::future::pending().await;
+                }
+                assert_eq!(
+                    request.backend_session_id.as_deref(),
+                    Some("restart-thread")
                 );
-                assert!(request.input.text().contains("Pending elicitation:"));
-                assert!(
-                    request
-                        .input
-                        .text()
-                        .contains("Do not continue the original request")
-                        || request
+                assert_eq!(request.approval_mode, ApprovalMode::Allow);
+                if self.clarification {
+                    assert!(
+                        request
                             .input
                             .text()
-                            .contains("Do not continue or submit the plan")
-                );
-                assert!(!request.input.text().contains("Original request:"));
+                            .contains("Why choose staged migration?")
+                    );
+                    assert!(request.input.text().contains("Pending elicitation:"));
+                    assert!(
+                        request
+                            .input
+                            .text()
+                            .contains("Do not continue the original request")
+                            || request
+                                .input
+                                .text()
+                                .contains("Do not continue or submit the plan")
+                    );
+                    assert!(!request.input.text().contains("Original request:"));
+                }
+                event.kind = "turn_completed".into();
+                event.turn_boundary = Some(crate::backend::TurnBoundary::Finished {
+                    outcome: crate::turn::TurnOutcome::Completed,
+                });
+                sink.send(event)?;
+                Ok(crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        backend_session_id: Some("restart-thread".into()),
+                        ..Default::default()
+                    },
+                })
             }
-            event.kind = "turn_completed".into();
-            event.turn_boundary = Some(crate::backend::TurnBoundary::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-            });
-            sink.send(event)?;
-            Ok(crate::backend::BackendOutput {
-                backend_session_id: Some("restart-thread".into()),
-                ..Default::default()
-            })
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -12863,31 +12967,42 @@ mod test {
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
-            sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let sink = sink.context("cleanup test requires event delivery")?;
-            let mut event: BackendEvent = serde_json::from_value(json!({
-                "kind":"turn_started", "text":null, "data":null,
-                "address":{"thread_id":"cleanup-thread", "turn_id":"cleanup-turn"},
-                "turn_boundary":{"kind":"started"}
-            }))?;
-            event.turn_boundary = Some(crate::backend::TurnBoundary::Started);
-            sink.send(event.clone())?;
-            if self.visible_output {
-                sink.send(serde_json::from_value(json!({
-                    "kind":"assistant_message", "text":"Partial response", "data":null,
+            sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let sink = Some(sink);
+                let sink = sink.context("cleanup test requires event delivery")?;
+                let mut event: BackendEvent = serde_json::from_value(json!({
+                    "kind":"turn_started", "text":null, "data":null,
                     "address":{"thread_id":"cleanup-thread", "turn_id":"cleanup-turn"},
-                }))?)?;
+                    "turn_boundary":{"kind":"started"}
+                }))?;
+                event.turn_boundary = Some(crate::backend::TurnBoundary::Started);
+                sink.send(event.clone())?;
+                if self.visible_output {
+                    let mut response: BackendEvent = serde_json::from_value(json!({
+                        "kind":"assistant_message", "text":"Partial response", "data":null,
+                        "address":{"thread_id":"cleanup-thread", "turn_id":"cleanup-turn"},
+                    }))?;
+                    crate::turn::test_support::set_message(
+                        &mut response,
+                        "partial-response",
+                        crate::backend::MessageRole::Response,
+                    );
+                    sink.send(response)?;
+                }
+                self.started.notify_one();
+                self.complete.notified().await;
+                event.kind = "turn_completed".into();
+                event.turn_boundary = Some(crate::backend::TurnBoundary::Finished {
+                    outcome: crate::turn::TurnOutcome::Interrupted,
+                });
+                sink.send(event)?;
+                self.settled.notify_one();
+                Ok(crate::backend::BackendOutput::default())
             }
-            self.started.notify_one();
-            self.complete.notified().await;
-            event.kind = "turn_completed".into();
-            event.turn_boundary = Some(crate::backend::TurnBoundary::Finished {
-                outcome: crate::turn::TurnOutcome::Interrupted,
-            });
-            sink.send(event)?;
-            self.settled.notify_one();
-            Ok(crate::backend::BackendOutput::default())
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
@@ -13572,12 +13687,17 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let nested = Path::new(&request.workspace).join("failed/deep/write.txt");
-            std::fs::create_dir_all(nested.parent().context("failed write parent")?)?;
-            std::fs::write(&nested, "written before provider failure\n")?;
-            anyhow::bail!("synthetic provider failure")
+            _event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let _event_sink = Some(_event_sink);
+                let nested = Path::new(&request.workspace).join("failed/deep/write.txt");
+                std::fs::create_dir_all(nested.parent().context("failed write parent")?)?;
+                std::fs::write(&nested, "written before provider failure\n")?;
+                anyhow::bail!("synthetic provider failure")
+            }
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -13623,25 +13743,38 @@ mod test {
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
-            event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            if let Some(event_sink) = event_sink {
-                let _ = event_sink.send(BackendEvent {
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "assistant_message".into(),
-                    text: Some("Validated the corrected plan.".into()),
-                    data: Value::Null,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                });
+            event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let event_sink = Some(event_sink);
+                if let Some(event_sink) = event_sink {
+                    let _ = event_sink.send(BackendEvent {
+                        message: Some(completed_message(
+                            "corrected-plan",
+                            crate::backend::MessageRole::Response,
+                            "Validated the corrected plan.",
+                        )),
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "assistant_message".into(),
+                        text: Some("Validated the corrected plan.".into()),
+                        data: Value::Null,
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    });
+                }
+                Ok(crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        plan_read: Some("rejected-plan".into()),
+                        ..Default::default()
+                    },
+                })
             }
-            Ok(crate::backend::BackendOutput {
-                plan_read: Some("rejected-plan".into()),
-                ..crate::backend::BackendOutput::default()
-            })
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -13695,67 +13828,87 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let event_list = vec![
-                BackendEvent {
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "assistant_message".into(),
-                    text: Some("An intermediate answer.".into()),
-                    data: Value::Null,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                },
-                BackendEvent {
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "parent_boundary".into(),
-                    text: None,
-                    data: json!({ "boundary": "wait_started", "agent_count": 1 }),
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                },
-                BackendEvent {
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "parent_boundary".into(),
-                    text: None,
-                    data: json!({ "boundary": "wait_ended", "agent_count": 0 }),
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                },
-                BackendEvent {
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "assistant_message".into(),
-                    text: Some("A final synthesis.".into()),
-                    data: Value::Null,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                },
-            ];
-            if let Some(event_sink) = event_sink {
-                for event in event_list {
-                    let _ = event_sink.send(event);
+            event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let event_sink = Some(event_sink);
+                let event_list = vec![
+                    BackendEvent {
+                        message: Some(completed_message(
+                            "intermediate-answer",
+                            crate::backend::MessageRole::Response,
+                            "An intermediate answer.",
+                        )),
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "assistant_message".into(),
+                        text: Some("An intermediate answer.".into()),
+                        data: Value::Null,
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    },
+                    BackendEvent {
+                        message: None,
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "parent_boundary".into(),
+                        text: None,
+                        data: json!({ "boundary": "wait_started", "agent_count": 1 }),
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    },
+                    BackendEvent {
+                        message: None,
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "parent_boundary".into(),
+                        text: None,
+                        data: json!({ "boundary": "wait_ended", "agent_count": 0 }),
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    },
+                    BackendEvent {
+                        message: Some(completed_message(
+                            "final-synthesis",
+                            crate::backend::MessageRole::Response,
+                            "A final synthesis.",
+                        )),
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "assistant_message".into(),
+                        text: Some("A final synthesis.".into()),
+                        data: Value::Null,
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    },
+                ];
+                if let Some(event_sink) = event_sink {
+                    for event in event_list {
+                        let _ = event_sink.send(event);
+                    }
                 }
+                Ok(crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        backend_session_id: Some("parent-boundary".into()),
+                        runtime: crate::backend::BackendRuntime {
+                            provider: "Parent boundary test".into(),
+                            model: Some(request.model),
+                        },
+                        ..Default::default()
+                    },
+                })
             }
-            Ok(crate::backend::BackendOutput {
-                backend_session_id: Some("parent-boundary".into()),
-                runtime: crate::backend::BackendRuntime {
-                    provider: "Parent boundary test".into(),
-                    model: Some(request.model),
-                },
-                ..crate::backend::BackendOutput::default()
-            })
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -13822,8 +13975,9 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
+            _: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
             use crate::control_tools::{
                 ControlToolInvocation, ControlToolRuntime, apply_invocation,
             };
@@ -13880,6 +14034,9 @@ mod test {
                 _ => panic!("unexpected planning continuation {turn}"),
             }
             Ok(output)
+
+        }.await;
+            Ok(output?.into_completion())
         }
     }
 
@@ -14246,7 +14403,8 @@ mod test {
         params["review"]["sequence"] = json!(3);
         params["draft_annotation"][0]["id"] = json!("retry-question");
         params["draft_annotation"][0]["source"]["body"] = json!("Explain the caller contract.");
-        let (document, mut questions, _) = broker.prepare_review_questions(&params).unwrap();
+        let (document, mut questions, selection) =
+            broker.prepare_review_questions(&params).unwrap();
         assert!(scope.check().is_err());
         let scope = crate::plan::review_answer::ReviewAnswerScope::new(
             Arc::clone(&broker.plan_review),
@@ -14254,10 +14412,18 @@ mod test {
             questions.remove(0),
         );
         let count = broker.snapshot().unwrap().exchange.len();
+        let (progress_sink, mut progress_stream) = forge_protocol::outbound::channel();
         broker
-            .run_review_question(Arc::clone(&scope), &crate::settings::AskModel::default())
+            .run_review_question(Arc::clone(&scope), &selection, Some((&progress_sink, 53)))
             .await
             .unwrap();
+        let progress: Value =
+            serde_json::from_slice(progress_stream.try_recv().unwrap().bytes()).unwrap();
+        assert_eq!(progress["request_id"], 53);
+        assert_eq!(progress["event"], "session.plan.question.answer.progress");
+        assert_eq!(progress["payload"]["question_id"], "retry-question");
+        assert_eq!(progress["payload"]["model"], "mock-model");
+        assert_eq!(progress["payload"]["effort"], "high");
         assert_eq!(broker.snapshot().unwrap().exchange.len(), count + 1);
         assert!(
             broker.plan_review.annotations(&document).unwrap()[0]
@@ -14369,83 +14535,91 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let question_set = || PlanQuestionSet {
-                id: "migration-set".into(),
-                questions: vec![crate::plan::PlanQuestion {
-                    id: "migration".into(),
-                    header: "Migration".into(),
-                    question: "Which migration should the implementation use?".into(),
-                    options: vec![
+            _event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let _event_sink = Some(_event_sink);
+                let question_set = || PlanQuestionSet {
+                    id: "migration-set".into(),
+                    questions: vec![crate::plan::PlanQuestion {
+                        id: "migration".into(),
+                        header: "Migration".into(),
+                        question: "Which migration should the implementation use?".into(),
+                        options: vec![
+                            crate::plan::PlanQuestionOption {
+                                recommended: false,
+                                label: "Staged".into(),
+                                description: "Preserve compatibility temporarily.".into(),
+                            },
+                            crate::plan::PlanQuestionOption {
+                                recommended: false,
+                                label: "Immediate".into(),
+                                description: "Replace the old format now.".into(),
+                            },
+                        ],
+                        allow_freeform: true,
+                    }],
+                };
+                let request_text = request.input.text();
+                let mut output = crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        backend_session_id: Some("mutable-question".into()),
+                        capability: BackendCapability::default(),
+                        runtime: crate::backend::BackendRuntime {
+                            provider: "Mutable question test".into(),
+                            model: Some(request.model.clone()),
+                        },
+                        ..Default::default()
+                    },
+                };
+                if request_text.contains("User follow-up:\nreplace the options") {
+                    let mut replacement = question_set();
+                    replacement.questions[0].options = vec![
                         crate::plan::PlanQuestionOption {
                             recommended: false,
-                            label: "Staged".into(),
-                            description: "Preserve compatibility temporarily.".into(),
+                            label: "Safe".into(),
+                            description: "Retain compatibility.".into(),
                         },
                         crate::plan::PlanQuestionOption {
                             recommended: false,
-                            label: "Immediate".into(),
-                            description: "Replace the old format now.".into(),
+                            label: "Fast".into(),
+                            description: "Prefer immediate cleanup.".into(),
                         },
-                    ],
-                    allow_freeform: true,
-                }],
-            };
-            let request_text = request.input.text();
-            let mut output = crate::backend::BackendOutput {
-                backend_session_id: Some("mutable-question".into()),
-                capability: BackendCapability::default(),
-                runtime: crate::backend::BackendRuntime {
-                    provider: "Mutable question test".into(),
-                    model: Some(request.model.clone()),
-                },
-                ..crate::backend::BackendOutput::default()
-            };
-            if request_text.contains("User follow-up:\nreplace the options") {
-                let mut replacement = question_set();
-                replacement.questions[0].options = vec![
-                    crate::plan::PlanQuestionOption {
-                        recommended: false,
-                        label: "Safe".into(),
-                        description: "Retain compatibility.".into(),
-                    },
-                    crate::plan::PlanQuestionOption {
-                        recommended: false,
-                        label: "Fast".into(),
-                        description: "Prefer immediate cleanup.".into(),
-                    },
-                ];
-                output.plan_question = Some(replacement);
-            } else if request_text.contains("User follow-up:\nuse staged") {
-                output.question_answer = Some(PlanQuestionAnswer {
-                    source: crate::session::ResolutionSource::User,
-                    question_id: "migration".into(),
-                    response: PlanQuestionResponse::Selected {
-                        option: "Staged".into(),
-                        feedback: None,
-                    },
-                });
-            } else if request_text.contains("User follow-up:\nthis decision is not material") {
-                output.question_withdrawal = Some(PlanQuestionWithdrawal {
-                    reason: "Repository policy determines the migration.".into(),
-                });
-            } else if request_text.contains("Pending planning questions withdrawn")
-                || request_text.contains("Planning feedback:\n- Migration: Staged")
-                || request_text.contains("Harness resolved the pending questions")
-            {
-                if self.fail_withdrawal_continuation
-                    && request_text.contains("Pending planning questions withdrawn")
+                    ];
+                    output.plan_question = Some(replacement);
+                } else if request_text.contains("User follow-up:\nuse staged") {
+                    output.question_answer = Some(PlanQuestionAnswer {
+                        source: crate::session::ResolutionSource::User,
+                        question_id: "migration".into(),
+                        response: PlanQuestionResponse::Selected {
+                            option: "Staged".into(),
+                            feedback: None,
+                        },
+                    });
+                } else if request_text.contains("User follow-up:\nthis decision is not material") {
+                    output.question_withdrawal = Some(PlanQuestionWithdrawal {
+                        reason: "Repository policy determines the migration.".into(),
+                    });
+                } else if request_text.contains("Pending planning questions withdrawn")
+                    || request_text.contains("Planning feedback:\n- Migration: Staged")
+                    || request_text.contains("Harness resolved the pending questions")
                 {
-                    anyhow::bail!("synthetic withdrawal continuation failure");
+                    if self.fail_withdrawal_continuation
+                        && request_text.contains("Pending planning questions withdrawn")
+                    {
+                        anyhow::bail!("synthetic withdrawal continuation failure");
+                    }
+                    if request.mode == PromptMode::Plan {
+                        submit_test_plan(&request, &mut output, "Follow repository policy.");
+                    }
+                } else {
+                    output.plan_question = Some(question_set());
                 }
-                if request.mode == PromptMode::Plan {
-                    submit_test_plan(&request, &mut output, "Follow repository policy.");
-                }
-            } else {
-                output.plan_question = Some(question_set());
+                Ok(output)
             }
-            Ok(output)
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -14491,48 +14665,56 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut output = crate::backend::BackendOutput {
-                backend_session_id: Some("repeated-question".into()),
-                capability: BackendCapability::default(),
-                runtime: crate::backend::BackendRuntime {
-                    provider: "Repeated question test".into(),
-                    model: Some(request.model.clone()),
-                },
-                ..crate::backend::BackendOutput::default()
-            };
-            if turn < 2 {
-                output.plan_question = Some(PlanQuestionSet {
-                    id: format!("provider-set-{turn}"),
-                    questions: vec![crate::plan::PlanQuestion {
-                        id: format!("provider-question-{turn}"),
-                        header: "Migration".into(),
-                        question: "Which migration should the implementation use?".into(),
-                        options: vec![
-                            crate::plan::PlanQuestionOption {
-                                recommended: false,
-                                label: "Staged".into(),
-                                description: "Preserve compatibility temporarily.".into(),
-                            },
-                            crate::plan::PlanQuestionOption {
-                                recommended: false,
-                                label: "Immediate".into(),
-                                description: "Replace the old format now.".into(),
-                            },
-                        ],
-                        allow_freeform: true,
-                    }],
-                });
-            } else {
-                submit_test_plan(
-                    &request,
-                    &mut output,
-                    "Use the consumed migration decision.",
-                );
+            _event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let _event_sink = Some(_event_sink);
+                let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut output = crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        backend_session_id: Some("repeated-question".into()),
+                        capability: BackendCapability::default(),
+                        runtime: crate::backend::BackendRuntime {
+                            provider: "Repeated question test".into(),
+                            model: Some(request.model.clone()),
+                        },
+                        ..Default::default()
+                    },
+                };
+                if turn < 2 {
+                    output.plan_question = Some(PlanQuestionSet {
+                        id: format!("provider-set-{turn}"),
+                        questions: vec![crate::plan::PlanQuestion {
+                            id: format!("provider-question-{turn}"),
+                            header: "Migration".into(),
+                            question: "Which migration should the implementation use?".into(),
+                            options: vec![
+                                crate::plan::PlanQuestionOption {
+                                    recommended: false,
+                                    label: "Staged".into(),
+                                    description: "Preserve compatibility temporarily.".into(),
+                                },
+                                crate::plan::PlanQuestionOption {
+                                    recommended: false,
+                                    label: "Immediate".into(),
+                                    description: "Replace the old format now.".into(),
+                                },
+                            ],
+                            allow_freeform: true,
+                        }],
+                    });
+                } else {
+                    submit_test_plan(
+                        &request,
+                        &mut output,
+                        "Use the consumed migration decision.",
+                    );
+                }
+                Ok(output)
             }
-            Ok(output)
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -14578,22 +14760,30 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut output = crate::backend::BackendOutput {
-                backend_session_id: Some("retry-plan".into()),
-                capability: crate::backend::mock_capability(),
-                runtime: crate::backend::BackendRuntime {
-                    provider: "Retry plan test".into(),
-                    model: Some(request.model.clone()),
-                },
-                ..crate::backend::BackendOutput::default()
-            };
-            if turn >= 2 {
-                submit_test_plan(&request, &mut output, "Submitted after an explicit retry.");
+            _event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let _event_sink = Some(_event_sink);
+                let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut output = crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        backend_session_id: Some("retry-plan".into()),
+                        capability: crate::backend::mock_capability(),
+                        runtime: crate::backend::BackendRuntime {
+                            provider: "Retry plan test".into(),
+                            model: Some(request.model.clone()),
+                        },
+                        ..Default::default()
+                    },
+                };
+                if turn >= 2 {
+                    submit_test_plan(&request, &mut output, "Submitted after an explicit retry.");
+                }
+                Ok(output)
             }
-            Ok(output)
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -14639,20 +14829,28 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let mut output = crate::backend::BackendOutput {
-                backend_session_id: Some("repeated-plan-document".into()),
-                capability: BackendCapability::default(),
-                runtime: crate::backend::BackendRuntime {
-                    provider: "Repeated plan document test".into(),
-                    model: Some(request.model.clone()),
-                },
-                ..crate::backend::BackendOutput::default()
-            };
-            submit_test_plan(&request, &mut output, "The same canonical plan.");
-            output.plan_submit = None;
-            Ok(output)
+            _event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let _event_sink = Some(_event_sink);
+                let mut output = crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        backend_session_id: Some("repeated-plan-document".into()),
+                        capability: BackendCapability::default(),
+                        runtime: crate::backend::BackendRuntime {
+                            provider: "Repeated plan document test".into(),
+                            model: Some(request.model.clone()),
+                        },
+                        ..Default::default()
+                    },
+                };
+                submit_test_plan(&request, &mut output, "The same canonical plan.");
+                output.plan_submit = None;
+                Ok(output)
+            }
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -14707,68 +14905,80 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let text = if turn == 0 {
-                "Which migration strategy should the plan use?"
-            } else {
-                "The plan is ready for review."
-            };
-            let event = BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "assistant_message".into(),
-                text: Some(text.into()),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            };
-            if let Some(event_sink) = event_sink {
-                let _ = event_sink.send(event.clone());
-            }
-            let plan_question = (turn == 0 && self.structured).then(|| PlanQuestionSet {
-                id: String::new(),
-                questions: vec![crate::plan::PlanQuestion {
+            event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let event_sink = Some(event_sink);
+                let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let text = if turn == 0 {
+                    "Which migration strategy should the plan use?"
+                } else {
+                    "The plan is ready for review."
+                };
+                let event = BackendEvent {
+                    message: Some(completed_message(
+                        "planning-response",
+                        crate::backend::MessageRole::Response,
+                        text,
+                    )),
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "assistant_message".into(),
+                    text: Some(text.into()),
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    checklist_update: None,
+                };
+                if let Some(event_sink) = event_sink {
+                    let _ = event_sink.send(event.clone());
+                }
+                let plan_question = (turn == 0 && self.structured).then(|| PlanQuestionSet {
                     id: String::new(),
-                    header: "Migration".into(),
-                    question: text.into(),
-                    options: vec![
-                        crate::plan::PlanQuestionOption {
-                            recommended: false,
-                            label: "Staged".into(),
-                            description: "Support both formats temporarily.".into(),
+                    questions: vec![crate::plan::PlanQuestion {
+                        id: String::new(),
+                        header: "Migration".into(),
+                        question: text.into(),
+                        options: vec![
+                            crate::plan::PlanQuestionOption {
+                                recommended: false,
+                                label: "Staged".into(),
+                                description: "Support both formats temporarily.".into(),
+                            },
+                            crate::plan::PlanQuestionOption {
+                                recommended: false,
+                                label: "Immediate".into(),
+                                description: "Remove the old format now.".into(),
+                            },
+                        ],
+                        allow_freeform: true,
+                    }],
+                });
+                let mut output = crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        backend_session_id: Some("planning-question".into()),
+                        plan_question,
+                        capability: BackendCapability::default(),
+                        runtime: crate::backend::BackendRuntime {
+                            provider: "Planning question test".into(),
+                            model: Some(request.model.clone()),
                         },
-                        crate::plan::PlanQuestionOption {
-                            recommended: false,
-                            label: "Immediate".into(),
-                            description: "Remove the old format now.".into(),
-                        },
-                    ],
-                    allow_freeform: true,
-                }],
-            });
-            let mut output = crate::backend::BackendOutput {
-                backend_session_id: Some("planning-question".into()),
-                event: vec![event],
-                plan_question,
-                capability: BackendCapability::default(),
-                runtime: crate::backend::BackendRuntime {
-                    provider: "Planning question test".into(),
-                    model: Some(request.model.clone()),
-                },
-                ..crate::backend::BackendOutput::default()
-            };
-            if turn > 0 && request.mode == PromptMode::Plan {
-                submit_test_plan(
-                    &request,
-                    &mut output,
-                    "Use the selected migration strategy.",
-                );
+                        ..Default::default()
+                    },
+                };
+                if turn > 0 && request.mode == PromptMode::Plan {
+                    submit_test_plan(
+                        &request,
+                        &mut output,
+                        "Use the selected migration strategy.",
+                    );
+                }
+                Ok(output)
             }
-            Ok(output)
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -14816,153 +15026,167 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let commentary = BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "assistant_message".into(),
-                text: Some("Creating the nested module.".into()),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            };
-            let provider_change = crate::backend::ProviderChangeSet {
-                file: vec![crate::backend::ProviderFileChange {
-                    path: "seed.txt".into(),
-                    move_path: None,
-                    kind: crate::backend::ProviderChangeKind::Update,
-                    diff: "@@ -1 +1 @@\n-seed\n+provider edit".into(),
-                }],
-            };
-            let file_started = BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "tool".into(),
-                text: None,
-                data: Value::Null,
-                activity: Some(crate::backend::ToolActivity {
-                    id: "provider-file-change".into(),
-                    kind: crate::backend::ToolActivityKind::FileChange,
-                    title: "file changes".into(),
-                    output: None,
-                    status: Some("inProgress".into()),
-                    change: provider_change.clone(),
-                    output_delta: false,
-                }),
-                summary: None,
-                checklist_update: None,
-            };
-            let started = BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "tool".into(),
-                text: None,
-                data: Value::Null,
-                activity: Some(crate::backend::ToolActivity {
-                    id: "nested-command".into(),
-                    kind: crate::backend::ToolActivityKind::Command,
-                    title: "create nested module".into(),
-                    output: None,
-                    status: Some("inProgress".into()),
-                    change: crate::backend::ProviderChangeSet::default(),
-                    output_delta: false,
-                }),
-                summary: None,
-                checklist_update: None,
-            };
-            if let Some(event_sink) = event_sink.as_ref() {
-                let _ = event_sink.send(commentary.clone());
-                let _ = event_sink.send(file_started.clone());
+            event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let event_sink = Some(event_sink);
+                let commentary = BackendEvent {
+                    message: Some(completed_message(
+                        "nested-commentary",
+                        crate::backend::MessageRole::Commentary,
+                        "Creating the nested module.",
+                    )),
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "assistant_message".into(),
+                    text: Some("Creating the nested module.".into()),
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    checklist_update: None,
+                };
+                let provider_change = crate::backend::ProviderChangeSet {
+                    file: vec![crate::backend::ProviderFileChange {
+                        path: "seed.txt".into(),
+                        move_path: None,
+                        kind: crate::backend::ProviderChangeKind::Update,
+                        diff: "@@ -1 +1 @@\n-seed\n+provider edit".into(),
+                    }],
+                };
+                let file_started = BackendEvent {
+                    message: None,
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "tool".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: Some(crate::backend::ToolActivity {
+                        id: "provider-file-change".into(),
+                        kind: crate::backend::ToolActivityKind::FileChange,
+                        title: "file changes".into(),
+                        output: None,
+                        status: Some(crate::backend::ToolStatus::Running),
+                        change: provider_change.clone(),
+                        output_delta: false,
+                    }),
+                    summary: None,
+                    checklist_update: None,
+                };
+                let started = BackendEvent {
+                    message: None,
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "tool".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: Some(crate::backend::ToolActivity {
+                        id: "nested-command".into(),
+                        kind: crate::backend::ToolActivityKind::Command,
+                        title: "create nested module".into(),
+                        output: None,
+                        status: Some(crate::backend::ToolStatus::Running),
+                        change: crate::backend::ProviderChangeSet::default(),
+                        output_delta: false,
+                    }),
+                    summary: None,
+                    checklist_update: None,
+                };
+                if let Some(event_sink) = event_sink.as_ref() {
+                    let _ = event_sink.send(commentary.clone());
+                    let _ = event_sink.send(file_started.clone());
+                }
+                std::fs::write(
+                    Path::new(&request.workspace).join("seed.txt"),
+                    "provider edit\n",
+                )?;
+                let file_completed = BackendEvent {
+                    message: None,
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "tool".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: Some(crate::backend::ToolActivity {
+                        id: "provider-file-change".into(),
+                        kind: crate::backend::ToolActivityKind::FileChange,
+                        title: "file changes".into(),
+                        output: None,
+                        status: Some(crate::backend::ToolStatus::Succeeded),
+                        change: provider_change,
+                        output_delta: false,
+                    }),
+                    summary: None,
+                    checklist_update: None,
+                };
+                if let Some(event_sink) = event_sink.as_ref() {
+                    let _ = event_sink.send(file_completed.clone());
+                    let _ = event_sink.send(started.clone());
+                }
+                let nested = Path::new(&request.workspace).join("apps/new/deep/module");
+                std::fs::create_dir_all(&nested)?;
+                std::fs::write(nested.join("lib.rs"), "pub fn nested() {}\n")?;
+                let ignored = Path::new(&request.workspace).join("target/generated/deep");
+                std::fs::create_dir_all(&ignored)?;
+                std::fs::write(ignored.join("artifact.txt"), "ignored\n")?;
+                let completed = BackendEvent {
+                    message: None,
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "tool".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: Some(crate::backend::ToolActivity {
+                        id: "nested-command".into(),
+                        kind: crate::backend::ToolActivityKind::Command,
+                        title: "create nested module".into(),
+                        output: Some("created nested module".into()),
+                        status: Some(crate::backend::ToolStatus::Succeeded),
+                        change: crate::backend::ProviderChangeSet::default(),
+                        output_delta: false,
+                    }),
+                    summary: None,
+                    checklist_update: None,
+                };
+                let response = BackendEvent {
+                    message: Some(completed_message(
+                        "nested-response",
+                        crate::backend::MessageRole::Response,
+                        "The nested module is ready.",
+                    )),
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "assistant_message".into(),
+                    text: Some("The nested module is ready.".into()),
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    checklist_update: None,
+                };
+                if let Some(event_sink) = event_sink {
+                    let _ = event_sink.send(completed.clone());
+                    let _ = event_sink.send(response.clone());
+                }
+                Ok(crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        backend_session_id: Some("nested-write".into()),
+                        capability: BackendCapability::default(),
+                        runtime: crate::backend::BackendRuntime {
+                            provider: "Nested test".into(),
+                            model: Some(request.model),
+                        },
+                        ..Default::default()
+                    },
+                })
             }
-            std::fs::write(
-                Path::new(&request.workspace).join("seed.txt"),
-                "provider edit\n",
-            )?;
-            let file_completed = BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "tool".into(),
-                text: None,
-                data: Value::Null,
-                activity: Some(crate::backend::ToolActivity {
-                    id: "provider-file-change".into(),
-                    kind: crate::backend::ToolActivityKind::FileChange,
-                    title: "file changes".into(),
-                    output: None,
-                    status: Some("completed".into()),
-                    change: provider_change,
-                    output_delta: false,
-                }),
-                summary: None,
-                checklist_update: None,
-            };
-            if let Some(event_sink) = event_sink.as_ref() {
-                let _ = event_sink.send(file_completed.clone());
-                let _ = event_sink.send(started.clone());
-            }
-            let nested = Path::new(&request.workspace).join("apps/new/deep/module");
-            std::fs::create_dir_all(&nested)?;
-            std::fs::write(nested.join("lib.rs"), "pub fn nested() {}\n")?;
-            let ignored = Path::new(&request.workspace).join("target/generated/deep");
-            std::fs::create_dir_all(&ignored)?;
-            std::fs::write(ignored.join("artifact.txt"), "ignored\n")?;
-            let completed = BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "tool".into(),
-                text: None,
-                data: Value::Null,
-                activity: Some(crate::backend::ToolActivity {
-                    id: "nested-command".into(),
-                    kind: crate::backend::ToolActivityKind::Command,
-                    title: "create nested module".into(),
-                    output: Some("created nested module".into()),
-                    status: Some("completed".into()),
-                    change: crate::backend::ProviderChangeSet::default(),
-                    output_delta: false,
-                }),
-                summary: None,
-                checklist_update: None,
-            };
-            let response = BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "assistant_message".into(),
-                text: Some("The nested module is ready.".into()),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            };
-            if let Some(event_sink) = event_sink {
-                let _ = event_sink.send(completed.clone());
-                let _ = event_sink.send(response.clone());
-            }
-            Ok(crate::backend::BackendOutput {
-                backend_session_id: Some("nested-write".into()),
-                event: vec![
-                    commentary,
-                    file_started,
-                    file_completed,
-                    started,
-                    completed,
-                    response,
-                ],
-                capability: BackendCapability::default(),
-                runtime: crate::backend::BackendRuntime {
-                    provider: "Nested test".into(),
-                    model: Some(request.model),
-                },
-                ..crate::backend::BackendOutput::default()
-            })
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -15010,56 +15234,69 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let task_event = BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "plan".into(),
-                text: None,
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: Some(crate::backend::ProviderChecklistUpdate {
-                    scope_id: "ordinary-turn".into(),
-                    name: None,
-                    complete: false,
-                    replace_entries: true,
-                    entry_list: vec![crate::backend::ProviderChecklistEntry {
-                        provider_id: None,
-                        content: "Inspect ordinary chat".into(),
-                        priority: None,
-                        status: crate::backend::ChecklistStatus::InProgress,
-                        provider_ordinal: 0,
-                    }],
-                }),
-            };
-            let response = BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "assistant_message".into(),
-                text: Some("Ordinary chat completed.".into()),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            };
-            if let Some(event_sink) = event_sink {
-                let _ = event_sink.send(task_event.clone());
-                let _ = event_sink.send(response.clone());
+            event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let event_sink = Some(event_sink);
+                let task_event = BackendEvent {
+                    message: None,
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "plan".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    checklist_update: Some(crate::backend::ProviderChecklistUpdate {
+                        scope_id: "ordinary-turn".into(),
+                        name: None,
+                        complete: false,
+                        replace_entries: true,
+                        entry_list: vec![crate::backend::ProviderChecklistEntry {
+                            provider_id: None,
+                            content: "Inspect ordinary chat".into(),
+                            priority: None,
+                            status: crate::backend::ChecklistStatus::InProgress,
+                            provider_ordinal: 0,
+                        }],
+                    }),
+                };
+                let response = BackendEvent {
+                    message: Some(completed_message(
+                        "ordinary-response",
+                        crate::backend::MessageRole::Response,
+                        "Ordinary chat completed.",
+                    )),
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "assistant_message".into(),
+                    text: Some("Ordinary chat completed.".into()),
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    checklist_update: None,
+                };
+                if let Some(event_sink) = event_sink {
+                    let _ = event_sink.send(task_event.clone());
+                    let _ = event_sink.send(response.clone());
+                }
+                Ok(crate::backend::BackendOutput {
+                    event: Vec::new(),
+                    completion: crate::backend::BackendCompletion {
+                        backend_session_id: Some("task-update".into()),
+                        capability: BackendCapability::default(),
+                        runtime: crate::backend::BackendRuntime {
+                            provider: "Task test".into(),
+                            model: Some(request.model),
+                        },
+                        ..Default::default()
+                    },
+                })
             }
-            Ok(crate::backend::BackendOutput {
-                backend_session_id: Some("task-update".into()),
-                event: vec![task_event, response],
-                capability: BackendCapability::default(),
-                runtime: crate::backend::BackendRuntime {
-                    provider: "Task test".into(),
-                    model: Some(request.model),
-                },
-                ..crate::backend::BackendOutput::default()
-            })
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -15568,6 +15805,7 @@ mod test {
         broker
             .apply_agent_lifecycle(
                 &BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -15608,6 +15846,7 @@ mod test {
         let spawned = broker
             .apply_agent_lifecycle(
                 &BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -15661,6 +15900,7 @@ mod test {
         broker
             .apply_agent_lifecycle(
                 &BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -15774,6 +16014,7 @@ mod test {
             active_wait: None,
         };
         let mut provider = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -15796,18 +16037,24 @@ mod test {
         provider.turn_boundary = None;
         provider.kind = "assistant_message".into();
         provider.text = Some("Inspecting".into());
+        crate::turn::test_support::set_message(
+            &mut provider,
+            "inspection",
+            crate::backend::MessageRole::Commentary,
+        );
         broker
             .process_backend_event(&mut runtime, &mut exchange, provider.clone(), &mut events)
             .await
             .unwrap();
         provider.text = None;
         provider.kind = "tool".into();
+        provider.message = None;
         provider.activity = Some(ToolActivity {
             id: "tool".into(),
             kind: ToolActivityKind::Command,
             title: "inspect".into(),
             output: Some("result".into()),
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             output_delta: false,
             change: Default::default(),
         });
@@ -15861,6 +16108,7 @@ mod test {
                 &mut runtime,
                 &mut exchange,
                 BackendEvent {
+                    message: None,
                     received_at_ms: Some(300),
                     address: Some(ProviderAddress {
                         owner: None,
@@ -16873,6 +17121,7 @@ mod test {
         broker.store.save_session_event(&record).unwrap();
         for used in [32_000, 64_000] {
             let usage_event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -16931,6 +17180,7 @@ mod test {
             .await
             .unwrap();
         let usage_event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,
@@ -17396,9 +17646,14 @@ mod test {
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
-            _sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            anyhow::bail!("preference persistence must not start a model turn")
+            _sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let _sink = Some(_sink);
+                anyhow::bail!("preference persistence must not start a model turn")
+            }
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn model_list(
@@ -18962,84 +19217,96 @@ mod test {
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
-            sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            use crate::backend::usage::{TokenUsage, UsageUpdate};
-            use crate::backend::{ProviderAddress, TurnBoundary};
-            let sink = sink.unwrap();
-            for ordinal in 1..=2 {
-                let address = ProviderAddress {
-                    owner: None,
-                    thread_id: "native-goal-thread".into(),
-                    turn_id: format!("turn-{ordinal}"),
-                };
-                let mut event = BackendEvent {
-                    received_at_ms: None,
-                    address: Some(address.clone()),
-                    turn_boundary: Some(TurnBoundary::Started),
-                    kind: "turn_started".into(),
-                    text: None,
-                    data: Value::Null,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                };
-                sink.send_wait(event.clone()).await?;
-                sink.send_wait(event.clone()).await?;
-                if ordinal == 2 && self.cancel_continuation {
-                    return Err(anyhow::Error::new(TurnCancelled));
-                }
-                event.turn_boundary = None;
-                event.kind = "assistant_message".into();
-                event.text = Some(format!("Attempt {ordinal}"));
-                sink.send_wait(event.clone()).await?;
-                event.kind = "usage".into();
-                event.text = None;
-                event.data = serde_json::to_value(UsageUpdate {
-                    id: format!("request-{ordinal}"),
-                    cumulative: None,
-                    cumulative_total: None,
-                    usage: TokenUsage {
-                        input: Some(100 * ordinal),
-                        cached_input: Some(0),
-                        reasoning: Some(10),
-                        output: Some(20),
-                    },
-                })?;
-                sink.send_wait(event.clone()).await?;
-                if ordinal == 2 {
-                    let mut late = event.clone();
-                    late.address.as_mut().unwrap().turn_id = "turn-1".into();
-                    late.data = serde_json::to_value(UsageUpdate {
-                        id: "late-request".into(),
+            sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let sink = Some(sink);
+                use crate::backend::usage::{TokenUsage, UsageUpdate};
+                use crate::backend::{ProviderAddress, TurnBoundary};
+                let sink = sink.unwrap();
+                for ordinal in 1..=2 {
+                    let address = ProviderAddress {
+                        owner: None,
+                        thread_id: "native-goal-thread".into(),
+                        turn_id: format!("turn-{ordinal}"),
+                    };
+                    let mut event = BackendEvent {
+                        message: None,
+                        received_at_ms: None,
+                        address: Some(address.clone()),
+                        turn_boundary: Some(TurnBoundary::Started),
+                        kind: "turn_started".into(),
+                        text: None,
+                        data: Value::Null,
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    };
+                    sink.send_wait(event.clone()).await?;
+                    sink.send_wait(event.clone()).await?;
+                    if ordinal == 2 && self.cancel_continuation {
+                        return Err(anyhow::Error::new(TurnCancelled));
+                    }
+                    event.turn_boundary = None;
+                    event.kind = "assistant_message".into();
+                    event.text = Some(format!("Attempt {ordinal}"));
+                    event.message = Some(completed_message(
+                        format!("attempt-{ordinal}"),
+                        crate::backend::MessageRole::Response,
+                        format!("Attempt {ordinal}"),
+                    ));
+                    sink.send_wait(event.clone()).await?;
+                    event.kind = "usage".into();
+                    event.message = None;
+                    event.text = None;
+                    event.data = serde_json::to_value(UsageUpdate {
+                        id: format!("request-{ordinal}"),
                         cumulative: None,
                         cumulative_total: None,
                         usage: TokenUsage {
-                            input: Some(50),
+                            input: Some(100 * ordinal),
                             cached_input: Some(0),
-                            reasoning: Some(0),
-                            output: Some(5),
+                            reasoning: Some(10),
+                            output: Some(20),
                         },
                     })?;
-                    sink.send_wait(late.clone()).await?;
-                    sink.send_wait(late).await?;
-                    let mut replay = event.clone();
-                    replay.address.as_mut().unwrap().turn_id = "turn-1".into();
-                    replay.kind = "turn_started".into();
-                    replay.turn_boundary = Some(TurnBoundary::Started);
-                    sink.send_wait(replay).await?;
+                    sink.send_wait(event.clone()).await?;
+                    if ordinal == 2 {
+                        let mut late = event.clone();
+                        late.address.as_mut().unwrap().turn_id = "turn-1".into();
+                        late.data = serde_json::to_value(UsageUpdate {
+                            id: "late-request".into(),
+                            cumulative: None,
+                            cumulative_total: None,
+                            usage: TokenUsage {
+                                input: Some(50),
+                                cached_input: Some(0),
+                                reasoning: Some(0),
+                                output: Some(5),
+                            },
+                        })?;
+                        sink.send_wait(late.clone()).await?;
+                        sink.send_wait(late).await?;
+                        let mut replay = event.clone();
+                        replay.address.as_mut().unwrap().turn_id = "turn-1".into();
+                        replay.kind = "turn_started".into();
+                        replay.turn_boundary = Some(TurnBoundary::Started);
+                        sink.send_wait(replay).await?;
+                    }
+                    event.kind = "turn_completed".into();
+                    event.data = Value::Null;
+                    event.turn_boundary = Some(TurnBoundary::Finished {
+                        outcome: crate::turn::TurnOutcome::Completed,
+                    });
+                    sink.send_wait(event).await?;
                 }
-                event.kind = "turn_completed".into();
-                event.data = Value::Null;
-                event.turn_boundary = Some(TurnBoundary::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                });
-                sink.send_wait(event).await?;
+                let mut output = crate::backend::BackendOutput::default();
+                output.evidence.native_state = Some(GoalState::Complete);
+                output.evidence.tool_called = true;
+                Ok(output)
             }
-            let mut output = crate::backend::BackendOutput::default();
-            output.evidence.native_state = Some(GoalState::Complete);
-            output.evidence.tool_called = true;
-            Ok(output)
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -19272,12 +19539,21 @@ mod test {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            event_sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            let mut output = self.inner.prompt_stream(request, event_sink).await?;
-            output.evidence.native_state = Some(self.state);
-            output.evidence.tool_called = true;
-            Ok(output)
+            event_sink: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let event_sink = Some(event_sink);
+                let mut output = self
+                    .inner
+                    .prompt_stream(request, event_sink.unwrap())
+                    .await?
+                    .into_output();
+                output.evidence.native_state = Some(self.state);
+                output.evidence.tool_called = true;
+                Ok(output)
+            }
+            .await;
+            Ok(output?.into_completion())
         }
 
         async fn fork(
@@ -19733,7 +20009,7 @@ mod test {
                     title: "file changes".into(),
                     output: None,
                     output_delta: false,
-                    status: Some("completed".into()),
+                    status: Some(crate::backend::ToolStatus::Succeeded),
                     change: crate::backend::ProviderChangeSet {
                         file: vec![crate::backend::ProviderFileChange {
                             path: path.into(),

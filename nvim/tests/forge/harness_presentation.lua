@@ -232,13 +232,24 @@ local ok, failure = xpcall(function()
   assert(requests[#requests].params.sequence == staging.params.sequence, "staging retry changed mutation identity")
   requests[#requests].callback({})
   assert(not owner.failure)
+  local retained_lines = vim.api.nvim_buf_get_lines(transcript, 0, -1, false)
+  local retained_cursor = vim.api.nvim_win_get_cursor(window)
+  local retained_view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
+  local retained_revision = owner.transcript.revision
   refresh().callback(nil, "duplicate block identity", { code = "invalid_state" })
   local failed_count = #requests
   for _ = 1, 3 do owner.sync() end
   assert(#requests == failed_count, "failed presentation retried a request requiring reopening")
   assert(owner.failure and owner.failure:find("Reopen Harness to retry", 1, true))
+  assert(not owner.pending and not owner.syncing, "permanent projection failure left publication pending")
   assert(#notices == 1, "refresh failure flooded notifications: " .. vim.inspect(notices))
-  assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "retained history")
+  assert(owner.transcript.status == "Applied" and owner.transcript.revision == retained_revision,
+    "permanent projection failure invalidated the usable transcript revision")
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), retained_lines),
+    "permanent projection failure replaced usable transcript content")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), retained_cursor)
+    and vim.deep_equal(vim.api.nvim_win_call(window, vim.fn.winsaveview), retained_view),
+    "permanent projection failure moved the transcript cursor or viewport")
   assert(owner.close())
   transcript = vim.api.nvim_create_buf(false, true)
   composer = vim.api.nvim_create_buf(false, true)

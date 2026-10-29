@@ -6,6 +6,32 @@ use crate::{
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn message(
+    id: impl Into<String>,
+    role: Option<crate::backend::MessageRole>,
+    text: impl Into<String>,
+) -> crate::backend::ProviderMessage {
+    crate::backend::ProviderMessage {
+        id: crate::backend::MessageId(id.into()),
+        role,
+        update: crate::backend::MessageUpdate::Delta { text: text.into() },
+    }
+}
+
+pub(crate) fn set_message(
+    event: &mut BackendEvent,
+    id: impl Into<String>,
+    role: crate::backend::MessageRole,
+) {
+    let role = if role == crate::backend::MessageRole::Thought && event.kind == "reasoning_summary"
+    {
+        crate::backend::MessageRole::ThoughtSummary
+    } else {
+        role
+    };
+    event.message = Some(message(id, Some(role), event.text.as_deref().unwrap_or("")));
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct TestTurn {
     exchange: Exchange,
@@ -49,6 +75,7 @@ impl TestTurn {
     }
     pub(crate) fn record_tool(&mut self, activity: &ToolActivity, now_ms: i64) -> Result<()> {
         let event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,

@@ -107,7 +107,7 @@ impl HarnessBroker {
                 .await?;
         }
         self.emit_backend_event(
-            BackendEvent {
+            BackendEvent { message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,

@@ -116,6 +116,7 @@ impl HarnessBroker {
                     self.store.save_exchange(&interaction)?;
                     self.emit_live_interaction(
                         BackendEvent {
+                            message: None,
                             received_at_ms: None,
                             address: None,
                             turn_boundary: None,
@@ -236,6 +237,7 @@ impl HarnessBroker {
                 if cancelled {
                     Box::pin(self.emit_live_interaction(
                         BackendEvent {
+                            message: None,
                             received_at_ms: None,
                             address: None,
                             turn_boundary: None,
@@ -354,6 +356,7 @@ impl HarnessBroker {
         }
         Box::pin(self.emit_live_interaction(
             BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -387,6 +390,7 @@ impl HarnessBroker {
         self.session.active_task = self.task_controller.current()?;
         Box::pin(self.emit_backend_event(
             BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,

@@ -129,8 +129,8 @@ impl ToolStore {
                 output: super::ToolOutputText::default(),
                 status: activity
                     .status
-                    .clone()
-                    .unwrap_or_else(|| "inProgress".into()),
+                    .unwrap_or(crate::backend::ToolStatus::Running)
+                    .to_string(),
                 failed: false,
                 change: ProviderChangeSet::default(),
             });
@@ -145,7 +145,7 @@ impl ToolStore {
         if tool.state() == ToolState::Running
             && let Some(status) = activity.status.as_ref()
         {
-            tool.status.clone_from(status);
+            tool.status = status.to_string();
         }
         if let Some(output) = activity.output.as_ref() {
             if activity.output_delta {
@@ -227,7 +227,7 @@ mod tests {
         assert!(tool_failed("failed"));
         let mut store = ToolStore::default();
         let activity: ToolActivity = serde_json::from_value(serde_json::json!({
-            "id":"successful", "kind":"tool_call", "title":"test", "status":"completed",
+            "id":"successful", "kind":"tool_call", "title":"test", "status":"succeeded",
             "output":"0 rejected: valid output", "output_delta":false
         }))
         .unwrap();

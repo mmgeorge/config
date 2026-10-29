@@ -344,6 +344,14 @@
     "github.issue.sync.progress": {
       "route": "progress",
       "required": {}
+    },
+    "session.plan.question.answer.progress": {
+      "route": "progress",
+      "required": {
+        "question_id": "string",
+        "model": "string",
+        "effort": "string"
+      }
     }
   },
   "document": {

@@ -78,7 +78,7 @@ impl<'exchange> ExchangeLayout<'exchange> {
         let mut response_position = activity.len();
         let mut response_turn = None;
         for (position, node) in activity.iter().enumerate() {
-            if is_final_response(exchange, node)? {
+            if is_outer_message(exchange, node)? {
                 response_position = position;
                 if let ExchangeNode::TurnContent { turn_id, .. } = node {
                     response_turn = Some(turn_id.as_str());
@@ -116,8 +116,8 @@ impl<'exchange> ExchangeLayout<'exchange> {
     }
 }
 
-/// Identify outer responses without treating later-turn commentary as final output.
-pub(super) fn is_final_response(exchange: &Exchange, node: &ExchangeNode) -> Result<bool> {
+/// Keeps unclassified streaming text visible without granting commentary ownership.
+pub(super) fn is_outer_message(exchange: &Exchange, node: &ExchangeNode) -> Result<bool> {
     let ExchangeNode::TurnContent {
         turn_id,
         item: TurnItem::Message { id },
@@ -136,7 +136,10 @@ pub(super) fn is_final_response(exchange: &Exchange, node: &ExchangeNode) -> Res
         .iter()
         .find(|message| message.id() == id)
         .context("timeline content references a missing message")?;
-    Ok(message.delivery() == MessageDelivery::Final)
+    Ok(matches!(
+        message.delivery(),
+        MessageDelivery::Final | MessageDelivery::Unknown
+    ))
 }
 
 /// Materializes Markdown padding once so native wrapping shares the parser's content origin.

@@ -8,7 +8,7 @@ pub use identity::ToolAddress;
 pub use output::ToolOutputText;
 pub use tool::{ToolCall, ToolState, ToolStore};
 
-pub use message::{Message, MessageDelivery, MessageKind, TurnItem};
+pub use message::{Message, MessageDelivery, MessageKind, MessageState, TurnItem};
 mod identity;
 
 #[cfg(test)]

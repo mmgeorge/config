@@ -223,6 +223,11 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
         };
         active.start_turn(address.clone(), 0)?;
         let commentary = BackendEvent {
+            message: Some(crate::turn::test_support::message(
+                "commentary",
+                Some(crate::backend::MessageRole::Commentary),
+                "Inspecting startup",
+            )),
             received_at_ms: None,
             address: Some(address.clone()),
             turn_boundary: None,
@@ -253,6 +258,7 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
         }
         active.observe_turn(
             &BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(address),
                 turn_boundary: None,
@@ -265,7 +271,7 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
                     title: "Inspect files".into(),
                     output: None,
                     output_delta: false,
-                    status: Some("completed".into()),
+                    status: Some(crate::backend::ToolStatus::Succeeded),
                     change: Default::default(),
                 }),
                 summary: None,

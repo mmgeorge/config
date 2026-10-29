@@ -22,6 +22,11 @@ local ok, failure = xpcall(function()
   reject({ id = -1, result = {} })
   reject({ id = 1, error = "failure" })
   reject({ id = 1, result = {}, unexpected = true })
+  local answer_progress = { request_id = 7, event = "session.plan.question.answer.progress",
+    payload = { question_id = "question", model = "mock-model", effort = "high" } }
+  assert(decode(answer_progress).payload.model == "mock-model")
+  answer_progress.payload.effort = nil
+  reject(answer_progress)
   reject({ session_id = "session", event = "unregistered", payload = {} })
   reject({ session_id = "session", event = "backend_event", payload = { kind = "unregistered" } })
   reject({ session_id = "session", event = "document_changed", payload = { session_id = "session", revision = -1 } })

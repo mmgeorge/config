@@ -127,10 +127,7 @@ end
             !backend.model_list(prompt.clone()).await?.is_empty(),
             "model catalog missing"
         );
-        request.backend_session_id = backend
-            .prompt_stream(prompt, None)
-            .await?
-            .backend_session_id;
+        request.backend_session_id = backend.prompt(prompt).await?.completion.backend_session_id;
         for _ in 0..2 {
             let servers = backend.mcp_list(request.clone()).await?;
             let unavailable = servers

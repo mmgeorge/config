@@ -322,6 +322,11 @@ mod tests {
         };
         source.start_turn(address.clone(), 0)?;
         let commentary = |id: &str| BackendEvent {
+            message: Some(crate::turn::test_support::message(
+                id,
+                Some(crate::backend::MessageRole::Commentary),
+                id,
+            )),
             received_at_ms: None,
             address: Some(address.clone()),
             turn_boundary: None,

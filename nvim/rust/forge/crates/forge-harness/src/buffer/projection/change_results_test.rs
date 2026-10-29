@@ -163,6 +163,7 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
     .enumerate()
     {
         let event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address.clone()),
             turn_boundary: None,
@@ -177,7 +178,7 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
                 title: "edit".into(),
                 output: Some(format!("operation-{index}")),
                 output_delta: false,
-                status: Some(status.into()),
+                status: Some(crate::backend::ToolStatus::parse(status).unwrap()),
                 change: if index == 5 {
                     ProviderChangeSet::default()
                 } else {

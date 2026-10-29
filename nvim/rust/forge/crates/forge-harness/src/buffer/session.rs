@@ -728,6 +728,9 @@ impl SessionPresentation {
         document: &DocumentId,
         revision: DocumentRevision,
     ) -> Result<PresentationSync> {
+        if let Some(failure) = &self.document(document)?.failure {
+            return Err(super::TranscriptProjectionFailure::new(failure.clone()).into());
+        }
         if self.activity_updated.elapsed() >= std::time::Duration::from_secs(1)
             && self.timeline.ticking_entries().next().is_some()
         {
@@ -739,9 +742,6 @@ impl SessionPresentation {
             self.activity_updated = std::time::Instant::now();
         }
         let open = self.document(document)?;
-        if let Some(failure) = &open.failure {
-            anyhow::bail!("transcript projection requires reopening: {failure}");
-        }
         let current = open.sections.document.document.revision();
         ensure!(
             revision <= current,
@@ -1561,8 +1561,9 @@ fn toggle_inline_output(
     let patches = match open.transcript.tool_layout(changes) {
         Ok(patches) => patches,
         Err(failure) => {
-            open.failure = Some(format!("{failure:#}"));
-            return Err(failure);
+            let diagnostic = format!("{failure:#}");
+            open.failure = Some(diagnostic.clone());
+            return Err(super::TranscriptProjectionFailure::new(diagnostic).into());
         }
     };
     for target in &retired_target {
@@ -2184,13 +2185,14 @@ fn retain_patch(open: &mut OpenPresentation, patch: BufferPatch) -> Result<()> {
 
 fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>) -> Result<()> {
     if let Some(failure) = &open.failure {
-        anyhow::bail!("transcript projection requires reopening: {failure}");
+        return Err(super::TranscriptProjectionFailure::new(failure.clone()).into());
     }
     let patches = match open.sections.refresh(&mut open.transcript) {
         Ok(patches) => patches,
         Err(failure) => {
-            open.failure = Some(format!("loaded section projection: {failure:#}"));
-            return Err(failure.context("loaded section projection"));
+            let diagnostic = format!("loaded section projection: {failure:#}");
+            open.failure = Some(diagnostic.clone());
+            return Err(super::TranscriptProjectionFailure::new(diagnostic).into());
         }
     };
     for patch in patches {
@@ -2287,6 +2289,7 @@ mod tests {
             exchange.finalization_outcome(),
         );
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -2307,6 +2310,11 @@ mod tests {
         event.text =
             Some("response one\nresponse two\nresponse three\nresponse four\nresponse five".into());
         event.data = serde_json::json!({"phase":"final_answer", "provider_message_id":"reply"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "reply",
+            crate::backend::MessageRole::Response,
+        );
         exchange.observe_turn(&event, 3)?;
         let mut owner = super::SessionPresentation::new("session".into());
         owner.initialize(vec![entry.clone()])?;
@@ -2430,6 +2438,11 @@ mod tests {
         event.text = Some("next one\nnext two\nnext three\nnext four\nnext five".into());
         event.data =
             serde_json::json!({"phase":"final_answer", "provider_message_id":"second-reply"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "second-reply",
+            crate::backend::MessageRole::Response,
+        );
         exchange.observe_turn(&event, 5)?;
         owner.reconcile(vec![entry.clone(), second.clone()])?;
         let second_response = owner.open.as_ref().unwrap().entry["second"].response[0].clone();
@@ -2477,6 +2490,11 @@ mod tests {
         event.text = Some("third one\nthird two\nthird three\nthird four\nthird five".into());
         event.data =
             serde_json::json!({"phase":"final_answer", "provider_message_id":"third-reply"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "third-reply",
+            crate::backend::MessageRole::Response,
+        );
         exchange.observe_turn(&event, 7)?;
         owner.reconcile(vec![entry.clone(), second.clone(), third.clone()])?;
         assert_eq!(
@@ -3281,6 +3299,7 @@ mod tests {
         let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
         for iteration in 0..100 {
             let event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(ProviderAddress {
                     owner: None,
@@ -3298,7 +3317,7 @@ mod tests {
                     kind: ToolActivityKind::Command,
                     title: "Read output".into(),
                     output: Some(format!("new {iteration} 🦀\n")),
-                    status: Some("inProgress".into()),
+                    status: Some(crate::backend::ToolStatus::Running),
                     output_delta: true,
                     change: Default::default(),
                 }),
@@ -3398,6 +3417,7 @@ mod tests {
         active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
         let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -3412,6 +3432,11 @@ mod tests {
             checklist_update: None,
             activity: None,
         };
+        crate::turn::test_support::set_message(
+            &mut event,
+            "message",
+            crate::backend::MessageRole::Response,
+        );
         exchange.observe_turn(&event, 2)?;
         let entry = TimelineEntry::Exchange {
             id: "active".into(),
@@ -3438,6 +3463,11 @@ mod tests {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         event.text = Some("\n\nMore **text** with λ.".into());
+        crate::turn::test_support::set_message(
+            &mut event,
+            "message",
+            crate::backend::MessageRole::Response,
+        );
         exchange.observe_turn(&event, 3)?;
         let patch = owner
             .update_message(&exchange, &event)?
@@ -3487,6 +3517,7 @@ mod tests {
         active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
         let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -3501,10 +3532,16 @@ mod tests {
             checklist_update: None,
             activity: None,
         };
+        crate::turn::test_support::set_message(
+            &mut event,
+            "message",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 2)?;
         let thought_id = exchange.node_list.last().unwrap().id().to_owned();
         let mut tool_event = event.clone();
         tool_event.kind = "tool".into();
+        tool_event.message = None;
         tool_event.text = None;
         tool_event.data = serde_json::Value::Null;
         tool_event.activity = Some(ToolActivity {
@@ -3513,7 +3550,7 @@ mod tests {
             title: "Read owned output".into(),
             output: Some("Thought-owned output".into()),
             output_delta: false,
-            status: Some("running".into()),
+            status: Some(crate::backend::ToolStatus::Running),
             change: Default::default(),
         });
         exchange.observe_turn(&tool_event, 2)?;
@@ -3573,6 +3610,11 @@ mod tests {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         event.text = Some("\n\nMore **text** with λ.".into());
+        crate::turn::test_support::set_message(
+            &mut event,
+            "message",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 3)?;
         let patch = owner
             .update_message(&exchange, &event)?
@@ -3631,7 +3673,7 @@ mod tests {
                 .0,
             thought_id
         );
-        tool_event.activity.as_mut().unwrap().status = Some("completed".into());
+        tool_event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
         exchange.observe_turn(&tool_event, 4)?;
         owner.reconcile(vec![
             interaction_entry("settled"),
@@ -3672,6 +3714,7 @@ mod tests {
             active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
             let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
             let mut event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(ProviderAddress {
                     owner: None,
@@ -3681,11 +3724,16 @@ mod tests {
                 turn_boundary: None,
                 kind: "reasoning_summary".into(),
                 text: Some("Inspect settings.".into()),
-                data: serde_json::json!({"provider_message_id":"thought"}),
+                data: serde_json::Value::Null,
                 summary: None,
                 checklist_update: None,
                 activity: None,
             };
+            crate::turn::test_support::set_message(
+                &mut event,
+                "streamed-summary",
+                crate::backend::MessageRole::Thought,
+            );
             exchange.observe_turn(&event, 2)?;
             let mut owner = SessionPresentation::new("session".into());
             owner.initialize(vec![
@@ -3719,6 +3767,11 @@ mod tests {
                 WidthProfile::default(),
             )?;
             event.text = Some(" Next step.".into());
+            crate::turn::test_support::set_message(
+                &mut event,
+                "streamed-summary",
+                crate::backend::MessageRole::Thought,
+            );
             exchange.observe_turn(&event, 3)?;
             let patch = owner
                 .update_message(&exchange, &event)?
@@ -3864,6 +3917,7 @@ mod tests {
         );
         let expanded_revision = owner.snapshot(&document)?.revision;
         let event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -3881,7 +3935,7 @@ mod tests {
                 kind: ToolActivityKind::Command,
                 title: "Read output".into(),
                 output: Some("\nseventh\n".into()),
-                status: Some("inProgress".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 output_delta: true,
                 change: Default::default(),
             }),
@@ -3976,6 +4030,7 @@ mod tests {
         let mut group_position = None;
         let mut thought_id = None;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,
@@ -4002,6 +4057,11 @@ mod tests {
                 event.kind = "assistant_message".into();
                 event.text = Some("Write the requested files.\nPreserve their content.".into());
                 event.data = json!({"params":{"itemId":"thought","phase":"commentary"}});
+                crate::turn::test_support::set_message(
+                    &mut event,
+                    "thought",
+                    crate::backend::MessageRole::Commentary,
+                );
                 exchange.observe_turn(&event, 0)?;
                 owner.reconcile(vec![entry(&exchange)])?;
                 let snapshot = owner.snapshot(&document)?;
@@ -4034,8 +4094,14 @@ mod tests {
             event.kind = "reasoning_summary".into();
             event.text = Some("Continue writing".into());
             event.data = json!({"provider_message_id":format!("reasoning-{batch}")});
+            crate::turn::test_support::set_message(
+                &mut event,
+                format!("reasoning-{batch}"),
+                crate::backend::MessageRole::Thought,
+            );
             exchange.observe_turn(&event, batch as i64 * 10 + 1)?;
             event.kind = "tool".into();
+            event.message = None;
             event.text = None;
             event.data = Value::Null;
             event.activity = Some(ToolActivity {
@@ -4044,7 +4110,7 @@ mod tests {
                 title: "file changes".into(),
                 output: None,
                 output_delta: false,
-                status: Some("running".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: ProviderChangeSet {
                     file: range
                         .map(|index| ProviderFileChange {
@@ -4089,7 +4155,7 @@ mod tests {
                     .unwrap();
                 assert!(group.text.wire_rows().join("").contains("running"));
             }
-            event.activity.as_mut().unwrap().status = Some("completed".into());
+            event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
             exchange.observe_turn(&event, batch as i64 * 10 + 3)?;
             exchange.observe_turn(&event, batch as i64 * 10 + 3)?;
             if batch == 0 {
@@ -4115,7 +4181,7 @@ mod tests {
                 title: "Inspect file".into(),
                 output: Some("File inspected".into()),
                 output_delta: false,
-                status: Some("completed".into()),
+                status: Some(crate::backend::ToolStatus::Succeeded),
                 change: ProviderChangeSet::default(),
             });
             exchange.observe_turn(&event, batch as i64 * 10 + 4)?;
@@ -4430,6 +4496,21 @@ mod tests {
                     .is_some_and(|error| error.contains("retaining the previous document"))
             );
             assert_eq!(owner.snapshot(&document)?.block, previous.block);
+            let failure = owner
+                .sync(&document, previous.revision)
+                .err()
+                .expect("failed projection");
+            assert!(
+                failure
+                    .downcast_ref::<super::super::TranscriptProjectionFailure>()
+                    .is_some()
+            );
+            let failure = retain_patches(owner.open.as_mut().unwrap(), Vec::new()).unwrap_err();
+            assert!(
+                failure
+                    .downcast_ref::<super::super::TranscriptProjectionFailure>()
+                    .is_some()
+            );
         }
         Ok(())
     }
@@ -4450,6 +4531,7 @@ mod tests {
             Value::Null;
         let mut exchange: Exchange = serde_json::from_value(value["exchange"].take())?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -4467,7 +4549,7 @@ mod tests {
                 kind: ToolActivityKind::Command,
                 title: "Latest parallel tool".into(),
                 output: Some("Latest output".into()),
-                status: Some("inProgress".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 output_delta: false,
                 change: Default::default(),
             }),
@@ -4558,7 +4640,7 @@ mod tests {
             kind: ToolActivityKind::Command,
             title: "Third parallel tool".into(),
             output: Some("Third output".into()),
-            status: Some("inProgress".into()),
+            status: Some(crate::backend::ToolStatus::Running),
             output_delta: false,
             change: Default::default(),
         });
@@ -4600,7 +4682,7 @@ mod tests {
         for id in ["tool", "latest", "third"] {
             let activity = event.activity.as_mut().unwrap();
             activity.id = id.into();
-            activity.status = Some("completed".into());
+            activity.status = Some(crate::backend::ToolStatus::Succeeded);
             activity.output = None;
             exchange.observe_turn(&event, 5)?;
         }
@@ -4608,6 +4690,11 @@ mod tests {
         event.kind = "assistant_message".into();
         event.text = Some("Tool group complete, continuing the exchange.".into());
         event.data = json!({ "phase": "commentary" });
+        crate::turn::test_support::set_message(
+            &mut event,
+            "continuing",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 6)?;
         owner.reconcile(vec![TimelineEntry::Exchange {
             id: "parallel".into(),
@@ -4745,6 +4832,7 @@ mod tests {
                 started_at_ms: 1,
             };
             let mut event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(ProviderAddress {
                     owner: None,
@@ -4764,6 +4852,11 @@ mod tests {
             event.kind = "assistant_message".into();
             event.text = Some(body.into());
             event.data = serde_json::json!({"phase":"final_answer"});
+            crate::turn::test_support::set_message(
+                &mut event,
+                "response",
+                crate::backend::MessageRole::Response,
+            );
             exchange.observe_turn(&event, 2).unwrap();
             event.text = None;
             event.turn_boundary = Some(TurnBoundary::Finished {
@@ -5013,6 +5106,7 @@ mod tests {
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 1 },
         };
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: Some(TurnBoundary::Started),
@@ -5027,16 +5121,22 @@ mod tests {
         event.turn_boundary = None;
         event.kind = "reasoning".into();
         event.text = Some("Completed thought\nwith details".into());
+        crate::turn::test_support::set_message(
+            &mut event,
+            "thought",
+            crate::backend::MessageRole::Thought,
+        );
         interaction.observe_turn(&event, 0).unwrap();
         event.text = None;
         event.kind = "tool".into();
+        event.message = None;
         event.activity = Some(ToolActivity {
             id: "tool".into(),
             kind: ToolActivityKind::Command,
             title: "Read output".into(),
             output: Some("first\nsecond\nthird\nfourth\nfifth\nsixth".into()),
             output_delta: false,
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: Default::default(),
         });
         interaction.observe_turn(&event, 1).unwrap();
@@ -5197,6 +5297,7 @@ mod tests {
             })?;
             let projected = owner.open.as_ref().unwrap().sections.projected_entries;
             let event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(ProviderAddress {
                     owner: None,
@@ -5214,7 +5315,7 @@ mod tests {
                     kind: ToolActivityKind::Command,
                     title: "Read output".into(),
                     output: Some(delta),
-                    status: Some("inProgress".into()),
+                    status: Some(crate::backend::ToolStatus::Running),
                     output_delta: true,
                     change: Default::default(),
                 }),
@@ -5498,6 +5599,7 @@ mod tests {
                 WidthProfile::default(),
             )?;
             let mut event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(ProviderAddress {
                     owner: None,
@@ -5516,6 +5618,11 @@ mod tests {
             event.turn_boundary = None;
             event.kind = "assistant_message".into();
             event.text = Some("Second task is running".into());
+            crate::turn::test_support::set_message(
+                &mut event,
+                "response",
+                crate::backend::MessageRole::Response,
+            );
             exchange.observe_turn(&event, 3)?;
             let patch = owner.update_live(Some(&exchange), None, SessionPhase::Idle, true)?;
             assert_eq!(
@@ -5692,6 +5799,7 @@ mod tests {
             run_id: None,
         })?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(child.turn[0].provider().clone()),
             turn_boundary: None,
@@ -5704,7 +5812,7 @@ mod tests {
                 title: "Read output".into(),
                 output: Some("\nSTREAMED_CHILD_OUTPUT".into()),
                 output_delta: true,
-                status: Some("inProgress".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: Default::default(),
             }),
             summary: None,
@@ -5719,6 +5827,11 @@ mod tests {
         event.kind = "assistant_message".into();
         event.text = Some("CHILD_FINAL_RESPONSE".into());
         event.data = serde_json::json!({"phase":"final_answer"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "response",
+            crate::backend::MessageRole::Response,
+        );
         child.observe_turn(&event, 3)?;
         owner.reconcile(vec![entry(child.clone())])?;
         assert!(!contents(&owner)?.contains("CHILD_FINAL_RESPONSE"));
@@ -5895,6 +6008,7 @@ mod tests {
                 .any(|row| row.contains("queued while selecting agent"))
         );
         let event = crate::backend::BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(interaction.turn[0].provider().clone()),
             turn_boundary: None,
@@ -5906,7 +6020,7 @@ mod tests {
                 kind: crate::backend::ToolActivityKind::Command,
                 title: "Read output".into(),
                 output: Some("\nscoped output".into()),
-                status: Some("inProgress".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 output_delta: true,
                 change: Default::default(),
             }),

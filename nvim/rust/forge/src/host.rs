@@ -435,15 +435,8 @@ impl ConnectionHost {
                 }
                 .await;
                 if let Err(error) = outcome {
-                    let code = if error.is::<forge_harness::broker::RequestNotAdmitted>() {
-                        "not_admitted"
-                    } else {
-                        "request_failed"
-                    };
-                    sink.send(Message::Response(Response::failure(
-                        request_id,
-                        code,
-                        forge_harness::storage::error_message(&error),
+                    sink.send(Message::Response(request_failure_response(
+                        request_id, &error,
                     )))?;
                 }
                 Ok(())
@@ -679,6 +672,21 @@ fn handshake_response(envelope: RoutedRequestEnvelope) -> Result<Response> {
     )?)
 }
 
+fn request_failure_response(request_id: u64, error: &anyhow::Error) -> Response {
+    let code = if error.is::<forge_harness::broker::RequestNotAdmitted>() {
+        "not_admitted"
+    } else if error.is::<forge_harness::buffer::TranscriptProjectionFailure>() {
+        "invalid_state"
+    } else {
+        "request_failed"
+    };
+    Response::failure(
+        request_id,
+        code,
+        forge_harness::storage::error_message(error),
+    )
+}
+
 fn complete_request(state: &mut RequestTaskState, outcome: TaskOutcome) -> Result<()> {
     let task_id = match &outcome {
         Ok((task_id, _)) => *task_id,
@@ -734,6 +742,39 @@ async fn write_frame<Output: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_projection_failure_is_invalid_state_through_context() {
+        let error = anyhow::Error::new(forge_harness::buffer::TranscriptProjectionFailure::new(
+            "duplicate block identity",
+        ))
+        .context("sync Harness transcript");
+        let response = request_failure_response(37, &error);
+        assert_eq!(response.id, 37);
+        let failure = response.error().unwrap();
+        assert_eq!(failure.code, "invalid_state");
+        assert_eq!(
+            failure.message,
+            "sync Harness transcript: transcript projection requires reopening: duplicate block identity"
+        );
+
+        let untyped = anyhow::anyhow!("{error:#}");
+        assert_eq!(
+            request_failure_response(38, &untyped).error().unwrap().code,
+            "request_failed"
+        );
+        let admission = anyhow::Error::new(forge_harness::broker::RequestNotAdmitted(
+            "execution is unavailable",
+        ))
+        .context("prepare Harness request");
+        assert_eq!(
+            request_failure_response(39, &admission)
+                .error()
+                .unwrap()
+                .code,
+            "not_admitted"
+        );
+    }
 
     #[test]
     fn handshake_rejects_session_context() {

@@ -167,6 +167,7 @@ mod test {
         exchange
             .observe_turn(
                 &BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: Some(address),
                     turn_boundary: None,
@@ -181,7 +182,7 @@ mod test {
                         title: "edit".into(),
                         output: None,
                         output_delta: false,
-                        status: Some("completed".into()),
+                        status: Some(crate::backend::ToolStatus::Succeeded),
                         change: changes,
                     }),
                 },
@@ -247,6 +248,7 @@ mod test {
             .unwrap();
             exchange.resume(0).unwrap();
             let mut event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(ProviderAddress {
                     owner: None,
@@ -270,7 +272,7 @@ mod test {
                 title: "apply_patch".into(),
                 output: Some(source),
                 output_delta: false,
-                status: Some("completed".into()),
+                status: Some(crate::backend::ToolStatus::Succeeded),
                 change: changes,
             });
             exchange.observe_turn(&event, 1).unwrap();

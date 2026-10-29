@@ -312,7 +312,7 @@ async fn cancellation_during_copilot_startup_does_not_wait_or_send() -> Result<(
     let slot = backend.session_slot(&session_id).await;
     let startup = slot.lock().await;
     let (sink, _events) = crate::backend::events::channel();
-    let mut prompt = Box::pin(backend.prompt_stream(request, Some(sink)));
+    let mut prompt = Box::pin(backend.prompt_stream(request, sink));
     assert!(futures_util::poll!(prompt.as_mut()).is_pending());
     assert!(backend.has_active_turn(&session_id).await);
     tokio::time::timeout(
@@ -636,7 +636,7 @@ async fn native_rewind(first_failure: Option<Value>, delivery: NativeUserDeliver
     };
     let execution = async {
         let (sink, _events) = crate::backend::events::channel();
-        let prompt = backend.prompt_stream(request, Some(sink));
+        let prompt = backend.prompt_stream(request, sink);
         let cleanup = async {
             sent_ready.await?;
             backend.cleanup_execution(&session_id).await
@@ -985,7 +985,7 @@ async fn copilot_rejection_without_answer_fails_instead_of_completing() -> Resul
                 Ok::<_, anyhow::Error>(())
             };
             let (server, result) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                tokio::join!(server, backend.prompt_stream(request.clone(), Some(sink)))
+                tokio::join!(server, backend.prompt_stream(request.clone(), sink))
             })
             .await?;
             server?;

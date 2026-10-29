@@ -162,7 +162,10 @@ impl Fixture {
                                 "data":{"totalResponseSizeBytes":index}}}})).await;
                     }
                     for (event_type, data) in [
-                        ("assistant.message", json!({"content":"Repository answer"})),
+                        (
+                            "assistant.message",
+                            json!({"messageId":"answer","phase":"final_answer","content":"Repository answer"}),
+                        ),
                         ("assistant.idle", json!({})),
                     ] {
                         write_message(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event",
@@ -232,11 +235,7 @@ impl Drop for Fixture {
 async fn mcp_failures_keep_prompt_and_catalog_available() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let fixture = Fixture::new(&["broken", "disabled", "healthy"]).await;
-        let output = fixture
-            .backend
-            .prompt_stream(fixture.prompt(), None)
-            .await
-            .unwrap();
+        let output = fixture.backend.prompt(fixture.prompt()).await.unwrap();
         assert!(
             output
                 .event
@@ -373,11 +372,7 @@ async fn mcp_timeout_preserves_healthy_servers_and_session() {
                 .iter()
                 .any(|method| method == "session.destroy")
         );
-        let output = fixture
-            .backend
-            .prompt_stream(fixture.prompt(), None)
-            .await
-            .unwrap();
+        let output = fixture.backend.prompt(fixture.prompt()).await.unwrap();
         assert!(
             output
                 .event

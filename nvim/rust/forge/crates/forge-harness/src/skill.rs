@@ -473,6 +473,7 @@ mod tests {
 
     fn event(id: &str, data: Value, status: &str) -> BackendEvent {
         BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -488,7 +489,7 @@ mod tests {
                 kind: ToolActivityKind::ToolCall,
                 title: "Read".into(),
                 output: Some("Instructions".into()),
-                status: Some(status.into()),
+                status: Some(crate::backend::ToolStatus::parse(status).unwrap()),
                 change: Default::default(),
                 output_delta: false,
             }),

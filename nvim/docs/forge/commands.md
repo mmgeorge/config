@@ -402,6 +402,11 @@ to the planning model. Choose a model, thinking level, and speed to override it,
 or **Use planning** to clear the override. Answers run in a forked session using
 the same provider and appear below their review questions without entering the
 main timeline.
+After saving a question, its answer block shows
+`Generating response · <model> · Thinking: <effort>`. Leaving and returning to the
+block preserves the pending status and the eventual answer. Closing PlanReview
+while an answer is running keeps the review open and explains the pending operation.
+If the buffer is forcibly closed, completed answers remain available after reopening.
 Planning has an approval preference (Keep current, ask, deny, or allow) and an
 Auto-approve control. Execute has an approval default (ask, deny, or allow) for new
 goals and accepted plans. Neither preference changes filesystem access.

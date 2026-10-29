@@ -92,9 +92,13 @@ pub(crate) async fn prompt(
         let result = if progress.attempt == 0 {
             submit(backend, &mut request, event_sink.clone(), submission_store).await
         } else {
-            backend
-                .prompt_stream(request.clone(), event_sink.clone())
-                .await
+            match event_sink.clone() {
+                Some(sink) => backend
+                    .prompt_stream(request.clone(), sink)
+                    .await
+                    .map(super::BackendCompletion::into_output),
+                None => backend.prompt(request.clone()).await,
+            }
         };
         let error = match result {
             Ok(output) => {
@@ -194,7 +198,13 @@ async fn submit(
             submission.accepted("local mock admission".into())?;
         }
     }
-    let result = backend.prompt_stream(request.clone(), sink).await;
+    let result = match sink {
+        Some(sink) => backend
+            .prompt_stream(request.clone(), sink)
+            .await
+            .map(super::BackendCompletion::into_output),
+        None => backend.prompt(request.clone()).await,
+    };
     if result.is_ok()
         || result
             .as_ref()
@@ -239,6 +249,7 @@ async fn publish(
 ) -> Result<()> {
     if let Some(sink) = sink {
         sink.send_wait(BackendEvent {
+            message: None,
             received_at_ms: None,
             address,
             turn_boundary: None,
@@ -297,27 +308,31 @@ mod tests {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _: Option<BackendEventSink>,
-        ) -> Result<BackendOutput> {
-            let mut requests = self.request.lock().unwrap();
-            requests.push((request, tokio::time::Instant::now()));
-            if self.permanent {
-                anyhow::bail!("unauthorized");
-            }
-            if requests.len() <= self.failure_count {
-                return Err(RetryableFailure {
-                    address: ProviderAddress {
-                        owner: None,
-                        thread_id: "retained-thread".into(),
-                        turn_id: format!("turn-{}", requests.len()),
-                    },
-                    code: "serverOverloaded".into(),
-                    detail: json!({"message":format!("capacity failure {}", requests.len())}),
-                    message: format!("capacity failure {}", requests.len()),
+            _: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                let mut requests = self.request.lock().unwrap();
+                requests.push((request, tokio::time::Instant::now()));
+                if self.permanent {
+                    anyhow::bail!("unauthorized");
                 }
-                .into());
+                if requests.len() <= self.failure_count {
+                    return Err(RetryableFailure {
+                        address: ProviderAddress {
+                            owner: None,
+                            thread_id: "retained-thread".into(),
+                            turn_id: format!("turn-{}", requests.len()),
+                        },
+                        code: "serverOverloaded".into(),
+                        detail: json!({"message":format!("capacity failure {}", requests.len())}),
+                        message: format!("capacity failure {}", requests.len()),
+                    }
+                    .into());
+                }
+                Ok(BackendOutput::default())
             }
-            Ok(BackendOutput::default())
+            .await;
+            Ok(output?.into_completion())
         }
     }
 
@@ -360,6 +375,7 @@ mod tests {
         assert!(!replay_safe(&output));
         output = BackendOutput::default();
         output.event.push(BackendEvent {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,

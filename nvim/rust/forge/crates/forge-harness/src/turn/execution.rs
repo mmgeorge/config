@@ -1,4 +1,6 @@
-use super::{Message, MessageDelivery, MessageKind, TurnItem};
+#[cfg(test)]
+use super::MessageDelivery;
+use super::{Message, MessageKind, MessageState, TurnItem};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -145,7 +147,7 @@ impl Turn {
         self.record_provider_text(kind, text, None, default_delivery(kind), false)
     }
 
-    /// Reconcile provider text while retaining its message identity and original timeline position.
+    #[cfg(test)]
     pub(crate) fn record_provider_text(
         &mut self,
         kind: MessageKind,
@@ -154,46 +156,90 @@ impl Turn {
         delivery: MessageDelivery,
         snapshot: bool,
     ) -> Result<()> {
+        use crate::backend::{MessageId, MessageRole, MessageUpdate, ProviderMessage};
+        let provider_id = provider_id.unwrap_or_else(|| {
+            self.current_message
+                .filter(|index| self.message[*index].kind() == kind && !snapshot)
+                .and_then(|index| self.message[index].provider_id.clone())
+                .unwrap_or_else(|| format!("test-message:{}", self.message.len() + 1))
+        });
+        let role = match kind {
+            MessageKind::Unknown => None,
+            MessageKind::Reasoning => Some(MessageRole::Thought),
+            MessageKind::ReasoningSummary => Some(MessageRole::ThoughtSummary),
+            MessageKind::Assistant => match delivery {
+                MessageDelivery::Unknown => None,
+                MessageDelivery::Commentary => Some(MessageRole::Commentary),
+                MessageDelivery::Final => Some(MessageRole::Response),
+            },
+        };
+        self.record_message(&ProviderMessage {
+            id: MessageId(provider_id),
+            role,
+            update: if snapshot {
+                MessageUpdate::Completed { text: text.into() }
+            } else {
+                MessageUpdate::Delta { text: text.into() }
+            },
+        })
+    }
+
+    pub(crate) fn record_message(
+        &mut self,
+        update: &crate::backend::ProviderMessage,
+    ) -> Result<()> {
+        use crate::backend::MessageUpdate;
         ensure!(
             self.state == TurnState::Running,
             "completed turn rejects message events"
         );
-        if let Some(provider_id) = provider_id.as_deref()
-            && let Some(message) = self.message.iter_mut().find(|message| {
-                message.kind == kind && message.provider_id.as_deref() == Some(provider_id)
-            })
-        {
-            message.delivery = delivery;
-            if snapshot {
-                message.text = text.to_owned();
-            } else {
+        ensure!(
+            !update.id.0.is_empty(),
+            "provider message identity is empty"
+        );
+        ensure!(
+            !matches!(update.update, MessageUpdate::Classified) || update.role.is_some(),
+            "provider message classification omitted its role"
+        );
+        let index = self
+            .message
+            .iter()
+            .position(|message| message.provider_id.as_deref() == Some(update.id.0.as_str()))
+            .unwrap_or_else(|| {
+                let index = self.message.len();
+                let id = format!("{}:message:{}", self.id, index + 1);
+                self.message.push(Message {
+                    id: id.clone(),
+                    provider_id: Some(update.id.0.clone()),
+                    role: None,
+                    state: MessageState::Streaming,
+                    text: String::new(),
+                });
+                self.item.push(TurnItem::Message { id });
+                index
+            });
+        let message = &mut self.message[index];
+        if let Some(role) = update.role {
+            message.role = Some(role);
+        }
+        match &update.update {
+            MessageUpdate::Started | MessageUpdate::Classified => {}
+            MessageUpdate::Delta { text } if message.state == MessageState::Streaming => {
                 message.text.push_str(text);
             }
-            return Ok(());
+            MessageUpdate::Completed { text } => {
+                ensure!(
+                    message.state != MessageState::Interrupted,
+                    "interrupted message rejects completion"
+                );
+                message.text = text.clone();
+                message.state = MessageState::Completed;
+            }
+            MessageUpdate::Interrupted if message.state == MessageState::Streaming => {
+                message.state = MessageState::Interrupted;
+            }
+            MessageUpdate::Delta { .. } | MessageUpdate::Interrupted => {}
         }
-        if text.is_empty() {
-            return Ok(());
-        }
-        if let Some(index) = self.current_message
-            && self.message[index].kind == kind
-            && self.message[index].delivery == delivery
-            && provider_id.is_none()
-            && self.message[index].provider_id.is_none()
-            && !snapshot
-        {
-            self.message[index].text.push_str(text);
-            return Ok(());
-        }
-        let index = self.message.len();
-        let id = format!("{}:message:{}", self.id, index + 1);
-        self.message.push(Message {
-            id: id.clone(),
-            provider_id,
-            kind,
-            delivery,
-            text: text.to_owned(),
-        });
-        self.item.push(TurnItem::Message { id });
         self.current_message = Some(index);
         Ok(())
     }
@@ -205,6 +251,11 @@ impl Turn {
                 ensure!(previous == outcome, "completed turn outcome cannot change");
             }
             TurnState::Running => {
+                for message in &mut self.message {
+                    if message.state == MessageState::Streaming {
+                        message.state = MessageState::Interrupted;
+                    }
+                }
                 self.current_message = None;
                 self.state = TurnState::Finished { outcome };
                 self.completed_at_ms = Some(now_ms.max(self.started_at_ms));
@@ -217,6 +268,7 @@ impl Turn {
 #[cfg(test)]
 fn default_delivery(kind: MessageKind) -> MessageDelivery {
     match kind {
+        MessageKind::Unknown => MessageDelivery::Unknown,
         MessageKind::Assistant => MessageDelivery::Final,
         MessageKind::Reasoning | MessageKind::ReasoningSummary => MessageDelivery::Commentary,
     }
@@ -226,6 +278,67 @@ fn default_delivery(kind: MessageKind) -> MessageDelivery {
 mod tests {
     use super::*;
     use crate::turn::test_support::TestTurn as Turn;
+
+    #[test]
+    fn typed_message_retains_identity_role_and_terminal_lifecycle() -> Result<()> {
+        use crate::backend::{MessageId, MessageRole, MessageUpdate, ProviderMessage};
+        let mut turn = super::Turn::new(
+            "local".into(),
+            ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: "provider".into(),
+            },
+            0,
+        );
+        let mut update = ProviderMessage {
+            id: MessageId("message".into()),
+            role: None,
+            update: MessageUpdate::Started,
+        };
+        turn.record_message(&update)?;
+        assert_eq!(turn.messages()[0].kind(), MessageKind::Unknown);
+        assert_eq!(turn.messages()[0].delivery(), MessageDelivery::Unknown);
+        update.update = MessageUpdate::Delta {
+            text: "Draft".into(),
+        };
+        turn.record_message(&update)?;
+        let mut turn: super::Turn = serde_json::from_value(serde_json::to_value(turn)?)?;
+        assert_eq!(turn.messages()[0].state(), MessageState::Streaming);
+        assert_eq!(turn.messages()[0].role(), None);
+        update.update = MessageUpdate::Completed {
+            text: "Final answer".into(),
+        };
+        turn.record_message(&update)?;
+        update.role = Some(MessageRole::Response);
+        update.update = MessageUpdate::Classified;
+        turn.record_message(&update)?;
+        update.role = None;
+        update.update = MessageUpdate::Delta {
+            text: "late delta".into(),
+        };
+        turn.record_message(&update)?;
+        update.update = MessageUpdate::Interrupted;
+        turn.record_message(&update)?;
+        assert_eq!(turn.items().len(), 1);
+        assert_eq!(turn.messages().len(), 1);
+        assert_eq!(turn.messages()[0].id(), "local:message:1");
+        assert_eq!(turn.messages()[0].role(), Some(MessageRole::Response));
+        assert_eq!(turn.messages()[0].state(), MessageState::Completed);
+        assert_eq!(turn.messages()[0].text(), "Final answer");
+        update.id = MessageId("unfinished".into());
+        update.role = Some(MessageRole::Commentary);
+        update.update = MessageUpdate::Delta {
+            text: "Partial".into(),
+        };
+        turn.record_message(&update)?;
+        turn.finish(TurnOutcome::Interrupted, 10)?;
+        let restored: super::Turn = serde_json::from_value(serde_json::to_value(turn)?)?;
+        assert_eq!(restored.messages()[0].state(), MessageState::Completed);
+        assert_eq!(restored.messages()[1].state(), MessageState::Interrupted);
+        assert_eq!(restored.messages()[1].text(), "Partial");
+        Ok(())
+    }
 
     #[test]
     fn provider_duration_excludes_delivery_delay_and_stays_frozen() {
@@ -239,6 +352,7 @@ mod tests {
             1000,
         );
         let event = crate::backend::BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(turn.provider().clone()),
             turn_boundary: None,
@@ -266,7 +380,7 @@ mod tests {
             kind: crate::backend::ToolActivityKind::Command,
             title: "command".into(),
             output: Some("result".into()),
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: Default::default(),
             output_delta: false,
         }
@@ -284,7 +398,7 @@ mod tests {
             1000,
         );
         let mut first = activity("first");
-        first.status = Some("running".into());
+        first.status = Some(crate::backend::ToolStatus::Running);
         let mut second = first.clone();
         second.id = "second".into();
         turn.record_tool(&first, 1000).unwrap();
@@ -296,7 +410,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(2500), Some(1500)]
         );
-        first.status = Some("failed".into());
+        first.status = Some(crate::backend::ToolStatus::Failed);
         turn.record_tool(&first, 3500).unwrap();
         turn.record_tool(&first, 6000).unwrap();
         turn.record_tool(&activity("missing-start"), 6000).unwrap();
@@ -417,7 +531,7 @@ mod tests {
         );
         let mut tool = activity("call");
         turn.record_tool(&tool, 1000).unwrap();
-        tool.status = Some("inProgress".into());
+        tool.status = Some(crate::backend::ToolStatus::Running);
         tool.output = Some("late output".into());
         turn.record_tool(&tool, 1000).unwrap();
         assert_eq!(turn.tools().count(), 1);
@@ -456,7 +570,7 @@ mod tests {
             );
             turn.record_tool(&activity("completed"), 1000).unwrap();
             let mut running = activity("running");
-            running.status = Some("inProgress".into());
+            running.status = Some(crate::backend::ToolStatus::Running);
             turn.record_tool(&running, 1000).unwrap();
             turn.finish(outcome, 20).unwrap();
             let state: Vec<_> = turn.tools().map(|tool| tool.state()).collect();

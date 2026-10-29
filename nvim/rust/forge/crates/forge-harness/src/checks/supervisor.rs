@@ -1519,6 +1519,7 @@ impl CheckSupervisor {
                 .error(
                     sink,
                     BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,

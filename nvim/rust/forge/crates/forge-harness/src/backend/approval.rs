@@ -424,6 +424,7 @@ impl PermissionCoordinator {
             Err(error) => {
                 if let Some(sink) = event_sink {
                     sink.send_wait(BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: address.clone(),
                         turn_boundary: None,
@@ -713,6 +714,7 @@ impl PermissionCoordinator {
         if let Some(event_sink) = event_sink {
             event_sink
                 .send_wait(BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: address.clone(),
                     turn_boundary: None,
@@ -923,6 +925,7 @@ impl PermissionCoordinator {
             && let Some(sink) = event_sink
         {
             sink.send_wait(BackendEvent {
+                message: None,
                 address: None,
                 turn_boundary: None,
                 received_at_ms: None,
@@ -1026,6 +1029,7 @@ impl PermissionCoordinator {
         if let Some(event_sink) = event_sink {
             let _ = event_sink
                 .send_wait(BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,

@@ -319,6 +319,7 @@ fn admitted_request_fixture(
 
 fn child_event(kind: &str) -> BackendEvent {
     BackendEvent {
+        message: None,
         received_at_ms: None,
         address: Some(crate::backend::ProviderAddress {
             owner: None,
@@ -374,12 +375,16 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         .await?;
     for ordinal in 0..6 {
         let mut thought = child_event("assistant_message");
-        thought.data = json!({"provider_message_id":format!("thought-{ordinal}"),"phase":"commentary","message_update":"snapshot"});
         thought.text = Some(if ordinal == 5 {
             "思".repeat(4001)
         } else {
             format!("Thought {ordinal}")
         });
+        thought.message = Some(completed_message(
+            format!("thought-{ordinal}"),
+            crate::backend::MessageRole::Commentary,
+            thought.text.as_deref().unwrap(),
+        ));
         broker
             .observe_managed_agent(owner.clone(), &admission.task.id, thought, &mut Vec::new())
             .await?;
@@ -388,7 +393,7 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
     let mut update = child_event("tool");
     update.activity = Some(serde_json::from_value(
         json!({"id":"same-provider-call","kind":"command",
-        "title":"Inspect compilation diagnostics","status":"inProgress","output":source}),
+        "title":"Inspect compilation diagnostics","status":"running","output":source}),
     )?);
     broker
         .observe_managed_agent(
@@ -619,7 +624,7 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         "queued follow-up must not hide active progress"
     );
 
-    update.activity.as_mut().unwrap().status = Some("failed".into());
+    update.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Failed);
     update.activity.as_mut().unwrap().output_delta = false;
     update.activity.as_mut().unwrap().output = Some("failure details".into());
     broker
@@ -631,9 +636,12 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         )
         .await?;
     let mut final_message = child_event("assistant_message");
-    final_message.data =
-        json!({"provider_message_id":"final","phase":"final_answer","message_update":"snapshot"});
     final_message.text = Some("FINAL ANSWER MUST NOT ENTER ACTIVITY".into());
+    final_message.message = Some(completed_message(
+        "final",
+        crate::backend::MessageRole::Response,
+        "FINAL ANSWER MUST NOT ENTER ACTIVITY",
+    ));
     broker
         .observe_managed_agent(
             owner.clone(),
@@ -1268,6 +1276,7 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     }
     let mut event = Vec::new();
     let mut update = BackendEvent {
+        message: None,
         received_at_ms: None,
         address: Some(crate::backend::ProviderAddress {
             owner: None,
@@ -1298,9 +1307,12 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     };
     update.turn_boundary = None;
     update.kind = "assistant_message".into();
-    update.data =
-        json!({"provider_message_id":"thought","phase":"commentary","message_update":"snapshot"});
     update.text = Some("First child thought".into());
+    update.message = Some(completed_message(
+        "thought",
+        crate::backend::MessageRole::Commentary,
+        "First child thought",
+    ));
     broker
         .observe_managed_agent(owner.clone(), &first.task.id, update.clone(), &mut event)
         .await?;
@@ -1365,9 +1377,12 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
         broker.agent_coordinator.resolve(&first.agent.id)?.inbox[0].message,
         "Retain after rejected steering"
     );
-    update.data =
-        json!({"provider_message_id":"final","phase":"final_answer","message_update":"snapshot"});
     update.text = Some("Child final response".into());
+    update.message = Some(completed_message(
+        "final",
+        crate::backend::MessageRole::Response,
+        "Child final response",
+    ));
     broker
         .observe_managed_agent(owner.clone(), &first.task.id, update.clone(), &mut event)
         .await?;
@@ -1415,11 +1430,17 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     };
     update.turn_boundary = Some(crate::backend::TurnBoundary::Started);
     update.text = None;
+    update.message = None;
     broker
         .observe_managed_agent(owner.clone(), &next.task.id, update.clone(), &mut event)
         .await?;
     update.turn_boundary = None;
     update.text = Some("New task thought".into());
+    update.message = Some(completed_message(
+        "next-thought",
+        crate::backend::MessageRole::Commentary,
+        "New task thought",
+    ));
     broker
         .observe_managed_agent(owner.clone(), &next.task.id, update.clone(), &mut event)
         .await?;
@@ -1429,6 +1450,11 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     );
     let saved_next = serde_json::to_value(broker.store.load_exchange(&next.task.id)?)?;
     update.text = Some("LATE OLD TASK".into());
+    update.message = Some(completed_message(
+        "late-old-task",
+        crate::backend::MessageRole::Commentary,
+        "LATE OLD TASK",
+    ));
     broker
         .observe_managed_agent(owner.clone(), &first.task.id, update, &mut event)
         .await?;
@@ -1516,8 +1542,10 @@ impl Backend for RoutingBackend {
     async fn prompt_stream(
         &self,
         request: BackendRequest,
-        sink: Option<BackendEventSink>,
-    ) -> Result<crate::backend::BackendOutput> {
+        sink: BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion> {
+        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+let sink = Some(sink);
         let ordinal = self.turn.fetch_add(1, Ordering::AcqRel);
         let response = if request.owner()?.is_root() {
             if ordinal == 0 {
@@ -1562,7 +1590,9 @@ impl Backend for RoutingBackend {
             "CHILD_RESULT"
         };
         if let Some(sink) = sink {
-            sink.send_wait(BackendEvent {
+            sink.send_wait(BackendEvent { message: Some(completed_message(
+                "routing-response", crate::backend::MessageRole::Response, response,
+            )),
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -1575,18 +1605,17 @@ impl Backend for RoutingBackend {
             })
             .await?;
         }
-        Ok(crate::backend::BackendOutput {
-            backend_session_id: Some(
+        Ok(crate::backend::BackendOutput { event: Vec::new(), completion: crate::backend::BackendCompletion { backend_session_id: Some(
                 if request.owner()?.is_root() {
                     "root-history"
                 } else {
                     "child-history"
                 }
                 .into(),
-            ),
-            capability: self.descriptor().capability,
-            ..Default::default()
-        })
+            ), capability: self.descriptor().capability, ..Default::default() } })
+
+        }.await;
+        Ok(output?.into_completion())
     }
 }
 
@@ -1824,57 +1853,70 @@ impl Backend for ResultReceivingBackend {
     async fn prompt_stream(
         &self,
         request: BackendRequest,
-        sink: Option<BackendEventSink>,
-    ) -> Result<crate::backend::BackendOutput> {
-        self.turn.fetch_add(1, Ordering::AcqRel);
-        self.input.lock().unwrap().push(request.input.text());
-        self.active.store(true, Ordering::Release);
-        if !request.input.text().starts_with("EXPLICIT_NEXT_TURN") {
-            let scope = request
-                .control_context
-                .as_ref()
-                .and_then(|context| context.agent.as_ref())
-                .context("root authority missing")?;
-            for task in ["first", "second"] {
-                scope
-                    .invoke(
-                        "agent_spawn",
-                        json!({"profile":"worker","text":format!("CHILD_REPORT_{task}")}),
-                    )
-                    .await?;
-            }
-            loop {
-                let notified = self.incoming.notified();
-                for (message, receipt) in self.receipt.lock().unwrap().drain(..) {
-                    self.message.lock().unwrap().push(message);
-                    let _ = receipt.send(());
+        sink: BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion> {
+        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+            let sink = Some(sink);
+            self.turn.fetch_add(1, Ordering::AcqRel);
+            self.input.lock().unwrap().push(request.input.text());
+            self.active.store(true, Ordering::Release);
+            if !request.input.text().starts_with("EXPLICIT_NEXT_TURN") {
+                let scope = request
+                    .control_context
+                    .as_ref()
+                    .and_then(|context| context.agent.as_ref())
+                    .context("root authority missing")?;
+                for task in ["first", "second"] {
+                    scope
+                        .invoke(
+                            "agent_spawn",
+                            json!({"profile":"worker","text":format!("CHILD_REPORT_{task}")}),
+                        )
+                        .await?;
                 }
-                if self.message.lock().unwrap().len() == 2 {
-                    break;
+                loop {
+                    let notified = self.incoming.notified();
+                    for (message, receipt) in self.receipt.lock().unwrap().drain(..) {
+                        self.message.lock().unwrap().push(message);
+                        let _ = receipt.send(());
+                    }
+                    if self.message.lock().unwrap().len() == 2 {
+                        break;
+                    }
+                    notified.await;
                 }
-                notified.await;
             }
-        }
-        self.active.store(false, Ordering::Release);
-        if let Some(sink) = sink {
-            sink.send_wait(BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "assistant_message".into(),
-                text: Some("SYNTHESIZED_RESULT".into()),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
+            self.active.store(false, Ordering::Release);
+            if let Some(sink) = sink {
+                sink.send_wait(BackendEvent {
+                    message: Some(completed_message(
+                        "synthesized-response",
+                        crate::backend::MessageRole::Response,
+                        "SYNTHESIZED_RESULT",
+                    )),
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "assistant_message".into(),
+                    text: Some("SYNTHESIZED_RESULT".into()),
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    checklist_update: None,
+                })
+                .await?;
+            }
+            Ok(crate::backend::BackendOutput {
+                event: Vec::new(),
+                completion: crate::backend::BackendCompletion {
+                    backend_session_id: Some("result-parent-history".into()),
+                    capability: self.descriptor().capability,
+                    ..Default::default()
+                },
             })
-            .await?;
         }
-        Ok(crate::backend::BackendOutput {
-            backend_session_id: Some("result-parent-history".into()),
-            capability: self.descriptor().capability,
-            ..Default::default()
-        })
+        .await;
+        Ok(output?.into_completion())
     }
 }
 
@@ -1968,7 +2010,11 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
         .await?;
     let mut response = child_event("assistant_message");
     response.text = Some("RETAINED_CHILD_REPORT".into());
-    response.data = json!({"phase":"final_answer","provider_message_id":"result"});
+    response.message = Some(completed_message(
+        "result",
+        crate::backend::MessageRole::Response,
+        "RETAINED_CHILD_REPORT",
+    ));
     broker
         .observe_managed_agent(owner.clone(), &admission.task.id, response, &mut event)
         .await?;
@@ -2121,59 +2167,72 @@ impl Backend for SuspendedParentBackend {
     async fn prompt_stream(
         &self,
         request: BackendRequest,
-        sink: Option<BackendEventSink>,
-    ) -> Result<crate::backend::BackendOutput> {
-        let response = if request.owner()?.is_root() {
-            self.input.lock().unwrap().push(request.input.text());
-            let ordinal = self.root_turn.fetch_add(1, Ordering::AcqRel);
-            if ordinal == 0 {
-                let scope = request
-                    .control_context
-                    .as_ref()
-                    .and_then(|context| context.agent.as_ref())
-                    .context("root authority missing")?;
-                for name in ["ONE", "TWO"] {
-                    scope
-                        .invoke(
-                            "agent_spawn",
-                            json!({"profile":"worker","text":format!("CHILD_{name}")}),
-                        )
-                        .await?;
+        sink: BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion> {
+        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+            let sink = Some(sink);
+            let response = if request.owner()?.is_root() {
+                self.input.lock().unwrap().push(request.input.text());
+                let ordinal = self.root_turn.fetch_add(1, Ordering::AcqRel);
+                if ordinal == 0 {
+                    let scope = request
+                        .control_context
+                        .as_ref()
+                        .and_then(|context| context.agent.as_ref())
+                        .context("root authority missing")?;
+                    for name in ["ONE", "TWO"] {
+                        scope
+                            .invoke(
+                                "agent_spawn",
+                                json!({"profile":"worker","text":format!("CHILD_{name}")}),
+                            )
+                            .await?;
+                    }
                 }
+                self.root_started.add_permits(1);
+                "PARENT_RESPONSE".to_owned()
+            } else {
+                let index = usize::from(request.input.text().ends_with("CHILD_TWO"));
+                self.child_started.add_permits(1);
+                self.child_release[index].acquire().await?.forget();
+                format!("RESULT_{}", if index == 0 { "ONE" } else { "TWO" })
+            };
+            if let Some(sink) = sink {
+                sink.send_wait(BackendEvent {
+                    message: Some(completed_message(
+                        "suspended-response",
+                        crate::backend::MessageRole::Response,
+                        response.clone(),
+                    )),
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "assistant_message".into(),
+                    text: Some(response),
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    checklist_update: None,
+                })
+                .await?;
             }
-            self.root_started.add_permits(1);
-            "PARENT_RESPONSE".to_owned()
-        } else {
-            let index = usize::from(request.input.text().ends_with("CHILD_TWO"));
-            self.child_started.add_permits(1);
-            self.child_release[index].acquire().await?.forget();
-            format!("RESULT_{}", if index == 0 { "ONE" } else { "TWO" })
-        };
-        if let Some(sink) = sink {
-            sink.send_wait(BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "assistant_message".into(),
-                text: Some(response),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            })
-            .await?;
+            let mut output = crate::backend::BackendOutput {
+                event: Vec::new(),
+                completion: crate::backend::BackendCompletion {
+                    backend_session_id: Some("suspended-history".into()),
+                    capability: self.descriptor().capability,
+                    ..Default::default()
+                },
+            };
+            if self.blocked.load(Ordering::Acquire) && request.input.text() == "Research both" {
+                output.plan_question = Some(crate::plan::PlanQuestionSet::freeform(
+                    "Which research scope?".into(),
+                ));
+            }
+            Ok(output)
         }
-        let mut output = crate::backend::BackendOutput {
-            backend_session_id: Some("suspended-history".into()),
-            capability: self.descriptor().capability,
-            ..Default::default()
-        };
-        if self.blocked.load(Ordering::Acquire) && request.input.text() == "Research both" {
-            output.plan_question = Some(crate::plan::PlanQuestionSet::freeform(
-                "Which research scope?".into(),
-            ));
-        }
-        Ok(output)
+        .await;
+        Ok(output?.into_completion())
     }
 }
 

@@ -14,6 +14,7 @@ pub(super) async fn answer(
         .await
         .prepare_review_questions(&request.params)?;
     let mut pending = tokio::task::JoinSet::new();
+    let request_id = request.id;
     for question in questions {
         let registry = Arc::clone(&registry);
         let source = Arc::clone(&source);
@@ -44,7 +45,7 @@ pub(super) async fn answer(
                 .broker
                 .lock()
                 .await
-                .run_review_question(scope, &selection)
+                .run_review_question(scope, &selection, Some((&message_sink, request_id)))
                 .await
         });
     }

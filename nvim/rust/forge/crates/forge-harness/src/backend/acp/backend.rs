@@ -740,102 +740,121 @@ impl Backend for AcpBackend {
     async fn prompt_stream(
         &self,
         request: BackendRequest,
-        sink: Option<BackendEventSink>,
-    ) -> Result<BackendOutput> {
-        let cancelled = request
-            .control_context
-            .as_ref()
-            .and_then(|context| context.submission_cancelled.clone())
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let skills = self
-            .permission
-            .skills(Some(&self.settings_root), &request, self.kind)?;
-        let _directories = self
-            .permission
-            .directories(Some(&self.settings_root), &request)?;
-        let sink = skills.sink(sink);
-        self.cancellation
-            .lock()
-            .await
-            .insert(request.runtime_key()?, cancelled.clone());
-        let tools = crate::control_tools::ControlToolRegistry.definition_list_for_context(
-            request.control_context.as_ref(),
-            request.owner()?.is_root(),
-        );
-        let session = self
-            .session(catalog_request(&request), Some(tools), Some(&cancelled))
-            .await?;
-        let _turn = session
-            .turn
-            .try_lock()
-            .context("ACP session already owns active work")?;
-        self.configure(&session, &request).await?;
-        if cancelled.load(Ordering::Acquire) {
-            return Err(crate::broker::TurnCancelled.into());
-        }
-        let text = match &request.input {
-            BackendInput::Text { text, .. } => text.clone(),
-            BackendInput::Skill {
-                name, arguments, ..
-            } => format!("/{name} {arguments}"),
-        };
-        let recovered = request
-            .recovered_input
-            .iter()
-            .map(BackendInput::text)
-            .collect::<Vec<_>>();
-        let text = request.recovered_text(&text, &recovered);
-        let prompt = if text == "/compact" {
-            text
-        } else {
-            format!("{}\n\n{}", request.system_message(), text)
-        };
-        let image_supported = session
-            .initialized
-            .pointer("/agentCapabilities/promptCapabilities/image")
-            .and_then(Value::as_bool)
-            == Some(true);
-        let prompt =
-            crate::attachment::acp_input(prompt, &request.input_attachments(), image_supported)
+        sink: BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion> {
+        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+            let sink = Some(sink);
+            let cancelled = request
+                .control_context
+                .as_ref()
+                .and_then(|context| context.submission_cancelled.clone())
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            let skills = self
+                .permission
+                .skills(Some(&self.settings_root), &request, self.kind)?;
+            let _directories = self
+                .permission
+                .directories(Some(&self.settings_root), &request)?;
+            let sink = skills.sink(sink);
+            self.cancellation
+                .lock()
+                .await
+                .insert(request.runtime_key()?, cancelled.clone());
+            let tools = crate::control_tools::ControlToolRegistry.definition_list_for_context(
+                request.control_context.as_ref(),
+                request.owner()?.is_root(),
+            );
+            let session = self
+                .session(catalog_request(&request), Some(tools), Some(&cancelled))
                 .await?;
-        session
-            .state
-            .begin(&request, request.owner()?, &session.id, sink)
-            .await;
-        self.conversation
-            .lock()
-            .await
-            .insert(request.runtime_key()?, session.id.clone());
-        let response = session
-            .transport
-            .submit(
-                "session/prompt",
-                json!({"sessionId":session.id,
+            let _turn = session
+                .turn
+                .try_lock()
+                .context("ACP session already owns active work")?;
+            self.configure(&session, &request).await?;
+            if cancelled.load(Ordering::Acquire) {
+                return Err(crate::broker::TurnCancelled.into());
+            }
+            let text = match &request.input {
+                BackendInput::Text { text, .. } => text.clone(),
+                BackendInput::Skill {
+                    name, arguments, ..
+                } => format!("/{name} {arguments}"),
+            };
+            let recovered = request
+                .recovered_input
+                .iter()
+                .map(BackendInput::text)
+                .collect::<Vec<_>>();
+            let text = request.recovered_text(&text, &recovered);
+            let prompt = if text == "/compact" {
+                text
+            } else {
+                format!("{}\n\n{}", request.system_message(), text)
+            };
+            let image_supported = session
+                .initialized
+                .pointer("/agentCapabilities/promptCapabilities/image")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let prompt =
+                crate::attachment::acp_input(prompt, &request.input_attachments(), image_supported)
+                    .await?;
+            session
+                .state
+                .begin(&request, request.owner()?, &session.id, sink)
+                .await;
+            self.conversation
+                .lock()
+                .await
+                .insert(request.runtime_key()?, session.id.clone());
+            let response = session
+                .transport
+                .submit(
+                    "session/prompt",
+                    json!({"sessionId":session.id,
             "prompt":prompt}),
-                request.submission.as_ref(),
-            )
-            .await;
-        let cleanup = session.state.finish().await;
-        response.context("ACP prompt failed")?;
-        cleanup?;
-        let mut output = std::mem::take(&mut *session.state.output.lock().await);
-        output.backend_session_id = Some(session.id.clone());
-        output.capability = self.runtime_capability(&session).await;
-        let catalog = session.state.catalog.read().await;
-        output.runtime = BackendRuntime {
-            provider: self.descriptor().label,
-            model: catalog
-                .pointer("/models/currentModelId")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    find_option(&catalog, "model")
-                        .and_then(|option| option["currentValue"].as_str())
-                        .map(str::to_owned)
-                }),
-        };
-        skills.output(&mut output)?;
-        Ok(output)
+                    request.submission.as_ref(),
+                )
+                .await;
+            let outcome = if cancelled.load(Ordering::Acquire)
+                || response
+                    .as_ref()
+                    .is_ok_and(|response| response["stopReason"] == "cancelled")
+            {
+                crate::turn::TurnOutcome::Cancelled
+            } else if response.is_ok() {
+                crate::turn::TurnOutcome::Completed
+            } else {
+                crate::turn::TurnOutcome::Failed
+            };
+            let cleanup = session.state.finish(outcome).await;
+            response.context("ACP prompt failed")?;
+            cleanup?;
+            if outcome == crate::turn::TurnOutcome::Cancelled {
+                return Err(crate::broker::TurnCancelled.into());
+            }
+            let mut output = std::mem::take(&mut *session.state.output.lock().await);
+            output.backend_session_id = Some(session.id.clone());
+            output.capability = self.runtime_capability(&session).await;
+            let catalog = session.state.catalog.read().await;
+            output.runtime = BackendRuntime {
+                provider: self.descriptor().label,
+                model: catalog
+                    .pointer("/models/currentModelId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        find_option(&catalog, "model")
+                            .and_then(|option| option["currentValue"].as_str())
+                            .map(str::to_owned)
+                    }),
+            };
+            skills.output(&mut output)?;
+            Ok(output)
+        }
+        .await;
+        Ok(output?.into_completion())
     }
 
     async fn model_list(&self, request: BackendRequest) -> Result<Vec<BackendModel>> {
@@ -928,7 +947,7 @@ impl Backend for AcpBackend {
         );
         let mut prompt = request.request;
         prompt.input = BackendInput::from_text("/compact");
-        self.prompt_stream(prompt, None).await
+        self.prompt(prompt).await
     }
 
     async fn has_active_turn(&self, id: &str) -> bool {

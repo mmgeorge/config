@@ -2072,6 +2072,7 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
     let runner = make_runner(workspace.path(), data.path());
     let (sink, mut stream) = crate::backend::events::channel();
     let filler = crate::backend::BackendEvent {
+        message: None,
         received_at_ms: None,
         address: None,
         turn_boundary: None,

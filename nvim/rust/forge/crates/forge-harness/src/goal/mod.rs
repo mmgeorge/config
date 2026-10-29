@@ -140,17 +140,20 @@ mod test {
         let current = crate::task::ActiveTask::goal("Current".into(), Default::default(), false, 2);
         for termination in [GoalTermination::Complete, GoalTermination::Blocked] {
             let output = crate::backend::BackendOutput {
-                evidence: TurnEvidence {
-                    structured_complete: true,
-                    structured_blocked: true,
+                event: Vec::new(),
+                completion: crate::backend::BackendCompletion {
+                    evidence: TurnEvidence {
+                        structured_complete: true,
+                        structured_blocked: true,
+                        ..Default::default()
+                    },
+                    goal_control: Some(GoalControl {
+                        permit: current.permit(),
+                        termination,
+                    }),
+                    dispatched_task_permit: Some(previous.permit()),
                     ..Default::default()
                 },
-                goal_control: Some(GoalControl {
-                    permit: current.permit(),
-                    termination,
-                }),
-                dispatched_task_permit: Some(previous.permit()),
-                ..Default::default()
             };
             let (evidence, permit) = output.goal_evidence();
             assert_eq!(

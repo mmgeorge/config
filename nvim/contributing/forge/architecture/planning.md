@@ -80,6 +80,18 @@ captures preserve accepted identities and revisions. Comment save can resolve a 
 to its numeric identity, and restoration retains that region when reopening saved draft state.
 Materialization returns comment body snapshots and anchors for local presentation ownership.
 
+Plan Review Ask requests publish request-correlated progress after the answer fork
+resolves its model and thinking settings. The question's reply block displays
+`Generating response · <model> · Thinking: <effort>` until the saved answer arrives.
+Lua binds each update to its pending request and annotation identity, preserving
+that status across compact and focused rendering without moving the reader's
+cursor. Progress from a retired request cannot replace another question or a
+completed answer. The source session's planning model and thinking remain unchanged.
+Answer and annotation-save completions settle their operation ownership even when
+the physical review buffer has been wiped. Saved answers remain in native plan
+state, so reopening reconstructs the completed thread rather than retaining a
+permanently saving view. Retiring an invalid view never reads its buffer options.
+
 ## Captured declarations and saved-plan resolution
 
 Declaration design records use the schema version declared by the current plan implementation. Older plan records are excluded from storage reads,

@@ -16,6 +16,11 @@ local perf = require("forge.infra.perf")
 ---@field version integer
 ---@field checks {id: string, name: string, stage: string, enabled: boolean, available: boolean, reason?: string}[]
 
+---@class ForgePlanAnswerProgress
+---@field question_id string
+---@field model string
+---@field effort string
+
 ---@param options table
 ---@param callback fun(owner: table?, failure: string?)
 ---@return table
@@ -100,9 +105,9 @@ function M.attach(options, callback)
       pending_operation = owner.pending_operation and vim.deepcopy(owner.pending_operation) }
   end
   function owner.close()
-    if owner.saving or owner.submission_pending then return false end
-    if vim.bo[options.buffer].modified then return true end
     if owner.closed then return true end
+    if owner.saving or owner.submission_pending then return false end
+    if vim.api.nvim_buf_is_valid(options.buffer) and vim.bo[options.buffer].modified then return true end
     owner.closed = true
     comments.detach(options.buffer, false)
     if owner.gutter_selection then owner.gutter_selection.close() end
@@ -165,7 +170,7 @@ function M.attach(options, callback)
         status = failure and "failed" or "completed" })
       owner.annotation_saving, owner.submission_pending = false, false
       owner.saving = next(owner.pending_reply_by_id) ~= nil
-      if not failure then
+      if not failure and alive() then
         perf.trace("harness", "ui.plan.edit.comments_saved", {
           operation_id = operation.params and operation.params.operation_id, document = owner.document,
         }, function() comments.saved(options.buffer, operation.capture) end)
@@ -206,22 +211,32 @@ function M.attach(options, callback)
           and (not reply or reply.question_body ~= annotation.source.body)
           and (not answering or answering.replies_body ~= annotation.source.body) then
           pending[#pending + 1] = { id = annotation.id, replies_body = annotation.source.body,
-            replies = { { heading = "Plan answer", body_lines = { "Answering…" } } } }
+            replies = { { heading = "Plan answer", body_lines = { "Generating response · Resolving model and thinking…" } } } }
         end
       end
-      request({ operation = "plan_save_annotations", document = owner.document,
-        saved_source_digest = owner.saved_source_digest, annotation = operation.capture }, function(result, failure)
+      client.request({ session_id = options.session_id, method = "session.document", params = {
+        operation = "plan_save_annotations", document = owner.document,
+        saved_source_digest = owner.saved_source_digest, annotation = operation.capture } }, function(result, failure)
+        if owner.generation ~= client.host_get_generation() or not client.host_is_accepting() then
+          complete(nil, "Plan host is unavailable. The local draft remains in its buffer.")
+          return
+        end
         if failure then complete(nil, failure) return end
+        if not alive() then complete(result, nil) return end
         for _, update in ipairs(pending) do owner.pending_reply_by_id[tostring(update.id)] = update end
         comments.update(options.buffer, pending)
         for _, update in ipairs(pending) do
           local captured, capture_failure = input.capture(owner.replica, owner.current_view(), "session.plan.question.answer")
           local function answer_received(answer_result, answer_failure)
-            if not alive() then return end
             local id = tostring(update.id)
             if owner.pending_reply_by_id[id] ~= update then return end
             owner.pending_reply_by_id[id] = nil
             owner.saving = owner.annotation_saving or next(owner.pending_reply_by_id) ~= nil
+            if not alive() then
+              if answer_failure and owner.generation == client.host_get_generation()
+                and client.host_is_accepting() and options.notice then options.notice(answer_failure) end
+              return
+            end
             if answer_failure then
               update.replies = {}
               comments.update(options.buffer, { update })
@@ -230,9 +245,19 @@ function M.attach(options, callback)
               show_answers(answer_result.annotation)
             end
           end
+          ---@param progress ForgePlanAnswerProgress
+          local function answer_progress(progress)
+            if not alive() or owner.pending_reply_by_id[tostring(update.id)] ~= update
+              or progress.question_id ~= tostring(update.id) then return end
+            local model = progress.model == "default" and "Resolving model" or progress.model
+            update.replies = { { heading = "Plan answer", body_lines = {
+              "Generating response · " .. model .. " · Thinking: " .. progress.effort,
+            } } }
+            comments.update(options.buffer, { update })
+          end
           if captured then
             client.request({ session_id = options.session_id, method = "session.plan.question.answer",
-              params = { review = captured, question_ids = { tostring(update.id) } } }, answer_received)
+              params = { review = captured, question_ids = { tostring(update.id) } } }, answer_received, answer_progress)
           else answer_received(nil, capture_failure) end
         end
         complete(result, nil)

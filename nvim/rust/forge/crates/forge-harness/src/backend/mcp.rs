@@ -108,8 +108,7 @@ impl McpDiscovery {
 mod test {
     use super::*;
     use crate::backend::{
-        BackendCapability, BackendDescriptor, BackendEventSink, BackendKind, BackendOutput,
-        BackendRequest,
+        BackendCapability, BackendDescriptor, BackendEventSink, BackendKind, BackendRequest,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -153,9 +152,11 @@ mod test {
         async fn prompt_stream(
             &self,
             _: BackendRequest,
-            _: Option<BackendEventSink>,
-        ) -> Result<BackendOutput> {
-            anyhow::bail!("catalog discovery must not prompt")
+            _: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> =
+                async { anyhow::bail!("catalog discovery must not prompt") }.await;
+            Ok(output?.into_completion())
         }
 
         async fn mcp_configuration(&self, _: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {

@@ -187,6 +187,7 @@ fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
     exchange.start_turn(address.clone(), 1)?;
     let source = "λ unicode output\n".repeat(100_000);
     let event = BackendEvent {
+        message: None,
         received_at_ms: None,
         address: Some(address),
         turn_boundary: None,
@@ -200,7 +201,7 @@ fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
             kind: ToolActivityKind::Command,
             title: "read".into(),
             output: Some(source.clone()),
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: Default::default(),
             output_delta: false,
         }),

@@ -1043,8 +1043,10 @@ impl Backend for CopilotBackend {
     async fn prompt_stream(
         &self,
         request: BackendRequest,
-        event_sink: Option<BackendEventSink>,
-    ) -> Result<BackendOutput> {
+        event_sink: BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion> {
+        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+let event_sink = Some(event_sink);
         let turn_event = self.turn_event(&request.runtime_key()?).await;
         let skills = self.permission_coordinator.skills(
             self.settings_root.as_deref(),
@@ -1103,15 +1105,10 @@ impl Backend for CopilotBackend {
             .clone()
             .unwrap_or_else(|| ControlTurnContext::inactive(request.mode));
         let mut control_stream = control_router.activate(control_context)?;
-        let mut output = BackendOutput {
-            backend_session_id: Some(session.id().to_string()),
-            capability: capability(),
-            runtime: crate::backend::BackendRuntime {
+        let mut output = BackendOutput { event: Vec::new(), completion: crate::backend::BackendCompletion { backend_session_id: Some(session.id().to_string()), capability: capability(), runtime: crate::backend::BackendRuntime {
                 provider: "Copilot CLI".into(),
                 model: (request.model != "default").then(|| request.model.clone()),
-            },
-            ..BackendOutput::default()
-        };
+            }, ..Default::default() } };
         let decoder = CopilotEventDecoder {
             workspace: request.workspace.clone(),
         };
@@ -1201,7 +1198,7 @@ impl Backend for CopilotBackend {
                     if completes_exchange(&provider_event) {
                         if let Some(failure) = &retry_failure {
                             let failure: &super::retry::RetryableFailure = failure;
-                            let completed = BackendEvent {
+                            let completed = BackendEvent { message: None,
                                 received_at_ms: None, address: Some(failure.address.clone()),
                                 turn_boundary: Some(super::TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Failed }),
                                 kind: "turn_completed".into(), text: None, data: failure.detail.clone(),
@@ -1316,6 +1313,9 @@ impl Backend for CopilotBackend {
                 .take_timeout_feedback(&request.owner()?)?;
         }
         Ok(output)
+
+        }.await;
+        Ok(output?.into_completion())
     }
 
     async fn compact(&self, request: super::BackendCompactionRequest) -> Result<BackendOutput> {
@@ -1375,18 +1375,20 @@ impl Backend for CopilotBackend {
                     .and_then(|(used, size)| crate::session::ContextUsage::reported(used, size))
             });
         Ok(BackendOutput {
-            backend_session_id: Some(session.id().to_string()),
-            capability: capability(),
-            runtime: crate::backend::BackendRuntime {
-                provider: "Copilot CLI".into(),
-                model: None,
-            },
             event: vec![BackendEvent::from_compaction(compaction, None)],
-            metrics: crate::backend::TurnMetrics {
-                context_usage,
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some(session.id().to_string()),
+                capability: capability(),
+                runtime: crate::backend::BackendRuntime {
+                    provider: "Copilot CLI".into(),
+                    model: None,
+                },
+                metrics: crate::backend::TurnMetrics {
+                    context_usage,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..BackendOutput::default()
         })
     }
 

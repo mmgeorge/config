@@ -554,6 +554,7 @@ mod tests {
         let mut output = BackendOutput::default();
         apply_invocation(&invocation, &mut output)?;
         let permit = output
+            .completion
             .goal_control
             .context("goal control lost its task permit")?
             .permit;
@@ -574,7 +575,7 @@ mod tests {
                         exchange_ordinal: 1,
                         turn_ordinal: 1
                     },
-                    output.evidence,
+                    output.completion.evidence,
                     3
                 )
                 .unwrap_err()

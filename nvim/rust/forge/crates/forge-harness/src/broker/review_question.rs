@@ -81,6 +81,7 @@ impl HarnessBroker {
         &mut self,
         scope: Arc<ReviewAnswerScope>,
         selection: &AskModel,
+        progress: Option<(&forge_protocol::outbound::MessageSender, u64)>,
     ) -> Result<()> {
         let catalog = if selection.model.is_some() {
             self.backend
@@ -103,6 +104,20 @@ impl HarnessBroker {
         self.session.access.write_access = crate::session::WriteScope::Off;
         self.save_session()?;
         scope.check()?;
+        if let Some((sink, request_id)) = progress {
+            sink.send(forge_protocol::message::Message::RequestEvent(
+                forge_protocol::message::RequestEvent {
+                    request_id,
+                    event: forge_protocol::contract::RequestEventName::SessionPlanQuestionAnswerProgress
+                        .as_str().into(),
+                    payload: json!({
+                        "question_id": scope.question.id,
+                        "model": self.session.model,
+                        "effort": if self.session.effort.is_empty() { "Default" } else { &self.session.effort },
+                    }),
+                },
+            ))?;
+        }
         let prompt = format!(
             "Answer this Plan Review question in 1-2 sentences in your final response. Do not edit files or the plan.\n\n{}",
             scope.question.prompt

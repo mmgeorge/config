@@ -1,9 +1,11 @@
+use crate::backend::MessageRole;
 use serde::{Deserialize, Serialize};
 
 /// Distinguishes provider reasoning from user-visible assistant text.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
+    Unknown,
     Assistant,
     Reasoning,
     ReasoningSummary,
@@ -13,8 +15,17 @@ pub enum MessageKind {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageDelivery {
+    Unknown,
     Commentary,
     Final,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageState {
+    Streaming,
+    Completed,
+    Interrupted,
 }
 
 /// Owns one contiguous provider message independently of presentation folds.
@@ -22,8 +33,8 @@ pub enum MessageDelivery {
 pub struct Message {
     pub(crate) id: String,
     pub(crate) provider_id: Option<String>,
-    pub(crate) kind: MessageKind,
-    pub(crate) delivery: MessageDelivery,
+    pub(crate) role: Option<MessageRole>,
+    pub(crate) state: MessageState,
     pub(crate) text: String,
 }
 
@@ -35,7 +46,12 @@ impl Message {
 
     /// Return the normalized provider message role.
     pub fn kind(&self) -> MessageKind {
-        self.kind
+        match self.role {
+            None => MessageKind::Unknown,
+            Some(MessageRole::ThoughtSummary) => MessageKind::ReasoningSummary,
+            Some(MessageRole::Thought) => MessageKind::Reasoning,
+            Some(MessageRole::Commentary | MessageRole::Response) => MessageKind::Assistant,
+        }
     }
 
     /// Return the provider identity used to coalesce replayed message deltas.
@@ -45,7 +61,21 @@ impl Message {
 
     /// Return whether the message is progress commentary or the final answer.
     pub fn delivery(&self) -> MessageDelivery {
-        self.delivery
+        match self.role {
+            None => MessageDelivery::Unknown,
+            Some(MessageRole::Response) => MessageDelivery::Final,
+            Some(MessageRole::Thought | MessageRole::ThoughtSummary | MessageRole::Commentary) => {
+                MessageDelivery::Commentary
+            }
+        }
+    }
+
+    pub fn role(&self) -> Option<MessageRole> {
+        self.role
+    }
+
+    pub fn state(&self) -> MessageState {
+        self.state
     }
 
     /// Borrow all received text without granting mutation of completed history.

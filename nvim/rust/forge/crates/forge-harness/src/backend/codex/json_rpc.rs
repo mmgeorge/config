@@ -1040,6 +1040,7 @@ async fn normalize_event_in_workspace(
         .is_some()
     {
         let event = BackendEvent {
+            message: None,
             address,
             received_at_ms: None,
             turn_boundary: Some(if method_lower == "turn/started" {
@@ -1070,6 +1071,7 @@ async fn normalize_event_in_workspace(
     if !agent_lifecycle_list.is_empty() {
         for lifecycle in agent_lifecycle_list {
             let event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -1096,6 +1098,7 @@ async fn normalize_event_in_workspace(
             && let Some(update) = usage_update(&params)
         {
             let event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: address.clone(),
                 turn_boundary: None,
@@ -1114,6 +1117,7 @@ async fn normalize_event_in_workspace(
         if let Some(context_usage) = context_usage(&params) {
             output.metrics.context_usage = Some(context_usage.clone());
             let event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: address.clone(),
                 turn_boundary: None,
@@ -1179,9 +1183,32 @@ async fn normalize_event_in_workspace(
     if !user_message_item
         && (tool_event || plan_event || reasoning_event || assistant_event || error_event)
     {
-        let activity = tool_event
-            .then(|| normalize_tool_activity(method, &params, workspace))
-            .flatten();
+        let activity = if tool_event {
+            match normalize_tool_activity(method, &params, workspace) {
+                Ok(activity) => activity,
+                Err(error) => {
+                    let event = BackendEvent {
+                        message: None,
+                        address,
+                        received_at_ms: None,
+                        turn_boundary: None,
+                        kind: "error".into(),
+                        text: Some(format!("{error:#}")),
+                        data: json!({"method":method}),
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    };
+                    if let Some(sink) = event_sink {
+                        let _ = sink.send_wait(event.clone()).await;
+                    }
+                    append_output_event(output, event);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if control_tool.is_some() && activity.is_none() {
             return;
         }
@@ -1193,6 +1220,7 @@ async fn normalize_event_in_workspace(
             .flatten();
         let data = json!({ "method": method, "params": params });
         let event = BackendEvent {
+            message: None,
             address,
             received_at_ms: None,
             turn_boundary: None,
@@ -1254,6 +1282,15 @@ fn normalize_reasoning(
                     data["message_update"] = json!("snapshot");
                 }
                 BackendEvent {
+                    message: Some(crate::backend::ProviderMessage {
+                        id: crate::backend::MessageId(format!("{item_id}:summary:{index}")),
+                        role: Some(crate::backend::MessageRole::ThoughtSummary),
+                        update: if lifecycle {
+                            crate::backend::MessageUpdate::Completed { text: text.clone() }
+                        } else {
+                            crate::backend::MessageUpdate::Delta { text: text.clone() }
+                        },
+                    }),
                     address: address.clone(),
                     received_at_ms: None,
                     turn_boundary: None,
@@ -1286,42 +1323,70 @@ fn normalize_message(
     if !delta && !lifecycle {
         return None;
     }
-    let mut event = BackendEvent {
+    let id = pointer_string(params, &["/itemId", "/item_id", "/item/id"])?;
+    let role = match pointer_string(params, &["/item/phase", "/phase"]) {
+        Some(phase) => match crate::backend::MessageRole::from_phase(&phase) {
+            Ok(role) => Some(role),
+            Err(error) => {
+                return Some(BackendEvent {
+                    message: None,
+                    address,
+                    received_at_ms: None,
+                    turn_boundary: None,
+                    kind: "error".into(),
+                    text: Some(error.to_string()),
+                    data: json!({"method":method}),
+                    activity: None,
+                    summary: None,
+                    checklist_update: None,
+                });
+            }
+        },
+        None => output.event.iter().rev().find_map(|previous| {
+            (previous.address == address && previous.message_id() == Some(id.as_str()))
+                .then(|| previous.message.as_ref().and_then(|message| message.role))
+                .flatten()
+        }),
+    };
+    let text = if delta {
+        params
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else if completed {
+        params
+            .pointer("/item/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    let event = BackendEvent {
+        message: Some(crate::backend::ProviderMessage {
+            id: crate::backend::MessageId(id),
+            role,
+            update: if delta {
+                crate::backend::MessageUpdate::Delta {
+                    text: text.clone().unwrap_or_default(),
+                }
+            } else if completed {
+                crate::backend::MessageUpdate::Completed {
+                    text: text.clone().unwrap_or_default(),
+                }
+            } else {
+                crate::backend::MessageUpdate::Started
+            },
+        }),
         address,
         received_at_ms: None,
         turn_boundary: None,
         kind: "assistant_message".into(),
-        text: if delta {
-            params
-                .get("delta")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        } else if completed {
-            params
-                .pointer("/item/text")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        } else {
-            None
-        },
+        text,
         data: json!({ "method": method, "params": params }),
         activity: None,
         summary: None,
         checklist_update: None,
     };
-    if event.message_phase().is_none()
-        && let Some(id) = event.message_id()
-        && let Some(phase) = output.event.iter().rev().find_map(|previous| {
-            (previous.address == event.address && previous.message_id() == Some(id))
-                .then(|| previous.message_phase())
-                .flatten()
-        })
-    {
-        event.data["params"]["phase"] = json!(phase);
-    }
-    if completed {
-        event.data["message_update"] = json!("snapshot");
-    }
     Some(event)
 }
 
@@ -1705,6 +1770,29 @@ fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
                 previous.text.get_or_insert_default().push_str(text);
             }
         }
+        if let Some(message) = &mut previous.message {
+            message.role = event
+                .message
+                .as_ref()
+                .and_then(|message| message.role)
+                .or(message.role);
+            message.update = if event.message_snapshot() {
+                crate::backend::MessageUpdate::Completed {
+                    text: previous.text.clone().unwrap_or_default(),
+                }
+            } else if event.text.is_some() {
+                crate::backend::MessageUpdate::Delta {
+                    text: previous.text.clone().unwrap_or_default(),
+                }
+            } else {
+                event
+                    .message
+                    .as_ref()
+                    .expect("message event")
+                    .update
+                    .clone()
+            };
+        }
         previous.data = event.data;
         return;
     }
@@ -1846,18 +1934,25 @@ fn normalize_checklist_update(method: &str, params: &Value) -> Option<ProviderCh
     })
 }
 
-fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Option<ToolActivity> {
+fn normalize_tool_activity(
+    method: &str,
+    params: &Value,
+    workspace: &str,
+) -> Result<Option<ToolActivity>> {
     let envelope = params.get("update").unwrap_or(params);
     let item = envelope.get("item").unwrap_or(envelope);
-    let id = item
+    let Some(id) = item
         .get("id")
         .or_else(|| envelope.get("itemId"))
         .or_else(|| envelope.get("item_id"))
         .or_else(|| envelope.get("toolCallId"))
         .or_else(|| envelope.get("tool_call_id"))
         .or_else(|| envelope.get("callId"))
-        .and_then(Value::as_str)?
-        .to_owned();
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let id = id.to_owned();
     let item_type = item
         .get("type")
         .and_then(Value::as_str)
@@ -1971,7 +2066,11 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
                         .then(|| "inProgress".to_owned())
                 })
         });
-    Some(ToolActivity {
+    let status = status
+        .as_deref()
+        .map(crate::backend::ToolStatus::parse)
+        .transpose()?;
+    Ok(Some(ToolActivity {
         id,
         kind,
         title,
@@ -1980,7 +2079,7 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
         change: normalize_file_change_set(item, envelope, workspace),
         output_delta: method_lower.ends_with("/outputdelta")
             || method_lower.ends_with("/output_delta"),
-    })
+    }))
 }
 
 fn normalize_file_change_set(item: &Value, envelope: &Value, workspace: &str) -> ProviderChangeSet {
@@ -2382,7 +2481,7 @@ mod test {
         }
         process.finish_requests(&mut output).await?;
         assert_eq!(output.design_patch.len(), 2);
-        for patch in output.design_patch {
+        for patch in output.completion.design_patch {
             document = document.patch_design(fixture.path(), patch)?;
         }
         assert_eq!(document.version, 6);
@@ -2653,8 +2752,11 @@ mod test {
     async fn native_goal_state_ignores_child_and_unknown_notifications() {
         use crate::goal::GoalState;
         let mut output = crate::backend::BackendOutput {
-            backend_session_id: Some("parent".into()),
-            ..Default::default()
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some("parent".into()),
+                ..Default::default()
+            },
         };
         for (thread, status, expected) in [
             ("child", "blocked", None),
@@ -2902,7 +3004,10 @@ mod test {
         normalize_event_in_workspace(&lifecycle("item/completed"), &mut output, None, "", false)
             .await;
 
-        let submit = output.plan_submit.expect("accepted submit request");
+        let submit = output
+            .completion
+            .plan_submit
+            .expect("accepted submit request");
         assert_eq!(submit.plan_id, "plan-1");
         assert_eq!(submit.expected_version, 5);
     }
@@ -2975,7 +3080,10 @@ mod test {
             &mut output,
             None,
         ).await;
-        let question = output.plan_question.expect("structured planning question");
+        let question = output
+            .completion
+            .plan_question
+            .expect("structured planning question");
         assert_eq!(question.questions[0].header, "Migration");
         assert_eq!(question.questions[0].options[0].label, "Staged");
         assert!(output.event.is_empty());
@@ -3001,6 +3109,7 @@ mod test {
         )
         .await;
         let answer = answer_output
+            .completion
             .question_answer
             .expect("structured question answer");
         assert_eq!(answer.question_id, "migration");
@@ -3021,7 +3130,11 @@ mod test {
         )
         .await;
         assert_eq!(
-            withdrawal_output.question_withdrawal.unwrap().reason,
+            withdrawal_output
+                .completion
+                .question_withdrawal
+                .unwrap()
+                .reason,
             "Repository policy determines the choice."
         );
         assert!(withdrawal_output.event.is_empty());
@@ -3213,7 +3326,10 @@ mod test {
             let event = stream.try_recv()?;
             let activity = event.activity.expect("published tool lifecycle");
             assert_eq!(activity.id, call_id);
-            assert_eq!(activity.status.as_deref(), Some(status));
+            assert_eq!(
+                activity.status,
+                Some(crate::backend::ToolStatus::parse(status).unwrap())
+            );
             turn.record_tool(&activity, now_ms)?;
         }
         let tool = turn.tools().collect::<Vec<_>>();
@@ -3419,14 +3535,20 @@ mod test {
             if !event.message_snapshot()
                 && let Some(text) = event.text
             {
-                delta.push((text, event.data["params"]["phase"].clone()));
+                delta.push((
+                    text,
+                    event.message.as_ref().and_then(|message| message.role),
+                ));
             }
         }
         assert_eq!(
             delta,
             vec![
-                ("Checking files".into(), json!("commentary")),
-                ("Done".into(), json!("final_answer")),
+                (
+                    "Checking files".into(),
+                    Some(crate::backend::MessageRole::Commentary)
+                ),
+                ("Done".into(), Some(crate::backend::MessageRole::Response)),
             ]
         );
         // The same provider item ID in another agent must not inherit the parent's phase.
@@ -3584,7 +3706,7 @@ mod test {
         assert_eq!(activity.id, "command-1");
         assert_eq!(activity.title, "Get-Content README.md");
         assert_eq!(activity.output.as_deref(), Some("# Harness\nline two\n"));
-        assert_eq!(activity.status.as_deref(), Some("inProgress"));
+        assert_eq!(activity.status, Some(crate::backend::ToolStatus::Running));
         let completed = output.event[1].activity.as_ref().unwrap();
         assert_eq!(completed.id, "command-completed-with-different-provider-id");
         assert_eq!(completed.status.as_deref(), Some("completed"));

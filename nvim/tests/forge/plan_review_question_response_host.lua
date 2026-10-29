@@ -5,7 +5,7 @@ assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
 vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
 local initialized = vim.system({ "git", "init", workspace }, { text = true }):wait(30000)
 assert(initialized.code == 0, initialized.stderr)
-local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
+local executable = data .. "/forge-test-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
@@ -76,7 +76,11 @@ local function begin_answer(scene, body)
   assert(pending.session_id ~= scene.review.session_id, "review question entered the main timeline")
   scene.answer_session_id = pending.session_id
   assert(scene.review.owner.saving, "question did not remain pending before release")
-  assert(text(scene):find("Answering…", 1, true), "pending question omitted its progress row")
+  assert(text(scene):find("Generating response", 1, true), "pending question omitted its progress row")
+  local model = scene.expected_model or state.session.resolved_model or state.session.model
+  local effort = scene.expected_effort or (state.session.effort ~= "" and state.session.effort or "Default")
+  assert(text(scene):find("Generating response · " .. model .. " · Thinking: " .. effort, 1, true),
+    "pending question omitted its captured model and thinking")
 end
 
 local function finish_answer(scene)
@@ -98,7 +102,7 @@ local function assert_answer(scene, question)
   local question_row = row_containing(scene, question.source.body)
   local answer_row = row_containing(scene, answer, question_row + 1)
   assert(answer_row > question_row, "answer did not appear below its question")
-  assert(not text(scene):find("Answering…", 1, true), "completed question retained its progress row")
+  assert(not text(scene):find("Generating response", 1, true), "completed question retained its progress row")
   local reply = scene.review.owner.reply_by_id[tostring(question.id)]
   assert(reply and reply.question_body == question.source.body, "answer attached to a different question")
   assert(not vim.bo[scene.review.buf].modified, "completed answer left the saved question dirty")
@@ -292,7 +296,115 @@ local cases = {
     reopen(scene)
     assert_answer(scene, question)
   end },
+  { name = "answer completes while another tab owns the cursor", run = function(scene)
+    local question = add_message(scene, "A", "Why does requested_change own this behavior?")
+    begin_answer(scene, question.source.body)
+    vim.api.nvim_set_current_tabpage(scene.review.return_tab)
+    local window = vim.api.nvim_get_current_win()
+    local cursor = vim.api.nvim_win_get_cursor(window)
+    finish_answer(scene)
+    assert(vim.api.nvim_get_current_win() == window, "answer stole focus from another tab")
+    assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), cursor), "answer moved another tab's cursor")
+    assert_answer(scene, question)
+    review_view.open(scene.plan)
+    await(function() return vim.api.nvim_get_current_tabpage() == scene.review.tab end, "review did not regain focus")
+    assert_answer(scene, question)
+  end },
+  { name = "unsaved comment survives closing and reopening the plan", run = function(scene)
+    local comment = add_message(scene, "C", "Retain this unsaved review comment.")
+    assert(vim.bo[scene.review.buf].modified, "new comment was not dirty")
+    press(scene, "q")
+    await(function() return vim.api.nvim_get_current_tabpage() == scene.review.return_tab end,
+      "dirty PlanReview did not return to Harness")
+    review_view.open(scene.plan)
+    await(function() return state.plan_review and state.plan_review.owner.ready end,
+      "dirty PlanReview did not reopen")
+    scene.review = state.plan_review
+    assert(text(scene):find(comment.source.body, 1, true), "reopening discarded the unsaved comment")
+    assert(vim.bo[scene.review.buf].modified, "reopening cleared the unsaved marker")
+    press(scene, ":write<CR>")
+    await(function() return not scene.review.owner.saving end, "reopened comment did not save")
+    reopen(scene)
+    assert(text(scene):find(comment.source.body, 1, true), "saving discarded the recovered comment")
+    assert(not vim.bo[scene.review.buf].modified, "saved recovered comment remained dirty")
+  end },
+  { name = "cancelled answer clears progress and can be retried", run = function(scene)
+    local question = add_message(scene, "A", "Why does requested_change own this behavior?")
+    begin_answer(scene, question.source.body)
+    leave_question(scene, question.id)
+    scene.hold:cancel()
+    scene.hold = nil
+    assert(vim.wait(10000, function() return not scene.review.owner.saving and #errors > 0 end, 10),
+      "cancelled answer did not finish and report its failure")
+    assert(#errors == 1, "cancelled answer did not report one failure")
+    errors = {}
+    assert(not text(scene):find("Generating response", 1, true), "cancelled answer retained its progress row")
+    assert(scene.review.owner.reply_by_id[tostring(question.id)] == nil, "cancelled request published an answer")
+    begin_answer(scene, question.source.body)
+    finish_answer(scene)
+    assert_answer(scene, question)
+  end },
+  { name = "wiped review buffer settles its answer and can reopen", run = function(scene)
+    local question = add_message(scene, "A", "Why does requested_change own this behavior?")
+    begin_answer(scene, question.source.body)
+    vim.api.nvim_buf_delete(scene.review.buf, { force = true })
+    scene.hold:release()
+    scene.hold = nil
+    await(function() return not scene.review.owner.saving end, "closed review retained a completed answer operation")
+    review_view.open(scene.plan)
+    await(function() return state.plan_review and state.plan_review.owner.ready
+      and vim.api.nvim_buf_is_valid(state.plan_review.buf) end, "wiped PlanReview did not reopen")
+    scene.review = state.plan_review
+    assert_answer(scene, question)
+  end },
+  { name = "wiped review settles a failed answer and allows retry", run = function(scene)
+    local question = add_message(scene, "A", "Why does requested_change own this behavior?")
+    begin_answer(scene, question.source.body)
+    vim.api.nvim_buf_delete(scene.review.buf, { force = true })
+    scene.hold:cancel()
+    scene.hold = nil
+    assert(vim.wait(10000, function() return not scene.review.owner.saving and #errors > 0 end, 10),
+      "closed review retained a failed answer operation")
+    assert(#errors == 1, "failed closed review did not report one failure")
+    errors = {}
+    review_view.open(scene.plan)
+    await(function() return state.plan_review and state.plan_review.owner.ready
+      and vim.api.nvim_buf_is_valid(state.plan_review.buf) end, "failed wiped review did not reopen")
+    scene.review = state.plan_review
+    begin_answer(scene, question.source.body)
+    finish_answer(scene)
+    assert_answer(scene, question)
+  end },
+  { name = "pending question shows its Ask model and thinking after focus changes", run = function(scene)
+    local completed, configured, failure
+    client.request({ session_id = scene.review.session_id, method = "session.configure",
+      params = { ask_model = { model = "mock-model", effort = "high" } } }, function(result, diagnostic)
+        completed, configured, failure = true, result, diagnostic
+      end)
+    await(function() return completed end, "Ask settings did not settle")
+    assert(not failure, failure)
+    state.ask_model = configured.ask_model
+    scene.expected_model, scene.expected_effort = "mock-model", "high"
+    local planning_effort = state.session.effort
+    local question = add_message(scene, "A", "Why does the Ask model answer this question?")
+    begin_answer(scene, question.source.body)
+    leave_question(scene, question.id)
+    assert(text(scene):find("Generating response · mock-model · Thinking: high", 1, true),
+      "collapsed question lost its captured Ask settings")
+    assert(comments.focus(scene.review.buf, question.id))
+    assert(text(scene):find("Generating response · mock-model · Thinking: high", 1, true),
+      "focused question lost its captured Ask settings")
+    finish_answer(scene)
+    assert_answer(scene, question)
+    assert(state.session.effort == planning_effort, "Ask model changed the planning effort")
+  end },
 }
+
+if arg[1] then
+  local selected = vim.tbl_filter(function(case) return case.name == arg[1] end, cases)
+  assert(#selected == 1, "unknown plan question scenario: " .. tostring(arg[1]))
+  cases = selected
+end
 
 vim.api.nvim_set_current_dir(workspace)
 require("forge").setup({ diff_logging = false, harness_logging = false, harness = { backend = "mock" } })

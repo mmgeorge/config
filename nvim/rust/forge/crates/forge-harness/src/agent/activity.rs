@@ -92,6 +92,7 @@ impl AgentActivity {
                             continue;
                         };
                         if message.text().trim().is_empty()
+                            || message.kind() == MessageKind::Unknown
                             || message.delivery() == MessageDelivery::Final
                         {
                             continue;
@@ -99,7 +100,7 @@ impl AgentActivity {
                         let (text, truncated) = preview(message.text(), 4000);
                         json!({"kind":"thought", "source":match message.kind() {
                             MessageKind::Reasoning | MessageKind::ReasoningSummary => "reasoning_summary",
-                            MessageKind::Assistant => "commentary",
+                            MessageKind::Assistant | MessageKind::Unknown => "commentary",
                         }, "text":text, "truncated":truncated})
                     }
                     TurnItem::Tool { id } => {

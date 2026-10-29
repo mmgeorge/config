@@ -2,14 +2,20 @@ local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 local pending = {}
+local saves = {}
 client.host_get_generation = function() return 1 end
 client.host_is_accepting = function() return true end
-client.request = function(request_specification, callback)
+client.request = function(request_specification, callback, progress)
   local method = request_specification.method
   local params = request_specification.params or {}
 
   callback = encode_delivery(callback)
-  pending[#pending + 1] = { method = method, params = vim.deepcopy(params), callback = callback }
+  if method == "session.document" and params.operation == "plan_save_annotations" then
+    saves[#saves + 1] = vim.deepcopy(params)
+    callback({ saved = true })
+    return
+  end
+  pending[#pending + 1] = { method = method, params = vim.deepcopy(params), callback = callback, progress = progress }
 end
 local buffer = vim.api.nvim_create_buf(false, true)
 vim.api.nvim_buf_set_name(buffer, vim.fn.tempname() .. ".md")
@@ -52,9 +58,15 @@ replace_body("Why own this state?")
 assert(text():find("Plan question", 1, true), "question used the ordinary comment heading")
 vim.cmd("write")
 assert(pending[2].method == "session.plan.question.answer", "saving did not ask the LLM")
-assert(pending[2].params.draft_annotation[1].kind == "question", "question kind was lost in the request")
-assert(text():find("Answering…", 1, true), "request omitted persistent progress")
-leave_and_return("Answering…")
+assert(saves[1].annotation[1].kind == "question", "question kind was lost in the saved annotation")
+assert(pending[2].params.question_ids[1] == "1", "answer request lost its saved question identity")
+assert(text():find("Generating response", 1, true), "request omitted persistent progress")
+pending[2].progress({ question_id = "other", model = "wrong-model", effort = "low" })
+assert(not text():find("wrong-model", 1, true), "another question changed this pending answer")
+pending[2].progress({ question_id = "1", model = "test-ask-model", effort = "high" })
+assert(text():find("Generating response · test-ask-model · Thinking: high", 1, true),
+  "request did not display its resolved model and thinking")
+leave_and_return("Generating response · test-ask-model · Thinking: high")
 local function response(question, answer)
   return { annotation = { { id = "1", kind = "question", source = { start_line = 1, end_line = 1, body = question },
     reply = { question_body = question, body = answer, duration_ms = 3210 } } } }
@@ -66,29 +78,32 @@ assert(text():find("Thought for 3 seconds", 1, true) and text():find("It gives o
 assert(comments.capture(buffer)[1].source.body == "Why own this state?", "reply entered the saved question body")
 leave_and_return("It gives one component ownership.")
 vim.cmd("write")
-assert(pending[3].params.operation == "plan_save_annotations", "saving an answered question asked it again")
-pending[3].callback({ saved = true })
+assert(#saves == 2 and #pending == 2, "saving an answered question asked it again")
 replace_body("Why this interface?")
 vim.cmd("write")
-assert(pending[4].method == "session.plan.question.answer", "editing an answered question did not ask again")
+assert(pending[3].method == "session.plan.question.answer", "editing an answered question did not ask again")
 replace_body("Newer unsaved question?")
-pending[4].callback(response("Why this interface?", "This is an older answer."))
+pending[3].callback(response("Why this interface?", "This is an older answer."))
 assert(vim.bo[buffer].modified and comments.capture(buffer)[1].source.body == "Newer unsaved question?", "late answer overwrote newer typing")
 assert(not text():find("This is an older answer.", 1, true), "late answer appeared beneath a different question")
 vim.cmd("write")
-pending[5].callback(nil, "Provider unavailable")
+pending[4].callback(nil, "Provider unavailable")
 assert(#notices == 1 and notices[1] == "Provider unavailable", "provider failure was not surfaced")
-assert(vim.bo[buffer].modified and not owner.saving, "provider failure lost the draft or blocked retry")
+assert(comments.capture(buffer)[1].source.body == "Newer unsaved question?" and not owner.saving,
+  "provider failure lost the saved question or blocked retry")
+assert(not text():find("Generating response", 1, true), "provider failure retained a generating placeholder")
 vim.cmd("write")
-assert(pending[6].method == "session.plan.question.answer", "retry did not resubmit the unanswered question")
-pending[6].callback(response("Newer unsaved question?", "The interface establishes the ownership boundary."))
+assert(pending[5].method == "session.plan.question.answer", "retry did not resubmit the unanswered question")
+pending[5].callback(response("Newer unsaved question?", "The interface establishes the ownership boundary."))
+pending[4].progress({ question_id = "1", model = "obsolete-model", effort = "low" })
+assert(not text():find("obsolete-model", 1, true), "retired request progress replaced the completed answer")
 assert(not vim.bo[buffer].modified and text():find("ownership boundary.", 1, true), "retry did not retain the answer")
 owner.action("toggle_public", function(_, failure) assert(not failure, failure) end)
 local refreshed = vim.deepcopy(opened)
 refreshed.patch = {}
 refreshed.annotation = response("Newer unsaved question?", "unused").annotation
 refreshed.annotation[1].reply = nil
-pending[7].callback(refreshed)
+pending[6].callback(refreshed)
 assert(text():find("ownership boundary.", 1, true), "source refresh discarded the retained answer")
 for row, line in ipairs(vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) do
   if line:find("ownership boundary.", 1, true) then
@@ -106,13 +121,13 @@ local row = vim.api.nvim_win_get_cursor(0)[1] - 1
 vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "Which getter should I use?" })
 vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
 vim.cmd("write")
-assert(pending[8].method == "session.plan.question.answer" and pending[8].params.draft_annotation[2].parent_id == "1",
+assert(pending[7].method == "session.plan.question.answer" and saves[#saves].annotation[2].parent_id == "1",
   "question request omitted the follow-up identity")
 local threaded = response("Newer unsaved question?", "The interface establishes the ownership boundary.")
 threaded.annotation[2] = { id = "2", kind = "question", parent_id = "1",
   source = { start_line = 1, end_line = 1, body = "Which getter should I use?" },
   reply = { question_body = "Which getter should I use?", body = "Use the state getter.", duration_ms = 1000 } }
-pending[8].callback(threaded)
+pending[7].callback(threaded)
 assert(not vim.bo[buffer].modified and text():find("Use the state getter.", 1, true), "follow-up answer was not retained")
 assert(text():find("Thought for 1 second", 1, true), "one-second duration was not rendered correctly")
 for row, line in ipairs(vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) do

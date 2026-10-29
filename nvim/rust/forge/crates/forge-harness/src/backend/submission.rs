@@ -862,22 +862,26 @@ mod tests {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _: Option<BackendEventSink>,
-        ) -> Result<BackendOutput> {
-            if self.fail_before_send.swap(false, Ordering::SeqCst) {
-                anyhow::bail!("provider startup failed");
+            _: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                if self.fail_before_send.swap(false, Ordering::SeqCst) {
+                    anyhow::bail!("provider startup failed");
+                }
+                let submission = request.submission.as_ref().unwrap();
+                submission.sending(SubmissionTarget::Codex {
+                    thread_id: "native-thread".into(),
+                })?;
+                self.send_count.fetch_add(1, Ordering::SeqCst);
+                self.input.lock().unwrap().push(request.clone());
+                if self.lose_ack.swap(false, Ordering::SeqCst) {
+                    anyhow::bail!("connection lost after write");
+                }
+                submission.accepted("native-ack".into())?;
+                Ok(BackendOutput::default())
             }
-            let submission = request.submission.as_ref().unwrap();
-            submission.sending(SubmissionTarget::Codex {
-                thread_id: "native-thread".into(),
-            })?;
-            self.send_count.fetch_add(1, Ordering::SeqCst);
-            self.input.lock().unwrap().push(request.clone());
-            if self.lose_ack.swap(false, Ordering::SeqCst) {
-                anyhow::bail!("connection lost after write");
-            }
-            submission.accepted("native-ack".into())?;
-            Ok(BackendOutput::default())
+            .await;
+            Ok(output?.into_completion())
         }
     }
 

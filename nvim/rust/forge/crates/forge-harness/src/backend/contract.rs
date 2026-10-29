@@ -194,6 +194,8 @@ impl BackendRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<ProviderMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     /// First adapter receipt time, retained through queueing and forwarding.
     pub received_at_ms: Option<i64>,
     #[serde(default)]
@@ -234,6 +236,11 @@ impl<'event> ToolEvent<'event> {
 }
 
 impl BackendEvent {
+    pub fn with_message(mut self, message: ProviderMessage) -> Self {
+        self.text = message.text().map(str::to_owned);
+        self.message = Some(message);
+        self
+    }
     pub(crate) fn tool_event(&self) -> Option<ToolEvent<'_>> {
         self.activity.as_ref().map(|activity| ToolEvent {
             event: self,
@@ -255,6 +262,7 @@ impl BackendEvent {
         address: Option<ProviderAddress>,
     ) -> Self {
         Self {
+            message: None,
             received_at_ms: None,
             address,
             turn_boundary: None,
@@ -282,7 +290,7 @@ impl BackendEvent {
                     && activity
                         .status
                         .as_deref()
-                        .is_none_or(|status| status == "inProgress")
+                        .is_none_or(|status| status == "running")
             })
             .and_then(|activity| activity.output.as_deref())
     }
@@ -292,15 +300,13 @@ impl BackendEvent {
             || self.summary.is_some()
             || self.checklist_update.is_some()
             || self.activity.is_some()
-            || self.message_snapshot()
-            || !matches!(
-                self.kind.as_str(),
-                "assistant_message" | "reasoning" | "reasoning_summary"
-            )
         {
             return None;
         }
-        self.text.as_deref()
+        match &self.message.as_ref()?.update {
+            MessageUpdate::Delta { text } => Some(text),
+            _ => None,
+        }
     }
 
     pub(crate) fn observed_at_ms(&self, fallback: i64) -> i64 {
@@ -318,42 +324,29 @@ impl BackendEvent {
 
     /// Borrow the provider message identity shared by lifecycle and delta events.
     pub(crate) fn message_id(&self) -> Option<&str> {
-        [
-            "/provider_message_id",
-            "/params/item/id",
-            "/params/itemId",
-            "/params/item_id",
-            "/params/messageId",
-            "/params/message_id",
-            "/data/messageId",
-            "/data/message_id",
-            "/data/id",
-            "/id",
-        ]
-        .into_iter()
-        .find_map(|path| self.data.pointer(path).and_then(Value::as_str))
+        self.message.as_ref().map(|message| message.id.0.as_str())
     }
 
     /// Borrow the provider delivery phase when the adapter has identified it.
     pub(crate) fn message_phase(&self) -> Option<&str> {
-        [
-            "/params/item/phase",
-            "/params/phase",
-            "/data/phase",
-            "/phase",
-        ]
-        .into_iter()
-        .find_map(|path| self.data.pointer(path).and_then(Value::as_str))
+        self.message.as_ref()?.role.map(|role| match role {
+            MessageRole::Thought | MessageRole::ThoughtSummary => "thought",
+            MessageRole::Commentary => "commentary",
+            MessageRole::Response => "final_answer",
+        })
     }
 
     /// Distinguish authoritative message text from incremental text delivery.
     pub(crate) fn message_snapshot(&self) -> bool {
-        self.data.get("message_update").and_then(Value::as_str) == Some("snapshot")
+        self.message
+            .as_ref()
+            .is_some_and(ProviderMessage::is_snapshot)
     }
 
     /// Build the canonical event for provider-acknowledged active-turn input.
     pub(crate) fn steering_input(text: String) -> Self {
         Self {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,
@@ -368,6 +361,7 @@ impl BackendEvent {
 
     pub(crate) fn task_started(start: crate::exchange::TaskStart, prompt: String) -> Self {
         Self {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,
@@ -430,7 +424,7 @@ pub struct ToolActivity {
     pub kind: ToolActivityKind,
     pub title: String,
     pub output: Option<String>,
-    pub status: Option<String>,
+    pub status: Option<ToolStatus>,
     #[serde(default)]
     pub change: ProviderChangeSet,
     #[serde(default)]
@@ -565,12 +559,20 @@ pub enum ToolActivityKind {
 /// Routes normalized provider updates to the live interaction reducer.
 pub use events::BackendEventSink;
 
-/// Represents the normalized result of one complete backend turn.
+/// Collected provider events and their completion metadata for non-streaming callers.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BackendOutput {
+    pub event: Vec<BackendEvent>,
+    #[serde(flatten)]
+    pub completion: BackendCompletion,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// Settled provider metadata and control results, without a second transcript source.
+pub struct BackendCompletion {
     pub backend_session_id: Option<String>,
     pub provider_checkpoint_id: Option<String>,
-    pub event: Vec<BackendEvent>,
+
     #[serde(default)]
     pub plan_edit: Vec<crate::plan::PlanEditRequest>,
     #[serde(default)]
@@ -600,6 +602,35 @@ pub struct BackendOutput {
     pub structured_plan: bool,
     #[serde(skip)]
     pub metrics: TurnMetrics,
+}
+
+impl BackendOutput {
+    pub(crate) fn into_completion(self) -> BackendCompletion {
+        self.completion
+    }
+}
+
+impl BackendCompletion {
+    pub(crate) fn into_output(self) -> BackendOutput {
+        BackendOutput {
+            event: Vec::new(),
+            completion: self,
+        }
+    }
+}
+
+impl std::ops::Deref for BackendOutput {
+    type Target = BackendCompletion;
+
+    fn deref(&self) -> &BackendCompletion {
+        &self.completion
+    }
+}
+
+impl std::ops::DerefMut for BackendOutput {
+    fn deref_mut(&mut self) -> &mut BackendCompletion {
+        &mut self.completion
+    }
 }
 
 impl BackendOutput {
@@ -652,6 +683,7 @@ impl BackendRuntime {
     /// Publishes resolved provider identity independently of turn content and completion.
     pub fn resolved_event(&self) -> BackendEvent {
         BackendEvent {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,
@@ -775,17 +807,36 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
-    /// Run one prompt and normalize provider events into Harness events.
+    /// Collects the ordered stream while the provider executes, including its final drain.
     async fn prompt(&self, request: BackendRequest) -> Result<BackendOutput> {
-        self.prompt_stream(request, None).await
+        let (sink, mut stream) = events::channel();
+        let execution = self.prompt_stream(request, sink);
+        tokio::pin!(execution);
+        let mut events = Vec::new();
+        let mut open = true;
+        let mut output = loop {
+            tokio::select! {
+                event = stream.recv(), if open => match event? {
+                    Some(event) => events.push(event),
+                    None => open = false,
+                },
+                output = &mut execution => break output?.into_output(),
+            }
+        };
+        while let Some(event) = stream.try_next()? {
+            events.push(event);
+        }
+        output.event = events;
+        Ok(output)
     }
 
-    /// Run one prompt while publishing provider events before the turn completes.
+    /// Publishes normalized updates in order and returns completion metadata after delivery settles.
+    /// Implementations must collect provider work before returning and propagate delivery failures.
     async fn prompt_stream(
         &self,
         request: BackendRequest,
-        event_sink: Option<BackendEventSink>,
-    ) -> Result<BackendOutput>;
+        event_sink: BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion>;
 
     /// Fork a provider session only when the provider advertises native support.
     async fn fork(&self, _request: BackendForkRequest) -> Result<BackendForkResult> {
@@ -1135,8 +1186,10 @@ impl Backend for MockBackend {
     async fn prompt_stream(
         &self,
         request: BackendRequest,
-        event_sink: Option<BackendEventSink>,
-    ) -> Result<BackendOutput> {
+        event_sink: BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion> {
+        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+        let event_sink = Some(event_sink);
         let steering = self.steering_lane(&request.runtime_key()?);
         let mut active_steering = steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
@@ -1179,6 +1232,7 @@ impl Backend for MockBackend {
             let tool_id = uuid::Uuid::new_v4().to_string();
             if control_probe && let Some(sink) = &event_sink {
                 sink.send_wait(BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -1190,7 +1244,7 @@ impl Backend for MockBackend {
                         kind: ToolActivityKind::ToolCall,
                         title: name.clone(),
                         output: None,
-                        status: Some("running".into()),
+                        status: Some(crate::backend::ToolStatus::Running),
                         change: Default::default(),
                         output_delta: false,
                     }),
@@ -1255,6 +1309,7 @@ impl Backend for MockBackend {
             };
             if control_probe && let Some(sink) = &event_sink {
                 sink.send_wait(BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,
@@ -1266,7 +1321,7 @@ impl Backend for MockBackend {
                         kind: ToolActivityKind::ToolCall,
                         title: name,
                         output: Some(text.clone()),
-                        status: Some("completed".into()),
+                        status: Some(crate::backend::ToolStatus::Succeeded),
                         change: Default::default(),
                         output_delta: false,
                     }),
@@ -1276,6 +1331,7 @@ impl Backend for MockBackend {
                 .await?;
             }
             let event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -1294,14 +1350,17 @@ impl Backend for MockBackend {
                 summary: None,
                 checklist_update: None,
             };
+            let event = event.clone().with_message(ProviderMessage {
+                id: MessageId(uuid::Uuid::new_v4().to_string()),
+                role: Some(MessageRole::Response),
+                update: MessageUpdate::Completed {
+                    text: event.text.clone().unwrap_or_default(),
+                },
+            });
             if let Some(sink) = event_sink {
                 sink.send_wait(event.clone()).await?;
             }
-            return Ok(BackendOutput {
-                event: vec![event],
-                capability: mock_capability(),
-                ..Default::default()
-            });
+            return Ok(BackendOutput { event: vec![event], completion: crate::backend::BackendCompletion { capability: mock_capability(), ..Default::default() } });
         }
         if let Some(context) = request.control_context.as_ref()
             && context
@@ -1400,6 +1459,7 @@ impl Backend for MockBackend {
             };
         }
         let event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,
@@ -1418,6 +1478,13 @@ impl Backend for MockBackend {
             summary: None,
             checklist_update: None,
         };
+        let event = event.clone().with_message(ProviderMessage {
+            id: MessageId(uuid::Uuid::new_v4().to_string()),
+            role: Some(MessageRole::Response),
+            update: MessageUpdate::Completed {
+                text: event.text.clone().unwrap_or_default(),
+            },
+        });
         if self.emit_before_delay
             && let Some(event_sink) = event_sink.as_ref()
         {
@@ -1435,6 +1502,7 @@ impl Backend for MockBackend {
         }
         if approval_denial.is_some() {
             let denial = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
@@ -1446,7 +1514,7 @@ impl Backend for MockBackend {
                     kind: ToolActivityKind::ToolCall,
                     title: "mock-probe".into(),
                     output: approval_denial.map(str::to_owned),
-                    status: Some("denied".into()),
+                    status: Some(crate::backend::ToolStatus::Denied),
                     change: Default::default(),
                     output_delta: false,
                 }),
@@ -1461,11 +1529,7 @@ impl Backend for MockBackend {
                 .as_ref()
                 .expect("mock approval owner")
                 .take_timeout_feedback(&request.owner()?)?;
-            return Ok(BackendOutput {
-                event: vec![denial, event],
-                capability: mock_capability(),
-                ..Default::default()
-            });
+            return Ok(BackendOutput { event: vec![denial, event], completion: crate::backend::BackendCompletion { capability: mock_capability(), ..Default::default() } });
         }
         if request.mode == PromptMode::Plan
             && let Some(document) = request
@@ -1595,17 +1659,10 @@ impl Backend for MockBackend {
             };
             let proposed =
                 document.patch_design(std::path::Path::new(&request.workspace), change.clone())?;
-            return Ok(BackendOutput {
-                backend_session_id: request.backend_session_id.or(Some("mock-session".into())),
-                design_patch: vec![change],
-                plan_submit: Some(PlanSubmitRequest {
+            return Ok(BackendOutput { event: Vec::new(), completion: crate::backend::BackendCompletion { backend_session_id: request.backend_session_id.or(Some("mock-session".into())), design_patch: vec![change], plan_submit: Some(PlanSubmitRequest {
                     plan_id: document.plan_id.clone(),
                     expected_version: proposed.version,
-                }),
-                structured_plan: true,
-                capability: mock_capability(),
-                ..Default::default()
-            });
+                }), structured_plan: true, capability: mock_capability(), ..Default::default() } });
         }
         let planning_note = (request.mode == PromptMode::Plan).then(|| {
             let steering = steering_text_list
@@ -1842,39 +1899,19 @@ branches: Vec::new()
             } else {
                 None
             };
-        Ok(BackendOutput {
-            backend_session_id: request
+        Ok(BackendOutput { event: vec![event], completion: crate::backend::BackendCompletion { backend_session_id: request
                 .backend_session_id
-                .or_else(|| Some("mock-session".into())),
-            provider_checkpoint_id: Some("mock-checkpoint".into()),
-            event: vec![event],
-            plan_edit,
-            design_patch: Vec::new(),
-            plan_submit,
-            plan_read: None,
-            plan_deviation: Vec::new(),
-            plan_task_report: plan_task_report.into_iter().collect(),
-            plan_question,
-            question_answer: None,
-            question_withdrawal: None,
-            control_error: None,
-            goal_control: None,
-            dispatched_task_permit: None,
-            dispatched_execution_id: None,
-            dispatched_entry_id: None,
-            evidence: TurnEvidence {
+                .or_else(|| Some("mock-session".into())), provider_checkpoint_id: Some("mock-checkpoint".into()), plan_edit, design_patch: Vec::new(), plan_submit, plan_read: None, plan_deviation: Vec::new(), plan_task_report: plan_task_report.into_iter().collect(), plan_question, question_answer: None, question_withdrawal: None, control_error: None, goal_control: None, dispatched_task_permit: None, dispatched_execution_id: None, dispatched_entry_id: None, evidence: TurnEvidence {
                 tool_called: request.access.write_access != crate::session::WriteScope::Off,
                 structured_complete: execution_complete,
                 ..TurnEvidence::default()
-            },
-            capability: mock_capability(),
-            runtime: BackendRuntime {
+            }, capability: mock_capability(), runtime: BackendRuntime {
                 provider: "Mock backend".into(),
                 model: Some(request.model),
-            },
-            structured_plan: request.mode == PromptMode::Plan,
-            metrics: TurnMetrics::default(),
-        })
+            }, structured_plan: request.mode == PromptMode::Plan, metrics: TurnMetrics::default() } })
+
+        }.await;
+        Ok(output?.into_completion())
     }
 
     async fn fork(&self, request: BackendForkRequest) -> Result<BackendForkResult> {
@@ -1923,17 +1960,19 @@ branches: Vec::new()
         let request = request.request;
         Ok(BackendOutput {
             event: vec![BackendEvent::from_compaction(compaction, None)],
-            backend_session_id: request.backend_session_id,
-            capability: mock_capability(),
-            runtime: BackendRuntime {
-                provider: "Mock backend".into(),
-                model: Some(request.model),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: request.backend_session_id,
+                capability: mock_capability(),
+                runtime: BackendRuntime {
+                    provider: "Mock backend".into(),
+                    model: Some(request.model),
+                },
+                metrics: TurnMetrics {
+                    context_usage: ContextUsage::reported(20_000, 100_000),
+                    ..TurnMetrics::default()
+                },
+                ..Default::default()
             },
-            metrics: TurnMetrics {
-                context_usage: ContextUsage::reported(20_000, 100_000),
-                ..TurnMetrics::default()
-            },
-            ..BackendOutput::default()
         })
     }
 
@@ -2098,7 +2137,7 @@ mod test {
         let prompt_backend = Arc::clone(&backend);
         let prompt = tokio::spawn(async move {
             prompt_backend
-                .prompt_stream(
+                .prompt(
                     BackendRequest {
                         execution_owner: None,
                         harness_session_id: "harness-session".into(),
@@ -2118,7 +2157,6 @@ mod test {
                         recovered_input: Vec::new(),
                         control_context: None,
                     },
-                    None,
                 )
                 .await
         });

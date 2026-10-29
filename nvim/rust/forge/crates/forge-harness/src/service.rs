@@ -3957,7 +3957,7 @@ mod tests {
     use super::*;
     use crate::backend::{
         Backend, BackendCatalogRequest, BackendDescriptor, BackendEventSink, BackendKind,
-        BackendOutput, BackendRequest, TextGeneration,
+        BackendRequest, TextGeneration,
     };
     use forge_diff::cache::CacheLimits;
 
@@ -4596,9 +4596,11 @@ mod tests {
         async fn prompt_stream(
             &self,
             _: BackendRequest,
-            _: Option<BackendEventSink>,
-        ) -> Result<BackendOutput> {
-            anyhow::bail!("terminal fixture cannot prompt")
+            _: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> =
+                async { anyhow::bail!("terminal fixture cannot prompt") }.await;
+            Ok(output?.into_completion())
         }
         async fn shutdown(&self) -> Result<()> {
             Ok(())
@@ -4725,9 +4727,13 @@ mod tests {
         async fn prompt_stream(
             &self,
             _: BackendRequest,
-            _: Option<BackendEventSink>,
-        ) -> Result<BackendOutput> {
-            anyhow::bail!("isolated generation must not submit a conversational turn")
+            _: BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+                anyhow::bail!("isolated generation must not submit a conversational turn")
+            }
+            .await;
+            Ok(output?.into_completion())
         }
         async fn shutdown(&self) -> Result<()> {
             self.shutdown.store(true, Ordering::Release);
@@ -6513,9 +6519,11 @@ mod tests {
         async fn prompt_stream(
             &self,
             _: crate::backend::BackendRequest,
-            _: Option<crate::backend::BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            anyhow::bail!("steering must not start another provider request")
+            _: crate::backend::BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> =
+                async { anyhow::bail!("steering must not start another provider request") }.await;
+            Ok(output?.into_completion())
         }
 
         async fn steer_session(
@@ -7507,9 +7515,11 @@ mod tests {
         async fn prompt_stream(
             &self,
             _: crate::backend::BackendRequest,
-            _: Option<crate::backend::BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            anyhow::bail!("cleanup must finish before another provider turn")
+            _: crate::backend::BackendEventSink,
+        ) -> Result<crate::backend::BackendCompletion> {
+            let output: anyhow::Result<crate::backend::BackendOutput> =
+                async { anyhow::bail!("cleanup must finish before another provider turn") }.await;
+            Ok(output?.into_completion())
         }
     }
 

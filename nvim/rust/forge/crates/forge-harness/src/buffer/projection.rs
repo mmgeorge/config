@@ -1337,10 +1337,10 @@ impl TimelineRenderer<'_> {
         )?;
         let mut continuation = layout.continuation.as_slice();
         while let Some(node) = continuation.first() {
-            let response = super::layout::is_final_response(interaction, node)?;
+            let response = super::layout::is_outer_message(interaction, node)?;
             let mut count = 1;
             while count < continuation.len()
-                && super::layout::is_final_response(interaction, continuation[count])? == response
+                && super::layout::is_outer_message(interaction, continuation[count])? == response
             {
                 count += 1;
             }
@@ -1702,7 +1702,15 @@ impl TimelineRenderer<'_> {
                                 turn.messages().iter().find(|message| message.id() == id)
                             })
                             .context("response references a missing provider message")?;
-                        self.markdown(nodes[0].id(), message.text(), response_role)?;
+                        self.markdown(
+                            nodes[0].id(),
+                            message.text(),
+                            if message.role().is_none() {
+                                MarkdownRole::Message
+                            } else {
+                                response_role
+                            },
+                        )?;
                     } else {
                         self.content_nodes(interaction, agents, depth, nodes, questions)?;
                     }
@@ -1723,15 +1731,15 @@ impl TimelineRenderer<'_> {
     ) -> Result<()> {
         let section = if let Some(message) = thought.message {
             if message.delivery() == crate::turn::MessageDelivery::Final {
-                self.markdown(thought.id, message.text(), response_role)?;
+                self.markdown(&thought.id, message.text(), response_role)?;
                 None
             } else {
-                self.markdown(thought.id, message.text(), MarkdownRole::Commentary)?;
+                self.markdown(&thought.id, message.text(), MarkdownRole::Commentary)?;
                 thought.has_activity().then(|| self.begin_section(2))
             }
         } else {
             self.markdown(
-                thought.id,
+                &thought.id,
                 "Considering initial steps",
                 MarkdownRole::Commentary,
             )?;
@@ -1744,7 +1752,7 @@ impl TimelineRenderer<'_> {
         }
         self.check_group(&format!("{}:results", thought.id), thought.checks.iter())?;
         if let Some(section) = section {
-            self.finish_section(section, thought.id, true).kind = NodeKind::Thought;
+            self.finish_section(section, &thought.id, true).kind = NodeKind::Thought;
         }
         Ok(())
     }
@@ -4054,6 +4062,7 @@ mod tests {
             .unwrap();
             exchange.resume(0).unwrap();
             let mut event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(ProviderAddress {
                     owner: None,
@@ -4073,10 +4082,20 @@ mod tests {
             event.kind = "assistant_message".into();
             event.text = Some("Inspecting the repository".into());
             event.data = json!({"phase":"commentary"});
+            crate::turn::test_support::set_message(
+                &mut event,
+                "inspection",
+                crate::backend::MessageRole::Commentary,
+            );
             exchange.observe_turn(&event, 1).unwrap();
             event.text =
                 Some("The repository contains only .git. Three choices are pending.".into());
             event.data = json!({"phase":"final_answer"});
+            crate::turn::test_support::set_message(
+                &mut event,
+                "response",
+                crate::backend::MessageRole::Response,
+            );
             exchange.observe_turn(&event, 2).unwrap();
             event.text = None;
             event.turn_boundary = Some(TurnBoundary::Finished {
@@ -4135,6 +4154,11 @@ mod tests {
             event.turn_boundary = None;
             event.text = Some("The design will use a 2D arena survival loop.".into());
             event.data = json!({"phase":"commentary"});
+            crate::turn::test_support::set_message(
+                &mut event,
+                "continuation",
+                crate::backend::MessageRole::Commentary,
+            );
             exchange.observe_turn(&event, 6).unwrap();
 
             let render = |exchange: &Exchange| {
@@ -4172,6 +4196,7 @@ mod tests {
 
             event.text = None;
             event.kind = "tool".into();
+            event.message = None;
             for tool_count in 1..=3 {
                 event.activity = Some(ToolActivity {
                     id: format!("lookup-{tool_count}"),
@@ -4179,7 +4204,7 @@ mod tests {
                     title: format!("lookup_{tool_count}"),
                     output: Some("found".into()),
                     output_delta: false,
-                    status: Some("completed".into()),
+                    status: Some(crate::backend::ToolStatus::Succeeded),
                     change: Default::default(),
                 });
                 exchange.observe_turn(&event, 6 + tool_count).unwrap();
@@ -4258,6 +4283,11 @@ mod tests {
             event.kind = "assistant_message".into();
             event.text = Some("The design is ready for review.".into());
             event.data = json!({"phase":"final_answer"});
+            crate::turn::test_support::set_message(
+                &mut event,
+                "response",
+                crate::backend::MessageRole::Response,
+            );
             exchange.observe_turn(&event, 10).unwrap();
             event.text = None;
             event.turn_boundary = Some(TurnBoundary::Finished {
@@ -4429,6 +4459,7 @@ mod tests {
                     )
                     .unwrap();
                 let mut event = BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: Some(ProviderAddress {
                         owner: None,
@@ -4448,6 +4479,11 @@ mod tests {
                 event.kind = "assistant_message".into();
                 event.text = Some(reply.into());
                 event.data = json!({"phase":"final_answer"});
+                crate::turn::test_support::set_message(
+                    &mut event,
+                    "response",
+                    crate::backend::MessageRole::Response,
+                );
                 exchange.observe_turn(&event, index as i64).unwrap();
                 event.text = None;
                 event.turn_boundary = Some(TurnBoundary::Finished {
@@ -4592,6 +4628,7 @@ mod tests {
         .unwrap();
         exchange.resume(0).unwrap();
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -4611,8 +4648,14 @@ mod tests {
         event.kind = "assistant_message".into();
         event.text = Some("The scope determines the implementation.".into());
         event.data = json!({"phase":"commentary"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "scope",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 1).unwrap();
         event.kind = "tool".into();
+        event.message = None;
         event.text = None;
         for (id, status) in [
             ("failed-question", "failed"),
@@ -4631,7 +4674,7 @@ mod tests {
                     .into(),
                 ),
                 output_delta: false,
-                status: Some(status.into()),
+                status: Some(crate::backend::ToolStatus::parse(status).unwrap()),
                 change: Default::default(),
             });
             exchange.observe_turn(&event, 2).unwrap();
@@ -4699,6 +4742,11 @@ mod tests {
         event.kind = "assistant_message".into();
         event.text = Some("I mean a Rust CLI or a redesigned TypeScript demo.".into());
         event.data = json!({"phase":"final_answer"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "response",
+            crate::backend::MessageRole::Response,
+        );
         exchange.observe_turn(&event, 5).unwrap();
         event.text = None;
         event.turn_boundary = Some(TurnBoundary::Finished {
@@ -4883,6 +4931,11 @@ mod tests {
         exchange.observe_turn(&event, 7).unwrap();
         event.turn_boundary = None;
         event.text = Some("Proceeding with Rust".into());
+        crate::turn::test_support::set_message(
+            &mut event,
+            "continuation",
+            crate::backend::MessageRole::Response,
+        );
         exchange.observe_turn(&event, 8).unwrap();
         event.text = None;
         event.turn_boundary = Some(TurnBoundary::Finished {
@@ -4943,6 +4996,7 @@ mod tests {
             };
             exchange.start_turn(address.clone(), 0)?;
             let mut event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(address),
                 turn_boundary: None,
@@ -4958,9 +5012,15 @@ mod tests {
                     event.kind = "assistant_message".into();
                     event.text = Some("Continue after this message".into());
                     event.data = json!({"message_id":"message", "phase":"commentary"});
+                    crate::turn::test_support::set_message(
+                        &mut event,
+                        "message",
+                        crate::backend::MessageRole::Commentary,
+                    );
                     event.activity = None;
                 } else {
                     event.kind = "tool".into();
+                    event.message = None;
                     event.text = None;
                     event.data = serde_json::Value::Null;
                     event.activity = Some(ToolActivity {
@@ -4978,12 +5038,14 @@ mod tests {
                             ToolActivityKind::FileChange
                         },
                         status: Some(
-                            if ordinal == 1 && name != "command" {
-                                name
-                            } else {
-                                "completed"
-                            }
-                            .into(),
+                            crate::backend::ToolStatus::parse(
+                                if ordinal == 1 && name != "command" {
+                                    name
+                                } else {
+                                    "completed"
+                                },
+                            )
+                            .unwrap(),
                         ),
                         change: ProviderChangeSet {
                             file: vec![ProviderFileChange {
@@ -5015,7 +5077,7 @@ mod tests {
                     output: Some(format!("second turn {boundary} details")),
                     output_delta: false,
                     kind: ToolActivityKind::FileChange,
-                    status: Some(boundary.into()),
+                    status: Some(crate::backend::ToolStatus::parse(boundary).unwrap()),
                     change: ProviderChangeSet::default(),
                 });
                 stored.observe_turn(&event, 6)?;
@@ -5131,6 +5193,7 @@ mod tests {
         };
         exchange.start_turn(address.clone(), 0)?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -5178,7 +5241,7 @@ mod tests {
                 },
                 output: None,
                 output_delta: false,
-                status: Some("running".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: ProviderChangeSet {
                     file: if file_change {
                         vec![ProviderFileChange {
@@ -5219,7 +5282,8 @@ mod tests {
                         .contains("changing 1 file")
                 }));
             }
-            event.activity.as_mut().unwrap().status = Some(status.into());
+            event.activity.as_mut().unwrap().status =
+                Some(crate::backend::ToolStatus::parse(status).unwrap());
             exchange.observe_turn(&event, index as i64 * 10 + 2)?;
         }
         event.activity = None;
@@ -5358,6 +5422,7 @@ mod tests {
         };
         exchange.start_turn(address.clone(), 0).unwrap();
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -5383,13 +5448,14 @@ mod tests {
                 title: format!("inspect_{index}"),
                 output: None,
                 output_delta: false,
-                status: Some("running".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: Default::default(),
             });
             exchange.observe_turn(&event, clock).unwrap();
             if let Some(duration) = duration {
                 clock += duration;
-                event.activity.as_mut().unwrap().status = Some("completed".into());
+                event.activity.as_mut().unwrap().status =
+                    Some(crate::backend::ToolStatus::Succeeded);
                 exchange.observe_turn(&event, clock).unwrap();
             }
             clock += 1;
@@ -5559,6 +5625,7 @@ mod tests {
         }))?;
         exchange.resume(0)?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -5599,9 +5666,15 @@ mod tests {
                 event.kind = kind.into();
                 event.text = Some("Thoughts must not become commentary".into());
                 event.data = json!({"message_id":format!("{kind}-{ordinal}")});
+                crate::turn::test_support::set_message(
+                    &mut event,
+                    format!("{kind}-{ordinal}"),
+                    crate::backend::MessageRole::Thought,
+                );
                 exchange.observe_turn(&event, ordinal * 10 + 1)?;
             }
             event.kind = "tool".into();
+            event.message = None;
             event.text = None;
             event.data = Value::Null;
             event.activity = Some(ToolActivity {
@@ -5610,7 +5683,7 @@ mod tests {
                 title: format!("Inspect file {ordinal}"),
                 output: Some(format!("output-{ordinal}\n")),
                 output_delta: false,
-                status: Some("in_progress".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: Default::default(),
             });
             exchange.observe_turn(&event, ordinal * 10 + 2)?;
@@ -5686,8 +5759,11 @@ mod tests {
                 "timer refresh counted only the newest provider turn"
             );
             assert_eq!(refreshed_group.metadata.node, groups[0].metadata.node);
-            event.activity.as_mut().unwrap().status =
-                Some(if ordinal == 2 { "failed" } else { "completed" }.into());
+            event.activity.as_mut().unwrap().status = Some(if ordinal == 2 {
+                crate::backend::ToolStatus::Failed
+            } else {
+                crate::backend::ToolStatus::Succeeded
+            });
             exchange.observe_turn(&event, ordinal * 10 + 3)?;
             let completed_call = render(&exchange)?;
             let group = completed_call
@@ -5749,8 +5825,14 @@ mod tests {
         event.kind = "assistant_message".into();
         event.text = Some("Now inspect the final file".into());
         event.data = json!({"message_id":"commentary","phase":"commentary"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "commentary",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 41)?;
         event.kind = "tool".into();
+        event.message = None;
         event.text = None;
         event.data = Value::Null;
         event.activity = Some(ToolActivity {
@@ -5759,7 +5841,7 @@ mod tests {
             title: "Inspect final file".into(),
             output: Some("final-output\n".into()),
             output_delta: false,
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: Default::default(),
         });
         exchange.observe_turn(&event, 42)?;
@@ -5832,6 +5914,7 @@ mod tests {
         .unwrap();
         exchange.resume(0).unwrap();
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -5849,6 +5932,7 @@ mod tests {
         exchange.observe_turn(&event, 0).unwrap();
         event.turn_boundary = None;
         event.kind = "tool".into();
+        event.message = None;
         let render = |exchange: &Exchange| {
             project_at(
                 &TimelineEntry::Exchange {
@@ -5872,7 +5956,7 @@ mod tests {
                     title: format!("Inspect repository file {count}"),
                     output: Some(format!("first-{count}\nmiddle\nlast-{count}\n")),
                     output_delta: false,
-                    status: Some(status.into()),
+                    status: Some(crate::backend::ToolStatus::parse(status).unwrap()),
                     change: Default::default(),
                 });
                 exchange.observe_turn(&event, count).unwrap();
@@ -5956,6 +6040,11 @@ mod tests {
         event.kind = "assistant_message".into();
         event.text = Some("Repository inspection complete".into());
         event.data = json!({"phase":"commentary"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "inspection",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 11).unwrap();
         assert!(
             render(&exchange)
@@ -6060,6 +6149,11 @@ mod tests {
         }))
         .unwrap();
         let mut response = crate::backend::BackendEvent {
+            message: Some(crate::turn::test_support::message(
+                "response",
+                Some(crate::backend::MessageRole::Response),
+                "Submitted the revised design.",
+            )),
             received_at_ms: None,
             address: Some(crate::backend::ProviderAddress {
                 owner: None,
@@ -6198,6 +6292,7 @@ mod tests {
         .unwrap();
         nested.resume(0).unwrap();
         let mut update = crate::backend::BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(crate::backend::ProviderAddress {
                 owner: None,
@@ -6217,21 +6312,37 @@ mod tests {
         update.kind = "assistant_message".into();
         update.data = json!({"phase":"commentary", "provider_message_id":"earlier"});
         update.text = Some("Earlier child thought".into());
+        crate::turn::test_support::set_message(
+            &mut update,
+            "earlier",
+            crate::backend::MessageRole::Commentary,
+        );
         nested.observe_turn(&update, 1).unwrap();
         update.data = json!({"phase":"commentary", "provider_message_id":"latest"});
         update.text = Some("Latest child thought".into());
+        crate::turn::test_support::set_message(
+            &mut update,
+            "latest",
+            crate::backend::MessageRole::Commentary,
+        );
         nested.observe_turn(&update, 2).unwrap();
         update.data = json!({"phase":"final_answer"});
         update.text = Some("Child final response".into());
+        crate::turn::test_support::set_message(
+            &mut update,
+            "response",
+            crate::backend::MessageRole::Response,
+        );
         nested.observe_turn(&update, 3).unwrap();
         update.text = None;
+        update.message = None;
         update.activity = Some(crate::backend::ToolActivity {
             id: "call".into(),
             kind: crate::backend::ToolActivityKind::ToolCall,
             title: "Child tool".into(),
             output: Some("Child tool result".into()),
             output_delta: false,
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: Default::default(),
         });
         nested.observe_turn(&update, 3).unwrap();
@@ -6250,13 +6361,18 @@ mod tests {
             title: "agent_spawn(task_name=Nested)".into(),
             output: Some("SPAWN_PAYLOAD".into()),
             output_delta: false,
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: Default::default(),
         });
         parent.observe_turn(&update, 1).unwrap();
         parent
             .observe_turn(
                 &crate::backend::BackendEvent {
+                    message: Some(crate::turn::test_support::message(
+                        "parent-response",
+                        Some(crate::backend::MessageRole::Response),
+                        "Parent final response",
+                    )),
                     activity: None,
                     text: Some("Parent final response".into()),
                     ..update.clone()
@@ -6569,7 +6685,7 @@ mod tests {
         let mut failed_entry = entry.clone();
         if let TimelineEntry::Exchange { exchange, .. } = &mut failed_entry {
             update.activity.as_mut().unwrap().id = "failed-spawn-call".into();
-            update.activity.as_mut().unwrap().status = Some("failed".into());
+            update.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Failed);
             exchange.observe_turn(&update, 2).unwrap();
         }
         let failed = project_at(&failed_entry, &WidthProfile::default(), 2).unwrap();
@@ -6745,6 +6861,7 @@ mod tests {
         .unwrap();
         exchange.resume(0).unwrap();
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(ProviderAddress {
                 owner: None,
@@ -6764,16 +6881,22 @@ mod tests {
         event.kind = "assistant_message".into();
         event.text = Some("Inspecting ownership".into());
         event.data = serde_json::json!({ "phase": "commentary" });
+        crate::turn::test_support::set_message(
+            &mut event,
+            "ownership",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 1).unwrap();
         event.text = None;
         event.kind = "tool".into();
+        event.message = None;
         event.activity = Some(ToolActivity {
             id: "call".into(),
             kind: ToolActivityKind::FileChange,
             title: "inspect".into(),
             output: Some("result".into()),
             output_delta: false,
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: crate::backend::ProviderChangeSet {
                 file: vec![crate::backend::ProviderFileChange {
                     path: "owned.rs".into(),
@@ -6795,6 +6918,11 @@ mod tests {
         event.kind = "assistant_message".into();
         event.text = Some("Finished the work".into());
         event.data = serde_json::json!({ "phase": "final_answer" });
+        crate::turn::test_support::set_message(
+            &mut event,
+            "response",
+            crate::backend::MessageRole::Response,
+        );
         exchange.observe_turn(&event, 4).unwrap();
         exchange
             .node_list
@@ -6810,6 +6938,7 @@ mod tests {
             });
         event.text = None;
         event.kind = "tool".into();
+        event.message = None;
         event.data = serde_json::Value::Null;
         event.activity = Some(ToolActivity {
             id: "interrupted-edit".into(),
@@ -6817,7 +6946,7 @@ mod tests {
             title: "file changes".into(),
             output: None,
             output_delta: false,
-            status: Some("interrupted".into()),
+            status: Some(crate::backend::ToolStatus::Interrupted),
             change: Default::default(),
         });
         exchange.observe_turn(&event, 4).unwrap();
@@ -7780,6 +7909,7 @@ mod tests {
         exchange.start_turn(address.clone(), 0)?;
         let text = "I’ll run the two Rust regression tests individually.\nThe next line retains its own source position.";
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -7790,10 +7920,16 @@ mod tests {
             checklist_update: None,
             activity: None,
         };
+        crate::turn::test_support::set_message(
+            &mut event,
+            "initial",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 1)?;
         let thought_id = exchange.node_list.last().unwrap().id().to_owned();
         for index in 0..3 {
             event.kind = "tool".into();
+            event.message = None;
             event.text = None;
             event.data = serde_json::Value::Null;
             event.activity = Some(ToolActivity {
@@ -7802,7 +7938,11 @@ mod tests {
                 title: format!("checks_run exact test {index}"),
                 output: Some("retained test output".into()),
                 output_delta: false,
-                status: Some(if index == 2 { "running" } else { "completed" }.into()),
+                status: Some(if index == 2 {
+                    crate::backend::ToolStatus::Running
+                } else {
+                    crate::backend::ToolStatus::Succeeded
+                }),
                 change: Default::default(),
             });
             exchange.observe_turn(&event, index + 2)?;
@@ -7914,6 +8054,7 @@ mod tests {
             .enumerate()
             {
                 let mut event = BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: Some(address.clone()),
                     turn_boundary: None,
@@ -7924,6 +8065,11 @@ mod tests {
                     summary: None,
                     checklist_update: None,
                 };
+                crate::turn::test_support::set_message(
+                    &mut event,
+                    format!("step-{index}"),
+                    crate::backend::MessageRole::Commentary,
+                );
                 exchange.observe_turn(&event, index as i64 * 10 + 1)?;
                 let mut file = vec![ProviderFileChange {
                     path: "temporary.lua".into(),
@@ -7940,6 +8086,7 @@ mod tests {
                     });
                 }
                 event.kind = "tool".into();
+                event.message = None;
                 event.text = None;
                 event.data = serde_json::Value::Null;
                 event.activity = Some(ToolActivity {
@@ -7948,7 +8095,7 @@ mod tests {
                     title: "file changes".into(),
                     output: None,
                     output_delta: false,
-                    status: Some("completed".into()),
+                    status: Some(crate::backend::ToolStatus::Succeeded),
                     change: ProviderChangeSet { file },
                 });
                 exchange.observe_turn(&event, index as i64 * 10 + 2)?;
@@ -8044,6 +8191,7 @@ mod tests {
         let mut thought_ids = Vec::new();
         for index in 0..2 {
             let mut event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(address.clone()),
                 turn_boundary: None,
@@ -8054,9 +8202,15 @@ mod tests {
                 summary: None,
                 checklist_update: None,
             };
+            crate::turn::test_support::set_message(
+                &mut event,
+                format!("thought-{index}"),
+                crate::backend::MessageRole::Commentary,
+            );
             exchange.observe_turn(&event, index * 10 + 1)?;
             thought_ids.push(exchange.node_list.last().unwrap().id().to_owned());
             event.kind = "tool".into();
+            event.message = None;
             event.text = None;
             event.data = serde_json::Value::Null;
             event.activity = Some(ToolActivity {
@@ -8065,7 +8219,7 @@ mod tests {
                 title: "file changes".into(),
                 output: None,
                 output_delta: false,
-                status: Some("completed".into()),
+                status: Some(crate::backend::ToolStatus::Succeeded),
                 change: ProviderChangeSet {
                     file: vec![ProviderFileChange {
                         path: "result.txt".into(),
@@ -8739,6 +8893,7 @@ mod tests {
         };
         exchange.start_turn(address.clone(), 1000).unwrap();
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -8750,7 +8905,7 @@ mod tests {
                 kind: ToolActivityKind::ToolCall,
                 title: "cargo test".into(),
                 output: None,
-                status: Some("running".into()),
+                status: Some(crate::backend::ToolStatus::Running),
                 change: Default::default(),
                 output_delta: false,
             }),
@@ -8798,7 +8953,7 @@ mod tests {
             super::exchange_activity_summary(&permission_wait, 902_000),
             "● Thinking 5s │ 0/1 tools · 4.5 s"
         );
-        event.activity.as_mut().unwrap().status = Some("failed".into());
+        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Failed);
         exchange.observe_turn(&event, 5000).unwrap();
         let entry = crate::timeline::TimelineEntry::Exchange {
             id: exchange.id.clone(),
@@ -8885,6 +9040,7 @@ mod tests {
         };
         exchange.start_turn(address.clone(), 1000).unwrap();
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -8954,6 +9110,7 @@ mod tests {
         ] {
             let mut exchange = original.clone();
             let event = BackendEvent {
+                message: None,
                 received_at_ms: None,
                 address: Some(address.clone()),
                 turn_boundary: None,

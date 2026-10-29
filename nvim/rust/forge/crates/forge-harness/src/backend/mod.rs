@@ -36,5 +36,9 @@ pub use steering::{SteerTarget, SteeringInput};
 
 mod contract;
 pub use contract::*;
+mod message;
+pub use message::{MessageId, MessageRole, MessageUpdate, ProviderMessage};
+mod tool_status;
+pub use tool_status::ToolStatus;
 mod capability;
 pub use capability::{CapabilityManifest, UnsupportedCapability};

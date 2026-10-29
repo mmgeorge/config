@@ -82,6 +82,7 @@ impl CheckNotification {
                 }
                 if let Some((sink, data)) = latest {
                     let event = BackendEvent {
+                        message: None,
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,

@@ -110,6 +110,7 @@ impl AgentRuntime {
             self.publish(
                 &owner,
                 BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: None,
                     turn_boundary: None,

@@ -100,6 +100,7 @@ impl CompactionMonitor {
                     Err(error) => {
                         let _ = sink
                             .send_wait(BackendEvent {
+                                message: None,
                                 received_at_ms: None,
                                 address: None,
                                 turn_boundary: None,

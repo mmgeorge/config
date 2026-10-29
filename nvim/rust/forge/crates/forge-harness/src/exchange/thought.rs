@@ -15,7 +15,7 @@ pub(crate) struct ThoughtGroup<'source> {
 }
 
 pub(crate) struct CommentaryView<'source> {
-    pub id: &'source str,
+    pub id: String,
     pub message: Option<&'source Message>,
     pub tools: ThoughtGroup<'source>,
     pub writes: ThoughtGroup<'source>,
@@ -56,7 +56,12 @@ impl Exchange {
             .iter()
             .rev()
             .find(|entry| match entry {
-                ExchangeEntry::Commentary { .. } | ExchangeEntry::Response { .. } => true,
+                ExchangeEntry::Commentary { commentary } => self.commentary_is_eligible(commentary)
+                    || matches!(&commentary.source, CommentarySource::Provider { turn_id, message_id }
+                        if self.turn.iter().find(|turn| turn.id() == turn_id)
+                            .and_then(|turn| turn.messages().iter().find(|message| message.id() == message_id))
+                            .is_some_and(|message| message.role() == Some(crate::backend::MessageRole::Response))),
+                ExchangeEntry::Response { .. } => true,
                 ExchangeEntry::Event { id } => self.node_list.iter().any(|node| {
                     node.id() == id
                         && matches!(
@@ -67,7 +72,8 @@ impl Exchange {
                 }),
                 ExchangeEntry::Steering { .. } => false,
             })
-            .filter(|entry| matches!(entry, ExchangeEntry::Commentary { .. }))
+            .filter(|entry| matches!(entry, ExchangeEntry::Commentary { commentary }
+                if self.commentary_is_eligible(commentary)))
             .map(ExchangeEntry::id);
         let mut content = ExchangeContentView {
             commentary: Vec::new(),
@@ -100,11 +106,21 @@ impl Exchange {
                                 .find(|message| message.id() == message_id)
                         })
                         .context("commentary references a missing provider message")?,
-                ),
+                )
+                .filter(|message| message.role() == Some(crate::backend::MessageRole::Commentary)),
             };
+            if message.is_none() && commentary.tool.is_empty() && commentary.check.is_empty() {
+                continue;
+            }
             let live = !self.is_finished() && active == Some(commentary.id.as_str());
             let mut view = CommentaryView {
-                id: &commentary.id,
+                id: if matches!(commentary.source, CommentarySource::Provider { .. })
+                    && message.is_none()
+                {
+                    format!("{}:activity", commentary.id)
+                } else {
+                    commentary.id.clone()
+                },
                 message,
                 checks: &commentary.check,
                 tools: ThoughtGroup {
@@ -184,9 +200,10 @@ impl Exchange {
                                 turn.messages().iter().find(|message| message.id() == id)
                             })
                             .context("timeline references a missing provider message")?;
-                        if message.kind() != crate::turn::MessageKind::Assistant
-                            || message.delivery() != crate::turn::MessageDelivery::Final
-                        {
+                        if !matches!(
+                            message.role(),
+                            None | Some(crate::backend::MessageRole::Response)
+                        ) {
                             continue;
                         }
                     }
@@ -222,6 +239,7 @@ mod tests {
         };
         exchange.start_turn(address.clone(), 0)?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -232,8 +250,14 @@ mod tests {
             summary: None,
             checklist_update: None,
         };
+        crate::turn::test_support::set_message(
+            &mut event,
+            "thought",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 1)?;
         event.kind = "tool".into();
+        event.message = None;
         event.text = None;
         event.data = serde_json::Value::Null;
         event.activity = Some(ToolActivity {
@@ -242,7 +266,7 @@ mod tests {
             kind: ToolActivityKind::Command,
             output: None,
             output_delta: false,
-            status: Some("running".into()),
+            status: Some(crate::backend::ToolStatus::Running),
             change: Default::default(),
         });
         exchange.observe_turn(&event, 2)?;
@@ -250,7 +274,7 @@ mod tests {
         event.activity.as_mut().unwrap().id = "after".into();
         exchange.observe_turn(&event, 4)?;
         event.activity.as_mut().unwrap().id = "before".into();
-        event.activity.as_mut().unwrap().status = Some("completed".into());
+        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
         event.activity.as_mut().unwrap().output = Some("Late result".into());
         exchange.observe_turn(&event, 5)?;
         exchange.observe_turn(&event, 6)?;
@@ -291,6 +315,7 @@ mod tests {
         };
         exchange.start_turn(address.clone(), 0)?;
         let mut event = BackendEvent {
+            message: None,
             received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
@@ -301,8 +326,14 @@ mod tests {
             summary: None,
             checklist_update: None,
         };
+        crate::turn::test_support::set_message(
+            &mut event,
+            "first",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 1)?;
         event.kind = "tool".into();
+        event.message = None;
         event.text = None;
         event.activity = Some(ToolActivity {
             id: "earlier".into(),
@@ -310,7 +341,7 @@ mod tests {
             title: "earlier".into(),
             output: None,
             output_delta: false,
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: Default::default(),
         });
         exchange.observe_turn(&event, 2)?;
@@ -319,10 +350,16 @@ mod tests {
         event.text = Some("I will run the relevant checks".into());
         event.activity = None;
         event.data = json!({"provider_message_id":"ack","phase":"commentary"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "ack",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 4)?;
         let acknowledgement = exchange.node_list.last().unwrap().id().to_owned();
         exchange.append_input(InputIntent::Steering, "That was temporary".into(), 5)?;
         event.kind = "tool".into();
+        event.message = None;
         event.text = None;
         event.data = serde_json::Value::Null;
         for index in 0..6 {
@@ -332,7 +369,7 @@ mod tests {
                 title: format!("inspect {index}"),
                 output: None,
                 output_delta: false,
-                status: Some("completed".into()),
+                status: Some(crate::backend::ToolStatus::Succeeded),
                 change: Default::default(),
             });
             exchange.observe_turn(&event, index + 6)?;
@@ -343,7 +380,7 @@ mod tests {
             title: "edit".into(),
             output: None,
             output_delta: false,
-            status: Some("completed".into()),
+            status: Some(crate::backend::ToolStatus::Succeeded),
             change: ProviderChangeSet {
                 file: (0..9)
                     .map(|index| ProviderFileChange {
@@ -361,6 +398,11 @@ mod tests {
         event.text = Some("Admission now reads committed state".into());
         event.activity = None;
         event.data = json!({"provider_message_id":"next","phase":"commentary"});
+        crate::turn::test_support::set_message(
+            &mut event,
+            "next",
+            crate::backend::MessageRole::Commentary,
+        );
         exchange.observe_turn(&event, 13)?;
         let settled_group = exchange.clone();
         exchange.finish(super::super::ExchangeOutcome::Cancelled, 14)?;
@@ -447,6 +489,7 @@ mod tests {
                 };
                 exchange.start_turn(address.clone(), 0)?;
                 let mut event = BackendEvent {
+                    message: None,
                     received_at_ms: None,
                     address: Some(address),
                     turn_boundary: None,
@@ -457,9 +500,19 @@ mod tests {
                     summary: None,
                     checklist_update: None,
                 };
+                crate::turn::test_support::set_message(
+                    &mut event,
+                    "existing",
+                    if phase == "commentary" {
+                        crate::backend::MessageRole::Commentary
+                    } else {
+                        crate::backend::MessageRole::Response
+                    },
+                );
                 exchange.observe_turn(&event, 1)?;
                 exchange.append_input(intent, "New input".into(), 2)?;
                 event.kind = "tool".into();
+                event.message = None;
                 event.text = None;
                 event.activity = Some(ToolActivity {
                     id: "later".into(),
@@ -467,7 +520,7 @@ mod tests {
                     title: "later".into(),
                     output: None,
                     output_delta: false,
-                    status: Some("completed".into()),
+                    status: Some(crate::backend::ToolStatus::Succeeded),
                     change: Default::default(),
                 });
                 exchange.observe_turn(&event, 3)?;

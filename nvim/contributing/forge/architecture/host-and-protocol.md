@@ -11,6 +11,14 @@ each request into its own tracked task before waiting for normalization or provi
 preparation. A waiting request therefore retains its admission permit without
 preventing the reader from accepting independent requests or transport credit.
 
+Irrecoverable Harness transcript publication failures carry the typed
+`buffer::TranscriptProjectionFailure` through the request error chain.
+`ConnectionHost` classifies that type as `invalid_state`, independently of its
+diagnostic text. Lua stops automatic presentation retries, retains the last
+applied transcript and viewport, and reports that reopening is required.
+Admission failures retain `not_admitted`, while other request failures retain
+`request_failed`.
+
 ## Host executable and service ownership
 
 The `forge` package builds a library and a thin executable. `src/main.rs` parses

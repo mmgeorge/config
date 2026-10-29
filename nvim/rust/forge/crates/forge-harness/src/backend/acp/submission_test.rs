@@ -211,7 +211,7 @@ async fn acp_cancelled_prompt_cannot_replay_after_dispatch() -> Result<()> {
         let fixture = Fixture::new(kind)?;
         fixture.response("wait")?;
         let (request, submission) = fixture.prepare()?;
-        let mut sending = Box::pin(fixture.backend.prompt_stream(request, None));
+        let mut sending = Box::pin(fixture.backend.prompt(request));
         tokio::select! {
             result = &mut sending => panic!("pending submission returned: {result:?}"),
             received = fixture.received() => received?,
@@ -244,10 +244,7 @@ async fn acp_steering_only_requeues_a_proven_idle_rejection() -> Result<()> {
         "wait",
     ] {
         let fixture = Fixture::new(BackendKind::Claude)?;
-        fixture
-            .backend
-            .prompt_stream(fixture.request.clone(), None)
-            .await?;
+        fixture.backend.prompt(fixture.request.clone()).await?;
         fixture.response(response)?;
         let mut steering_request = fixture.request.clone();
         steering_request.input = BackendInput::from_text("steering input");

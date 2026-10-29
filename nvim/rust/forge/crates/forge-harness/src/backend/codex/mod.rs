@@ -1458,297 +1458,305 @@ impl Backend for CodexBackend {
     async fn prompt_stream(
         &self,
         mut request: BackendRequest,
-        event_sink: Option<BackendEventSink>,
-    ) -> Result<BackendOutput> {
-        let skills = self.permission_coordinator.skills(
-            self.settings_root.as_deref(),
-            &request,
-            super::BackendKind::Codex,
-        )?;
-        let _directories = self
-            .permission_coordinator
-            .directories(self.settings_root.as_deref(), &request)?;
-        let event_sink = skills.sink(event_sink);
-        let mut active_steering = self
-            .activate_turn_control(&request.runtime_key()?, event_sink.clone())
-            .await?;
-        let mut output = BackendOutput {
-            capability: capability(),
-            ..BackendOutput::default()
-        };
-        let coordinator_event_sink = event_sink.clone();
-        let connection = self
-            .persistent_connection(&request, &mut output, event_sink)
-            .await?;
-        let mut connection = connection.lock().await;
-        let process = &mut connection.process;
-        process.set_activity_publication(false);
-        let request_text = request.input.text();
-        let mut control_context = request
-            .control_context
-            .clone()
-            .unwrap_or_else(|| crate::control_tools::ControlTurnContext::inactive(request.mode));
-        control_context.planning_feedback =
-            request.mode == PromptMode::Plan && request_text.contains("Planning feedback:");
-        if control_context.plan_document.is_none() {
-            control_context.plan_document = (request.mode == PromptMode::Plan)
-                .then(|| super::mock_plan_document_from_prompt(&request_text))
-                .flatten();
-        }
-        let dynamic_tool_definition = ControlToolRegistry
-            .definition_list_for_context(Some(&control_context), request.owner()?.is_root());
-        process.set_control_context(control_context).await;
-        request.model = self.resolve_model(&request, process, &mut output).await?;
-        output.runtime.provider = "Codex CLI".into();
-        output.runtime.model = Some(request.model.clone());
-        let runtime_event = output.runtime.resolved_event();
-        if let Some(sink) = coordinator_event_sink.as_ref() {
-            sink.send_wait(runtime_event).await?;
-        } else {
-            output.event.push(runtime_event);
-        }
-        let dynamic_tool_list = dynamic_tool_definition
-            .into_iter()
-            .map(|definition| {
-                json!({
-                    "type": "function",
-                    "name": definition.name,
-                    "description": definition.description,
-                    "inputSchema": definition.input_schema,
-                })
-            })
-            .collect::<Vec<_>>();
-        let thread_id = self
-            .load_thread(process, &mut output, &request, false, dynamic_tool_list)
-            .await?;
-        if request.backend_session_id.is_some()
-            && let Some(gate) = request
-                .control_context
-                .as_ref()
-                .and_then(|context| context.checkpoint.as_ref())
-            && !gate.ready()
-        {
-            // Existing exec sessions accept stdin without running Codex's PreToolUse hook.
-            let terminals = process
-                .request(
-                    "thread/backgroundTerminals/list",
-                    json!({"threadId":thread_id,"limit":1}),
-                    &mut output,
-                )
-                .await
-                .and_then(|value| super::terminal::TerminalSnapshot::parse(&value, false));
-            if !terminals
-                .as_ref()
-                .is_ok_and(|snapshot| snapshot.terminal.is_empty())
-            {
-                gate.wait().await?;
+        event_sink: BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion> {
+        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+            let event_sink = Some(event_sink);
+            let skills = self.permission_coordinator.skills(
+                self.settings_root.as_deref(),
+                &request,
+                super::BackendKind::Codex,
+            )?;
+            let _directories = self
+                .permission_coordinator
+                .directories(self.settings_root.as_deref(), &request)?;
+            let event_sink = skills.sink(event_sink);
+            let mut active_steering = self
+                .activate_turn_control(&request.runtime_key()?, event_sink.clone())
+                .await?;
+            let mut output = BackendOutput {
+                event: Vec::new(),
+                completion: crate::backend::BackendCompletion {
+                    capability: capability(),
+                    ..Default::default()
+                },
+            };
+            let coordinator_event_sink = event_sink.clone();
+            let connection = self
+                .persistent_connection(&request, &mut output, event_sink)
+                .await?;
+            let mut connection = connection.lock().await;
+            let process = &mut connection.process;
+            process.set_activity_publication(false);
+            let request_text = request.input.text();
+            let mut control_context = request.control_context.clone().unwrap_or_else(|| {
+                crate::control_tools::ControlTurnContext::inactive(request.mode)
+            });
+            control_context.planning_feedback =
+                request.mode == PromptMode::Plan && request_text.contains("Planning feedback:");
+            if control_context.plan_document.is_none() {
+                control_context.plan_document = (request.mode == PromptMode::Plan)
+                    .then(|| super::mock_plan_document_from_prompt(&request_text))
+                    .flatten();
             }
-        }
-        output.backend_session_id = Some(thread_id.clone());
-        let mut prompt = request_text.clone();
-        let native_goal = request
-            .control_context
-            .as_ref()
-            .and_then(|context| context.native_goal.as_deref());
-        if let Some(objective) = native_goal {
-            if request_text.lines().next() != Some("/goal resume") {
-                process
+            let dynamic_tool_definition = ControlToolRegistry
+                .definition_list_for_context(Some(&control_context), request.owner()?.is_root());
+            process.set_control_context(control_context).await;
+            request.model = self.resolve_model(&request, process, &mut output).await?;
+            output.runtime.provider = "Codex CLI".into();
+            output.runtime.model = Some(request.model.clone());
+            let runtime_event = output.runtime.resolved_event();
+            if let Some(sink) = coordinator_event_sink.as_ref() {
+                sink.send_wait(runtime_event).await?;
+            } else {
+                output.event.push(runtime_event);
+            }
+            let dynamic_tool_list = dynamic_tool_definition
+                .into_iter()
+                .map(|definition| {
+                    json!({
+                        "type": "function",
+                        "name": definition.name,
+                        "description": definition.description,
+                        "inputSchema": definition.input_schema,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let thread_id = self
+                .load_thread(process, &mut output, &request, false, dynamic_tool_list)
+                .await?;
+            if request.backend_session_id.is_some()
+                && let Some(gate) = request
+                    .control_context
+                    .as_ref()
+                    .and_then(|context| context.checkpoint.as_ref())
+                && !gate.ready()
+            {
+                // Existing exec sessions accept stdin without running Codex's PreToolUse hook.
+                let terminals = process
                     .request(
-                        "thread/goal/set",
-                        json!({
-                            "threadId": thread_id,
-                            "objective": objective,
-                            "status": "active"
-                        }),
+                        "thread/backgroundTerminals/list",
+                        json!({"threadId":thread_id,"limit":1}),
                         &mut output,
                     )
-                    .await?;
-                if request_text.starts_with("/goal ") {
-                    prompt = format!("Work toward the active goal: {objective}");
+                    .await
+                    .and_then(|value| super::terminal::TerminalSnapshot::parse(&value, false));
+                if !terminals
+                    .as_ref()
+                    .is_ok_and(|snapshot| snapshot.terminal.is_empty())
+                {
+                    gate.wait().await?;
                 }
-            } else {
-                prompt = "Continue working toward the active goal.".into();
             }
-        }
-        let recovered = request
-            .recovered_input
-            .iter()
-            .map(BackendInput::text)
-            .collect::<Vec<_>>();
-        prompt = request.recovered_text(&prompt, &recovered);
-        let mut input =
-            crate::attachment::codex_input(prompt, &request.input_attachments()).await?;
-        for name in request
-            .recovered_input
-            .iter()
-            .chain(std::iter::once(&request.input))
-            .filter_map(|input| {
-                if let BackendInput::Skill { name, .. } = input {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-        {
-            let catalog = if let Some(resources) = self
-                .resources(&Self::catalog_from_request(&request))
-                .await?
-            {
-                resources.catalog.skill.clone()
-            } else {
-                Self::skill_catalog(process, &mut output, &request.workspace, true).await?
-            };
-            let skill = catalog
-                .into_iter()
-                .find(|skill| skill.name == *name && skill.enabled && skill.user_invocable)
-                .with_context(|| format!("skill ${name} is unavailable or disabled"))?;
-            let path = skill
-                .path
-                .with_context(|| format!("skill ${name} omitted its provider path"))?;
-            input.push(json!({ "type": "skill", "name": name, "path": path }));
-        }
-        let native_resume = native_goal.is_some()
-            && request_text.lines().next() == Some("/goal resume")
-            && request.recovered_input.is_empty();
-        let resume_message = native_resume
-            .then(|| {
-                request_text
-                    .split_once("\n\nAdditional user instructions:\n")
-                    .or_else(|| request_text.split_once("\n\nHarness transition:\n"))
-                    .map(|(_, text)| text.to_owned())
-            })
-            .flatten();
-        let admission = if native_resume {
-            if let Some(submission) = &request.submission {
-                submission.sending(super::submission::SubmissionTarget::Untracked)?;
-            }
-            let admission = self
-                .resume_native_goal_turn(process, &mut output, &request, &thread_id)
-                .await?;
-            if let Some(submission) = &request.submission {
-                submission.accepted(format!("goal/resume:{thread_id}"))?;
-            }
-            admission
-        } else {
-            Some(
-                self.start_turn(
-                    process,
-                    &mut output,
-                    &request,
-                    &thread_id,
-                    false,
-                    Self::with_model(
-                        Self::secure(
+            output.backend_session_id = Some(thread_id.clone());
+            let mut prompt = request_text.clone();
+            let native_goal = request
+                .control_context
+                .as_ref()
+                .and_then(|context| context.native_goal.as_deref());
+            if let Some(objective) = native_goal {
+                if request_text.lines().next() != Some("/goal resume") {
+                    process
+                        .request(
+                            "thread/goal/set",
                             json!({
                                 "threadId": thread_id,
-                                "input": input,
-                                "cwd": request.workspace,
-                                "effort": request.effort,
-                                "serviceTier": request.service_tier
+                                "objective": objective,
+                                "status": "active"
                             }),
-                            &request,
-                        ),
-                        &request.model,
-                    ),
-                )
-                .await?,
-            )
-        };
-        let turn_id = if let Some((turn, provider_turn_started, observed_message_list)) = admission
-        {
-            let current_turn_id = turn
-                .pointer("/turn/id")
-                .or_else(|| turn.get("turnId"))
-                .or_else(|| turn.get("turn_id"))
-                .and_then(Value::as_str)
-                .context("Codex turn/start response omitted turn id")?
-                .to_owned();
-            let coordinator = turn_coordinator::CodexTurnCoordinator::new(
-                self,
-                process,
-                &mut output,
-                &mut active_steering,
-                coordinator_event_sink.clone(),
-                &request,
-                &thread_id,
-            );
-            let completion = coordinator.run(
-                current_turn_id.clone(),
-                provider_turn_started,
-                observed_message_list,
-            );
-            let completed = if let Some(text) = resume_message {
-                let lane = self.steering_lane(&request.runtime_key()?).await;
-                let (completed, delivered) = tokio::join!(completion, lane.steer(text.into()));
-                delivered.context("deliver instructions to resumed native goal")?;
-                completed?
-            } else {
-                completion.await?
-            };
-            let status = completed
-                .pointer("/turn/status")
-                .or_else(|| completed.get("status"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if status.eq_ignore_ascii_case("failed") {
-                self.active_turn_by_session
-                    .lock()
-                    .await
-                    .insert(request.runtime_key()?, CodexTurnState::Completed);
-                let error = completed
-                    .pointer("/turn/error")
-                    .or_else(|| completed.get("error"));
-                if let Some((error, code)) =
-                    error.and_then(|error| retry::transient_code(error).map(|code| (error, code)))
-                    && super::retry::replay_safe(&output)
-                {
-                    return Err(super::retry::RetryableFailure {
-                        address: super::ProviderAddress {
-                            owner: Some(request.owner()?),
-                            thread_id: thread_id.clone(),
-                            turn_id: completed
-                                .pointer("/turn/id")
-                                .or_else(|| completed.get("turnId"))
-                                .and_then(Value::as_str)
-                                .unwrap_or(&current_turn_id)
-                                .to_owned(),
-                        },
-                        code,
-                        detail: error.clone(),
-                        message: format!("Codex turn failed: {completed}"),
+                            &mut output,
+                        )
+                        .await?;
+                    if request_text.starts_with("/goal ") {
+                        prompt = format!("Work toward the active goal: {objective}");
                     }
-                    .into());
+                } else {
+                    prompt = "Continue working toward the active goal.".into();
                 }
-                anyhow::bail!("Codex turn failed: {completed}");
             }
-            Some(
-                completed
+            let recovered = request
+                .recovered_input
+                .iter()
+                .map(BackendInput::text)
+                .collect::<Vec<_>>();
+            prompt = request.recovered_text(&prompt, &recovered);
+            let mut input =
+                crate::attachment::codex_input(prompt, &request.input_attachments()).await?;
+            for name in request
+                .recovered_input
+                .iter()
+                .chain(std::iter::once(&request.input))
+                .filter_map(|input| {
+                    if let BackendInput::Skill { name, .. } = input {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+            {
+                let catalog = if let Some(resources) = self
+                    .resources(&Self::catalog_from_request(&request))
+                    .await?
+                {
+                    resources.catalog.skill.clone()
+                } else {
+                    Self::skill_catalog(process, &mut output, &request.workspace, true).await?
+                };
+                let skill = catalog
+                    .into_iter()
+                    .find(|skill| skill.name == *name && skill.enabled && skill.user_invocable)
+                    .with_context(|| format!("skill ${name} is unavailable or disabled"))?;
+                let path = skill
+                    .path
+                    .with_context(|| format!("skill ${name} omitted its provider path"))?;
+                input.push(json!({ "type": "skill", "name": name, "path": path }));
+            }
+            let native_resume = native_goal.is_some()
+                && request_text.lines().next() == Some("/goal resume")
+                && request.recovered_input.is_empty();
+            let resume_message = native_resume
+                .then(|| {
+                    request_text
+                        .split_once("\n\nAdditional user instructions:\n")
+                        .or_else(|| request_text.split_once("\n\nHarness transition:\n"))
+                        .map(|(_, text)| text.to_owned())
+                })
+                .flatten();
+            let admission = if native_resume {
+                if let Some(submission) = &request.submission {
+                    submission.sending(super::submission::SubmissionTarget::Untracked)?;
+                }
+                let admission = self
+                    .resume_native_goal_turn(process, &mut output, &request, &thread_id)
+                    .await?;
+                if let Some(submission) = &request.submission {
+                    submission.accepted(format!("goal/resume:{thread_id}"))?;
+                }
+                admission
+            } else {
+                Some(
+                    self.start_turn(
+                        process,
+                        &mut output,
+                        &request,
+                        &thread_id,
+                        false,
+                        Self::with_model(
+                            Self::secure(
+                                json!({
+                                    "threadId": thread_id,
+                                    "input": input,
+                                    "cwd": request.workspace,
+                                    "effort": request.effort,
+                                    "serviceTier": request.service_tier
+                                }),
+                                &request,
+                            ),
+                            &request.model,
+                        ),
+                    )
+                    .await?,
+                )
+            };
+            let turn_id = if let Some((turn, provider_turn_started, observed_message_list)) =
+                admission
+            {
+                let current_turn_id = turn
                     .pointer("/turn/id")
-                    .or_else(|| completed.get("turnId"))
+                    .or_else(|| turn.get("turnId"))
+                    .or_else(|| turn.get("turn_id"))
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or(current_turn_id),
-            )
-        } else {
-            anyhow::ensure!(
-                resume_message.is_none(),
-                "native goal settled before receiving the resume message"
-            );
-            None
-        };
-        self.active_turn_by_session
-            .lock()
-            .await
-            .insert(request.runtime_key()?, CodexTurnState::Completed);
-        if let Some(turn_id) = turn_id {
-            self.completed_turn_by_session
+                    .context("Codex turn/start response omitted turn id")?
+                    .to_owned();
+                let coordinator = turn_coordinator::CodexTurnCoordinator::new(
+                    self,
+                    process,
+                    &mut output,
+                    &mut active_steering,
+                    coordinator_event_sink.clone(),
+                    &request,
+                    &thread_id,
+                );
+                let completion = coordinator.run(
+                    current_turn_id.clone(),
+                    provider_turn_started,
+                    observed_message_list,
+                );
+                let completed = if let Some(text) = resume_message {
+                    let lane = self.steering_lane(&request.runtime_key()?).await;
+                    let (completed, delivered) = tokio::join!(completion, lane.steer(text.into()));
+                    delivered.context("deliver instructions to resumed native goal")?;
+                    completed?
+                } else {
+                    completion.await?
+                };
+                let status = completed
+                    .pointer("/turn/status")
+                    .or_else(|| completed.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if status.eq_ignore_ascii_case("failed") {
+                    self.active_turn_by_session
+                        .lock()
+                        .await
+                        .insert(request.runtime_key()?, CodexTurnState::Completed);
+                    let error = completed
+                        .pointer("/turn/error")
+                        .or_else(|| completed.get("error"));
+                    if let Some((error, code)) = error
+                        .and_then(|error| retry::transient_code(error).map(|code| (error, code)))
+                        && super::retry::replay_safe(&output)
+                    {
+                        return Err(super::retry::RetryableFailure {
+                            address: super::ProviderAddress {
+                                owner: Some(request.owner()?),
+                                thread_id: thread_id.clone(),
+                                turn_id: completed
+                                    .pointer("/turn/id")
+                                    .or_else(|| completed.get("turnId"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(&current_turn_id)
+                                    .to_owned(),
+                            },
+                            code,
+                            detail: error.clone(),
+                            message: format!("Codex turn failed: {completed}"),
+                        }
+                        .into());
+                    }
+                    anyhow::bail!("Codex turn failed: {completed}");
+                }
+                Some(
+                    completed
+                        .pointer("/turn/id")
+                        .or_else(|| completed.get("turnId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or(current_turn_id),
+                )
+            } else {
+                anyhow::ensure!(
+                    resume_message.is_none(),
+                    "native goal settled before receiving the resume message"
+                );
+                None
+            };
+            self.active_turn_by_session
                 .lock()
                 .await
-                .insert(request.runtime_key()?, turn_id.clone());
-            output.provider_checkpoint_id = Some(turn_id);
+                .insert(request.runtime_key()?, CodexTurnState::Completed);
+            if let Some(turn_id) = turn_id {
+                self.completed_turn_by_session
+                    .lock()
+                    .await
+                    .insert(request.runtime_key()?, turn_id.clone());
+                output.provider_checkpoint_id = Some(turn_id);
+            }
+            skills.output(&mut output)?;
+            Ok(output)
         }
-        skills.output(&mut output)?;
-        Ok(output)
+        .await;
+        Ok(output?.into_completion())
     }
 
     async fn fork(&self, request: BackendForkRequest) -> Result<BackendForkResult> {
@@ -1851,9 +1859,12 @@ impl Backend for CodexBackend {
             .clone()
             .context("Codex thread has not started")?;
         let mut output = BackendOutput {
-            backend_session_id: Some(thread_id.clone()),
-            capability: capability(),
-            ..BackendOutput::default()
+            event: Vec::new(),
+            completion: crate::backend::BackendCompletion {
+                backend_session_id: Some(thread_id.clone()),
+                capability: capability(),
+                ..Default::default()
+            },
         };
         let mut process = self.connect(&request, &mut output, None).await?.process;
         self.load_thread(&mut process, &mut output, &request, false, Vec::new())
@@ -2723,7 +2734,7 @@ mod test {
         let store = super::super::submission::SubmissionStore::open(fixture.path(), trace)?;
         let submission = store.prepare(&request, BackendKind::Codex)?;
         request.submission = Some(submission.clone());
-        let error = backend.prompt_stream(request, None).await.unwrap_err();
+        let error = backend.prompt(request).await.unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3033,11 +3044,9 @@ mod test {
             )?;
             let submission = journal.prepare(&request, BackendKind::Codex)?;
             request.submission = Some(submission.clone());
-            let output = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                backend.prompt_stream(request, None),
-            )
-            .await??;
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(2), backend.prompt(request))
+                    .await??;
             assert!(matches!(
                 submission.record()?.delivery,
                 super::super::submission::SubmissionState::Accepted { .. }
@@ -3274,7 +3283,7 @@ mod test {
             );
             let output = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                backend.prompt_stream(
+                backend.prompt(
                     BackendRequest {
                         execution_owner: None,
                         harness_session_id: "session".into(),
@@ -3297,7 +3306,6 @@ mod test {
                             context
                         }),
                     },
-                    None,
                 ),
             )
             .await??;

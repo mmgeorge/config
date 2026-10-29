@@ -1,6 +1,7 @@
 mod changes;
 pub mod document;
 mod duration;
+mod failure;
 pub mod identity;
 mod layout;
 mod markdown_math;
@@ -14,5 +15,7 @@ mod status;
 mod syntax;
 pub mod tool;
 pub mod transcript;
+
+pub use failure::TranscriptProjectionFailure;
 
 pub(crate) mod sections;

@@ -84,6 +84,15 @@ impl BackendEventSink {
     }
     /// Waits for bounded queue capacity without treating a burst as delivery failure.
     pub async fn send_wait(&self, mut event: BackendEvent) -> Result<(), EventDeliveryFailure> {
+        if let Some(message) = &event.message {
+            event.text = message.text().map(str::to_owned);
+            event.kind = match message.role {
+                Some(crate::backend::MessageRole::Thought) => "reasoning",
+                Some(crate::backend::MessageRole::ThoughtSummary) => "reasoning_summary",
+                _ => "assistant_message",
+            }
+            .into();
+        }
         if let (Some(owner), Some(address)) = (&self.owner, &mut event.address) {
             if address
                 .owner
@@ -248,6 +257,21 @@ impl EventReceiver {
 }
 
 impl BackendEventStream {
+    /// Returns the next available event, preserving delivery failures separately from an empty queue.
+    pub fn try_next(&mut self) -> Result<Option<BackendEvent>, EventDeliveryFailure> {
+        match self.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(EventDeliveryFailure(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub fn check(&self) -> Result<(), EventDeliveryFailure> {
         self.input.receiver.check().map_err(EventDeliveryFailure)
     }
@@ -345,8 +369,10 @@ fn merge_output(pending: &mut BackendEvent, event: &BackendEvent) -> bool {
             return false;
         };
         previous.push_str(next);
-        if let Some(delta) = pending.data.pointer_mut("/params/delta") {
-            *delta = serde_json::Value::String(previous.clone());
+        if let Some(message) = &mut pending.message {
+            message.update = crate::backend::MessageUpdate::Delta {
+                text: previous.clone(),
+            };
         }
         return true;
     }
@@ -431,6 +457,7 @@ mod tests {
 
     fn event(sequence: usize) -> BackendEvent {
         BackendEvent {
+            message: None,
             received_at_ms: None,
             address: None,
             turn_boundary: None,
@@ -452,7 +479,7 @@ mod tests {
             kind: super::super::ToolActivityKind::Command,
             title: "command".into(),
             output: Some(text.into()),
-            status: Some("inProgress".into()),
+            status: Some(crate::backend::ToolStatus::Running),
             change: Default::default(),
             output_delta: true,
         });
@@ -463,6 +490,11 @@ mod tests {
     async fn message_batches_preserve_message_phase_and_snapshot_barriers() {
         let (sink, mut stream) = channel();
         let message = |id: &str, text: &str| BackendEvent {
+            message: Some(crate::backend::ProviderMessage {
+                id: crate::backend::MessageId(id.into()),
+                role: Some(crate::backend::MessageRole::Commentary),
+                update: crate::backend::MessageUpdate::Delta { text: text.into() },
+            }),
             kind: "assistant_message".into(),
             text: Some(text.into()),
             data: json!({"provider_message_id":id,"provider_message_phase":"commentary"}),
@@ -474,7 +506,9 @@ mod tests {
             }
             sink.send_wait(message("two", "second")).await.unwrap();
             let mut snapshot = message("two", "complete");
-            snapshot.data["message_update"] = json!("snapshot");
+            snapshot.message.as_mut().unwrap().update = crate::backend::MessageUpdate::Completed {
+                text: "complete".into(),
+            };
             sink.send_wait(snapshot).await.unwrap();
             sink.send_wait(event(1)).await.unwrap();
         };

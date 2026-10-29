@@ -52,8 +52,9 @@ local previous = { plan = plan, owner = owner, buf = native_buffer, win = vim.ap
 harness.plan_review = previous
 local before = vim.api.nvim_buf_get_lines(native_buffer, 0, -1, false)
 owner.saving = true
+owner.annotation_saving = true
 vim.cmd("write")
-assert(owner.pending_operation and owner.pending_operation.capture[1].source.body == "draft\nλ\r\n")
+assert(owner.pending_operation[1].capture[1].source.body == "draft\nλ\r\n")
 generation = 2
 require("forge.views.plan_review.native_controller").open(plan)
 assert(#pending == 2)
@@ -96,13 +97,14 @@ assert(failure_notice and failure_notice:find("physical source conflict", 1, tru
 print("plan_review_recovery: conflicts preserve retained text and ownership")
 generation = 2
 replacement.owner.saving = true
+replacement.owner.annotation_saving = true
 local submitted
 replacement.owner.submit("session.plan.changes.request", { comment = "Revision requested" }, function(result, failure)
   assert(result and not failure, failure)
   submitted = true
 end)
-assert(replacement.owner.pending_operation)
-local frozen = vim.deepcopy(replacement.owner.pending_operation.params)
+assert(replacement.owner.pending_operation[1])
+local frozen = vim.deepcopy(replacement.owner.pending_operation[1].params)
 generation = 4
 require("forge.views.plan_review.native_controller").open(plan)
 assert(#pending == 5)
@@ -120,3 +122,15 @@ assert(recovered_submission.comment == frozen.comment)
 pending[6].callback({})
 assert(submitted and not submission_owner.submission_pending)
 print("plan_review_recovery: queued submission retains capture and rebinds host identity")
+assert(comments.focus(native_buffer, comments.capture(native_buffer)[1].id))
+local closing_row = vim.api.nvim_win_get_cursor(0)[1] - 1
+vim.api.nvim_buf_set_lines(native_buffer, closing_row, closing_row + 1, false, { "Save before this buffer closes" })
+vim.api.nvim_exec_autocmds("TextChanged", { buffer = native_buffer })
+vim.cmd("write")
+assert(pending[7].params.operation == "plan_save_annotations" and submission_owner.annotation_saving)
+vim.api.nvim_buf_delete(native_buffer, { force = true })
+pending[7].callback({ saved = true })
+assert(not submission_owner.annotation_saving and not submission_owner.saving,
+  "closed review retained a completed annotation save")
+assert(submission_owner.close(), "invalid review buffer prevented owner cleanup")
+print("plan_review_recovery: annotation saves settle after their physical buffer is wiped")
