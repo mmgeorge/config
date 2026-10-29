@@ -979,10 +979,15 @@ impl CodexBackend {
         thread_id: &str,
     ) -> Result<Option<(Value, bool, Vec<Value>)>> {
         process.set_activity_publication(true);
+        let objective = request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.native_goal.as_ref())
+            .context("native goal resume requires its committed objective")?;
         let request_id = process
             .send_request(
                 "thread/goal/set",
-                json!({"threadId":thread_id,"status":"active"}),
+                json!({"threadId":thread_id,"objective":objective,"status":"active"}),
             )
             .await?;
         self.active_turn_by_session.lock().await.insert(
@@ -1186,6 +1191,10 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
+    fn supports_task_steering(&self, _kind: crate::task::TaskKind) -> bool {
+        false
+    }
+
     async fn reconcile_submission(
         &self,
         submission: &super::submission::SubmissionRecord,
@@ -1537,15 +1546,12 @@ impl Backend for CodexBackend {
         }
         output.backend_session_id = Some(thread_id.clone());
         let mut prompt = request_text.clone();
-        if request.mode == PromptMode::GoalContinuation {
-            let objective = request
-                .input
-                .text()
-                .strip_prefix("/goal ")
-                .and_then(|value| value.lines().next())
-                .filter(|value| *value != "resume")
-                .map(str::to_owned);
-            if let Some(objective) = objective {
+        let native_goal = request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.native_goal.as_deref());
+        if let Some(objective) = native_goal {
+            if request_text.lines().next() != Some("/goal resume") {
                 process
                     .request(
                         "thread/goal/set",
@@ -1557,7 +1563,9 @@ impl Backend for CodexBackend {
                         &mut output,
                     )
                     .await?;
-                prompt = format!("Work toward the active goal: {objective}");
+                if request_text.starts_with("/goal ") {
+                    prompt = format!("Work toward the active goal: {objective}");
+                }
             } else {
                 prompt = "Continue working toward the active goal.".into();
             }
@@ -1599,7 +1607,7 @@ impl Backend for CodexBackend {
                 .with_context(|| format!("skill ${name} omitted its provider path"))?;
             input.push(json!({ "type": "skill", "name": name, "path": path }));
         }
-        let native_resume = request.mode == PromptMode::GoalContinuation
+        let native_resume = native_goal.is_some()
             && request_text.lines().next() == Some("/goal resume")
             && request.recovered_input.is_empty();
         let resume_message = native_resume
@@ -3175,7 +3183,7 @@ mod test {
                 );
                 assert_eq!(
                     request["params"],
-                    json!({"threadId":"parent","status":"active"})
+                    json!({"threadId":"parent","objective":"Resume test objective","status":"active"})
                 );
                 let acknowledgement =
                     json!({"id":request["id"],"result":{"goal":{"status":"active"}}});
@@ -3281,7 +3289,11 @@ mod test {
                         backend_session_id: Some("parent".into()),
                         submission: None,
                         recovered_input: Vec::new(),
-                        control_context: None,
+                        control_context: Some({
+                            let mut context = crate::control_tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
+                            context.native_goal = Some("Resume test objective".into());
+                            context
+                        }),
                     },
                     None,
                 ),

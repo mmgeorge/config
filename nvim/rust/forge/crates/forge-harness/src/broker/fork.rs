@@ -81,8 +81,7 @@ pub fn prepare_provider_fork(
     child.context_usage.clone_from(&source.context_usage);
     child.approval_mode = source.approval_mode;
 
-    child.current_task_id = None;
-    child.goal_id = None;
+    child.active_task = None;
     child.created_at_ms = now_ms;
     child.updated_at_ms = now_ms;
     child.lease_owner = Some(client_id.to_owned());

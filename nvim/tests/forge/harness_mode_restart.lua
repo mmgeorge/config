@@ -13,8 +13,8 @@ vim.defer_fn = function() end
 local function reset()
   if state.working_timer then state.working_timer:stop() state.working_timer:close() end
   state.working_timer, state.working_started_ns = nil, nil
-  state.session = { id = "permission-transition", approval_mode = "ask", current_task_id = "task" }
-  state.task = { { id = "task", kind = "goal", phase = "continue", status = "running" } }
+  state.session = { id = "permission-transition", approval_mode = "ask", active_task = { revision = "task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }
+
   state.busy, state.no_checkpoint = true, false
   state.execution_notice, state.host_error, state.task_operation = nil, nil, nil
   state.task_operation_scope, state.task_operation_by_id = nil, nil
@@ -22,7 +22,7 @@ local function reset()
   state.state_sync_pending, state.state_sync_again, state.state_sync_callback = nil, nil, nil
   state.queue, state.pending_steer, state.capability = {}, {}, {}
   state.approval, state.active_elicitation, state.selected_agent_run_id = {}, nil, nil
-  state.goal, state.goal_execution, state.status = nil, nil, nil
+  state.status = nil
   state.configuring, state.configuration_debounce, state.pending_config = nil, nil, nil
   requests, failures = {}, {}
 end

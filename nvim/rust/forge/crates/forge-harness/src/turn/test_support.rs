@@ -57,7 +57,7 @@ impl TestTurn {
             data: serde_json::Value::Null,
             activity: Some(activity.clone()),
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         self.record_tool_event(event.tool_event().unwrap(), now_ms)
     }

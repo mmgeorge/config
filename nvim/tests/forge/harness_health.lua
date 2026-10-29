@@ -46,31 +46,26 @@ local success, failure = xpcall(function()
   advance(1)
   assert(health.notice(state) == nil)
   state.status.kind = "idle"
-  state.session.current_task_id = "task"
-  state.task = {{id = "task", status = "running"}}
-  local queued = {text = "Next message", task_id = "task"}
+  state.session.active_task = { revision = "task", kind = "goal", goal = { state = "active" } }
+  local queued = {text = "Next message", purpose = {kind = "user"}}
   state.queue = {queued}
   local handoff = health.notice(state)
   assert(handoff.text == "Working" and handoff.animated and handoff.hint == "working",
     "a ready queued message must keep Working visible during handoff")
   state.queue_paused = true
   assert(health.notice(state) == nil, "locally paused input must not imply a queued handoff")
-  state.session.current_task_id, state.task = nil, {}
-  queued.task_id = nil
+  state.session.active_task = nil
   assert(health.notice(state) == nil, "taskless chat cancellation must not retain a Working spinner")
   state.queue_paused = false
   assert(health.notice(state).text == "Working", "resuming taskless queued work lost its handoff status")
-  state.session.current_task_id, state.task = "task", {{id = "task", status = "running"}}
-  queued.task_id = "task"
+  state.session.active_task = { revision = "task", kind = "goal", goal = { state = "active" } }
   state.queue_edit = {barrier = queued}
   assert(health.notice(state) == nil, "editing the next message must not imply a handoff")
   state.queue_edit = nil
-  state.task[1].status = "paused"
-  assert(health.notice(state) == nil, "a paused task must not imply queued execution")
-  state.task[1].status = "running"
-  queued.task_id = "another-task"
-  assert(health.notice(state) == nil, "queued work for another task must not imply execution")
-  queued.task_id = "task"
+  state.session.active_task.goal.state = "paused"
+  assert(health.notice(state).text == "Working", "paused task state must not hide explicitly queued user input")
+  state.session.active_task = { revision = "replacement-task", kind = "goal", goal = { state = "active" } }
+  assert(health.notice(state).text == "Working", "task replacement hid queued user input")
   state.checks_running = true
   assert(health.notice(state) == nil, "native check progress must remain visible")
   state.checks_running = false

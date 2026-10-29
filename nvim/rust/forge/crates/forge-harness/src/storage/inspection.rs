@@ -78,22 +78,11 @@ impl SessionReader {
     }
 
     pub(crate) fn task(&self, session: &HarnessSession) -> Result<serde_json::Value> {
-        let Some(id) = &session.current_task_id else {
+        let Some(task) = &session.active_task else {
             return Ok(serde_json::Value::Null);
         };
-        let payload: String = self
-            .connection
-            .query_row(
-                "SELECT payload FROM task_record WHERE session_id=?1 AND id=?2",
-                params![session.id, id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .context("selected session task is missing")?;
-        let task: crate::task::TaskRecord = decode(&payload)?;
         Ok(
-            serde_json::json!({"id":task.id,"kind":task.kind,"status":task.status,
-            "phase":task.phase,"reason":task.reason}),
+            serde_json::json!({"revision":task.revision,"kind":task.kind(),"status":task.status(),"title":task.title()}),
         )
     }
 

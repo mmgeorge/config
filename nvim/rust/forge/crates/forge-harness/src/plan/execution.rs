@@ -318,7 +318,6 @@ pub struct PlanExecutionRecord {
     pub id: String,
     pub session_id: String,
     pub plan_id: String,
-    pub goal_id: String,
     pub baseline_checkpoint: Option<String>,
     pub state: PlanExecutionState,
     pub phase: PlanPhase,
@@ -503,19 +502,32 @@ pub enum ExecutionOperation {
 
 /// Associates one broker request with the execution generation captured at turn start.
 pub struct ExecutionControl {
+    pub(crate) task_permit: crate::task::TaskPermit,
     pub execution_id: String,
     pub generation: u64,
     pub operation: ExecutionOperation,
     pub response: oneshot::Sender<Result<Value>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 /// Restricts provider execution controls to their admitted broker turn.
 pub struct ExecutionControlSender {
+    pub(crate) task_controller: std::sync::Arc<crate::task::SessionTaskController>,
     pub phase: PlanPhase,
     pub execution_id: String,
     pub generation: u64,
     pub sender: mpsc::Sender<ExecutionControl>,
+}
+
+impl std::fmt::Debug for ExecutionControlSender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionControlSender")
+            .field("phase", &self.phase)
+            .field("execution_id", &self.execution_id)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutionControlSender {
@@ -531,6 +543,21 @@ impl ExecutionControlSender {
 
     /// Await a committed broker result before acknowledging the provider's request.
     pub async fn send(&self, operation: ExecutionOperation) -> Result<Value> {
+        let task_permit = self.task_controller.admit(crate::task::TaskKind::Execute)?;
+        let task = self
+            .task_controller
+            .current()?
+            .context("execution task was cleared")?;
+        task_permit.validate(Some(&task))?;
+        let crate::task::TaskWorkflow::Execute { execution } = task.workflow else {
+            return Err(crate::task::StaleTask.into());
+        };
+        if execution.record.id != self.execution_id
+            || execution.record.generation != self.generation
+            || execution.record.phase != self.phase
+        {
+            return Err(crate::task::StaleTask.into());
+        }
         if matches!(
             &operation,
             ExecutionOperation::Draft(_) | ExecutionOperation::Submit { .. }
@@ -540,6 +567,7 @@ impl ExecutionControlSender {
         let (response, receive) = oneshot::channel();
         self.sender
             .send(ExecutionControl {
+                task_permit,
                 execution_id: self.execution_id.clone(),
                 generation: self.generation,
                 operation,
@@ -576,7 +604,6 @@ mod tests {
             id: "execution".into(),
             session_id: "session".into(),
             plan_id: "plan".into(),
-            goal_id: "goal".into(),
             baseline_checkpoint: None,
             state: PlanExecutionState::Active,
             phase: PlanPhase::Implement,
@@ -932,11 +959,95 @@ mod tests {
 #[cfg(test)]
 mod revision_policy_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn execution_requests_keep_their_task_permit_across_queue_waits() -> Result<()> {
+        let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let record: PlanExecutionRecord = serde_json::from_value(json!({
+            "id":"execution","session_id":"session","plan_id":"plan",
+            "state":"active","phase":"implement","original_revision":1,"revision":1,"generation":1,
+            "lifecycle":[],"findings":[],"progress":SemanticProgress::default(),
+            "verification":[],"revision_history":[],"review_paused":false,"observed_source":{},
+            "observed_generation":0,"observed_check":[],"created_at_ms":0
+        }))?;
+        let previous = controller.current()?.unwrap();
+        let task = controller
+            .change(
+                &mut store,
+                Some(&previous.revision),
+                crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::execute(
+                    "Execute plan".into(),
+                    record.clone(),
+                    Default::default(),
+                    false,
+                    2,
+                ))),
+                2,
+            )?
+            .unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let control = ExecutionControlSender {
+            task_controller: controller.clone(),
+            phase: record.phase,
+            execution_id: record.id.clone(),
+            generation: record.generation,
+            sender,
+        };
+        let mut pending = Box::pin(control.send(ExecutionOperation::Inspect));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        let request = receiver.recv().await.unwrap();
+        let paused = controller
+            .change(
+                &mut store,
+                Some(&task.revision),
+                crate::task::TaskChange::Pause,
+                3,
+            )?
+            .unwrap();
+        let resumed = controller
+            .change(
+                &mut store,
+                Some(&paused.revision),
+                crate::task::TaskChange::Resume,
+                4,
+            )?
+            .unwrap();
+        let stale = request.task_permit.validate(Some(&resumed)).unwrap_err();
+        assert!(stale.is::<crate::task::StaleTask>());
+        request.response.send(Err(stale)).unwrap();
+        assert!(pending.await.unwrap_err().is::<crate::task::StaleTask>());
+        let mut pending = Box::pin(control.send(ExecutionOperation::Inspect));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        let request = receiver.recv().await.unwrap();
+        request.task_permit.validate(Some(&resumed))?;
+        request
+            .response
+            .send(Ok(json!({"phase":"implement"})))
+            .unwrap();
+        assert_eq!(pending.await?["phase"], "implement");
+        controller.change(
+            &mut store,
+            Some(&resumed.revision),
+            crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+                "Replacement".into(),
+                Default::default(),
+                false,
+                5,
+            ))),
+            5,
+        )?;
+        assert!(control.send(ExecutionOperation::Inspect).await.is_err());
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+
     #[test]
     fn stale_tools_cannot_revise_outside_resolve() {
+        let (_root, _store, task_controller) = crate::task::SessionTaskController::test_goal();
         let (sender, _receiver) = mpsc::channel(1);
         for phase in [PlanPhase::Implement, PlanPhase::Verify, PlanPhase::Resolve] {
             let control = ExecutionControlSender {
+                task_controller: task_controller.clone(),
                 phase,
                 execution_id: "e".into(),
                 generation: 1,

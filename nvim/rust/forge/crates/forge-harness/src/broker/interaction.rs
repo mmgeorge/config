@@ -8,6 +8,58 @@ impl HarnessBroker {
         admission: Option<ExchangeAdmission>,
         input: BackendInput,
     ) -> Result<(Value, Vec<SessionEvent>)> {
+        let mut preparation_event = Vec::new();
+        if let Some(task) = self.task_controller.current()?
+            && let Some(entry) = &task.entry
+            && let Some(preparation) = &entry.execution
+            && self
+                .input_submission
+                .as_ref()
+                .map(|submission| submission.record())
+                .transpose()?
+                .and_then(|record| record.input_message_id)
+                .as_deref()
+                == Some(entry.id.as_str())
+        {
+            if preparation.executor.enabled {
+                self.validate_plan_executor(&preparation.executor).await?;
+            }
+            task.permit()
+                .validate(self.task_controller.current()?.as_ref())?;
+            if preparation.compact {
+                preparation_event = Box::pin(self.compact_session(true)).await?.1;
+            }
+            task.permit()
+                .validate(self.task_controller.current()?.as_ref())?;
+            if preparation.executor.enabled {
+                self.session.model = preparation
+                    .executor
+                    .model
+                    .clone()
+                    .context("executor model is missing")?;
+                self.session.resolved_model = Some(self.session.model.clone());
+                self.session.effort = preparation
+                    .executor
+                    .effort
+                    .clone()
+                    .context("executor thinking is missing")?;
+                self.session.context_window = None;
+            }
+            self.session.approval_mode = preparation.approval_mode;
+            self.save_session()?;
+            self.task_controller.update(
+                &mut self.store,
+                &task.permit(),
+                self.clock.now_ms(),
+                |task| {
+                    task.entry
+                        .as_mut()
+                        .context("execution entry disappeared")?
+                        .execution = None;
+                    Ok(())
+                },
+            )?;
+        }
         let submission_store = self.submission_store.clone();
         let submission = match self.input_submission.take() {
             Some(submission) => submission,
@@ -23,6 +75,8 @@ impl HarnessBroker {
             submission.record()?.input_message_id,
         ))
         .await?;
+        preparation_event.append(&mut event);
+        let mut event = preparation_event;
 
         let output = self
             .run_admitted_provider(
@@ -75,7 +129,7 @@ impl HarnessBroker {
                             data: serde_json::to_value(&interaction)?,
                             activity: None,
                             summary: None,
-                            task_update: None,
+                            checklist_update: None,
                         },
                         &interaction,
                         &mut event,
@@ -190,7 +244,7 @@ impl HarnessBroker {
                             data: serde_json::to_value(&interaction)?,
                             activity: None,
                             summary: None,
-                            task_update: None,
+                            checklist_update: None,
                         },
                         &interaction,
                         &mut event,
@@ -240,33 +294,13 @@ impl HarnessBroker {
         interaction.input_message_id = input_message_id;
         interaction.approval_mode = Some(self.session.approval_mode);
         if new_interaction && let Some(admission) = admission {
+            interaction.origin = admission.origin.clone();
             if self.check_setup {
                 interaction.check_setup = Some(crate::checks::CheckSetupState::Discovery);
             } else if mode == PromptMode::Chat {
                 interaction.check_setup = self.continued_check_setup(admission)?;
             }
-            interaction.lifecycle.clone_from(&admission.lifecycle);
             interaction.check_owner.clone_from(&admission.check_owner);
-            interaction.kind = admission.kind;
-            interaction.plan_id.clone_from(&admission.plan_id);
-            interaction.execution_id.clone_from(&admission.execution_id);
-            if let Some(execution_id) = &interaction.execution_id {
-                let execution = self
-                    .store
-                    .load_plan_execution(execution_id)?
-                    .context("phase exchange has no execution")?;
-                interaction.execution_phase = Some(crate::exchange::ExecutionPhase {
-                    phase: execution.phase,
-                    outcome: None,
-                    summary: None,
-                    findings: Vec::new(),
-                    verification: None,
-                    declaration_findings: Vec::new(),
-                    declaration_changes: Vec::new(),
-                    verification_tools: Default::default(),
-                });
-            }
-            interaction.goal_id.clone_from(&admission.goal_id);
             if let Some(run_id) = admission.agent_run_id.as_deref()
                 && let Some(run) = self.agent_registry.get(run_id).cloned()
             {
@@ -275,13 +309,11 @@ impl HarnessBroker {
                 self.store.save_agent_run(&run)?;
                 self.agent_registry.insert(run);
             }
-            if interaction.task.is_none()
-                && let Some(execution_id) = interaction.execution_id.as_deref()
-            {
-                interaction.task = self
+            if interaction.checklist.is_none() && self.current_execution()?.is_some() {
+                interaction.checklist = self
                     .store
-                    .latest_execution_exchange(&self.session.id, execution_id)?
-                    .and_then(|previous| previous.task);
+                    .latest_exchange(&self.session.id)?
+                    .and_then(|previous| previous.checklist);
             }
         }
         if new_interaction {
@@ -297,13 +329,18 @@ impl HarnessBroker {
                 lifecycle.anchor = Some(crate::plan::ExchangeAnchor::capture(&interaction));
                 self.store.save_plan_lifecycle(&lifecycle)?;
             }
-            if let Some(execution_id) = interaction.execution_id.as_deref()
-                && let Some(mut execution) = self.store.load_plan_execution(execution_id)?
+            if let Some(task) = self.task_controller.current()?
+                && matches!(&task.workflow, crate::task::TaskWorkflow::Execute { execution } if execution.record.baseline_checkpoint.is_none())
             {
-                if execution.baseline_checkpoint.is_none() {
-                    execution.baseline_checkpoint = interaction.checkpoint_before.clone();
-                }
-                self.store.save_plan_execution(&execution)?;
+                let checkpoint = interaction.checkpoint_before.clone();
+                self.task_controller
+                    .update(&mut self.store, &task.permit(), now_ms, |task| {
+                        if let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow
+                        {
+                            execution.record.baseline_checkpoint = checkpoint;
+                        }
+                        Ok(())
+                    })?;
             }
         }
         interaction.resume(self.clock.now_ms())?;
@@ -325,7 +362,7 @@ impl HarnessBroker {
                 data: serde_json::to_value(&interaction)?,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             },
             &interaction,
             &mut event,
@@ -347,28 +384,22 @@ impl HarnessBroker {
             Box::pin(self.emit_timeline_patch(patch, &mut event)).await?;
         }
 
-        let goal = self
-            .session
-            .goal_id
-            .as_deref()
-            .map(|id| self.store.load_goal(id))
-            .transpose()?
-            .flatten();
-        let goal_execution = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .rev()
-            .find(|execution| {
-                goal.as_ref()
-                    .is_some_and(|goal| goal.id == execution.goal_id)
-            });
-        Box::pin(self.emit_backend_event(BackendEvent {
-            received_at_ms: None,
-            address: None, turn_boundary: None, kind: "execution_state".into(), text: None,
-            data: json!({"session":self.session,"task":self.store.list_task(&self.session.id)?,"goal":goal,"goal_execution":goal_execution}),
-            activity: None, summary: None, task_update: None,
-        }, &mut event)).await?;
+        self.session.active_task = self.task_controller.current()?;
+        Box::pin(self.emit_backend_event(
+            BackendEvent {
+                received_at_ms: None,
+                address: None,
+                turn_boundary: None,
+                kind: "execution_state".into(),
+                text: None,
+                data: json!({"session":self.session}),
+                activity: None,
+                summary: None,
+                checklist_update: None,
+            },
+            &mut event,
+        ))
+        .await?;
 
         Ok((interaction, new_interaction, event))
     }
@@ -377,9 +408,26 @@ impl HarnessBroker {
         &mut self,
         mut interaction: Exchange,
         mut output: crate::backend::BackendOutput,
-        mode: PromptMode,
+        mut mode: PromptMode,
         mut event: Vec<SessionEvent>,
     ) -> Result<(Value, Vec<SessionEvent>)> {
+        let current = self.task_controller.current()?;
+        if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
+            && output
+                .dispatched_task_permit
+                .as_ref()
+                .is_some_and(|permit| permit.validate(current.as_ref()).is_err())
+        {
+            output.plan_edit.clear();
+            output.design_patch.clear();
+            output.plan_read = None;
+            output.plan_submit = None;
+            output.plan_question = None;
+            output.question_answer = None;
+            output.question_withdrawal = None;
+            output.control_error = None;
+            mode = PromptMode::Chat;
+        }
         self.trace.record(
             &self.session.id,
             "model.completed",
@@ -474,7 +522,6 @@ impl HarnessBroker {
                     plan.acceptance = None;
                     plan.user_revision += 1;
                     plan.generation.reset();
-                    interaction.kind = ExchangeKind::PlanRevision;
                 }
                 plan.document_version = result.version;
                 plan.title = result.document.title;
@@ -496,7 +543,6 @@ impl HarnessBroker {
                     plan.acceptance = None;
                     plan.user_revision += 1;
                     plan.generation.reset();
-                    interaction.kind = ExchangeKind::PlanRevision;
                 }
                 plan.document_version = updated.version;
                 plan.title = updated.title;
@@ -556,7 +602,7 @@ impl HarnessBroker {
                 plan.review_digest = Some(digest);
                 plan.validation_warning = validation_warning;
                 PlanStateMachine::apply(&mut plan, PlanEvent::PlanSubmitted, self.clock.now_ms())?;
-                self.store.save_plan(&plan)?;
+                self.persist_plan_output(&plan, output.dispatched_entry_id.as_ref())?;
                 self.record_plan_trace("plan_submitted", plan_trace_fields(&plan));
                 if lifecycle_kind == PlanLifecycleKind::RevisionCreated {
                     let lifecycle = self
@@ -625,6 +671,7 @@ impl HarnessBroker {
                     change: crate::exchange::ArtifactChange {
                         id: format!("{}:artifact:{}", interaction.id, plan.model_revision),
                         path: plan.working_path.clone(),
+                        revision_request: false,
                         diff_text,
                         declaration,
                         created_at_ms: self.clock.now_ms(),
@@ -681,7 +728,7 @@ impl HarnessBroker {
                         PlanEvent::QuestionAsked,
                         self.clock.now_ms(),
                     )?;
-                    self.store.save_plan(&plan)?;
+                    self.persist_plan_output(&plan, output.dispatched_entry_id.as_ref())?;
                     self.record_plan_trace("plan_question_asked", plan_trace_fields(&plan));
                     interaction.set_awaiting_input(true);
                     let lifecycle = PlanLifecycleRecord {
@@ -706,7 +753,7 @@ impl HarnessBroker {
                     )?);
                 } else {
                     plan.updated_at_ms = self.clock.now_ms();
-                    self.store.save_plan(&plan)?;
+                    self.persist_plan_output(&plan, output.dispatched_entry_id.as_ref())?;
                     self.record_plan_trace(
                         "resolved_plan_question_suppressed",
                         plan_trace_fields(&plan),
@@ -714,7 +761,7 @@ impl HarnessBroker {
                 }
             } else {
                 plan.updated_at_ms = self.clock.now_ms();
-                self.store.save_plan(&plan)?;
+                self.persist_plan_output(&plan, output.dispatched_entry_id.as_ref())?;
                 self.record_plan_trace(
                     "plan_turn_without_terminal_control",
                     plan_trace_fields(&plan),
@@ -745,7 +792,7 @@ impl HarnessBroker {
                         "question",
                         json!({
                             "owner": "interaction",
-                            "plan_id": interaction.plan_id,
+                            "plan_id": self.current_plan_id()?,
                             "exchange_id": interaction.id,
                             "elicitation": interaction.elicitation(),
                         }),
@@ -774,10 +821,15 @@ impl HarnessBroker {
         }
         self.session.updated_at_ms = self.clock.now_ms();
         self.save_session()?;
+        let (evidence, permit) = output.goal_evidence();
+        let completed_turn = crate::task::TaskTurnId {
+            exchange_ordinal: interaction.ordinal,
+            turn_ordinal: interaction.turn.len(),
+        };
         let continuing = if execution_paused {
             false
         } else {
-            Box::pin(self.apply_goal_evidence(output.evidence, &mut event)).await?
+            Box::pin(self.apply_goal_evidence(evidence, permit, completed_turn, &mut event)).await?
         };
         let mut runtime = self
             .exchange_runtime
@@ -790,52 +842,29 @@ impl HarnessBroker {
             self.clock.now_ms(),
         )?;
         runtime.synthetic_turn = None;
-        let planning_open = interaction
-            .plan_id
-            .as_deref()
-            .map(|id| self.store.load_plan(id))
-            .transpose()?
-            .flatten()
-            .is_some_and(|plan| {
-                matches!(
-                    plan.state,
-                    PlanState::Generating | PlanState::Revising | PlanState::AwaitingInput
-                )
-            });
-        let goal_state = interaction
-            .goal_id
-            .as_deref()
-            .map(|goal_id| self.store.load_goal(goal_id))
-            .transpose()?
-            .flatten()
-            .map(|goal| goal.state);
-        let goal_suspended = matches!(
-            goal_state,
-            Some(GoalState::Paused | GoalState::UsageLimited | GoalState::BudgetLimited)
-        );
-        let phase_finished = interaction
-            .execution_phase
-            .as_ref()
-            .is_some_and(|phase| phase.outcome.is_some());
-        let remains_open = !phase_finished
-            && (continuing || goal_suspended || interaction.awaiting_input() || planning_open);
+        let remains_open = interaction.awaiting_input();
         if remains_open {
             self.exchange_runtime = Some(runtime);
         } else {
-            let outcome = if goal_state == Some(GoalState::Cleared) {
-                crate::exchange::ExchangeOutcome::Cancelled
-            } else {
-                crate::exchange::ExchangeOutcome::Complete
-            };
+            let outcome = crate::exchange::ExchangeOutcome::Complete;
             Box::pin(self.capture_final_checkpoint(&mut interaction, outcome)).await?;
             interaction.finish(outcome, self.clock.now_ms())?;
         }
         self.store.save_exchange(&interaction)?;
+        if !remains_open
+            && let Some(task) = self.task_controller.current()?
+            && let crate::task::TaskWorkflow::Execute { execution } = &task.workflow
+            && output.dispatched_execution_id.as_deref() == Some(execution.record.id.as_str())
+            && task.entry.as_ref().map(|entry| &entry.id) == output.dispatched_entry_id.as_ref()
+        {
+            self.reserve_execution_continuation(crate::task::TaskTurnId {
+                exchange_ordinal: interaction.ordinal,
+                turn_ordinal: interaction.turn.len(),
+            })?;
+        }
         let can_finalize_incrementally = !continuing
             && mode == PromptMode::Chat
             && self.current_plan_id()?.is_none()
-            && interaction.plan_id.is_none()
-            && interaction.execution_id.is_none()
             && interaction.elicitation().is_none()
             && !interaction.awaiting_input()
             && !self.agent_registry.list().iter().any(|run| {
@@ -862,5 +891,36 @@ impl HarnessBroker {
             json!({ "exchange": {"id": interaction.id, "state": interaction.state()}, "session": self.session, "capability": self.capability }),
             event,
         ))
+    }
+
+    fn persist_plan_output(
+        &mut self,
+        plan: &PlanRecord,
+        entry_id: Option<&crate::task::TaskInputId>,
+    ) -> Result<()> {
+        let task = self
+            .task_controller
+            .current()?
+            .context("planning task disappeared")?;
+        anyhow::ensure!(
+            task.entry.as_ref().map(|entry| &entry.id) == entry_id,
+            "planning task entry changed"
+        );
+        self.task_controller.update(
+            &mut self.store,
+            &task.permit(),
+            self.clock.now_ms(),
+            |task| {
+                let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow else {
+                    anyhow::bail!("planning task changed");
+                };
+                anyhow::ensure!(
+                    active.artifact.id == plan.id && !active.paused,
+                    "planning task changed"
+                );
+                active.artifact = plan.clone();
+                Ok(())
+            },
+        )
     }
 }

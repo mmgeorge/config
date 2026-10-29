@@ -90,7 +90,7 @@ impl CheckNotification {
                         data,
                         activity: None,
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     };
                     // Finish an admitted multipart transfer before replacing pending progress.
                     if let Err(error) = sink.send_wait(event).await {

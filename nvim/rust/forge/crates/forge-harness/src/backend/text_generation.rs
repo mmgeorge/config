@@ -126,6 +126,14 @@ pub(crate) fn history(entries: &[TimelineEntry]) -> Result<String> {
         for node in &exchange.node_list {
             match node {
                 ExchangeNode::ExchangeInput { prompt } => messages.push(("User", &prompt.text)),
+                ExchangeNode::TimelineEvent { event } => {
+                    if let crate::timeline::TimelineEvent::Session { event } = event.as_ref()
+                        && let crate::timeline::SessionEventKind::TaskStarted { prompt, .. } =
+                            &event.detail
+                    {
+                        messages.push(("User", prompt));
+                    }
+                }
                 ExchangeNode::TurnContent {
                     turn_id,
                     item: TurnItem::Message { id },
@@ -297,13 +305,38 @@ mod tests {
         }];
         let captured = history(&entries).unwrap();
         assert_eq!(captured, "User: Fix this\n\nAssistant: Visible progress");
+        if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
+            exchange.node_list.push(ExchangeNode::TimelineEvent {
+                event: Box::new(crate::timeline::TimelineEvent::Session {
+                    event: Box::new(crate::timeline::SessionEventRecord {
+                        id: "task-start".into(),
+                        session_id: "session".into(),
+                        owner: crate::timeline::TimelineOwner::exchange(exchange),
+                        created_at_ms: 2,
+                        detail: crate::timeline::SessionEventKind::TaskStarted {
+                            start: crate::exchange::TaskStart {
+                                kind: crate::task::TaskKind::Goal,
+                                title: "Fix startup".into(),
+                            },
+                            prompt: "Complete the remaining startup work".into(),
+                        },
+                    }),
+                }),
+            });
+        }
+        assert_eq!(
+            history(&entries).unwrap(),
+            "User: Fix this\n\nAssistant: Visible progress\n\nUser: Complete the remaining startup work"
+        );
         let large_prompt = "λ".repeat(60_001);
         if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
             exchange.prompt = large_prompt.clone();
         }
         assert_eq!(
             history(&entries).unwrap(),
-            format!("User: {large_prompt}\n\nAssistant: Visible progress")
+            format!(
+                "User: {large_prompt}\n\nAssistant: Visible progress\n\nUser: Complete the remaining startup work"
+            )
         );
         if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
             exchange

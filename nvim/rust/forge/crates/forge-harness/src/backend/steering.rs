@@ -16,6 +16,11 @@ pub enum SteeringInput {
         /// Durable input ownership retained through queueing and native acknowledgment.
         submission: Option<Arc<super::submission::Submission>>,
     },
+    TaskEntry {
+        start: crate::exchange::TaskStart,
+        text: String,
+        submission: Arc<super::submission::Submission>,
+    },
     /// Adds an attributed child result while its transcript remains under the child.
     AgentResult(String),
 }
@@ -24,7 +29,9 @@ impl SteeringInput {
     /// Returns the provider-visible message without its presentation origin.
     pub fn text(&self) -> &str {
         match self {
-            Self::User { text, .. } | Self::AgentResult(text) => text,
+            Self::User { text, .. } | Self::TaskEntry { text, .. } | Self::AgentResult(text) => {
+                text
+            }
         }
     }
 
@@ -32,14 +39,22 @@ impl SteeringInput {
     pub(crate) fn attachments(&self) -> &[crate::attachment::InputAttachment] {
         match self {
             Self::User { attachments, .. } => attachments,
-            Self::AgentResult(_) => &[],
+            Self::TaskEntry { .. } | Self::AgentResult(_) => &[],
         }
     }
 
-    fn submission(&self) -> Option<Arc<super::submission::Submission>> {
+    pub(crate) fn submission(&self) -> Option<Arc<super::submission::Submission>> {
         match self {
             Self::User { submission, .. } => submission.clone(),
+            Self::TaskEntry { submission, .. } => Some(submission.clone()),
             Self::AgentResult(_) => None,
+        }
+    }
+
+    pub(crate) fn task_start(&self) -> Option<&crate::exchange::TaskStart> {
+        match self {
+            Self::TaskEntry { start, .. } => Some(start),
+            _ => None,
         }
     }
 }
@@ -99,6 +114,7 @@ pub struct SteerCommand {
     completion: Option<oneshot::Sender<std::result::Result<(), String>>>,
     event_sink: Option<BackendEventSink>,
     publish_input: bool,
+    task_start: Option<crate::exchange::TaskStart>,
 }
 
 /// Identifies the provider child receiving steering or interruption.
@@ -141,6 +157,7 @@ impl SteeringLane {
             false,
             Vec::new(),
             None,
+            None,
         )
         .await
     }
@@ -166,7 +183,7 @@ impl SteeringLane {
 
     /// Delivers input to the active turn and publishes only acknowledged user additions.
     pub async fn steer(&self, input: SteeringInput) -> Result<()> {
-        let publish_input = matches!(input, SteeringInput::User { .. });
+        let publish_input = !matches!(input, SteeringInput::AgentResult(_));
         self.submit(
             ActiveTurnOperation::Steer,
             input.text().to_owned(),
@@ -174,6 +191,7 @@ impl SteeringLane {
             publish_input,
             input.attachments().to_vec(),
             input.submission(),
+            input.task_start().cloned(),
         )
         .await
     }
@@ -187,6 +205,7 @@ impl SteeringLane {
             false,
             Vec::new(),
             None,
+            None,
         )
         .await
     }
@@ -199,6 +218,7 @@ impl SteeringLane {
         publish_input: bool,
         attachments: Vec<crate::attachment::InputAttachment>,
         submission: Option<Arc<super::submission::Submission>>,
+        task_start: Option<crate::exchange::TaskStart>,
     ) -> Result<()> {
         let sender = self
             .state
@@ -236,6 +256,7 @@ impl SteeringLane {
                 completion: Some(completion),
                 event_sink: None,
                 publish_input,
+                task_start,
             })
             .map_err(|_| anyhow::anyhow!("active turn completed before steering input was sent"))?;
         response
@@ -271,6 +292,23 @@ impl Drop for ActiveSteering {
 }
 
 impl SteerCommand {
+    pub(crate) fn input(&self) -> SteeringInput {
+        if !self.publish_input {
+            return SteeringInput::AgentResult(self.text.clone());
+        }
+        match (&self.task_start, &self.submission) {
+            (Some(start), Some(submission)) => SteeringInput::TaskEntry {
+                start: start.clone(),
+                text: self.text.clone(),
+                submission: submission.clone(),
+            },
+            _ => SteeringInput::User {
+                text: self.text.clone(),
+                attachments: self.attachments.clone(),
+                submission: self.submission.clone(),
+            },
+        }
+    }
     /// Retain continuation ownership until provider acceptance or a terminal failure.
     pub(crate) async fn complete_with<Output>(
         mut self,
@@ -363,11 +401,17 @@ impl SteerCommand {
             && self.operation == ActiveTurnOperation::Steer
             && let Some(event_sink) = self.event_sink.take()
         {
-            let mut event = BackendEvent::steering_input(self.text.clone());
+            let mut event = match self.task_start.take() {
+                Some(start) => BackendEvent::task_started(start, self.text.clone()),
+                None => BackendEvent::steering_input(self.text.clone()),
+            };
             if let Some(submission) = &self.submission {
                 match submission.record() {
                     Ok(record) => {
-                        event.data = serde_json::json!({"input_message_id":record.input_message_id})
+                        if !event.data.is_object() {
+                            event.data = serde_json::json!({});
+                        }
+                        event.data["input_message_id"] = serde_json::json!(record.input_message_id);
                     }
                     Err(error) => {
                         result = Err(error);
@@ -493,6 +537,7 @@ mod test {
             false,
             Vec::new(),
             None,
+            None,
         ));
         assert!(futures_util::poll!(interrupt.as_mut()).is_pending());
         assert!(
@@ -502,6 +547,7 @@ mod test {
                 None,
                 false,
                 Vec::new(),
+                None,
                 None
             )
             .await
@@ -542,6 +588,7 @@ mod test {
             }),
             true,
             Vec::new(),
+            None,
             None,
         ));
         assert!(futures_util::poll!(request.as_mut()).is_pending());
@@ -595,9 +642,75 @@ mod test {
         });
         let command = active.receive().await.unwrap();
         assert_eq!(command.text, "child report");
+        assert!(matches!(
+            command.input(),
+            super::SteeringInput::AgentResult(_)
+        ));
         command.complete(Ok(())).await;
         delivery.await.unwrap().unwrap();
         assert!(event_stream.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn task_start_preserves_origin_and_publishes_only_after_acknowledgement()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = std::sync::Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        let store = crate::backend::submission::SubmissionStore::open(directory.path(), trace)?;
+        let catalog = crate::backend::BackendCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "steering".into(),
+            workspace: "workspace".into(),
+            access: Default::default(),
+            approval_mode: crate::session::ApprovalMode::Ask,
+            backend_session_id: None,
+        };
+        let prompt = "Complete the startup work.\nVerify the result.";
+        let start = crate::exchange::TaskStart {
+            kind: crate::task::TaskKind::Goal,
+            title: "Reduce startup time".into(),
+        };
+        let submission = store.prepare_input(
+            &catalog,
+            crate::backend::BackendInput::from_text(prompt),
+            crate::backend::BackendKind::Codex,
+            Some("task-entry".into()),
+        )?;
+        let lane = SteeringLane::default();
+        let (event_sink, mut events) = crate::backend::events::channel();
+        let mut active = lane.activate(Some(event_sink))?;
+        let mut delivery = Box::pin(lane.steer(super::SteeringInput::TaskEntry {
+            start: start.clone(),
+            text: prompt.into(),
+            submission,
+        }));
+        assert!(futures_util::poll!(delivery.as_mut()).is_pending());
+        let command = active.receive().await.unwrap();
+        assert!(events.try_recv().is_err());
+        match command.input() {
+            super::SteeringInput::TaskEntry {
+                start: forwarded,
+                text,
+                submission,
+            } => {
+                assert_eq!(forwarded, start);
+                assert_eq!(text, prompt);
+                assert_eq!(
+                    submission.record()?.input_message_id.as_deref(),
+                    Some("task-entry")
+                );
+            }
+            _ => panic!("forwarding discarded the task entry origin"),
+        }
+        command.complete(Ok(())).await;
+        delivery.await?;
+        let event = events.recv().await?.unwrap();
+        assert_eq!(event.kind, "task_started");
+        assert_eq!(event.text.as_deref(), Some(prompt));
+        assert_eq!(event.data["start"], serde_json::to_value(start)?);
+        assert_eq!(event.data["input_message_id"], "task-entry");
+        assert!(events.try_recv().is_err());
+        Ok(())
     }
 
     #[tokio::test]

@@ -74,7 +74,7 @@ pub fn prepare_new_session(
             .as_ref()
             .map_or(source.shell, |value| value.shell),
         approval_mode: ApprovalMode::Ask,
-        current_task_id: None,
+        active_task: None,
         default_approval: preference
             .as_ref()
             .map_or(source.default_approval, |value| value.default_approval),
@@ -83,7 +83,6 @@ pub fn prepare_new_session(
             .map_or(source.plan_approval, |value| value.plan_approval),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
-        goal_id: None,
         lease_owner: Some(client_id.to_owned()),
         native_fork: false,
         native_compact,

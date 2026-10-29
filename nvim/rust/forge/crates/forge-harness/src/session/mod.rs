@@ -163,14 +163,13 @@ pub struct HarnessSession {
     pub shell: CheckShell,
     pub approval_mode: ApprovalMode,
     #[serde(default)]
-    pub current_task_id: Option<String>,
+    pub active_task: Option<crate::task::ActiveTask>,
     #[serde(default)]
     pub default_approval: ApprovalMode,
     #[serde(default)]
     pub plan_approval: Option<ApprovalMode>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    pub goal_id: Option<String>,
     pub lease_owner: Option<String>,
     #[serde(default)]
     pub native_fork: bool,
@@ -212,7 +211,7 @@ pub struct HarnessPreference {
 }
 
 /// Selects the model used after a plan is accepted.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanExecutor {
     pub enabled: bool,
     pub model: Option<String>,

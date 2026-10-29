@@ -8,7 +8,7 @@ client.request_for = function(session_id, method, parameters, callback)
   requests[#requests + 1] = { method = method, parameters = parameters, callback = callback }
 end
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
-local state = { session = { id = "optimistic-input", current_task_id = "task" }, queue = {} }
+local state = { session = { id = "optimistic-input", active_task = { revision = "task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }, queue = {} }
 local renders = 0
 input.attach(state, function() renders = renders + 1 end)
 assert(requests[1].method == "input.get")
@@ -28,6 +28,8 @@ assert(text() == "" and #state.queue == 0 and #state.pending_steer == 1,
   "active submission did not enter the separate steering presentation immediately")
 local first = requests[2]
 assert(first.method == "input.apply" and first.parameters.action.kind == "submit")
+assert(first.parameters.action.message.purpose.kind == "user"
+  and first.parameters.action.message.task_id == nil, "user input retained workflow ownership")
 local first_id = first.parameters.action.message.id
 compose("newer unsent text")
 local second_id = input.submit(state, "queued message", {}, "queue")

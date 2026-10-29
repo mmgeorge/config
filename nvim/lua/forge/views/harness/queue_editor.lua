@@ -4,7 +4,7 @@ local input_state = require("forge.views.harness.input_state")
 
 ---@class ForgeQueuedPrompt
 ---@field text string
----@field task_id? string
+---@field purpose? table
 ---@field config? table
 ---@field attachments? ForgeAttachmentSelection[]
 

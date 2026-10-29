@@ -65,13 +65,13 @@ local success, failure = xpcall(function()
   controller.task_transition({ action = "pause" })
   await(function() return not state.busy and not state.task_operation and not state.state_sync_pending end,
     "pause did not settle")
-  assert(task.current(state).status == "paused")
+  assert(task.status(task.current(state)) == "paused")
   local paused_applied
   controller.configure({ effort = "low" }, true, function(value) paused_applied = value end)
   await(function() return paused_applied ~= nil and not state.task_operation and not state.state_sync_pending end,
     "paused configuration did not settle")
   assert(paused_applied and state.session.effort == "low")
-  assert(starts == 4 and task.current(state).status == "paused", "configuration restarted a paused task")
+  assert(starts == 4 and task.status(task.current(state)) == "paused", "configuration restarted a paused task")
   local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(not transcript:find("Settings applying", 1, true), transcript)
   assert(not transcript:find("Settings verifying", 1, true), transcript)

@@ -210,7 +210,7 @@ pub struct BackendEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<TurnSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_update: Option<ProviderTaskUpdate>,
+    pub checklist_update: Option<ProviderChecklistUpdate>,
 }
 
 #[derive(Clone, Copy)]
@@ -263,13 +263,13 @@ impl BackendEvent {
             data: serde_json::to_value(compaction).expect("compaction is JSON serializable"),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         }
     }
     pub(crate) fn tool_output_delta(&self) -> Option<&str> {
         if self.turn_boundary.is_some()
             || self.summary.is_some()
-            || self.task_update.is_some()
+            || self.checklist_update.is_some()
             || self.text.is_some()
         {
             return None;
@@ -290,7 +290,7 @@ impl BackendEvent {
     pub(crate) fn message_delta(&self) -> Option<&str> {
         if self.turn_boundary.is_some()
             || self.summary.is_some()
-            || self.task_update.is_some()
+            || self.checklist_update.is_some()
             || self.activity.is_some()
             || self.message_snapshot()
             || !matches!(
@@ -362,20 +362,34 @@ impl BackendEvent {
             data: Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
+        }
+    }
+
+    pub(crate) fn task_started(start: crate::exchange::TaskStart, prompt: String) -> Self {
+        Self {
+            received_at_ms: None,
+            address: None,
+            turn_boundary: None,
+            kind: "task_started".into(),
+            text: Some(prompt),
+            data: serde_json::json!({"start":start}),
+            activity: None,
+            summary: None,
+            checklist_update: None,
         }
     }
 }
 
 /// Represents one complete provider task replacement.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProviderTaskUpdate {
+pub struct ProviderChecklistUpdate {
     pub scope_id: String,
     pub name: Option<String>,
     pub complete: bool,
     #[serde(default = "default_true")]
     pub replace_entries: bool,
-    pub entry_list: Vec<ProviderTaskEntry>,
+    pub entry_list: Vec<ProviderChecklistEntry>,
 }
 
 fn default_true() -> bool {
@@ -384,18 +398,18 @@ fn default_true() -> bool {
 
 /// Represents one task within a provider replacement.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProviderTaskEntry {
+pub struct ProviderChecklistEntry {
     pub provider_id: Option<String>,
     pub content: String,
     pub priority: Option<String>,
-    pub status: TaskStatus,
+    pub status: ChecklistStatus,
     pub provider_ordinal: usize,
 }
 
 /// Defines provider task state plus retained superseded history.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
+pub enum ChecklistStatus {
     Pending,
     InProgress,
     Completed,
@@ -572,12 +586,37 @@ pub struct BackendOutput {
     pub question_withdrawal: Option<PlanQuestionWithdrawal>,
     pub control_error: Option<String>,
     pub evidence: TurnEvidence,
+    #[serde(skip)]
+    pub(crate) goal_control: Option<crate::goal::GoalControl>,
+    #[serde(skip)]
+    pub(crate) dispatched_task_permit: Option<crate::task::TaskPermit>,
+    #[serde(skip)]
+    pub(crate) dispatched_execution_id: Option<String>,
+    #[serde(skip)]
+    pub(crate) dispatched_entry_id: Option<crate::task::TaskInputId>,
     pub capability: BackendCapability,
     pub runtime: BackendRuntime,
     #[serde(skip)]
     pub structured_plan: bool,
     #[serde(skip)]
     pub metrics: TurnMetrics,
+}
+
+impl BackendOutput {
+    pub(crate) fn goal_evidence(&self) -> (TurnEvidence, Option<crate::task::TaskPermit>) {
+        let mut evidence = self.evidence;
+        let permit = match &self.goal_control {
+            Some(control) => {
+                evidence.structured_complete =
+                    control.termination == crate::goal::GoalTermination::Complete;
+                evidence.structured_blocked =
+                    control.termination == crate::goal::GoalTermination::Blocked;
+                Some(control.permit.clone())
+            }
+            None => self.dispatched_task_permit.clone(),
+        };
+        (evidence, permit)
+    }
 }
 
 /// Identifies the exact canonical plan version entering review.
@@ -621,7 +660,7 @@ impl BackendRuntime {
             data: serde_json::json!(self),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         }
     }
 }
@@ -720,6 +759,11 @@ pub trait Backend: Send + Sync {
 
     /// Return stable provider identity and capability without starting a provider process.
     fn descriptor(&self) -> BackendDescriptor;
+
+    /// Plan and execution scopes remain bound to their provider request until its turn ends.
+    fn supports_task_steering(&self, kind: crate::task::TaskKind) -> bool {
+        kind == crate::task::TaskKind::Goal
+    }
 
     /// Returns a native receipt only when history proves this exact submission was accepted.
     /// Missing history and unsupported reconciliation return None and never authorize replay.
@@ -1151,7 +1195,7 @@ impl Backend for MockBackend {
                         output_delta: false,
                     }),
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await?;
             }
@@ -1165,6 +1209,7 @@ impl Backend for MockBackend {
                 )?
             } else {
                 let invocation = crate::control_tools::ControlToolInvocation {
+                    task_permit: None,
                     name: name.clone(),
                     arguments: arguments.clone(),
                 };
@@ -1191,6 +1236,7 @@ impl Backend for MockBackend {
                             arguments["cursor"] = json!(cursor);
                             let result = executor
                                 .execute(crate::control_tools::ControlToolInvocation {
+                                    task_permit: None,
                                     name: name.clone(),
                                     arguments: arguments.clone(),
                                 })
@@ -1225,7 +1271,7 @@ impl Backend for MockBackend {
                         output_delta: false,
                     }),
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await?;
             }
@@ -1246,7 +1292,7 @@ impl Backend for MockBackend {
                 },
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(sink) = event_sink {
                 sink.send_wait(event.clone()).await?;
@@ -1370,7 +1416,7 @@ impl Backend for MockBackend {
             data: Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         if self.emit_before_delay
             && let Some(event_sink) = event_sink.as_ref()
@@ -1405,7 +1451,7 @@ impl Backend for MockBackend {
                     output_delta: false,
                 }),
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(sink) = &event_sink {
                 sink.send_wait(denial.clone()).await?;
@@ -1793,7 +1839,7 @@ branches: Vec::new()
             && let Some(scope) = context.review_answer.as_ref()
         {
             let executor = crate::control_tools::ControlToolExecutor::new(context.clone());
-            executor.execute(crate::control_tools::ControlToolInvocation {
+            executor.execute(crate::control_tools::ControlToolInvocation { task_permit: None,
                 name: "plan_review_answer".into(),
                 arguments: serde_json::json!({"question_id":scope.question.id,"answer":event.text}),
             }).await?.result?;
@@ -1822,6 +1868,10 @@ branches: Vec::new()
             question_answer: None,
             question_withdrawal: None,
             control_error: None,
+            goal_control: None,
+            dispatched_task_permit: None,
+            dispatched_execution_id: None,
+            dispatched_entry_id: None,
             evidence: TurnEvidence {
                 tool_called: request.access.write_access != crate::session::WriteScope::Off,
                 structured_complete: execution_complete,
@@ -1949,7 +1999,7 @@ pub(crate) fn mock_capability() -> BackendCapability {
         },
         native_steer: true,
         native_turn_rollback: true,
-        native_goal: true,
+        native_goal: false,
         model_selection: true,
         effort_selection: true,
         fast_mode: true,

@@ -110,7 +110,7 @@ impl CompactionMonitor {
                                 data: serde_json::Value::Null,
                                 activity: None,
                                 summary: None,
-                                task_update: None,
+                                checklist_update: None,
                             })
                             .await;
                         return;

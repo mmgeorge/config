@@ -1512,7 +1512,7 @@ impl CheckSupervisor {
                         data: serde_json::json!({"run_id":run.id,"error":error.text}),
                         activity: None,
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     },
                 );
         }

@@ -965,19 +965,27 @@ impl Backend for AcpBackend {
         let prompt =
             crate::attachment::acp_input(text.to_owned(), input.attachments(), image_supported)
                 .await?;
-        let submission = match &input {
-            SteeringInput::User { submission, .. } => submission.as_ref(),
-            SteeringInput::AgentResult(_) => None,
-        };
+        let submission = input.submission();
         session
             .transport
             .submit(
                 "_session/steering",
                 json!({"sessionId":session.id,
             "prompt":prompt,"_meta":{"steering":{"idleBehavior":"promptRequired"}}}),
-                submission,
+                submission.as_ref(),
             )
             .await?;
+        if let Some(start) = input.task_start() {
+            let mut event = BackendEvent::task_started(start.clone(), input.text().to_owned());
+            event.data["input_message_id"] = serde_json::json!(
+                submission
+                    .as_ref()
+                    .map(|submission| submission.record())
+                    .transpose()?
+                    .and_then(|record| record.input_message_id)
+            );
+            session.state.emit(event).await?;
+        }
         Ok(())
     }
 

@@ -489,6 +489,7 @@ mod test {
     #[test]
     fn formats_argument_failures_as_json_only() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "harness_plan_edit".to_owned(),
             arguments: json!({ "plan_id": "plan-1", "expected_version": 2 }),
         };
@@ -521,6 +522,7 @@ mod test {
     #[test]
     fn classifies_version_conflicts_with_the_active_version() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "harness_plan_edit".to_owned(),
             arguments: json!({ "plan_id": "plan-1", "expected_version": 2 }),
         };
@@ -541,6 +543,7 @@ mod test {
     #[test]
     fn formats_plan_mutation_errors_with_the_exact_path_and_hint() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "harness_plan_edit".to_owned(),
             arguments: json!({ "plan_id": "plan-1", "expected_version": 2 }),
         };
@@ -609,6 +612,7 @@ mod test {
     #[test]
     fn formats_return_only_expansions_as_actionable_submission_json() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "plan_submit".to_owned(),
             arguments: json!({ "plan_id": "plan-1", "expected_version": 1 }),
         };

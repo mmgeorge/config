@@ -432,7 +432,7 @@ impl PermissionCoordinator {
                         data: json!({"error":format!("{error:#}")}),
                         activity: None,
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     })
                     .await?;
                 }
@@ -721,7 +721,7 @@ impl PermissionCoordinator {
                     data: serde_json::to_value(&view)?,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await?;
         }
@@ -930,7 +930,7 @@ impl PermissionCoordinator {
                 text: None,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
                 data: serde_json::to_value(&directory_list)?,
             })
             .await?;
@@ -1034,7 +1034,7 @@ impl PermissionCoordinator {
                     data: serde_json::to_value(view)?,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await;
         }

@@ -1,6 +1,18 @@
 use crate::session::{AccessPolicy, ApprovalMode, DirectoryScope, WriteScope};
 use serde::{Deserialize, Serialize};
 
+mod active;
+pub(crate) mod command;
+mod controller;
+pub(crate) use active::StaleTask;
+pub use active::{
+    ActiveTask, ExecutionEntry, ExecutionTask, GoalTask, PlanTask, TaskContinuation,
+    TaskContinuationWork, TaskDecision, TaskEntry, TaskInputDelivery, TaskInputId, TaskOutcome,
+    TaskOutcomeState, TaskPermit, TaskRevision, TaskTurn, TaskTurnId, TaskWorkflow,
+};
+pub(crate) use controller::SessionTaskController;
+pub(crate) use controller::TaskChange;
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 /// Captures a policy intent resolved once against authoritative session state.
@@ -118,93 +130,6 @@ impl TaskStatus {
     /// Terminal tasks retain history but cannot admit new attempts.
     pub fn terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled)
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-/// Persists the selected workflow and its resumption boundary.
-pub struct TaskRecord {
-    /// Stable workflow identity across attempts and Plan-to-Execute acceptance.
-    pub id: String,
-    /// Conversation that owns this workflow.
-    pub session_id: String,
-    /// User-facing objective or plan title.
-    pub title: String,
-    /// Workflow independent of permissions.
-    pub kind: TaskKind,
-    /// Admission and recovery state.
-    pub status: TaskStatus,
-    /// Saved workflow checkpoint for resumption.
-    pub phase: String,
-    /// Explanation of the current pause, block, or failure.
-    pub reason: Option<String>,
-    /// Associated design artifact when planning or executing.
-    pub plan_id: Option<String>,
-    /// Associated continuation evidence when executing or pursuing a goal.
-    pub goal_id: Option<String>,
-    /// Confirmed filesystem policy restored when this task resumes.
-    pub access: AccessPolicy,
-    /// Confirmed tool approval policy, independent of filesystem access.
-    pub approval_mode: ApprovalMode,
-    /// Revision used to reject stale picker selections.
-    pub generation: u64,
-    /// Identity of the latest admitted attempt.
-    pub attempt_id: Option<String>,
-    /// Durable intent that selected the current attempt.
-    pub operation_id: Option<String>,
-    /// Creation time in Unix milliseconds.
-    pub created_at_ms: i64,
-    /// Latest lifecycle update in Unix milliseconds.
-    pub updated_at_ms: i64,
-}
-
-impl TaskRecord {
-    /// Creates a workflow before any provider dispatch occurs.
-    pub fn new(
-        session_id: String,
-        title: String,
-        kind: TaskKind,
-        access: AccessPolicy,
-        approval_mode: ApprovalMode,
-        now_ms: i64,
-    ) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_id,
-            title,
-            kind,
-            status: TaskStatus::Ready,
-            phase: match kind {
-                TaskKind::Plan => "draft",
-                TaskKind::Execute => "implement",
-                TaskKind::Goal => "continue",
-            }
-            .into(),
-            reason: None,
-            plan_id: None,
-            goal_id: None,
-            access,
-            approval_mode,
-            generation: 0,
-            attempt_id: None,
-            operation_id: None,
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-        }
-    }
-
-    /// Advances the attempt fence before invoking an external provider.
-    pub fn begin(&mut self, now_ms: i64) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.status.terminal(),
-            "task is terminal. Fork its plan or create a new task"
-        );
-        self.generation += 1;
-        self.attempt_id = Some(uuid::Uuid::new_v4().to_string());
-        self.status = TaskStatus::Running;
-        self.reason = None;
-        self.updated_at_ms = now_ms;
-        Ok(())
     }
 }
 

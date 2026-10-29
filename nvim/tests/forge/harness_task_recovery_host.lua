@@ -3,7 +3,7 @@ vim.loader.enable(false)
 local root = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
-local executable = require("forge.builder").binary_path()
+local executable = vim.fn.fnamemodify(require("forge.builder").binary_path(), ":p")
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback)
@@ -12,14 +12,10 @@ package.loaded["forge.builder"] = { ensure = function(callback)
 end }
 local client = require("forge.client")
 client._set_launcher_for_test(vim.system)
-local errors, operation, starts = {}, {}, 0
+local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
-client.subscribe(function(event, payload)
-  if event == "task_operation" then operation[payload.id] = payload end
-  if event == "backend_event" and payload.kind == "execution_state" then starts = starts + 1 end
-end)
 local function await(predicate, message)
-  assert(vim.wait(10000, predicate, 10), message .. "\n" .. table.concat(errors, "\n") .. "\n" .. vim.inspect(operation))
+  assert(vim.wait(15000, predicate, 10), message .. "\n" .. table.concat(errors, "\n"))
 end
 local function request(session_id, method, params)
   local received, result, failure
@@ -37,91 +33,129 @@ local function open(session_id)
   assert(not failure, failure)
   return opened
 end
-local function snapshot(session_id)
-  local current = request(session_id, "state.get", {})
-  current.exchange = request(session_id, "exchange.list", {})
+local function submit(session_id, id, text)
+  local input = request(session_id, "input.get", {})
+  local result = request(session_id, "input.apply", {
+    control_revision = input.control_revision,
+    id = id, action = { kind = "submit", message = {
+      id = id, text = text, intent = "auto", attachments = {},
+    } },
+  })
+  assert(result.error == nil or result.error == vim.NIL, vim.inspect(result.error))
+  return result
+end
+local function transition(session_id, id, action)
+  action.operation_id = id
+  local receipt = request(session_id, "task.transition", action)
+  assert(receipt.state == "completed", "state mutation did not complete at admission: " .. vim.inspect(receipt))
+  return receipt
+end
+local function await_snapshot(session_id, predicate, message)
+  local current, failure, pending
+  await(function()
+    if failure then error(failure) end
+    if current and predicate(current) then return true end
+    if not pending then
+      pending = true
+      client.request_for(session_id, "state.get", {}, function(value, problem)
+        current, failure, pending = value, problem, false
+      end)
+    end
+    return false
+  end, message)
   return current
+end
+local function empty_task(snapshot)
+  return snapshot.session.active_task == nil or snapshot.session.active_task == vim.NIL
+end
+local function stop_host()
+  assert(client._client.process, "host process is missing")
+  client._client.process:kill(9)
+  await(function() return client._client.process == nil end, "killed host retained ownership")
 end
 local success, failure = xpcall(function()
   vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "blocking" } } } } })
+  require("forge").setup({ harness = { backend = "mock" } })
   local initial = open()
   local session_id = initial.session.id
-  local acknowledgement = request(session_id, "task.transition", { operation_id = "plan-before-stop", action = "plan", text = "Plan until interrupted" })
-  assert(acknowledgement.state == "accepted")
-  await(function() return starts == 1 end, "planning did not start")
-  assert(request(session_id, "health.get", {}).responsive)
-  request(session_id, "task.transition", { operation_id = "pause-once", action = "pause" })
-  await(function() return operation["pause-once"] and operation["pause-once"].state == "completed" end, "pause did not collect planning")
-  local cancelled = request(session_id, "task.operation", { operation_id = "plan-before-stop" })
-  assert(cancelled.state == "cancelled" and (not cancelled.error or cancelled.error == vim.NIL),
-    "user cancellation was recorded as a failed task operation: " .. vim.inspect(cancelled))
-  local paused = snapshot(session_id)
-  assert(paused.task[1].status == "paused" and #paused.exchange == 1)
-  assert(paused.artifact[1].state == "generating", "interrupt changed the draft state: " .. vim.inspect(paused.artifact))
-  local resumed_prompt
-  client.request_for(session_id, "prompt.submit", { text = "continue planning without questions" }, function(_, problem) resumed_prompt = problem or true end)
-  await(function() return starts == 2 or resumed_prompt end, "message did not resume planning")
-  assert(starts == 2, tostring(resumed_prompt))
-  request(session_id, "task.transition", { operation_id = "pause-message", action = "pause" })
-  await(function() return operation["pause-message"] and operation["pause-message"].state == "completed" end, "resumed planning did not stop")
-  local resumed = snapshot(session_id)
-  assert(resumed.task[1].id == paused.task[1].id)
-  assert(resumed.artifact[1].state == "generating", "resumed draft lost editable state")
-  assert(resumed.exchange[2].plan_id == paused.task[1].plan_id and resumed.exchange[2].prompt == "continue planning without questions",
-    "message did not retain the interrupted planning context")
-  request(session_id, "task.transition", { operation_id = "goal-before-kill", action = "goal", text = "Retain interrupted goal" })
-  await(function() return starts == 3 end, "goal did not start")
-  client.request_for(session_id, "task.transition", { operation_id = "pause-before-settings", action = "pause" }, function(_, problem) assert(not problem, problem) end)
-  request(session_id, "task.transition", { operation_id = "settings-after-pause", action = "permission", change = { kind = "toggle_write_enabled" } })
-  await(function() return operation["settings-after-pause"] and operation["settings-after-pause"].state == "completed" end, "settings did not collect the pause")
-  local changed = snapshot(session_id)
-  assert(changed.task[1].status == "paused" and changed.session.approval_mode == "ask" and starts == 3,
-    "settings after pause restarted execution")
-  request(session_id, "task.transition", { operation_id = "resume-before-kill", action = "resume" })
-  await(function() return starts == 4 end, "explicit resume did not start")
-  client._client.process:kill(9)
-  await(function() return client._client.process == nil end, "killed host retained ownership")
-  local recovered = open(session_id)
-  recovered.exchange = request(session_id, "exchange.list", {})
-  assert(recovered.runtime_epoch ~= initial.runtime_epoch)
-  assert(#recovered.task == 2 and #recovered.exchange == 4)
-  assert(recovered.task[1].status == "paused", vim.inspect(recovered.task))
-  assert(recovered.task_operation.state == "outcome_unknown")
-  assert(request(session_id, "task.operation", { operation_id = "resume-before-kill" }).state == "outcome_unknown")
-  local repeated = request(session_id, "task.transition", { operation_id = "resume-before-kill", action = "resume" })
-  assert(repeated.state == "outcome_unknown", "uncertain operation was replayed")
-  vim.wait(100, function() return false end)
-  local inspected = snapshot(session_id)
-  assert(#inspected.exchange == 4 and starts == 4, "restart automatically dispatched work")
-  local recovered_prompt
-  client.request_for(session_id, "prompt.submit", { text = "continue the saved goal" }, function(_, problem) recovered_prompt = problem or true end)
-  await(function() return starts == 5 or recovered_prompt end, "message did not resume recovered goal")
-  assert(starts == 5, tostring(recovered_prompt))
-  request(session_id, "task.transition", { operation_id = "pause-recovered-message", action = "pause" })
-  await(function() return operation["pause-recovered-message"] and operation["pause-recovered-message"].state == "completed" end, "recovered goal did not stop")
-  local final = snapshot(session_id)
-  assert(final.task[1].id == recovered.task[1].id and final.exchange[5].goal_id == recovered.task[1].goal_id)
-  assert(recovered.exchange[4].prompt == "" and recovered.exchange[4].lifecycle == "Goal resumed",
-    "restart lost the control-resume lifecycle label")
-  request(session_id, "task.transition", { operation_id = "resume-for-permission", action = "resume" })
-  await(function() return starts == 6 end, "goal did not resume before permission change")
-  request(session_id, "task.transition", { operation_id = "permission-while-running", action = "permission", change = { kind = "enable_yolo" } })
-  await(function() return starts == 7 end, "permission change did not resume goal")
-  request(session_id, "task.transition", { operation_id = "pause-after-permission", action = "pause" })
-  await(function() return operation["pause-after-permission"] and operation["pause-after-permission"].state == "completed" end, "changed goal did not stop")
-  local changed_goal = snapshot(session_id)
-  assert(changed_goal.task[1].id == recovered.task[1].id)
-  assert(changed_goal.exchange[7].prompt == "" and changed_goal.exchange[7].lifecycle == "Permission changed to allow · Goal resumed",
-    vim.inspect(changed_goal.exchange[7]))
-  request(session_id, "task.transition", { operation_id = "resume-planning-control", action = "resume", task_id = paused.task[1].id })
-  await(function() return starts == 8 end, "planning control resume did not start")
-  request(session_id, "task.transition", { operation_id = "pause-planning-control", action = "pause" })
-  await(function() return operation["pause-planning-control"] and operation["pause-planning-control"].state == "completed" end, "planning control did not stop")
-  local planning = snapshot(session_id)
-  assert(planning.exchange[8].prompt == "" and planning.exchange[8].lifecycle == "Planning resumed")
-  assert(planning.exchange[8].plan_id == paused.task[1].plan_id)
+  local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")
+
+  local held = mock.hold(session_id)
+  submit(session_id, "original-input", "Inspect startup")
+  held:wait()
+  local original = request(session_id, "exchange.list", {})[1]
+  assert(original and original.state == "running")
+  transition(session_id, "goal-start", { action = "goal", text = "Finish startup work" })
+  await_snapshot(session_id, function(snapshot)
+    local task = snapshot.session.active_task
+    return task and task ~= vim.NIL and task.kind == "goal" and task.entry
+      and task.entry ~= vim.NIL and task.entry.delivery == "accepted"
+  end, "goal entry was not acknowledged during the held turn")
+  transition(session_id, "goal-pause", { action = "pause" })
+  local paused = request(session_id, "state.get", {})
+  assert(paused.session.active_task.goal.state == "paused")
+  assert(request(session_id, "exchange.list", {})[1].state == "running", "pause cancelled the active provider turn")
+  transition(session_id, "goal-clear", { action = "clear" })
+  assert(empty_task(request(session_id, "state.get", {})))
+  local cleared_exchange = request(session_id, "exchange.list", {})
+  assert(#cleared_exchange == 1 and cleared_exchange[1].id == original.id
+    and cleared_exchange[1].state == "running", "clear replaced or cancelled the active exchange")
+  held:release()
+  await_snapshot(session_id, function(snapshot) return empty_task(snapshot) and snapshot.status.kind == "idle" end,
+    "cleared task continued after the original response")
+  local completed = request(session_id, "exchange.list", {})
+  assert(#completed == 1 and completed[1].id == original.id and completed[1].state == "complete")
+
+  local interrupted_hold = mock.hold(session_id)
+  submit(session_id, "before-restart-input", "Inspect the pending plan boundary")
+  interrupted_hold:wait()
+  local interrupted = request(session_id, "exchange.list", {})[2]
+  assert(interrupted and interrupted.state == "running")
+  transition(session_id, "pending-plan", { action = "plan", text = "Create the recovery design" })
+  local pending = request(session_id, "state.get", {}).session.active_task
+  assert(pending.kind == "plan" and pending.entry.delivery == "pending",
+    "plan entry did not wait for the existing turn boundary")
+  local entry_id, plan_id = pending.entry.id, pending.plan.artifact.id
+  assert(#request(session_id, "exchange.list", {}) == 2, "pending plan created a competing exchange")
+  stop_host()
+
+  local restarted = open(session_id)
+  assert(restarted.runtime_epoch ~= initial.runtime_epoch)
+  for _, id in ipairs({ "goal-start", "goal-pause", "goal-clear", "pending-plan" }) do
+    assert(request(session_id, "task.operation", { operation_id = id }).state == "completed",
+      "restart changed a completed receipt: " .. id)
+  end
+  local recovered = await_snapshot(session_id, function(snapshot)
+    local task = snapshot.session.active_task
+    return task and task ~= vim.NIL and task.kind == "plan" and task.entry.delivery == "accepted"
+      and task.plan.artifact.state == "awaiting_review"
+  end, "pending plan entry was not replayed after restart")
+  assert(recovered.session.active_task.entry.id == entry_id)
+  assert(recovered.session.active_task.plan.artifact.id == plan_id)
+  local history = request(session_id, "exchange.list", {})
+  assert(#history == 3 and history[1].id == original.id and history[2].id == interrupted.id,
+    "restart replaced prior exchanges or delivered the plan entry more than once: " .. vim.inspect(history))
+  assert(history[3].origin.kind == "task_started" and history[3].origin.start.kind == "plan")
+  assert(history[3].prompt:find("Create the recovery design", 1, true))
+  local plan_exchange_id = history[3].id
+
+  transition(session_id, "pending-plan", { action = "plan", text = "Create the recovery design" })
+  transition(session_id, "goal-clear", { action = "clear" })
+  local deduplicated = request(session_id, "state.get", {})
+  assert(deduplicated.session.active_task.plan.artifact.id == plan_id,
+    "replaying an old clear receipt cleared the replacement task")
+  assert(deduplicated.session.active_task.entry.id == entry_id)
+  assert(#request(session_id, "exchange.list", {}) == 3, "receipt replay submitted another provider exchange")
+  stop_host()
+
+  local settled = open(session_id)
+  assert(settled.runtime_epoch ~= restarted.runtime_epoch)
+  assert(settled.session.active_task.plan.artifact.id == plan_id)
+  assert(settled.session.active_task.entry.id == entry_id and settled.session.active_task.entry.delivery == "accepted")
+  local final = request(session_id, "exchange.list", {})
+  assert(#final == 3 and final[3].id == plan_exchange_id, "accepted entry replayed on the next restart")
+  assert(request(session_id, "task.operation", { operation_id = "pending-plan" }).state == "completed")
 end, debug.traceback)
 client.stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)

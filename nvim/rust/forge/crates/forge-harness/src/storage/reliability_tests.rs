@@ -194,7 +194,7 @@ fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
         text: None,
         data: serde_json::json!({}),
         summary: None,
-        task_update: None,
+        checklist_update: None,
         activity: Some(ToolActivity {
             id: "call".into(),
             kind: ToolActivityKind::Command,

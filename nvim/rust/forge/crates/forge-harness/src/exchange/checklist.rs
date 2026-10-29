@@ -1,15 +1,15 @@
-use crate::backend::{ProviderTaskEntry, ProviderTaskUpdate, TaskStatus};
+use crate::backend::{ChecklistStatus, ProviderChecklistEntry, ProviderChecklistUpdate};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-/// Represents one provider task with a stable Harness identity.
+/// Represents one provider item with a stable Harness identity.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TaskItem {
+pub struct ChecklistItem {
     pub id: String,
     pub provider_id: Option<String>,
     pub title: String,
     pub priority: Option<String>,
-    pub status: TaskStatus,
+    pub status: ChecklistStatus,
     pub provider_ordinal: usize,
     #[serde(default)]
     pub attributed: bool,
@@ -17,37 +17,37 @@ pub struct TaskItem {
 
 /// Stores the current provider presentation and superseded attributed history.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TaskSnapshot {
+pub struct ChecklistSnapshot {
     pub scope_id: String,
     pub name: Option<String>,
     pub revision: u64,
     pub complete: bool,
-    pub current: Vec<TaskItem>,
-    pub superseded: Vec<TaskItem>,
+    pub current: Vec<ChecklistItem>,
+    pub superseded: Vec<ChecklistItem>,
 }
 
-/// Reconciles complete provider task replacements without losing attributed history.
+/// Reconciles complete provider item replacements without losing attributed history.
 #[derive(Clone, Debug, Default)]
-pub struct TaskTracker {
-    snapshot: TaskSnapshot,
+pub struct ChecklistTracker {
+    snapshot: ChecklistSnapshot,
     next_id: u64,
 }
 
-impl TaskTracker {
-    /// Restore task reconciliation from one durable snapshot.
-    pub fn from_snapshot(snapshot: TaskSnapshot) -> Self {
+impl ChecklistTracker {
+    /// Restore item reconciliation from one durable snapshot.
+    pub fn from_snapshot(snapshot: ChecklistSnapshot) -> Self {
         let next_id = snapshot
             .current
             .iter()
             .chain(&snapshot.superseded)
-            .filter_map(|task| task.id.rsplit(':').next()?.parse::<u64>().ok())
+            .filter_map(|item| item.id.rsplit(':').next()?.parse::<u64>().ok())
             .max()
             .unwrap_or_default();
         Self { snapshot, next_id }
     }
 
-    /// Replace the provider presentation while preserving stable attributed tasks.
-    pub fn replace(&mut self, update: &ProviderTaskUpdate) -> &TaskSnapshot {
+    /// Replace the provider presentation while preserving stable attributed items.
+    pub fn replace(&mut self, update: &ProviderChecklistUpdate) -> &ChecklistSnapshot {
         if !update.replace_entries {
             self.snapshot.scope_id.clone_from(&update.scope_id);
             if update.name.is_some() {
@@ -62,8 +62,8 @@ impl TaskTracker {
         let mut matched = vec![None; update.entry_list.len()];
 
         let mut by_provider_id = HashMap::new();
-        for (index, task) in previous.iter().enumerate() {
-            if let Some(provider_id) = task.provider_id.as_ref() {
+        for (index, item) in previous.iter().enumerate() {
+            if let Some(provider_id) = item.provider_id.as_ref() {
                 by_provider_id.insert(provider_id.as_str(), index);
             }
         }
@@ -108,11 +108,11 @@ impl TaskTracker {
 
         let mut current = Vec::with_capacity(update.entry_list.len());
         for (index, entry) in update.entry_list.iter().enumerate() {
-            let task = match matched[index] {
-                Some(previous_index) => merge_task(previous[previous_index].clone(), entry, index),
+            let item = match matched[index] {
+                Some(previous_index) => merge_item(previous[previous_index].clone(), entry, index),
                 None => {
                     self.next_id += 1;
-                    TaskItem {
+                    ChecklistItem {
                         id: format!("{}:task:{}", update.scope_id, self.next_id),
                         provider_id: entry.provider_id.clone(),
                         title: entry.content.clone(),
@@ -123,14 +123,14 @@ impl TaskTracker {
                     }
                 }
             };
-            current.push(task);
+            current.push(item);
         }
 
         for previous_index in unmatched_previous {
-            let mut task = previous[previous_index].clone();
-            if task.attributed {
-                task.status = TaskStatus::Superseded;
-                self.snapshot.superseded.push(task);
+            let mut item = previous[previous_index].clone();
+            if item.attributed {
+                item.status = ChecklistStatus::Superseded;
+                self.snapshot.superseded.push(item);
             }
         }
         self.snapshot.scope_id.clone_from(&update.scope_id);
@@ -141,32 +141,32 @@ impl TaskTracker {
         &self.snapshot
     }
 
-    /// Return the only current in-progress task when attribution is unambiguous.
+    /// Return the only current in-progress item when attribution is unambiguous.
     pub fn attribution_target(&self) -> Option<&str> {
         let mut matching = self
             .snapshot
             .current
             .iter()
-            .filter(|task| task.status == TaskStatus::InProgress);
-        let task = matching.next()?;
-        matching.next().is_none().then_some(task.id.as_str())
+            .filter(|item| item.status == ChecklistStatus::InProgress);
+        let item = matching.next()?;
+        matching.next().is_none().then_some(item.id.as_str())
     }
 
-    /// Mark a task as historically referenced so replacement cannot discard it.
-    pub fn mark_attributed(&mut self, task_id: &str) {
-        if let Some(task) = self
+    /// Mark a item as historically referenced so replacement cannot discard it.
+    pub fn mark_attributed(&mut self, checklist_item_id: &str) {
+        if let Some(item) = self
             .snapshot
             .current
             .iter_mut()
             .chain(&mut self.snapshot.superseded)
-            .find(|task| task.id == task_id)
+            .find(|item| item.id == checklist_item_id)
         {
-            task.attributed = true;
+            item.attributed = true;
         }
     }
 
-    /// Borrow the durable task presentation.
-    pub fn snapshot(&self) -> &TaskSnapshot {
+    /// Borrow the durable item presentation.
+    pub fn snapshot(&self) -> &ChecklistSnapshot {
         &self.snapshot
     }
 }
@@ -179,21 +179,25 @@ fn normalize_title(title: &str) -> String {
         .to_lowercase()
 }
 
-fn merge_task(mut task: TaskItem, entry: &ProviderTaskEntry, provider_ordinal: usize) -> TaskItem {
-    task.provider_id.clone_from(&entry.provider_id);
-    task.title.clone_from(&entry.content);
-    task.priority.clone_from(&entry.priority);
-    task.status = entry.status;
-    task.provider_ordinal = provider_ordinal;
-    task
+fn merge_item(
+    mut item: ChecklistItem,
+    entry: &ProviderChecklistEntry,
+    provider_ordinal: usize,
+) -> ChecklistItem {
+    item.provider_id.clone_from(&entry.provider_id);
+    item.title.clone_from(&entry.content);
+    item.priority.clone_from(&entry.priority);
+    item.status = entry.status;
+    item.provider_ordinal = provider_ordinal;
+    item
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
 
-    fn update(entry_list: Vec<(&str, TaskStatus)>) -> ProviderTaskUpdate {
-        ProviderTaskUpdate {
+    fn update(entry_list: Vec<(&str, ChecklistStatus)>) -> ProviderChecklistUpdate {
+        ProviderChecklistUpdate {
             scope_id: "turn".into(),
             name: None,
             complete: false,
@@ -201,7 +205,7 @@ mod test {
             entry_list: entry_list
                 .into_iter()
                 .enumerate()
-                .map(|(ordinal, (content, status))| ProviderTaskEntry {
+                .map(|(ordinal, (content, status))| ProviderChecklistEntry {
                     provider_id: None,
                     content: content.into(),
                     priority: None,
@@ -214,23 +218,29 @@ mod test {
 
     #[test]
     fn replaces_titles_without_changing_identity() {
-        let mut tracker = TaskTracker::default();
+        let mut tracker = ChecklistTracker::default();
         let original = tracker
-            .replace(&update(vec![("Build renderer", TaskStatus::InProgress)]))
+            .replace(&update(vec![(
+                "Build renderer",
+                ChecklistStatus::InProgress,
+            )]))
             .current[0]
             .id
             .clone();
-        let snapshot = tracker.replace(&update(vec![("Refactor renderer", TaskStatus::Completed)]));
+        let snapshot = tracker.replace(&update(vec![(
+            "Refactor renderer",
+            ChecklistStatus::Completed,
+        )]));
         assert_eq!(snapshot.current[0].id, original);
         assert_eq!(snapshot.current[0].title, "Refactor renderer");
     }
 
     #[test]
-    fn preserves_only_removed_tasks_with_attributed_history() {
-        let mut tracker = TaskTracker::default();
+    fn preserves_only_removed_items_with_attributed_history() {
+        let mut tracker = ChecklistTracker::default();
         let snapshot = tracker.replace(&update(vec![
-            ("Keep history", TaskStatus::InProgress),
-            ("Discard me", TaskStatus::Pending),
+            ("Keep history", ChecklistStatus::InProgress),
+            ("Discard me", ChecklistStatus::Pending),
         ]));
         let retained_id = snapshot.current[0].id.clone();
         tracker.mark_attributed(&retained_id);
@@ -238,17 +248,17 @@ mod test {
         assert!(snapshot.current.is_empty());
         assert_eq!(snapshot.superseded.len(), 1);
         assert_eq!(snapshot.superseded[0].id, retained_id);
-        assert_eq!(snapshot.superseded[0].status, TaskStatus::Superseded);
+        assert_eq!(snapshot.superseded[0].status, ChecklistStatus::Superseded);
     }
 
     #[test]
     fn attribution_requires_exactly_one_running_task() {
-        let mut tracker = TaskTracker::default();
-        tracker.replace(&update(vec![("One", TaskStatus::InProgress)]));
+        let mut tracker = ChecklistTracker::default();
+        tracker.replace(&update(vec![("One", ChecklistStatus::InProgress)]));
         assert!(tracker.attribution_target().is_some());
         tracker.replace(&update(vec![
-            ("One", TaskStatus::InProgress),
-            ("Two", TaskStatus::InProgress),
+            ("One", ChecklistStatus::InProgress),
+            ("Two", ChecklistStatus::InProgress),
         ]));
         assert!(tracker.attribution_target().is_none());
     }

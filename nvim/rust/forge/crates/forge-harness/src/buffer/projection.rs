@@ -12,7 +12,7 @@ use forge_buffer::node::{NodeDisplay, NodeKind, NodeLifecycle, NodeState};
 use forge_buffer::width::WidthProfile;
 use serde::Serialize;
 
-use crate::exchange::{Exchange, ExchangeActivity, ExchangeKind, ExchangeNode, ExchangeState};
+use crate::exchange::{Exchange, ExchangeActivity, ExchangeNode, ExchangeState};
 use crate::session::state_machine::{ExecutionStatus, SessionPhase, WorkflowActivity};
 use crate::timeline::{SessionEventKind, TimelineEntry};
 
@@ -26,6 +26,10 @@ mod checks;
 #[cfg(test)]
 #[path = "projection/change_results_test.rs"]
 mod change_results_test;
+
+#[cfg(test)]
+#[path = "projection/task_start_test.rs"]
+mod task_start_test;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1206,7 +1210,12 @@ impl TimelineRenderer<'_> {
         agents: &HashMap<&str, &TimelineEntry>,
         depth: usize,
     ) -> Result<()> {
-        if interaction.lifecycle.as_deref() == Some("agent_admission") {
+        if interaction
+            .node_list
+            .iter()
+            .any(|node| matches!(node, ExchangeNode::AgentReference { .. }))
+            && interaction.turn.is_empty()
+        {
             return self.content(
                 interaction,
                 agents,
@@ -1228,12 +1237,23 @@ impl TimelineRenderer<'_> {
             Some(&layout.questions),
             MarkdownRole::Response,
         )?;
-        if let Some(lifecycle) = &interaction.lifecycle {
+        if let crate::exchange::ExchangeOrigin::TaskStarted { start } = &interaction.origin {
+            self.task_started(&interaction.id, start, &interaction.prompt)?;
+        } else if let crate::exchange::ExchangeOrigin::TaskContinuation { reason } =
+            &interaction.origin
+        {
             self.literal(
-                &format!("{}:lifecycle", interaction.id),
-                &format!("◇ {lifecycle}"),
+                &format!("{}:origin", interaction.id),
+                &format!("◇ {reason}"),
                 None,
             )?;
+            let prompt = TranscriptRenderer::new(&self.content_width())?.literal(
+                BlockId(format!("{}:prompt", interaction.id)),
+                &interaction.prompt,
+                2,
+            )?;
+            self.prompt.push(prompt.id.clone());
+            self.push(prompt)?;
         } else if !interaction.prompt.is_empty() {
             let prompt = TranscriptRenderer::new(&self.content_width())?.prompt(
                 BlockId(format!("{}:prompt", interaction.id)),
@@ -1256,11 +1276,7 @@ impl TimelineRenderer<'_> {
                     column: 0,
                 },
             },
-            capture: if interaction.approval_mode.is_some()
-                || matches!(
-                    interaction.kind,
-                    ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
-                ) {
+            capture: if interaction.approval_mode.is_some() {
                 "ForgeHarnessRead".into()
             } else if interaction.is_finished() {
                 "ForgeHarnessThought".into()
@@ -1304,7 +1320,6 @@ impl TimelineRenderer<'_> {
             Some(&layout.questions),
             MarkdownRole::Response,
         )?;
-        self.verification_result(interaction)?;
         self.content(
             interaction,
             agents,
@@ -1389,26 +1404,22 @@ impl TimelineRenderer<'_> {
         self.checks(&combined, false, Some(&heading))
     }
 
-    fn verification_result(&mut self, interaction: &Exchange) -> Result<()> {
-        use crate::plan::{PlanPhase, execution::VerificationOutcome};
-        let Some(phase) = interaction
-            .execution_phase
-            .as_ref()
-            .filter(|phase| phase.phase == PlanPhase::Verify)
-        else {
-            return Ok(());
-        };
-        let Some(outcome) = phase.outcome else {
-            return Ok(());
-        };
-        let identity = format!("{}:verification-result", interaction.id);
+    fn verification_result(
+        &mut self,
+        exchange_id: &str,
+        id: &str,
+        result: &crate::exchange::VerificationResult,
+    ) -> Result<()> {
+        use crate::plan::execution::VerificationOutcome;
+        let outcome = result.outcome;
+        let identity = id.to_owned();
         if outcome == VerificationOutcome::Passed
-            && phase
+            && result
                 .verification
                 .as_ref()
                 .is_none_or(|report| report.checks.is_empty())
         {
-            let summary = phase
+            let summary = result
                 .summary
                 .as_deref()
                 .unwrap_or("")
@@ -1433,7 +1444,7 @@ impl TimelineRenderer<'_> {
             VerificationOutcome::Blocked => "Verification blocked",
             VerificationOutcome::Passed => "Verification passed",
         };
-        let checks = phase
+        let checks = result
             .verification
             .as_ref()
             .map_or(&[][..], |report| report.checks.as_slice());
@@ -1458,11 +1469,11 @@ impl TimelineRenderer<'_> {
                 if blocked == 1 { "" } else { "s" }
             ));
         }
-        if !phase.declaration_findings.is_empty() {
+        if !result.declaration_findings.is_empty() {
             totals.push(format!(
                 "{} declaration mismatch{}",
-                phase.declaration_findings.len(),
-                if phase.declaration_findings.len() == 1 {
+                result.declaration_findings.len(),
+                if result.declaration_findings.len() == 1 {
                     ""
                 } else {
                     "es"
@@ -1530,11 +1541,11 @@ impl TimelineRenderer<'_> {
                     MarkdownRole::Detail,
                 )?;
                 for (evidence_index, evidence) in check.evidence.iter().enumerate() {
-                    let source_id = phase
+                    let source_id = result
                         .verification_tools
                         .get(evidence)
                         .cloned()
-                        .unwrap_or_else(|| format!("{}:{evidence}", interaction.id));
+                        .unwrap_or_else(|| format!("{exchange_id}:{evidence}"));
                     let action = self
                         .display
                         .legacy_tool(&source_id)
@@ -1549,12 +1560,12 @@ impl TimelineRenderer<'_> {
             }
             self.finish_section(group, &group_id, true);
         }
-        if !phase.declaration_findings.is_empty() || !phase.declaration_changes.is_empty() {
+        if !result.declaration_findings.is_empty() || !result.declaration_changes.is_empty() {
             let declaration_id = format!("{identity}:declarations");
-            let count = phase
+            let count = result
                 .declaration_findings
                 .len()
-                .max(phase.declaration_changes.len());
+                .max(result.declaration_changes.len());
             self.literal(
                 &declaration_id,
                 &format!(
@@ -1568,7 +1579,7 @@ impl TimelineRenderer<'_> {
                 &str,
                 Vec<&crate::plan::execution::DeclarationMismatch>,
             >::new();
-            for change in &phase.declaration_changes {
+            for change in &result.declaration_changes {
                 files.entry(&change.path).or_default().push(change);
             }
             for (file_index, (path, changes)) in files.into_iter().enumerate() {
@@ -1597,8 +1608,8 @@ impl TimelineRenderer<'_> {
                 }
                 self.finish_section(file, &file_id, true);
             }
-            for (index, finding) in phase.declaration_findings.iter().enumerate() {
-                if phase
+            for (index, finding) in result.declaration_findings.iter().enumerate() {
+                if result
                     .declaration_changes
                     .iter()
                     .any(|change| finding == &change.finding)
@@ -1613,10 +1624,10 @@ impl TimelineRenderer<'_> {
             }
             self.finish_section(declarations, &declaration_id, true);
         }
-        let findings = phase
+        let findings = result
             .verification
             .as_ref()
-            .map_or(phase.findings.as_slice(), |report| {
+            .map_or(result.findings.as_slice(), |report| {
                 report.findings.as_slice()
             });
         if !findings.is_empty() {
@@ -1638,12 +1649,12 @@ impl TimelineRenderer<'_> {
         }
         if checks.is_empty()
             && findings.is_empty()
-            && phase.declaration_findings.is_empty()
-            && let Some(reason) = phase
+            && result.declaration_findings.is_empty()
+            && let Some(reason) = result
                 .verification
                 .as_ref()
                 .and_then(|report| report.reason.as_deref())
-                .or(phase.summary.as_deref())
+                .or(result.summary.as_deref())
         {
             self.markdown(&format!("{identity}:reason"), reason, MarkdownRole::Detail)?;
         }
@@ -1918,6 +1929,7 @@ impl TimelineRenderer<'_> {
                 } => {
                     self.question(id, question, answer.as_deref())?;
                 }
+                ExchangeNode::QuestionWithdrawn { .. } => {}
                 ExchangeNode::PlanCommentResolution { resolution } => {
                     for (index, annotation) in resolution.annotation.iter().enumerate() {
                         let identity = format!("{}:comment:{index}", resolution.id);
@@ -2010,9 +2022,12 @@ impl TimelineRenderer<'_> {
                     }
                     self.finish_section(section, id, true);
                 }
+                ExchangeNode::VerificationResult { id, result } => {
+                    self.verification_result(&interaction.id, id, result)?;
+                }
                 ExchangeNode::ArtifactChange { change } => {
                     if let Some(declaration) = &change.declaration {
-                        let revision_request = interaction.kind == ExchangeKind::PlanExecution;
+                        let revision_request = change.revision_request;
                         let revision_section = if revision_request {
                             self.literal(
                                 &format!("{}:request", change.id),
@@ -2602,6 +2617,9 @@ impl TimelineRenderer<'_> {
     }
 
     fn session_event(&mut self, event: &crate::timeline::SessionEventRecord) -> Result<()> {
+        if let SessionEventKind::TaskStarted { start, prompt } = &event.detail {
+            return self.task_started(&event.id, start, prompt);
+        }
         if let SessionEventKind::Compaction { compaction } = &event.detail {
             return self.compaction(&event.id, compaction);
         }
@@ -2618,6 +2636,26 @@ impl TimelineRenderer<'_> {
             &format!("◇ {}", session_event_text(&event.detail)),
             action,
         )
+    }
+
+    fn task_started(
+        &mut self,
+        id: &str,
+        start: &crate::exchange::TaskStart,
+        prompt: &str,
+    ) -> Result<()> {
+        self.literal(
+            &format!("{id}:start"),
+            &format!("◇ {}", start.heading()),
+            None,
+        )?;
+        let prompt = TranscriptRenderer::new(&self.content_width())?.literal(
+            BlockId(format!("{id}:prompt")),
+            prompt,
+            0,
+        )?;
+        self.prompt.push(prompt.id.clone());
+        self.push(prompt)
     }
 
     fn tool(
@@ -3019,6 +3057,24 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
 
 fn session_event_text(event: &SessionEventKind) -> String {
     match event {
+        SessionEventKind::TaskStarted { start, .. } => start.heading(),
+        SessionEventKind::TaskFinished { outcome } => {
+            let label = match outcome.kind {
+                crate::task::TaskKind::Goal => "Goal",
+                crate::task::TaskKind::Plan => "Plan",
+                crate::task::TaskKind::Execute => "Execution",
+            };
+            let state = match outcome.state {
+                crate::task::TaskOutcomeState::Complete => "completed",
+                crate::task::TaskOutcomeState::Cancelled => "cleared",
+            };
+            let summary = if outcome.summary.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", outcome.summary)
+            };
+            format!("{label} {state}: {}{summary}", outcome.title)
+        }
         SessionEventKind::Configuration {
             state,
             field,
@@ -3095,41 +3151,12 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     } else if matches!(status, ExchangeActivity::Compacting { .. }) {
         "Compacting"
     } else {
-        let activity = WorkflowActivity::from_exchange(interaction);
-        match interaction.kind {
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if paused => {
-                if activity == WorkflowActivity::Revising {
-                    "Revising plan paused"
-                } else {
-                    "Planning paused"
-                }
-            }
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if complete => {
-                activity.completed_label()
-            }
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => activity.active_label(),
-            ExchangeKind::PlanExecution
-                if interaction
-                    .execution_phase
-                    .as_ref()
-                    .is_some_and(|phase| phase.outcome.is_some()) =>
-            {
-                activity.completed_label()
-            }
-            ExchangeKind::PlanExecution if complete => match activity {
-                WorkflowActivity::Verifying => "Verification stopped",
-                WorkflowActivity::Resolving => "Resolution stopped",
-                _ => "Implementation stopped",
-            },
-            ExchangeKind::PlanExecution if paused => match activity {
-                WorkflowActivity::Verifying => "Verifying paused",
-                WorkflowActivity::Resolving => "Resolving paused",
-                _ => "Implementing paused",
-            },
-            ExchangeKind::PlanExecution => activity.active_label(),
-            ExchangeKind::Chat if complete => activity.completed_label(),
-            ExchangeKind::Chat if paused => "Paused",
-            ExchangeKind::Chat => activity.active_label(),
+        if complete {
+            "Thought"
+        } else if paused {
+            "Paused"
+        } else {
+            "Thinking"
         }
     };
     let summary = format!(
@@ -3526,14 +3553,78 @@ mod tests {
     }
 
     #[test]
+    fn task_replacement_withdraws_question_without_losing_its_content() -> anyhow::Result<()> {
+        let question = serde_json::json!({ "id":"set", "questions":[{
+            "id":"scope", "header":"Scope", "question":"Which files should change?",
+            "options":[{"label":"Source", "description":"Update source files", "recommended":false}],
+            "allow_freeform":true
+        }] });
+        let exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id":"withdrawn", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Plan the change", "state":"complete", "created_at_ms":0,
+            "completed_at_ms":1, "attributed_matches_checkpoint":false,
+            "node_list":[
+                {"kind":"question_presented", "id":"presented", "question":question, "answer":null},
+                {"kind":"question_withdrawn", "id":"withdrawal", "question":question, "reason":"task changed",
+                    "answer":[{"question_id":"scope","response":{"kind":"selected","option":"Source","feedback":null}}]}
+            ]
+        }))?;
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange,
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            1,
+        )?;
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Questions · Withdrawn"));
+        assert_eq!(text.matches("Which files should change?").count(), 1);
+        assert!(text.contains("Update source files"));
+        assert!(text.contains("task changed"));
+        assert!(text.contains("You answered: Source"));
+        Ok(())
+    }
+
+    #[test]
+    fn task_finished_event_keeps_outcome_without_a_task_owner() {
+        let event = SessionEventKind::TaskFinished {
+            outcome: crate::task::TaskOutcome {
+                kind: crate::task::TaskKind::Goal,
+                title: "Reduce startup time".into(),
+                state: crate::task::TaskOutcomeState::Complete,
+                summary: "Startup now takes 80 ms.".into(),
+            },
+        };
+        assert_eq!(
+            super::session_event_text(&event),
+            "Goal completed: Reduce startup time\nStartup now takes 80 ms."
+        );
+        let restored: SessionEventKind =
+            serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+        assert_eq!(
+            super::session_event_text(&restored),
+            "Goal completed: Reduce startup time\nStartup now takes 80 ms."
+        );
+    }
+
+    #[test]
     fn verification_groups_keep_checks_and_declaration_diffs_separate() -> anyhow::Result<()> {
         use super::*;
         use serde_json::json;
         let exchange: Exchange = serde_json::from_value(json!({
             "id":"verify", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"", "kind":"plan_execution", "state":"complete", "created_at_ms":0,
-            "completed_at_ms":1000, "attributed_matches_checkpoint":true, "node_list":[],
-            "execution_phase":{"phase":"verify","outcome":"failed", "findings":[],
+            "completed_at_ms":1000, "attributed_matches_checkpoint":true,
+            "node_list":[{"kind":"verification_result","id":"verify:verification-result","result":{"outcome":"failed", "findings":[],
                 "verification":{"outcome":"failed", "checks":[
                     {"category":"automated","label":"cargo test","outcome":"passed","summary":"8 tests passed","evidence":["test-tool"]},
                     {"category":"automated","label":"cargo check","outcome":"failed","summary":"Expected FontSize","evidence":[]},
@@ -3544,7 +3635,7 @@ mod tests {
                 "declaration_changes":[{"path":"src/lib.rs","name":"function update",
                     "finding":"src/lib.rs: function update: changed",
                     "diff":"diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn update(input: State);\n+fn update(mut input: State);\n"}]
-            }
+            }}]
         }))?;
         let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
         let mut display = crate::buffer::identity::DisplayRegistry::default();
@@ -3619,9 +3710,9 @@ mod tests {
                 "id":"verify-result", "session_id":"session", "agent_id":"primary", "ordinal":1,
                 "prompt":"", "kind":"plan_execution", "state":"complete", "created_at_ms":0,
                 "completed_at_ms":18000, "duration_ms":18000, "attributed_matches_checkpoint":true,
-                "execution_phase":{"phase":"verify","outcome":outcome,
-                    "summary":"Ran eight gameplay tests.", "findings":findings},
-                "node_list":[{"kind":"artifact_change","change":{
+                "node_list":[{"kind":"verification_result","id":"verify-result:verification-result","result":{
+                    "outcome":outcome,"summary":"Ran eight gameplay tests.", "findings":findings}},
+                    {"kind":"artifact_change","change":{
                     "id":"inspected-change", "path":"game.rs", "created_at_ms":1,
                     "diff_text":"diff --git a/game.rs b/game.rs\n--- a/game.rs\n+++ b/game.rs\n@@ -1 +1 @@\n-old\n+new\n"
                 }}]
@@ -3648,7 +3739,7 @@ mod tests {
                     .text
                     .wire_rows()
                     .join("\n")
-                    .contains("Verified 18s")
+                    .contains("Thought 18s")
             );
             assert!(
                 blocks[0].metadata.fold.is_empty(),
@@ -3684,79 +3775,39 @@ mod tests {
     }
 
     #[test]
-    fn execution_phase_headings_and_lifecycle_events_survive_serialization() {
+    fn task_origin_and_artifact_events_survive_serialization() {
         use super::*;
-        use serde_json::json;
-        let source = json!({
-            "id":"phase", "session_id":"session", "agent_id":"primary", "ordinal":1,
-            "prompt":"", "kind":"plan_execution", "state":"running", "created_at_ms":0,
-            "lifecycle":"Plan implementation started",
-            "execution_started_at_ms":0, "attributed_matches_checkpoint":false,
-            "execution_phase":{"phase":"implement","outcome":null},
-            "node_list":[
-                {"kind":"artifact_change","change":{"id":"files","path":"lib.rs",
-                    "diff_text":"diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
-                    "created_at_ms":1}},
-                {"kind":"plan_event","event":{"id":"done","node_count":1,"content":{
-                    "kind":"execution","event":{"kind":"completed","title":"Collection game"}
-                }}}
-            ]
-        });
-        for (phase, outcome, state, expected) in [
-            ("implement", None, "running", "Implementing"),
-            ("verify", None, "running", "Verifying"),
-            ("resolve", None, "running", "Resolving"),
-            ("implement", Some("passed"), "complete", "Implemented"),
-            ("verify", Some("failed"), "complete", "Verified"),
-            ("verify", Some("blocked"), "complete", "Verified"),
-            ("resolve", Some("passed"), "complete", "Resolved"),
-            ("verify", Some("passed"), "complete", "Verified"),
-            ("implement", None, "complete", "Implementation stopped"),
-            ("verify", None, "complete", "Verification stopped"),
-            ("resolve", None, "complete", "Resolution stopped"),
-            ("implement", None, "cancelled", "Cancelled"),
-            ("implement", None, "interrupted", "Interrupted"),
-            ("implement", None, "failed", "Failed"),
-        ] {
-            let mut value = source.clone();
-            value["execution_phase"] = json!({"phase":phase,"outcome":outcome});
-            value["state"] = json!(state);
-            value["completed_at_ms"] = if state == "running" {
-                json!(null)
-            } else {
-                json!(1000)
-            };
-            let exchange: Exchange = serde_json::from_value(value).unwrap();
-            let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange).unwrap()).unwrap();
-            let projected = project_at(
-                &TimelineEntry::Exchange {
-                    id: "phase".into(),
-                    created_at_ms: 0,
-                    exchange,
-                    agent_by_id: HashMap::new(),
-                },
-                &WidthProfile::default(),
-                1000,
-            )
-            .unwrap();
-            let blocks = &projected.entry.block;
-            assert_eq!(blocks[0].id.0, "phase:lifecycle");
-            assert_eq!(
-                blocks[0].text.wire_rows().join("\n"),
-                "◇ Plan implementation started"
-            );
-            let summary = blocks
-                .iter()
-                .find(|block| block.id.0 == "phase:summary")
-                .unwrap();
-            assert!(summary.text.wire_rows().join("\n").contains(expected));
-            assert_eq!(blocks.last().unwrap().id.0, "done");
-            assert!(
-                summary.metadata.fold.is_empty(),
-                "artifacts and outcomes stay outside activity"
-            );
-            assert!(!blocks.iter().any(|block| block.id.0 == "phase:prompt"));
-        }
+        let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id":"continuation", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Implement the plan", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))
+        .unwrap();
+        exchange.origin = crate::exchange::ExchangeOrigin::TaskContinuation {
+            reason: "Implementation required".into(),
+        };
+        let exchange: Exchange =
+            serde_json::from_slice(&serde_json::to_vec(&exchange).unwrap()).unwrap();
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange,
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            1000,
+        )
+        .unwrap();
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Implement the plan"));
+        assert!(text.contains("Implementation required"));
     }
 
     #[test]
@@ -3956,7 +4007,7 @@ mod tests {
         use crate::backend::{
             BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
         };
-        use crate::exchange::{ExchangeKind, ExchangeNode, InputIntent, QuestionInput};
+        use crate::exchange::{ExchangeNode, InputIntent, QuestionInput};
 
         for planning_question in [None, Some(false), Some(true)] {
             let mut exchange: Exchange = serde_json::from_value(json!({
@@ -3979,7 +4030,7 @@ mod tests {
                 data: serde_json::Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             exchange.observe_turn(&event, 0).unwrap();
             event.turn_boundary = None;
@@ -4006,7 +4057,6 @@ mod tests {
                 }))
                 .unwrap();
                 exchange.node_list.push(if planning {
-                    exchange.kind = ExchangeKind::PlanDraft;
                     serde_json::from_value(json!({"kind":"plan_event", "event":{
                         "id":"presented", "node_count":exchange.node_list.len(),
                         "content":{"kind":"lifecycle", "title":"Game", "lifecycle":{
@@ -4279,7 +4329,7 @@ mod tests {
     #[test]
     fn question_branches_keep_targets_responses_and_folds_across_reload() {
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
-        use crate::exchange::{ExchangeKind, ExchangeNode, InputIntent, QuestionInput};
+        use crate::exchange::{ExchangeNode, InputIntent, QuestionInput};
         use forge_buffer::block::BufferBlock;
         for planning in [false, true] {
             let mut exchange: Exchange = serde_json::from_value(json!({
@@ -4297,8 +4347,7 @@ mod tests {
                 ]
             })).unwrap();
             exchange.node_list.push(if planning {
-                exchange.kind = ExchangeKind::PlanDraft;
-                serde_json::from_value(json!({"kind":"plan_event", "event":{
+                        serde_json::from_value(json!({"kind":"plan_event", "event":{
                     "id":"presented", "node_count":0, "content":{"kind":"lifecycle", "title":"Replacement", "lifecycle":{
                         "id":"presented", "session_id":"session", "plan_id":"plan", "kind":"question_asked",
                         "model_revision":0,"user_revision":0,"annotation":[],"question":set,"created_at_ms":0
@@ -4352,7 +4401,7 @@ mod tests {
                     data: serde_json::Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 };
                 exchange.observe_turn(&event, index as i64).unwrap();
                 event.turn_boundary = None;
@@ -4513,7 +4562,7 @@ mod tests {
             data: serde_json::Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 0).unwrap();
         event.turn_boundary = None;
@@ -4850,7 +4899,7 @@ mod tests {
                 text: None,
                 data: serde_json::Value::Null,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
                 activity: None,
             };
             for (ordinal, name) in ["first", boundary, "last"].into_iter().enumerate() {
@@ -5035,7 +5084,7 @@ mod tests {
             data: serde_json::Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         for (index, (id, kind, status, diff)) in [
             ("inspect", ToolActivityKind::Command, "completed", ""),
@@ -5256,7 +5305,7 @@ mod tests {
             data: serde_json::Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         let mut clock = 1;
         for (index, duration) in [Some(4), Some(21), Some(1000), Some(626), None]
@@ -5457,7 +5506,7 @@ mod tests {
             data: Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         let render = |exchange: &Exchange| {
             project_at(
@@ -5726,7 +5775,7 @@ mod tests {
             data: serde_json::Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 0).unwrap();
         event.turn_boundary = None;
@@ -5865,6 +5914,7 @@ mod tests {
                 .node_list
                 .push(crate::exchange::ExchangeNode::ArtifactChange {
                     change: crate::exchange::ArtifactChange {
+                        revision_request: false,
                         id: format!("artifact-{revision}"),
                         declaration: None,
                         path: path.into(),
@@ -5949,7 +5999,7 @@ mod tests {
             data: json!({"phase":"final_answer"}),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange
             .start_turn(response.address.clone().unwrap(), 0)
@@ -5963,6 +6013,7 @@ mod tests {
         exchange.observe_turn(&response, 2).unwrap();
         exchange.node_list.push(crate::exchange::ExchangeNode::ArtifactChange {
             change: crate::exchange::ArtifactChange {
+                        revision_request: false,
                 id: "artifact".into(), path: "working.md".into(), created_at_ms: 1,
                 diff_text: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub struct Old;\n+pub struct New;\n".into(),
                 declaration: Some(crate::exchange::DeclarationRevision {
@@ -6081,7 +6132,7 @@ mod tests {
             data: serde_json::Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         nested.observe_turn(&update, 0).unwrap();
         update.turn_boundary = None;
@@ -6618,7 +6669,7 @@ mod tests {
             data: serde_json::Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 0).unwrap();
         event.turn_boundary = None;
@@ -7372,6 +7423,46 @@ mod tests {
     }
 
     #[test]
+    fn task_continuation_renders_actual_input_with_harness_origin() {
+        let interaction: Exchange = serde_json::from_value(json!({
+            "id":"continuation", "session_id":"session", "agent_id":"primary", "ordinal":2,
+            "prompt":"Run the remaining validation and resolve failures.",
+            "origin":{"kind":"task_continuation","reason":"Validation remains"},
+            "kind":"chat", "state":"running", "created_at_ms":1000,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))
+        .unwrap();
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: "continuation".into(),
+                created_at_ms: 1000,
+                exchange: interaction,
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(projected.entry.block[0].id.0, "continuation:origin");
+        assert!(
+            projected.entry.block[0]
+                .text
+                .wire_rows()
+                .join("\n")
+                .contains("◇ Validation remains")
+        );
+        assert_eq!(projected.entry.block[1].id.0, "continuation:prompt");
+        assert!(
+            projected.entry.block[1]
+                .text
+                .wire_rows()
+                .join("\n")
+                .contains("Run the remaining validation and resolve failures.")
+        );
+        assert_eq!(projected.prompt, vec![projected.entry.block[1].id.clone()]);
+    }
+
+    #[test]
     fn lifecycle_resumption_does_not_render_as_user_input() {
         let interaction: Exchange = serde_json::from_value(json!({
             "id":"interaction", "session_id":"session", "agent_id":"primary", "ordinal":1,
@@ -7479,19 +7570,11 @@ mod tests {
 
     #[test]
     fn exchange_and_session_activity_share_waits_and_execution_time() -> anyhow::Result<()> {
-        for (kind, phase) in [
-            ("chat", None),
-            ("plan_draft", None),
-            ("plan_revision", None),
-            ("plan_execution", Some("implement")),
-            ("plan_execution", Some("verify")),
-            ("plan_execution", Some("resolve")),
-        ] {
+        {
             let mut exchange: Exchange = serde_json::from_value(json!({
                 "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
-                "kind":kind, "state":"running", "prompt":"Work", "created_at_ms":1000,
+                "state":"running", "prompt":"Work", "created_at_ms":1000,
                 "node_list":[], "attributed_matches_checkpoint":false,
-                "execution_phase":phase.map(|phase|json!({"phase":phase})),
             }))?;
             let activity = WorkflowActivity::from_exchange(&exchange);
             let assert_working = |exchange: &Exchange, now_ms, seconds| -> anyhow::Result<()> {
@@ -7515,7 +7598,7 @@ mod tests {
                 );
                 assert_eq!(
                     super::exchange_activity_summary(exchange, now_ms),
-                    format!("● {} {seconds}s", activity.active_label())
+                    format!("● Thinking {seconds}s")
                 );
                 Ok(())
             };
@@ -7562,17 +7645,6 @@ mod tests {
             assert!(!SessionPhase::resolve(None, None, Some(&exchange)).animated());
             exchange.resume(200_000)?;
             assert_working(&exchange, 201_000, 9)?;
-            if let Some(phase) = &mut exchange.execution_phase {
-                phase.outcome = Some(crate::plan::execution::VerificationOutcome::Passed);
-                assert_eq!(
-                    SessionPhase::resolve(None, None, Some(&exchange)),
-                    SessionPhase::Idle
-                );
-                assert!(
-                    super::exchange_activity_summary(&exchange, 201_000)
-                        .contains(activity.completed_label())
-                );
-            }
         }
         Ok(())
     }
@@ -7602,7 +7674,7 @@ mod tests {
             text: Some(text.into()),
             data: json!({"provider_message_id":"initial", "phase":"commentary"}),
             summary: None,
-            task_update: None,
+            checklist_update: None,
             activity: None,
         };
         exchange.observe_turn(&event, 1)?;
@@ -7735,7 +7807,7 @@ mod tests {
                     data: json!({"message_id":format!("step-{index}"), "phase":"commentary"}),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 };
                 exchange.observe_turn(&event, index as i64 * 10 + 1)?;
                 let mut file = vec![ProviderFileChange {
@@ -7867,7 +7939,7 @@ mod tests {
                 data: json!({"message_id":format!("thought-{index}"), "phase":"commentary"}),
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             exchange.observe_turn(&event, index * 10 + 1)?;
             thought_ids.push(exchange.node_list.last().unwrap().id().to_owned());
@@ -8306,10 +8378,10 @@ mod tests {
     #[test]
     fn paused_exchange_activity_summary_freezes_until_execution_resumes() {
         for (kind, paused, running) in [
-            ("chat", "Paused", "Working"),
-            ("plan_draft", "Planning paused", "Planning"),
-            ("plan_revision", "Revising plan paused", "Revising plan"),
-            ("plan_execution", "Implementing paused", "Implementing"),
+            ("chat", "Paused", "Thinking"),
+            ("plan_draft", "Paused", "Thinking"),
+            ("plan_revision", "Paused", "Thinking"),
+            ("plan_execution", "Paused", "Thinking"),
         ] {
             let mut exchange: Exchange = serde_json::from_value(json!({
                 "id":"exchange", "session_id":"session", "agent_id":"primary",
@@ -8481,7 +8553,7 @@ mod tests {
         let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 44000),
-            "● Planned 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps"
+            "● Thought 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps"
         );
         for status in ["running", "cancelled", "interrupted"] {
             crate::turn::test_support::tool_value_mut(&mut value, "1")["status"] = json!(status);
@@ -8547,7 +8619,7 @@ mod tests {
                 output_delta: false,
             }),
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 2000).unwrap();
         for (now_ms, duration, aggregate) in [
@@ -8576,7 +8648,6 @@ mod tests {
             );
         }
         let mut permission_wait = exchange.clone();
-        permission_wait.kind = crate::exchange::ExchangeKind::PlanDraft;
         permission_wait.observe_blocker("approval:command".into(), true, 4500);
         for now_ms in [90_000, 900_000] {
             assert_eq!(
@@ -8587,7 +8658,7 @@ mod tests {
         permission_wait.observe_blocker("approval:command".into(), false, 900_000);
         assert_eq!(
             super::exchange_activity_summary(&permission_wait, 902_000),
-            "● Planning 5s │ 0/1 tools · 4.5 s"
+            "● Thinking 5s │ 0/1 tools · 4.5 s"
         );
         event.activity.as_mut().unwrap().status = Some("failed".into());
         exchange.observe_turn(&event, 5000).unwrap();
@@ -8683,12 +8754,12 @@ mod tests {
                 "cumulative":null,"cumulative_total":null}),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 3000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 4000),
-            "● Working 3s │ 1.0k (90%) -> 100 · 50 tps"
+            "● Thinking 3s │ 1.0k (90%) -> 100 · 50 tps"
         );
         exchange.observe_turn(&event, 6000).unwrap();
         assert!(super::exchange_activity_summary(&exchange, 6000).contains("50 tps"));
@@ -8696,7 +8767,7 @@ mod tests {
         exchange.observe_turn(&event, 6000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 9000),
-            "● Working 8s │ 2.0k (90%) -> 200 · 40 tps"
+            "● Thinking 8s │ 2.0k (90%) -> 200 · 40 tps"
         );
     }
 
@@ -8718,27 +8789,27 @@ mod tests {
         original.start_turn(address.clone(), 1000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&original, 4000),
-            "● Working 3s"
+            "● Thinking 3s"
         );
         for (usage, expected) in [
-            (json!({}), "● Working 3s"),
+            (json!({}), "● Thinking 3s"),
             (
                 json!({"input":1000,"output":100}),
-                "● Working 3s │ 1.0k -> 100 · 50 tps",
+                "● Thinking 3s │ 1.0k -> 100 · 50 tps",
             ),
             (
                 json!({"input":1000,"cached_input":876}),
-                "● Working 3s │ in 1.0k (88%)",
+                "● Thinking 3s │ in 1.0k (88%)",
             ),
-            (json!({"input":0,"cached_input":0}), "● Working 3s │ in 0"),
+            (json!({"input":0,"cached_input":0}), "● Thinking 3s │ in 0"),
             (
                 json!({"input":1000,"cached_input":1001}),
-                "● Working 3s │ in 1.0k",
+                "● Thinking 3s │ in 1.0k",
             ),
-            (json!({"reasoning":23}), "● Working 3s"),
+            (json!({"reasoning":23}), "● Thinking 3s"),
             (
                 json!({"input":1000,"cached_input":0,"reasoning":0,"output":0}),
-                "● Working 3s │ 1.0k (0%) -> 0",
+                "● Thinking 3s │ 1.0k (0%) -> 0",
             ),
         ] {
             let mut exchange = original.clone();
@@ -8751,7 +8822,7 @@ mod tests {
                 data: json!({"id":"first", "usage":usage, "cumulative":null,"cumulative_total":null}),
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             exchange.observe_turn(&event, 3000).unwrap();
             assert_eq!(super::exchange_activity_summary(&exchange, 4000), expected);
@@ -8760,7 +8831,7 @@ mod tests {
 
     #[test]
     fn running_exchange_activity_summary_tracks_duration_and_completion_metadata() {
-        use crate::exchange::{Exchange, ExchangeKind};
+        use crate::exchange::Exchange;
         let mut interaction: Exchange = serde_json::from_value(json!({
             "id":"interaction", "session_id":"session", "agent_id":"primary", "ordinal":1, "prompt":"Plan parser",
             "kind":"plan_draft", "state":"running", "created_at_ms":1000,
@@ -8770,7 +8841,7 @@ mod tests {
         interaction.resume(1000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 4200),
-            "● Planning 3s"
+            "● Thinking 3s"
         );
         interaction.pause(5500);
         interaction
@@ -8804,7 +8875,6 @@ mod tests {
             super::exchange_activity_summary(&interaction, 20000),
             "● Waiting for your answer 4s │ 1.0k (90%) -> 280"
         );
-        interaction.kind = ExchangeKind::Chat;
         interaction
             .finish(crate::exchange::ExchangeOutcome::Complete, 5500)
             .unwrap();

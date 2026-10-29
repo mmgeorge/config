@@ -248,7 +248,7 @@ mod tests {
                 "item":{"durationMs":383},"completedAtMs":1383 }}),
             activity: Some(activity("call")),
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         turn.record_tool_event(event.tool_event().unwrap(), 10000)
             .unwrap();
@@ -501,7 +501,7 @@ mod tests {
         assert!(turn.attribute_tool("tool", "original-task").unwrap());
         assert!(!turn.attribute_tool("tool", "another-task").unwrap());
         assert_eq!(
-            turn.tools().next().unwrap().task_id.as_deref(),
+            turn.tools().next().unwrap().checklist_item_id.as_deref(),
             Some("original-task")
         );
 

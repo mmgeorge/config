@@ -112,8 +112,7 @@ impl HarnessBroker {
         );
         loop {
             scope.check()?;
-            let mut admission = ExchangeAdmission::chat(scope.question.body.clone());
-            admission.plan_id = Some(scope.question.plan_id.clone());
+            let admission = ExchangeAdmission::chat(scope.question.body.clone());
             let (result, _) = self
                 .run_interaction(prompt, PromptMode::PlanQuestion, Some(admission))
                 .await?;

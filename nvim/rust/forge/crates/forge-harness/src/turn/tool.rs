@@ -20,8 +20,8 @@ pub struct ToolCall {
     pub started_at_ms: Option<i64>,
     /// First terminal observation, retained across replay and session reopening.
     pub completed_at_ms: Option<i64>,
-    #[serde(default)]
-    pub task_id: Option<String>,
+    #[serde(default, alias = "task_id")]
+    pub checklist_item_id: Option<String>,
     pub id: String,
     pub kind: String,
     pub title: String,
@@ -101,14 +101,14 @@ impl ToolStore {
     }
 
     /// Assign a call to its first observed task without changing historical attribution.
-    pub(crate) fn attribute(&mut self, id: &str, task_id: &str) -> bool {
+    pub(crate) fn attribute(&mut self, id: &str, checklist_item_id: &str) -> bool {
         let Some(tool) = self.item.get_mut(id) else {
             return false;
         };
-        if tool.task_id.is_some() {
+        if tool.checklist_item_id.is_some() {
             return false;
         }
-        tool.task_id = Some(task_id.to_owned());
+        tool.checklist_item_id = Some(checklist_item_id.to_owned());
         true
     }
 
@@ -122,7 +122,7 @@ impl ToolStore {
             .or_insert_with(|| ToolCall {
                 started_at_ms: None,
                 completed_at_ms: None,
-                task_id: None,
+                checklist_item_id: None,
                 id: activity.id.clone(),
                 kind: tool_kind(activity),
                 title: activity.title.clone(),

@@ -41,6 +41,18 @@ pub struct TurnEvidence {
     pub structured_blocked: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GoalTermination {
+    Complete,
+    Blocked,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GoalControl {
+    pub permit: crate::task::TaskPermit,
+    pub termination: GoalTermination,
+}
+
 /// Represents the broker action selected after a goal turn ends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContinuationDecision {
@@ -56,41 +68,15 @@ pub enum ContinuationDecision {
 impl GoalRecord {
     /// Resolve the next goal action from turn evidence and continuation guards.
     pub fn observe(&mut self, evidence: TurnEvidence, now_ms: i64) -> ContinuationDecision {
-        if self.state != GoalState::Active {
-            return ContinuationDecision::Stop;
+        if self.state == GoalState::Active {
+            self.updated_at_ms = now_ms;
         }
-        self.updated_at_ms = now_ms;
-        if self.native
-            && let Some(state) = evidence
-                .native_state
-                .filter(|state| *state != GoalState::Active)
-        {
-            self.state = state;
-            return ContinuationDecision::Settled;
-        }
-        if evidence.structured_complete {
-            self.state = GoalState::Complete;
-            return ContinuationDecision::Complete;
-        }
-        if evidence.structured_blocked {
-            self.state = GoalState::Blocked;
-            return ContinuationDecision::Blocked;
-        }
-        let progress = evidence.workspace_changed || evidence.tool_called;
-        let may_continue = self.continuation.observe(progress);
-        if !may_continue {
-            self.state = GoalState::Stalled;
-            return ContinuationDecision::Stalled;
-        }
-        if progress {
-            return ContinuationDecision::Continue;
-        }
-        if self.continuation.consecutive_no_progress == 1 {
-            ContinuationDecision::RetryNoProgress
-        } else {
-            self.state = GoalState::Stalled;
-            ContinuationDecision::Stalled
-        }
+        observe(
+            &mut self.state,
+            &mut self.continuation,
+            self.native,
+            evidence,
+        )
     }
 
     /// Resume goal execution with a fresh continuation budget.
@@ -101,9 +87,87 @@ impl GoalRecord {
     }
 }
 
+pub(crate) fn observe(
+    state: &mut GoalState,
+    continuation: &mut ContinuationBudget,
+    native: bool,
+    evidence: TurnEvidence,
+) -> ContinuationDecision {
+    if *state != GoalState::Active {
+        return ContinuationDecision::Stop;
+    }
+    if native
+        && let Some(native_state) = evidence
+            .native_state
+            .filter(|state| *state != GoalState::Active)
+    {
+        *state = native_state;
+        return ContinuationDecision::Settled;
+    }
+    if evidence.structured_complete {
+        *state = GoalState::Complete;
+        return ContinuationDecision::Complete;
+    }
+    if evidence.structured_blocked {
+        *state = GoalState::Blocked;
+        return ContinuationDecision::Blocked;
+    }
+    let progress = evidence.workspace_changed || evidence.tool_called;
+    let may_continue = continuation.observe(progress);
+    if !may_continue {
+        *state = GoalState::Stalled;
+        return ContinuationDecision::Stalled;
+    }
+    if progress {
+        return ContinuationDecision::Continue;
+    }
+    if continuation.consecutive_no_progress == 1 {
+        ContinuationDecision::RetryNoProgress
+    } else {
+        *state = GoalState::Stalled;
+        ContinuationDecision::Stalled
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn goal_control_keeps_its_outcome_with_the_admitted_revision() {
+        let previous =
+            crate::task::ActiveTask::goal("Previous".into(), Default::default(), false, 1);
+        let current = crate::task::ActiveTask::goal("Current".into(), Default::default(), false, 2);
+        for termination in [GoalTermination::Complete, GoalTermination::Blocked] {
+            let output = crate::backend::BackendOutput {
+                evidence: TurnEvidence {
+                    structured_complete: true,
+                    structured_blocked: true,
+                    ..Default::default()
+                },
+                goal_control: Some(GoalControl {
+                    permit: current.permit(),
+                    termination,
+                }),
+                dispatched_task_permit: Some(previous.permit()),
+                ..Default::default()
+            };
+            let (evidence, permit) = output.goal_evidence();
+            assert_eq!(
+                evidence.structured_complete,
+                termination == GoalTermination::Complete
+            );
+            assert_eq!(
+                evidence.structured_blocked,
+                termination == GoalTermination::Blocked
+            );
+            permit.as_ref().unwrap().validate(Some(&current)).unwrap();
+            assert!(permit.unwrap().validate(Some(&previous)).is_err());
+            let serialized = serde_json::to_value(&output).unwrap();
+            assert!(serialized.get("goal_control").is_none());
+            assert!(serialized.get("dispatched_task_permit").is_none());
+        }
+    }
 
     fn goal() -> GoalRecord {
         GoalRecord {

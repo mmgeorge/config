@@ -415,7 +415,7 @@ impl TimelineRenderer<'_> {
             title: title.clone(),
             started_at_ms: elapsed.map(|_| 0),
             completed_at_ms: elapsed.map(|value| value.min(i64::MAX as u64) as i64),
-            task_id: None,
+            checklist_item_id: None,
             output: Default::default(),
             status: String::new(),
             failed,

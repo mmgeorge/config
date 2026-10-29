@@ -6,11 +6,11 @@ fn submit(id: &str) -> InputOperation {
         control_revision: 0,
         after_control: None,
         action: InputAction::Submit {
-            message: InputMessage {
+            message: Box::new(InputMessage {
                 id: id.into(),
                 revision: 0,
                 text: format!("message {id}"),
-                task_id: None,
+                purpose: crate::input::InputPurpose::User,
                 attachments: Vec::new(),
                 config: None,
                 intent: InputIntent::Queue,
@@ -19,7 +19,7 @@ fn submit(id: &str) -> InputOperation {
                 reservation: None,
                 submission_id: None,
                 error: None,
-            },
+            }),
         },
     }
 }
@@ -153,16 +153,13 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
         action: InputAction::Resume,
     })?;
     assert!(resumed.error.is_none() && !restored.snapshot()?.suspended);
-    let mut independent = submit("different-task");
-    if let InputAction::Submit { message } = &mut independent.action {
-        message.task_id = Some("new-task".into());
-    }
+    let independent = submit("after-task-change");
     restored.apply(independent)?;
     assert!(
         restored
-            .claim("different-task", 1, InputRoute::Turn)?
-            .is_some(),
-        "an old task's queue blocked a different task"
+            .claim("after-task-change", 1, InputRoute::Turn)?
+            .is_none(),
+        "changing tasks bypassed unresolved input delivery"
     );
     std::thread::scope(|scope| {
         let worker = |session_id: &str| -> Result<()> {
@@ -209,6 +206,60 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
         },
     })?;
     assert!(failed.claim("following", 1, InputRoute::Turn)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn user_input_precedes_generated_continuation() -> Result<()> {
+    let input = SessionInputQueue::default();
+    let mut continuation = submit("continuation");
+    if let InputAction::Submit { message } = &mut continuation.action {
+        message.purpose = InputPurpose::TaskContinuation {
+            revision: crate::task::TaskRevision::fresh(),
+            id: crate::task::TaskInputId::fresh(),
+            completed_turn_id: crate::task::TaskTurnId {
+                exchange_ordinal: 1,
+                turn_ordinal: 1,
+            },
+            reason: "More work remains".into(),
+        };
+        message.intent = InputIntent::Auto;
+    }
+    input.apply(continuation)?;
+    input.apply(submit("user"))?;
+    assert!(input.claim("continuation", 1, InputRoute::Turn)?.is_none());
+    assert!(
+        input
+            .claim("continuation", 1, InputRoute::Steering)?
+            .is_none()
+    );
+    assert!(input.claim("user", 1, InputRoute::Turn)?.is_some());
+    input.delivery("user", None, None, None)?;
+    assert!(input.claim("continuation", 1, InputRoute::Turn)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn legacy_task_bound_input_becomes_session_input() -> Result<()> {
+    let message: InputMessage = serde_json::from_value(serde_json::json!({
+        "id":"queued-before-replacement", "text":"Keep this message", "task_id":"replaced-task"
+    }))?;
+    assert!(matches!(message.purpose, InputPurpose::User));
+    let input = SessionInputQueue::default();
+    input.apply(InputOperation {
+        id: "submit-before-replacement".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Submit {
+            message: Box::new(message),
+        },
+    })?;
+    assert!(input.has_pending()?.1);
+    let admitted = input
+        .claim("queued-before-replacement", 1, InputRoute::Turn)?
+        .unwrap();
+    assert_eq!(admitted.text, "Keep this message");
+    assert!(serde_json::to_value(admitted)?.get("task_id").is_none());
     Ok(())
 }
 

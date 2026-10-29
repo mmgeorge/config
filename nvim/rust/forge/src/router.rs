@@ -515,7 +515,14 @@ impl HostRouter {
         &self,
         envelope: &mut RoutedRequestEnvelope,
     ) -> Result<RoutedMethod> {
-        let method = decode_method(&envelope.request.method)?;
+        let mut method = decode_method(&envelope.request.method)?;
+        if matches!(method, RoutedMethod::Harness(_)) {
+            self.host
+                .harness
+                .normalize_request(envelope.session_id.as_deref(), &mut envelope.request)
+                .await?;
+            method = decode_method(&envelope.request.method)?;
+        }
         if let RoutedMethod::Harness(harness_method) = method {
             // Queued prompts wait in their request task so the input lane can still cancel work.
             if harness_method == HarnessMethod::PromptSubmit

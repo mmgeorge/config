@@ -243,7 +243,7 @@ mod test {
         ToolCall {
             started_at_ms: None,
             completed_at_ms: None,
-            task_id: None,
+            checklist_item_id: None,
             id: id.into(),
             kind: "file_change".into(),
             title: "file changes".into(),
@@ -321,7 +321,7 @@ mod test {
         let command = ToolCall {
             started_at_ms: None,
             completed_at_ms: None,
-            task_id: None,
+            checklist_item_id: None,
             id: "command".into(),
             kind: "command".into(),
             title: "cargo fmt".into(),

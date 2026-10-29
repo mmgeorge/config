@@ -248,8 +248,8 @@ local function status_text()
     append_status("Task " .. state.task_operation.state, "ForgeHarnessGoal")
   elseif current_task then
     append_status(current_task.kind, "ForgeHarnessGoal")
-    append_status(current_task.phase, "ForgeHarnessGoal")
-    if current_task.status ~= "running" then append_status(current_task.status, "ForgeHarnessGoal") end
+    append_status(task_control.phase(current_task), "ForgeHarnessGoal")
+    if task_control.status(current_task) ~= "running" then append_status(task_control.status(current_task), "ForgeHarnessGoal") end
   end
   local artifact_count = #(state.artifact or {})
   if artifact_count > 0 then
@@ -611,9 +611,6 @@ local function on_event(event, payload)
       state.session = execution.session
       state.execution_busy = true
       state.busy = true
-      state.task = execution.task or state.task
-      state.goal = type(execution.goal) == "table" and execution.goal.state ~= "cleared" and execution.goal or nil
-      state.goal_execution = type(execution.goal_execution) == "table" and execution.goal_execution or nil
       M.refresh_winbar()
     elseif payload.kind == "prompt_submission" then
       schedule_render()
@@ -692,14 +689,7 @@ local function on_event(event, payload)
     M.refresh_winbar()
     schedule_render()
   elseif event == "goal_changed" or event == "goal_continue_requested" then
-    state.goal = payload.state ~= "cleared" and payload or nil
-    if event == "goal_continue_requested" then
-      synchronize_state()
-    elseif state.goal_execution then
-      synchronize_state()
-    else
-      M.refresh_winbar()
-    end
+    synchronize_state()
   elseif event == "context_compacted" then
     synchronize_state()
   elseif event == "session_fork_ready" or event == "session_fork_failed" then
@@ -716,8 +706,6 @@ local function on_event(event, payload)
       recap.clear(state)
       state.queue = {}
       state.queue_edit = nil
-      state.goal = nil
-      state.goal_execution = nil
       state.active_plan = nil
       state.active_elicitation = nil
       state.active_wait = nil
@@ -1606,8 +1594,7 @@ function M.submit()
         return
       end
       if state.session and state.session.id == session_id then
-        state.goal = result.state ~= "cleared" and result or nil
-        M.refresh_winbar()
+        synchronize_state()
       end
     end)
     return
@@ -2219,8 +2206,7 @@ function M.task_transition(action, submitted_text, completed, method)
     end
   end
   local current = task_control.current(state)
-  if action.action == "resume" and current and current.status == "running"
-    and (not action.task_id or action.task_id == current.id) then
+  if action.action == "resume" and current and task_control.status(current) == "running" then
     input_state.perform(state, { kind = "resume" })
     return
   end

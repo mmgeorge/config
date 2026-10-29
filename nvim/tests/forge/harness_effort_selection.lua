@@ -16,7 +16,7 @@ client.request = function(method, params, callback)
 end
 client.request_for = function(_, method, params, callback)
   if method == "state.get" then
-    callback({ session = state.session, task = state.task, capability = state.capability })
+    callback({ session = state.session, capability = state.capability })
   else
     assert(method == "task.transition", method)
     transition[#transition + 1] = { params = params, callback = callback }
@@ -138,8 +138,8 @@ assert(state.session.effort == "minimal", "late configuration response overwrote
 transition = {}
 
 state.busy = true
-state.session.current_task_id = "goal"
-state.task = { { id = "goal", kind = "goal", phase = "continue", status = "running" } }
+state.session.active_task = { revision = "goal", kind = "goal", goal = { objective = "Fixture goal", state = "active" } }
+
 controller.change_effort(1)
 controller.change_effort(1)
 controller.configure_service_tier("fast")
@@ -165,7 +165,7 @@ for index = 2, #transition - 1 do
   task.receive(state, { id = transition[index].params.operation_id, state = "completed" })
 end
 state.session.effort, state.session.service_tier = "medium", "default"
-state.task[1].status = "paused"
+state.session.active_task.goal.state = "paused"
 task.receive(state, { id = latest.params.operation_id, state = "completed" })
 assert(not state.task_config and not state.busy and state.session.effort == "medium")
 assert(not header:find("fast", 1, true))

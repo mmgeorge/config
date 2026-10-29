@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use crate::exchange::{Exchange, ExchangeNode, InputIntent};
+use crate::exchange::{Exchange, ExchangeNode};
 use crate::plan::{
-    ExchangeAnchor, ExchangePlanEvent, PlanAudit, PlanDeviation, PlanEventContent,
-    PlanExecutionRecord, PlanLifecycleKind, PlanLifecycleRecord, PlanRecord, PlanResolutionRecord,
+    ExchangePlanEvent, PlanAudit, PlanDeviation, PlanEventContent, PlanExecutionRecord,
+    PlanLifecycleKind, PlanLifecycleRecord, PlanRecord, PlanResolutionRecord,
 };
 
 /// Attach plan audit content to exchange positions before constructing the timeline.
@@ -21,18 +21,7 @@ pub(super) fn attach(
         let Some(plan) = plans.iter().find(|plan| plan.id == record.plan_id) else {
             continue;
         };
-        let anchor = record.anchor.clone().or_else(|| {
-            legacy_anchor(
-                exchanges,
-                &record.plan_id,
-                None,
-                record.created_at_ms,
-                matches!(
-                    record.kind,
-                    PlanLifecycleKind::Accepted | PlanLifecycleKind::ChangesRequested
-                ),
-            )
-        });
+        let anchor = record.anchor.clone();
         if let Some(anchor) = anchor {
             pending.entry(anchor.exchange_id).or_default().push((
                 record.created_at_ms,
@@ -53,24 +42,7 @@ pub(super) fn attach(
     }
     for execution in executions {
         for record in execution.lifecycle.clone() {
-            let anchor = record
-                .anchor
-                .or_else(|| {
-                    record
-                        .after_exchange_id
-                        .as_ref()
-                        .and_then(|id| exchanges.iter().find(|exchange| &exchange.id == id))
-                        .map(|exchange| legacy_position(exchange, record.occurred_at_ms))
-                })
-                .or_else(|| {
-                    legacy_anchor(
-                        exchanges,
-                        &execution.plan_id,
-                        Some(&execution.id),
-                        record.occurred_at_ms,
-                        true,
-                    )
-                });
+            let anchor = record.anchor;
             if let Some(anchor) = anchor {
                 pending.entry(anchor.exchange_id).or_default().push((
                     record.occurred_at_ms,
@@ -86,15 +58,7 @@ pub(super) fn attach(
         }
     }
     for resolution in resolutions {
-        let anchor = resolution.anchor.clone().or_else(|| {
-            legacy_anchor(
-                exchanges,
-                &resolution.plan_id,
-                Some(&resolution.execution_id),
-                resolution.resolved_at_ms,
-                false,
-            )
-        });
+        let anchor = resolution.anchor.clone();
         if let Some(anchor) = anchor {
             let deviation = deviations
                 .iter()
@@ -126,10 +90,9 @@ pub(super) fn attach(
         }
         // The timeline snapshot carries current selections without changing the durable plan owner.
         if let Some(elicitation) = plans.iter()
-            .find(|plan| exchange.plan_id.as_deref() == Some(plan.id.as_str()))
-            .and_then(|plan| plan.elicitation.as_ref())
-            .filter(|elicitation| exchange.node_list.iter().any(|node| matches!(node,
-                crate::exchange::ExchangeNode::PlanEvent { event } if matches!(&event.content,
+            .filter_map(|plan| plan.elicitation.as_ref())
+            .find(|elicitation| exchange.node_list.iter().any(|node| matches!(node,
+                ExchangeNode::PlanEvent { event } if matches!(&event.content,
                     PlanEventContent::Lifecycle { lifecycle, .. }
                     if lifecycle.kind == PlanLifecycleKind::QuestionAsked
                         && lifecycle.question.as_ref().is_some_and(|question| question.id == elicitation.question_set.id)))))
@@ -161,61 +124,11 @@ fn pair_questions(events: Vec<(i64, ExchangePlanEvent)>) -> Vec<ExchangePlanEven
     paired
 }
 
-/// Recover ownership only for records written before explicit exchange anchors existed.
-fn legacy_anchor(
-    exchanges: &[Exchange],
-    plan_id: &str,
-    execution_id: Option<&str>,
-    time: i64,
-    admission: bool,
-) -> Option<ExchangeAnchor> {
-    let matching = || {
-        exchanges.iter().filter(|exchange| {
-            exchange.plan_id.as_deref() == Some(plan_id)
-                && execution_id.is_none_or(|id| exchange.execution_id.as_deref() == Some(id))
-        })
-    };
-    let exchange = if admission {
-        matching()
-            .find(|exchange| exchange.created_at_ms >= time)
-            .or_else(|| matching().rfind(|exchange| exchange.created_at_ms <= time))
-    } else {
-        matching()
-            .rfind(|exchange| exchange.created_at_ms <= time)
-            .or_else(|| matching().next())
-    }?;
-    Some(legacy_position(exchange, time))
-}
-
-/// Place old questions before their answer when historical provider items lack timestamps.
-fn legacy_position(exchange: &Exchange, time: i64) -> ExchangeAnchor {
-    let node_count = if time <= exchange.created_at_ms {
-        0
-    } else {
-        exchange
-            .node_list
-            .iter()
-            .position(|node| match node {
-                ExchangeNode::ExchangeInput { prompt } => {
-                    prompt.created_at_ms >= time && prompt.intent == InputIntent::Clarification
-                }
-                ExchangeNode::ArtifactChange { change } => change.created_at_ms > time,
-                ExchangeNode::PlanCommentResolution { resolution } => {
-                    resolution.created_at_ms > time
-                }
-                _ => false,
-            })
-            .unwrap_or(exchange.node_list.len())
-    };
-    ExchangeAnchor {
-        exchange_id: exchange.id.clone(),
-        node_count,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::InputIntent;
+    use crate::plan::ExchangeAnchor;
     use serde_json::json;
 
     fn exchange() -> Exchange {
@@ -319,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_question_precedes_answer_without_repeating_at_the_timeline_tail() {
+    fn anchored_question_precedes_answer_without_repeating_at_the_timeline_tail() {
         let mut source = exchange();
         source
             .append_input(InputIntent::Steering, "Before question".into(), 2)
@@ -334,7 +247,13 @@ mod tests {
         attach(
             &mut projected,
             &[plan()],
-            vec![lifecycle(PlanLifecycleKind::QuestionAsked, None)],
+            vec![lifecycle(
+                PlanLifecycleKind::QuestionAsked,
+                Some(ExchangeAnchor {
+                    exchange_id: source.id.clone(),
+                    node_count: 1,
+                }),
+            )],
             vec![],
             vec![],
             &[],

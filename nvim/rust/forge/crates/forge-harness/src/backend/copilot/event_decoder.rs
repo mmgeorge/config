@@ -1,8 +1,8 @@
 use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
 use crate::backend::{
-    BackendEvent, BackendEventSink, BackendOutput, ProviderChangeKind, ProviderChangeSet,
-    ProviderFileChange, ProviderTaskEntry, ProviderTaskUpdate, TaskStatus, ToolActivity,
-    ToolActivityKind,
+    BackendEvent, BackendEventSink, BackendOutput, ChecklistStatus, ProviderChangeKind,
+    ProviderChangeSet, ProviderChecklistEntry, ProviderChecklistUpdate, ProviderFileChange,
+    ToolActivity, ToolActivityKind,
 };
 use crate::session::ContextUsage;
 use github_copilot_sdk::SessionEvent;
@@ -72,7 +72,7 @@ impl CopilotEventDecoder {
                             data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
                             activity: None,
                             summary: None,
-                            task_update: None,
+                            checklist_update: None,
                         },
                         output,
                         event_sink,
@@ -196,7 +196,7 @@ impl CopilotEventDecoder {
                         data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
                         activity: None,
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     },
                     output,
                     event_sink,
@@ -285,7 +285,7 @@ impl CopilotEventDecoder {
                             data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
                             activity: Some(activity),
                             summary: None,
-                            task_update: None,
+                            checklist_update: None,
                         },
                         output,
                         event_sink,
@@ -310,7 +310,7 @@ impl CopilotEventDecoder {
                             data: serde_json::to_value(context_usage).unwrap_or(Value::Null),
                             activity: None,
                             summary: None,
-                            task_update: None,
+                            checklist_update: None,
                         },
                         output,
                         event_sink,
@@ -342,7 +342,7 @@ impl CopilotEventDecoder {
                         .expect("provider event is JSON serializable"),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 };
                 address_event(&mut event, output);
                 event.data =
@@ -361,7 +361,7 @@ impl CopilotEventDecoder {
                             .unwrap_or(Value::Null),
                         activity: None,
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     },
                     output,
                     event_sink,
@@ -398,7 +398,7 @@ impl CopilotEventDecoder {
         output: &mut BackendOutput,
         event_sink: Option<&BackendEventSink>,
     ) {
-        let Some(task_update) = task_update(&data, scope_id) else {
+        let Some(checklist_update) = checklist_update(&data, scope_id) else {
             return;
         };
         publish(
@@ -411,7 +411,7 @@ impl CopilotEventDecoder {
                 data,
                 activity: None,
                 summary: None,
-                task_update: Some(task_update),
+                checklist_update: Some(checklist_update),
             },
             output,
             event_sink,
@@ -463,7 +463,7 @@ impl CopilotEventDecoder {
                 data,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             },
             output,
             event_sink,
@@ -811,7 +811,7 @@ fn successful_file_change(activity: &ToolActivity) -> bool {
         })
 }
 
-fn task_update(data: &Value, scope_id: String) -> Option<ProviderTaskUpdate> {
+fn checklist_update(data: &Value, scope_id: String) -> Option<ProviderChecklistUpdate> {
     let entry = data
         .get("todos")
         .or_else(|| data.get("items"))
@@ -828,11 +828,11 @@ fn task_update(data: &Value, scope_id: String) -> Option<ProviderTaskUpdate> {
                 .to_ascii_lowercase()
                 .as_str()
             {
-                "in_progress" | "inprogress" | "active" => TaskStatus::InProgress,
-                "completed" | "complete" | "done" => TaskStatus::Completed,
-                _ => TaskStatus::Pending,
+                "in_progress" | "inprogress" | "active" => ChecklistStatus::InProgress,
+                "completed" | "complete" | "done" => ChecklistStatus::Completed,
+                _ => ChecklistStatus::Pending,
             };
-            Some(ProviderTaskEntry {
+            Some(ProviderChecklistEntry {
                 provider_id: string_field(value, &["id"]),
                 content,
                 priority: string_field(value, &["priority"]),
@@ -841,13 +841,13 @@ fn task_update(data: &Value, scope_id: String) -> Option<ProviderTaskUpdate> {
             })
         })
         .collect::<Vec<_>>();
-    Some(ProviderTaskUpdate {
+    Some(ProviderChecklistUpdate {
         scope_id,
         name: string_field(data, &["name", "title"]),
         complete: !entry_list.is_empty()
             && entry_list
                 .iter()
-                .all(|entry| entry.status == TaskStatus::Completed),
+                .all(|entry| entry.status == ChecklistStatus::Completed),
         replace_entries: true,
         entry_list,
     })
@@ -1624,7 +1624,7 @@ mod test {
             )
             .await;
         assert_eq!(output.metrics.context_usage.unwrap().remaining_percent, 80);
-        assert!(output.event[1].task_update.as_ref().unwrap().complete);
+        assert!(output.event[1].checklist_update.as_ref().unwrap().complete);
         let lifecycle: AgentLifecycleEvent =
             serde_json::from_value(output.event[2].data.clone()).unwrap();
         assert_eq!(lifecycle.status, AgentExecutionState::Running);

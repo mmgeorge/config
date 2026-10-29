@@ -8,6 +8,9 @@ use tokio::sync::{Notify, watch};
 
 /// Owns tool execution and cancellation for one provider turn.
 pub(crate) struct ControlToolExecutor {
+    task_controller: Option<std::sync::Arc<crate::task::SessionTaskController>>,
+    task_permit: Option<crate::task::TaskPermit>,
+    mode: crate::backend::PromptMode,
     runtime: tokio::sync::Mutex<ControlToolRuntime>,
     admission: Mutex<Admission>,
     cancelled: watch::Sender<bool>,
@@ -18,6 +21,9 @@ impl ControlToolExecutor {
     /// Creates a fresh execution generation from the broker's turn context.
     pub(crate) fn new(context: ControlTurnContext) -> Self {
         Self {
+            task_controller: context.task_controller.clone(),
+            task_permit: context.task_permit.clone(),
+            mode: context.mode,
             runtime: tokio::sync::Mutex::new(ControlToolRuntime::new(context)),
             admission: Mutex::new(Admission::default()),
             cancelled: watch::channel(false).0,
@@ -28,7 +34,7 @@ impl ControlToolExecutor {
     /// Serializes canonical mutations while allowing cancellation to release any tool wait.
     pub(crate) async fn execute(
         &self,
-        invocation: ControlToolInvocation,
+        mut invocation: ControlToolInvocation,
     ) -> Result<ControlToolOutcome<'_>> {
         let execution = {
             let mut admission = self
@@ -41,6 +47,11 @@ impl ControlToolExecutor {
             admission.active += 1;
             Execution { owner: self }
         };
+        invocation.admit_turn_control(
+            self.task_controller.as_deref(),
+            self.task_permit.as_ref(),
+            self.mode,
+        )?;
         let mut cancelled = self.cancelled.subscribe();
         let mut runtime = tokio::select! {
             biased;
@@ -148,6 +159,92 @@ mod test {
     use super::*;
     use crate::backend::PromptMode;
     use anyhow::Context;
+
+    #[test]
+    fn plan_control_keeps_its_admitted_revision_before_waiting() -> Result<()> {
+        use crate::task::{ActiveTask, SessionTaskController, TaskChange};
+        let (_root, mut store, controller) = SessionTaskController::test_goal();
+        let previous = controller.current()?.unwrap();
+        let plan: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
+            "id":"plan", "session_id":"session", "request":"Design", "state":"generating",
+            "working_path":"working.md", "model_revision":0, "user_revision":0,
+            "review_digest":null, "accepted_digest":null, "created_at_ms":1, "updated_at_ms":1
+        }))?;
+        let task = controller
+            .change(
+                &mut store,
+                Some(&previous.revision),
+                TaskChange::Install(Box::new(ActiveTask::plan(plan, 2))),
+                2,
+            )?
+            .unwrap();
+        let permit = task.permit();
+        let mut invocation = ControlToolInvocation {
+            name: "plan_read".into(),
+            arguments: serde_json::json!({"plan_id":"plan"}),
+            task_permit: None,
+        };
+        invocation.admit_turn_control(Some(&controller), Some(&permit), PromptMode::Plan)?;
+        let paused = controller
+            .change(&mut store, Some(&task.revision), TaskChange::Pause, 3)?
+            .unwrap();
+        controller.change(&mut store, Some(&paused.revision), TaskChange::Resume, 4)?;
+        let error = invocation
+            .admit_turn_control(Some(&controller), Some(&permit), PromptMode::Plan)
+            .unwrap_err();
+        assert!(error.is::<crate::task::StaleTask>());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_replacement_invalidates_running_and_queued_goal_controls() -> Result<()> {
+        let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+        context.task_controller = Some(controller.clone());
+        let checkpoint = crate::checkpoint::ToolGate::new()?;
+        context.checkpoint = Some(checkpoint.clone());
+        let executor = ControlToolExecutor::new(context);
+        let invocation = || ControlToolInvocation {
+            name: "goal_complete".into(),
+            arguments: serde_json::json!({"summary":"Finish the old goal"}),
+            task_permit: None,
+        };
+        let mut running = Box::pin(executor.execute(invocation()));
+        let mut queued = Box::pin(executor.execute(invocation()));
+        assert!(futures_util::poll!(running.as_mut()).is_pending());
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        let previous = controller.current()?.unwrap();
+        let replacement = controller
+            .change(
+                &mut store,
+                Some(&previous.revision),
+                crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+                    "Replacement".into(),
+                    Default::default(),
+                    false,
+                    2,
+                ))),
+                2,
+            )?
+            .unwrap();
+        checkpoint.complete(Ok(()))?;
+        let running = running.await?.result.unwrap_err();
+        let queued = queued.await?.result.unwrap_err();
+        assert!(running.is::<crate::task::StaleTask>());
+        assert!(queued.is::<crate::task::StaleTask>());
+        assert_eq!(
+            controller.current()?.unwrap().revision,
+            replacement.revision
+        );
+        let accepted = executor.execute(invocation()).await?.result?;
+        accepted
+            .invocation
+            .unwrap()
+            .task_permit
+            .unwrap()
+            .validate(Some(&replacement))?;
+        Ok(())
+    }
     use serde_json::json;
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::Duration;
@@ -156,10 +253,13 @@ mod test {
     async fn cancellation_releases_running_and_queued_tools_without_reusing_their_state()
     -> Result<()> {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.has_active_goal = true;
+        let (_task_root, _task_store, task_controller) =
+            crate::task::SessionTaskController::test_goal();
+        context.task_controller = Some(task_controller);
         context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
         let executor = ControlToolExecutor::new(context);
         let invocation = || ControlToolInvocation {
+            task_permit: None,
             name: "goal_complete".into(),
             arguments: json!({"summary":"finished"}),
         };
@@ -182,7 +282,9 @@ mod test {
                 .is::<crate::broker::TurnCancelled>()
         );
         let mut replacement = ControlTurnContext::inactive(PromptMode::Chat);
-        replacement.has_active_goal = true;
+        let (_task_root, _task_store, task_controller) =
+            crate::task::SessionTaskController::test_goal();
+        replacement.task_controller = Some(task_controller);
         assert!(
             ControlToolExecutor::new(replacement)
                 .execute(invocation())
@@ -196,10 +298,13 @@ mod test {
     #[tokio::test]
     async fn cleanup_retains_completed_results_until_their_consumer_releases_them() -> Result<()> {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.has_active_goal = true;
+        let (_task_root, _task_store, task_controller) =
+            crate::task::SessionTaskController::test_goal();
+        context.task_controller = Some(task_controller);
         let executor = ControlToolExecutor::new(context);
         let outcome = executor
             .execute(ControlToolInvocation {
+                task_permit: None,
                 name: "goal_status".into(),
                 arguments: json!({"status":"working"}),
             })
@@ -237,6 +342,7 @@ mod test {
         context.lsp = Some(scope);
         let executor = ControlToolExecutor::new(context);
         let pending = executor.execute(ControlToolInvocation {
+            task_permit: None,
             name: "lsp_context".into(),
             arguments: json!({"path":"source.rs","line":1,"column":1}),
         });

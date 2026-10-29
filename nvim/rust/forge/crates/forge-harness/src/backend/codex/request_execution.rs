@@ -23,6 +23,7 @@ pub(super) struct RequestExecutor {
     planning_feedback: bool,
     plan_document: Option<PlanDocument>,
     control_runtime: Option<Arc<ControlToolExecutor>>,
+    task_authority: Option<crate::control_tools::TaskAuthority>,
     replay_invocation: Option<ControlToolInvocation>,
     source_digests: Option<BTreeMap<String, String>>,
     execution_finished: bool,
@@ -50,6 +51,7 @@ impl RequestExecutor {
             planning_feedback: false,
             plan_document: None,
             control_runtime: None,
+            task_authority: None,
             replay_invocation: None,
             source_digests: None,
             execution_finished: false,
@@ -82,6 +84,7 @@ impl RequestExecutor {
         self.approval_mode = mode;
         self.event_sink = sink;
         self.control_runtime = None;
+        self.task_authority = None;
         self.plan_document = None;
         self.planning_feedback = false;
         self.approval = None;
@@ -89,6 +92,7 @@ impl RequestExecutor {
 
     /// Installs the canonical plan and tool services for the next turn.
     pub(super) fn configure(&mut self, context: ControlTurnContext) -> Arc<ControlToolExecutor> {
+        self.task_authority = crate::control_tools::TaskAuthority::capture(&context);
         self.plan_document = context.plan_document.clone();
         self.planning_feedback = context.planning_feedback;
         let executor = Arc::new(ControlToolExecutor::new(context));
@@ -410,6 +414,9 @@ impl RequestExecutor {
         method: &str,
         message: &Value,
     ) -> Result<ApprovalResolution> {
+        if let Some(authority) = &self.task_authority {
+            authority.validate()?;
+        }
         let prepared = self.approval.take().unwrap_or_else(|| {
             permission_from_provider(method, message, &self.workspace).map(PreparedApproval::direct)
         })?;
@@ -453,6 +460,9 @@ impl RequestExecutor {
                 | ApprovalResolution::AllowBroad
         ) {
             prepared.validate()?;
+            if let Some(authority) = &self.task_authority {
+                authority.validate()?;
+            }
         }
         self.trace.record(&self.session_id, "permission_decision", json!({
             "provider":"codex", "thread_id":message.pointer("/params/threadId"),
@@ -501,5 +511,75 @@ impl ExecutedRequest {
             has_runtime: false,
             execution_finished: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn goal_result_replay_preserves_the_admitted_task_revision() -> Result<()> {
+        let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let mut executor = RequestExecutor::new(
+            root.path().to_string_lossy().into_owned(),
+            ApprovalMode::Ask,
+            PermissionCoordinator::transient(root.path())?,
+            None,
+            Arc::new(TraceStore::open(root.path())?),
+            "session".into(),
+        );
+        let mut context = ControlTurnContext::inactive(crate::backend::PromptMode::Chat);
+        context.task_controller = Some(controller.clone());
+        executor.configure(context);
+        let result = executor
+            .execute(
+                json!({
+                    "id":1, "method":"item/tool/call", "params":{
+                        "threadId":"thread", "turnId":"turn", "callId":"call",
+                        "tool":"goal_complete", "arguments":{"summary":"Complete"},
+                    },
+                }),
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(
+            result.response["result"]["success"], true,
+            "{}",
+            result.response
+        );
+        let invocation = result
+            .invocation
+            .context("accepted goal control was not retained")?;
+        let mut output = BackendOutput::default();
+        apply_invocation(&invocation, &mut output)?;
+        let permit = output
+            .goal_control
+            .context("goal control lost its task permit")?
+            .permit;
+        let task = controller.current()?.unwrap();
+        permit.validate(Some(&task))?;
+        controller.change(
+            &mut store,
+            Some(&task.revision),
+            crate::task::TaskChange::Clear,
+            2,
+        )?;
+        assert!(
+            controller
+                .observe_goal(
+                    &mut store,
+                    &permit,
+                    crate::task::TaskTurnId {
+                        exchange_ordinal: 1,
+                        turn_ordinal: 1
+                    },
+                    output.evidence,
+                    3
+                )
+                .unwrap_err()
+                .is::<crate::task::StaleTask>()
+        );
+        Ok(())
     }
 }

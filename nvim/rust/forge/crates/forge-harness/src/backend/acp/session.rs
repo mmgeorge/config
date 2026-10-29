@@ -28,6 +28,7 @@ pub(super) struct AcpSessionState {
 #[derive(Clone)]
 /// Captures immutable callback routing for the admitted provider turn.
 pub(super) struct ActiveTurn {
+    task_authority: Option<crate::control_tools::TaskAuthority>,
     pub(super) owner: crate::backend::ExecutionOwner,
     pub(super) mode: ApprovalMode,
     pub(super) sink: Option<BackendEventSink>,
@@ -67,13 +68,17 @@ impl AcpSessionState {
                 .unwrap_or_else(|| ControlTurnContext::inactive(request.mode)),
         )));
         *self.active.write().await = Some(ActiveTurn {
+            task_authority: request
+                .control_context
+                .as_ref()
+                .and_then(crate::control_tools::TaskAuthority::capture),
             owner,
             mode: request.approval_mode,
             sink,
         });
     }
 
-    async fn emit(&self, event: BackendEvent) -> Result<()> {
+    pub(super) async fn emit(&self, event: BackendEvent) -> Result<()> {
         let active = self.active.read().await.clone();
         let Some(active) = active else { return Ok(()) };
         self.output.lock().await.event.push(event.clone());
@@ -193,6 +198,19 @@ impl AcpSessionState {
                 .context("ACP agent did not advertise protected-target rejection")?;
             return Ok(json!({"outcome":{"outcome":"selected","optionId":option["optionId"]}}));
         }
+        let authority = if approval
+            .address
+            .as_ref()
+            .and_then(|address| address.owner.as_ref())
+            .is_some_and(|owner| owner.is_root())
+        {
+            active.task_authority.clone()
+        } else {
+            None
+        };
+        if let Some(authority) = &authority {
+            authority.validate()?;
+        }
         let control = request.target_list.as_slice();
         let internal = matches!(control, [PermissionTarget::Mcp { target }]
             if target.strip_prefix("forge-harness-control/").is_some_and(|name|
@@ -218,6 +236,15 @@ impl AcpSessionState {
                     .is_some_and(|current| current == observed),
                 "ACP tool changed while approval was pending"
             );
+        }
+        if matches!(
+            resolution,
+            ApprovalResolution::AllowOnce
+                | ApprovalResolution::AllowExact
+                | ApprovalResolution::AllowBroad
+        ) && let Some(authority) = &authority
+        {
+            authority.validate()?;
         }
         if resolution == ApprovalResolution::Cancel {
             return Ok(json!({"outcome":{"outcome":"cancelled"}}));
@@ -442,6 +469,7 @@ impl AcpHandler for AcpSessionState {
             "forge/control" => {
                 ensure_active(&self.active).await?;
                 let invocation = ControlToolInvocation {
+                    task_permit: None,
                     name: parameter["name"]
                         .as_str()
                         .context("control tool name missing")?
@@ -617,7 +645,7 @@ fn event(kind: &str, text: Option<String>, data: Value) -> BackendEvent {
         turn_boundary: None,
         activity: None,
         summary: None,
-        task_update: None,
+        checklist_update: None,
     }
 }
 
@@ -632,12 +660,15 @@ mod test {
             let state =
                 AcpSessionState::new(kind, PermissionCoordinator::transient(fixture.path())?);
             *state.active.write().await = Some(ActiveTurn {
+                task_authority: None,
                 owner: crate::backend::ExecutionOwner::root("root"),
                 mode: ApprovalMode::Ask,
                 sink: None,
             });
             let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-            context.has_active_goal = true;
+            let (_task_root, _task_store, task_controller) =
+                crate::task::SessionTaskController::test_goal();
+            context.task_controller = Some(task_controller);
             context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
             *state.control.lock().await = Some(Arc::new(ControlToolExecutor::new(context)));
             let mut pending = Box::pin(state.request(
@@ -654,7 +685,9 @@ mod test {
             assert!(outcome.unwrap_err().is::<crate::broker::TurnCancelled>());
             assert!(!state.output.lock().await.evidence.structured_complete);
             let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-            context.has_active_goal = true;
+            let (_task_root, _task_store, task_controller) =
+                crate::task::SessionTaskController::test_goal();
+            context.task_controller = Some(task_controller);
             *state.control.lock().await = Some(Arc::new(ControlToolExecutor::new(context)));
             state
                 .request(
@@ -665,6 +698,7 @@ mod test {
                 )
                 .await?;
             assert!(state.output.lock().await.evidence.structured_complete);
+            assert!(state.output.lock().await.goal_control.is_some());
         }
         Ok(())
     }
@@ -678,6 +712,7 @@ mod test {
             PermissionCoordinator::transient(fixture.path())?,
         );
         *state.active.write().await = Some(ActiveTurn {
+            task_authority: None,
             owner: crate::backend::ExecutionOwner::root("root"),
             mode: ApprovalMode::Ask,
             sink: None,
@@ -733,6 +768,7 @@ mod test {
         ));
         *state.children.lock().await = super::super::children::AcpChildren::new("root".into());
         *state.active.write().await = Some(ActiveTurn {
+            task_authority: None,
             owner: crate::backend::ExecutionOwner::root("test"),
             mode: ApprovalMode::Ask,
             sink: None,
@@ -818,6 +854,7 @@ mod test {
             permission.clone(),
         ));
         *state.active.write().await = Some(ActiveTurn {
+            task_authority: None,
             owner: crate::backend::ExecutionOwner::root("test"),
             mode: ApprovalMode::Ask,
             sink: None,
@@ -899,6 +936,7 @@ mod test {
         state.notification("session/update", json!({"update":{"sessionUpdate":"available_commands_update","availableCommands":[]}})).await.unwrap();
         assert_eq!(state.catalog.read().await["availableCommands"], json!([]));
         *state.active.write().await = Some(ActiveTurn {
+            task_authority: None,
             owner: crate::backend::ExecutionOwner::root("test"),
             mode: ApprovalMode::Ask,
             sink: None,
@@ -983,6 +1021,7 @@ mod test {
             PermissionCoordinator::transient(fixture.path()).unwrap(),
         );
         *state.active.write().await = Some(ActiveTurn {
+            task_authority: None,
             owner: crate::backend::ExecutionOwner::root("test"),
             mode: ApprovalMode::Ask,
             sink: None,
@@ -1027,6 +1066,7 @@ mod test {
             PermissionCoordinator::transient(fixture.path()).unwrap(),
         );
         *state.active.write().await = Some(ActiveTurn {
+            task_authority: None,
             owner: crate::backend::ExecutionOwner::root("test"),
             mode: ApprovalMode::Ask,
             sink: None,
@@ -1085,6 +1125,7 @@ mod test {
         )])?;
         let state = AcpSessionState::new(BackendKind::Claude, permission.clone());
         *state.active.write().await = Some(ActiveTurn {
+            task_authority: None,
             owner: crate::backend::ExecutionOwner::root("session"),
             mode: ApprovalMode::Ask,
             sink: None,

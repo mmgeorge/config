@@ -13,7 +13,7 @@ controller.refresh_winbar = function() end
 client.request_for = function(_, method, parameters, callback)
   assert(host.request(method, parameters, callback), method)
 end
-state.session = { id = "queue-edit", backend = "mock", current_task_id = "task" }
+state.session = { id = "queue-edit", backend = "mock", active_task = { revision = "task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }
 state.queue, state.pending_steer = {}, {}
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 state.presentation = { follow_tail = function() end, capture_prompt = function()

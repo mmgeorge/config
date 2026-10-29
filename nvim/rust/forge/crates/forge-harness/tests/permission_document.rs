@@ -146,7 +146,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
             .await;
         assert!(changed.response.error().is_none());
         let snapshot = broker.snapshot().unwrap();
-        assert!(snapshot.session.current_task_id.is_none());
+        assert!(snapshot.session.active_task.is_none());
         assert_eq!(snapshot.session.approval_mode, ApprovalMode::Ask);
         assert!(snapshot.active_plan.is_none());
         assert!(snapshot.exchange.is_empty());
@@ -163,7 +163,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         broker.snapshot().unwrap().session.approval_mode,
         ApprovalMode::Ask
     );
-    assert!(broker.snapshot().unwrap().session.current_task_id.is_some());
+    assert!(broker.snapshot().unwrap().session.active_task.is_some());
     let before = broker.snapshot().unwrap();
     let retained = broker
         .dispatch(Request {
@@ -198,5 +198,5 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         broker.snapshot().unwrap().session.approval_mode,
         ApprovalMode::Ask
     );
-    assert!(broker.snapshot().unwrap().session.current_task_id.is_some());
+    assert!(broker.snapshot().unwrap().session.active_task.is_some());
 }

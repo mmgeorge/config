@@ -48,6 +48,15 @@ impl<'exchange> QuestionHistory<'exchange> {
                     question,
                     answer,
                 } => Some((id.as_str(), question, answer.as_deref())),
+                ExchangeNode::QuestionWithdrawn { id, question, .. }
+                    if !exchange.node_list[..position].iter().any(|node| match node {
+                        ExchangeNode::QuestionPresented { question: prior, .. } => prior.id == question.id,
+                        ExchangeNode::PlanEvent { event } => matches!(&event.content,
+                            PlanEventContent::Lifecycle { lifecycle, .. }
+                            if lifecycle.kind == PlanLifecycleKind::QuestionAsked
+                                && lifecycle.question.as_ref().is_some_and(|prior| prior.id == question.id)),
+                        _ => false,
+                    }) => Some((id.as_str(), question, None)),
                 ExchangeNode::PlanEvent { event } => match &event.content {
                     PlanEventContent::Lifecycle { lifecycle, .. }
                         if lifecycle.kind == PlanLifecycleKind::QuestionAsked =>
@@ -62,6 +71,9 @@ impl<'exchange> QuestionHistory<'exchange> {
             };
             if let Some((id, set, answer)) = source {
                 let withdrawal = exchange.node_list.iter().find_map(|node| match node {
+                    ExchangeNode::QuestionWithdrawn {
+                        question, reason, ..
+                    } if question.id == set.id => Some(reason.as_str()),
                     ExchangeNode::PlanEvent { event } => match &event.content {
                         PlanEventContent::Lifecycle { lifecycle, .. }
                             if lifecycle.kind == PlanLifecycleKind::QuestionWithdrawn
@@ -93,10 +105,37 @@ impl<'exchange> QuestionHistory<'exchange> {
                     resolved: answer.is_some() || withdrawal.is_some(),
                     withdrawal,
                 };
-                if let Some(answer) = answer.filter(|_| withdrawal.is_none()) {
+                if let Some(answer) = answer.filter(|_| {
+                    withdrawal.is_none() || matches!(node, ExchangeNode::QuestionPresented { .. })
+                }) {
                     group.legacy_answer(answer);
                 }
+                for node in &exchange.node_list {
+                    if let ExchangeNode::QuestionWithdrawn {
+                        question, answer, ..
+                    } = node
+                        && question.id == set.id
+                    {
+                        for answer in answer {
+                            if let Some(branch) = group.branch.iter_mut().find(|branch| {
+                                branch.question.id == answer.question_id && branch.answer.is_none()
+                            }) {
+                                branch.answer = Some(response_text(&answer.response));
+                                branch.source = answer.source;
+                            }
+                        }
+                    }
+                }
                 occurrence.push((position, group));
+            }
+        }
+        for node in &exchange.node_list {
+            if let ExchangeNode::QuestionWithdrawn { id, question, .. } = node
+                && occurrence
+                    .iter()
+                    .any(|(_, group)| group.set.id == question.id && group.id != id)
+            {
+                history.nested.insert(id);
             }
         }
         for (position, node) in exchange.node_list.iter().enumerate() {

@@ -203,13 +203,13 @@ impl Exchange {
         &mut self,
         turn_id: &str,
         tool_id: &str,
-        task_id: &str,
+        checklist_item_id: &str,
     ) -> Result<bool> {
         ensure!(self.turn.iter().any(|turn| turn.id() == turn_id && turn.state() == crate::turn::TurnState::Running),
             "completed turn rejects attribution changes");
         Ok(self
             .tool_store_mut(turn_id, tool_id)?
-            .attribute(tool_id, task_id))
+            .attribute(tool_id, checklist_item_id))
     }
 
     pub fn tools_for_turn<'exchange>(
@@ -408,7 +408,7 @@ mod tests {
                 change: Default::default(),
             }),
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 1)?;
         exchange.append_input(InputIntent::Steering, "more".into(), 2)?;

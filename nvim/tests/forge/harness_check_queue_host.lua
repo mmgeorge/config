@@ -27,7 +27,7 @@ client.subscribe(function(event, payload)
 end)
 local function await(predicate, message)
   assert(vim.wait(15000, function() return #failures > 0 or predicate() end, 10),
-    message .. "\n" .. vim.inspect({ queue = state.queue, task = state.task,
+    message .. "\n" .. vim.inspect({ queue = state.queue, task = state.session.active_task,
       operation = state.task_operation, input = state.input and { revision = state.input.revision,
         pending = state.input.pending, suspended = state.input.suspended }, status = state.status,
       busy = state.busy, state_sync_pending = state.state_sync_pending, checks_running = state.checks_running,

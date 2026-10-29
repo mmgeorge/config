@@ -61,6 +61,7 @@ impl Fixture {
 
     fn invoke(&self, name: &str, args: Value) -> Result<Value> {
         super::super::validate_arguments(&super::super::ControlToolInvocation {
+            task_permit: None,
             name: name.into(),
             arguments: args.clone(),
         })?;
@@ -311,16 +312,12 @@ fn session_status_separates_approval_access_and_active_task() -> Result<()> {
     selected.approval_mode = crate::session::ApprovalMode::Deny;
     selected.access.write_access = crate::session::WriteScope::Off;
     selected.default_approval = crate::session::ApprovalMode::Allow;
-    let task = crate::task::TaskRecord::new(
-        selected.id.clone(),
+    selected.active_task = Some(crate::task::ActiveTask::goal(
         "Inspect".into(),
-        crate::task::TaskKind::Goal,
-        selected.access.clone(),
-        selected.approval_mode,
+        Default::default(),
+        false,
         1,
-    );
-    selected.current_task_id = Some(task.id.clone());
-    store.save_task(&task)?;
+    ));
     store.save_session(&selected)?;
     let (scope, _lease) = HarnessInspectionScope::open(
         selected,
@@ -426,7 +423,7 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
         data: Value::Null,
         activity: None,
         summary: None,
-        task_update: None,
+        checklist_update: None,
     };
     exchange.observe_turn(&event, 0)?;
     event.turn_boundary = None;

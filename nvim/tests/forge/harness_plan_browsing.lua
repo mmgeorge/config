@@ -11,7 +11,7 @@ client.request_for = function(session_id, method, params, callback)
   assert(method == "plan.get")
   requests[#requests + 1] = { session_id = session_id, params = params, callback = callback }
 end
-state.session = { id = "browsing", current_task_id = "current-task" }
+state.session = { id = "browsing", active_task = { revision = "current-task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }
 state.active_plan = { id = "current-plan" }
 state.artifact = {
   { id = "failed-plan", title = "Failed attempt", state = "failed", updated_at_ms = 3 },
@@ -23,7 +23,7 @@ assert(specification.page_list[1].option_list[1].value.id == "current-plan")
 specification.on_confirm({ option = specification.page_list[1].option_list[3] })
 requests[1].callback({ id = "older-plan" })
 assert(opened[1].id == "older-plan")
-assert(state.active_plan.id == "current-plan" and state.session.current_task_id == "current-task")
+assert(state.active_plan.id == "current-plan" and state.session.active_task.revision == "current-task")
 state.transcript_buf = vim.api.nvim_get_current_buf()
 state.presentation = {
   activate = function(callback) callback({ kind = "plan", plan_id = "older-plan", revision = 1 }, {}) end,

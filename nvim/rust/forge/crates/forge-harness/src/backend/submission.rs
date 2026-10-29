@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Result, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -104,6 +104,7 @@ impl SubmissionStore {
             id: id.into(),
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(accepted).0,
+            accepted_action: Mutex::new(None),
         });
         live.retain(|_, entry| entry.strong_count() > 0);
         live.insert(id.to_owned(), Arc::downgrade(&submission));
@@ -130,6 +131,7 @@ impl SubmissionStore {
                 id TEXT PRIMARY KEY, runtime TEXT NOT NULL, provider TEXT NOT NULL, payload TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS submission_runtime_provider ON submission(runtime,provider);
+            CREATE INDEX IF NOT EXISTS submission_input_identity ON submission(runtime,json_extract(payload,'$.input_message_id'));
             CREATE INDEX IF NOT EXISTS submission_unfinished ON submission(runtime,provider)
                 WHERE json_extract(payload,'$.delivery.state') IN ('prepared','sending');
             CREATE INDEX IF NOT EXISTS submission_sending ON submission(runtime,provider)
@@ -166,9 +168,6 @@ impl SubmissionStore {
                 .record
                 .lock()
                 .map_err(|_| anyhow::anyhow!("submission state lock poisoned"))? = record.clone();
-            if matches!(record.delivery, SubmissionState::Accepted { .. }) {
-                submission.acceptance.send_replace(true);
-            }
         }
         Ok(())
     }
@@ -188,6 +187,16 @@ impl SubmissionStore {
         provider: super::BackendKind,
         input_message_id: Option<String>,
     ) -> Result<Arc<Submission>> {
+        self.prepare_record(request, provider, input_message_id, false)
+    }
+
+    fn prepare_record(
+        self: &Arc<Self>,
+        request: &BackendRequest,
+        provider: super::BackendKind,
+        input_message_id: Option<String>,
+        deduplicate: bool,
+    ) -> Result<Arc<Submission>> {
         let provider = serde_json::to_string(&provider)?;
         let record = SubmissionRecord {
             input_message_id,
@@ -197,11 +206,43 @@ impl SubmissionStore {
             included: Vec::new(),
             error: None,
         };
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
-        connection.execute(
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if deduplicate && let Some(input_id) = &record.input_message_id {
+            let existing: Option<(String, String, String)> = transaction.query_row(
+                "SELECT id,provider,payload FROM submission WHERE runtime=?1 AND json_extract(payload,'$.input_message_id')=?2 ORDER BY rowid DESC LIMIT 1",
+                params![request.runtime_key()?, input_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?;
+            if let Some((id, existing_provider, payload)) = existing {
+                let mut existing: SubmissionRecord = serde_json::from_str(&payload)?;
+                ensure!(
+                    existing_provider == provider
+                        && serde_json::to_value(&existing.request.input)?
+                            == serde_json::to_value(&request.input)?,
+                    "input identity was reused for different provider content"
+                );
+                if existing.delivery == SubmissionState::Cancelled {
+                    existing.delivery = SubmissionState::Prepared;
+                    existing.error = None;
+                    transaction.execute(
+                        "UPDATE submission SET payload=?2 WHERE id=?1",
+                        params![id, serde_json::to_string(&existing)?],
+                    )?;
+                    transaction.commit()?;
+                    self.publish(&existing)?;
+                } else {
+                    drop(transaction);
+                }
+                drop(connection);
+                return self.submission(&id);
+            }
+        }
+        transaction.execute(
             "INSERT INTO submission(id,runtime,provider,payload) VALUES(?1,?2,?3,?4)",
             params![
                 record.id,
@@ -210,12 +251,14 @@ impl SubmissionStore {
                 serde_json::to_string(&record)?
             ],
         )?;
+        transaction.commit()?;
         self.log(&record);
         let submission = Arc::new(Submission {
             store: self.clone(),
             id: record.id.clone(),
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(false).0,
+            accepted_action: Mutex::new(None),
         });
         let mut live = self
             .live
@@ -272,26 +315,48 @@ impl SubmissionStore {
         input_message_id: Option<String>,
     ) -> Result<Arc<Submission>> {
         self.prepare_identified(
-            &BackendRequest {
-                execution_owner: catalog.execution_owner.clone(),
-                harness_session_id: catalog.harness_session_id.clone(),
-                workspace: catalog.workspace.clone(),
-                input,
-                mode: super::PromptMode::Chat,
-                model: "default".into(),
-                effort: String::new(),
-                context_window: None,
-                service_tier: Default::default(),
-                access: catalog.access.clone(),
-                approval_mode: catalog.approval_mode,
-                backend_session_id: catalog.backend_session_id.clone(),
-                submission: None,
-                recovered_input: Vec::new(),
-                control_context: None,
-            },
+            &Self::input_request(catalog, input),
             provider,
             input_message_id,
         )
+    }
+
+    pub(crate) fn prepare_task_input(
+        self: &Arc<Self>,
+        catalog: &super::BackendCatalogRequest,
+        input: super::BackendInput,
+        provider: super::BackendKind,
+        id: &crate::task::TaskInputId,
+    ) -> Result<Arc<Submission>> {
+        self.prepare_record(
+            &Self::input_request(catalog, input),
+            provider,
+            Some(id.as_str().into()),
+            true,
+        )
+    }
+
+    fn input_request(
+        catalog: &super::BackendCatalogRequest,
+        input: super::BackendInput,
+    ) -> BackendRequest {
+        BackendRequest {
+            execution_owner: catalog.execution_owner.clone(),
+            harness_session_id: catalog.harness_session_id.clone(),
+            workspace: catalog.workspace.clone(),
+            input,
+            mode: super::PromptMode::Chat,
+            model: "default".into(),
+            effort: String::new(),
+            context_window: None,
+            service_tier: Default::default(),
+            access: catalog.access.clone(),
+            approval_mode: catalog.approval_mode,
+            backend_session_id: catalog.backend_session_id.clone(),
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        }
     }
 
     fn log(&self, record: &SubmissionRecord) {
@@ -339,9 +404,47 @@ pub struct Submission {
     id: String,
     record: Mutex<SubmissionRecord>,
     acceptance: tokio::sync::watch::Sender<bool>,
+    accepted_action: Mutex<Option<AcceptedAction>>,
+}
+
+struct AcceptedAction(Arc<dyn Fn() -> Result<()> + Send + Sync>);
+
+impl std::fmt::Debug for AcceptedAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AcceptedAction")
+    }
 }
 
 impl Submission {
+    /// Runs committed-state activation before acceptance becomes visible to consumers.
+    pub(crate) fn on_accepted(
+        &self,
+        action: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        *self
+            .accepted_action
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission acceptance action lock poisoned"))? =
+            Some(AcceptedAction(Arc::new(action)));
+        if matches!(self.record()?.delivery, SubmissionState::Accepted { .. }) {
+            self.notify_accepted()?;
+        }
+        Ok(())
+    }
+
+    fn notify_accepted(&self) -> Result<()> {
+        let action = self
+            .accepted_action
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission acceptance action lock poisoned"))?
+            .as_ref()
+            .map(|action| action.0.clone());
+        if let Some(action) = action {
+            action()?;
+        }
+        self.acceptance.send_replace(true);
+        Ok(())
+    }
     pub(crate) fn acceptance(&self) -> tokio::sync::watch::Receiver<bool> {
         self.acceptance.subscribe()
     }
@@ -350,6 +453,11 @@ impl Submission {
         backend: &dyn Backend,
     ) -> Result<SubmissionRecord> {
         let record = self.record()?;
+        if matches!(record.delivery, SubmissionState::Accepted { .. }) {
+            self.persist(|submission| submission.notify_accepted())
+                .await?;
+            return Ok(record);
+        }
         if matches!(record.delivery, SubmissionState::Sending { .. }) {
             let request = record.request.clone();
             let provider = backend.descriptor().kind;
@@ -411,7 +519,9 @@ impl Submission {
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut record = self.record()?;
         if matches!(record.delivery, SubmissionState::Accepted { .. }) {
-            self.acceptance.send_replace(true);
+            drop(transaction);
+            drop(connection);
+            self.notify_accepted()?;
             return Ok(());
         }
         ensure!(
@@ -456,7 +566,18 @@ impl Submission {
             self.store.publish(record)?;
         }
         drop(connection);
-        self.acceptance.send_replace(true);
+        for changed in &changed {
+            let live = self
+                .store
+                .live
+                .lock()
+                .map_err(|_| anyhow::anyhow!("submission registry lock poisoned"))?
+                .get(&changed.id)
+                .and_then(Weak::upgrade);
+            if let Some(submission) = live {
+                submission.notify_accepted()?;
+            }
+        }
         for changed in &changed {
             self.store.log(changed);
         }
@@ -864,6 +985,97 @@ mod tests {
             dispatched.record()?.delivery,
             SubmissionState::Accepted { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn task_entry_identity_reuses_durable_delivery_and_activates_before_notification() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let store = SubmissionStore::open(directory.path(), trace.clone())?;
+        let first = store.prepare_record(
+            &request("entry"),
+            super::super::BackendKind::Codex,
+            Some("entry-id".into()),
+            true,
+        )?;
+        let id = first.id().to_owned();
+        let accepted = first.acceptance();
+        let activated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let activation = activated.clone();
+        first.on_accepted(move || {
+            activation.store(true, Ordering::SeqCst);
+            Ok(())
+        })?;
+        first.sending(SubmissionTarget::Codex {
+            thread_id: "thread".into(),
+        })?;
+        first.accepted("receipt".into())?;
+        assert!(*accepted.borrow() && activated.load(Ordering::SeqCst));
+        let duplicate = store.prepare_record(
+            &request("entry"),
+            super::super::BackendKind::Codex,
+            Some("entry-id".into()),
+            true,
+        )?;
+        assert_eq!(duplicate.id(), id);
+        assert!(
+            store
+                .prepare_record(
+                    &request("changed"),
+                    super::super::BackendKind::Codex,
+                    Some("entry-id".into()),
+                    true,
+                )
+                .is_err()
+        );
+        drop(accepted);
+        drop(duplicate);
+        drop(first);
+        drop(store);
+        let reopened = SubmissionStore::open(directory.path(), trace)?;
+        let recovered = reopened.prepare_record(
+            &request("entry"),
+            super::super::BackendKind::Codex,
+            Some("entry-id".into()),
+            true,
+        )?;
+        assert_eq!(recovered.id(), id);
+        assert!(matches!(
+            recovered.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_entry_activation_failure_keeps_receipt_and_retries_before_notifying() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let store = SubmissionStore::open(
+            directory.path(),
+            Arc::new(TraceStore::open(directory.path())?),
+        )?;
+        let submission = store.prepare(&request("entry"), super::super::BackendKind::Codex)?;
+        let accepted = submission.acceptance();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let activation = attempts.clone();
+        submission.on_accepted(move || {
+            if activation.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("activation unavailable");
+            }
+            Ok(())
+        })?;
+        assert!(submission.accepted("receipt".into()).is_err());
+        assert!(matches!(
+            submission.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        assert!(!*accepted.borrow());
+        submission.reconcile(&Provider::new()).await?;
+        assert!(*accepted.borrow());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         Ok(())
     }
 

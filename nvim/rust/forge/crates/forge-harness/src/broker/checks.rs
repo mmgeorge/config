@@ -8,20 +8,26 @@ impl HarnessBroker {
             self.agent_coordinator.active_count() == 0,
             "child execution must settle before running verification checks. Wait for or interrupt active children first"
         );
-        let result = self.run_checks_inner().await;
+        let permit = self
+            .task_controller
+            .current()?
+            .context("execution task is missing")?
+            .permit();
+        let result = self.run_checks_inner(&permit).await;
         if let Err(error) = &result {
+            if permit
+                .validate(self.task_controller.current()?.as_ref())
+                .is_err()
+            {
+                return result;
+            }
             if let Some(sink) = &self.event_sink {
                 let _ = sink.send_wait(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,
                     kind:"checks_configuration_error".into(),text:None,data:json!({"run_id":"automatic-gate","error":format!("Checking could not finish: {error:#}. Enable /checks edit on and request a correction in chat.")}),
-                    activity:None,summary:None,task_update:None}).await;
+                    activity:None,summary:None,checklist_update:None}).await;
             }
             let mut goal = self.active_goal()?;
-            if let Some(mut execution) = self
-                .store
-                .list_plan_execution(&self.session.id)?
-                .into_iter()
-                .find(|execution| execution.goal_id == goal.id)
-            {
+            if let Some(mut execution) = self.current_execution()? {
                 execution.state = PlanExecutionState::Blocked;
                 execution.findings = vec![format!("Checking could not finish: {error:#}")];
                 for run in &mut execution.check_runs {
@@ -37,23 +43,24 @@ impl HarnessBroker {
                 }
                 goal.state = GoalState::Blocked;
                 goal.updated_at_ms = self.clock.now_ms();
-                self.store
-                    .save_execution_transition(&execution, &goal, None, None, None)?;
+                self.persist_check_execution(&execution, &permit)?;
                 if let Some(run) = execution.check_runs.last().cloned() {
-                    self.publish_check_run(&mut execution, &run).await?;
+                    self.check_runner
+                        .publish(&run, self.event_sink.as_ref())
+                        .await?;
                 }
             }
         }
         result
     }
 
-    async fn run_checks_inner(&mut self) -> Result<Vec<SessionEvent>> {
+    async fn run_checks_inner(
+        &mut self,
+        permit: &crate::task::TaskPermit,
+    ) -> Result<Vec<SessionEvent>> {
         let mut goal = self.active_goal()?;
         let mut execution = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|record| record.goal_id == goal.id)
+            .current_execution()?
             .context("check execution is missing")?;
         anyhow::ensure!(
             execution.phase == crate::plan::PlanPhase::Checking
@@ -86,9 +93,9 @@ impl HarnessBroker {
                 .collect::<std::collections::BTreeMap<_, _>>(),
         )?);
         let task_id = self
-            .current_task()?
-            .filter(|task| !task.status.terminal())
-            .map(|task| task.id);
+            .task_controller
+            .current()?
+            .and_then(|task| task.entry.map(|entry| entry.id.as_str().to_owned()));
         let overrides = self.check_runner.overrides(task_id.as_deref())?;
         let mut snapshot = crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace))?;
         for definition in &mut snapshot.config.definitions {
@@ -146,7 +153,7 @@ impl HarnessBroker {
                 owner: {
                     let exchange = self
                         .store
-                        .latest_execution_exchange(&self.session.id, &execution.id)?
+                        .latest_exchange(&self.session.id)?
                         .context("plan checks require their execution exchange")?;
                     crate::timeline::TimelineOwner::exchange(&exchange)
                 },
@@ -284,9 +291,7 @@ impl HarnessBroker {
         if matches!(
             execution.state,
             PlanExecutionState::Complete | PlanExecutionState::Blocked
-        ) && let Some(mut exchange) = self
-            .store
-            .latest_execution_exchange(&self.session.id, &execution.id)?
+        ) && let Some(mut exchange) = self.store.latest_exchange(&self.session.id)?
         {
             self.capture_implementation_report(&mut execution, &mut exchange, self.clock.now_ms())
                 .await?;
@@ -295,10 +300,23 @@ impl HarnessBroker {
         execution.generation += 1;
         goal.updated_at_ms = self.clock.now_ms();
         Self::save_run(&mut execution, &run);
-        self.store
-            .save_execution_transition(&execution, &goal, None, None, None)?;
-        self.settle_task(None)?;
-        self.publish_check_run(&mut execution, &run).await?;
+        self.persist_check_execution(&execution, &permit)?;
+        if execution.state == PlanExecutionState::Complete {
+            let task = self
+                .task_controller
+                .current()?
+                .context("completed execution disappeared")?;
+            self.task_controller.finish(
+                &mut self.store,
+                &task.permit(),
+                crate::task::TaskOutcomeState::Complete,
+                "Accepted plan completed".into(),
+                self.clock.now_ms(),
+            )?;
+        }
+        self.check_runner
+            .publish(&run, self.event_sink.as_ref())
+            .await?;
         events.push(self.event("goal_changed", serde_json::to_value(&goal)?)?);
         Ok(events)
     }
@@ -328,6 +346,35 @@ impl HarnessBroker {
         ))?)))
     }
 
+    fn persist_check_execution(
+        &mut self,
+        execution: &PlanExecutionRecord,
+        permit: &crate::task::TaskPermit,
+    ) -> Result<()> {
+        let task = self
+            .task_controller
+            .current()?
+            .context("execution task is missing")?;
+        permit.validate(Some(&task))?;
+        anyhow::ensure!(
+            matches!(&task.workflow, crate::task::TaskWorkflow::Execute { execution: active } if active.record.id == execution.id),
+            "execution task changed"
+        );
+        self.task_controller.update(
+            &mut self.store,
+            &task.permit(),
+            self.clock.now_ms(),
+            |task| {
+                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
+                else {
+                    unreachable!()
+                };
+                active.record = execution.clone();
+                Ok(())
+            },
+        )
+    }
+
     fn save_run(execution: &mut PlanExecutionRecord, run: &CheckRun) {
         if let Some(saved) = execution
             .check_runs
@@ -338,17 +385,5 @@ impl HarnessBroker {
         } else {
             execution.check_runs.push(run.clone());
         }
-    }
-
-    async fn publish_check_run(
-        &mut self,
-        execution: &mut PlanExecutionRecord,
-        run: &CheckRun,
-    ) -> Result<()> {
-        Self::save_run(execution, run);
-        self.store.save_plan_execution(execution)?;
-        self.check_runner
-            .publish(run, self.event_sink.as_ref())
-            .await
     }
 }

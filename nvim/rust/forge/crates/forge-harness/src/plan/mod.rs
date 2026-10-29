@@ -29,6 +29,7 @@ pub use calls::{CallKind, CallPosition, CallSite, FunctionBehavior, FunctionBody
 mod design_review;
 mod deviation;
 mod document;
+mod entry;
 mod review_alignment;
 mod review_delivery;
 mod review_diff;

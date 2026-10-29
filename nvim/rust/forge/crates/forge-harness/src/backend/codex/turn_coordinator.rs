@@ -17,6 +17,18 @@ enum NativeGoalLifetime {
 }
 
 impl NativeGoalLifetime {
+    fn for_request(request: &BackendRequest) -> Self {
+        if request
+            .control_context
+            .as_ref()
+            .is_some_and(|context| context.native_goal.is_some())
+        {
+            Self::Active
+        } else {
+            Self::Disabled
+        }
+    }
+
     /// Accept only the owning thread's explicit goal lifecycle notifications.
     fn observe(&mut self, message: &Value, thread_id: &str) {
         if *self == Self::Disabled {
@@ -236,11 +248,7 @@ impl<'a> CodexTurnCoordinator<'a> {
             cleanup: None,
             stopping: false,
             provider_goal_active,
-            native_goal: if request.mode == crate::backend::PromptMode::GoalContinuation {
-                NativeGoalLifetime::Active
-            } else {
-                NativeGoalLifetime::Disabled
-            },
+            native_goal: NativeGoalLifetime::for_request(request),
         }
     }
 
@@ -878,7 +886,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                     }),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await;
         }
@@ -914,6 +922,38 @@ async fn settle_interruptions(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn harness_goal_does_not_enable_native_reader_lifetime() {
+        let mut request = BackendRequest {
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace: String::new(),
+            input: crate::backend::BackendInput::from_text("Continue the harness goal"),
+            mode: crate::backend::PromptMode::GoalContinuation,
+            model: "test".into(),
+            effort: "low".into(),
+            context_window: None,
+            service_tier: crate::backend::ServiceTier::Standard,
+            access: Default::default(),
+            approval_mode: crate::session::ApprovalMode::Ask,
+            backend_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: Some(crate::control_tools::ControlTurnContext::inactive(
+                crate::backend::PromptMode::GoalContinuation,
+            )),
+        };
+        assert_eq!(
+            NativeGoalLifetime::for_request(&request),
+            NativeGoalLifetime::Disabled
+        );
+        request.control_context.as_mut().unwrap().native_goal = Some("Native objective".into());
+        assert_eq!(
+            NativeGoalLifetime::for_request(&request),
+            NativeGoalLifetime::Active
+        );
+    }
 
     #[tokio::test]
     async fn pending_lsp_request_keeps_events_and_cleanup_responsive() -> Result<()> {
@@ -1412,7 +1452,13 @@ mod test {
                 backend_session_id: Some("parent".into()),
                 submission: None,
                 recovered_input: Vec::new(),
-                control_context: None,
+                control_context: Some({
+                    let mut context = crate::control_tools::ControlTurnContext::inactive(
+                        PromptMode::GoalContinuation,
+                    );
+                    context.native_goal = Some("Native reader objective".into());
+                    context
+                }),
             };
             let lane = SteeringLane::default();
             let mut steering = lane.activate(None)?;

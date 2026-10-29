@@ -34,13 +34,33 @@ pub enum InputDelivery {
     Failed,
 }
 
+/// Keeps user input independent of task selection and fences generated task input by revision.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputPurpose {
+    #[default]
+    User,
+    TaskEntry {
+        revision: crate::task::TaskRevision,
+        id: crate::task::TaskInputId,
+        start: crate::exchange::TaskStart,
+    },
+    TaskContinuation {
+        revision: crate::task::TaskRevision,
+        id: crate::task::TaskInputId,
+        completed_turn_id: crate::task::TaskTurnId,
+        reason: String,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InputMessage {
     pub id: String,
     #[serde(default)]
     pub revision: u64,
     pub text: String,
-    pub task_id: Option<String>,
+    #[serde(default)]
+    pub purpose: InputPurpose,
     #[serde(default)]
     pub attachments: Vec<Value>,
     pub config: Option<Value>,
@@ -74,7 +94,7 @@ pub enum InputAction {
     },
     Resume,
     Submit {
-        message: InputMessage,
+        message: Box<InputMessage>,
     },
     Reserve {
         id: String,
@@ -141,7 +161,7 @@ pub(crate) struct SessionInputQueue {
 }
 
 impl SessionInputQueue {
-    pub(crate) fn has_pending_for_task(&self, task_id: Option<&str>) -> Result<(u64, bool)> {
+    pub(crate) fn has_pending(&self) -> Result<(u64, bool)> {
         let state = self
             .state
             .lock()
@@ -149,11 +169,10 @@ impl SessionInputQueue {
         Ok((
             state.snapshot.revision,
             state.snapshot.messages.iter().any(|message| {
-                message.task_id.as_deref() == task_id
-                    && !matches!(
-                        message.delivery,
-                        InputDelivery::Delivering | InputDelivery::Accepted
-                    )
+                !matches!(
+                    message.delivery,
+                    InputDelivery::Delivering | InputDelivery::Accepted
+                )
             }),
         ))
     }
@@ -322,7 +341,8 @@ impl SessionInputQueue {
                 snapshot.suspended = false;
                 snapshot.control_revision += 1;
             }
-            InputAction::Submit { mut message } => {
+            InputAction::Submit { message } => {
+                let mut message = *message;
                 message.revision = 1;
                 message.delivery = InputDelivery::Queued;
                 message.route = None;
@@ -440,26 +460,42 @@ impl SessionInputQueue {
         };
         let message = &snapshot.messages[index];
         if snapshot.suspended
-            || snapshot.messages.iter().any(|previous| {
-                previous.task_id == message.task_id && previous.delivery == InputDelivery::Unknown
-            })
+            || snapshot
+                .messages
+                .iter()
+                .any(|previous| previous.delivery == InputDelivery::Unknown)
             || message.revision != revision
             || message.reservation.is_some()
             || message.delivery != InputDelivery::Queued
             || (route == InputRoute::Steering
-                && (message.intent != InputIntent::Auto || message.config.is_some()))
+                && (message.intent != InputIntent::Auto
+                    || message.config.is_some()
+                    || matches!(message.purpose, InputPurpose::TaskContinuation { .. })))
+            || (matches!(message.purpose, InputPurpose::TaskContinuation { .. })
+                && snapshot.messages.iter().any(|other| {
+                    !matches!(other.purpose, InputPurpose::TaskContinuation { .. })
+                        && !matches!(
+                            other.delivery,
+                            InputDelivery::Delivering | InputDelivery::Accepted
+                        )
+                }))
         {
             return Ok(None);
         }
         if snapshot.messages[..index].iter().any(|previous| {
-            previous.task_id == message.task_id
-                && !(route == InputRoute::Steering
-                    && previous.intent == InputIntent::Queue
-                    && previous.delivery == InputDelivery::Queued)
-                && !matches!(
-                    previous.delivery,
-                    InputDelivery::Delivering | InputDelivery::Accepted
-                )
+            let user_precedes_continuation =
+                matches!(previous.purpose, InputPurpose::TaskContinuation { .. })
+                    && !matches!(message.purpose, InputPurpose::TaskContinuation { .. });
+            let steering_precedes_queue = route == InputRoute::Steering
+                && previous.intent == InputIntent::Queue
+                && previous.delivery == InputDelivery::Queued;
+            if user_precedes_continuation || steering_precedes_queue {
+                return false;
+            }
+            !matches!(
+                previous.delivery,
+                InputDelivery::Delivering | InputDelivery::Accepted
+            )
         }) {
             return Ok(None);
         }

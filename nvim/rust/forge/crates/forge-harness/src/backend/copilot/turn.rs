@@ -192,6 +192,7 @@ impl CopilotTurnEvent {
         &self,
         text: String,
         input_message_id: Option<String>,
+        task_start: Option<crate::exchange::TaskStart>,
     ) -> Result<()> {
         let event_sink = {
             let state = self
@@ -204,8 +205,14 @@ impl CopilotTurnEvent {
             }
         };
         if let Some(event_sink) = event_sink {
-            let mut event = BackendEvent::steering_input(text);
-            event.data = serde_json::json!({"input_message_id":input_message_id});
+            let mut event = match task_start {
+                Some(start) => BackendEvent::task_started(start, text),
+                None => BackendEvent::steering_input(text),
+            };
+            if !event.data.is_object() {
+                event.data = serde_json::json!({});
+            }
+            event.data["input_message_id"] = serde_json::json!(input_message_id);
             event_sink
                 .send_wait(event)
                 .await

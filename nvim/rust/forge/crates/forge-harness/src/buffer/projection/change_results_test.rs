@@ -152,7 +152,7 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
             text: None,
             data: serde_json::Value::Null,
             summary: None,
-            task_update: None,
+            checklist_update: None,
             activity: Some(ToolActivity {
                 id: format!("write-{index}"),
                 kind: ToolActivityKind::FileChange,

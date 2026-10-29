@@ -124,9 +124,12 @@ impl HarnessBroker {
         interaction: &Exchange,
     ) -> Result<Vec<Value>> {
         let exchanges = self.store.list_exchange(&self.session.id)?;
+        let execution = self
+            .current_execution()?
+            .filter(|execution| execution.id == execution_id)
+            .context("execution evidence owner changed")?;
         Ok(exchanges.iter()
-            .filter(|exchange| exchange.id != interaction.id
-                && exchange.execution_id.as_deref() == Some(execution_id))
+            .filter(|exchange| exchange.id != interaction.id && exchange.created_at_ms >= execution.created_at_ms)
             .chain(std::iter::once(interaction))
             .flat_map(|exchange| exchange.tools())
             .filter(|(_, tool)| matches!(tool.state(), crate::turn::ToolState::Completed | crate::turn::ToolState::Failed))
@@ -144,9 +147,14 @@ impl HarnessBroker {
     }
 
     pub(super) async fn scan_execution(&mut self, execution_id: &str) -> Result<Value> {
+        let permit = self
+            .task_controller
+            .current()?
+            .context("execution task is missing")?
+            .permit();
         let mut execution = self
-            .store
-            .load_plan_execution(execution_id)?
+            .current_execution()?
+            .filter(|execution| execution.id == execution_id)
             .context("execution is missing")?;
         let document = self.plan_file.read_submitted_document(
             &self.session.id,
@@ -173,7 +181,15 @@ impl HarnessBroker {
         if execution.baseline_checkpoint.is_none() {
             execution.progress.warning.push(CHECKPOINT_WARNING.into());
         }
-        self.store.save_plan_execution(&execution)?;
+        self.task_controller
+            .update(&mut self.store, &permit, self.clock.now_ms(), |task| {
+                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
+                else {
+                    anyhow::bail!("execution task changed");
+                };
+                active.record = execution.clone();
+                Ok(())
+            })?;
         Ok(
             json!({"execution_id":execution.id,"phase":execution.phase,"revision":execution.revision,"progress":execution.progress}),
         )
@@ -183,18 +199,19 @@ impl HarnessBroker {
         &mut self,
         execution_id: &str,
         generation: u64,
+        task_permit: &crate::task::TaskPermit,
         operation: crate::plan::execution::ExecutionOperation,
-        interaction: &mut Exchange,
+        current_interaction: &mut Exchange,
     ) -> Result<Value> {
         use crate::plan::execution::{ExecutionOperation, ExecutionRevision, SemanticProgress};
+        task_permit.validate(self.task_controller.current()?.as_ref())?;
+        let mut proposed_interaction = current_interaction.clone();
+        let interaction = &mut proposed_interaction;
         let mut execution = self
             .store
             .load_plan_execution(execution_id)?
             .context("execution is missing")?;
-        let mut goal = self
-            .store
-            .load_goal(&execution.goal_id)?
-            .context("execution goal is missing")?;
+        let mut goal = self.active_goal()?;
         let mut plan = self
             .store
             .load_plan(&execution.plan_id)?
@@ -211,8 +228,9 @@ impl HarnessBroker {
             "execution interrupted"
         );
         anyhow::ensure!(
-            interaction.execution_id.as_deref() == Some(execution_id),
-            "control belongs to another interaction"
+            self.current_execution()?
+                .is_some_and(|current| current.id == execution_id),
+            "control belongs to another execution"
         );
         if matches!(
             &operation,
@@ -301,8 +319,26 @@ impl HarnessBroker {
                 plan.state = PlanState::Revising;
                 plan.document_version = document.version;
                 plan.updated_at_ms = now_ms;
-                self.store
-                    .save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
+                self.task_controller.update_with_effects(
+                    &mut self.store,
+                    task_permit,
+                    now_ms,
+                    |task| {
+                        let crate::task::TaskWorkflow::Execute { execution: active } =
+                            &mut task.workflow
+                        else {
+                            anyhow::bail!("execution task changed");
+                        };
+                        active.record = execution.clone();
+                        Ok((
+                            (),
+                            crate::storage::TaskEffects {
+                                plan: vec![plan.clone()],
+                                ..Default::default()
+                            },
+                        ))
+                    },
+                )?;
                 return Ok(
                     json!({"result":"draft_saved","version":document.version,"document":document,"execution":execution.response()}),
                 );
@@ -350,6 +386,7 @@ impl HarnessBroker {
                             baseline_paths: delta.baseline_paths,
                         }),
                         created_at_ms: now_ms,
+                        revision_request: true,
                     },
                 });
                 if self.session.plan_auto_approve_revisions {
@@ -478,27 +515,33 @@ impl HarnessBroker {
                     progress.warning.push(CHECKPOINT_WARNING.into());
                 }
                 execution.progress = progress.clone();
-                self.store.save_plan_execution(&execution)?;
                 let summary = request.summary.clone();
                 let verification = request.verification.clone();
                 let declaration_findings = progress.findings();
                 let declaration_changes = progress.declaration_changes.clone();
+                let verifying = execution.phase == crate::plan::PlanPhase::Verify;
                 execution.finish_phase(request, progress, now_ms)?;
-                if let Some(phase) = &mut interaction.execution_phase {
+                if verifying {
                     use crate::plan::execution::VerificationOutcome;
-                    phase.outcome = Some(match (execution.state, execution.phase) {
+                    let outcome = match (execution.state, execution.phase) {
                         (PlanExecutionState::Blocked, _) => VerificationOutcome::Blocked,
                         (_, crate::plan::PlanPhase::Resolve) => VerificationOutcome::Failed,
                         _ => VerificationOutcome::Passed,
-                    });
-                    phase.summary = Some(summary);
-                    if phase.phase == crate::plan::PlanPhase::Verify {
-                        phase.findings.clone_from(&execution.findings);
-                        phase.verification = verification;
-                        phase.declaration_findings = declaration_findings;
-                        phase.declaration_changes = declaration_changes;
-                        phase.verification_tools = verification_tools;
-                    }
+                    };
+                    interaction
+                        .node_list
+                        .push(ExchangeNode::VerificationResult {
+                            id: format!("{}:verification:{}", interaction.id, execution.generation),
+                            result: Box::new(crate::exchange::VerificationResult {
+                                outcome,
+                                summary: Some(summary),
+                                findings: execution.findings.clone(),
+                                verification,
+                                declaration_findings,
+                                declaration_changes,
+                                verification_tools,
+                            }),
+                        });
                 }
                 goal.state = match execution.state {
                     PlanExecutionState::Complete => GoalState::Complete,
@@ -547,13 +590,36 @@ impl HarnessBroker {
                 },
             );
         }
-        self.store.save_execution_transition(
-            &execution,
-            &goal,
-            Some(&plan),
-            Some(interaction),
-            None,
-        )?;
+        self.task_controller
+            .update_with_effects(&mut self.store, task_permit, now_ms, |task| {
+                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
+                else {
+                    anyhow::bail!("execution task changed");
+                };
+                active.record = execution.clone();
+                Ok((
+                    (),
+                    crate::storage::TaskEffects {
+                        plan: vec![plan.clone()],
+                        exchange: vec![interaction.clone()],
+                        ..Default::default()
+                    },
+                ))
+            })?;
+        if execution.state == PlanExecutionState::Complete {
+            let task = self
+                .task_controller
+                .current()?
+                .context("completed execution disappeared")?;
+            self.task_controller.finish(
+                &mut self.store,
+                &task.permit(),
+                crate::task::TaskOutcomeState::Complete,
+                "Accepted plan completed".into(),
+                now_ms,
+            )?;
+        }
+        *current_interaction = proposed_interaction;
         if !phase_completion && execution.state == crate::plan::PlanExecutionState::Active {
             return self.revision_review_response(execution_id);
         }
@@ -683,13 +749,14 @@ impl HarnessBroker {
         interaction: &mut Exchange,
         reason: String,
     ) -> Result<()> {
-        let Some(execution_id) = &interaction.execution_id else {
+        let permit = self
+            .task_controller
+            .current()?
+            .context("execution task is missing")?
+            .permit();
+        let Some(mut execution) = self.current_execution()? else {
             return Ok(());
         };
-        let mut execution = self
-            .store
-            .load_plan_execution(execution_id)?
-            .context("execution is missing")?;
         if execution.state == PlanExecutionState::Complete {
             return Ok(());
         }
@@ -707,7 +774,15 @@ impl HarnessBroker {
         );
         self.capture_partial_report(&mut execution, interaction)
             .await;
-        self.store.save_plan_execution(&execution)
+        self.task_controller
+            .update(&mut self.store, &permit, self.clock.now_ms(), |task| {
+                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
+                else {
+                    anyhow::bail!("execution task changed");
+                };
+                active.record = execution;
+                Ok(())
+            })
     }
 
     async fn capture_partial_report(
@@ -738,13 +813,14 @@ impl HarnessBroker {
     }
 
     pub(super) fn observe_plan_progress(&mut self, interaction: &Exchange) -> Result<bool> {
-        let Some(execution_id) = interaction.execution_id.as_deref() else {
+        let permit = self
+            .task_controller
+            .current()?
+            .context("execution task is missing")?
+            .permit();
+        let Some(mut execution) = self.current_execution()? else {
             return Ok(false);
         };
-        let mut execution = self
-            .store
-            .load_plan_execution(execution_id)?
-            .context("execution is missing")?;
         let document = self.plan_file.read_submitted_document(
             &self.session.id,
             &execution.plan_id,
@@ -803,21 +879,24 @@ impl HarnessBroker {
         if execution.baseline_checkpoint.is_none() {
             execution.progress.warning.push(CHECKPOINT_WARNING.into());
         }
-        self.store.save_plan_execution(&execution)?;
+        self.task_controller
+            .update(&mut self.store, &permit, self.clock.now_ms(), |task| {
+                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
+                else {
+                    anyhow::bail!("execution task changed");
+                };
+                active.record = execution.clone();
+                Ok(())
+            })?;
         Ok(changed)
     }
 
     pub(super) fn plan_goal_prompt(
         &self,
-        goal: &GoalRecord,
+        _goal: &GoalRecord,
         kind: PlanExecutionPromptKind,
     ) -> Result<Option<String>> {
-        let Some(execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.goal_id == goal.id)
-        else {
+        let Some(execution) = self.current_execution()? else {
             return Ok(None);
         };
         let plan = self
@@ -840,82 +919,5 @@ impl HarnessBroker {
             ),
             &plan.manual_changes,
         )))
-    }
-
-    pub(super) async fn sync_plan_execution(&mut self, goal: &GoalRecord) -> Result<()> {
-        let Some(mut execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.goal_id == goal.id)
-        else {
-            return Ok(());
-        };
-        let state = match goal.state {
-            GoalState::Active => crate::plan::PlanExecutionState::Active,
-            GoalState::Paused | GoalState::UsageLimited | GoalState::BudgetLimited => {
-                PlanExecutionState::Paused
-            }
-            GoalState::Cleared => PlanExecutionState::Cancelled,
-            GoalState::Complete => {
-                anyhow::ensure!(
-                    execution.state == PlanExecutionState::Complete,
-                    "plan execution can complete only through its verification gate"
-                );
-                PlanExecutionState::Complete
-            }
-            GoalState::Blocked => PlanExecutionState::Blocked,
-            GoalState::Stalled => PlanExecutionState::Stalled,
-        };
-        if execution.state != state {
-            execution.state = state;
-            execution.generation += 1;
-            let status = match state {
-                crate::plan::PlanExecutionState::Active => "resumed",
-                PlanExecutionState::Paused => "paused",
-                PlanExecutionState::Cancelled => "cancelled",
-                PlanExecutionState::Complete => "completed",
-                PlanExecutionState::Blocked => "blocked",
-                PlanExecutionState::Stalled => "stopped at continuation limit",
-            };
-            execution.append_lifecycle(
-                self.plan_exchange_anchor(&execution.plan_id)?,
-                goal.updated_at_ms,
-                PlanExecutionLifecycleEvent::Phase {
-                    title: format!("{} {status}", execution.phase.label()),
-                    phase: execution.phase,
-                    revision: execution.revision,
-                    state,
-                },
-            );
-        }
-        if matches!(
-            state,
-            PlanExecutionState::Complete | PlanExecutionState::Cancelled
-        ) {
-            execution.completed_at_ms.get_or_insert(goal.updated_at_ms);
-        } else {
-            execution.completed_at_ms = None;
-        }
-        let mut report_exchange = None;
-        if matches!(
-            state,
-            PlanExecutionState::Cancelled | PlanExecutionState::Stalled
-        ) && let Some(mut interaction) = self
-            .store
-            .latest_execution_exchange(&self.session.id, &execution.id)?
-        {
-            self.capture_partial_report(&mut execution, &mut interaction)
-                .await;
-            report_exchange = Some(interaction);
-        }
-        self.store.save_execution_transition(
-            &execution,
-            goal,
-            None,
-            report_exchange.as_ref(),
-            None,
-        )?;
-        Ok(())
     }
 }

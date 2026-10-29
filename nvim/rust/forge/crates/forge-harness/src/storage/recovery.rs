@@ -194,75 +194,12 @@ impl SqliteStore {
                 transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.check_runs',json(?2)) WHERE id=?1", params![execution.id,serde_json::to_string(&execution.check_runs)?])?;
             }
         }
-        transaction.execute("UPDATE goal_record SET payload=json_set(payload,'$.state','paused') WHERE session_id=?1 AND json_extract(payload,'$.state')='active'", [session_id])?;
-        transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.state','paused','$.generation',json_extract(payload,'$.generation')+1) WHERE session_id=?1 AND json_extract(payload,'$.state')='active'", [session_id])?;
-        let tasks = {
-            let mut statement =
-                transaction.prepare("SELECT payload FROM task_record WHERE session_id=?1")?;
-            statement
-                .query_map([session_id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for payload in tasks {
-            use crate::task::{TaskKind, TaskStatus};
-            let mut task: crate::task::TaskRecord = serde_json::from_str(&payload)?;
-            if task.status.terminal() {
-                continue;
-            }
-            if let Some(goal_id) = &task.goal_id {
-                let goal: Option<String> = transaction
-                    .query_row(
-                        "SELECT payload FROM goal_record WHERE id=?1",
-                        [goal_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(goal) = goal {
-                    let goal: crate::goal::GoalRecord = serde_json::from_str(&goal)?;
-                    if goal.state == crate::goal::GoalState::Complete {
-                        task.status = TaskStatus::Completed;
-                    }
-                    if goal.state == crate::goal::GoalState::Cleared {
-                        task.status = TaskStatus::Cancelled;
-                    }
-                }
-                let phase: Option<String> = transaction.query_row("SELECT json_extract(payload,'$.phase') FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload,'$.goal_id')=?2 ORDER BY rowid DESC LIMIT 1", params![session_id,goal_id], |row| row.get(0)).optional()?;
-                if let Some(phase) = phase {
-                    task.phase = phase;
-                }
-            }
-            if matches!(
-                task.status,
-                TaskStatus::Running | TaskStatus::Stopping | TaskStatus::Ready
-            ) {
-                let waiting = if task.kind == TaskKind::Plan {
-                    transaction.query_row("SELECT json_extract(payload,'$.state') IN ('awaiting_review','awaiting_input') FROM plan_record WHERE id=?1", [&task.plan_id], |row| row.get::<_, bool>(0)).optional()?.unwrap_or(false)
-                } else {
-                    false
-                };
-                task.status = if waiting {
-                    TaskStatus::Waiting
-                } else {
-                    TaskStatus::Paused
-                };
-                task.reason =
-                    Some("Runtime restarted. Inspect completed effects before resuming".into());
-                task.generation += 1;
-            }
-            transaction.execute(
-                "UPDATE task_record SET payload=?2 WHERE id=?1",
-                params![task.id, serde_json::to_string(&task)?],
-            )?;
-        }
         let clearing: bool = transaction.query_row(
             "SELECT COALESCE((SELECT json_extract(payload,'$.action.action')='clear' AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running') FROM task_operation WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1),0)",
             [session_id], |row| row.get(0))?;
-        if clearing {
-            transaction.execute("UPDATE task_record SET payload=json_set(payload,'$.status','cancelled','$.reason','Clear request recovered after runtime shutdown') WHERE id=(SELECT json_extract(payload,'$.session.current_task_id') FROM session_record WHERE id=?1) AND json_extract(payload,'$.status') NOT IN ('completed','cancelled')", [session_id])?;
-            transaction.execute("UPDATE session_record SET payload=json_set(payload,'$.session.current_task_id',NULL,'$.session.goal_id',NULL) WHERE id=?1", [session_id])?;
-        }
         transaction.execute("UPDATE task_operation SET payload=json_set(payload,'$.state','cancelled','$.error',NULL) WHERE session_id=?1 AND json_extract(payload,'$.action.action')='pause' AND (json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running') OR (json_extract(payload,'$.state')='outcome_unknown' AND json_extract(payload,'$.error')='Runtime stopped before the operation settled. Inspect task state before resuming'))", [session_id])?;
         transaction.execute("UPDATE task_operation SET payload=json_set(payload,'$.state','outcome_unknown','$.error','Runtime stopped before the operation settled. Inspect task state before resuming') WHERE session_id=?1 AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running','applying','verifying','resuming')", [session_id])?;
+        super::task::recover_active_task(&transaction, session_id, clearing)?;
         transaction.commit()?;
         self.refresh_admission_membership(session_id)
     }

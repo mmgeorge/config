@@ -15,7 +15,7 @@ controller.attach_transcript = function() end
 state.session = { id = "prompt-lifecycle", backend = "mock" }
 state.capability = { native_steer = true }
 state.composer_buf = vim.api.nvim_create_buf(false, true)
-state.queue, state.pending_steer, state.task = {}, {}, {}
+state.queue, state.pending_steer = {}, {}
 local current = true
 state.presentation = { capture_prompt = function()
   return { buffer = state.composer_buf, document = "original", is_current = function() return current end }
@@ -23,7 +23,7 @@ end }
 client.request_for = function(_, method, parameters, callback)
   if host.request(method, parameters, callback) then return end
   if method == "state.get" then
-    callback({ session = state.session, capability = state.capability, task = state.task,
+    callback({ session = state.session, capability = state.capability,
       status = { kind = "idle" }, runtime_epoch = state.runtime_epoch })
     return
   end

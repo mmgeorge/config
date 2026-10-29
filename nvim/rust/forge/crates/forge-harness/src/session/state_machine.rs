@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     broker::ElicitationOwner,
-    exchange::{ActiveWait, Exchange, ExchangeActivity, ExchangeKind, ExchangeState},
+    exchange::{ActiveWait, Exchange, ExchangeActivity, ExchangeState},
     plan::{PlanPhase, PlanRecord, PlanState, execution::SemanticProgress},
 };
 
@@ -65,18 +65,9 @@ impl WorkflowActivity {
         format!("{} {}", self.lifecycle_label(), action.label())
     }
 
-    /// Resolve activity from the exchange kind and execution phase.
-    pub fn from_exchange(exchange: &Exchange) -> Self {
-        match exchange.kind {
-            ExchangeKind::PlanDraft => Self::Planning,
-            ExchangeKind::PlanRevision => Self::Revising,
-            ExchangeKind::PlanExecution => exchange
-                .execution_phase
-                .as_ref()
-                .map_or(Self::Implementing, |phase| phase.phase.into()),
-            ExchangeKind::Chat if exchange.goal_id.is_some() => Self::Goal,
-            ExchangeKind::Chat => Self::Working,
-        }
+    /// Keeps historical exchanges independent of the session's active task.
+    pub fn from_exchange(_exchange: &Exchange) -> Self {
+        Self::Working
     }
 }
 
@@ -372,7 +363,7 @@ impl SessionPhase {
         }) {
             return Self::AwaitingInput {
                 owner: ElicitationOwner::Interaction,
-                plan_id: exchange.plan_id.clone(),
+                plan_id: None,
                 exchange_id: Some(exchange.id.clone()),
             };
         }
@@ -507,7 +498,7 @@ mod test {
     use super::{SessionPhase, WorkflowActivity};
     use crate::{
         agent::Delegation,
-        exchange::{Exchange, ExchangeKind, ExchangeState},
+        exchange::{Exchange, ExchangeState},
         plan::{PlanRecord, PlanState},
     };
 
@@ -552,27 +543,17 @@ mod test {
             1,
         );
         exchange.phase = crate::exchange::ExchangePhase::Running;
-        exchange.kind = ExchangeKind::PlanDraft;
         exchange.resume(42).unwrap();
         exchange
     }
 
     #[test]
     fn planning_retries_preserve_creation_and_revision_activity() {
-        for (kind, state, activity) in [
-            (
-                ExchangeKind::PlanDraft,
-                PlanState::Generating,
-                WorkflowActivity::Planning,
-            ),
-            (
-                ExchangeKind::PlanRevision,
-                PlanState::Revising,
-                WorkflowActivity::Revising,
-            ),
+        for (state, activity) in [
+            (PlanState::Generating, WorkflowActivity::Planning),
+            (PlanState::Revising, WorkflowActivity::Revising),
         ] {
-            let mut exchange = exchange();
-            exchange.kind = kind;
+            let exchange = exchange();
             let mut plan = plan(state);
             plan.generation.budget.observe(true);
             assert!(
@@ -676,7 +657,6 @@ mod test {
         }
         let plan = plan(PlanState::AwaitingReview);
         let mut unrelated = exchange();
-        unrelated.kind = ExchangeKind::Chat;
         assert!(matches!(
             SessionPhase::resolve(Some(&plan), None, Some(&unrelated)),
             SessionPhase::Working { .. }
@@ -729,7 +709,6 @@ mod test {
     #[test]
     fn clarification_resume_and_terminal_phases_follow_exchange_state() {
         let mut exchange = exchange();
-        exchange.kind = ExchangeKind::Chat;
         exchange.set_awaiting_input(true);
         exchange.clock = crate::exchange::ExchangeClock::Paused {
             elapsed_ms: exchange.duration_ms(),

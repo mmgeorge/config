@@ -5,13 +5,50 @@ local notifications = require("forge.infra.notifications")
 local diagnostic = require("forge.views.harness.diagnostic")
 local operation_sequence = 0
 
+---@class ForgeHarnessActiveTask
+---@field kind 'goal'|'plan'|'execute'
+---@field revision string
+---@field goal? {objective:string, state:string}
+---@field plan? {paused:boolean, artifact:{title:string, state:string}}
+---@field execution? {title:string, record:{phase:string, state:string}}
+
 ---@param state table
----@return table?
+---@return ForgeHarnessActiveTask?
 function M.current(state)
-  local selected = state.session and state.session.current_task_id
-  for _, task in ipairs(state.task or {}) do
-    if task.id == selected then return task end
+  local task = state.session and state.session.active_task
+  return task ~= vim.NIL and task or nil
+end
+
+---@param task ForgeHarnessActiveTask
+---@return string
+function M.status(task)
+  if task.kind == "plan" then
+    if task.plan.paused then return "paused" end
+    local status = task.plan.artifact.state
+    if status == "awaiting_review" or status == "awaiting_input" or status == "configuring_checks" then return "waiting" end
+    if status == "failed" then return "failed" end
+    if status == "cancelled" or status == "rejected" then return "cancelled" end
+    return status == "accepted" and "completed" or "running"
   end
+  local status = task.kind == "goal" and task.goal.state or task.execution.record.state
+  return ({ active = "running", paused = "paused", complete = "completed", cleared = "cancelled",
+    cancelled = "cancelled" })[status] or "blocked"
+end
+
+---@param task ForgeHarnessActiveTask
+---@return string
+function M.phase(task)
+  if task.kind == "goal" then return "continue" end
+  if task.kind == "execute" then return task.execution.record.phase end
+  return task.plan.artifact.state
+end
+
+---@param task ForgeHarnessActiveTask
+---@return string
+function M.title(task)
+  if task.kind == "goal" then return task.goal.objective end
+  if task.kind == "execute" then return task.execution.title end
+  return task.plan.artifact.title
 end
 
 ---@param state table
@@ -43,7 +80,6 @@ function M.transition(state, action, refresh, settled, admitted, method)
   state.task_operation = operation
   state.execution_notice = nil
   state.execution_notice_operation = nil
-  state.queue_suspended = true
   local function current()
     return state.session and state.session.id == session_id and registry[identity] == operation
       and client.host_generation() == generation
@@ -204,43 +240,24 @@ local function choose(host, title, options, select)
   })
 end
 
-local function inspect(host, task, transition)
-  local options = {
-    { label = task.kind .. " · " .. task.phase .. " · " .. task.status,
-      detail = task.reason or "Task history retained", value = {} },
-    { label = ("Read: %s · Write: %s · Approval: %s"):format(
-        task.access.read_access, task.access.write_access, task.approval_mode),
-      detail = "Attempt " .. tostring(task.generation), value = {} },
-  }
-  if task.plan_id then
-    options[#options + 1] = { label = "Fork plan", detail = "Start a new planning task from the latest saved design",
-      value = { action = "fork", plan_id = task.plan_id } }
-  end
-  choose(host, task.title, options, function(action)
-    if action.action then transition(action) end
-  end)
-end
-
 ---@param state table
 ---@param host table
 ---@param transition fun(action: table)
 function M.open(state, host, transition)
-  local session_id = state.session.id
-  client.request_for(session_id, "task.list", {}, function(result, failure)
-    if failure then notifications.error(failure, "Harness tasks") return end
-    if not state.session or state.session.id ~= session_id then return end
-    local options = {}
-    for _, task in ipairs(result or {}) do
-      local current = task.id == state.session.current_task_id
-      local option = { label = task.title, detail = ("%s · %s · %s%s"):format(task.kind, task.phase, task.status, current and " · current" or ""), value = task }
-      if current then table.insert(options, 1, option) else options[#options + 1] = option end
-    end
-    choose(host, "Tasks", options, function(task)
-      if task.status == "completed" or task.status == "cancelled" then
-        inspect(host, task, transition)
-      else transition({ action = "resume", task_id = task.id, generation = task.generation }) end
-    end)
-  end)
+  local task = M.current(state)
+  if not task then
+    M.plans(state, host, false, transition)
+    return
+  end
+  local status = M.status(task)
+  local options = {}
+  if status == "running" or status == "waiting" then
+    options[#options + 1] = { label = "Pause task", detail = M.phase(task), value = { action = "pause" } }
+  else
+    options[#options + 1] = { label = "Resume task", detail = M.phase(task), value = { action = "resume" } }
+  end
+  options[#options + 1] = { label = "Clear task", detail = M.title(task), value = { action = "clear" } }
+  choose(host, M.title(task), options, transition)
 end
 
 ---@param state table
@@ -255,23 +272,16 @@ function M.plans(state, host, execute, transition)
     local options = {}
     for _, plan in ipairs(result or {}) do
       if not execute or plan.revision_count > 0 then
-        local task = type(plan.task) == "table" and plan.task or nil
-        options[#options + 1] = { label = plan.title, detail = task and (task.kind .. " · " .. task.phase .. " · " .. task.status) or plan.state, value = plan }
+        options[#options + 1] = { label = plan.title, detail = plan.state, value = plan }
       end
     end
     choose(host, execute and "Execute Plan" or "Plans", options, function(plan)
       if execute then transition({ action = "execute", plan_id = plan.id, digest = plan.digest }) return end
-      local task = type(plan.task) == "table" and plan.task or nil
-      local actions = { { label = "Fork plan", detail = "Reassess the latest saved design against this repository", value = { action = "fork", plan_id = plan.id } } }
-      if task then
-        local terminal = task.status == "completed" or task.status == "cancelled"
-        table.insert(actions, 1, { label = terminal and "View task" or "Resume task", detail = task.status, value = terminal and { action = "view", task = task } or { action = "resume", task_id = task.id, generation = task.generation } })
-      else
-        table.insert(actions, 1, { label = "Start planning task", value = { action = "attach_plan", plan_id = plan.id } })
-      end
-      choose(host, plan.title, actions, function(action)
-        if action.action == "view" then inspect(host, action.task, transition) else transition(action) end
-      end)
+      local actions = {
+        { label = "Start planning task", detail = "Use this saved design", value = { action = "attach_plan", plan_id = plan.id } },
+        { label = "Fork plan", detail = "Reassess this design against the repository", value = { action = "fork", plan_id = plan.id } },
+      }
+      choose(host, plan.title, actions, transition)
     end)
   end)
 end

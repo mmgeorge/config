@@ -22,7 +22,6 @@ use super::SqliteStore;
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct AdmissionSession {
     pub id: String,
-    pub current_task_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -34,6 +33,7 @@ pub(crate) struct AdmissionTask {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct AdmissionSnapshot {
     pub session: AdmissionSession,
+    pub task_revision: Option<crate::task::TaskRevision>,
     pub task: Option<AdmissionTask>,
     pub operation_state: Option<String>,
     pub operation_id: Option<String>,
@@ -50,9 +50,8 @@ struct PublishedAdmission {
 #[derive(Clone, Debug)]
 /// Active lifecycle values published atomically with admission, excluding historical output.
 pub(crate) struct RuntimeSnapshot {
-    pub task: Option<crate::task::TaskRecord>,
+    pub active_task: Option<crate::task::ActiveTask>,
     pub plan: Option<crate::session::state_machine::PlanStatus>,
-    pub execution: Option<crate::session::state_machine::ExecutionStatusSnapshot>,
     pub configuring: bool,
 }
 
@@ -226,15 +225,14 @@ impl AdmissionRegistry {
 impl SqliteStore {
     fn read_runtime(&self, snapshot: &AdmissionSnapshot) -> Result<RuntimeSnapshot> {
         let session_id = &snapshot.session.id;
-        let task: Option<crate::task::TaskRecord> = self.load_payload(
-            "SELECT t.payload FROM task_record t JOIN session_record s ON t.id=json_extract(s.payload,'$.session.current_task_id') WHERE s.id=?1",[session_id])?;
-        let plan = match task.as_ref().and_then(|task|task.plan_id.as_deref()) {
-            Some(id) => self.load_payload("SELECT json_object('id',id,'state',json_extract(payload,'$.state'),'model_revision',json_extract(payload,'$.model_revision'),'acceptance',json(CASE WHEN json_type(payload,'$.acceptance')='object' THEN 'true' ELSE 'false' END),'elicitation',json(CASE WHEN json_type(payload,'$.elicitation')='object' THEN 'true' ELSE 'false' END),'generation',json(coalesce(json_extract(payload,'$.generation'),?3))) FROM plan_record WHERE id=?1 AND json_extract(payload,'$.schema_version')=?2",rusqlite::params![id,crate::plan::PLAN_SCHEMA_VERSION,serde_json::to_string(&crate::plan::PlanGeneration::default())?])?,
-            None => None,
-        };
-        let execution = match task.as_ref().and_then(|task|task.plan_id.as_deref()) {
-            Some(id) => self.load_payload("SELECT json_object('id',id,'state',json_extract(payload,'$.state'),'phase',json_extract(payload,'$.phase'),'progress',json_extract(payload,'$.progress'),'check_run',json_extract(payload,'$.check_runs[#-1]')) FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload,'$.plan_id')=?2 AND json_extract(payload,'$.schema_version')=?3 ORDER BY rowid DESC LIMIT 1",rusqlite::params![session_id,id,crate::plan::PLAN_SCHEMA_VERSION])?,
-            None => None,
+        let active_task = self.load_active_task(session_id)?;
+        let plan = match active_task.as_ref().map(|task| &task.workflow) {
+            Some(crate::task::TaskWorkflow::Plan { plan }) => Some((&plan.artifact).into()),
+            Some(crate::task::TaskWorkflow::Execute { execution }) => self
+                .load_plan(&execution.record.plan_id)?
+                .as_ref()
+                .map(Into::into),
+            _ => None,
         };
         let configuring = snapshot.operation_action.as_deref() == Some("configure")
             && matches!(
@@ -242,9 +240,8 @@ impl SqliteStore {
                 Some("admitted" | "accepted" | "stopping" | "running" | "applying" | "verifying")
             );
         Ok(RuntimeSnapshot {
-            task,
+            active_task,
             plan,
-            execution,
             configuring,
         })
     }
@@ -275,28 +272,40 @@ impl SqliteStore {
     fn read_admission(&self, session_id: &str) -> Result<AdmissionSnapshot> {
         let encoded: Option<String> = self.connection.query_row(
             "SELECT json_object(
-                'session',json_object('id',s.id,'current_task_id',json_extract(s.payload,'$.session.current_task_id')),
-                'task',CASE WHEN t.id IS NULL THEN NULL ELSE json_object('id',t.id,'status',json_extract(t.payload,'$.status')) END,
+                'session',json_object('id',s.id),
+                'task_revision',json_extract(s.payload,'$.session.active_task.revision'),
+                'task',NULL,
                 'operation_state',json_extract(o.payload,'$.state'),
                 'operation_id',o.id,
                 'operation_action',json_extract(o.payload,'$.action.action'),
-                'has_elicitation',json(CASE WHEN (
-                    (coalesce(json_extract(t.payload,'$.status'),'')!='paused' AND
-                     (json_type(p.payload,'$.acceptance')='object' OR json_type(p.payload,'$.elicitation')='object'))
-                    OR EXISTS(SELECT 1 FROM exchange_record e WHERE e.session_id=s.id AND e.agent_id=?2
-                        AND json_extract(e.payload,'$.awaiting_input')=1 AND json_type(e.payload,'$.elicitation')='object')
-                ) THEN 'true' ELSE 'false' END))
+                'has_elicitation',json('false'))
              FROM session_record s
-             LEFT JOIN task_record t ON t.id=json_extract(s.payload,'$.session.current_task_id')
-             LEFT JOIN plan_record p ON p.id=json_extract(t.payload,'$.plan_id') AND json_extract(p.payload,'$.schema_version')=?3
              LEFT JOIN task_operation o ON o.rowid=(SELECT rowid FROM task_operation WHERE session_id=s.id ORDER BY rowid DESC LIMIT 1)
-             WHERE s.id=?1 AND json_extract(s.payload,'$.format_version')=?4",
-            rusqlite::params![session_id, crate::session::HarnessSession::primary_agent_id(session_id), crate::plan::PLAN_SCHEMA_VERSION, super::SESSION_FORMAT_VERSION],
+             WHERE s.id=?1 AND json_extract(s.payload,'$.format_version')=?2",
+            rusqlite::params![session_id, super::SESSION_FORMAT_VERSION],
             |row| row.get(0),
         ).optional()?;
-        Ok(serde_json::from_str(&encoded.context(
-            "admission session is missing or incompatible",
-        )?)?)
+        let mut snapshot: AdmissionSnapshot = serde_json::from_str(
+            &encoded.context("admission session is missing or incompatible")?,
+        )?;
+        let active = self.load_active_task(session_id)?;
+        snapshot.task = active.as_ref().map(|task| AdmissionTask {
+            id: task.revision.as_str().into(),
+            status: task.status(),
+        });
+        let plan_wait = active.as_ref().is_some_and(|task| match &task.workflow {
+            crate::task::TaskWorkflow::Plan { plan } => {
+                !plan.paused
+                    && (plan.artifact.acceptance.is_some() || plan.artifact.elicitation.is_some())
+            }
+            _ => false,
+        });
+        let exchange_wait: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM exchange_record WHERE session_id=?1 AND agent_id=?2 AND json_extract(payload,'$.awaiting_input')=1 AND json_type(payload,'$.elicitation')='object')",
+            rusqlite::params![session_id, crate::session::HarnessSession::primary_agent_id(session_id)], |row| row.get(0),
+        )?;
+        snapshot.has_elicitation = plan_wait || exchange_wait;
+        Ok(snapshot)
     }
 
     fn admission_exchange_ids(&self, session_id: &str) -> Result<HashMap<String, bool>> {
@@ -314,7 +323,7 @@ mod tests {
     use super::*;
     use crate::{
         session::SessionStore,
-        task::{TaskKind, TaskRecord, TaskStatus},
+        task::{ActiveTask, TaskStatus},
     };
 
     #[test]
@@ -329,39 +338,47 @@ mod tests {
             &admission,
             &writer.session_admission(&session.id)?
         ));
-        let mut task = TaskRecord::new(
-            session.id.clone(),
-            "task".into(),
-            TaskKind::Plan,
-            session.access.clone(),
-            session.approval_mode,
-            1,
-        );
-        writer.save_task(&task)?;
-        session.current_task_id = Some(task.id.clone());
-        writer.save_session(&session)?;
+        let mut task = ActiveTask::goal("task".into(), Default::default(), false, 1);
+        writer.commit_task_change(&session.id, None, 1, |active| {
+            *active = Some(task.clone());
+            Ok(())
+        })?;
         assert_eq!(
             admission.snapshot()?.task.as_ref().unwrap().status,
-            TaskStatus::Ready
+            TaskStatus::Running
         );
-        writer.connection.execute_batch("CREATE TRIGGER reject_task BEFORE UPDATE ON task_record BEGIN SELECT RAISE(ABORT,'failed commit'); END;")?;
-        task.status = TaskStatus::Paused;
-        assert!(writer.save_task(&task).is_err());
+        writer.connection.execute_batch("CREATE TRIGGER reject_task BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'failed commit'); END;")?;
+        let previous_revision = task.revision.clone();
+        if let crate::task::TaskWorkflow::Goal { goal } = &mut task.workflow {
+            goal.state = crate::goal::GoalState::Paused;
+        }
+        task.renew(2);
+        assert!(
+            writer
+                .commit_task_change(&session.id, Some(&previous_revision), 2, |active| {
+                    *active = Some(task.clone());
+                    Ok(())
+                })
+                .is_err()
+        );
         assert_eq!(
             admission.snapshot()?.task.as_ref().unwrap().status,
-            TaskStatus::Ready
+            TaskStatus::Running
         );
         writer
             .connection
             .execute_batch("DROP TRIGGER reject_task")?;
-        writer.save_task(&task)?;
+        writer.commit_task_change(&session.id, Some(&previous_revision), 2, |active| {
+            *active = Some(task.clone());
+            Ok(())
+        })?;
         assert_eq!(
             admission.snapshot()?.task.as_ref().unwrap().status,
             TaskStatus::Paused
         );
         let previous = admission.snapshot()?;
-        task.title = "renamed".into();
-        writer.save_task(&task)?;
+        session.model = "metadata-change".into();
+        writer.save_session(&session)?;
         assert!(Arc::ptr_eq(&previous, &admission.snapshot()?));
         Ok(())
     }

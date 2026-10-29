@@ -3,17 +3,6 @@ use crate::agent::Delegation;
 use crate::plan::PlanElicitation;
 use serde::{Deserialize, Serialize};
 
-/// Defines the timeline role of one admitted interaction.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExchangeKind {
-    #[default]
-    Chat,
-    PlanDraft,
-    PlanRevision,
-    PlanExecution,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExchangeOutcome {
@@ -48,29 +37,6 @@ impl TryFrom<ExchangeState> for ExchangeOutcome {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-/// Retains one phase attempt independently of later execution transitions.
-pub struct ExecutionPhase {
-    pub phase: crate::plan::PlanPhase,
-    pub outcome: Option<crate::plan::execution::VerificationOutcome>,
-    #[serde(default)]
-    /// Phase-completion summary retained independently of subsequent attempts.
-    pub summary: Option<String>,
-    #[serde(default)]
-    /// Effective verification findings, including structural comparison failures.
-    pub findings: Vec<String>,
-    #[serde(default)]
-    /// Structured check results captured before the next phase starts.
-    pub verification: Option<crate::plan::execution::VerificationReport>,
-    #[serde(default)]
-    /// Harness-owned declaration findings, separate from behavioral checks.
-    pub declaration_findings: Vec<String>,
-    #[serde(default)]
-    pub declaration_changes: Vec<crate::plan::execution::DeclarationMismatch>,
-    #[serde(default)]
-    pub verification_tools: std::collections::BTreeMap<String, String>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Resolves work and waits independently from the elapsed-time clock.
 pub(crate) enum ExchangeActivity {
@@ -93,9 +59,11 @@ pub(crate) enum ExchangeActivity {
     Settled,
 }
 
-/// Owns one admitted action or plan phase and its backend turns.
+/// Owns one conversation exchange and its provider turns.
 #[derive(Clone, Debug, Serialize)]
 pub struct Exchange {
+    #[serde(default)]
+    pub origin: super::ExchangeOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_message_id: Option<String>,
     /// Runtime-only source for deferred tool output. Durable records keep output in their chunk table.
@@ -120,22 +88,8 @@ pub struct Exchange {
     pub ordinal: u64,
     pub prompt: String,
     #[serde(default)]
-    /// Lifecycle event that admitted this exchange instead of a user message.
-    pub lifecycle: Option<String>,
-    #[serde(default)]
-    pub kind: ExchangeKind,
-    #[serde(default)]
     /// Approval selection captured when this exchange starts.
     pub approval_mode: Option<crate::session::ApprovalMode>,
-    #[serde(default)]
-    pub plan_id: Option<String>,
-    #[serde(default)]
-    pub execution_id: Option<String>,
-    #[serde(default)]
-    pub execution_phase: Option<ExecutionPhase>,
-    #[serde(default)]
-    /// Goal whose lifecycle caused this exchange.
-    pub goal_id: Option<String>,
     #[serde(flatten)]
     pub(crate) phase: super::ExchangePhase,
     pub checkpoint_before: Option<String>,
@@ -167,12 +121,14 @@ pub struct Exchange {
     #[serde(default)]
     pub comment: Vec<ExchangeComment>,
     #[serde(default)]
-    pub task: Option<TaskSnapshot>,
+    pub checklist: Option<ChecklistSnapshot>,
 }
 
 #[derive(Deserialize)]
 #[serde(remote = "Exchange")]
 struct ExchangeRecord {
+    #[serde(default)]
+    pub origin: super::ExchangeOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_message_id: Option<String>,
     /// Runtime-only source for deferred tool output. Durable records keep output in their chunk table.
@@ -197,22 +153,8 @@ struct ExchangeRecord {
     pub ordinal: u64,
     pub prompt: String,
     #[serde(default)]
-    /// Lifecycle event that admitted this exchange instead of a user message.
-    pub lifecycle: Option<String>,
-    #[serde(default)]
-    pub kind: ExchangeKind,
-    #[serde(default)]
     /// Approval selection captured when this exchange starts.
     pub approval_mode: Option<crate::session::ApprovalMode>,
-    #[serde(default)]
-    pub plan_id: Option<String>,
-    #[serde(default)]
-    pub execution_id: Option<String>,
-    #[serde(default)]
-    pub execution_phase: Option<ExecutionPhase>,
-    #[serde(default)]
-    /// Goal whose lifecycle caused this exchange.
-    pub goal_id: Option<String>,
     #[serde(flatten)]
     pub(crate) phase: super::ExchangePhase,
     pub checkpoint_before: Option<String>,
@@ -244,7 +186,7 @@ struct ExchangeRecord {
     #[serde(default)]
     pub comment: Vec<ExchangeComment>,
     #[serde(default)]
-    pub task: Option<TaskSnapshot>,
+    pub checklist: Option<ChecklistSnapshot>,
 }
 
 impl<'de> Deserialize<'de> for Exchange {
@@ -376,7 +318,6 @@ impl Exchange {
             created_at_ms: now_ms,
         };
         let mut exchange = Self::delegated(session_id, &delegation, ordinal);
-        exchange.lifecycle = Some("agent_admission".into());
         exchange.phase = super::ExchangePhase::Running;
         exchange
     }
@@ -419,13 +360,8 @@ impl Exchange {
             agent_id: delegation.child_agent_id.clone(),
             ordinal,
             prompt: delegation.task.clone(),
-            lifecycle: None,
-            kind: ExchangeKind::Chat,
+            origin: crate::exchange::ExchangeOrigin::User,
             approval_mode: None,
-            plan_id: None,
-            execution_id: None,
-            execution_phase: None,
-            goal_id: None,
             phase: crate::exchange::ExchangePhase::Queued,
             finalization_error: None,
             check_owner: None,
@@ -447,7 +383,7 @@ impl Exchange {
             turn: Vec::new(),
             metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
-            task: None,
+            checklist: None,
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
@@ -816,12 +752,7 @@ impl Exchange {
 
     /// Resolves lifecycle ownership without treating a stopped clock as a task pause.
     pub(crate) fn activity(&self) -> ExchangeActivity {
-        if self.state() != ExchangeState::Running
-            || self
-                .execution_phase
-                .as_ref()
-                .is_some_and(|phase| phase.outcome.is_some())
-        {
+        if self.state() != ExchangeState::Running {
             return ExchangeActivity::Settled;
         }
         if self.execution_started_at_ms().is_none()
@@ -1225,7 +1156,6 @@ mod test {
 
     fn interaction() -> Exchange {
         Exchange {
-            lifecycle: None,
             finalization_error: None,
             check_owner: None,
             output_store: None,
@@ -1237,12 +1167,8 @@ mod test {
             session_id: "session-one".into(),
             ordinal: 1,
             prompt: "inspect the repository".into(),
-            kind: ExchangeKind::Chat,
+            origin: crate::exchange::ExchangeOrigin::User,
             approval_mode: None,
-            plan_id: None,
-            execution_id: None,
-            execution_phase: None,
-            goal_id: None,
             phase: crate::exchange::ExchangePhase::Running,
             checkpoint_before: None,
             checkpoint_after: None,
@@ -1258,7 +1184,7 @@ mod test {
             node_list: Vec::new(),
             metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
-            task: None,
+            checklist: None,
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
@@ -1290,7 +1216,7 @@ mod test {
             data: serde_json::to_value(&retry)?,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         assert!(!exchange.observe_turn(&event, 1000)?);
         exchange.start_turn(address.clone(), 1000)?;
@@ -1343,7 +1269,7 @@ mod test {
                 output_delta: false,
             }),
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 2000).unwrap();
         exchange.pause(3000);
@@ -1385,7 +1311,7 @@ mod test {
             data: serde_json::json!({"params":{"itemId":"one"}}),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 11).unwrap();
         exchange
@@ -1439,7 +1365,7 @@ mod test {
             data: serde_json::json!({"provider_message_id":"reasoning:summary:0"}),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 11).unwrap();
         event.kind = "reasoning".into();
@@ -1502,7 +1428,9 @@ mod test {
                 ExchangeNode::ExchangeInput { .. } => "steering",
                 ExchangeNode::PlanCommentResolution { .. } => "resolution",
                 ExchangeNode::ArtifactChange { .. } => "artifact",
+                ExchangeNode::VerificationResult { .. } => "verification",
                 ExchangeNode::QuestionPresented { .. } => "question",
+                ExchangeNode::QuestionWithdrawn { .. } => "question_withdrawn",
                 ExchangeNode::PlanEvent { .. } => "plan",
                 ExchangeNode::ImplementationReport { .. } => "implementation-report",
             })
@@ -1529,7 +1457,7 @@ mod test {
             data: serde_json::Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         assert!(exchange.observe_turn(&event, 10).unwrap());
         event.turn_boundary = None;
@@ -1939,6 +1867,7 @@ mod test {
         interaction.start_turn(address.clone(), 10).unwrap();
         interaction.node_list.push(ExchangeNode::ArtifactChange {
             change: ArtifactChange {
+                revision_request: false,
                 id: "artifact-one".into(),
                 path: "plan.md".into(),
                 diff_text: "plan".into(),

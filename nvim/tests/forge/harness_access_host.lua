@@ -121,11 +121,11 @@ local success, failure = xpcall(function()
   assert(current_session.access.sandbox == false and #current_session.access.writable_directory == 1)
   assert(current_session.access.read_access == "workspace" and #current_session.access.readable_directory == 1)
   assert(current_session.approval_mode == "ask")
-  local task_id = current_session.current_task_id
+  local task_id = current_session.active_task.revision
   require("forge.views.harness.controller").toggle_write()
   await(function() return starts == 3 end, "Read approval mode paused the task")
   assert(current_session.approval_mode == "ask" and current_session.access.write_access == "off" and current_session.access.sandbox == false)
-  assert(current_session.current_task_id == task_id)
+  assert(current_session.active_task.revision == task_id)
   for index, step in ipairs({
     { "/allow", "r", "allow" },
     { "/write full", "rwx", "allow" },
@@ -140,7 +140,7 @@ local success, failure = xpcall(function()
     controller.submit()
     assert_configuration_presentation(state)
     await(function() return starts == index + 3 and state.access_abbreviation == step[2] end, step[1])
-    assert(state.session.approval_mode == step[3] and state.session.current_task_id == task_id)
+    assert(state.session.approval_mode == step[3] and state.session.active_task.revision == task_id)
     assert(state.session.access.sandbox == false, "policy command changed sandbox selection")
   end
   request(session_id, "task.transition", { operation_id = "pause", action = "pause" })
@@ -157,7 +157,7 @@ local success, failure = xpcall(function()
   await(function() return state.access_abbreviation == "rxw" and not state.task_operation end,
     "rapid write toggles were lost or restored full access")
   local paused = require("forge.views.harness.task").current(state)
-  assert(paused.id == task_id and paused.status == "paused", "permission burst restarted paused work")
+  assert(paused.revision == task_id and require("forge.views.harness.task").status(paused) == "paused", "permission burst restarted paused work")
   model_frames = {}
   local paused_applied
   controller.configure({ effort = "high" }, false, function(value) paused_applied = value end)
@@ -168,7 +168,7 @@ local success, failure = xpcall(function()
   await(function() return state.access_abbreviation == "rxwx" and state.session.approval_mode == "ask"
     and not state.task_operation end, "paused YOLO toggles")
   assert(state.session.access.sandbox == false)
-  assert(require("forge.views.harness.task").current(state).status == "paused", "YOLO exit resumed paused work")
+  assert(require("forge.views.harness.task").status(require("forge.views.harness.task").current(state)) == "paused", "YOLO exit resumed paused work")
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Queued after the current task" })
   controller.queue_submit()
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Unsubmitted draft" })
@@ -179,14 +179,14 @@ local success, failure = xpcall(function()
   local resumed_response = mock.hold(session_id)
   controller.task_transition({ action = "resume" })
   resumed_response:wait()
-  assert(state.session.current_task_id == task_id and state.access_abbreviation == "rx")
+  assert(state.session.active_task.revision == task_id and state.access_abbreviation == "rx")
   assert(#state.queue == 1, "resuming consumed a follow-up during active work")
   controller.task_transition({ action = "pause" })
   await(function()
     local current = require("forge.views.harness.task").current(state)
-    return not state.task_operation and not state.busy and current and current.status == "paused"
+    return not state.task_operation and not state.busy and current and require("forge.views.harness.task").status(current) == "paused"
   end, "pause held response")
-  assert(require("forge.views.harness.task").current(state).status == "paused")
+  assert(require("forge.views.harness.task").status(require("forge.views.harness.task").current(state)) == "paused")
   assert(#state.queue == 1, "pausing discarded queued input")
   client._client.process:kill(9)
   await(function() return client._client.process == nil end, "shutdown")
@@ -194,7 +194,7 @@ local success, failure = xpcall(function()
   assert(recovered.session.approval_mode == "ask" and recovered.access_abbreviation == "rx" and recovered.session.access.write_access == "off")
   assert(recovered.session.access.sandbox == false and #recovered.session.access.writable_directory == 1)
   assert(recovered.session.access.read_access == "full" and #recovered.session.access.readable_directory == 1)
-  assert(recovered.session.current_task_id == task_id)
+  assert(recovered.session.active_task.revision == task_id)
   local created = request(session_id, "session.new", { name = "Cached default" })
   assert(created.session.id ~= session_id and created.session.model == "default")
   assert(created.session.resolved_model == "mock-model", "new conversation waited for another model catalog lookup: "

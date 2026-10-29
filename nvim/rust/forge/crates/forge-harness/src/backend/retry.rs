@@ -50,7 +50,7 @@ pub(crate) fn replay_safe(output: &BackendOutput) -> bool {
         && !output.evidence.workspace_changed
         && !output.event.iter().any(|event| {
             event.activity.is_some()
-                || event.task_update.is_some()
+                || event.checklist_update.is_some()
                 || matches!(
                     event.kind.as_str(),
                     "assistant_message" | "reasoning" | "reasoning_summary" | "plan"
@@ -247,7 +247,7 @@ async fn publish(
             data: serde_json::to_value(retry).context("encode provider retry state")?,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         })
         .await?;
     }
@@ -368,7 +368,7 @@ mod tests {
             data: Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         });
         assert!(!replay_safe(&output));
     }

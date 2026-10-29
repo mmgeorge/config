@@ -114,7 +114,7 @@ impl SqliteStore {
             )?;
         }
         transaction.execute(
-            "UPDATE session_record SET payload=json_set(?2,'$.session.name',json_extract(payload,'$.session.name')),updated_at_ms=?3 WHERE id=?1",
+            "UPDATE session_record SET payload=json_set(?2,'$.session.name',json_extract(payload,'$.session.name'),'$.session.active_task',json_extract(payload,'$.session.active_task')),updated_at_ms=?3 WHERE id=?1",
             params![
                 session.id,
                 super::encode_session(session)?,

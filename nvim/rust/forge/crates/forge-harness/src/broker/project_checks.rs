@@ -6,22 +6,14 @@ impl HarnessBroker {
         &self,
         admission: &ExchangeAdmission,
     ) -> Result<Option<crate::checks::CheckSetupState>> {
-        if admission.kind != ExchangeKind::Chat
-            || admission.execution_id.is_some()
-            || admission.goal_id.is_some()
-            || admission.agent_run_id.is_some()
-        {
+        if self.task_controller.current()?.is_some() || admission.agent_run_id.is_some() {
             return Ok(None);
         }
         let current = self.store.current_exchange_state(&self.session.id)?;
         let Some(previous) = current.latest.as_ref() else {
             return Ok(None);
         };
-        if previous.kind != ExchangeKind::Chat
-            || previous.plan_id != admission.plan_id
-            || previous.goal_id.is_some()
-            || previous.execution_id.is_some()
-            || previous.state == ExchangeState::Cancelled
+        if previous.state == ExchangeState::Cancelled
             || previous.disposition != crate::exchange::HistoryDisposition::Current
         {
             return Ok(None);
@@ -62,13 +54,16 @@ impl HarnessBroker {
         if self.find_active_interaction_elicitation()?.is_some() {
             return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
         }
-        let mut admission = ExchangeAdmission::chat(prompt);
-        admission.plan_id = Some(plan_id);
+        let admission = ExchangeAdmission::chat(prompt);
         self.observer.set_check_editing(true)?;
         self.check_setup = true;
-        let result = self.run_interaction(format!(
-            "The user requested a plan. Project checks are missing or invalid, so use the harness-checks skill to configure them before beginning that plan. Do not design or implement the requested feature yet. Use the original request only to identify the intended tooling. Harness will resume the original planning request after successful configuration publication.\n\nOriginal planning request:\n{}",
-            plan.request), PromptMode::Chat, Some(admission)).await;
+        let result = self
+            .run_interaction(
+                PlanPrompt::checks_setup(&plan.request),
+                PromptMode::Chat,
+                Some(admission),
+            )
+            .await;
         self.check_setup = false;
         result
     }
@@ -85,9 +80,9 @@ impl HarnessBroker {
             return Ok(result);
         };
         if plan.state != PlanState::ConfiguringChecks
-            || self.current_task()?.is_none_or(|task| {
+            || self.task_controller.current()?.is_none_or(|task| {
                 !matches!(
-                    task.status,
+                    task.status(),
                     crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting
                 )
             })
@@ -124,33 +119,52 @@ impl HarnessBroker {
                 .write_working_document(&self.session.id, &plan_id, &document)?;
         }
         PlanStateMachine::apply(&mut plan, PlanEvent::ChecksConfigured, self.clock.now_ms())?;
-        let mut task = self
-            .current_task()?
+        let task = self
+            .task_controller
+            .current()?
             .context("pending plan task is missing")?;
-        task.status = crate::task::TaskStatus::Running;
-        task.phase = "draft".into();
-        task.reason = None;
-        task.updated_at_ms = self.clock.now_ms();
-        self.store.select_task(
-            &self.session,
-            Some(&task),
-            None,
-            Some(&plan),
-            &self.client_id,
-        )?;
-        self.check_setup = false;
-        let mut admission = ExchangeAdmission::plan(String::new(), Some(plan_id), false);
-        admission.lifecycle = Some(WorkflowActivity::Planning.event(LifecycleAction::Started));
-        let (value, mut event) = self.run_planning_interaction(
-            PlanPrompt::with_active_document(format!(
+        let now_ms = self.clock.now_ms();
+        let instruction = PlanPrompt::with_active_document(
+            format!(
                 "Project checks have been saved and validated at revision {}. Check setup is complete. Now begin the original planning request.\n\n{}",
-                snapshot.digest, PlanPrompt::draft(&plan.request)), &document.model_json()?), Some(admission)).await?;
-        let mut leading = result.1;
-        leading.append(&mut event);
-        Ok((value, leading))
+                snapshot.digest,
+                PlanPrompt::draft(&plan.request)
+            ),
+            &document.model_json()?,
+        );
+        self.task_controller
+            .update(&mut self.store, &task.permit(), now_ms, |task| {
+                let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow else {
+                    anyhow::bail!("pending plan task changed");
+                };
+                active.artifact = plan;
+                Ok(())
+            })?;
+        self.check_setup = false;
+        let task = self
+            .task_controller
+            .current()?
+            .context("pending plan task is missing")?;
+        let exchange = self
+            .store
+            .latest_exchange(&self.session.id)?
+            .context("check setup exchange is missing")?;
+        self.task_controller.reserve_continuation(
+            &mut self.store,
+            &task.permit(),
+            crate::task::TaskTurnId {
+                exchange_ordinal: exchange.ordinal,
+                turn_ordinal: exchange.turn.len(),
+            },
+            instruction,
+            "Project check setup completed".into(),
+            now_ms,
+        )?;
+        Ok(result)
     }
 
     /// Refreshes the read-only check projection before acceptance without altering design metadata.
+    #[cfg(test)]
     pub(super) fn refresh_check_review(&mut self, plan_id: &str) -> Result<bool> {
         let mut plan = self
             .store
@@ -166,10 +180,16 @@ impl HarnessBroker {
             return Ok(false);
         };
         let mut snapshot = crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace))?;
-        let task = self.current_task()?.filter(|task| !task.status.terminal());
-        let overrides = self
-            .check_runner
-            .overrides(task.as_ref().map(|task| task.id.as_str()))?;
+        let task = self
+            .task_controller
+            .current()?
+            .filter(|task| !task.status().terminal());
+        let overrides = self.check_runner.overrides(task.as_ref().map(|task| {
+            task.entry
+                .as_ref()
+                .map(|entry| entry.id.as_str())
+                .unwrap_or(task.revision.as_str())
+        }))?;
         for definition in &mut snapshot.config.definitions {
             if let Some(enabled) = overrides.enabled.get(&definition.id) {
                 definition.enabled = *enabled;
@@ -192,7 +212,23 @@ impl HarnessBroker {
         plan.review_digest = Some(digest);
         plan.acceptance = None;
         plan.updated_at_ms = self.clock.now_ms();
-        self.store.save_plan(&plan)?;
+        let task = self
+            .task_controller
+            .current()?
+            .context("planning task is missing")?;
+        self.task_controller.update(
+            &mut self.store,
+            &task.permit(),
+            self.clock.now_ms(),
+            |task| {
+                let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow else {
+                    anyhow::bail!("planning task changed");
+                };
+                anyhow::ensure!(active.artifact.id == plan.id, "planning task changed");
+                active.artifact = plan;
+                Ok(())
+            },
+        )?;
         Ok(true)
     }
 
@@ -203,9 +239,16 @@ impl HarnessBroker {
     ) -> Result<(Value, Vec<SessionEvent>)> {
         self.check_runner.refresh_changes().await?;
         let task_id = self
-            .current_task()?
-            .filter(|task| !task.status.terminal())
-            .map(|task| task.id);
+            .task_controller
+            .current()?
+            .filter(|task| !task.status().terminal())
+            .map(|task| {
+                task.entry
+                    .as_ref()
+                    .map(|entry| entry.id.as_str())
+                    .unwrap_or(task.revision.as_str())
+                    .to_owned()
+            });
         let result = match method {
             HarnessMethod::ChecksList => {
                 let settings = crate::settings::SettingsStore::open(&self.data_root)?

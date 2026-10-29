@@ -439,7 +439,7 @@ mod tests {
             data: json!(sequence),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         }
     }
 

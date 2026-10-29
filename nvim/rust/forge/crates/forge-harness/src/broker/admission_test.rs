@@ -147,8 +147,8 @@ async fn input_readiness_matches_pending_question_without_loading_history() -> R
     assert!(snapshot.active_elicitation.is_some());
     assert!(ready.has_elicitation);
     assert_eq!(
-        ready.session.current_task_id,
-        snapshot.session.current_task_id
+        broker.observer().admission.snapshot()?.task_revision.as_ref(),
+        snapshot.session.active_task.as_ref().map(|task| &task.revision)
     );
     assert_eq!(ready.checks_running, snapshot.checks_running);
     assert_eq!(ready.has_approval, !snapshot.approval.is_empty());

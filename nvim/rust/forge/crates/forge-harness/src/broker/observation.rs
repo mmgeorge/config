@@ -2,7 +2,6 @@ use super::*;
 
 pub(crate) struct InputReadiness {
     pub session: crate::storage::admission::AdmissionSession,
-    pub task: Option<crate::storage::admission::AdmissionTask>,
     pub operation_state: Option<String>,
     pub has_elicitation: bool,
     pub has_approval: bool,
@@ -24,7 +23,7 @@ pub(crate) struct BrokerObserver {
     pub(super) runtime_epoch: String,
     pub(super) snapshot_revision: AtomicU64,
     pub(super) metadata: RwLock<ObservationMetadata>,
-    pub(super) plan_file: Arc<PlanFileStore>,
+    pub(crate) plan_file: Arc<PlanFileStore>,
     pub(super) permission_coordinator: Arc<PermissionCoordinator>,
     pub(super) permission_store: Arc<RwLock<PermissionStore>>,
     pub(super) agent_coordinator: Arc<crate::agent::AgentCoordinator>,
@@ -41,6 +40,25 @@ pub(super) struct ObservationMetadata {
 }
 
 impl BrokerObserver {
+    #[cfg(test)]
+    pub(crate) fn set_native_goal_for_test(&self, supported: bool) -> Result<()> {
+        self.metadata
+            .write()
+            .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?
+            .capability
+            .native_goal = supported;
+        Ok(())
+    }
+
+    pub(crate) fn native_goal_supported(&self) -> Result<bool> {
+        Ok(self
+            .metadata
+            .read()
+            .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?
+            .capability
+            .native_goal)
+    }
+
     pub(crate) fn input_readiness(&self) -> Result<InputReadiness> {
         let state = self.admission.snapshot()?;
         let mut has_approval = false;
@@ -51,7 +69,6 @@ impl BrokerObserver {
         }
         Ok(InputReadiness {
             session: state.session.clone(),
-            task: state.task.clone(),
             has_elicitation: state.has_elicitation,
             has_approval,
             operation_state: state.operation_state.clone(),
@@ -66,10 +83,6 @@ impl BrokerObserver {
     }
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
-    }
-    /// Returns the selected task from the same committed projection used by dispatch.
-    pub(crate) fn input_task_id(&self) -> Result<Option<String>> {
-        Ok(self.admission.snapshot()?.session.current_task_id.clone())
     }
     /// Renames the owning session without waiting for the provider turn.
     pub(super) fn rename_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -257,11 +270,12 @@ impl BrokerObserver {
             no_checkpoint: matches!(broker.workspace_kind, WorkspaceKind::Untracked(_)),
         };
         let mut session = broker.session.clone();
-        session.name = broker
+        let committed = broker
             .store
             .load_session(&session.id)?
-            .context("observed session is missing")?
-            .name;
+            .context("observed session is missing")?;
+        session.name = committed.name;
+        session.active_task = committed.active_task;
         let result = self.build(
             &broker.store,
             &session,
@@ -301,22 +315,14 @@ impl BrokerObserver {
         let automatic_checks = settings.automatic_checks_enabled();
         (session.approval_timeout, session.answer_timeout) =
             self.permission_coordinator.input_timeouts(&session.id)?;
-        let goal = source_session
-            .goal_id
-            .as_deref()
-            .map(|id| store.load_goal(id))
-            .transpose()?
-            .flatten();
-        let task_list = store.list_task(&source_session.id)?;
-        let task = task_list
-            .iter()
-            .find(|task| Some(&task.id) == source_session.current_task_id.as_ref());
-        let active_plan = task
-            .as_ref()
-            .and_then(|task| task.plan_id.as_deref())
-            .map(|id| store.load_plan(id))
-            .transpose()?
-            .flatten();
+        let task = source_session.active_task.as_ref();
+        let active_plan = match task.map(|task| &task.workflow) {
+            Some(crate::task::TaskWorkflow::Plan { plan }) => Some(plan.artifact.clone()),
+            Some(crate::task::TaskWorkflow::Execute { execution }) => {
+                store.load_plan(&execution.record.plan_id)?
+            }
+            _ => None,
+        };
         if let Some(plan) = active_plan.as_ref() {
             self.trace.record(
                 &source_session.id,
@@ -328,7 +334,7 @@ impl BrokerObserver {
         let plan_input = active_plan.as_ref().filter(|_| {
             !task
                 .as_ref()
-                .is_some_and(|task| task.status == crate::task::TaskStatus::Paused)
+                .is_some_and(|task| task.status() == crate::task::TaskStatus::Paused)
         });
         let active_elicitation = plan_input
             .and_then(|plan| {
@@ -364,7 +370,7 @@ impl BrokerObserver {
                             .cloned()
                             .map(|elicitation| ActiveElicitation {
                                 owner: ElicitationOwner::Interaction,
-                                plan_id: interaction.plan_id.clone(),
+                                plan_id: active_plan.as_ref().map(|plan| plan.id.clone()),
                                 exchange_id: Some(interaction.id.clone()),
                                 elicitation,
                             })
@@ -373,13 +379,12 @@ impl BrokerObserver {
         let plan_list = store.list_plan(&source_session.id)?;
         let lifecycle_list = store.list_plan_lifecycle(&source_session.id)?;
         let execution_list = store.list_plan_execution(&source_session.id)?;
-        let goal_execution = goal.as_ref().and_then(|goal| {
-            execution_list
-                .iter()
-                .rev()
-                .find(|execution| execution.goal_id == goal.id)
-                .cloned()
-        });
+        let goal_execution = match task.map(|task| &task.workflow) {
+            Some(crate::task::TaskWorkflow::Execute { execution }) => {
+                Some(execution.record.clone())
+            }
+            _ => None,
+        };
         let active_wait = metadata.active_wait.clone();
         let session_event_list = store.list_session_event(&source_session.id)?;
         let mut status = crate::session::state_machine::SessionPhase::resolve(
@@ -389,7 +394,7 @@ impl BrokerObserver {
         );
         if task
             .as_ref()
-            .is_some_and(|task| task.status == crate::task::TaskStatus::Paused)
+            .is_some_and(|task| task.status() == crate::task::TaskStatus::Paused)
         {
             status = crate::session::state_machine::SessionPhase::Paused;
         }
@@ -500,7 +505,6 @@ impl BrokerObserver {
                 })
                 .map(|operation| operation.view()),
             session,
-            task: task_list,
             exchange: interaction,
             capability: metadata.capability.clone(),
             no_checkpoint: metadata.no_checkpoint,
@@ -510,7 +514,6 @@ impl BrokerObserver {
             )?
             .filter(|progress| progress.state != crate::checkpoint::RestoreState::Complete)
             .map(|progress| json!({"applied":progress.applied,"files":progress.files})),
-            goal,
             active_plan,
             active_elicitation,
             artifact: plan_list
@@ -521,7 +524,6 @@ impl BrokerObserver {
             timeline,
             status,
             timeline_revision: check_snapshot.revision,
-            goal_execution,
             active_wait,
             prompt_history: store.list_prompt_history()?,
             agent: AgentSnapshot {
@@ -542,9 +544,7 @@ impl BrokerObserver {
                     .context("check editing requires enabled")?,
             )?,
             HarnessMethod::StateGet => serde_json::to_value(self.snapshot()?)?,
-            HarnessMethod::TaskList => serde_json::to_value(
-                SqliteStore::read_only(&self.data_root)?.list_task(&self.session_id)?,
-            )?,
+            HarnessMethod::TaskList => serde_json::to_value(self.snapshot()?.session.active_task)?,
             HarnessMethod::AgentList => {
                 let store = SqliteStore::read_only(&self.data_root)?;
                 store.read_snapshot(|| {
@@ -767,10 +767,6 @@ impl BrokerObserver {
                     implemented: execution.iter().any(|record| {
                         record.plan_id == plan.id && record.state == PlanExecutionState::Complete
                     }),
-                    task: store
-                        .list_task(&session.id)?
-                        .into_iter()
-                        .find(|task| task.plan_id.as_deref() == Some(&plan.id)),
                     digest: plan.review_digest.clone(),
                     id: plan.id,
                     created_at_ms: plan.created_at_ms,
@@ -939,5 +935,4 @@ struct PlanChoice {
     implemented: bool,
     state: PlanState,
     digest: Option<String>,
-    task: Option<crate::task::TaskRecord>,
 }

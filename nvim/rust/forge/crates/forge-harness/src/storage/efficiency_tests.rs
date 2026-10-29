@@ -24,7 +24,7 @@ fn output_exchange(text: &str) -> Result<(Exchange, BackendEvent)> {
         text: None,
         data: serde_json::json!({}),
         summary: None,
-        task_update: None,
+        checklist_update: None,
         activity: Some(ToolActivity {
             id: "call".into(),
             kind: ToolActivityKind::Command,
@@ -159,7 +159,6 @@ fn selected_exchange_queries_ignore_unrelated_malformed_history_and_use_indexes(
         exchange.completed_at_ms(),
         exchange.finalization_outcome(),
     );
-    exchange.execution_id = Some("execution".into());
     store.save_exchange(&exchange)?;
     store.connection.execute(
         "INSERT INTO agent_run_record VALUES('child','session','{}')",
@@ -170,13 +169,7 @@ fn selected_exchange_queries_ignore_unrelated_malformed_history_and_use_indexes(
     child.agent_id = "child".into();
     child.ordinal = 100;
     store.save_exchange(&child)?;
-    assert_eq!(
-        store
-            .latest_execution_exchange("session", "execution")?
-            .unwrap()
-            .id,
-        "latest"
-    );
+    assert_eq!(store.latest_exchange("session")?.unwrap().id, "latest");
     store.connection.execute("UPDATE exchange_record SET payload=json_set(payload,'$.turn','malformed history') WHERE id='output'",[])?;
     assert!(store.list_exchange("session").is_err());
     assert_eq!(store.latest_exchange("session")?.unwrap().id, "latest");
@@ -223,36 +216,41 @@ fn selected_exchange_queries_ignore_unrelated_malformed_history_and_use_indexes(
 fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut owner = SqliteStore::open(root.path())?;
-    let mut session = test::session("session", "workspace");
+    let session = test::session("session", "workspace");
     owner.save_session(&session)?;
     let projection = owner.session_admission(&session.id)?;
     let mut writer = SqliteStore::open(root.path())?;
-    let mut task = crate::task::TaskRecord::new(
-        session.id.clone(),
-        "original".into(),
-        crate::task::TaskKind::Plan,
-        session.access.clone(),
-        session.approval_mode,
-        1,
-    );
-    writer.save_task(&task)?;
-    session.current_task_id = Some(task.id.clone());
-    writer.save_session(&session)?;
+    let task = crate::task::ActiveTask::goal("original".into(), Default::default(), false, 1);
+    writer.commit_task_change(&session.id, None, 1, |active| {
+        *active = Some(task.clone());
+        Ok(())
+    })?;
     assert_eq!(
-        projection.runtime()?.task.as_ref().unwrap().title,
+        projection.runtime()?.active_task.as_ref().unwrap().title(),
         "original"
     );
-    writer.connection.execute_batch("CREATE TRIGGER fail_task BEFORE UPDATE ON task_record BEGIN SELECT RAISE(ABORT,'failed task write'); END;")?;
-    task.title = "committed".into();
-    assert!(writer.save_task(&task).is_err());
+    writer.connection.execute_batch("CREATE TRIGGER fail_task BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'failed task write'); END;")?;
+    let mut replacement =
+        crate::task::ActiveTask::goal("committed".into(), Default::default(), false, 2);
+    assert!(
+        writer
+            .commit_task_change(&session.id, Some(&task.revision), 2, |active| {
+                *active = Some(replacement.clone());
+                Ok(())
+            })
+            .is_err()
+    );
     assert_eq!(
-        projection.runtime()?.task.as_ref().unwrap().title,
+        projection.runtime()?.active_task.as_ref().unwrap().title(),
         "original"
     );
     writer.connection.execute_batch("DROP TRIGGER fail_task")?;
-    writer.save_task(&task)?;
+    writer.commit_task_change(&session.id, Some(&task.revision), 2, |active| {
+        *active = Some(replacement.clone());
+        Ok(())
+    })?;
     assert_eq!(
-        projection.runtime()?.task.as_ref().unwrap().title,
+        projection.runtime()?.active_task.as_ref().unwrap().title(),
         "committed"
     );
     let mut operation: crate::task::TaskOperation = serde_json::from_value(serde_json::json!({
@@ -268,48 +266,65 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
         "id":"plan","session_id":"session","request":"plan","state":"awaiting_review",
         "working_path":"","model_revision":1,"user_revision":0,"created_at_ms":0,"updated_at_ms":0
     }))?;
-    writer.save_plan(&plan)?;
-    task.plan_id = Some(plan.id.clone());
-    writer.save_task(&task)?;
+    let plan_task = crate::task::ActiveTask::plan(plan.clone(), 3);
+    writer.commit_task_change(&session.id, Some(&replacement.revision), 3, |active| {
+        *active = Some(plan_task.clone());
+        Ok(())
+    })?;
+    replacement = plan_task;
     assert_eq!(
         projection.runtime()?.plan.as_ref().unwrap().state,
         crate::plan::PlanState::AwaitingReview
     );
     let mut execution: crate::plan::PlanExecutionRecord = serde_json::from_value(
         serde_json::json!({
-            "id":"execution","session_id":"session","plan_id":"plan","goal_id":"goal",
+            "id":"execution","session_id":"session","plan_id":"plan",
             "state":"active","phase":"implement","original_revision":1,"revision":1,"generation":1,
             "lifecycle":[],"findings":[],"progress":crate::plan::execution::SemanticProgress::default(),
             "verification":[],"revision_history":[],"review_paused":false,"observed_source":{},
             "observed_generation":0,"observed_check":[],"created_at_ms":0
         }),
     )?;
-    writer.save_plan_execution(&execution)?;
+    let execute_task = crate::task::ActiveTask::execute(
+        "committed".into(),
+        execution.clone(),
+        Default::default(),
+        false,
+        4,
+    );
+    writer.commit_task_change(&session.id, Some(&replacement.revision), 4, |active| {
+        *active = Some(execute_task.clone());
+        Ok(())
+    })?;
     assert_eq!(
-        projection.runtime()?.execution.as_ref().unwrap().phase,
+        match &projection.runtime()?.active_task.as_ref().unwrap().workflow {
+            crate::task::TaskWorkflow::Execute { execution } => execution.record.phase,
+            _ => panic!("expected execution"),
+        },
         crate::plan::PlanPhase::Implement
     );
     let (exchange, _) = output_exchange("")?;
     writer.save_exchange(&exchange)?;
-    let goal = crate::goal::GoalRecord {
-        id: "goal".into(),
-        session_id: "session".into(),
-        objective: "run".into(),
-        state: crate::goal::GoalState::Active,
-        continuation: Default::default(),
-        native: false,
-        created_at_ms: 0,
-        updated_at_ms: 0,
-    };
     execution.phase = crate::plan::PlanPhase::Verify;
-    writer.save_execution_transition(&execution, &goal, None, Some(&exchange), None)?;
+    writer.commit_task_change(&session.id, Some(&execute_task.revision), 5, |active| {
+        let crate::task::TaskWorkflow::Execute { execution: current } =
+            &mut active.as_mut().unwrap().workflow
+        else {
+            unreachable!()
+        };
+        current.record = execution.clone();
+        Ok(())
+    })?;
     assert_eq!(
-        projection.runtime()?.execution.as_ref().unwrap().phase,
+        match &projection.runtime()?.active_task.as_ref().unwrap().workflow {
+            crate::task::TaskWorkflow::Execute { execution } => execution.record.phase,
+            _ => panic!("expected execution"),
+        },
         crate::plan::PlanPhase::Verify
     );
     owner.connection.execute_batch("ALTER TABLE task_record RENAME TO hidden_task; ALTER TABLE task_operation RENAME TO hidden_operation;")?;
     assert_eq!(
-        projection.runtime()?.task.as_ref().unwrap().title,
+        projection.runtime()?.active_task.as_ref().unwrap().title(),
         "committed"
     );
     assert!(!projection.runtime()?.configuring);

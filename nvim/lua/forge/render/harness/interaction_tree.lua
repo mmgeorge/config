@@ -42,7 +42,6 @@ local function append_session_event(result, entry)
 end
 local agent_event = require("forge.render.harness.agent_event")
 local markdown_text = require("forge.render.harness.markdown_text")
-local task_tree = require("forge.render.harness.task_tree")
 local tool_render = require("forge.render.harness.tool")
 
 --- Formats a numeric token count as an abbreviated string.
@@ -585,29 +584,10 @@ local function append_exchange_summary(result, interaction, options)
     end
     tools = duration_format.label(elapsed):gsub("(%a+)$", " %1")
   end
-  local verb = complete and "Thought" or "Working"
-  if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
-    local activity = interaction.kind == "plan_revision" and "Revising plan" or "Planning"
-    verb = paused and (activity .. " paused") or complete and "Planned" or activity
-  elseif interaction.kind == "plan_execution" then
-    local execution_phase = interaction.execution_phase or {}
-    local phase = execution_phase.phase or "implement"
-    if execution_phase.outcome and execution_phase.outcome ~= vim.NIL then
-      verb = ({ implement = "Implemented", verify = "Verified", resolve = "Resolved" })[phase] or "Implemented"
-    elseif complete then
-      verb = (({ implement = "Implementation", verify = "Verification", resolve = "Resolution" })[phase]
-        or "Implementation") .. " stopped"
-    else
-      verb = (({ implement = "Implementing", verify = "Verifying", resolve = "Resolving" })[phase]
-        or "Implementing") .. (paused and " paused" or "")
-    end
-  elseif paused then
-    verb = "Paused"
-  end
+  local verb = complete and "Thought" or paused and "Paused" or "Thinking"
   if interaction.state == "queued" then
     verb = "Starting"
-  elseif interaction.state == "running" and not complete and not paused
-    and not ((interaction.execution_phase or {}).outcome and (interaction.execution_phase or {}).outcome ~= vim.NIL) then
+  elseif interaction.state == "running" and not complete and not paused then
     if approval then verb = "Waiting for your approval"
     elseif waiting_input then verb = "Waiting for your answer"
     else
@@ -659,15 +639,15 @@ end
 
 --- Keeps verification evidence outside the exchange activity expansion.
 ---@param result table Render collection.
----@param interaction table Exchange with its persisted phase result.
+---@param interaction table Exchange containing the result.
+---@param node table Verification result content.
 ---@param options table Render options.
-local function append_verification_result(result, interaction, options)
-  local phase = interaction.execution_phase
-  if type(phase) ~= "table" or phase.phase ~= "verify" then return end
+local function append_verification_result(result, interaction, node, options)
+  local phase = node.result
   if phase.outcome ~= "passed" and phase.outcome ~= "failed" and phase.outcome ~= "blocked" then return end
   local summary = type(phase.summary) == "string" and phase.summary or ""
   local findings = vim.tbl_filter(function(finding) return finding:match("%S") ~= nil end, phase.findings or {})
-  local key = ("exchange:%s:verification-result"):format(interaction.id or interaction.ordinal)
+  local key = node.id
   local first = #result.lines + 1
   if phase.outcome == "passed" then
     local suffix = summary:match("%S") and " · " .. summary:gsub("%s+", " ") or ""
@@ -698,11 +678,29 @@ end
 ---@param interaction table Interaction descriptor table.
 ---@param options table Render options table.
 ---@param agent_by_id? table<string, table> Lookup map of child agent runs by identifier.
+local function withdrawal_text(node)
+  local lines = {}
+  for _, answer in ipairs(node.answer or {}) do
+    local response = answer.response
+    local text = response.kind == "selected" and response.option or response.kind == "other" and response.text or "Skipped"
+    if response.feedback then text = text .. " — " .. response.feedback end
+    lines[#lines + 1] = answer.question_id .. ": " .. text
+  end
+  lines[#lines + 1] = "Withdrawn: " .. node.reason
+  return table.concat(lines, "\n")
+end
+
 local function append_interaction(result, interaction, options, agent_by_id)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
-  if type(interaction.lifecycle) == "string" then
-    append_wrapped(result, interaction.lifecycle, "◇ ", "  ", "Comment", options.content_width)
-  elseif not interaction.hide_prompt and interaction.kind ~= "plan_execution" then
+  local origin = interaction.origin or { kind = "user" }
+  if origin.kind == "task_started" then
+    local label = ({ goal = "Goal", plan = "Plan", execute = "Execution" })[origin.start.kind]
+    append_wrapped(result, label .. " started: " .. origin.start.title, "◇ ", "  ", "Comment", options.content_width)
+    append_wrapped(result, interaction.prompt, "  ", "  ", "Normal", options.content_width)
+  elseif origin.kind == "task_continuation" then
+    append_wrapped(result, origin.reason, "◇ ", "  ", "Comment", options.content_width)
+    append_wrapped(result, interaction.prompt, "  ", "  ", "Normal", options.content_width)
+  elseif not interaction.hide_prompt then
     local prompt_line = #result.lines + 1
     append_wrapped(result, interaction.prompt, "▸ ", "  ", "ForgeHarnessPrompt", options.content_width)
     result.prompt_lines[#result.prompt_lines + 1] = prompt_line
@@ -742,7 +740,7 @@ local function append_interaction(result, interaction, options, agent_by_id)
     local node_content = node_turn and node.item and resolve_turn_item(node_turn, node.item)
     local final_response = node_content and node.item.kind == "message"
       and node_content.kind == "assistant" and node_content.delivery == "final"
-    if expanded or final_response and node == final_node then
+    if expanded or final_response and node == final_node or node.kind == "verification_result" then
     if node.kind == "turn_content" and node.item then
       local turn = turn_by_id[node.turn_id]
       local content = turn and resolve_turn_item(turn, node.item) or nil
@@ -789,11 +787,25 @@ local function append_interaction(result, interaction, options, agent_by_id)
       end
       end
     elseif node.kind == "question_presented" then
-      plan_event.question(result, node.id, node.question, node.answer, { append_response = append_response })
+      local withdrawal = vim.iter(interaction.node_list or {}):find(function(candidate)
+        return candidate.kind == "question_withdrawn" and candidate.question.id == node.question.id
+      end)
+      local answer = withdrawal and withdrawal_text(withdrawal) or node.answer
+      plan_event.question(result, node.id, node.question, answer, { append_response = append_response })
+    elseif node.kind == "question_withdrawn" then
+      local presented = vim.iter(interaction.node_list or {}):any(function(candidate)
+        return candidate.kind == "question_presented" and candidate.question.id == node.question.id
+      end)
+      if not presented then
+        plan_event.question(result, node.id, node.question, withdrawal_text(node),
+          { append_response = append_response })
+      end
     elseif node.kind == "plan_event" and node.event.content.kind == "lifecycle" then
       plan_event.append(result, { id = node.event.id, lifecycle = node.event.content.lifecycle }, { append_response = append_response })
     elseif node.kind == "plan_comment_resolution" and node.resolution then
       append_plan_comment_resolution(result, interaction, node.resolution, options)
+    elseif node.kind == "verification_result" then
+      append_verification_result(result, interaction, node, options)
     elseif node.kind == "artifact_change" and node.change then
       local artifact_key = ("interaction:%s:artifact:%s"):format(
         interaction.id or interaction.ordinal,
@@ -856,7 +868,6 @@ local function append_interaction(result, interaction, options, agent_by_id)
       }
     end
   end
-  append_verification_result(result, interaction, options)
 end
 
 --- Builds the complete harness timeline render tree with lines, highlights, extmarks, and row mappings.

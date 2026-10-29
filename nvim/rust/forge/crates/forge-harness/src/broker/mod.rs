@@ -1,14 +1,16 @@
+mod acceptance;
 mod admission;
 #[cfg(test)]
 mod change_results_test;
 mod checks;
+mod configuration;
 mod execution;
 mod fork;
 mod interaction;
 mod new_session;
 mod observation;
+pub(crate) mod plan_entry;
 mod project_checks;
-mod replanning;
 mod review_question;
 pub(crate) use observation::BrokerObserver;
 
@@ -26,20 +28,19 @@ use crate::backend::{
 use crate::buffer::session::SessionPresentation;
 use crate::checkpoint::{GitCheckpoint, checkpoint_diff, checkpoint_diff_for_paths};
 use crate::exchange::{
-    ActiveWait, Exchange, ExchangeComment, ExchangeKind, ExchangeNode, ExchangeState,
-    ProviderChangeIndex, TaskTracker,
+    ActiveWait, ChecklistTracker, Exchange, ExchangeComment, ExchangeNode, ExchangeState,
+    ProviderChangeIndex,
 };
 use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
 use crate::permissions::store::PermissionStore;
 use crate::plan::state_machine::{PlanEvent, PlanStateMachine};
 use crate::plan::{
-    ArtifactSummary, PlanAcceptance, PlanDocument, PlanElicitation, PlanExecutionLifecycleEvent,
+    ArtifactSummary, PlanAcceptance, PlanElicitation, PlanExecutionLifecycleEvent,
     PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState, PlanFileStore,
     PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer, PlanQuestionResponse,
     PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState, digest as plan_digest,
 };
 use crate::protocol::HarnessMethod;
-use crate::session::state_machine::{LifecycleAction, WorkflowActivity};
 use crate::session::{
     ApprovalMode, ContextUsage, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
     ProviderForkState, SessionStore,
@@ -181,13 +182,11 @@ pub struct BrokerSnapshot {
     pub active_check_run: Option<String>,
     pub task_operation: Option<Value>,
     pub session: HarnessSession,
-    pub task: Vec<crate::task::TaskRecord>,
     #[serde(skip)]
     pub exchange: Vec<Exchange>,
     pub capability: BackendCapability,
     pub no_checkpoint: bool,
     pub restore_recovery: Option<Value>,
-    pub goal: Option<GoalRecord>,
     pub active_plan: Option<PlanRecord>,
     pub active_elicitation: Option<ActiveElicitation>,
     pub artifact: Vec<ArtifactSummary>,
@@ -195,7 +194,6 @@ pub struct BrokerSnapshot {
     pub timeline: Vec<TimelineEntry>,
     pub timeline_revision: u64,
     pub status: crate::session::state_machine::SessionPhase,
-    pub goal_execution: Option<PlanExecutionRecord>,
     pub active_wait: Option<ActiveWait>,
     pub prompt_history: Vec<crate::attachment::PromptDraft>,
     pub agent: AgentSnapshot,
@@ -242,11 +240,12 @@ pub struct ActiveElicitation {
 }
 
 struct ExchangeRuntime {
+    task_permit: Option<crate::task::TaskPermit>,
     checkpoint: Option<crate::checkpoint::CheckpointTask>,
     tool_gate: Option<crate::checkpoint::ToolGate>,
     exchange_id: String,
     synthetic_turn: Option<crate::backend::ProviderAddress>,
-    task: TaskTracker,
+    checklist: ChecklistTracker,
     retraction_eligible: bool,
     active_wait: Option<ActiveWait>,
 }
@@ -272,7 +271,7 @@ impl Drop for ExchangeRuntime {
 struct ChildExchangeRuntime {
     exchange: Exchange,
     synthetic_turn: Option<crate::backend::ProviderAddress>,
-    task: TaskTracker,
+    checklist: ChecklistTracker,
 }
 
 /// Represents one request result plus asynchronous events emitted before its response.
@@ -496,15 +495,11 @@ impl std::fmt::Display for TurnRetracted {
 impl std::error::Error for TurnRetracted {}
 
 struct ExchangeAdmission {
+    origin: crate::exchange::ExchangeOrigin,
     check_owner: Option<String>,
     automatic_owner: Option<String>,
-    lifecycle: Option<String>,
     plan_event_id: Option<String>,
     prompt: String,
-    kind: ExchangeKind,
-    plan_id: Option<String>,
-    execution_id: Option<String>,
-    goal_id: Option<String>,
     agent_run_id: Option<String>,
 }
 
@@ -518,64 +513,11 @@ struct PromptControlSnapshot {
 impl ExchangeAdmission {
     fn chat(prompt: String) -> Self {
         Self {
-            lifecycle: None,
             plan_event_id: None,
             check_owner: None,
             automatic_owner: None,
             prompt,
-            kind: ExchangeKind::Chat,
-            plan_id: None,
-            execution_id: None,
-            goal_id: None,
-            agent_run_id: None,
-        }
-    }
-
-    fn plan(prompt: String, plan_id: Option<String>, revision: bool) -> Self {
-        Self {
-            lifecycle: None,
-            plan_event_id: None,
-            check_owner: None,
-            automatic_owner: None,
-            prompt,
-            kind: if revision {
-                ExchangeKind::PlanRevision
-            } else {
-                ExchangeKind::PlanDraft
-            },
-            plan_id,
-            execution_id: None,
-            goal_id: None,
-            agent_run_id: None,
-        }
-    }
-
-    fn execution(prompt: String, plan_id: String, execution_id: String, goal_id: String) -> Self {
-        Self {
-            lifecycle: None,
-            plan_event_id: None,
-            check_owner: None,
-            automatic_owner: None,
-            prompt,
-            kind: ExchangeKind::PlanExecution,
-            plan_id: Some(plan_id),
-            execution_id: Some(execution_id),
-            goal_id: Some(goal_id),
-            agent_run_id: None,
-        }
-    }
-
-    fn goal(prompt: String, goal_id: String) -> Self {
-        Self {
-            lifecycle: None,
-            plan_event_id: None,
-            check_owner: None,
-            automatic_owner: None,
-            prompt,
-            kind: ExchangeKind::Chat,
-            plan_id: None,
-            execution_id: None,
-            goal_id: Some(goal_id),
+            origin: crate::exchange::ExchangeOrigin::User,
             agent_run_id: None,
         }
     }
@@ -583,6 +525,7 @@ impl ExchangeAdmission {
 
 /// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
 pub struct HarnessBroker {
+    pub(crate) task_controller: Arc<crate::task::SessionTaskController>,
     review_answer: Option<Arc<crate::plan::review_answer::ReviewAnswerScope>>,
     context_usage_fresh: bool,
     pub(crate) lsp: Arc<crate::control_tools::lsp::LspService>,
@@ -606,7 +549,7 @@ pub struct HarnessBroker {
     backend: Arc<dyn Backend>,
     session: HarnessSession,
     capability: BackendCapability,
-    goal_max_turns: u32,
+    pub(crate) goal_max_turns: u32,
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
     pub(crate) trace: Arc<TraceStore>,
@@ -623,6 +566,7 @@ pub struct HarnessBroker {
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
     prompt_admission: Option<(Option<forge_buffer::identity::DocumentId>, u64)>,
     pub(crate) input_submission: Option<Arc<crate::backend::submission::Submission>>,
+    pub(crate) input_purpose: crate::input::InputPurpose,
     pub(crate) input_wakeup: Option<Arc<tokio::sync::Notify>>,
     submitted_attachments: Vec<crate::attachment::InputAttachment>,
     active_wait_projection: Option<ActiveWait>,
@@ -780,7 +724,7 @@ impl HarnessBroker {
                             approval_mode: preference
                                 .as_ref()
                                 .map_or(ApprovalMode::Ask, |value| value.default_approval),
-                            current_task_id: None,
+                            active_task: None,
                             default_approval: preference
                                 .as_ref()
                                 .map_or(ApprovalMode::Ask, |value| value.default_approval),
@@ -789,7 +733,6 @@ impl HarnessBroker {
                                 .and_then(|value| value.plan_approval),
                             created_at_ms: now_ms,
                             updated_at_ms: now_ms,
-                            goal_id: None,
                             lease_owner: None,
                             native_fork: false,
                             native_compact: backend_descriptor.capability.native_compact,
@@ -873,13 +816,6 @@ impl HarnessBroker {
         session = store
             .load_session(&session.id)?
             .context("session disappeared during recovery")?;
-        if store.list_task(&session.id)?.iter().any(|task| {
-            Some(&task.id) == session.current_task_id.as_ref()
-                && task.kind == crate::task::TaskKind::Plan
-                && task.status == crate::task::TaskStatus::Paused
-        }) {
-            store.save_owned_session(&session, &request.client_id)?;
-        }
         let agent_registry = load_agent_registry(&store, &session.id)?;
         startup_timing.insert(
             "session_recovered_ms",
@@ -960,6 +896,9 @@ impl HarnessBroker {
             startup_started.elapsed().as_secs_f64() * 1000.0,
         );
         let mut broker = Self {
+            task_controller: Arc::new(crate::task::SessionTaskController::new(
+                observer.admission.clone(),
+            )?),
             review_answer: None,
             submission_store: crate::backend::submission::SubmissionStore::open(
                 &data_root,
@@ -1007,6 +946,7 @@ impl HarnessBroker {
             presentation,
             prompt_admission: None,
             input_submission: None,
+            input_purpose: crate::input::InputPurpose::User,
             input_wakeup: None,
             active_wait_projection: None,
             parent_input: Default::default(),
@@ -1084,6 +1024,27 @@ impl HarnessBroker {
                 .ok()
         });
         Some(crate::control_tools::ControlTurnContext {
+            task_controller: Some(self.task_controller.clone()),
+            native_goal: if mode == PromptMode::GoalContinuation {
+                self.task_controller
+                    .current()
+                    .ok()
+                    .flatten()
+                    .and_then(|task| match task.workflow {
+                        crate::task::TaskWorkflow::Goal { goal } if goal.native => {
+                            Some(goal.objective)
+                        }
+                        _ => None,
+                    })
+            } else {
+                None
+            },
+            task_permit: self
+                .task_controller
+                .current()
+                .ok()
+                .flatten()
+                .map(|task| task.permit()),
             review_answer: self.review_answer.clone(),
             submission_cancelled: Some(Arc::clone(&self.turn_cancellation.submission_cancelled)),
             checkpoint: self
@@ -1111,24 +1072,12 @@ impl HarnessBroker {
                 })
                 .unwrap_or_default(),
             has_active_elicitation: plan.as_ref().is_some_and(|plan| plan.elicitation.is_some()),
-            has_active_execution: self
-                .store
-                .list_plan_execution(&self.session.id)
-                .ok()?
-                .iter()
-                .any(|execution| {
-                    Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref()
-                        && !matches!(
-                            execution.state,
-                            PlanExecutionState::Complete | PlanExecutionState::Cancelled
-                        )
-                }),
-            has_active_goal: self
-                .session
-                .goal_id
-                .as_deref()
-                .and_then(|goal_id| self.store.load_goal(goal_id).ok().flatten())
-                .is_some_and(|goal| goal.state == GoalState::Active),
+            has_active_execution: self.current_execution().ok()?.is_some_and(|execution| {
+                !matches!(
+                    execution.state,
+                    PlanExecutionState::Complete | PlanExecutionState::Cancelled
+                )
+            }),
             workspace_root: Some(PathBuf::from(&self.session.workspace)),
             repository: None,
             harness: None,
@@ -1351,32 +1300,59 @@ impl HarnessBroker {
         let mutation_stage = edit_trace
             .as_ref()
             .map(|trace| trace.stage("broker.mutation"));
-        let mut outcome =
-            match crate::attachment::resolve_input(&self.data_root, &request.params).await {
-                Ok(attachments) => {
-                    self.submitted_attachments = attachments;
-                    let outcome = self.dispatch_inner(method, request.params).await;
-                    self.submitted_attachments.clear();
-                    outcome
+        let command = (|| -> Result<_> {
+            let mut candidate = request.clone();
+            if candidate.params.get("operation_id").is_none() {
+                if let Some(id) = candidate
+                    .params
+                    .pointer("/_command/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                {
+                    candidate.params["operation_id"] = json!(id);
                 }
-                Err(error) => Err(error),
-            };
+            }
+            if method == HarnessMethod::QuestionContinue {
+                let prior = candidate.params["operation_id"]
+                    .as_str()
+                    .map(|id| self.store.load_task_operation(&self.session.id, id))
+                    .transpose()?
+                    .flatten();
+                let target = self
+                    .task_controller
+                    .current()?
+                    .and_then(|task| match task.workflow {
+                        crate::task::TaskWorkflow::Plan { plan } => plan
+                            .artifact
+                            .acceptance
+                            .map(|acceptance| (plan.artifact.id, acceptance.review_digest)),
+                        _ => None,
+                    });
+                crate::task::command::SessionCommand::question_continue(
+                    &candidate,
+                    prior.as_ref(),
+                    target,
+                )
+            } else {
+                crate::task::command::SessionCommand::parse_request(&candidate)
+            }
+        })();
+        let mut outcome = match command {
+            Ok(Some(command)) => self.commit_session_command(command),
+            Err(error) => Err(error),
+            Ok(None) => {
+                match crate::attachment::resolve_input(&self.data_root, &request.params).await {
+                    Ok(attachments) => {
+                        self.submitted_attachments = attachments;
+                        let outcome = self.dispatch_inner(method, request.params).await;
+                        self.submitted_attachments.clear();
+                        outcome
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
         if let Some(stage) = mutation_stage {
-            stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }}));
-        }
-        let settle_stage = edit_trace
-            .as_ref()
-            .map(|trace| trace.stage("broker.settle_task"));
-        if method.settles_task()
-            && !outcome
-                .as_ref()
-                .is_err_and(|error| error.is::<RequestNotAdmitted>())
-            && let Err(error) =
-                self.settle_task(outcome.as_ref().err().map(|error| format!("{error:#}")))
-        {
-            outcome = Err(error.context("persist task outcome"));
-        }
-        if let Some(stage) = settle_stage {
             stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }}));
         }
         if let Err(error) = self.refresh_input_schedule() {
@@ -1538,10 +1514,16 @@ impl HarnessBroker {
             HarnessMethod::AgentStart => Box::pin(self.start_agent(params)),
             HarnessMethod::ExchangeResume => Box::pin(self.resume_exchange(params)),
             HarnessMethod::PromptSubmit => Box::pin(self.submit_prompt(params)),
-            HarnessMethod::PlanAccept => Box::pin(self.accept_plan(params)),
-            HarnessMethod::PlanAcceptanceBegin => Box::pin(self.begin_plan_acceptance(params)),
+            HarnessMethod::PlanAccept => Box::pin(std::future::ready(
+                self.dispatch_session_command("plan.accept", params),
+            )),
+            HarnessMethod::PlanAcceptanceBegin => Box::pin(std::future::ready(
+                self.dispatch_session_command("plan.acceptance.begin", params),
+            )),
             HarnessMethod::PlanChecksUpdate => Box::pin(self.update_plan_checks(params)),
-            HarnessMethod::PlanRequestChanges => Box::pin(self.request_plan_changes(params)),
+            HarnessMethod::PlanRequestChanges => Box::pin(std::future::ready(
+                self.dispatch_session_command("plan.request_changes", params),
+            )),
             HarnessMethod::PlanAnswerQuestions => Box::pin(async {
                 anyhow::bail!("plan review questions must route through the session coordinator")
             }),
@@ -1579,11 +1561,21 @@ impl HarnessBroker {
                 self.continue_question().await
             }),
             HarnessMethod::ApprovalContinue => Box::pin(self.continue_after_approval_timeout()),
-            HarnessMethod::GoalSet => Box::pin(self.set_goal(params)),
-            HarnessMethod::GoalPause => Box::pin(self.pause_goal()),
-            HarnessMethod::GoalResume => Box::pin(self.resume_goal(None, None, None)),
-            HarnessMethod::GoalClear => Box::pin(self.clear_goal()),
-            HarnessMethod::GoalContinue => Box::pin(self.continue_goal()),
+            HarnessMethod::GoalSet => Box::pin(std::future::ready(
+                self.dispatch_session_command("goal.set", params),
+            )),
+            HarnessMethod::GoalPause => Box::pin(std::future::ready(
+                self.dispatch_session_command("goal.pause", json!({})),
+            )),
+            HarnessMethod::GoalResume => Box::pin(std::future::ready(
+                self.dispatch_session_command("goal.resume", json!({})),
+            )),
+            HarnessMethod::GoalClear => Box::pin(std::future::ready(
+                self.dispatch_session_command("goal.clear", json!({})),
+            )),
+            HarnessMethod::GoalContinue => Box::pin(std::future::ready(
+                self.dispatch_session_command("goal.continue", json!({})),
+            )),
             HarnessMethod::ExchangeRequestChanges => {
                 Box::pin(self.request_exchange_changes(params))
             }
@@ -1619,7 +1611,7 @@ impl HarnessBroker {
                 Vec::new(),
             )),
             HarnessMethod::TaskList => Ok((
-                serde_json::to_value(self.store.list_task(&self.session.id)?)?,
+                serde_json::to_value(self.task_controller.current()?)?,
                 Vec::new(),
             )),
             HarnessMethod::LspAuthorize
@@ -1726,10 +1718,12 @@ impl HarnessBroker {
             HarnessMethod::QueueEditLast => {
                 anyhow::bail!("queued edits require input.apply")
             }
-            HarnessMethod::PlanAcceptanceCancel => self.cancel_plan_acceptance(),
+            HarnessMethod::PlanAcceptanceCancel => {
+                self.dispatch_session_command("plan.acceptance.cancel", json!({}))
+            }
             HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
             HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
-            HarnessMethod::PlanCancel => self.cancel_plan(params),
+            HarnessMethod::PlanCancel => self.dispatch_session_command("plan.cancel", params),
             HarnessMethod::PlanGet => Ok((self.observer.plan(params)?, Vec::new())),
             HarnessMethod::PlanDeclaration => self.observer.read_plan_declaration(params),
             HarnessMethod::PlanList => self.observer.list_replanning_choices(),
@@ -1795,98 +1789,172 @@ impl HarnessBroker {
     }
 
     fn current_plan_id(&self) -> Result<Option<String>> {
-        Ok(self.current_task()?.and_then(|task| task.plan_id))
+        Ok(self
+            .task_controller
+            .current()?
+            .and_then(|task| match task.workflow {
+                crate::task::TaskWorkflow::Plan { plan } => Some(plan.artifact.id),
+                crate::task::TaskWorkflow::Execute { execution } => Some(execution.record.plan_id),
+                crate::task::TaskWorkflow::Goal { .. } => None,
+            }))
     }
 
-    async fn select_review_task(&mut self, plan: &PlanRecord) -> Result<Vec<SessionEvent>> {
-        anyhow::ensure!(
-            plan.session_id == self.session.id,
-            "plan belongs to another session"
-        );
-        let mut task = self
-            .store
-            .list_task(&self.session.id)?
-            .into_iter()
-            .find(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
-            .context("reviewed plan has no owning task")?;
-        anyhow::ensure!(
-            !task.status.terminal(),
-            "reviewed plan belongs to a completed task"
-        );
-        if self.session.current_task_id.as_deref() == Some(task.id.as_str())
-            && task.status != crate::task::TaskStatus::Paused
-        {
-            return Ok(Vec::new());
+    fn publish_plan(&mut self, plan: &PlanRecord) -> Result<()> {
+        let current = self.task_controller.current()?;
+        if let Some(task) = current.filter(|task| {
+            matches!(&task.workflow,
+            crate::task::TaskWorkflow::Plan { plan: active } if active.artifact.id == plan.id)
+        }) {
+            self.task_controller.update(
+                &mut self.store,
+                &task.permit(),
+                self.clock.now_ms(),
+                |task| {
+                    let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow
+                    else {
+                        return Err(crate::task::StaleTask.into());
+                    };
+                    active.artifact = plan.clone();
+                    Ok(())
+                },
+            )
+        } else {
+            self.store.save_plan(plan)
         }
-        let (_, events) = self.pause_task(false).await?;
-        task.status = crate::task::TaskStatus::Waiting;
-        task.reason = None;
-        task.generation += 1;
-        task.updated_at_ms = self.clock.now_ms();
-        self.session.current_task_id = Some(task.id.clone());
-        self.session.goal_id = task.goal_id.clone();
-        self.store
-            .select_task(&self.session, Some(&task), None, None, &self.client_id)?;
+    }
+
+    fn task_prompt_mode(&self) -> Result<PromptMode> {
+        let Some(task) = self.task_controller.current()? else {
+            return Ok(PromptMode::Chat);
+        };
+        if task.status() == crate::task::TaskStatus::Paused || !task.entry_accepted() {
+            return Ok(PromptMode::Chat);
+        }
+        Ok(match task.workflow {
+            crate::task::TaskWorkflow::Goal { .. } => PromptMode::GoalContinuation,
+            crate::task::TaskWorkflow::Execute { .. } => PromptMode::ExecutePlan,
+            crate::task::TaskWorkflow::Plan { plan } => {
+                if plan.artifact.state == PlanState::AwaitingReview {
+                    PromptMode::PlanDiscussion
+                } else {
+                    PromptMode::Plan
+                }
+            }
+        })
+    }
+
+    fn current_execution(&self) -> Result<Option<PlanExecutionRecord>> {
+        let Some(task) = self.task_controller.current()? else {
+            return Ok(None);
+        };
+        let crate::task::TaskWorkflow::Execute { execution } = task.workflow else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            execution.record.session_id == self.session.id,
+            "execution belongs to another session"
+        );
+        Ok(Some(execution.record))
+    }
+
+    fn reserve_execution_continuation(&mut self, completed: crate::task::TaskTurnId) -> Result<()> {
+        let Some(task) = self.task_controller.current()? else {
+            return Ok(());
+        };
+        let crate::task::TaskWorkflow::Execute { execution } = &task.workflow else {
+            return Ok(());
+        };
+        if execution.record.state != PlanExecutionState::Active {
+            return Ok(());
+        }
+        let now_ms = self.clock.now_ms();
+        if execution.record.phase == crate::plan::PlanPhase::Checking {
+            self.task_controller.reserve_checks(
+                &mut self.store,
+                &task.permit(),
+                completed,
+                now_ms,
+            )?;
+        } else {
+            let goal = self.active_goal()?;
+            let prompt = self
+                .plan_goal_prompt(&goal, PlanExecutionPromptKind::Continue)?
+                .context("execution continuation has no accepted plan")?;
+            self.task_controller.reserve_continuation(
+                &mut self.store,
+                &task.permit(),
+                completed,
+                prompt,
+                "The accepted plan requires another execution phase".into(),
+                now_ms,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn run_task_checks(&mut self) -> Result<Vec<SessionEvent>> {
+        let task = self
+            .task_controller
+            .current()?
+            .context("check task was cleared")?;
+        let turn = task
+            .turn
+            .as_ref()
+            .context("check work has no source turn")?;
+        let work = turn
+            .continuation
+            .as_ref()
+            .context("check work was removed")?;
+        anyhow::ensure!(
+            work.work == crate::task::TaskContinuationWork::Checks,
+            "pending work is not checks"
+        );
+        let source = turn.id.clone();
+        let id = work.id.clone();
+        let events = self.run_checks().await?;
+        let Some(current) = self.task_controller.current()? else {
+            return Ok(events);
+        };
+        if current.entry.as_ref().map(|entry| &entry.id)
+            != task.entry.as_ref().map(|entry| &entry.id)
+            || !matches!((&task.workflow, &current.workflow),
+                (crate::task::TaskWorkflow::Execute { execution: original }, crate::task::TaskWorkflow::Execute { execution: current }) if original.record.id == current.record.id)
+        {
+            return Ok(events);
+        }
+        self.task_controller.acknowledge_continuation(
+            &mut self.store,
+            &current.revision,
+            &id,
+            self.clock.now_ms(),
+        )?;
+        self.reserve_execution_continuation(source)?;
         Ok(events)
     }
 
-    fn current_task(&self) -> Result<Option<crate::task::TaskRecord>> {
-        Ok(self
-            .store
-            .session_admission(&self.session.id)?
-            .runtime()?
-            .task
-            .clone())
-    }
-
     fn current_task_is_plan(&self) -> Result<bool> {
-        Ok(self.current_task()?.is_some_and(|task| {
-            task.kind == crate::task::TaskKind::Plan
-                && matches!(
-                    task.status,
-                    crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting
-                )
-        }))
+        Ok(matches!(
+            self.task_prompt_mode()?,
+            PromptMode::Plan | PromptMode::PlanDiscussion
+        ))
     }
 
     async fn pause_task(&mut self, clear: bool) -> Result<(Value, Vec<SessionEvent>)> {
-        use crate::task::TaskStatus;
         self.retry_finalization().await?;
-        let mut events = Vec::new();
-        let mut task = self.current_task()?;
-        if let Some(task) = task.as_mut()
-            && !task.status.terminal()
-        {
-            if self
-                .current_goal()?
-                .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
-            {
-                events.extend(self.pause_goal().await?.1);
-            }
-            task.status = if clear {
-                TaskStatus::Cancelled
-            } else {
-                TaskStatus::Paused
-            };
-            task.generation += 1;
-            task.reason = Some(
+        let current = self.task_controller.current()?;
+        if let Some(task) = current {
+            self.task_controller.change(
+                &mut self.store,
+                Some(&task.revision),
                 if clear {
-                    "Cleared by user"
+                    crate::task::TaskChange::Clear
                 } else {
-                    "Paused by user"
-                }
-                .into(),
-            );
-            task.updated_at_ms = self.clock.now_ms();
+                    crate::task::TaskChange::Pause
+                },
+                self.clock.now_ms(),
+            )?;
         }
-
-        self.session.goal_id = None;
-        if clear {
-            self.session.current_task_id = None;
-        }
-        self.store
-            .select_task(&self.session, task.as_ref(), None, None, &self.client_id)?;
-        Ok((serde_json::to_value(self.snapshot()?)?, events))
+        Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()))
     }
 
     #[cfg(test)]
@@ -1895,110 +1963,27 @@ impl HarnessBroker {
         kind: crate::task::TaskKind,
         title: String,
         plan_id: Option<String>,
-        goal_id: Option<String>,
+        _goal_id: Option<String>,
     ) -> Result<()> {
-        let mut task = crate::task::TaskRecord::new(
-            self.session.id.clone(),
-            title,
-            kind,
-            self.session.access.clone(),
-            self.session.approval_mode,
-            self.clock.now_ms(),
-        );
-        task.plan_id = plan_id;
-        task.goal_id = goal_id;
-        task.begin(self.clock.now_ms())?;
-        self.session.current_task_id = Some(task.id.clone());
-        self.store
-            .select_task(&self.session, Some(&task), None, None, &self.client_id)
-    }
-
-    fn settle_task(&mut self, failure: Option<String>) -> Result<()> {
-        use crate::task::{TaskKind, TaskStatus};
-        let Some(mut task) = self.current_task()? else {
-            return Ok(());
+        let now_ms = self.clock.now_ms();
+        let task = if kind == crate::task::TaskKind::Plan {
+            crate::task::ActiveTask::plan(
+                self.store
+                    .load_plan(&plan_id.context("plan is required")?)?
+                    .context("plan is missing")?,
+                now_ms,
+            )
+        } else {
+            crate::task::ActiveTask::goal(title, Default::default(), false, now_ms)
         };
-        if task.status.terminal() || task.status == TaskStatus::Paused {
-            return Ok(());
-        }
-        if task.status == TaskStatus::Blocked && task.phase == "checks" && failure.is_none() {
-            return Ok(());
-        }
-        task.approval_mode = self.session.approval_mode;
-        task.access = self.session.access.clone();
-        if let Some(message) = failure {
-            task.status = if self.turn_cancellation.requested.load(Ordering::Acquire) {
-                TaskStatus::Paused
-            } else {
-                TaskStatus::Failed
-            };
-            task.reason = Some(message);
-        } else if task.kind == TaskKind::Plan {
-            if let Some(plan) = task
-                .plan_id
-                .as_deref()
-                .map(|id| self.store.load_plan(id))
-                .transpose()?
-                .flatten()
-            {
-                task.title = plan.title;
-                task.status = match plan.state {
-                    PlanState::ConfiguringChecks => TaskStatus::Waiting,
-                    PlanState::AwaitingInput | PlanState::AwaitingReview => TaskStatus::Waiting,
-                    PlanState::Failed => TaskStatus::Failed,
-                    PlanState::Cancelled => TaskStatus::Cancelled,
-                    _ => TaskStatus::Running,
-                };
-                task.phase = match plan.state {
-                    PlanState::ConfiguringChecks => "checks_setup",
-                    PlanState::AwaitingReview => "review",
-                    _ => "draft",
-                }
-                .into();
-            }
-        } else if let Some(goal) = task
-            .goal_id
-            .as_deref()
-            .map(|id| self.store.load_goal(id))
-            .transpose()?
-            .flatten()
-        {
-            task.status = match goal.state {
-                GoalState::Active => TaskStatus::Running,
-                GoalState::Complete => TaskStatus::Completed,
-                GoalState::Cleared => TaskStatus::Cancelled,
-                GoalState::Paused => TaskStatus::Paused,
-                _ => TaskStatus::Blocked,
-            };
-            task.reason = match goal.state {
-                GoalState::Blocked => Some("Provider reported that the task is blocked".into()),
-                GoalState::Stalled => {
-                    Some("Task stopped because no observable progress was recorded".into())
-                }
-                GoalState::UsageLimited => Some("Provider usage limit reached".into()),
-                GoalState::BudgetLimited => Some("Task budget limit reached".into()),
-                _ => None,
-            };
-            if let Some(execution) = self
-                .store
-                .list_plan_execution(&self.session.id)?
-                .into_iter()
-                .find(|entry| entry.goal_id == goal.id)
-            {
-                task.phase = format!("{:?}", execution.phase).to_lowercase();
-                if goal.state == GoalState::Stalled {
-                    task.reason = Some(format!(
-                        "{} stopped because no observable progress was recorded",
-                        execution.phase.label()
-                    ));
-                }
-                if execution.pending_revision_reason.is_some() {
-                    task.status = TaskStatus::Waiting;
-                }
-            }
-        }
-        task.updated_at_ms = self.clock.now_ms();
-        self.store.save_task(&task)
+        let current = self.task_controller.current()?;
+        self.task_controller.change(
+            &mut self.store,
+            current.as_ref().map(|task| &task.revision),
+            crate::task::TaskChange::Install(Box::new(task)),
+            now_ms,
+        )?;
+        Ok(())
     }
 
     /// Applies a transition only after the service has collected the previous owner.
@@ -2014,14 +1999,19 @@ impl HarnessBroker {
         match command.as_str() {
             "undo" => Box::pin(self.transition_undo(action)),
             "pause" | "clear" => Box::pin(self.transition_pause(command == "clear")),
-            "permission" | "configure" | "compact" => {
-                Box::pin(self.transition_settings(action, command))
-            }
-            "resume" => Box::pin(self.transition_resume(action)),
-            "plan" | "goal" => Box::pin(self.transition_start(action, command == "plan")),
-            "execute" => Box::pin(self.transition_execute(action)),
-            "attach_plan" => Box::pin(self.transition_attach_plan(action)),
-            "fork" => Box::pin(self.transition_fork_plan(action)),
+            "permission" => Box::pin(
+                self.apply_configuration(action, configuration::ConfigurationCommand::Permission),
+            ),
+            "configure" => Box::pin(
+                self.apply_configuration(action, configuration::ConfigurationCommand::Configure),
+            ),
+            "compact" => Box::pin(
+                self.apply_configuration(action, configuration::ConfigurationCommand::Compact),
+            ),
+            "resume" | "plan" | "goal" | "execute" | "attach_plan" | "fork" | "replan"
+            | "continue" => Box::pin(std::future::ready(
+                self.dispatch_session_command("task.transition", action),
+            )),
             _ => Box::pin(std::future::ready(Err(anyhow::anyhow!(
                 "unknown task action"
             )))),
@@ -2043,504 +2033,10 @@ impl HarnessBroker {
     }
 
     async fn transition_pause(&mut self, clear: bool) -> Result<(Value, Vec<SessionEvent>)> {
-        let (_, mut events) = self.pause_task(clear).await?;
-        events.extend(self.cancel_settled_execution().await?.1);
-        Ok((serde_json::to_value(self.snapshot()?)?, events))
-    }
-
-    async fn transition_settings(
-        &mut self,
-        action: Value,
-        command: String,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        use crate::task::TaskStatus;
-        let previous_permission = self.session.approval_mode;
-        let previous_access = self.session.access.abbreviation();
-        let mut access = self.session.access.clone();
-        let mut permission = self.session.approval_mode;
-        if command == "permission" {
-            let change: crate::task::PermissionChange = serde_json::from_value(
-                action
-                    .get("change")
-                    .cloned()
-                    .context("permission change is required")?,
-            )?;
-            if let Some(selection) = action.get("permission_selection") {
-                let selection: crate::task::PermissionSelection =
-                    serde_json::from_value(selection.clone())?;
-                access.sandbox = selection.sandbox;
-                access.read_access = selection.read_access;
-                access.write_access = selection.write_access;
-                permission = selection.approval_mode;
-            } else {
-                change.apply(
-                    &mut access,
-                    &mut permission,
-                    crate::backend::BackendKind::parse(&self.session.backend)?.supports_sandbox(),
-                );
-            }
-            access = access.validate()?;
-        }
-        let task = self.current_task()?;
-        let waiting = task
-            .as_ref()
-            .is_some_and(|task| task.status == TaskStatus::Waiting);
-        let resume = action
-            .get("resume")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let preserve_exchange = command == "configure"
-            && resume
-            && !waiting
-            && action
-                .get("config")
-                .and_then(Value::as_object)
-                .is_some_and(|config| {
-                    config
-                        .get("setting_fields")
-                        .and_then(Value::as_array)
-                        .is_some_and(|fields| {
-                            !fields.is_empty()
-                                && fields
-                                    .iter()
-                                    .all(|field| field.as_str() == Some("subagent_tools"))
-                        })
-                        || (config.contains_key("subagent_tools")
-                            && config.keys().all(|field| {
-                                matches!(field.as_str(), "subagent_tools" | "validate")
-                            }))
-                });
-        if !preserve_exchange {
-            Box::pin(self.pause_task(false)).await?;
-        }
-        if command == "configure" {
-            self.configuration_progress("applying").await?;
-        }
-        match command.as_str() {
-            "configure" => {
-                Box::pin(
-                    self.configure_session(
-                        action
-                            .get("config")
-                            .cloned()
-                            .context("configuration is required")?,
-                    ),
-                )
-                .await?;
-            }
-            "compact" => {
-                Box::pin(self.compact_session(true)).await?;
-            }
-            _ => {
-                Box::pin(self.configure_session(
-                    json!({"access": access, "approval_mode": permission, "session_policy": true}),
-                ))
-                .await?;
-            }
-        }
-        if command == "configure"
-            && let Some(revision) = action
-                .pointer("/config/settings_revision")
-                .and_then(Value::as_u64)
-            && self.active_operation_id.is_some()
-        {
-            self.configuration_progress("verifying").await?;
-            let operation = self
-                .active_operation_id
-                .as_deref()
-                .expect("active configuration operation");
-            let settings = crate::settings::SettingsStore::open(&self.data_root)?;
-            let snapshot = settings.get(
-                &self.session.workspace,
-                &self.session.id,
-                &self.session.backend,
-            )?;
-            anyhow::ensure!(
-                snapshot.revision == revision,
-                "settings changed before application confirmation"
-            );
-            let mut effective = snapshot.desired;
-            effective.access = Some(self.session.access.clone());
-            effective.shell = Some(self.session.shell);
-            effective.default_approval = Some(self.session.default_approval);
-            effective.plan_approval = self.session.plan_approval;
-            effective.plan_compact = Some(self.session.plan_compact);
-            effective.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions);
-            effective.approval_timeout = Some(self.session.approval_timeout);
-            effective.answer_timeout = Some(self.session.answer_timeout);
-            settings.confirm_application(&self.session.id, operation, revision, effective)?;
-        }
-        if command == "configure" {
-            let request = self.backend_catalog_request();
-            self.notify_unavailable_mcp(&request, &mut Vec::new())
-                .await?;
-        }
-        self.emit_backend_event(
-            BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "configuration_applied".into(),
-                text: None,
-                data: json!({"session":self.session,"access_abbreviation":self.session.access.abbreviation(),"operation_id":self.active_operation_id,
-                "catalog":self.backend_catalog_request()}),
-                activity: None,
-                summary: None,
-                task_update: None,
-            },
-            &mut Vec::new(),
+        self.dispatch_session_command(
+            "task.transition",
+            json!({"action":if clear { "clear" } else { "pause" }}),
         )
-        .await?;
-        if preserve_exchange {
-            self.configuration_progress("resuming").await?;
-            return Box::pin(self.resume_exchange(json!({"text":"Continue the interrupted request with the updated agent tools. Preserve completed actions and collect outstanding child results."}))).await;
-        }
-        let permission_notice = (command == "permission").then(|| format!(
-            "The user changed filesystem access from {} to {} and approval mode from {} to {}. Continue the interrupted work under the updated policy. \
-             Saved approval rules still apply. Preserve completed work. \
-             Before retrying an interrupted operation, inspect its recorded outcome and any affected files.",
-            previous_access, self.session.access.abbreviation(), previous_permission.label(), permission.label()
-        ));
-        if let Some(mut task) = self.current_task()? {
-            task.approval_mode = self.session.approval_mode;
-            task.access = self.session.access.clone();
-            if waiting {
-                task.status = TaskStatus::Waiting;
-
-                self.session.goal_id = task.goal_id.clone();
-            }
-            self.store.save_task(&task)?;
-            self.save_session()?;
-            if resume {
-                self.configuration_progress("resuming").await?;
-                if self.active_plan_awaits_input()?
-                    || self.find_active_interaction_elicitation()?.is_some()
-                {
-                    return Box::pin(self
-                        .resume_exchange(json!({"text":permission_notice.as_deref().unwrap_or("Continue the interrupted clarification using the updated settings.")})))
-                        .await;
-                }
-                let reason = match command.as_str() {
-                    "permission" => format!("Permission changed to {}", permission.label()),
-                    "configure" => "Configuration changed".into(),
-                    _ => "Context compacted".into(),
-                };
-                return self
-                    .transition_task(json!({"action":"resume","task_id":task.id,"reason":reason,"continuation":permission_notice}))
-                    .await;
-            }
-        } else if resume {
-            self.configuration_progress("resuming").await?;
-            let previous = self
-                .store
-                .latest_exchange(&self.session.id)?
-                .context("interrupted exchange is missing")?;
-            let notice = permission_notice.as_deref().unwrap_or("Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions.");
-            let prompt = if previous.elicitation().is_some() {
-                notice.to_owned()
-            } else {
-                format!("{notice}\n\nOriginal request: {}", previous.prompt)
-            };
-            return Box::pin(self.resume_exchange(json!({"text":prompt}))).await;
-        }
-        Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()))
-    }
-
-    async fn transition_resume(&mut self, action: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        use crate::task::{TaskKind, TaskStatus};
-        let continuation = action
-            .get("continuation")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let message = action
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let task_list = self.store.list_task(&self.session.id)?;
-        let task_id = action
-            .get("task_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| self.session.current_task_id.clone());
-        let mut task = if action.get("task_id").and_then(Value::as_str).is_some() {
-            task_list
-                .iter()
-                .find(|task| Some(&task.id) == task_id.as_ref())
-                .cloned()
-        } else {
-            task_list
-                .iter()
-                .find(|task| Some(&task.id) == task_id.as_ref() && !task.status.terminal())
-                .cloned()
-                .or_else(|| task_list.into_iter().find(|task| !task.status.terminal()))
-        }
-        .context("no resumable task matches this selection")?;
-        anyhow::ensure!(
-            !task.status.terminal(),
-            "task is terminal. Fork its plan or create a new task"
-        );
-        if let Some(expected) = action.get("generation").and_then(Value::as_u64) {
-            anyhow::ensure!(
-                task.generation == expected,
-                "task changed after selection. Refresh the task picker"
-            );
-        }
-        self.pause_task(false).await?;
-        self.session.current_task_id = Some(task.id.clone());
-
-        self.session.goal_id = task.goal_id.clone();
-        Box::pin(self.configure_session(json!({"access": task.access, "approval_mode": task.approval_mode, "session_policy": true}))).await?;
-        task.begin(self.clock.now_ms())?;
-        task.operation_id = self.active_operation_id.clone();
-        self.store.save_task(&task)?;
-        if task.kind == TaskKind::Execute
-            && let Some(plan_id) = task.plan_id.as_deref()
-            && self
-                .store
-                .load_plan(plan_id)?
-                .is_some_and(|plan| plan.state == PlanState::AwaitingReview)
-        {
-            task.status = TaskStatus::Waiting;
-            self.store.save_task(&task)?;
-            self.save_session()?;
-            return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
-        }
-        let resumed = match task.kind {
-            TaskKind::Plan => WorkflowActivity::Planning.event(LifecycleAction::Resumed),
-            TaskKind::Execute => WorkflowActivity::from(match task.phase.as_str() {
-                "verify" => crate::plan::PlanPhase::Verify,
-                "resolve" => crate::plan::PlanPhase::Resolve,
-                _ => crate::plan::PlanPhase::Implement,
-            })
-            .event(LifecycleAction::Resumed),
-            TaskKind::Goal => WorkflowActivity::Goal.event(LifecycleAction::Resumed),
-        };
-        let lifecycle = action
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(|reason| format!("{reason} · {resumed}"))
-            .unwrap_or(resumed);
-        if task.kind == TaskKind::Plan {
-            let plan_id = task.plan_id.clone().context("planning task has no plan")?;
-            let mut plan = self
-                .store
-                .load_plan(&plan_id)?
-                .context("task plan is missing")?;
-            if plan.state == PlanState::ConfiguringChecks {
-                return self
-                    .configure_plan_checks(message.unwrap_or_default())
-                    .await;
-            }
-            if plan.state == PlanState::Failed {
-                plan.generation.reset();
-                PlanStateMachine::apply(&mut plan, PlanEvent::RetryRequested, self.clock.now_ms())?;
-                self.store.save_plan(&plan)?;
-            }
-            if plan.state == PlanState::AwaitingReview || plan.state == PlanState::AwaitingInput {
-                task.status = TaskStatus::Waiting;
-                self.store.save_task(&task)?;
-                if let Some(text) = message {
-                    return Box::pin(self.submit_prompt_inner(json!({"text":text}))).await;
-                }
-                return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
-            }
-            let document = self
-                .plan_file
-                .read_working_document(&self.session.id, &plan_id)?;
-            let mut admission = ExchangeAdmission::plan(
-                message.clone().unwrap_or_default(),
-                Some(plan_id),
-                plan.model_revision > 0,
-            );
-            if message.is_none() {
-                admission.lifecycle = Some(lifecycle);
-            }
-            self.run_planning_interaction(PlanPrompt::with_active_document(
-                message.clone().or(continuation).unwrap_or_else(|| "Resume this planning task. Reassess the saved design against the current repository before continuing.".into()), &document.model_json()?),
-                Some(admission)).await
-        } else {
-            self.resume_goal(message, Some(lifecycle), continuation)
-                .await
-        }
-    }
-
-    async fn transition_start(
-        &mut self,
-        action: Value,
-        planning: bool,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let text = required_text(&action, "text")?;
-        self.pause_task(false).await?;
-        if planning {
-            self.submit_prompt_inner(json!({"text":format!("/plan {text}")}))
-                .await
-        } else {
-            self.set_goal(json!({"objective":text})).await
-        }
-    }
-
-    async fn transition_execute(&mut self, action: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        use crate::task::TaskKind;
-        let plans = self.store.list_plan(&self.session.id)?;
-        let selected = action
-            .get("plan_id")
-            .and_then(Value::as_str)
-            .unwrap_or("last");
-        let plan = if selected == "last" {
-            self.store
-                .list_plan_lifecycle(&self.session.id)?
-                .into_iter()
-                .rev()
-                .filter(|event| {
-                    matches!(
-                        event.kind,
-                        PlanLifecycleKind::Created | PlanLifecycleKind::RevisionCreated
-                    )
-                })
-                .find_map(|event| {
-                    plans
-                        .iter()
-                        .find(|plan| plan.id == event.plan_id && plan.model_revision > 0)
-                        .cloned()
-                })
-        } else {
-            plans.into_iter().find(|plan| plan.id == selected)
-        }
-        .context("no submitted plan matches this selection")?;
-        if let Some(task) = self
-            .store
-            .list_task(&self.session.id)?
-            .into_iter()
-            .find(|task| {
-                task.plan_id.as_deref() == Some(&plan.id) && task.kind == TaskKind::Execute
-            })
-        {
-            anyhow::ensure!(
-                !task.status.terminal(),
-                "this plan has finished. Fork it to create a new execution"
-            );
-            return self
-                .transition_task(json!({"action":"resume","task_id":task.id}))
-                .await;
-        }
-        anyhow::ensure!(
-            plan.state == PlanState::AwaitingReview,
-            "selected plan is not submitted for review"
-        );
-        let digest = plan
-            .review_digest
-            .clone()
-            .context("submitted plan has no digest")?;
-        if let Some(expected) = action.get("digest").and_then(Value::as_str) {
-            anyhow::ensure!(expected == digest, "plan changed after selection");
-        }
-        self.pause_task(false).await?;
-
-        self.session.current_task_id = None;
-        if let Some(task) = self
-            .store
-            .list_task(&self.session.id)?
-            .into_iter()
-            .find(|task| task.plan_id.as_deref() == Some(&plan.id))
-        {
-            self.session.current_task_id = Some(task.id);
-        }
-        self.save_session()?;
-        let saved_source = action.get("saved_source_digest").cloned().or_else(|| {
-            plan.acceptance
-                .as_ref()
-                .and_then(|acceptance| acceptance.saved_source_digest.as_ref())
-                .map(|digest| json!(digest))
-        });
-        let comment = action
-            .get("comment")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|comment| !comment.is_empty())
-            .map(|comment| json!(comment))
-            .or_else(|| {
-                plan.acceptance
-                    .as_ref()
-                    .and_then(|acceptance| acceptance.overall_comment.as_ref())
-                    .map(|comment| json!(comment))
-            });
-        self.accept_plan(json!({"plan_id":plan.id,"digest":digest,"approval_mode":self.session.default_approval,"saved_source_digest":saved_source,"comment":comment})).await
-    }
-
-    async fn transition_attach_plan(
-        &mut self,
-        action: Value,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        use crate::task::TaskKind;
-        let plan_id = required_text(&action, "plan_id")?;
-        let plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("selected plan is missing")?;
-        anyhow::ensure!(
-            plan.session_id == self.session.id,
-            "plan belongs to another conversation"
-        );
-        anyhow::ensure!(
-            plan.accepted_revision.is_none(),
-            "accepted plan requires its execution task. Fork the plan to start again"
-        );
-        anyhow::ensure!(
-            !self
-                .store
-                .list_task(&self.session.id)?
-                .iter()
-                .any(|task| task.plan_id.as_deref() == Some(&plan_id)),
-            "plan already has a task. Refresh the picker"
-        );
-        self.pause_task(false).await?;
-        let permission = self
-            .session
-            .plan_approval
-            .unwrap_or(self.session.approval_mode);
-        let mut task = crate::task::TaskRecord::new(
-            self.session.id.clone(),
-            plan.title,
-            TaskKind::Plan,
-            self.session.access.clone(),
-            permission,
-            self.clock.now_ms(),
-        );
-        task.plan_id = Some(plan_id);
-        self.session.current_task_id = Some(task.id.clone());
-        self.store
-            .select_task(&self.session, Some(&task), None, None, &self.client_id)?;
-        self.transition_task(json!({"action":"resume","task_id":task.id}))
-            .await
-    }
-
-    async fn transition_fork_plan(&mut self, action: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = required_text(&action, "plan_id")?;
-        let source = self
-            .store
-            .load_plan(&plan_id)?
-            .context("source plan is missing")?;
-        anyhow::ensure!(
-            source.session_id == self.session.id,
-            "source plan belongs to another conversation"
-        );
-        let mut document = self
-            .plan_file
-            .read_working_document(&self.session.id, &plan_id)?;
-        self.pause_task(false).await?;
-        document.plan_id = Uuid::new_v4().to_string();
-        document.version = 1;
-        let request = format!(
-            "Fork {}. Assess this saved design against the current repository and create a new plan. Original objective: {}",
-            source.title, source.request
-        );
-        document.prompt = request.clone();
-        if let Some(design) = document.design.as_mut() {
-            let fresh = crate::plan::DeclarationDesign::open(Path::new(&self.session.workspace))?;
-            design.baseline = fresh.baseline;
-            design.baseline_calls = fresh.baseline_calls;
-        }
-        self.start_plan(request.clone(), request, document).await
     }
 
     async fn resume_exchange(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -2595,15 +2091,7 @@ impl HarnessBroker {
             } else {
                 PlanPrompt::question_follow_up(&elicitation_json, &follow_up)
             };
-            let mode = if pending_plan.is_none()
-                && interaction.kind == ExchangeKind::Chat
-                && interaction.plan_id.is_some()
-                && interaction.check_setup.is_none()
-            {
-                PromptMode::PlanDiscussion
-            } else {
-                PromptMode::Chat
-            };
+            let mode = self.task_prompt_mode()?;
             let (value, event) = self.run_interaction(prompt, mode, None).await?;
             return if let Some(plan) = pending_plan {
                 self.finish_plan_clarification(&plan.id, value, event).await
@@ -2615,24 +2103,7 @@ impl HarnessBroker {
             !interaction.awaiting_input(),
             "the latest Harness exchange is awaiting a user decision"
         );
-        if let Some(mut task) = self
-            .current_task()?
-            .filter(|task| task.status == crate::task::TaskStatus::Paused)
-        {
-            task.begin(self.clock.now_ms())?;
-            self.store.save_task(&task)?;
-        }
-        let mode = match interaction.kind {
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => PromptMode::Plan,
-            ExchangeKind::PlanExecution => PromptMode::ExecutePlan,
-            ExchangeKind::Chat if interaction.goal_id.is_some() => PromptMode::GoalContinuation,
-            ExchangeKind::Chat
-                if interaction.plan_id.is_some() && interaction.check_setup.is_none() =>
-            {
-                PromptMode::PlanDiscussion
-            }
-            ExchangeKind::Chat => PromptMode::Chat,
-        };
+        let mode = self.task_prompt_mode()?;
         if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
             self.run_planning_interaction(text, None).await
         } else {
@@ -2989,7 +2460,7 @@ impl HarnessBroker {
                 data: serde_json::to_value(snapshot.agent)?,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             },
             event,
         )
@@ -3041,7 +2512,7 @@ impl HarnessBroker {
                     data: serde_json::to_value(approval)?,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 event,
             )
@@ -3408,7 +2879,7 @@ impl HarnessBroker {
                 ChildExchangeRuntime {
                     exchange,
                     synthetic_turn: None,
-                    task: TaskTracker::default(),
+                    checklist: ChecklistTracker::default(),
                 }
             }
         };
@@ -3466,12 +2937,16 @@ impl HarnessBroker {
             runtime
                 .exchange
                 .observe_turn(&backend_event, self.clock.now_ms())?;
-            if let Some(update) = &backend_event.task_update {
-                runtime.task.replace(update);
-                runtime.exchange.task = Some(runtime.task.snapshot().clone());
+            if let Some(update) = &backend_event.checklist_update {
+                runtime.checklist.replace(update);
+                runtime.exchange.checklist = Some(runtime.checklist.snapshot().clone());
             }
             if backend_event.address.is_some() {
-                attribute_provider_tool(&mut runtime.exchange, &mut runtime.task, &backend_event)?;
+                attribute_provider_tool(
+                    &mut runtime.exchange,
+                    &mut runtime.checklist,
+                    &backend_event,
+                )?;
             }
         }
         if backend_event.tool_output_delta().is_some() {
@@ -3676,8 +3151,10 @@ impl HarnessBroker {
     }
 
     async fn submit_prompt(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let mut snapshot_session = self.session.clone();
+        snapshot_session.active_task = self.task_controller.current()?;
         let snapshot = PromptControlSnapshot {
-            session: self.session.clone(),
+            session: snapshot_session,
             goal: self.current_goal()?,
             execution: self.store.list_plan_execution(&self.session.id)?,
             plan: self.store.list_plan(&self.session.id)?,
@@ -3731,7 +3208,7 @@ impl HarnessBroker {
                             data: transition,
                             activity: None,
                             summary: None,
-                            task_update: None,
+                            checklist_update: None,
                         },
                         &mut submission_event,
                     ))
@@ -3771,7 +3248,7 @@ impl HarnessBroker {
                     data: transition,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 event,
             )
@@ -3782,11 +3259,77 @@ impl HarnessBroker {
 
     async fn submit_prompt_inner(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         self.require_restore_recovered()?;
+        let text = required_text(&params, "text")?;
+        let purpose = std::mem::take(&mut self.input_purpose);
+        if matches!(purpose, crate::input::InputPurpose::User) {
+            let operation_id = params
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .or(self.active_operation_id.as_deref());
+            if let Some(command) =
+                crate::task::command::SessionCommand::parse_text(&text, operation_id)?
+            {
+                return self.commit_session_command(command);
+            }
+        }
         anyhow::ensure!(
             self.check_runner.active()?.is_none(),
             "wait for or cancel the active check run before starting source work"
         );
-        let text = required_text(&params, "text")?;
+        if !matches!(purpose, crate::input::InputPurpose::User) {
+            let (revision, origin) = match purpose {
+                crate::input::InputPurpose::TaskEntry {
+                    revision, start, ..
+                } => (
+                    revision,
+                    crate::exchange::ExchangeOrigin::TaskStarted { start },
+                ),
+                crate::input::InputPurpose::TaskContinuation {
+                    revision, reason, ..
+                } => (
+                    revision,
+                    crate::exchange::ExchangeOrigin::task_continuation(reason),
+                ),
+                crate::input::InputPurpose::User => unreachable!(),
+            };
+            let task = self
+                .task_controller
+                .current()?
+                .context("task input was cleared before dispatch")?;
+            anyhow::ensure!(
+                task.revision == revision,
+                "task input was replaced before dispatch"
+            );
+            if let crate::task::TaskWorkflow::Plan { plan } = &task.workflow {
+                let mut admission = ExchangeAdmission::chat(text.clone());
+                admission.origin = origin;
+                if plan.artifact.state == PlanState::ConfiguringChecks {
+                    self.observer.set_check_editing(true)?;
+                    self.check_setup = true;
+                    let result = self
+                        .run_interaction(text, PromptMode::Chat, Some(admission))
+                        .await;
+                    self.check_setup = false;
+                    return result;
+                }
+                return self.run_planning_interaction(text, Some(admission)).await;
+            }
+            let mode = if task.kind() == crate::task::TaskKind::Execute {
+                PromptMode::ExecutePlan
+            } else {
+                PromptMode::GoalContinuation
+            };
+            let mut admission = ExchangeAdmission::chat(text.clone());
+            admission.origin = origin;
+            return self
+                .run_interaction_input(
+                    text.clone(),
+                    mode,
+                    Some(admission),
+                    BackendInput::from_text(text),
+                )
+                .await;
+        }
         if text.trim() == "/plan" {
             return self.observer.list_replanning_choices();
         }
@@ -3820,26 +3363,16 @@ impl HarnessBroker {
         if text == "/clear" {
             return Box::pin(self.new_session(Value::Null)).await;
         }
-        if text == "/plan cancel" {
-            let plan_id = self
-                .current_task()?
-                .and_then(|task| task.plan_id)
-                .context("no current planning task")?;
-            return self.cancel_plan(json!({"plan_id":plan_id}));
-        }
-        if text == "/plan retry" {
-            return Box::pin(self.retry_plan()).await;
-        }
-        if let Some(selection) = text.strip_prefix("/replan ") {
-            return Box::pin(self.replan(selection)).await;
-        }
-        if !text.starts_with('/')
-            && let Some(task) = self
-                .current_task()?
-                .filter(|task| task.status == crate::task::TaskStatus::Paused)
-        {
+        if self.task_controller.current()?.is_some_and(|task| {
+            task.status() == crate::task::TaskStatus::Paused || !task.entry_accepted()
+        }) {
             return self
-                .transition_task(json!({"action":"resume","task_id":task.id,"text":text}))
+                .run_interaction_input(
+                    text.clone(),
+                    PromptMode::Chat,
+                    Some(ExchangeAdmission::chat(text.clone())),
+                    BackendInput::parse(&text),
+                )
                 .await;
         }
         let failed_plan_active = self
@@ -3853,50 +3386,6 @@ impl HarnessBroker {
             !failed_plan_active,
             "plan generation stopped; run /plan retry or /plan cancel"
         );
-        anyhow::ensure!(
-            text != "/replan",
-            "select a plan and revision with the /replan picker"
-        );
-        let explicit_plan_request = text.strip_prefix("/plan ");
-        let plan_request = explicit_plan_request;
-        if let Some(request) = plan_request {
-            anyhow::ensure!(!request.trim().is_empty(), "usage: /plan <prompt>");
-            let plan_id = Uuid::new_v4().to_string();
-            let document = PlanDocument {
-                schema_version: crate::plan::PLAN_SCHEMA_VERSION,
-                version: 1,
-                plan_id: plan_id.clone(),
-                title: crate::plan::PROVISIONAL_PLAN_TITLE.into(),
-                prompt: request.to_owned(),
-                overview: "Planning in progress.".into(),
-                design: None,
-                usage: None,
-                entity_changes: Vec::new(),
-                dependencies: Vec::new(),
-                flows: Vec::new(),
-                stages: Vec::new(),
-                assumptions: Vec::new(),
-            };
-            return Box::pin(self.start_plan(request.to_owned(), text.clone(), document)).await;
-        }
-        match text.as_str() {
-            "/goal pause" => return Box::pin(self.pause_goal()).await,
-            "/goal resume" => return Box::pin(self.resume_goal(None, None, None)).await,
-            "/goal clear" => return Box::pin(self.clear_goal()).await,
-            _ => {}
-        }
-        if let Some(objective) = text.strip_prefix("/goal ") {
-            return Box::pin(self.set_goal(json!({ "objective": objective }))).await;
-        }
-        if let Some(task) = self.current_task()?
-            && task.status == crate::task::TaskStatus::Paused
-        {
-            return self
-                .transition_task(json!({
-                    "action":"resume", "task_id":task.id, "text":text,
-                }))
-                .await;
-        }
         if let Some(plan) = self
             .current_plan_id()?
             .as_deref()
@@ -3952,12 +3441,11 @@ impl HarnessBroker {
             .transpose()?
             .flatten();
         if self.current_task_is_plan()?
-            && let Some(plan) = active_plan
+            && active_plan
                 .as_ref()
-                .filter(|plan| plan.state == PlanState::AwaitingReview)
+                .is_some_and(|plan| plan.state == PlanState::AwaitingReview)
         {
-            let mut admission = ExchangeAdmission::chat(text.clone());
-            admission.plan_id = Some(plan.id.clone());
+            let admission = ExchangeAdmission::chat(text.clone());
             return Box::pin(self.run_planning_interaction(text, Some(admission))).await;
         }
         let prompt = match active_plan.as_ref() {
@@ -4010,55 +3498,43 @@ impl HarnessBroker {
         &mut self,
         snapshot: PromptControlSnapshot,
     ) -> Result<()> {
-        let current_goal = self.current_goal()?;
-        let goal_changed = match (&current_goal, &snapshot.goal) {
-            (Some(current), Some(restored)) => {
-                current.id != restored.id
-                    || current.objective != restored.objective
-                    || current.state != restored.state
+        let current = self.task_controller.current()?;
+        let unchanged = match (&current, &snapshot.session.active_task) {
+            (Some(current), Some(original)) => {
+                current.revision == original.revision && current.same_contract(original)
             }
-            (None, None) => false,
-            _ => true,
+            (None, None) => true,
+            _ => false,
         };
-        let current_goal_id = self.session.goal_id.clone();
-        let restored_goal_id = snapshot.goal.as_ref().map(|goal| goal.id.as_str());
-        if current_goal_id.as_deref() != restored_goal_id
-            && let Some(goal_id) = current_goal_id.as_deref()
-        {
-            self.store.delete_goal(goal_id)?;
-        }
-        if let Some(goal) = snapshot.goal.as_ref() {
-            self.store.save_goal(goal)?;
-        }
-        for execution in &snapshot.execution {
-            self.store.save_plan_execution(execution)?;
-        }
-        let restored_plan_id = snapshot
-            .plan
-            .iter()
-            .map(|plan| plan.id.as_str())
-            .collect::<HashSet<_>>();
-        for plan in self.store.list_plan(&self.session.id)? {
-            if !restored_plan_id.contains(plan.id.as_str()) {
-                self.store.delete_plan(&plan.id)?;
-                self.plan_file.delete_plan(&self.session.id, &plan.id)?;
+        if unchanged {
+            for execution in &snapshot.execution {
+                self.store.save_plan_execution(execution)?;
             }
-        }
-        for plan in &snapshot.plan {
-            self.store.save_plan(plan)?;
+            let restored_plan_id = snapshot
+                .plan
+                .iter()
+                .map(|plan| plan.id.as_str())
+                .collect::<HashSet<_>>();
+            for plan in self.store.list_plan(&self.session.id)? {
+                if !restored_plan_id.contains(plan.id.as_str()) {
+                    self.store.delete_plan(&plan.id)?;
+                    self.plan_file.delete_plan(&self.session.id, &plan.id)?;
+                }
+            }
+            for plan in &snapshot.plan {
+                self.store.save_plan(plan)?;
+            }
         }
         self.session = snapshot.session;
+        self.session.active_task = current;
         self.save_session()?;
-
-        if goal_changed && self.capability.native_goal && self.session.backend_session_id.is_some()
-        {
+        if unchanged && self.capability.native_goal && self.session.backend_session_id.is_some() {
             let request = self.backend_request(BackendInput::from_text(""), PromptMode::Chat);
             match snapshot.goal {
                 Some(goal) => {
-                    let status = goal_state_name(goal.state);
                     self.backend
-                        .goal_status(request, Some(goal.objective), status)
-                        .await?;
+                        .goal_status(request, Some(goal.objective), goal_state_name(goal.state))
+                        .await?
                 }
                 None => self.backend.goal_status(request, None, "cleared").await?,
             }
@@ -4080,7 +3556,7 @@ impl HarnessBroker {
             .context("active plan has no elicitation state")?
             .answer(&question_id, response)?;
         plan.updated_at_ms = self.clock.now_ms();
-        self.store.save_plan(&plan)?;
+        self.publish_plan(&plan)?;
         Ok((
             serde_json::to_value(&plan)?,
             vec![self.event("plan_question_updated", json!({ "plan": plan }))?],
@@ -4105,7 +3581,7 @@ impl HarnessBroker {
             .elicitation
             .answer(&question_id, response)?;
         plan.updated_at_ms = self.clock.now_ms();
-        self.store.save_plan(&plan)?;
+        self.publish_plan(&plan)?;
         let snapshot = self.snapshot()?;
         Ok((
             serde_json::to_value(&snapshot)?,
@@ -4163,7 +3639,7 @@ impl HarnessBroker {
             elicitation.answer_from_model(&answer.question_id, answer.response)?;
             has_pending_question = elicitation.current_question().is_some();
             plan.updated_at_ms = self.clock.now_ms();
-            self.store.save_plan(&plan)?;
+            self.publish_plan(&plan)?;
         } else {
             let mut interaction = self.active_interaction_elicitation()?;
             let elicitation = interaction
@@ -4202,7 +3678,7 @@ impl HarnessBroker {
             }
             PlanStateMachine::apply(&mut plan, PlanEvent::FeedbackConsumed, now_ms)?;
             plan.generation.reset_no_progress();
-            self.store.save_plan(&plan)?;
+            self.publish_plan(&plan)?;
             let lifecycle = PlanLifecycleRecord {
                 title: plan.title.clone(),
                 anchor: Some(self.plan_exchange_anchor(&plan.id)?),
@@ -4256,7 +3732,7 @@ impl HarnessBroker {
                 .context("active plan has no elicitation state")?
                 .replace_question_set(question.clone());
             plan.updated_at_ms = self.clock.now_ms();
-            self.store.save_plan(&plan)?;
+            self.publish_plan(&plan)?;
             let lifecycle = PlanLifecycleRecord {
                 title: plan.title.clone(),
                 anchor: Some(self.plan_exchange_anchor(&plan.id)?),
@@ -4291,7 +3767,6 @@ impl HarnessBroker {
             "question",
             json!({
                 "owner": "interaction",
-                "plan_id": owner.plan_id,
                 "exchange_id": owner.id,
                 "elicitation": owner.elicitation(),
             }),
@@ -4355,12 +3830,19 @@ impl HarnessBroker {
 
     /// Capture the owning planning exchange for a user review or question action.
     fn plan_exchange_anchor(&self, plan_id: &str) -> Result<crate::plan::ExchangeAnchor> {
-        let exchange = self
+        if let Some(anchor) = self
             .store
-            .list_exchange_metadata(&self.session.id)?
+            .list_plan_lifecycle(&self.session.id)?
             .into_iter()
             .rev()
-            .find(|exchange| exchange.plan_id.as_deref() == Some(plan_id))
+            .filter(|lifecycle| lifecycle.plan_id == plan_id)
+            .find_map(|lifecycle| lifecycle.anchor)
+        {
+            return Ok(anchor);
+        }
+        let exchange = self
+            .store
+            .latest_exchange(&self.session.id)?
             .context("planning event has no owning exchange")?;
         Ok(crate::plan::ExchangeAnchor::capture(&exchange))
     }
@@ -4378,7 +3860,7 @@ impl HarnessBroker {
             .latest_exchange(&self.session.id)?
             .context("planning feedback has no owning exchange")?;
         anyhow::ensure!(
-            exchange.plan_id.as_deref() == Some(plan_id)
+            self.current_plan_id()?.as_deref() == Some(plan_id)
                 && exchange.state() == ExchangeState::Running,
             "planning feedback does not target the active exchange"
         );
@@ -4424,7 +3906,7 @@ impl HarnessBroker {
             crate::exchange::InputIntent::Clarification,
             Some(target),
         )?;
-        self.store.save_plan(&plan)?;
+        self.publish_plan(&plan)?;
         let (value, event) = self
             .run_interaction(
                 PlanPrompt::clarification(&plan.request, &elicitation_json, &text),
@@ -4539,15 +4021,7 @@ impl HarnessBroker {
         let (value, event) = self
             .run_interaction(
                 PlanPrompt::question_follow_up(&elicitation_json, &text),
-                if interaction.kind == ExchangeKind::Chat
-                    && interaction.plan_id.is_some()
-                    && interaction.check_setup.is_none()
-                    && interaction.plan_id.is_some()
-                {
-                    PromptMode::PlanDiscussion
-                } else {
-                    PromptMode::Chat
-                },
+                self.task_prompt_mode()?,
                 None,
             )
             .await?;
@@ -4605,9 +4079,8 @@ impl HarnessBroker {
         }
         PlanStateMachine::apply(&mut plan, PlanEvent::FeedbackConsumed, now_ms)?;
         plan.generation.reset_no_progress();
-        self.store.save_plan(&plan)?;
+        self.publish_plan(&plan)?;
         self.record_plan_trace("feedback_consumed", plan_trace_fields(&plan));
-        self.settle_task(None)?;
         let lifecycle = PlanLifecycleRecord {
             title: plan.title.clone(),
             anchor: Some(self.plan_exchange_anchor(&plan.id)?),
@@ -4696,11 +4169,10 @@ impl HarnessBroker {
         let prompt = format!(
             "Harness resolved the pending questions and recorded their response sources. Do not call question_answer or question_withdraw for this set. Continue the original request using the responses and current task context.\n\n{feedback}"
         );
-        let (value, mut event) = if interaction.kind == ExchangeKind::Chat
-            && interaction.plan_id.is_some()
-            && interaction.check_setup.is_none()
-            && interaction.plan_id.is_some()
-        {
+        let (value, mut event) = if matches!(
+            self.task_prompt_mode()?,
+            PromptMode::Plan | PromptMode::PlanDiscussion
+        ) {
             self.run_planning_interaction(prompt, None).await?
         } else {
             self.run_interaction(prompt, PromptMode::Chat, None).await?
@@ -4721,42 +4193,37 @@ impl HarnessBroker {
 
     async fn continue_after_approval_timeout(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let owner = crate::backend::ExecutionOwner::root(&self.session.id);
-        let latest = self.store.latest_exchange(&self.session.id)?;
-        if let Some(goal) = self.current_goal()?
-            && latest
-                .as_ref()
-                .is_some_and(|exchange| exchange.goal_id.as_deref() == Some(goal.id.as_str()))
-        {
-            if goal.state == GoalState::Active {
-                return self.continue_goal().await;
-            }
-            self.permission_coordinator.take_timeout_feedback(&owner)?;
-            return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
-        }
         let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? else {
             return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
         };
-        if let Some(exchange) = latest.as_ref()
-            && matches!(
-                exchange.kind,
-                ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
-            )
-        {
-            let mut admission = ExchangeAdmission::plan(
-                String::new(),
-                exchange.plan_id.clone(),
-                exchange.kind == ExchangeKind::PlanRevision,
-            );
-            admission.lifecycle =
-                Some(WorkflowActivity::from_exchange(exchange).event(LifecycleAction::Continued));
-            self.run_planning_interaction(feedback, Some(admission))
-                .await
-        } else {
-            let mut admission = ExchangeAdmission::chat(String::new());
-            admission.lifecycle = Some(WorkflowActivity::Working.event(LifecycleAction::Continued));
-            self.run_interaction(feedback, PromptMode::Chat, Some(admission))
-                .await
+        if let Some(task) = self.task_controller.current()? {
+            if matches!(
+                task.status(),
+                crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting
+            ) {
+                let exchange = self
+                    .store
+                    .latest_exchange(&self.session.id)?
+                    .context("task has no completed turn")?;
+                self.task_controller.reserve_continuation(
+                    &mut self.store,
+                    &task.permit(),
+                    crate::task::TaskTurnId {
+                        exchange_ordinal: exchange.ordinal,
+                        turn_ordinal: exchange.turn.len(),
+                    },
+                    feedback,
+                    "An approval timed out".into(),
+                    self.clock.now_ms(),
+                )?;
+            }
+            return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
         }
+        let mut admission = ExchangeAdmission::chat(feedback.clone());
+        admission.origin =
+            crate::exchange::ExchangeOrigin::task_continuation("An approval timed out");
+        self.run_interaction(feedback, PromptMode::Chat, Some(admission))
+            .await
     }
 
     /// Publish canonical input ownership after a durable state transition.
@@ -4855,7 +4322,7 @@ impl HarnessBroker {
                 {
                     elicitation.expire()?;
                     if let Some(plan) = &plan {
-                        self.store.save_plan(plan)?;
+                        self.publish_plan(plan)?;
                     }
                     if let Some(interaction) = &interaction {
                         self.store.save_exchange(interaction)?;
@@ -4919,145 +4386,139 @@ impl HarnessBroker {
 
     async fn run_planning_interaction(
         &mut self,
-        mut prompt: String,
-        mut admission: Option<ExchangeAdmission>,
+        prompt: String,
+        admission: Option<ExchangeAdmission>,
     ) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut accumulated_event = Vec::new();
-        loop {
-            let plan_id = self
-                .current_plan_id()?
-                .context("planning continuation has no active plan")?;
-            let before_document = self
-                .plan_file
-                .read_working_document(&self.session.id, &plan_id)?;
-            let before_digest = plan_digest(&serde_json::to_vec(&before_document)?);
-            let discussion = self
-                .store
-                .load_plan(&plan_id)?
-                .is_some_and(|plan| plan.state == PlanState::AwaitingReview);
-            let result = self
-                .run_interaction(
-                    prompt,
-                    if discussion {
-                        PromptMode::PlanDiscussion
-                    } else {
-                        PromptMode::Plan
-                    },
-                    admission.take(),
-                )
-                .await;
-            let (value, mut event) = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    if error.downcast_ref::<TurnCancelled>().is_some() {
-                        return Err(error);
-                    }
-                    let mut plan = self
-                        .store
-                        .load_plan(&plan_id)?
-                        .context("planning continuation lost its plan record")?;
-                    if matches!(
-                        plan.state,
-                        PlanState::Generating | PlanState::Revising | PlanState::AwaitingInput
-                    ) {
-                        PlanStateMachine::apply(
-                            &mut plan,
-                            PlanEvent::TransitionFailed,
-                            self.clock.now_ms(),
-                        )?;
-                        self.store.save_plan(&plan)?;
-                    }
-                    return Err(error);
-                }
-            };
-            accumulated_event.append(&mut event);
-            let mut plan = self
-                .store
-                .load_plan(&plan_id)?
-                .context("planning continuation lost its plan record")?;
-            if discussion && plan.state == PlanState::AwaitingReview {
-                return Ok((value, accumulated_event));
-            }
-            let after_document = self
-                .plan_file
-                .read_working_document(&self.session.id, &plan_id)?;
-            let canonical_progress =
-                plan_digest(&serde_json::to_vec(&after_document)?) != before_digest;
-            if canonical_progress {
-                plan.generation.canonical_revision =
-                    plan.generation.canonical_revision.saturating_add(1);
-            }
-            let continuation_allowed = plan.generation.observe(canonical_progress);
-            self.store.save_plan(&plan)?;
-            if matches!(
-                plan.state,
-                PlanState::AwaitingReview | PlanState::AwaitingInput
-            ) {
-                return Ok((value, accumulated_event));
-            }
-            if !matches!(plan.state, PlanState::Generating | PlanState::Revising) {
-                return Ok((value, accumulated_event));
-            }
-
-            if !continuation_allowed {
-                PlanStateMachine::apply(
-                    &mut plan,
-                    PlanEvent::TransitionFailed,
-                    self.clock.now_ms(),
-                )?;
-                self.store.save_plan(&plan)?;
-                self.record_plan_trace("plan_generation_exhausted", plan_trace_fields(&plan));
-                accumulated_event.push(self.event(
-                    "plan_generation_failed",
-                    json!({
-                        "plan": plan,
-                        "reason": "planning stopped without submitting the canonical plan"
-                    }),
-                )?);
-                return Ok((serde_json::to_value(self.snapshot()?)?, accumulated_event));
-            }
-            self.record_plan_trace(
-                "plan_generation_retry",
-                json!({
-                    "plan": plan_trace_fields(&plan),
-                    "turn": plan.generation.budget.turn_count + 1,
-                    "max_turn": plan.generation.budget.max_turn_count,
-                    "canonical_progress": canonical_progress,
-                }),
-            );
-            accumulated_event.push(self.event(
-                "plan_generation_retry",
-                json!({
-                    "plan_id": plan.id,
-                    "turn": plan.generation.budget.turn_count + 1,
-                    "max_turn": plan.generation.budget.max_turn_count,
-                    "canonical_progress": canonical_progress,
-                }),
-            )?);
-            prompt = format!(
-                "Continue the active planning task. The previous provider turn ended without a \
-terminal planning action. Edit the proposed declaration files if needed, then call \
-plan_submit. Ask only a genuinely new unresolved question with \
-question_ask when the user's question preferences allow it. Do not repeat resolved questions. Prose alone does not submit a plan. Report persistent control failures clearly instead of retrying unchanged rejected requests.\n\n\
-Planning continuation: turn {} of {}.",
-                plan.generation.budget.turn_count + 1,
-                plan.generation.budget.max_turn_count
-            );
-            let mut continuation = ExchangeAdmission::plan(
-                String::new(),
-                Some(plan.id.clone()),
-                plan.model_revision > 0,
-            );
-            continuation.lifecycle = Some(
-                if plan.state == PlanState::Revising {
-                    WorkflowActivity::Revising
+        let task = self
+            .task_controller
+            .current()?
+            .context("planning requires an active task")?;
+        let crate::task::TaskWorkflow::Plan { plan } = &task.workflow else {
+            anyhow::bail!("planning requires a Plan task");
+        };
+        let plan_id = plan.artifact.id.clone();
+        let before = self
+            .plan_file
+            .read_working_document(&self.session.id, &plan_id)?;
+        let before_digest = plan_digest(&serde_json::to_vec(&before)?);
+        let discussion = plan.artifact.state == PlanState::AwaitingReview;
+        let result = self
+            .run_interaction(
+                prompt,
+                if discussion {
+                    PromptMode::PlanDiscussion
                 } else {
-                    WorkflowActivity::Planning
-                }
-                .event(LifecycleAction::Continued),
-            );
-            admission = Some(continuation);
+                    PromptMode::Plan
+                },
+                admission,
+            )
+            .await;
+        let current = self.task_controller.current()?;
+        let Some(current) = current.filter(|current| {
+            matches!(&current.workflow,
+            crate::task::TaskWorkflow::Plan { plan } if plan.artifact.id == plan_id && !plan.paused)
+        }) else {
+            return result;
+        };
+        if task.permit().validate(Some(&current)).is_err()
+            && !matches!(&current.workflow, crate::task::TaskWorkflow::Plan { plan }
+                if matches!(plan.artifact.state, PlanState::AwaitingReview | PlanState::AwaitingInput))
+        {
+            return result;
         }
+        let (mut value, mut events) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if !error.is::<TurnCancelled>() {
+                    let now_ms = self.clock.now_ms();
+                    if let Err(persistence) = self.task_controller.update(
+                        &mut self.store,
+                        &current.permit(),
+                        now_ms,
+                        |task| {
+                            let crate::task::TaskWorkflow::Plan { plan } = &mut task.workflow
+                            else {
+                                anyhow::bail!("plan was replaced")
+                            };
+                            if matches!(
+                                plan.artifact.state,
+                                PlanState::Generating
+                                    | PlanState::Revising
+                                    | PlanState::AwaitingInput
+                            ) {
+                                PlanStateMachine::apply(
+                                    &mut plan.artifact,
+                                    PlanEvent::TransitionFailed,
+                                    now_ms,
+                                )?;
+                            }
+                            Ok(())
+                        },
+                    ) && !persistence.is::<crate::task::StaleTask>()
+                    {
+                        return Err(persistence).context("persist planning failure");
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let crate::task::TaskWorkflow::Plan { plan } = &current.workflow else {
+            unreachable!()
+        };
+        if discussion && plan.artifact.state == PlanState::AwaitingReview {
+            return Ok((value, events));
+        }
+        let after = self
+            .plan_file
+            .read_working_document(&self.session.id, &plan_id)?;
+        let progress = plan_digest(&serde_json::to_vec(&after)?) != before_digest;
+        let mut completed = self
+            .store
+            .latest_exchange(&self.session.id)?
+            .context("planning progress has no completed exchange")?;
+        let observed = self.task_controller.observe_plan(
+            &mut self.store,
+            &current.permit(),
+            crate::task::TaskTurnId {
+                exchange_ordinal: completed.ordinal,
+                turn_ordinal: completed.turn.len(),
+            },
+            progress,
+            self.clock.now_ms(),
+        );
+        let Some((plan, _)) = (match observed {
+            Ok(result) => result,
+            Err(error) if error.is::<crate::task::StaleTask>() => return Ok((value, events)),
+            Err(error) => return Err(error),
+        }) else {
+            return Ok((value, events));
+        };
+        if !completed.awaiting_input() && !completed.is_finished() {
+            self.capture_final_checkpoint(
+                &mut completed,
+                crate::exchange::ExchangeOutcome::Complete,
+            )
+            .await?;
+            completed.finish(
+                crate::exchange::ExchangeOutcome::Complete,
+                self.clock.now_ms(),
+            )?;
+            self.store.save_exchange(&completed)?;
+            self.exchange_runtime = None;
+            value["exchange"] = json!({"id":completed.id,"state":completed.state()});
+            events.push(self.event(
+                "exchange_complete",
+                json!({"id":completed.id,"state":completed.state()}),
+            )?);
+        }
+        if plan.state == PlanState::Failed {
+            events.push(self.event(
+                "plan_generation_failed",
+                json!({"plan":plan,
+                "reason":"planning stopped without submitting the canonical plan"}),
+            )?);
+        }
+        Ok((value, events))
     }
 
     async fn run_interaction_input(
@@ -5113,28 +4574,11 @@ Planning continuation: turn {} of {}.",
         };
         if interaction.state() != ExchangeState::Complete
             || interaction.awaiting_input()
-            || interaction.plan_id.is_some()
-            || interaction.execution_id.is_some()
             || interaction.check_setup.is_some()
         {
             return Ok(result);
         }
-        let goal = interaction
-            .goal_id
-            .as_deref()
-            .map(|id| self.store.load_goal(id))
-            .transpose()?
-            .flatten();
-        if goal
-            .as_ref()
-            .is_some_and(|goal| goal.state != GoalState::Complete)
-        {
-            return Ok(result);
-        }
-        if self
-            .current_goal()?
-            .is_some_and(|goal| goal.state != GoalState::Complete)
-        {
+        if self.task_controller.current()?.is_some() {
             return Ok(result);
         }
         let settings = crate::settings::SettingsStore::open(&self.data_root)?;
@@ -5162,11 +4606,7 @@ Planning continuation: turn {} of {}.",
         let Some(change_owner) = interaction.check_owner.clone() else {
             return Ok(result);
         };
-        let task = self.current_task()?.filter(|task| !task.status.terminal());
-        let owner = task
-            .as_ref()
-            .map(|task| task.id.clone())
-            .unwrap_or(change_owner.clone());
+        let owner = change_owner.clone();
         let mut automatic = AutomaticChecks::open(&self.check_runner.root, &owner)?;
         let timing = check_settings.check_timing.unwrap_or_default();
         if self
@@ -5212,7 +4652,7 @@ Planning continuation: turn {} of {}.",
                 self.store
                     .capture_timeline_owner(&self.session.id, &interaction.id)?,
                 RunRequest::default(),
-                task.as_ref().map(|task| task.id.clone()),
+                None,
                 self.session.shell,
                 "Automatic completion checks".into(),
             )?;
@@ -5232,11 +4672,6 @@ Planning continuation: turn {} of {}.",
             }
             automatic.pending = true;
             automatic.save()?;
-            if let Some(mut task) = self.current_task()? {
-                task.status = crate::task::TaskStatus::Running;
-                task.phase = "checks".into();
-                self.store.save_task(&task)?;
-            }
             run.context.automatic = true;
             let run = self
                 .check_runner
@@ -5265,40 +4700,10 @@ Planning continuation: turn {} of {}.",
             }
             let repair = automatic.observe(&run)?;
             if matches!(run.state, CheckState::Stopped | CheckState::ExecutionError) {
-                if let Some(mut task) = self.current_task()? {
-                    task.status = crate::task::TaskStatus::Paused;
-                    task.reason = Some(if run.state == CheckState::Stopped {
-                        "Checks stopped. Run checks explicitly to retry unchanged inputs.".into()
-                    } else {
-                        "Check execution needs attention. Inspect the recorded execution error."
-                            .into()
-                    });
-                    self.store.save_task(&task)?;
-                }
                 result.0["automatic_checks"] = json!({"run_id":run.id,"state":run.state});
                 return Ok(result);
             }
             if let Some(reason) = &automatic.blocked {
-                if let Some(mut task) = self.current_task()? {
-                    task.status = crate::task::TaskStatus::Blocked;
-                    task.phase = "checks".into();
-                    task.reason = Some(reason.clone());
-                    self.store.save_task(&task)?;
-                }
-                if let Some(mut goal) = goal
-                    .as_ref()
-                    .map(|goal| self.store.load_goal(&goal.id))
-                    .transpose()?
-                    .flatten()
-                {
-                    goal.state = GoalState::Blocked;
-                    goal.updated_at_ms = self.clock.now_ms();
-                    self.store.save_goal(&goal)?;
-                    result.1.retain(|event| event.event != "goal_changed");
-                    result
-                        .1
-                        .push(self.event("goal_changed", serde_json::to_value(goal)?)?);
-                }
                 self.emit_backend_event(
                     BackendEvent {
                         received_at_ms: None,
@@ -5309,7 +4714,7 @@ Planning continuation: turn {} of {}.",
                         data: json!({"owner":owner,"run_id":run.id}),
                         activity: None,
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     },
                     &mut result.1,
                 )
@@ -5322,25 +4727,6 @@ Planning continuation: turn {} of {}.",
                 result.0["automatic_checks"] = json!({"run_id":run.id,"state":run.state});
                 return Ok(result);
             };
-            if let Some(mut current_goal) = goal
-                .as_ref()
-                .map(|goal| self.store.load_goal(&goal.id))
-                .transpose()?
-                .flatten()
-            {
-                if current_goal.continuation.turn_count >= current_goal.continuation.max_turn_count
-                {
-                    automatic.blocked = Some("Automatic repair requires another provider turn, but the goal turn limit is exhausted.".into());
-                    automatic.save()?;
-                    current_goal.state = GoalState::Blocked;
-                    self.store.save_goal(&current_goal)?;
-                    result.0["automatic_checks"] =
-                        json!({"run_id":run.id,"blocked":automatic.blocked});
-                    return Ok(result);
-                }
-                current_goal.continuation.turn_count += 1;
-                self.store.save_goal(&current_goal)?;
-            }
             let mut admission = ExchangeAdmission::chat(String::new());
             admission.check_owner = Some(change_owner.clone());
             admission.automatic_owner = Some(owner.clone());
@@ -5411,7 +4797,7 @@ Planning continuation: turn {} of {}.",
                 data: serde_json::to_value(&interaction)?,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             },
             &interaction,
             &mut event,
@@ -5450,14 +4836,19 @@ Planning continuation: turn {} of {}.",
         });
         self.active_wait_projection = None;
         self.exchange_runtime = Some(ExchangeRuntime {
+            task_permit: self
+                .task_controller
+                .current()?
+                .filter(|task| task.entry_accepted())
+                .map(|task| task.permit()),
             checkpoint,
             tool_gate,
             exchange_id: interaction.id.clone(),
             synthetic_turn: None,
-            task: interaction
-                .task
+            checklist: interaction
+                .checklist
                 .clone()
-                .map(TaskTracker::from_snapshot)
+                .map(ChecklistTracker::from_snapshot)
                 .unwrap_or_default(),
             retraction_eligible: true,
             active_wait: None,
@@ -5473,17 +4864,23 @@ Planning continuation: turn {} of {}.",
     ) -> Result<()> {
         runtime.checkpoint.take();
         let saved = result.and_then(|checkpoint| {
-            let queued_owner = if interaction.execution_id.is_none() {
+            let task = self.task_controller.current()?.filter(|task| runtime.task_permit.as_ref()
+                .is_some_and(|permit| permit.validate(Some(task)).is_ok()));
+            let execution = task.as_ref().and_then(|task| match &task.workflow {
+                crate::task::TaskWorkflow::Execute { execution } => Some(execution),
+                _ => None,
+            });
+            let queued_owner = if execution.is_none() {
                 self.observer.completion_queue.owner()?
             } else {
                 None
             };
+            let task_owner = task.as_ref().map(|task| task.revision.as_str().to_owned());
             let owner = interaction
                 .check_owner
                 .as_ref()
                 .or(queued_owner.as_ref())
-                .or(interaction.execution_id.as_ref())
-                .or(interaction.goal_id.as_ref())
+                .or(task_owner.as_ref())
                 .unwrap_or(&interaction.id)
                 .clone();
             interaction.check_owner = Some(owner.clone());
@@ -5491,12 +4888,15 @@ Planning continuation: turn {} of {}.",
             interaction.checkpoint_before = Some(checkpoint.id.clone());
             self.store
                 .save_checkpoint_exchange(&checkpoint, interaction)?;
-            if let Some(execution_id) = interaction.execution_id.as_deref()
-                && let Some(mut execution) = self.store.load_plan_execution(execution_id)?
-                && execution.baseline_checkpoint.is_none()
+            if let Some(task) = task
+                && matches!(&task.workflow, crate::task::TaskWorkflow::Execute { execution } if execution.record.baseline_checkpoint.is_none())
             {
-                execution.baseline_checkpoint = Some(checkpoint.id);
-                self.store.save_plan_execution(&execution)?;
+                self.task_controller.update(&mut self.store, &task.permit(), self.clock.now_ms(), |task| {
+                    if let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow {
+                        execution.record.baseline_checkpoint = Some(checkpoint.id);
+                    }
+                    Ok(())
+                })?;
             }
             Ok(())
         });
@@ -5571,14 +4971,19 @@ Planning continuation: turn {} of {}.",
     fn resume_exchange_runtime(&mut self, interaction: &Exchange) -> Result<()> {
         self.require_restore_recovered()?;
         self.exchange_runtime = Some(ExchangeRuntime {
+            task_permit: self
+                .task_controller
+                .current()?
+                .filter(|task| task.entry_accepted())
+                .map(|task| task.permit()),
             checkpoint: None,
             tool_gate: None,
             exchange_id: interaction.id.clone(),
             synthetic_turn: None,
-            task: interaction
-                .task
+            checklist: interaction
+                .checklist
                 .clone()
-                .map(TaskTracker::from_snapshot)
+                .map(ChecklistTracker::from_snapshot)
                 .unwrap_or_default(),
             retraction_eligible: false,
             active_wait: None,
@@ -5766,6 +5171,7 @@ Planning continuation: turn {} of {}.",
                     .or(aggregate.evidence.native_state);
                 aggregate.evidence.structured_complete |= output.evidence.structured_complete;
                 aggregate.evidence.structured_blocked |= output.evidence.structured_blocked;
+                aggregate.goal_control = output.goal_control.or(aggregate.goal_control);
                 aggregate.metrics.context_usage = output
                     .metrics
                     .context_usage
@@ -5931,7 +5337,7 @@ Planning continuation: turn {} of {}.",
                     data: json!({"code":"mcp_command_missing","resource_id":id}),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 event,
             )
@@ -5951,6 +5357,10 @@ Planning continuation: turn {} of {}.",
         deferred_input: &mut std::collections::VecDeque<crate::backend::SteerCommand>,
         continuation_command: Option<crate::backend::SteerCommand>,
     ) -> Result<crate::backend::BackendOutput> {
+        let turn_task_authority = request
+            .control_context
+            .as_ref()
+            .and_then(crate::control_tools::TaskAuthority::capture);
         if request.mode != PromptMode::Background {
             self.notify_unavailable_mcp(
                 &BackendCatalogRequest {
@@ -5992,18 +5402,14 @@ Planning continuation: turn {} of {}.",
         let (execution_sender, mut execution_receiver) =
             tokio::sync::mpsc::channel::<crate::plan::execution::ExecutionControl>(1);
         let execution = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| {
-                Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref()
-                    && execution.state == PlanExecutionState::Active
-            });
+            .current_execution()?
+            .filter(|execution| execution.state == PlanExecutionState::Active);
         if request.mode == PromptMode::ExecutePlan
             && let (Some(context), Some(execution)) =
                 (&mut request.control_context, execution.as_ref())
         {
             context.execution = Some(crate::plan::execution::ExecutionControlSender {
+                task_controller: self.task_controller.clone(),
                 phase: execution.phase,
                 execution_id: execution.id.clone(),
                 generation: execution.generation,
@@ -6015,10 +5421,13 @@ Planning continuation: turn {} of {}.",
             crate::checks::CheckAuthority {
                 data_root: self.data_root.clone(),
                 backend: self.session.backend.clone(),
-                task_id: self
-                    .current_task()?
-                    .filter(|task| !task.status.terminal())
-                    .map(|task| task.id),
+                task_id: self.task_controller.current()?.map(|task| {
+                    task.entry
+                        .as_ref()
+                        .map(|entry| entry.id.as_str())
+                        .unwrap_or(task.revision.as_str())
+                        .to_owned()
+                }),
                 shell: self.session.shell,
                 mode: request.mode,
                 permission: self.session.approval_mode,
@@ -6105,7 +5514,7 @@ Planning continuation: turn {} of {}.",
                             let session_id = self.session.id.clone();
                             user_delivery.spawn(async move {
                                 let result = tokio::time::timeout(std::time::Duration::from_secs(30),
-                                    backend.steer_session(&session_id,crate::backend::SteeringInput::User { text: input.text.clone(), attachments: input.attachments.clone(), submission: input.submission.clone() }))
+                                    backend.steer_session(&session_id,input.input()))
                                     .await.context("parent input delivery exceeded 30 seconds").and_then(|result|result);
                                 (input,result)
                             });
@@ -6129,7 +5538,7 @@ Planning continuation: turn {} of {}.",
                                 self.process_backend_event(&mut runtime, interaction, backend_event, event).await?;
                             }
                             let submission = matches!(&control.operation, crate::plan::execution::ExecutionOperation::Submit { .. });
-                            let result = self.handle_execution_control(&control.execution_id, control.generation, control.operation, interaction).await;
+                            let result = self.handle_execution_control(&control.execution_id, control.generation, &control.task_permit, control.operation, interaction).await;
                             let committed = result.is_ok();
                             let waiting = submission && result.as_ref().is_ok_and(|response| response["status"] == "paused");
                             if waiting {
@@ -6158,7 +5567,12 @@ Planning continuation: turn {} of {}.",
                         use crate::plan::revision_review::RevisionReviewRequest;
                         match review.context("revision review request lane closed")? {
                             RevisionReviewRequest::Capture { plan_id, digest, revision, response } => {
-                                let result = if interaction.plan_id.as_deref() != Some(plan_id.as_str()) {
+                                if let Some(authority) = &turn_task_authority
+                                    && let Err(error) = authority.validate() {
+                                    let _ = response.send(Err(error));
+                                    continue;
+                                }
+                                let result = if self.current_plan_id()?.as_deref() != Some(plan_id.as_str()) {
                                     Err(anyhow::anyhow!("review belongs to another plan"))
                                 } else if let Some(revision) = revision {
                                     self.observer.capture_plan_revision(&plan_id, revision).and_then(|source| {
@@ -6170,14 +5584,19 @@ Planning continuation: turn {} of {}.",
                                 let _ = response.send(result);
                             }
                             RevisionReviewRequest::Decide { method, params, response } => {
+                                if let Some(authority) = &turn_task_authority
+                                    && let Err(error) = authority.validate() {
+                                    let _ = response.send(Err(error));
+                                    continue;
+                                }
                                 let result = if params.get("plan_id").and_then(Value::as_str)
-                                    .is_some_and(|id| interaction.plan_id.as_deref() != Some(id)) {
+                                    .is_some_and(|id| self.current_plan_id().ok().flatten().as_deref() != Some(id)) {
                                     Err(anyhow::anyhow!("review decision belongs to another plan"))
                                 } else {
                                     match method {
-                                        HarnessMethod::PlanAcceptanceBegin => Box::pin(self.begin_plan_acceptance(params)).await,
-                                        HarnessMethod::PlanRequestChanges => Box::pin(self.request_plan_changes(params)).await,
-                                        HarnessMethod::PlanCancel => self.cancel_plan(params),
+                                        HarnessMethod::PlanAcceptanceBegin => self.dispatch_session_command("plan.acceptance.begin", params),
+                                        HarnessMethod::PlanRequestChanges => self.dispatch_session_command("plan.request_changes", params),
+                                        HarnessMethod::PlanCancel => self.dispatch_session_command("plan.cancel", params),
                                         HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
                                         HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
                                         HarnessMethod::PlanChecksUpdate => Box::pin(self.update_plan_checks(params)).await,
@@ -6193,8 +5612,8 @@ Planning continuation: turn {} of {}.",
                                         interaction.set_awaiting_input(false);
                                         interaction.resume(self.clock.now_ms())?;
                                         self.store.save_exchange(interaction)?;
-                                        let provider_response = self.revision_review_response(interaction.execution_id.as_deref()
-                                            .context("review has no execution")?)?;
+                                        let execution_id = self.current_execution()?.context("review has no execution")?.id;
+                                        let provider_response = self.revision_review_response(&execution_id)?;
                                         events.retain(|event| event.event != "goal_continue_requested");
                                         let patch = self.reconcile_timeline()?;
                                         self.emit_timeline_patch(patch, event).await?;
@@ -6217,7 +5636,7 @@ Planning continuation: turn {} of {}.",
                                     self.emit_backend_event(BackendEvent {
             received_at_ms: None,
                                     address: None, turn_boundary: None, kind: "plan_execution_progress".into(), text: None,
-                                    data: progress, activity: None, summary: None, task_update: None,
+                                    data: progress, activity: None, summary: None, checklist_update: None,
                                 }, event).await?;
                                 },
                                 Err(error) => self.trace.record(&self.session.id, "plan.progress_failed", json!({"error":format!("{error:#}")})),
@@ -6392,7 +5811,7 @@ Planning continuation: turn {} of {}.",
                         data: json!({"exchange_id": interaction.id, "prompt": interaction.prompt}),
                         activity: None,
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     },
                     event,
                 )
@@ -6411,7 +5830,7 @@ Planning continuation: turn {} of {}.",
                         data: Value::Null,
                         activity: None,
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     },
                     event,
                 )
@@ -6428,7 +5847,7 @@ Planning continuation: turn {} of {}.",
             .current_goal()?
             .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
         {
-            let (_, goal_event) = self.pause_goal().await?;
+            let (_, goal_event) = self.dispatch_session_command("goal.pause", json!({}))?;
             event.extend(goal_event);
         }
         if let Some(mut exchange) = self
@@ -6702,27 +6121,22 @@ Planning continuation: turn {} of {}.",
                     }
                 }
                 self.save_session()?;
-                let goal = self
-                    .session
-                    .goal_id
-                    .as_deref()
-                    .map(|id| self.store.load_goal(id))
-                    .transpose()?
-                    .flatten();
-                let goal_execution = self
-                    .store
-                    .list_plan_execution(&self.session.id)?
-                    .into_iter()
-                    .rev()
-                    .find(|execution| {
-                        goal.as_ref()
-                            .is_some_and(|goal| goal.id == execution.goal_id)
-                    });
-                self.emit_backend_event(BackendEvent { address: None, turn_boundary: None,
-                    received_at_ms: None, kind: "execution_state".into(), text: None,
-                    activity: None, summary: None, task_update: None,
-                    data: json!({ "session": self.session, "task": self.store.list_task(&self.session.id)?, "goal": goal,
-                        "goal_execution": goal_execution }) }, event).await?;
+                self.session.active_task = self.task_controller.current()?;
+                self.emit_backend_event(
+                    BackendEvent {
+                        address: None,
+                        turn_boundary: None,
+                        received_at_ms: None,
+                        kind: "execution_state".into(),
+                        text: None,
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                        data: json!({ "session": self.session }),
+                    },
+                    event,
+                )
+                .await?;
                 return Ok(());
             }
             if backend_event.kind == "error" {
@@ -7020,6 +6434,65 @@ Planning continuation: turn {} of {}.",
                 }
                 return Ok(());
             }
+            if backend_event.kind == "task_started" {
+                let input_id = backend_event.data["input_message_id"]
+                    .as_str()
+                    .context("task entry is missing its input identity")?;
+                let id = format!("{}:task-start:{input_id}", self.session.id);
+                let start: crate::exchange::TaskStart =
+                    serde_json::from_value(backend_event.data["start"].clone())?;
+                let prompt = backend_event
+                    .text
+                    .context("task entry is missing its delivered prompt")?;
+                if let Some(existing) = self.store.load_session_event(&self.session.id, &id)? {
+                    anyhow::ensure!(
+                        matches!(existing.detail, SessionEventKind::TaskStarted { start: previous, prompt: previous_prompt }
+                        if previous == start && previous_prompt == prompt),
+                        "task entry identity was reused for different content"
+                    );
+                    return Ok(());
+                }
+                runtime.retraction_eligible = false;
+                let now_ms = self.clock.now_ms();
+                interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                runtime.active_wait = None;
+                self.store.save_exchange(interaction)?;
+                let task_event = crate::timeline::SessionEventRecord {
+                    id,
+                    session_id: self.session.id.clone(),
+                    owner: self
+                        .store
+                        .capture_timeline_owner(&self.session.id, &interaction.id)?,
+                    created_at_ms: now_ms,
+                    detail: SessionEventKind::TaskStarted { start, prompt },
+                };
+                self.store.save_session_event(&task_event)?;
+                let mut displayed = interaction.clone();
+                crate::timeline::ownership::insert_event(
+                    &mut displayed,
+                    crate::timeline::TimelineEvent::Session {
+                        event: Box::new(task_event),
+                    },
+                )?;
+                self.emit_live_interaction(
+                    BackendEvent {
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "timeline_node_updated".into(),
+                        text: None,
+                        data: json!({"exchange_id":interaction.id}),
+                        activity: None,
+                        summary: None,
+                        checklist_update: None,
+                    },
+                    &displayed,
+                    event,
+                )
+                .await?;
+                self.emit_active_wait(interaction, runtime, event).await?;
+                return Ok(());
+            }
             if backend_event.kind == "steering_input" {
                 if let Some(id) = backend_event.data["input_message_id"].as_str()
                     && interaction.node_list.iter().any(|node|
@@ -7052,7 +6525,7 @@ Planning continuation: turn {} of {}.",
                         }),
                         activity: None,
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     },
                     interaction,
                     event,
@@ -7061,7 +6534,7 @@ Planning continuation: turn {} of {}.",
                 self.emit_active_wait(interaction, runtime, event).await?;
                 return Ok(());
             }
-            if backend_event.task_update.is_some()
+            if backend_event.checklist_update.is_some()
                 || backend_event.activity.is_some()
                 || (backend_event.kind == "assistant_message"
                     && backend_event
@@ -7114,21 +6587,21 @@ Planning continuation: turn {} of {}.",
                 self.emit_backend_event(backend_event, event).await?;
                 return Ok(());
             }
-            if let Some(update) = backend_event.task_update.as_ref() {
-                runtime.task.replace(update);
-                interaction.task = Some(runtime.task.snapshot().clone());
+            if let Some(update) = backend_event.checklist_update.as_ref() {
+                runtime.checklist.replace(update);
+                interaction.checklist = Some(runtime.checklist.snapshot().clone());
                 self.store.save_exchange(interaction)?;
                 self.emit_live_interaction(
                     BackendEvent {
                         received_at_ms: None,
                         address: None,
                         turn_boundary: None,
-                        kind: "timeline_task_updated".into(),
+                        kind: "timeline_checklist_updated".into(),
                         text: None,
-                        data: serde_json::to_value(runtime.task.snapshot())?,
+                        data: serde_json::to_value(runtime.checklist.snapshot())?,
                         activity: None,
                         summary: None,
-                        task_update: Some(update.clone()),
+                        checklist_update: Some(update.clone()),
                     },
                     interaction,
                     event,
@@ -7136,7 +6609,7 @@ Planning continuation: turn {} of {}.",
                 .await?;
             }
             if backend_event.address.is_some() {
-                attribute_provider_tool(interaction, &mut runtime.task, &backend_event)?;
+                attribute_provider_tool(interaction, &mut runtime.checklist, &backend_event)?;
                 if backend_event.tool_output_delta().is_some() {
                     self.store
                         .save_tool_output_delta(interaction, &backend_event)?;
@@ -7322,20 +6795,22 @@ Planning continuation: turn {} of {}.",
         if backend_event.turn_boundary != Some(crate::backend::TurnBoundary::Started) {
             return Ok(());
         }
-        let (Some(address), Some(goal_id), Some(previous)) = (
-            backend_event.address.as_ref(),
-            interaction.goal_id.as_ref(),
-            interaction.turn.last(),
-        ) else {
+        let (Some(address), Some(previous)) =
+            (backend_event.address.as_ref(), interaction.turn.last())
+        else {
             return Ok(());
         };
         if previous.provider().thread_id != address.thread_id
             || interaction.turn.iter().any(|turn| {
                 turn.provider() == address || turn.state() == crate::turn::TurnState::Running
             })
+            || runtime.task_permit.as_ref().is_none_or(|permit| {
+                permit
+                    .validate(self.task_controller.current().ok().flatten().as_ref())
+                    .is_err()
+            })
             || !self
-                .store
-                .load_goal(goal_id)?
+                .current_goal()?
                 .is_some_and(|goal| goal.native && goal.state == GoalState::Active)
         {
             return Ok(());
@@ -7356,10 +6831,10 @@ Planning continuation: turn {} of {}.",
             .interaction_for_turn("", true, self.clock.now_ms())
             .await?;
         event.extend(boundary_event);
-        continuation.lifecycle = Some(WorkflowActivity::Goal.event(LifecycleAction::Continued));
-        continuation.kind = interaction.kind;
-        continuation.goal_id.clone_from(&interaction.goal_id);
-        continuation.task.clone_from(&interaction.task);
+        continuation.origin = crate::exchange::ExchangeOrigin::task_continuation(
+            "The native goal requires another turn",
+        );
+        continuation.checklist.clone_from(&interaction.checklist);
         self.start_exchange_runtime(&mut continuation, self.clock.now_ms())
             .await?;
         let mut continuation_runtime = self
@@ -7382,7 +6857,7 @@ Planning continuation: turn {} of {}.",
                 data: serde_json::to_value(&interaction)?,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             },
             interaction,
             event,
@@ -7411,7 +6886,7 @@ Planning continuation: turn {} of {}.",
                 }),
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             },
             interaction,
             event,
@@ -7519,7 +6994,7 @@ Planning continuation: turn {} of {}.",
                     data: timeline_patch.notification(),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await;
             if let Err(error) = delivery {
@@ -7604,14 +7079,17 @@ Planning continuation: turn {} of {}.",
                 agent_count: self.agent_coordinator.active_count(),
             };
         }
-        if let Some(execution_id) =
-            interaction.and_then(|exchange| exchange.execution_id.as_deref())
-            && let Some(execution) = runtime
-                .execution
-                .as_ref()
-                .filter(|execution| execution.id == execution_id)
-        {
-            execution.apply(&mut status);
+        if let Some(task) = &runtime.active_task {
+            match &task.workflow {
+                crate::task::TaskWorkflow::Execute { execution } => {
+                    crate::session::state_machine::ExecutionStatusSnapshot::from(&execution.record)
+                        .apply(&mut status)
+                }
+                _ if task.status() == crate::task::TaskStatus::Paused => {
+                    status = crate::session::state_machine::SessionPhase::Paused
+                }
+                _ => {}
+            }
         }
         Ok(status)
     }
@@ -7659,9 +7137,9 @@ Planning continuation: turn {} of {}.",
                 .load_exchange(&previous.id)?
                 .context("previous running exchange disappeared")?;
             let outcome = if previous
-                .execution_phase
-                .as_ref()
-                .is_some_and(|phase| phase.outcome.is_none())
+                .turn
+                .iter()
+                .any(|turn| turn.state() == crate::turn::TurnState::Running)
             {
                 crate::exchange::ExchangeOutcome::Interrupted
             } else {
@@ -7683,7 +7161,7 @@ Planning continuation: turn {} of {}.",
                     data: serde_json::to_value(&previous)?,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 &previous,
                 &mut event,
@@ -7692,7 +7170,6 @@ Planning continuation: turn {} of {}.",
         }
         Ok((
             Exchange {
-                lifecycle: None,
                 finalization_error: None,
                 check_owner: None,
                 output_store: None,
@@ -7704,12 +7181,8 @@ Planning continuation: turn {} of {}.",
                 session_id: self.session.id.clone(),
                 ordinal: self.store.next_exchange_ordinal(&self.session.id)?,
                 prompt: text.to_owned(),
-                kind: ExchangeKind::Chat,
+                origin: crate::exchange::ExchangeOrigin::User,
                 approval_mode: Some(self.session.approval_mode),
-                plan_id: None,
-                execution_id: None,
-                execution_phase: None,
-                goal_id: None,
                 phase: crate::exchange::ExchangePhase::Running,
                 checkpoint_before: None,
                 checkpoint_after: None,
@@ -7725,7 +7198,7 @@ Planning continuation: turn {} of {}.",
                 node_list: Vec::new(),
                 metrics: crate::exchange::ExchangeMetrics::default(),
                 comment: Vec::new(),
-                task: None,
+                checklist: None,
 
                 question: crate::exchange::ExchangeQuestion::None,
                 clock: crate::exchange::ExchangeClock::Running {
@@ -7735,164 +7208,6 @@ Planning continuation: turn {} of {}.",
             },
             true,
             event,
-        ))
-    }
-
-    async fn begin_plan_acceptance(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = required_text(&params, "plan_id")?;
-        let mut plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("active plan record is missing")?;
-        anyhow::ensure!(
-            matches!(plan.state, PlanState::AwaitingReview | PlanState::Accepted),
-            "plan does not await review"
-        );
-        let review_digest = plan
-            .review_digest
-            .clone()
-            .context("submitted plan digest is missing")?;
-        let overall_comment = params
-            .get("comment")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|comment| !comment.is_empty())
-            .map(str::to_owned);
-        if let Some(expected) = params.get("digest").and_then(Value::as_str) {
-            anyhow::ensure!(
-                expected == review_digest,
-                "plan changed after the accept action began"
-            );
-        }
-        anyhow::ensure!(
-            !self.refresh_check_review(&plan.id)?,
-            "Configured checks changed. Reopen /plan to review them before acceptance."
-        );
-        let reviewed = self
-            .observer
-            .capture_plan_review(&plan.id, &review_digest)?;
-        if let Some(mut execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.plan_id == plan.id)
-        {
-            anyhow::ensure!(
-                execution.pending_revision_reason.is_some(),
-                "execution already exists. Use /goal resume to continue it"
-            );
-            let mut goal = self
-                .store
-                .load_goal(&execution.goal_id)?
-                .context("execution goal is missing")?;
-            self.finalize_review_draft(&mut plan, &reviewed)?;
-            plan.accepted_revision = Some(plan.model_revision);
-            plan.accepted_digest = plan.review_digest.clone();
-            plan.user_revision += 1;
-            plan.state = PlanState::Accepted;
-            execution.revision = plan.model_revision;
-            execution.generation += 1;
-            execution
-                .revision_history
-                .push(crate::plan::execution::ExecutionRevision {
-                    revision: execution.revision,
-                    reason: execution.pending_revision_reason.take().unwrap(),
-                    approval: "user".into(),
-                    recorded_at_ms: self.clock.now_ms(),
-                });
-            if let Some(comment) = overall_comment.clone() {
-                execution.approval_comments.push(comment);
-            }
-            execution.progress = Default::default();
-            let resume = execution.review_paused;
-            execution.review_paused = false;
-            if resume {
-                execution.state = PlanExecutionState::Active;
-                goal.resume(self.clock.now_ms());
-            }
-            execution.append_lifecycle(
-                self.plan_exchange_anchor(&plan.id)?,
-                self.clock.now_ms(),
-                PlanExecutionLifecycleEvent::Phase {
-                    title: "Plan revision accepted".into(),
-                    phase: execution.phase,
-                    revision: execution.revision,
-                    state: execution.state,
-                },
-            );
-            let lifecycle = PlanLifecycleRecord {
-                title: plan.title.clone(),
-                anchor: Some(self.plan_exchange_anchor(&plan.id)?),
-                id: Uuid::new_v4().to_string(),
-                session_id: self.session.id.clone(),
-                plan_id: plan.id.clone(),
-                kind: PlanLifecycleKind::Accepted,
-                model_revision: plan.model_revision,
-                user_revision: plan.user_revision,
-                overall_comment: overall_comment.clone(),
-                annotation: Vec::new(),
-                question: None,
-                answer: None,
-                created_at_ms: self.clock.now_ms(),
-            };
-            self.store.save_execution_transition(
-                &execution,
-                &goal,
-                Some(&plan),
-                None,
-                Some(&lifecycle),
-            )?;
-            let mut events = vec![self.event("backend_event", json!({
-                "kind":"timeline_plan_lifecycle", "data":{"kind":"plan_lifecycle", "id":lifecycle.id,
-                    "created_at_ms":lifecycle.created_at_ms, "plan":&plan, "lifecycle":&lifecycle}
-            }))?, self.event("plan_accepted", json!({"plan":plan,"lifecycle":lifecycle,"execution":execution}))?];
-            if resume {
-                events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?);
-            }
-            return Ok((serde_json::to_value(self.snapshot()?)?, events));
-        }
-        if let Some(design) = &reviewed.document.design {
-            design.check_workspace(Path::new(&self.session.workspace))?;
-            if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
-                anyhow::ensure!(
-                    expected == reviewed.saved_digest,
-                    "saved design changed after review"
-                );
-            }
-        }
-        let mut acceptance =
-            PlanAcceptance::new(review_digest, &self.capability.approval_mode_list)?;
-        if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
-            anyhow::ensure!(
-                expected == reviewed.saved_digest,
-                "saved plan source changed after the review action"
-            );
-        }
-        let mut events = self.select_review_task(&plan).await?;
-        acceptance.saved_source_digest = Some(reviewed.into_data().revision.into_parts().2);
-        acceptance.overall_comment = overall_comment;
-        plan.acceptance = Some(acceptance);
-        plan.updated_at_ms = self.clock.now_ms();
-        self.store.save_plan(&plan)?;
-
-        self.save_session()?;
-        let snapshot = self.snapshot()?;
-        events.push(self.event(
-            "plan_acceptance_started",
-            serde_json::to_value(&snapshot.active_elicitation)?,
-        )?);
-        Ok((serde_json::to_value(&snapshot)?, events))
-    }
-
-    fn cancel_plan_acceptance(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut plan = self.active_plan_acceptance()?;
-        plan.acceptance = None;
-        plan.updated_at_ms = self.clock.now_ms();
-        self.store.save_plan(&plan)?;
-        let snapshot = self.snapshot()?;
-        Ok((
-            serde_json::to_value(&snapshot)?,
-            vec![self.event("plan_acceptance_cancelled", json!({ "plan": plan }))?],
         ))
     }
 
@@ -7954,7 +7269,7 @@ Planning continuation: turn {} of {}.",
         );
         plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();
-        self.store.save_plan(&plan)?;
+        self.publish_plan(&plan)?;
 
         self.save_session()?;
         records.complete(json!({"count":selected.len(), "version":document.version}));
@@ -8030,7 +7345,7 @@ Planning continuation: turn {} of {}.",
                 .join(", ")
         ));
         plan.updated_at_ms = self.clock.now_ms();
-        self.store.save_plan(&plan)?;
+        self.publish_plan(&plan)?;
         self.save_session()?;
         let payload = json!({ "plan": plan, "content": rendered.markdown, "document": document });
         Ok((
@@ -8128,7 +7443,7 @@ Planning continuation: turn {} of {}.",
         let change = format!("Renamed {previous_name} to {new_name}");
         plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();
-        self.store.save_plan(&plan)?;
+        self.publish_plan(&plan)?;
 
         self.save_session()?;
         records.complete(json!({"version":version}));
@@ -8146,46 +7461,6 @@ Planning continuation: turn {} of {}.",
         ))
     }
 
-    fn finalize_review_draft(
-        &mut self,
-        plan: &mut PlanRecord,
-        reviewed: &crate::plan::review_source::PlanReviewSource,
-    ) -> Result<()> {
-        if plan.submitted_version == Some(reviewed.document.version) {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            plan.document_version == reviewed.document.version,
-            "plan version changed before the review decision"
-        );
-        let revision = plan
-            .model_revision
-            .checked_add(1)
-            .context("plan revision exhausted")?;
-        self.plan_file
-            .submit_reviewed_revision(&self.session.id, &plan.id, revision, reviewed)?;
-        plan.model_revision = revision;
-        plan.submitted_version = Some(reviewed.document.version);
-        plan.updated_at_ms = self.clock.now_ms();
-        self.store.save_plan(plan)?;
-        self.store.save_plan_lifecycle(&PlanLifecycleRecord {
-            title: plan.title.clone(),
-            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
-            plan_id: plan.id.clone(),
-            kind: PlanLifecycleKind::RevisionCreated,
-            model_revision: revision,
-            user_revision: plan.user_revision + 1,
-            overall_comment: Some(plan.manual_changes.join("\n")),
-            annotation: Vec::new(),
-            question: None,
-            answer: None,
-            created_at_ms: self.clock.now_ms(),
-        })?;
-        Ok(())
-    }
-
     async fn continue_plan_acceptance(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let plan = self.active_plan_acceptance()?;
         let acceptance = plan
@@ -8193,1045 +7468,96 @@ Planning continuation: turn {} of {}.",
             .as_ref()
             .context("active plan has no acceptance state")?;
         let approval_mode = acceptance.approval_mode()?;
-        self.accept_plan(json!({
-            "plan_id": plan.id,
-            "digest": acceptance.review_digest,
-            "saved_source_digest": acceptance.saved_source_digest,
-            "approval_mode": approval_mode,
-            "comment": acceptance.overall_comment,
-        }))
-        .await
-    }
-
-    async fn accept_plan(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        anyhow::ensure!(
-            !self
-                .store
-                .list_plan_execution(&self.session.id)?
-                .iter()
-                .any(|execution| execution.state == PlanExecutionState::Active),
-            "another plan execution is already active"
-        );
-        let approval_mode = serde_json::from_value::<ApprovalMode>(
-            params
-                .get("approval_mode")
-                .cloned()
-                .context("approval_mode is required")?,
-        )?;
-        anyhow::ensure!(
-            self.capability.approval_mode_list.contains(&approval_mode),
-            "execution mode {} is unavailable for this backend",
-            approval_mode.label()
-        );
-        let plan_id = required_text(&params, "plan_id")?;
-        let mut plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("active plan record is missing")?;
-        anyhow::ensure!(
-            matches!(plan.state, PlanState::AwaitingReview | PlanState::Accepted),
-            "plan does not await review"
-        );
-        let digest = plan
-            .review_digest
-            .clone()
-            .context("submitted plan digest is missing")?;
-        let overall_comment = params
-            .get("comment")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|comment| !comment.is_empty())
-            .map(str::to_owned);
-        if let Some(expected) = params.get("digest").and_then(Value::as_str) {
-            anyhow::ensure!(
-                expected == digest,
-                "plan changed after the accept action began"
-            );
-        }
-        anyhow::ensure!(
-            !self.refresh_check_review(&plan.id)?,
-            "Configured checks changed. Reopen /plan to review them before acceptance."
-        );
-        let reviewed = self.observer.capture_plan_review(&plan.id, &digest)?;
-        let accepted_document = &reviewed.document;
-        let accepted_render = &reviewed.rendered;
-        anyhow::ensure!(
-            accepted_document.design.is_some(),
-            "execution requires a semantic plan"
-        );
-        anyhow::ensure!(
-            !self
-                .store
-                .list_plan_execution(&self.session.id)?
-                .iter()
-                .any(|execution| execution.plan_id == plan.id),
-            "execution already exists. Use /goal resume to continue it"
-        );
-        accepted_document
-            .design
-            .as_ref()
-            .unwrap()
-            .check_workspace(Path::new(&self.session.workspace))?;
-        if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
-            anyhow::ensure!(
-                expected == reviewed.saved_digest,
-                "saved plan source changed during acceptance"
-            );
-        }
-        if self.session.plan_executor.enabled {
-            let executor = self.session.plan_executor.clone();
-            self.validate_plan_executor(&executor).await?;
-        }
-        if self.session.plan_compact {
-            anyhow::ensure!(
-                self.capability.native_compact,
-                "current backend does not support context compaction"
-            );
-            anyhow::ensure!(
-                self.session.backend_session_id.is_some(),
-                "current session has no provider conversation to compact"
-            );
-        }
-        let mut selection_events = self.select_review_task(&plan).await?;
-        let compact_event = if self.session.plan_compact {
-            self.compact_session(true).await?.1
-        } else {
-            Vec::new()
-        };
-        self.finalize_review_draft(&mut plan, &reviewed)?;
-        plan.user_revision += 1;
-        plan.accepted_digest = Some(digest);
-        plan.accepted_revision = Some(plan.model_revision);
-        plan.acceptance = None;
-        if plan.state != PlanState::Accepted {
-            PlanStateMachine::apply(&mut plan, PlanEvent::Accepted, self.clock.now_ms())?;
-        }
-
-        let objective = format!("Complete accepted plan: {}", plan.title);
-        let now_ms = self.clock.now_ms();
-        let goal = GoalRecord {
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
-            objective,
-            state: GoalState::Active,
-            continuation: crate::session::continuation::ContinuationBudget::new(
-                self.goal_max_turns,
-                2,
-            ),
-            native: false,
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-        };
-        self.session.goal_id = Some(goal.id.clone());
-        let lifecycle = PlanLifecycleRecord {
-            title: plan.title.clone(),
-            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
-            plan_id: plan.id.clone(),
-            kind: PlanLifecycleKind::Accepted,
-            model_revision: plan.model_revision,
-            user_revision: plan.user_revision,
-            overall_comment: overall_comment.clone(),
-            annotation: Vec::new(),
-            question: None,
-            answer: None,
-            created_at_ms: self.clock.now_ms(),
-        };
-
-        let planning_backend_session_id = self.session.backend_session_id.clone();
-        if self.session.plan_executor.enabled {
-            let executor = &self.session.plan_executor;
-            self.session.model = executor
-                .model
-                .clone()
-                .context("plan executor model is not configured")?;
-            self.session.resolved_model = Some(self.session.model.clone());
-            self.session.effort = executor
-                .effort
-                .clone()
-                .context("plan executor thinking is not configured")?;
-            self.session.context_window = None;
-        }
-        self.session.approval_mode = approval_mode;
-        let mut task = self
-            .current_task()?
-            .filter(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
-            .unwrap_or_else(|| {
-                crate::task::TaskRecord::new(
-                    self.session.id.clone(),
-                    plan.title.clone(),
-                    crate::task::TaskKind::Execute,
-                    self.session.access.clone(),
-                    approval_mode,
-                    now_ms,
-                )
-            });
-        task.kind = crate::task::TaskKind::Execute;
-        task.operation_id = self.active_operation_id.clone();
-        task.phase = "implement".into();
-        task.plan_id = Some(plan.id.clone());
-        task.goal_id = Some(goal.id.clone());
-        task.approval_mode = approval_mode;
-        task.access = self.session.access.clone();
-        task.begin(now_ms)?;
-        self.session.current_task_id = Some(task.id.clone());
-        let execution_created_at_ms = self.clock.now_ms();
-        let mut execution_record = PlanExecutionRecord {
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
-            plan_id: plan.id.clone(),
-            goal_id: goal.id.clone(),
-            baseline_checkpoint: None,
-            state: PlanExecutionState::Active,
-            implementation_report: None,
-            phase: crate::plan::PlanPhase::Implement,
-            original_revision: plan.model_revision,
-            revision: plan.model_revision,
-            generation: 0,
-            planning_backend_session_id,
-            execution_backend_session_id: self.session.backend_session_id.clone(),
-            lifecycle: Vec::new(),
-            findings: Vec::new(),
-            progress: Default::default(),
-            verification: Vec::new(),
-            check_runs: Vec::new(),
-            revision_history: Vec::new(),
-            approval_comments: overall_comment.iter().cloned().collect(),
-            pending_revision_reason: None,
-            review_paused: false,
-            observed_source: Default::default(),
-            observed_generation: 0,
-            observed_check: Default::default(),
-            created_at_ms: execution_created_at_ms,
-            completed_at_ms: None,
-        };
-        execution_record.progress = Default::default();
-        execution_record.observed_source = execution_record.progress.source_digest.clone();
-        self.store.accept_task(
-            &self.session,
-            &task,
-            &goal,
-            &plan,
-            &execution_record,
-            &lifecycle,
-            &self.client_id,
-        )?;
-        selection_events.extend(compact_event);
-        let mut pre_execution_event = selection_events;
-        self.emit_live(
-            BackendEvent {
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "timeline_plan_lifecycle".into(),
-                text: None,
-                data: json!({
-                    "kind": "plan_lifecycle",
-                    "id": lifecycle.id,
-                    "created_at_ms": lifecycle.created_at_ms,
-                    "plan": &plan,
-                    "lifecycle": &lifecycle,
-                    "content": &accepted_render.markdown,
-                    "document": &accepted_document
-                }),
-                activity: None,
-                summary: None,
-                task_update: None,
-            },
-            &mut pre_execution_event,
+        self.dispatch_session_command(
+            "plan.accept",
+            json!({
+                "plan_id": plan.id,
+                "digest": acceptance.review_digest,
+                "saved_source_digest": acceptance.saved_source_digest,
+                "approval_mode": approval_mode,
+                "comment": acceptance.overall_comment,
+            }),
         )
-        .await?;
-        let execution_prompt = PlanPrompt::with_manual_changes(
-            PlanPrompt::execution(
-                &execution_record,
-                PlanExecutionPromptKind::Start,
-                &accepted_document.execution_json(execution_record.phase)?,
-            ),
-            &plan.manual_changes,
-        );
-        let mut admission = ExchangeAdmission::execution(
-            String::new(),
-            plan.id.clone(),
-            execution_record.id.clone(),
-            goal.id.clone(),
-        );
-        admission.lifecycle = Some(WorkflowActivity::Implementing.event(LifecycleAction::Started));
-        admission.plan_event_id = Some(lifecycle.id.clone());
-        let execution = self
-            .run_interaction(execution_prompt, PromptMode::ExecutePlan, Some(admission))
-            .await;
-        let execution_succeeded = execution.is_ok();
-        execution_record = self
-            .store
-            .load_plan_execution(&execution_record.id)?
-            .unwrap_or(execution_record);
-        execution_record.execution_backend_session_id = self.session.backend_session_id.clone();
-        self.store.save_plan_execution(&execution_record)?;
-        let (mut result, mut event) = match execution {
-            Ok(result) => result,
-            Err(error)
-                if error.downcast_ref::<TurnCancelled>().is_some()
-                    && !self.turn_cancellation.restart.load(Ordering::Acquire) =>
-            {
-                (
-                    serde_json::to_value(self.snapshot()?)?,
-                    vec![self.event("goal_changed", serde_json::to_value(self.active_goal()?)?)?],
-                )
-            }
-            Err(error) => {
-                if error.downcast_ref::<TurnCancelled>().is_some()
-                    && self.turn_cancellation.restart.load(Ordering::Acquire)
-                {
-                    return Err(error);
-                }
-                let mut paused_goal = self.active_goal()?;
-                paused_goal.state = GoalState::Paused;
-                paused_goal.updated_at_ms = self.clock.now_ms();
-                self.store.save_goal(&paused_goal)?;
-                execution_record.state = PlanExecutionState::Paused;
-                self.store.save_plan_execution(&execution_record)?;
-                let backend_event = BackendEvent {
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "error".into(),
-                    text: Some(format!(
-                        "The plan was accepted, but its first execution turn failed: {error:#}. Use /goal resume to retry."
-                    )),
-                    data: Value::Null,
-                    activity: None,
-                    summary: None,
-                    task_update: None,
-                };
-                (
-                    json!({
-                        "session": self.session,
-                        "capability": self.capability,
-                        "execution_error": format!("{error:#}")
-                    }),
-                    vec![
-                        self.event("backend_event", serde_json::to_value(backend_event)?)?,
-                        self.event("goal_changed", serde_json::to_value(paused_goal)?)?,
-                    ],
-                )
-            }
-        };
-        event.splice(0..0, pre_execution_event);
-        if execution_succeeded {
-            event.insert(
-                0,
-                self.event("goal_changed", serde_json::to_value(self.active_goal()?)?)?,
-            );
-        }
-        event.insert(
-            0,
-            self.event(
-                "plan_accepted",
-                json!({
-                    "plan": plan,
-                    "lifecycle": lifecycle,
-                    "execution": execution_record,
-                    "content": accepted_render.markdown,
-                    "document": accepted_document,
-                    "plan_compact": self.session.plan_compact
-                }),
-            )?,
-        );
-        result["manual_changes"] = serde_json::to_value(&plan.manual_changes)?;
-        Ok((result, event))
-    }
-
-    async fn request_plan_changes(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = required_text(&params, "plan_id")?;
-        let mut plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("active plan record is missing")?;
-        anyhow::ensure!(
-            plan.state == PlanState::AwaitingReview,
-            "plan does not await review"
-        );
-        let expected_digest = params
-            .get("digest")
-            .and_then(Value::as_str)
-            .or(plan.review_digest.as_deref())
-            .context("submitted plan digest is missing")?;
-        let reviewed = self
-            .observer
-            .capture_plan_review(&plan.id, expected_digest)?;
-        if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
-            anyhow::ensure!(
-                expected == reviewed.saved_digest,
-                "saved plan source changed after the review action"
-            );
-        }
-        let document = &reviewed.document;
-        let rendered = &reviewed.rendered;
-        let annotation_input: Vec<crate::plan::PlanAnnotationInput> = serde_json::from_value(
-            params
-                .get("annotations")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-        )?;
-        let annotation = crate::plan::resolve_annotations(rendered, annotation_input)?;
-        let overall_comment = params
-            .get("comment")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|comment| !comment.is_empty())
-            .map(str::to_owned);
-        let feedback = crate::plan::render_review_feedback(document, &annotation)?;
-        let document_json = document.model_json()?;
-        self.finalize_review_draft(&mut plan, &reviewed)?;
-        plan.user_revision += 1;
-        if let Some(mut execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| {
-                execution.plan_id == plan.id && execution.pending_revision_reason.is_some()
-            })
-        {
-            let mut goal = self
-                .store
-                .load_goal(&execution.goal_id)?
-                .context("execution goal is missing")?;
-            execution.findings.push(format!(
-                "Revise the pending design using this review feedback: {}\n{}",
-                overall_comment.as_deref().unwrap_or_default(),
-                feedback
-            ));
-            execution.pending_revision_reason = None;
-            plan.state = PlanState::Revising;
-            let resume = execution.review_paused;
-            execution.review_paused = false;
-            if resume {
-                execution.state = PlanExecutionState::Active;
-                goal.resume(self.clock.now_ms());
-            }
-            execution.generation += 1;
-            execution.append_lifecycle(
-                self.plan_exchange_anchor(&plan.id)?,
-                self.clock.now_ms(),
-                PlanExecutionLifecycleEvent::Phase {
-                    title: "Plan revision changes requested".into(),
-                    phase: execution.phase,
-                    revision: execution.revision,
-                    state: execution.state,
-                },
-            );
-            self.store
-                .save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
-            let mut events = vec![self.event(
-                "plan_changes_requested",
-                json!({"plan":plan,"execution":execution}),
-            )?];
-            if resume {
-                events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?);
-            }
-            return Ok((serde_json::to_value(self.snapshot()?)?, events));
-        }
-        let mut selection_events = self.select_review_task(&plan).await?;
-        let instruction = PlanPrompt::with_manual_changes(
-            PlanPrompt::revision(&document_json, &feedback, overall_comment.as_deref()),
-            &plan.manual_changes,
-        );
-        plan.acceptance = None;
-        PlanStateMachine::apply(&mut plan, PlanEvent::ChangesRequested, self.clock.now_ms())?;
-        plan.generation.reset();
-        self.store.save_plan(&plan)?;
-
-        self.save_session()?;
-        let lifecycle = PlanLifecycleRecord {
-            title: plan.title.clone(),
-            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
-            plan_id: plan.id.clone(),
-            kind: PlanLifecycleKind::ChangesRequested,
-            model_revision: plan.model_revision,
-            user_revision: plan.user_revision,
-            overall_comment: overall_comment.clone(),
-            annotation: annotation.clone(),
-            question: None,
-            answer: None,
-            created_at_ms: self.clock.now_ms(),
-        };
-        self.store.save_plan_lifecycle(&lifecycle)?;
-        let leading_event = self.event(
-            "plan_changes_requested",
-            json!({ "plan": &plan, "lifecycle": &lifecycle }),
-        )?;
-        let review_prompt = overall_comment.clone().unwrap_or_default();
-        let mut admission = ExchangeAdmission::plan(review_prompt, Some(plan.id.clone()), true);
-        admission.plan_event_id = Some(lifecycle.id.clone());
-        match self
-            .run_planning_interaction(instruction, Some(admission))
-            .await
-        {
-            Ok((mut result, mut event)) => {
-                selection_events.push(leading_event);
-                selection_events.append(&mut event);
-                event = selection_events;
-                result["manual_changes"] = serde_json::to_value(&plan.manual_changes)?;
-                Ok((result, event))
-            }
-            Err(error) => Err(error).context("revise reviewed plan"),
-        }
-    }
-
-    fn cancel_plan(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = required_text(&params, "plan_id")?;
-        let mut plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("active plan record is missing")?;
-        anyhow::ensure!(
-            plan.session_id == self.session.id,
-            "plan belongs to another session"
-        );
-        if let Some(mut execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| {
-                execution.plan_id == plan.id && execution.pending_revision_reason.is_some()
-            })
-        {
-            let mut goal = self
-                .store
-                .load_goal(&execution.goal_id)?
-                .context("execution goal is missing")?;
-            let accepted =
-                self.plan_file
-                    .restore_revision(&self.session.id, &plan.id, execution.revision)?;
-            plan.state = PlanState::Accepted;
-            plan.document_version = accepted.version;
-            plan.title = accepted.title;
-            plan.review_digest = plan.accepted_digest.clone();
-            execution
-                .revision_history
-                .push(crate::plan::execution::ExecutionRevision {
-                    revision: plan.model_revision,
-                    reason: execution.pending_revision_reason.take().unwrap(),
-                    approval: "rejected".into(),
-                    recorded_at_ms: self.clock.now_ms(),
-                });
-            execution.findings.push(
-                "The user rejected the proposed revision. Match the current accepted design."
-                    .into(),
-            );
-            let resume = execution.review_paused;
-            execution.review_paused = false;
-            if resume {
-                execution.state = PlanExecutionState::Active;
-                goal.resume(self.clock.now_ms());
-            }
-            execution.generation += 1;
-            execution.append_lifecycle(
-                self.plan_exchange_anchor(&plan.id)?,
-                self.clock.now_ms(),
-                PlanExecutionLifecycleEvent::Phase {
-                    title: "Plan revision rejected".into(),
-                    phase: execution.phase,
-                    revision: execution.revision,
-                    state: execution.state,
-                },
-            );
-            self.store
-                .save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
-            let mut events = vec![self.event(
-                "plan_revision_rejected",
-                json!({"plan":plan,"execution":execution}),
-            )?];
-            if resume {
-                events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?);
-            }
-            return Ok((serde_json::to_value(self.snapshot()?)?, events));
-        }
-        PlanStateMachine::apply(&mut plan, PlanEvent::Cancelled, self.clock.now_ms())?;
-        plan.acceptance = None;
-        self.store.save_plan(&plan)?;
-        let lifecycle = PlanLifecycleRecord {
-            title: plan.title.clone(),
-            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
-            plan_id: plan.id.clone(),
-            kind: PlanLifecycleKind::Cancelled,
-            model_revision: plan.model_revision,
-            user_revision: plan.user_revision,
-            overall_comment: None,
-            annotation: Vec::new(),
-            question: None,
-            answer: None,
-            created_at_ms: self.clock.now_ms(),
-        };
-        self.store.save_plan_lifecycle(&lifecycle)?;
-        for mut exchange in self.store.list_exchange(&self.session.id)? {
-            if exchange.plan_id.as_deref() == Some(&plan.id) && !exchange.is_finished() {
-                exchange.set_awaiting_input(false);
-                exchange.set_elicitation(None);
-                exchange.finish(
-                    crate::exchange::ExchangeOutcome::Cancelled,
-                    self.clock.now_ms(),
-                )?;
-                self.store.save_exchange(&exchange)?;
-            }
-        }
-
-        if let Some(mut task) = self
-            .store
-            .list_task(&self.session.id)?
-            .into_iter()
-            .find(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
-        {
-            task.status = crate::task::TaskStatus::Cancelled;
-            task.reason = Some("Plan cancelled by user".into());
-            task.generation += 1;
-            task.updated_at_ms = self.clock.now_ms();
-            self.store.save_task(&task)?;
-            if self.session.current_task_id.as_deref() == Some(task.id.as_str()) {
-                self.session.current_task_id = None;
-                self.session.goal_id = None;
-                self.save_session()?;
-            }
-        }
-        Ok((
-            serde_json::to_value(self.snapshot()?)?,
-            vec![self.event(
-                "plan_cancelled",
-                json!({ "plan": plan, "lifecycle": lifecycle }),
-            )?],
-        ))
-    }
-
-    async fn retry_plan(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = self
-            .current_plan_id()?
-            .context("no failed plan can be retried")?;
-        let mut plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("failed plan record is missing")?;
-        if plan.state == PlanState::ConfiguringChecks {
-            let task = self.current_task()?.context("pending plan has no task")?;
-            return self
-                .transition_task(json!({
-                    "action": "resume", "task_id": task.id,
-                }))
-                .await;
-        }
-        anyhow::ensure!(
-            plan.state == PlanState::Failed,
-            "/plan retry requires a failed plan"
-        );
-        plan.generation.reset();
-        PlanStateMachine::apply(&mut plan, PlanEvent::RetryRequested, self.clock.now_ms())?;
-        self.store.save_plan(&plan)?;
-        let document = self
-            .plan_file
-            .read_working_document(&self.session.id, &plan.id)?;
-        self.run_planning_interaction(
-            PlanPrompt::with_active_document(
-                format!(
-                    "Resume the failed planning task using the existing canonical document and \
-resolved decisions. Complete and submit the plan for this request:\n\n{}",
-                    plan.request
-                ),
-                &document.model_json()?,
-            ),
-            Some(ExchangeAdmission::plan(
-                "/plan retry".into(),
-                Some(plan.id),
-                plan.model_revision > 0,
-            )),
-        )
-        .await
-    }
-
-    /// Read a submitted revision after validating its owning session and revision range.
-
-    async fn set_goal(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let objective = required_text(&params, "objective")?;
-        self.pause_task(false).await?;
-        self.configure_session(json!({"approval_mode":self.session.default_approval}))
-            .await?;
-        let now_ms = self.clock.now_ms();
-        let goal = GoalRecord {
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
-            objective: objective.clone(),
-            state: GoalState::Active,
-            continuation: crate::session::continuation::ContinuationBudget::new(
-                self.goal_max_turns,
-                2,
-            ),
-            native: self.capability.native_goal,
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-        };
-        let mut task = crate::task::TaskRecord::new(
-            self.session.id.clone(),
-            objective.clone(),
-            crate::task::TaskKind::Goal,
-            self.session.access.clone(),
-            self.session.approval_mode,
-            now_ms,
-        );
-        task.operation_id = self.active_operation_id.clone();
-        task.goal_id = Some(goal.id.clone());
-        task.begin(now_ms)?;
-        self.session.goal_id = Some(goal.id.clone());
-        self.session.current_task_id = Some(task.id.clone());
-        self.store.select_task(
-            &self.session,
-            Some(&task),
-            Some(&goal),
-            None,
-            &self.client_id,
-        )?;
-        let prompt = if goal.native {
-            format!("/goal {objective}")
-        } else {
-            format!(
-                "Goal: {objective}\nContinue working until the goal is complete. Use goal_complete or goal_blocked to report terminal state."
-            )
-        };
-        let (result, mut event) = self
-            .run_interaction(
-                prompt,
-                PromptMode::GoalContinuation,
-                Some(ExchangeAdmission::goal(
-                    format!("/goal {objective}"),
-                    goal.id.clone(),
-                )),
-            )
-            .await?;
-        event.insert(0, self.event("goal_changed", serde_json::to_value(goal)?)?);
-        Ok((result, event))
     }
 
     #[cfg(test)]
     fn create_goal(&mut self, objective: String, native: bool) -> Result<GoalRecord> {
         let now_ms = self.clock.now_ms();
-        let goal = GoalRecord {
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
+        let mut task = crate::task::ActiveTask::goal(
             objective,
-            state: GoalState::Active,
-            continuation: crate::session::continuation::ContinuationBudget::new(
-                self.goal_max_turns,
-                2,
-            ),
+            crate::session::continuation::ContinuationBudget::new(self.goal_max_turns, 2),
             native,
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-        };
-        self.store.save_goal(&goal)?;
-        self.session.goal_id = Some(goal.id.clone());
-        self.save_session()?;
-        Ok(goal)
-    }
-
-    async fn pause_goal(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut goal = self.active_goal()?;
-        if let Some(mut execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.goal_id == goal.id)
-        {
-            execution.review_paused = false;
-            self.store.save_plan_execution(&execution)?;
-        }
-        if goal.state == GoalState::Paused {
-            return Ok((
-                serde_json::to_value(&goal)?,
-                vec![self.event("goal_changed", serde_json::to_value(goal)?)?],
-            ));
-        }
-        anyhow::ensure!(goal.state == GoalState::Active, "goal is not active");
-        self.sync_native_goal(&goal, "paused").await?;
-        goal.state = GoalState::Paused;
-        goal.updated_at_ms = self.clock.now_ms();
-        self.store.save_goal(&goal)?;
-        self.sync_plan_execution(&goal).await?;
-        Ok((
-            serde_json::to_value(&goal)?,
-            vec![self.event("goal_changed", serde_json::to_value(goal)?)?],
-        ))
-    }
-
-    async fn resume_goal(
-        &mut self,
-        message: Option<String>,
-        lifecycle: Option<String>,
-        continuation: Option<String>,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut goal = self.active_goal()?;
-        if let Some(execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.goal_id == goal.id)
-        {
-            anyhow::ensure!(
-                execution.pending_revision_reason.is_none(),
-                "review the pending plan revision before resuming execution"
-            );
-        }
-        anyhow::ensure!(
-            matches!(
-                goal.state,
-                GoalState::Paused
-                    | GoalState::Stalled
-                    | GoalState::Blocked
-                    | GoalState::UsageLimited
-                    | GoalState::BudgetLimited
-            ),
-            "goal cannot resume from its current state"
+            now_ms,
         );
-        let (_, mut finalization_event) = self
-            .retry_finalization()
-            .await
-            .context("finish previous exchange before resuming goal")?;
-        if self.turn_cancellation.requested.load(Ordering::Acquire)
-            || !matches!(
-                *self.turn_cancellation.cleanup.borrow(),
-                ExecutionCleanup::Idle
-            )
-        {
-            return Err(anyhow::Error::new(TurnCancelled));
-        }
-        goal.resume(self.clock.now_ms());
-        self.store.save_goal(&goal)?;
-        self.sync_plan_execution(&goal).await?;
-        if self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .iter()
-            .any(|record| {
-                record.goal_id == goal.id && record.phase == crate::plan::PlanPhase::Checking
-            })
-        {
-            finalization_event.extend(self.run_checks().await?);
-            goal = self.active_goal()?;
-            if goal.state != GoalState::Active {
-                return Ok((json!({"goal": goal}), finalization_event));
-            }
-        }
-        let plan_prompt =
-            self.plan_goal_prompt(&goal, PlanExecutionPromptKind::ResumeAfterInterruption)?;
-        let mode = if plan_prompt.is_some() {
-            PromptMode::ExecutePlan
-        } else {
-            PromptMode::GoalContinuation
-        };
-        let mut prompt = plan_prompt.unwrap_or_else(|| {
-            if goal.native {
-                "/goal resume".to_owned()
-            } else {
-                format!(
-                    "/goal resume\nContinue working toward this goal: {}",
-                    goal.objective
-                )
-            }
-        });
-        if let Some(text) = message.as_deref() {
-            prompt.push_str("\n\nAdditional user instructions:\n");
-            prompt.push_str(text);
-        }
-        if let Some(notice) = continuation {
-            prompt.push_str("\n\nHarness transition:\n");
-            prompt.push_str(&notice);
-        }
-        let control_resume = message.is_none();
-        let visible_prompt = message.unwrap_or_default();
-        let mut resumed_phase = None;
-        let mut admission = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.goal_id == goal.id)
-            .map(|execution| {
-                resumed_phase = Some(execution.phase);
-                ExchangeAdmission::execution(
-                    visible_prompt.clone(),
-                    execution.plan_id,
-                    execution.id,
-                    goal.id.clone(),
-                )
-            })
-            .unwrap_or_else(|| ExchangeAdmission::goal(visible_prompt, goal.id.clone()));
-        if control_resume {
-            admission.lifecycle = Some(lifecycle.unwrap_or_else(|| {
-                resumed_phase
-                    .map(|phase| WorkflowActivity::from(phase).event(LifecycleAction::Resumed))
-                    .unwrap_or_else(|| WorkflowActivity::Goal.event(LifecycleAction::Resumed))
-            }));
-        }
-        match self.run_interaction(prompt, mode, Some(admission)).await {
-            Ok((result, mut event)) => {
-                event.insert(0, self.event("goal_changed", serde_json::to_value(goal)?)?);
-                finalization_event.extend(event);
-                Ok((result, finalization_event))
-            }
-            Err(error) => {
-                if error.downcast_ref::<TurnCancelled>().is_some()
-                    && self.turn_cancellation.restart.load(Ordering::Acquire)
-                {
-                    return Err(error);
-                }
-                goal.state = GoalState::Paused;
-                goal.updated_at_ms = self.clock.now_ms();
-                self.store.save_goal(&goal)?;
-                self.sync_plan_execution(&goal).await?;
-                let _ = self.sync_native_goal(&goal, "paused").await;
-                Err(error).context("resume Harness goal")
-            }
-        }
-    }
-
-    async fn clear_goal(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut goal = self.active_goal()?;
-        self.sync_native_goal(&goal, "cleared").await?;
-        goal.state = GoalState::Cleared;
-        goal.updated_at_ms = self.clock.now_ms();
-        self.store.save_goal(&goal)?;
-        let mut event = Vec::new();
-        for mut exchange in self.store.list_exchange(&self.session.id)? {
-            if exchange.goal_id.as_deref() != Some(goal.id.as_str())
-                || !matches!(
-                    exchange.state(),
-                    ExchangeState::Running | ExchangeState::Finalizing
-                )
-            {
-                continue;
-            }
-            let outcome = exchange
-                .finalization_outcome()
-                .unwrap_or(crate::exchange::ExchangeOutcome::Cancelled);
-            self.capture_final_checkpoint(&mut exchange, outcome)
-                .await?;
-            if self
-                .exchange_runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.exchange_id == exchange.id)
-            {
-                self.exchange_runtime = None;
-            }
-            event.push(self.event(
-                "exchange_complete",
-                json!({"id":exchange.id,"state":exchange.state()}),
-            )?);
-        }
-        self.sync_plan_execution(&goal).await?;
-        self.session.goal_id = None;
-        self.save_session()?;
-        event.push(self.event("goal_changed", serde_json::to_value(&goal)?)?);
-        Ok((serde_json::to_value(goal)?, event))
-    }
-
-    async fn continue_goal(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let goal = self.active_goal()?;
-        anyhow::ensure!(goal.state == GoalState::Active, "goal is not active");
-        let mut check_events = Vec::new();
-        if self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .iter()
-            .any(|record| {
-                record.goal_id == goal.id && record.phase == crate::plan::PlanPhase::Checking
-            })
-        {
-            check_events = self.run_checks().await?;
-            if self.active_goal()?.state != GoalState::Active {
-                return Ok((json!({"checks_finished":true}), check_events));
-            }
-        }
-        let goal = self.active_goal()?;
-        let plan_prompt = self.plan_goal_prompt(&goal, PlanExecutionPromptKind::Continue)?;
-        let mode = if plan_prompt.is_some() {
-            PromptMode::ExecutePlan
-        } else {
-            PromptMode::GoalContinuation
-        };
-        let prompt = plan_prompt.unwrap_or_else(|| {
-            if goal.native {
-                "/goal resume".to_owned()
-            } else {
-                format!("Continue working toward this goal: {}", goal.objective)
-            }
-        });
-        let admission = if let Some(execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.goal_id == goal.id)
-        {
-            let previous_phase = self
-                .store
-                .latest_exchange(&self.session.id)?
-                .as_ref()
-                .and_then(|exchange| exchange.execution_phase.as_ref().map(|phase| phase.phase));
-            let activity = WorkflowActivity::from(execution.phase);
-            let action = if previous_phase == Some(execution.phase) {
-                LifecycleAction::Continued
-            } else {
-                LifecycleAction::Started
-            };
-            let mut admission = ExchangeAdmission::execution(
-                String::new(),
-                execution.plan_id,
-                execution.id,
-                goal.id.clone(),
-            );
-            admission.lifecycle = Some(activity.event(action));
-            admission
-        } else {
-            let mut admission = ExchangeAdmission::goal(String::new(), goal.id.clone());
-            admission.lifecycle = Some(WorkflowActivity::Goal.event(LifecycleAction::Continued));
-            admission
-        };
-        if let Some(mut previous) = self.store.latest_exchange(&self.session.id)?
-            && previous.state() == ExchangeState::Running
-        {
-            self.capture_final_checkpoint(
-                &mut previous,
-                crate::exchange::ExchangeOutcome::Complete,
-            )
-            .await?;
-        }
-        let (result, mut events) = self.run_interaction(prompt, mode, Some(admission)).await?;
-        check_events.append(&mut events);
-        Ok((result, check_events))
+        task.request_entry("Continue the active goal".into(), now_ms)?;
+        let current = self.task_controller.current()?;
+        self.task_controller.change(
+            &mut self.store,
+            current.as_ref().map(|task| &task.revision),
+            crate::task::TaskChange::Install(Box::new(task)),
+            now_ms,
+        )?;
+        self.session.active_task = self.task_controller.current()?;
+        self.active_goal()
     }
 
     async fn apply_goal_evidence(
         &mut self,
-        mut evidence: crate::goal::TurnEvidence,
+        evidence: crate::goal::TurnEvidence,
+        permit: Option<crate::task::TaskPermit>,
+        completed_turn: crate::task::TaskTurnId,
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
-        let Some(goal_id) = self.session.goal_id.clone() else {
+        let Some(permit) = permit else {
             return Ok(false);
         };
-        let mut goal = self
-            .store
-            .load_goal(&goal_id)?
-            .context("active goal record is missing")?;
-        if self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .iter()
-            .any(|execution| execution.goal_id == goal.id)
-        {
-            evidence.structured_complete = false;
+        let Some(task) = self.task_controller.current()? else {
+            return Ok(false);
+        };
+        if task.kind() == crate::task::TaskKind::Plan {
+            return Ok(false);
         }
-        let continuing = match goal.observe(evidence, self.clock.now_ms()) {
+        let observed = self.task_controller.observe_goal(
+            &mut self.store,
+            &permit,
+            completed_turn,
+            evidence,
+            self.clock.now_ms(),
+        );
+        let (observed, decision) = match observed {
+            Ok(observed) => observed,
+            Err(error) if error.is::<crate::task::StaleTask>() => {
+                self.trace
+                    .record(&self.session.id, "task.stale_goal_evidence", json!({}));
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let goal = GoalRecord {
+            id: task.revision.as_str().into(),
+            session_id: self.session.id.clone(),
+            objective: observed.objective,
+            state: observed.state,
+            continuation: observed.continuation,
+            native: observed.native,
+            created_at_ms: task.created_at_ms,
+            updated_at_ms: self.clock.now_ms(),
+        };
+        let continuing = match decision {
             ContinuationDecision::Continue | ContinuationDecision::RetryNoProgress => {
-                event.push(self.event("goal_continue_requested", serde_json::to_value(&goal)?)?);
+                self.trace.record(
+                    &self.session.id,
+                    "task.continuation_reserved",
+                    json!({"revision":permit.revision()}),
+                );
+                event.push(self.event(
+                    if task.kind() == crate::task::TaskKind::Goal {
+                        "goal_changed"
+                    } else {
+                        "goal_continue_requested"
+                    },
+                    serde_json::to_value(&goal)?,
+                )?);
                 true
             }
             ContinuationDecision::Complete
@@ -9243,39 +7569,64 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             }
             ContinuationDecision::Stop => return Ok(false),
         };
-        self.store.save_goal(&goal)?;
-        self.sync_plan_execution(&goal).await?;
         Ok(continuing)
     }
 
     fn active_goal(&self) -> Result<GoalRecord> {
-        let goal_id = self.session.goal_id.as_deref().context("no active goal")?;
-        self.store
-            .load_goal(goal_id)?
-            .context("active goal record is missing")
+        self.current_goal()?.context("no active goal")
     }
 
     fn current_goal(&self) -> Result<Option<GoalRecord>> {
-        self.session
-            .goal_id
-            .as_deref()
-            .map(|goal_id| self.store.load_goal(goal_id))
-            .transpose()
-            .map(Option::flatten)
+        if let Some(task) = self.task_controller.current()? {
+            let (objective, state, continuation, native) = match &task.workflow {
+                crate::task::TaskWorkflow::Goal { goal } => (
+                    goal.objective.clone(),
+                    goal.state,
+                    goal.continuation.clone(),
+                    goal.native,
+                ),
+                crate::task::TaskWorkflow::Execute { execution } => (
+                    execution.title.clone(),
+                    match execution.record.state {
+                        PlanExecutionState::Active => GoalState::Active,
+                        PlanExecutionState::Paused => GoalState::Paused,
+                        PlanExecutionState::Complete => GoalState::Complete,
+                        PlanExecutionState::Cancelled => GoalState::Cleared,
+                        PlanExecutionState::Stalled => GoalState::Stalled,
+                        PlanExecutionState::Blocked => GoalState::Blocked,
+                    },
+                    execution.continuation.clone(),
+                    execution.native,
+                ),
+                crate::task::TaskWorkflow::Plan { .. } => return Ok(None),
+            };
+            return Ok(Some(GoalRecord {
+                id: task.revision.as_str().into(),
+                session_id: self.session.id.clone(),
+                objective,
+                state,
+                continuation,
+                native,
+                created_at_ms: task.created_at_ms,
+                updated_at_ms: task.updated_at_ms,
+            }));
+        }
+        Ok(None)
     }
 
     async fn pause_goal_after_turn_failure(&mut self) -> Result<()> {
-        let Some(mut goal) = self.current_goal()? else {
-            return Ok(());
-        };
-        if goal.state != GoalState::Active {
-            return Ok(());
+        if let Some(task) = self.task_controller.current()?
+            && task.entry_accepted()
+            && task.status() == crate::task::TaskStatus::Running
+        {
+            self.task_controller.change(
+                &mut self.store,
+                Some(&task.revision),
+                crate::task::TaskChange::Pause,
+                self.clock.now_ms(),
+            )?;
         }
-        let _ = self.sync_native_goal(&goal, "paused").await;
-        goal.state = GoalState::Paused;
-        goal.updated_at_ms = self.clock.now_ms();
-        self.store.save_goal(&goal)?;
-        self.sync_plan_execution(&goal).await
+        Ok(())
     }
 
     async fn sync_native_goal(&mut self, goal: &GoalRecord, status: &str) -> Result<()> {
@@ -9530,13 +7881,17 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             return Ok(Vec::new());
         };
         let mut session = self.session.clone();
-        if session.goal_id.is_some() {
-            let mut goal = self.active_goal()?;
-            self.sync_native_goal(&goal, "cleared").await?;
-            goal.state = GoalState::Cleared;
-            goal.updated_at_ms = self.clock.now_ms();
-            self.store.save_goal(&goal)?;
-            session.goal_id = None;
+        if let Some(task) = self.task_controller.current()? {
+            if let Some(goal) = self.current_goal()? {
+                self.sync_native_goal(&goal, "cleared").await?;
+            }
+            self.task_controller.change(
+                &mut self.store,
+                Some(&task.revision),
+                crate::task::TaskChange::Clear,
+                self.clock.now_ms(),
+            )?;
+            session.active_task = None;
         }
         let replacement = crate::backend::build(
             self.backend_launch.clone(),
@@ -9753,19 +8108,24 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn pause_current_goal(&mut self) -> Result<()> {
-        let Some(goal_id) = self.session.goal_id.clone() else {
-            return Ok(());
-        };
-        let Some(mut goal) = self.store.load_goal(&goal_id)? else {
+        let Some(goal) = self.current_goal()? else {
             return Ok(());
         };
         if goal.state != GoalState::Active {
             return Ok(());
         }
         self.sync_native_goal(&goal, "paused").await?;
-        goal.state = GoalState::Paused;
-        goal.updated_at_ms = self.clock.now_ms();
-        self.store.save_goal(&goal)
+        let task = self
+            .task_controller
+            .current()?
+            .context("task was cleared while pausing")?;
+        self.task_controller.change(
+            &mut self.store,
+            Some(&task.revision),
+            crate::task::TaskChange::Pause,
+            self.clock.now_ms(),
+        )?;
+        Ok(())
     }
 
     async fn configuration_progress(&mut self, state: &str) -> Result<()> {
@@ -9782,7 +8142,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 data: json!({"operation_id": operation_id, "state": state}),
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             },
             &mut Vec::new(),
         )
@@ -10578,23 +8938,23 @@ impl Drop for HarnessBroker {
     }
 }
 
-/// Attribute a native tool once to the single active task in its owning exchange.
+/// Attribute a native tool once to the single active checklist item in its owning exchange.
 fn attribute_provider_tool(
     exchange: &mut Exchange,
-    task: &mut TaskTracker,
+    checklist: &mut ChecklistTracker,
     event: &BackendEvent,
 ) -> Result<()> {
-    let (Some(address), Some(activity), Some(task_id)) = (
+    let (Some(address), Some(activity), Some(checklist_item_id)) = (
         event.address.as_ref(),
         event.activity.as_ref(),
-        task.attribution_target().map(str::to_owned),
+        checklist.attribution_target().map(str::to_owned),
     ) else {
         return Ok(());
     };
     let turn_id = exchange.turn_mut(address)?.id().to_owned();
-    if exchange.attribute_tool(&turn_id, &activity.id, &task_id)? {
-        task.mark_attributed(&task_id);
-        exchange.task = Some(task.snapshot().clone());
+    if exchange.attribute_tool(&turn_id, &activity.id, &checklist_item_id)? {
+        checklist.mark_attributed(&checklist_item_id);
+        exchange.checklist = Some(checklist.snapshot().clone());
     }
     Ok(())
 }
@@ -10766,29 +9126,26 @@ fn default_goal_max_turns() -> u32 {
 
 #[cfg(test)]
 mod test {
+    fn active_execution(broker: &HarnessBroker) -> crate::plan::PlanExecutionRecord {
+        match broker.task_controller.current().unwrap().unwrap().workflow {
+            crate::task::TaskWorkflow::Execute { execution } => execution.record,
+            _ => panic!("expected an active execution"),
+        }
+    }
+
     #[tokio::test]
     async fn live_status_and_agent_queries_do_not_reload_unrelated_history() -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let task = crate::task::TaskRecord::new(
-            broker.session.id.clone(),
-            "active".into(),
-            crate::task::TaskKind::Plan,
-            broker.session.access.clone(),
-            broker.session.approval_mode,
-            1,
-        );
-        broker.store.save_task(&task)?;
-        broker.session.current_task_id = Some(task.id.clone());
-        broker.save_session()?;
+        broker.create_task(crate::task::TaskKind::Goal, "active".into(), None, None)?;
+        let task = broker.task_controller.current()?.unwrap();
         let connection = rusqlite::Connection::open(data.path().join("harness.sqlite3"))?;
-        connection.execute(
-            "INSERT INTO task_record VALUES('unrelated',?1,'{}')",
-            [&broker.session.id],
-        )?;
         connection.execute("INSERT INTO exchange_record(id,session_id,agent_id,ordinal,payload) VALUES('old',?1,?2,1,?3)",rusqlite::params![broker.session.id,HarnessSession::primary_agent_id(&broker.session.id),serde_json::json!({"state":"complete","turn":"malformed history"}).to_string()])?;
-        assert_eq!(broker.current_task()?.unwrap().id, task.id);
+        assert_eq!(
+            broker.task_controller.current()?.unwrap().revision,
+            task.revision
+        );
         assert_eq!(
             broker.live_interaction_status(None)?,
             crate::session::state_machine::SessionPhase::Idle
@@ -10922,7 +9279,7 @@ mod test {
                     sink.send_wait(BackendEvent {
                         received_at_ms: None, address: Some(address.clone()), turn_boundary: boundary,
                         kind: kind.into(), text: text.map(str::to_owned), data: json!({"provider_message_id":"repair-message","provider_message_phase":"commentary"}),
-                        activity: None, summary: None, task_update: None,
+                        activity: None, summary: None, checklist_update: None,
                     }).await?;
                 }
             }
@@ -11116,20 +9473,11 @@ mod test {
             .check_runner
             .begin_changes("goal-gate".into(), &checkpoint)?;
         std::fs::write(repository.path().join("seed.txt"), "changed")?;
-        let mut goal = GoalRecord {
-            id: "goal-gate".into(),
-            session_id: broker.session.id.clone(),
-            objective: "Verify completion".into(),
-            state: GoalState::Active,
-            continuation: Default::default(),
-            native: false,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-        };
-        broker.session.goal_id = Some(goal.id.clone());
-        broker.store.save_goal(&goal)?;
+        let goal = broker.create_goal("Verify completion".into(), false)?;
+        broker
+            .check_runner
+            .begin_changes(goal.id.clone(), &checkpoint)?;
         let mut exchange = completed_interaction("goal-turn", &broker.session.id, Vec::new());
-        exchange.goal_id = Some(goal.id.clone());
         exchange.check_owner = Some(goal.id.clone());
         broker.store.save_exchange(&exchange)?;
         broker.reconcile_timeline()?;
@@ -11137,14 +9485,25 @@ mod test {
             .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
             .await?;
         assert!(broker.check_runner.history()?.is_empty());
-        goal.state = GoalState::Paused;
-        broker.store.save_goal(&goal)?;
+        broker.task_controller.change(
+            &mut broker.store,
+            None,
+            crate::task::TaskChange::Pause,
+            2,
+        )?;
         broker
             .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
             .await?;
         assert!(broker.check_runner.history()?.is_empty());
-        goal.state = GoalState::Complete;
-        broker.store.save_goal(&goal)?;
+        let active = broker.task_controller.current()?.unwrap();
+        broker
+            .task_controller
+            .update(&mut broker.store, &active.permit(), 3, |task| {
+                if let crate::task::TaskWorkflow::Goal { goal } = &mut task.workflow {
+                    goal.state = GoalState::Complete;
+                }
+                Ok(())
+            })?;
         exchange.set_awaiting_input(true);
         broker.store.save_exchange(&exchange)?;
         broker
@@ -11830,7 +10189,7 @@ mod test {
                     data: Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await?;
             }
@@ -11906,7 +10265,10 @@ mod test {
                         });
                     }
                     broker
-                        .transition_settings(action, "permission".into())
+                        .apply_configuration(
+                            action,
+                            configuration::ConfigurationCommand::Permission,
+                        )
                         .await
                         .unwrap();
                     let stored = broker
@@ -11917,7 +10279,7 @@ mod test {
                     assert_eq!(stored.access.sandbox, sandbox);
                     assert_eq!(stored.access.abbreviation(), "rxwx");
                     assert_eq!(stored.approval_mode.label().to_lowercase(), approval);
-                    assert!(broker.store.list_task(&stored.id).unwrap().is_empty());
+                    assert!(stored.active_task.is_none());
                 }
             }
         }
@@ -11997,38 +10359,59 @@ mod test {
     }
 
     #[tokio::test]
-    async fn task_switch_retains_paused_history_and_clear_does_not_destroy_it() {
-        use crate::task::{TaskKind, TaskStatus};
+    async fn task_replacement_keeps_one_owner_and_clear_records_outcome() {
+        use crate::task::TaskKind;
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker
-            .create_task(TaskKind::Plan, "First".into(), None, None)
+            .create_task(TaskKind::Goal, "First".into(), None, None)
             .unwrap();
-        let first = broker.session.current_task_id.clone().unwrap();
-        broker.pause_task(false).await.unwrap();
+        let first = broker.task_controller.current().unwrap().unwrap().revision;
         broker
-            .create_task(TaskKind::Plan, "Second".into(), None, None)
+            .create_task(TaskKind::Goal, "Second".into(), None, None)
             .unwrap();
-        let second = broker.session.current_task_id.clone().unwrap();
+        let second = broker.task_controller.current().unwrap().unwrap();
+        assert_ne!(first, second.revision);
+        assert_eq!(second.title(), "Second");
         broker.pause_task(true).await.unwrap();
-        let tasks = broker.store.list_task(&broker.session.id).unwrap();
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(
-            tasks.iter().find(|task| task.id == first).unwrap().status,
-            TaskStatus::Paused
-        );
-        assert_eq!(
-            tasks.iter().find(|task| task.id == second).unwrap().status,
-            TaskStatus::Cancelled
-        );
-        assert!(broker.session.current_task_id.is_none());
+        assert!(broker.task_controller.current().unwrap().is_none());
+        let events = broker.store.list_session_event(&broker.session.id).unwrap();
+        assert!(events.iter().any(|event| matches!(&event.detail,
+            SessionEventKind::TaskFinished { outcome } if outcome.title == "Second")));
+    }
+
+    #[tokio::test]
+    async fn paused_task_discussion_does_not_resume_task() -> Result<()> {
+        use crate::task::{TaskKind, TaskStatus};
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let goal = broker.create_goal("Persist goal".into(), false)?;
+        broker.create_task(TaskKind::Goal, goal.objective.clone(), None, Some(goal.id))?;
+        broker.pause_task(false).await?;
+        let paused = broker.task_controller.current()?.unwrap();
+        let response = broker
+            .dispatch(Request {
+                id: 2,
+                method: "prompt.submit".into(),
+                params: json!({"text":"Explain the current approach"}),
+            })
+            .await;
         assert!(
-            broker
-                .transition_task(json!({"action":"resume","task_id":second}))
-                .await
-                .is_err()
+            response.response.error().is_none(),
+            "{:?}",
+            response.response.error()
         );
+        let current = broker.task_controller.current()?.unwrap();
+        assert_eq!(current.title(), paused.title());
+        assert_eq!(current.revision, paused.revision);
+        assert_eq!(current.status(), TaskStatus::Paused);
+        let exchange = broker.store.list_exchange(&broker.session.id)?;
+        assert_eq!(exchange.len(), 1);
+        assert_eq!(exchange[0].prompt, "Explain the current approach");
+        assert_eq!(exchange[0].origin, crate::exchange::ExchangeOrigin::User);
+        Ok(())
     }
 
     #[tokio::test]
@@ -12048,10 +10431,9 @@ mod test {
             )
             .await
             .unwrap();
-        let task = broker.current_task().unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Paused);
-        assert_eq!(task.approval_mode, ApprovalMode::Ask);
-        assert_eq!(task.access, broker.session.access);
+        let task = broker.task_controller.current().unwrap().unwrap();
+        assert_eq!(task.status(), TaskStatus::Paused);
+        assert_eq!(broker.session.approval_mode, ApprovalMode::Ask);
         assert!(
             broker
                 .store
@@ -12062,95 +10444,135 @@ mod test {
     }
 
     #[test]
-    fn restart_recovers_clear_without_replaying_or_deleting_task_history() {
-        use crate::task::{TaskKind, TaskOperation, TaskStatus};
+    fn completed_clear_receipt_survives_runtime_recovery() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker
-            .create_task(TaskKind::Plan, "Interrupted".into(), None, None)
+            .create_task(
+                crate::task::TaskKind::Goal,
+                "Interrupted".into(),
+                None,
+                None,
+            )
             .unwrap();
-        let operation = TaskOperation {
+        let receipt = crate::task::TaskOperation {
             revision: 0,
             id: "clear-before-shutdown".into(),
             session_id: broker.session.id.clone(),
             action: json!({"action":"clear"}),
             permission_selection: None,
-            state: "accepted".into(),
+            state: "completed".into(),
             error: None,
             exchange_id: None,
             created_at_ms: 1,
             resume_after_transition: false,
         };
-        broker.store.admit_task_operation(&operation).unwrap();
+        let task = broker.task_controller.current().unwrap().unwrap();
+        broker
+            .task_controller
+            .command(
+                &mut broker.store,
+                &receipt,
+                Some(&task.revision),
+                crate::task::TaskChange::Clear,
+                1,
+            )
+            .unwrap();
+        assert!(broker.task_controller.current().unwrap().is_none());
         broker
             .store
             .interrupt_detached_execution(&broker.session.id)
             .unwrap();
-        let session = broker
-            .store
-            .load_session(&broker.session.id)
-            .unwrap()
-            .unwrap();
-        assert!(session.current_task_id.is_none());
-        assert_eq!(
-            broker.store.list_task(&session.id).unwrap()[0].status,
-            TaskStatus::Cancelled
-        );
-        assert!(broker.store.list_exchange(&session.id).unwrap().is_empty());
-        assert_eq!(
+        assert!(
             broker
                 .store
-                .load_task_operation(&session.id, &operation.id)
+                .load_session(&broker.session.id)
                 .unwrap()
                 .unwrap()
-                .state,
-            "outcome_unknown"
+                .active_task
+                .is_none()
         );
+        let operation = broker
+            .store
+            .load_task_operation(&broker.session.id, "clear-before-shutdown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.state, "completed");
+        assert!(broker.store.list_session_event(&broker.session.id).unwrap().iter().any(|event|
+            matches!(&event.detail, SessionEventKind::TaskFinished { outcome } if outcome.title == "Interrupted")));
     }
 
     #[test]
-    fn task_operations_deduplicate_and_survive_runtime_recovery_without_replay() {
-        use crate::task::{TaskKind, TaskOperation, TaskStatus};
+    fn completed_task_receipt_deduplicates_without_repeating_the_mutation() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker
-            .create_task(TaskKind::Plan, "Interrupted".into(), None, None)
+            .create_task(
+                crate::task::TaskKind::Goal,
+                "Retain task".into(),
+                None,
+                None,
+            )
             .unwrap();
-        let mut operation = TaskOperation {
+        let mut receipt = crate::task::TaskOperation {
             revision: 0,
             id: "original".into(),
             session_id: broker.session.id.clone(),
-            action: json!({"action":"plan","text":"Original"}),
+            action: json!({"action":"pause"}),
             permission_selection: None,
-            state: "running".into(),
+            state: "completed".into(),
             error: None,
             exchange_id: None,
             created_at_ms: 1,
             resume_after_transition: false,
         };
-        assert!(broker.store.admit_task_operation(&operation).unwrap());
-        assert!(!broker.store.admit_task_operation(&operation).unwrap());
-        operation.action["text"] = json!("Changed");
-        assert!(broker.store.admit_task_operation(&operation).is_err());
+        let admitted = broker.task_controller.current().unwrap().unwrap().revision;
         broker
-            .store
-            .interrupt_detached_execution(&broker.session.id)
+            .task_controller
+            .command(
+                &mut broker.store,
+                &receipt,
+                Some(&admitted),
+                crate::task::TaskChange::Pause,
+                1,
+            )
+            .unwrap();
+        let revision = broker.task_controller.current().unwrap().unwrap().revision;
+        broker
+            .task_controller
+            .command(
+                &mut broker.store,
+                &receipt,
+                Some(&admitted),
+                crate::task::TaskChange::Pause,
+                2,
+            )
             .unwrap();
         assert_eq!(
-            broker.current_task().unwrap().unwrap().status,
-            TaskStatus::Paused
+            broker.task_controller.current().unwrap().unwrap().revision,
+            revision
         );
-        assert_eq!(
+        receipt.action = json!({"action":"clear"});
+        assert!(
             broker
-                .store
-                .load_task_operation(&broker.session.id, "original")
-                .unwrap()
-                .unwrap()
-                .state,
-            "outcome_unknown"
+                .task_controller
+                .command(
+                    &mut broker.store,
+                    &receipt,
+                    Some(&revision),
+                    crate::task::TaskChange::Clear,
+                    3
+                )
+                .is_err()
         );
+        let receipt = broker
+            .store
+            .load_task_operation(&broker.session.id, "original")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.state, "completed");
         assert!(
             broker
                 .store
@@ -12307,8 +10729,6 @@ mod test {
             created_at_ms: 1,
             updated_at_ms: 1,
         };
-        broker.store.save_goal(&goal).unwrap();
-        broker.session.goal_id = Some(goal.id.clone());
         broker.save_session().unwrap();
         let execution:PlanExecutionRecord=serde_json::from_value(json!({
             "id":"check-execution","session_id":broker.session.id,"plan_id":"check-plan","goal_id":goal.id,
@@ -12318,6 +10738,22 @@ mod test {
             "observed_source":{},"observed_generation":0,"observed_check":[],"created_at_ms":1
         })).unwrap();
         broker.store.save_plan_execution(&execution).unwrap();
+        let task = crate::task::ActiveTask::execute(
+            "Run checks".into(),
+            execution,
+            crate::session::continuation::ContinuationBudget::new(20, 2),
+            false,
+            1,
+        );
+        broker
+            .task_controller
+            .change(
+                &mut broker.store,
+                None,
+                crate::task::TaskChange::Install(Box::new(task)),
+                1,
+            )
+            .unwrap();
         save_check_exchange(&mut broker, "check-exchange", true).unwrap();
         broker
     }
@@ -12555,9 +10991,19 @@ mod test {
             broker.turn_cancellation.arm(false);
             execution.state = PlanExecutionState::Active;
             broker.store.save_plan_execution(&execution).unwrap();
-            let mut goal = broker.active_goal().unwrap();
-            goal.resume(100);
-            broker.store.save_goal(&goal).unwrap();
+            let task = broker.task_controller.current().unwrap().unwrap();
+            broker
+                .task_controller
+                .update(&mut broker.store, &task.permit(), 100, |task| {
+                    let crate::task::TaskWorkflow::Execute { execution: active } =
+                        &mut task.workflow
+                    else {
+                        anyhow::bail!("expected an execution task");
+                    };
+                    active.record = execution.clone();
+                    Ok(())
+                })
+                .unwrap();
             broker.run_checks().await.unwrap();
             let execution = broker
                 .store
@@ -12593,6 +11039,7 @@ mod test {
             "{:?}",
             result.response.error()
         );
+        run_plan_to_input_boundary(&mut broker).await.unwrap();
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
         let before = broker
             .plan_file
@@ -12834,10 +11281,16 @@ mod test {
         broker.capability.approval_mode_list =
             vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow];
         broker
-            .begin_plan_acceptance(json!({"plan_id":plan.id,"digest":draft.review_digest}))
-            .await
+            .dispatch_session_command(
+                "plan.acceptance.begin",
+                json!({"plan_id":plan.id,"digest":draft.review_digest}),
+            )
             .unwrap();
-        broker.cancel_plan_acceptance().unwrap();
+        broker
+            .dispatch_session_command("plan.acceptance.cancel", json!({}))
+            .unwrap();
+        let selected_task =
+            serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
         assert!(
             broker
                 .plan_file
@@ -12852,6 +11305,11 @@ mod test {
             })
             .await;
         assert!(invalid.response.error().is_some());
+        assert_eq!(
+            serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
+            selected_task,
+            "a rejected plan approval must preserve the active task"
+        );
         assert!(
             broker
                 .plan_file
@@ -12948,6 +11406,67 @@ mod test {
     }
 
     #[tokio::test]
+    async fn task_migration_preserves_plan_and_execution() -> Result<()> {
+        for executing in [false, true] {
+            let repository = repository();
+            let data = tempfile::tempdir()?;
+            let mut broker = planning_question_broker(repository.path(), data.path(), false);
+            broker.backend = Arc::from(crate::backend::build(
+                BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                broker.permission_coordinator.clone(),
+                broker.trace.clone(),
+                broker.data_root.clone(),
+            )?);
+            broker
+                .submit_prompt(json!({"text":"/plan add a reusable API"}))
+                .await?;
+            if executing {
+                let plan = broker
+                    .snapshot()?
+                    .active_plan
+                    .context("test plan missing")?;
+                broker.backend = Arc::new(StoppedExecutionBackend { cancelled: true });
+                broker.dispatch_session_command(
+                    "plan.accept",
+                    json!({"plan_id":plan.id,"approval_mode":"ask"}),
+                )?;
+            }
+            let before = broker
+                .store
+                .load_active_task(&broker.session.id)?
+                .context("task missing before migration")?;
+            let plan_id = match &before.workflow {
+                crate::task::TaskWorkflow::Plan { plan } => plan.artifact.id.clone(),
+                crate::task::TaskWorkflow::Execute { execution } => {
+                    execution.record.plan_id.clone()
+                }
+                crate::task::TaskWorkflow::Goal { .. } => unreachable!(),
+            };
+            let title = broker.store.load_plan(&plan_id)?.unwrap().title;
+            let session_id = broker.session.id.clone();
+            let path = broker.data_root.join("harness.sqlite3");
+            let connection = rusqlite::Connection::open(&path)?;
+            connection.execute("UPDATE session_record SET payload=json_set(payload,'$.format_version',51,'$.session.active_task',NULL) WHERE id=?1", [&session_id])?;
+            connection.pragma_update(None, "user_version", 3)?;
+            drop(connection);
+            drop(broker);
+            let migrated = SqliteStore::open(data.path())?;
+            let after = migrated
+                .load_active_task(&session_id)?
+                .context("task missing after migration")?;
+            assert_eq!(
+                serde_json::to_value(&before.workflow)?,
+                serde_json::to_value(&after.workflow)?
+            );
+            assert_eq!(migrated.load_plan(&plan_id)?.unwrap().title, title);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn execution_failure_and_cancellation_resume_the_phase_without_accepting_again() {
         for cancelled in [false, true] {
             let repository = repository();
@@ -12972,8 +11491,10 @@ mod test {
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
             broker.backend = Arc::new(StoppedExecutionBackend { cancelled });
             let (result, _) = broker
-                .accept_plan(json!({"plan_id":plan.id,"approval_mode":"ask"}))
-                .await
+                .dispatch_session_command(
+                    "plan.accept",
+                    json!({"plan_id":plan.id,"approval_mode":"ask"}),
+                )
                 .unwrap();
             assert_eq!(result["execution_error"].as_str().is_some(), !cancelled);
             let history = broker.store.list_exchange(&broker.session.id).unwrap();
@@ -12986,32 +11507,27 @@ mod test {
                     ExchangeState::Failed
                 }
             );
-            assert_eq!(
-                stopped.execution_phase.as_ref().unwrap().phase,
-                crate::plan::PlanPhase::Implement
+            assert!(
+                stopped
+                    .node_list
+                    .iter()
+                    .all(|node| !matches!(node, ExchangeNode::VerificationResult { .. }))
             );
-            assert_eq!(
-                broker.snapshot().unwrap().goal.unwrap().state,
-                GoalState::Paused
-            );
+            assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
             let text = timeline_text(&broker.snapshot().unwrap());
             assert_eq!(text.contains("Plan failed:"), !cancelled, "{text}");
             assert_eq!(text.matches("Plan accepted:").count(), 1);
             let stopped_id = stopped.id.clone();
             broker.backend = Arc::new(NoProgressExecutionBackend);
-            broker.resume_goal(None, None, None).await.unwrap();
+            broker
+                .dispatch_session_command("goal.resume", json!({}))
+                .unwrap();
             let resumed = broker.store.list_exchange(&broker.session.id).unwrap();
             assert_ne!(resumed.last().unwrap().id, stopped_id);
-            assert_eq!(
-                resumed
-                    .last()
-                    .unwrap()
-                    .execution_phase
-                    .as_ref()
-                    .unwrap()
-                    .phase,
-                crate::plan::PlanPhase::Implement
-            );
+            assert!(matches!(
+                &resumed.last().unwrap().origin,
+                crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+            ));
             assert_eq!(
                 timeline_text(&broker.snapshot().unwrap())
                     .matches("Plan accepted:")
@@ -13061,6 +11577,7 @@ mod test {
             let mut runtime = crate::control_tools::ControlToolRuntime::new(context);
             runtime
                 .invoke(crate::control_tools::ControlToolInvocation {
+                    task_permit: None,
                     name: "plan_read".into(),
                     arguments: json!({"plan_id":plan_id}),
                 })
@@ -13068,6 +11585,7 @@ mod test {
             assert!(
                 runtime
                     .invoke(crate::control_tools::ControlToolInvocation {
+                        task_permit: None,
                         name: "goal_complete".into(),
                         arguments: json!({"summary":"premature"})
                     })
@@ -13123,65 +11641,57 @@ mod test {
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
         broker.backend = Arc::new(NoProgressExecutionBackend);
         let (_, first) = broker
-            .accept_plan(json!({"plan_id":plan.id,"approval_mode":"ask"}))
-            .await
+            .dispatch_session_command(
+                "plan.accept",
+                json!({"plan_id":plan.id,"approval_mode":"ask"}),
+            )
             .unwrap();
         assert!(
             first
                 .iter()
                 .any(|event| event.event == "goal_continue_requested")
         );
-        let (_, second) = broker.continue_goal().await.unwrap();
+        let (_, second) = broker
+            .dispatch_session_command("goal.continue", json!({}))
+            .unwrap();
         assert!(
             !second
                 .iter()
                 .any(|event| event.event == "goal_continue_requested")
         );
-        let stalled = broker.snapshot().unwrap().goal_execution.unwrap();
+        let stalled = active_execution(&broker);
         assert_eq!(stalled.state, PlanExecutionState::Stalled);
         assert_eq!(stalled.phase, crate::plan::PlanPhase::Implement);
         assert!(stalled.completed_at_ms.is_none());
-        assert_eq!(
-            broker
-                .snapshot()
-                .unwrap()
-                .goal
-                .unwrap()
-                .continuation
-                .turn_count,
-            2
-        );
+        assert_eq!(broker.active_goal().unwrap().continuation.turn_count, 2);
         let attempts = broker
             .store
             .list_exchange(&broker.session.id)
             .unwrap()
             .into_iter()
-            .filter(|exchange| exchange.execution_id.as_deref() == Some(&stalled.id))
             .collect::<Vec<_>>();
         assert_eq!(attempts.len(), 2);
         assert_ne!(attempts[0].id, attempts[1].id);
         assert_eq!(attempts[0].state(), ExchangeState::Complete);
-        assert_eq!(attempts[0].execution_phase.as_ref().unwrap().outcome, None);
-        assert_eq!(
-            attempts[1].lifecycle.as_deref(),
-            Some("Plan implementation continued")
+        assert!(
+            !attempts[0]
+                .node_list
+                .iter()
+                .any(|node| matches!(node, ExchangeNode::VerificationResult { .. }))
         );
-        assert_eq!(attempts[0].goal_id, attempts[1].goal_id);
-        broker.resume_goal(None, None, None).await.unwrap();
-        let resumed = broker.snapshot().unwrap().goal_execution.unwrap();
+        assert!(matches!(
+            &attempts[1].origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
+        assert_eq!(attempts[0].session_id, attempts[1].session_id);
+        broker
+            .dispatch_session_command("goal.resume", json!({}))
+            .unwrap();
+        let resumed = active_execution(&broker);
         assert_eq!(resumed.id, stalled.id);
         assert_eq!(resumed.state, PlanExecutionState::Active);
         assert_eq!(resumed.phase, stalled.phase);
-        assert_eq!(
-            broker
-                .snapshot()
-                .unwrap()
-                .goal
-                .unwrap()
-                .continuation
-                .turn_count,
-            1
-        );
+        assert_eq!(broker.active_goal().unwrap().continuation.turn_count, 1);
     }
 
     struct SemanticExecutionBackend {
@@ -13242,7 +11752,7 @@ mod test {
                     data: Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await?;
             let context = request
@@ -13268,7 +11778,7 @@ mod test {
             };
             let mut arguments = json!({"phase":phase,"revision":self.revision,"summary":"Checked planned behavior"});
             if turn == 0 {
-                let rejected = runtime.invoke(ControlToolInvocation { name: "design_patch".into(), arguments: json!({
+                let rejected = runtime.invoke(ControlToolInvocation { task_permit: None, name: "design_patch".into(), arguments: json!({
                     "plan_id":document.plan_id, "expected_version":document.version, "patch":"*** Begin Patch\n*** End Patch"}) }).await.unwrap_err();
                 assert!(rejected.to_string().contains("Resolve"));
                 for (path, overview) in &document.design.as_ref().unwrap().proposed {
@@ -13308,7 +11818,7 @@ mod test {
                             output_delta: false,
                         }),
                         summary: None,
-                        task_update: None,
+                        checklist_update: None,
                     })
                     .await?;
                 let checks = document.design.as_ref().unwrap().document.verification.iter().map(String::as_str)
@@ -13323,6 +11833,7 @@ mod test {
             if phase == "verify" {
                 let read = runtime
                     .invoke(ControlToolInvocation {
+                        task_permit: None,
                         name: "plan_read".into(),
                         arguments: json!({"plan_id":document.plan_id}),
                     })
@@ -13343,6 +11854,7 @@ mod test {
                 assert!(
                     runtime
                         .invoke(ControlToolInvocation {
+                            task_permit: None,
                             name: "plan_phase_done".into(),
                             arguments: invalid
                         })
@@ -13357,6 +11869,7 @@ mod test {
                     assert!(
                         runtime
                             .invoke(ControlToolInvocation {
+                                task_permit: None,
                                 name: "plan_phase_done".into(),
                                 arguments: reused
                             })
@@ -13368,6 +11881,7 @@ mod test {
                 }
             }
             let invocation = ControlToolInvocation {
+                task_permit: None,
                 name: "plan_phase_done".into(),
                 arguments,
             };
@@ -13377,6 +11891,7 @@ mod test {
             assert!(
                 runtime
                     .invoke(ControlToolInvocation {
+                        task_permit: None,
                         name: "goal_complete".into(),
                         arguments: json!({"summary":"premature"})
                     })
@@ -13396,7 +11911,7 @@ mod test {
                 }, "cumulative": null, "cumulative_total": null}),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await?;
             sink.as_ref()
@@ -13412,7 +11927,7 @@ mod test {
                     data: Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 })
                 .await?;
             Ok(crate::backend::BackendOutput {
@@ -13483,7 +11998,6 @@ mod test {
         node_list: Vec<ExchangeNode>,
     ) -> Exchange {
         Exchange {
-            lifecycle: None,
             approval_mode: None,
             finalization_error: None,
             check_owner: None,
@@ -13496,11 +12010,8 @@ mod test {
             session_id: session_id.into(),
             ordinal: 1,
             prompt: "test interaction".into(),
-            kind: ExchangeKind::Chat,
-            plan_id: None,
-            execution_id: None,
-            execution_phase: None,
-            goal_id: None,
+            origin: crate::exchange::ExchangeOrigin::User,
+
             phase: crate::exchange::ExchangePhase::fixture(ExchangeState::Complete, Some(2), None),
             checkpoint_before: None,
             checkpoint_after: None,
@@ -13516,7 +12027,7 @@ mod test {
             node_list,
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
-            task: None,
+            checklist: None,
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 1 },
@@ -13571,7 +12082,7 @@ mod test {
                     data: Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 };
                 if self.wait_for_capacity {
                     event_sink.send_wait(event).await?;
@@ -13804,7 +12315,7 @@ mod test {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             let sink = event_sink.context("restart test requires event delivery")?;
             sink.send(event.clone())?;
@@ -13939,7 +12450,10 @@ mod test {
             PlanState::Generating
         );
         assert_eq!(before.exchange.len(), 1);
-        assert_eq!(before.exchange[0].kind, ExchangeKind::PlanDraft);
+        assert!(!matches!(
+            &before.exchange[0].origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
         broker.backend = Arc::new(PlanningQuestionBackend::new(true));
         broker.turn_cancellation.arm(false);
         broker
@@ -13949,7 +12463,7 @@ mod test {
         let after = broker.snapshot().unwrap();
         assert_eq!(after.exchange.len(), 1);
         assert_eq!(after.exchange[0].id, before.exchange[0].id);
-        assert_eq!(after.exchange[0].plan_id, before.exchange[0].plan_id);
+        assert_eq!(after.exchange[0].origin, before.exchange[0].origin);
         assert_eq!(
             after.exchange[0].checkpoint_before,
             before.exchange[0].checkpoint_before
@@ -14047,9 +12561,102 @@ mod test {
                     snapshot.active_plan.unwrap().state,
                     PlanState::AwaitingInput
                 );
-                assert_eq!(snapshot.task[0].status, crate::task::TaskStatus::Waiting);
+                assert_eq!(
+                    snapshot.session.active_task.as_ref().unwrap().status(),
+                    crate::task::TaskStatus::Waiting
+                );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn configuration_preserves_the_complete_active_task_in_every_lifecycle_state()
+    -> Result<()> {
+        for status in ["running", "waiting", "paused", "blocked"] {
+            let repository = repository();
+            let data = tempfile::tempdir()?;
+            let mut broker = planning_question_broker(repository.path(), data.path(), true);
+            let task = if status == "waiting" {
+                let prepared = broker.plan_file.prepare_entry(
+                    &broker.session.id,
+                    "Preserve the review".into(),
+                    None,
+                    1,
+                )?;
+                let mut plan = prepared.record;
+                plan.state = PlanState::AwaitingReview;
+                broker.store.save_plan(&plan)?;
+                crate::task::ActiveTask::plan(plan, 1)
+            } else {
+                let mut task = crate::task::ActiveTask::goal(
+                    "Preserve the goal".into(),
+                    crate::session::continuation::ContinuationBudget::new(12, 3),
+                    true,
+                    1,
+                );
+                if let crate::task::TaskWorkflow::Goal { goal } = &mut task.workflow {
+                    goal.state = match status {
+                        "running" => GoalState::Active,
+                        "paused" => GoalState::Paused,
+                        "blocked" => GoalState::Blocked,
+                        _ => unreachable!(),
+                    };
+                    goal.continuation.turn_count = 2;
+                }
+                task
+            };
+            broker.task_controller.change(
+                &mut broker.store,
+                None,
+                crate::task::TaskChange::Install(Box::new(task)),
+                1,
+            )?;
+            broker.session.active_task = broker.task_controller.current()?;
+            let before = serde_json::to_value(broker.task_controller.current()?)?;
+            let provider = Arc::new(RestartBackend {
+                cancellation: broker.turn_cancellation(),
+                invocation: std::sync::atomic::AtomicUsize::new(0),
+                clarification: false,
+            });
+            broker.backend = provider.clone();
+            broker.capability = crate::backend::mock_capability();
+            for action in [
+                json!({"action":"configure","config":{"effort":"high"}}),
+                json!({"action":"permission","change":{"kind":"toggle_write_enabled"}}),
+                json!({"action":"permission","change":{"kind":"set_approval","mode":"allow"}}),
+                json!({"action":"configure","config":{"effort":"low"}}),
+            ] {
+                broker.transition_task(action.clone()).await?;
+                assert_eq!(
+                    serde_json::to_value(broker.task_controller.current()?)?,
+                    before,
+                    "configuration mutated {status} task: {action}"
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        broker
+                            .store
+                            .load_session(&broker.session.id)?
+                            .unwrap()
+                            .active_task
+                    )?,
+                    before,
+                    "configuration changed stored {status} task: {action}"
+                );
+                assert_eq!(
+                    serde_json::to_value(broker.snapshot()?.session.active_task)?,
+                    before,
+                    "configuration changed projected {status} task: {action}"
+                );
+                assert_eq!(
+                    provider.invocation.load(Ordering::SeqCst),
+                    0,
+                    "configuration resumed an idle provider for {status}: {action}"
+                );
+                assert!(broker.store.list_exchange(&broker.session.id)?.is_empty());
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -14070,6 +12677,34 @@ mod test {
                 })
                 .await;
             assert!(prompted.response.error().is_none());
+            if planning {
+                let task = broker.task_controller.current().unwrap().unwrap();
+                let entry = task.entry.as_ref().unwrap().clone();
+                assert!(
+                    broker
+                        .task_controller
+                        .acknowledge_entry(
+                            &mut broker.store,
+                            &task.revision,
+                            &entry.id,
+                            broker.clock.now_ms()
+                        )
+                        .unwrap()
+                );
+                broker.input_purpose = crate::input::InputPurpose::TaskEntry {
+                    revision: task.revision.clone(),
+                    id: entry.id,
+                    start: crate::exchange::TaskStart {
+                        kind: task.kind(),
+                        title: task.title().to_owned(),
+                    },
+                };
+                broker
+                    .submit_prompt_inner(json!({"text":entry.instruction}))
+                    .await
+                    .unwrap();
+                broker.input_purpose = crate::input::InputPurpose::User;
+            }
             let before = broker.snapshot().unwrap();
             let restart = Arc::new(RestartBackend {
                 cancellation: broker.turn_cancellation(),
@@ -14242,11 +12877,13 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let mut goal = broker
+        broker
             .create_goal("Finish implementation".into(), false)
             .unwrap();
-        goal.state = GoalState::Paused;
-        broker.store.save_goal(&goal).unwrap();
+        broker
+            .task_controller
+            .change(&mut broker.store, None, crate::task::TaskChange::Pause, 2)
+            .unwrap();
         let before = GitCheckpoint::new(repository.path())
             .capture(
                 &broker.store.objects,
@@ -14285,7 +12922,9 @@ mod test {
             .share_mode(0)
             .open(repository.path().join("seed.txt"))
             .unwrap();
-        let error = broker.resume_goal(None, None, None).await.unwrap_err();
+        let error = broker
+            .dispatch_session_command("goal.resume", json!({}))
+            .unwrap_err();
         assert!(format!("{error:#}").contains("seed.txt"));
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
@@ -14297,8 +12936,7 @@ mod test {
         broker.turn_cancellation.request(false);
         assert!(
             broker
-                .resume_goal(None, None, None)
-                .await
+                .dispatch_session_command("goal.resume", json!({}))
                 .unwrap_err()
                 .downcast_ref::<TurnCancelled>()
                 .is_some()
@@ -14313,7 +12951,9 @@ mod test {
             1
         );
         broker.turn_cancellation.arm(false);
-        let (_, event) = broker.resume_goal(None, None, None).await.unwrap();
+        let (_, event) = broker
+            .dispatch_session_command("goal.resume", json!({}))
+            .unwrap();
         assert_eq!(event[0].event, "goal_changed");
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(stored.len(), 2);
@@ -14500,6 +13140,7 @@ mod test {
         .unwrap();
         let (complete, completed) = tokio::sync::oneshot::channel();
         broker.exchange_runtime = Some(ExchangeRuntime {
+            task_permit: None,
             checkpoint: Some(crate::checkpoint::CheckpointTask(tokio::spawn(
                 async move {
                     completed
@@ -14510,7 +13151,7 @@ mod test {
             tool_gate: Some(gate.clone()),
             exchange_id: exchange.id.clone(),
             synthetic_turn: None,
-            task: TaskTracker::default(),
+            checklist: ChecklistTracker::default(),
             retraction_eligible: true,
             active_wait: None,
         });
@@ -14580,13 +13221,14 @@ mod test {
             .unwrap();
         let gate = crate::checkpoint::ToolGate::new().unwrap();
         broker.exchange_runtime = Some(ExchangeRuntime {
+            task_permit: None,
             checkpoint: Some(crate::checkpoint::CheckpointTask(tokio::spawn(async {
                 anyhow::bail!("initial checkpoint fixture failed")
             }))),
             tool_gate: Some(gate.clone()),
             exchange_id: exchange.id.clone(),
             synthetic_turn: None,
-            task: TaskTracker::default(),
+            checklist: ChecklistTracker::default(),
             retraction_eligible: true,
             active_wait: None,
         });
@@ -14931,7 +13573,7 @@ mod test {
                     data: Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 });
             }
             Ok(crate::backend::BackendOutput {
@@ -15003,7 +13645,7 @@ mod test {
                     data: Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 BackendEvent {
                     received_at_ms: None,
@@ -15014,7 +13656,7 @@ mod test {
                     data: json!({ "boundary": "wait_started", "agent_count": 1 }),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 BackendEvent {
                     received_at_ms: None,
@@ -15025,7 +13667,7 @@ mod test {
                     data: json!({ "boundary": "wait_ended", "agent_count": 0 }),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 BackendEvent {
                     received_at_ms: None,
@@ -15036,7 +13678,7 @@ mod test {
                     data: Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
             ];
             if let Some(event_sink) = event_sink {
@@ -15147,6 +13789,7 @@ mod test {
             let mut output = crate::backend::BackendOutput::default();
             let read = runtime
                 .invoke(ControlToolInvocation {
+                    task_permit: None,
                     name: "plan_read".into(),
                     arguments: json!({"plan_id":document.plan_id}),
                 })
@@ -15158,7 +13801,7 @@ mod test {
                     output.plan_question = Some(PlanQuestionSet::freeform("Which controls?".into()))
                 }
                 3 => {
-                    let edit = runtime.invoke(ControlToolInvocation {
+                    let edit = runtime.invoke(ControlToolInvocation { task_permit: None,
                         name: "design_patch".into(),
                         arguments: json!({"plan_id":document.plan_id, "expected_version":document.version,
                             "patch":"*** Begin Patch\n*** Add File: src/controls.rs\n+pub fn keyboard_movement();\n+Algorithm\n+  update movement from keyboard input\n*** End Patch"}),
@@ -15166,7 +13809,7 @@ mod test {
                     apply_invocation(&edit.invocation.unwrap(), &mut output)?;
                 }
                 4 => {
-                    let submit = runtime.invoke(ControlToolInvocation {
+                    let submit = runtime.invoke(ControlToolInvocation { task_permit: None,
                         name: "plan_submit".into(),
                         arguments: json!({"plan_id":document.plan_id, "expected_version":document.version}),
                     }).await?;
@@ -15187,11 +13830,12 @@ mod test {
             .submit_prompt_inner(json!({"text":"/plan preserve review ownership"}))
             .await
             .unwrap();
+        run_plan_to_input_boundary(&mut broker).await.unwrap();
         let current = broker.snapshot().unwrap().active_plan.unwrap();
         let mut older = current.clone();
         older.id = "older-review".into();
         broker.store.save_plan(&older).unwrap();
-        let selected = serde_json::to_value(broker.current_task().unwrap()).unwrap();
+        let selected = serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
         for params in [
             json!({"plan_id":older.id}),
             json!({"plan_id":older.id,"revision":older.model_revision}),
@@ -15214,7 +13858,7 @@ mod test {
                 Some(current.id.as_str())
             );
             assert_eq!(
-                serde_json::to_value(broker.current_task().unwrap()).unwrap(),
+                serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
                 selected
             );
         }
@@ -15235,7 +13879,7 @@ mod test {
                 .await;
             assert!(result.response.error().is_some(), "{method}");
             assert_eq!(
-                serde_json::to_value(broker.current_task().unwrap()).unwrap(),
+                serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
                 selected,
                 "{method}"
             );
@@ -15264,7 +13908,7 @@ mod test {
                 None,
             )
             .unwrap();
-        let selected = serde_json::to_value(broker.current_task().unwrap()).unwrap();
+        let selected = serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
         for (method, params) in [
             ("session.preview", json!({"session_id":"missing"})),
             ("plan.get", json!({"plan_id":"missing"})),
@@ -15280,7 +13924,7 @@ mod test {
                 .await;
             assert!(result.response.error().is_some(), "{method}");
             assert_eq!(
-                serde_json::to_value(broker.current_task().unwrap()).unwrap(),
+                serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
                 selected,
                 "{method}"
             );
@@ -15306,16 +13950,16 @@ mod test {
             .await
             .unwrap();
         let snapshot = broker.snapshot().unwrap();
-        let discussed = snapshot.active_plan.unwrap();
+        let discussed = snapshot.active_plan.as_ref().unwrap();
         assert_eq!(discussed.state, PlanState::AwaitingReview);
         assert_eq!(discussed.model_revision, before.model_revision);
         assert_eq!(discussed.document_version, before.document_version);
         assert_eq!(discussed.review_digest, before.review_digest);
-        assert_eq!(
-            snapshot.exchange.last().unwrap().plan_id.as_deref(),
-            Some(before.id.as_str())
-        );
-        assert_eq!(snapshot.exchange.last().unwrap().kind, ExchangeKind::Chat);
+        assert_eq!(snapshot.active_plan.as_ref().unwrap().id, before.id);
+        assert!(!matches!(
+            &snapshot.exchange.last().unwrap().origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
 
         broker
             .submit_prompt_inner(json!({"text":"Add interactive controls"}))
@@ -15346,11 +13990,14 @@ mod test {
         assert_eq!(revised.document_version, before.document_version + 1);
         let exchange = snapshot.exchange.last().unwrap();
         assert_ne!(exchange.id, interaction.id);
-        assert_eq!(
-            exchange.lifecycle.as_deref(),
-            Some("Plan revision continued")
-        );
-        assert_eq!(exchange.kind, ExchangeKind::PlanRevision);
+        assert!(matches!(
+            &exchange.origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
+        assert!(!matches!(
+            &exchange.origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
         assert_eq!(exchange.state(), ExchangeState::Complete);
         assert!(!exchange.awaiting_input());
         assert_eq!(backend.turn.load(Ordering::SeqCst), 5);
@@ -15439,7 +14086,8 @@ mod test {
                 None,
             )
             .unwrap();
-        let selected_task = serde_json::to_value(broker.current_task().unwrap()).unwrap();
+        let selected_task =
+            serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
         let count = broker.snapshot().unwrap().exchange.len();
         let (document, mut questions, _) = broker.prepare_review_questions(&params).unwrap();
         assert_eq!(questions.len(), 1);
@@ -15463,6 +14111,7 @@ mod test {
         assert!(
             runtime
                 .invoke(crate::control_tools::ControlToolInvocation {
+                    task_permit: None,
                     name: "plan_review_answer".into(),
                     arguments: json!({"question_id":"wrong", "answer":"wrong"})
                 })
@@ -15473,13 +14122,14 @@ mod test {
         assert!(
             runtime
                 .invoke(crate::control_tools::ControlToolInvocation {
+                    task_permit: None,
                     name: "plan_review_answer".into(),
                     arguments: json!({"question_id":"question", "answer":"   "})
                 })
                 .await
                 .is_err()
         );
-        runtime.invoke(crate::control_tools::ControlToolInvocation {
+        runtime.invoke(crate::control_tools::ControlToolInvocation { task_permit: None,
             name: "plan_review_answer".into(), arguments: json!({"question_id":"question", "answer":"The declaration preserves the caller contract."})
         }).await.unwrap();
         assert!(scope.answered().unwrap());
@@ -15487,7 +14137,7 @@ mod test {
         assert_eq!(snapshot.exchange.len(), count);
         assert_eq!(snapshot.active_plan.as_ref().unwrap().id, other.id);
         assert_eq!(
-            serde_json::to_value(broker.current_task().unwrap()).unwrap(),
+            serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
             selected_task
         );
         assert_eq!(broker.session.backend_session_id, thread);
@@ -16018,7 +14668,7 @@ mod test {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(event_sink) = event_sink {
                 let _ = event_sink.send(event.clone());
@@ -16121,7 +14771,7 @@ mod test {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             let provider_change = crate::backend::ProviderChangeSet {
                 file: vec![crate::backend::ProviderFileChange {
@@ -16148,7 +14798,7 @@ mod test {
                     output_delta: false,
                 }),
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             let started = BackendEvent {
                 received_at_ms: None,
@@ -16167,7 +14817,7 @@ mod test {
                     output_delta: false,
                 }),
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(event_sink) = event_sink.as_ref() {
                 let _ = event_sink.send(commentary.clone());
@@ -16194,7 +14844,7 @@ mod test {
                     output_delta: false,
                 }),
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(event_sink) = event_sink.as_ref() {
                 let _ = event_sink.send(file_completed.clone());
@@ -16223,7 +14873,7 @@ mod test {
                     output_delta: false,
                 }),
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             let response = BackendEvent {
                 received_at_ms: None,
@@ -16234,7 +14884,7 @@ mod test {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(event_sink) = event_sink {
                 let _ = event_sink.send(completed.clone());
@@ -16315,16 +14965,16 @@ mod test {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: Some(crate::backend::ProviderTaskUpdate {
+                checklist_update: Some(crate::backend::ProviderChecklistUpdate {
                     scope_id: "ordinary-turn".into(),
                     name: None,
                     complete: false,
                     replace_entries: true,
-                    entry_list: vec![crate::backend::ProviderTaskEntry {
+                    entry_list: vec![crate::backend::ProviderChecklistEntry {
                         provider_id: None,
                         content: "Inspect ordinary chat".into(),
                         priority: None,
-                        status: crate::backend::TaskStatus::InProgress,
+                        status: crate::backend::ChecklistStatus::InProgress,
                         provider_ordinal: 0,
                     }],
                 }),
@@ -16338,7 +14988,7 @@ mod test {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(event_sink) = event_sink {
                 let _ = event_sink.send(task_event.clone());
@@ -16487,12 +15137,12 @@ mod test {
             access: Default::default(),
             shell: Default::default(),
             approval_mode: ApprovalMode::Ask,
-            current_task_id: None,
+            active_task: None,
             default_approval: ApprovalMode::Ask,
             plan_approval: None,
             created_at_ms: 0,
             updated_at_ms: 0,
-            goal_id: None,
+
             lease_owner: Some("one".into()),
             native_fork: false,
             native_compact: false,
@@ -16567,6 +15217,103 @@ mod test {
         git(temporary.path(), &["add", "."]);
         git(temporary.path(), &["commit", "-qm", "seed"]);
         temporary
+    }
+
+    async fn run_plan_to_input_boundary(broker: &mut HarnessBroker) -> Result<()> {
+        let task = broker
+            .task_controller
+            .current()?
+            .context("pending plan task is missing")?;
+        let entry = task
+            .entry
+            .as_ref()
+            .context("pending plan entry is missing")?
+            .clone();
+        anyhow::ensure!(
+            broker.task_controller.acknowledge_entry(
+                &mut broker.store,
+                &task.revision,
+                &entry.id,
+                broker.clock.now_ms()
+            )?,
+            "plan entry was replaced before test dispatch"
+        );
+        broker.input_purpose = crate::input::InputPurpose::TaskEntry {
+            revision: task.revision.clone(),
+            id: entry.id,
+            start: crate::exchange::TaskStart {
+                kind: task.kind(),
+                title: task.title().to_owned(),
+            },
+        };
+        let result = broker
+            .submit_prompt_inner(json!({"text":entry.instruction}))
+            .await;
+        broker.input_purpose = crate::input::InputPurpose::User;
+        result?;
+        loop {
+            let task = broker
+                .task_controller
+                .current()?
+                .context("planning owner disappeared")?;
+            let crate::task::TaskWorkflow::Plan { plan } = &task.workflow else {
+                anyhow::bail!("plan test owner changed")
+            };
+            if matches!(
+                plan.artifact.state,
+                PlanState::AwaitingInput | PlanState::AwaitingReview
+            ) {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                matches!(
+                    plan.artifact.state,
+                    PlanState::Generating | PlanState::Revising
+                ),
+                "planning stopped before input boundary: {:?}",
+                plan.artifact.state
+            );
+            let turn = task
+                .turn
+                .as_ref()
+                .context("planning turn did not record its completion")?;
+            let continuation = turn
+                .continuation
+                .as_ref()
+                .context("planning turn did not schedule its continuation")?
+                .clone();
+            anyhow::ensure!(
+                continuation.delivery == crate::task::TaskInputDelivery::Pending,
+                "planning continuation was not pending"
+            );
+            anyhow::ensure!(
+                broker
+                    .store
+                    .continuation_source_complete(&broker.session.id, &turn.id)?,
+                "planning continuation source was not finalized"
+            );
+            anyhow::ensure!(
+                broker.task_controller.acknowledge_continuation(
+                    &mut broker.store,
+                    &task.revision,
+                    &continuation.id,
+                    broker.clock.now_ms()
+                )?,
+                "planning continuation authority changed"
+            );
+            broker.task_controller.admit(crate::task::TaskKind::Plan)?;
+            broker.input_purpose = crate::input::InputPurpose::TaskContinuation {
+                revision: task.revision,
+                id: continuation.id,
+                completed_turn_id: turn.id.clone(),
+                reason: continuation.reason,
+            };
+            let result = broker
+                .submit_prompt_inner(json!({"text":continuation.instruction}))
+                .await;
+            broker.input_purpose = crate::input::InputPurpose::User;
+            result?;
+        }
     }
 
     pub(super) fn planning_question_broker(
@@ -16703,7 +15450,7 @@ mod test {
                     data: serde_json::to_value(lifecycle).unwrap(),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 None,
                 &mut event,
@@ -16743,7 +15490,7 @@ mod test {
                     data: serde_json::to_value(lifecycle).unwrap(),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 Some("parent-exchange"),
                 &mut events,
@@ -16796,7 +15543,7 @@ mod test {
                     data: serde_json::to_value(lifecycle).unwrap(),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 Some("parent-interaction"),
                 &mut event,
@@ -16834,11 +15581,12 @@ mod test {
             exchange.finalization_outcome(),
         );
         let mut runtime = ExchangeRuntime {
+            task_permit: None,
             exchange_id: exchange.id.clone(),
             checkpoint: None,
             tool_gate: None,
             synthetic_turn: None,
-            task: TaskTracker::default(),
+            checklist: ChecklistTracker::default(),
             retraction_eligible: true,
             active_wait: None,
         };
@@ -16890,11 +15638,12 @@ mod test {
             exchange.finalization_outcome(),
         );
         let mut runtime = ExchangeRuntime {
+            task_permit: None,
             checkpoint: None,
             tool_gate: None,
             exchange_id: exchange.id.clone(),
             synthetic_turn: None,
-            task: TaskTracker::default(),
+            checklist: ChecklistTracker::default(),
             retraction_eligible: true,
             active_wait: None,
         };
@@ -16911,7 +15660,7 @@ mod test {
             data: Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         let mut events = Vec::new();
         broker
@@ -17000,7 +15749,7 @@ mod test {
                     data: Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
                 &mut events,
             )
@@ -17496,12 +16245,6 @@ mod test {
             setup.finalization_outcome(),
         );
         broker.store.save_exchange(&setup).unwrap();
-        let mut goal = ExchangeAdmission::chat("Start a goal".into());
-        goal.goal_id = Some("another-goal".into());
-        assert_eq!(broker.continued_check_setup(&goal).unwrap(), None);
-        let mut plan = ExchangeAdmission::chat("Discuss another plan".into());
-        plan.plan_id = Some("another-plan".into());
-        assert_eq!(broker.continued_check_setup(&plan).unwrap(), None);
 
         setup.phase = crate::exchange::ExchangePhase::fixture(
             ExchangeState::Cancelled,
@@ -17923,9 +16666,10 @@ mod test {
         );
         broker.store.save_exchange(&current).unwrap();
         let mut runtime = ExchangeRuntime {
+            task_permit: None,
             exchange_id: current.id.clone(),
             synthetic_turn: None,
-            task: TaskTracker::default(),
+            checklist: ChecklistTracker::default(),
             checkpoint: None,
             tool_gate: None,
             retraction_eligible: true,
@@ -18010,7 +16754,7 @@ mod test {
                 data: serde_json::to_value(ContextUsage::reported(used, 100_000).unwrap()).unwrap(),
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             broker
                 .process_backend_event(&mut runtime, &mut current, usage_event, &mut events)
@@ -18068,7 +16812,7 @@ mod test {
             data: serde_json::to_value(ContextUsage::reported(12_000, 100_000).unwrap()).unwrap(),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         broker
             .process_backend_event(&mut runtime, &mut current, usage_event, &mut events)
@@ -18358,8 +17102,13 @@ mod test {
                 .unwrap()
                 .is_empty()
         );
-        assert!(child_controller.session.current_task_id.is_none());
-        assert!(child_controller.session.goal_id.is_none());
+        assert!(
+            child_controller
+                .task_controller
+                .current()
+                .unwrap()
+                .is_none()
+        );
         assert!(matches!(
             &timeline[inherited.len()],
             TimelineEntry::SessionEvent { .. }
@@ -19260,7 +18009,10 @@ mod test {
         let rendered = timeline_text(&completed_snapshot);
         assert_eq!(rendered.matches("You answered: Staged").count(), 1);
         assert!(!rendered.contains("QuestionAsked"));
-        let plan = completed_snapshot.active_plan.expect("submitted plan");
+        let plan = completed_snapshot
+            .active_plan
+            .as_ref()
+            .expect("submitted plan");
         assert_eq!(plan.state, PlanState::AwaitingReview);
         assert!(plan.elicitation.is_none());
         assert!(completed_snapshot.timeline.iter().any(|entry| matches!(
@@ -19291,7 +18043,7 @@ mod test {
                 )
                 .is_err()
         );
-        assert_eq!(completed_snapshot.exchange[0].plan_id, Some(plan.id));
+        assert_eq!(completed_snapshot.active_plan.as_ref().unwrap().id, plan.id);
         assert!(completed_snapshot.timeline.iter().all(|entry| matches!(
             entry,
             TimelineEntry::Exchange { .. } | TimelineEntry::Status { .. }
@@ -19371,10 +18123,10 @@ mod test {
             2,
             "automatic retries must follow the answered exchange as a separate attempt"
         );
-        assert_eq!(
-            snapshot.exchange[1].lifecycle.as_deref(),
-            Some("Planning continued")
-        );
+        assert!(matches!(
+            &snapshot.exchange[1].origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
         assert_eq!(
             broker
                 .store
@@ -19460,11 +18212,31 @@ mod test {
         .unwrap();
         broker.store.save_plan(&interrupted).unwrap();
         broker.pause_task(false).await.unwrap();
+        let paused = broker.task_controller.current().unwrap().unwrap();
         let resumed = broker
             .dispatch(Request {
                 id: 4,
                 method: "prompt.submit".into(),
                 params: json!({"text":"continue the existing design"}),
+            })
+            .await;
+        assert!(
+            resumed.response.error().is_none(),
+            "{:?}",
+            resumed.response.error()
+        );
+        let recovered = broker.snapshot().unwrap().active_plan.unwrap();
+        assert_eq!(recovered.id, plan_id);
+        assert_eq!(recovered.state, PlanState::Failed);
+        assert_eq!(
+            broker.task_controller.current().unwrap().unwrap().revision,
+            paused.revision
+        );
+        let resumed = broker
+            .dispatch(Request {
+                id: 5,
+                method: "prompt.submit".into(),
+                params: json!({"text":"/plan retry"}),
             })
             .await;
         assert!(
@@ -19493,6 +18265,7 @@ mod test {
                 })
                 .await;
             assert!(planned.response.error().is_none());
+            run_plan_to_input_boundary(&mut broker).await.unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
             assert!(matches!(
                 plan.state,
@@ -19523,7 +18296,6 @@ mod test {
                     .list_exchange(&broker.session.id)
                     .unwrap()
                     .iter()
-                    .filter(|exchange| exchange.plan_id.as_deref() == Some(&plan.id))
                     .all(|exchange| exchange.is_finished() && !exchange.awaiting_input())
             );
         }
@@ -19965,25 +18737,27 @@ mod test {
         assert_eq!(exchanges.len(), 2);
         assert_eq!(exchanges[0].prompt, "/plan migrate the event format");
         assert!(
-            exchanges[1].prompt.is_empty(),
-            "internal continuation appeared as user input"
+            !exchanges[1].prompt.is_empty(),
+            "internal continuation omitted its provider instruction"
         );
-        assert_eq!(
-            exchanges[1].lifecycle.as_deref(),
-            Some("Planning continued")
-        );
+        assert!(matches!(
+            &exchanges[1].origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
         assert_ne!(exchanges[0].id, exchanges[1].id);
         assert!(
             exchanges
                 .iter()
                 .all(|exchange| exchange.state() == ExchangeState::Complete
                     && exchange.is_finished()
-                    && exchange.turn.len() == 1
-                    && exchange.plan_id.as_deref() == Some(plan.id.as_str()))
+                    && exchange.turn.len() == 1)
         );
         let restored: Vec<Exchange> =
             serde_json::from_value(serde_json::to_value(&exchanges).unwrap()).unwrap();
-        assert_eq!(restored[1].lifecycle.as_deref(), Some("Planning continued"));
+        assert!(matches!(
+            &restored[1].origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
         assert_eq!(restored[0].turn.len(), 1);
         assert_eq!(restored[1].turn.len(), 1);
     }
@@ -20078,7 +18852,7 @@ mod test {
                     data: Value::Null,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 };
                 sink.send_wait(event.clone()).await?;
                 sink.send_wait(event.clone()).await?;
@@ -20156,14 +18930,16 @@ mod test {
             cancel_continuation: false,
         });
         broker
-            .set_goal(json!({"objective":"complete two native turns"}))
-            .await
+            .dispatch_session_command("goal.set", json!({"objective":"complete two native turns"}))
             .unwrap();
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 2);
         assert_eq!(exchanges[0].prompt, "/goal complete two native turns");
-        assert_eq!(exchanges[1].prompt, "");
-        assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Goal continued"));
+        assert!(!exchanges[1].prompt.is_empty());
+        assert!(matches!(
+            &exchanges[1].origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
         assert!(exchanges.iter().all(
             |exchange| exchange.state() == ExchangeState::Complete && exchange.turn.len() == 1
         ));
@@ -20192,15 +18968,18 @@ mod test {
             state: GoalState::Active,
         });
         broker
-            .set_goal(json!({"objective":"complete a continued goal"}))
-            .await
+            .dispatch_session_command("goal.set", json!({"objective":"complete a continued goal"}))
             .unwrap();
-        broker.continue_goal().await.unwrap();
+        broker
+            .dispatch_session_command("goal.continue", json!({}))
+            .unwrap();
         broker.backend = Arc::new(NativeSettlementBackend {
             inner: broker.backend.clone(),
             state: GoalState::Complete,
         });
-        broker.continue_goal().await.unwrap();
+        broker
+            .dispatch_session_command("goal.continue", json!({}))
+            .unwrap();
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 3);
         assert!(exchanges.iter().all(
@@ -20209,9 +18988,73 @@ mod test {
         assert!(
             exchanges[1..]
                 .iter()
-                .all(|exchange| exchange.prompt.is_empty()
-                    && exchange.lifecycle.as_deref() == Some("Goal continued")
-                    && exchange.goal_id == exchanges[0].goal_id)
+                .all(|exchange| !exchange.prompt.is_empty()
+                    && matches!(
+                        exchange.origin,
+                        crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+                    ))
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_snapshots_use_the_committed_task_owner() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        assert!(broker.session.active_task.is_none());
+        let controller = broker.task_controller.clone();
+        let installed = controller
+            .change(
+                &mut broker.store,
+                None,
+                crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+                    "Current task".into(),
+                    Default::default(),
+                    false,
+                    1,
+                ))),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            broker
+                .snapshot()
+                .unwrap()
+                .session
+                .active_task
+                .unwrap()
+                .revision,
+            installed.revision
+        );
+        assert_eq!(
+            broker
+                .observer
+                .snapshot()
+                .unwrap()
+                .session
+                .active_task
+                .unwrap()
+                .revision,
+            installed.revision
+        );
+        controller
+            .change(
+                &mut broker.store,
+                Some(&installed.revision),
+                crate::task::TaskChange::Clear,
+                2,
+            )
+            .unwrap();
+        assert!(broker.snapshot().unwrap().session.active_task.is_none());
+        assert!(
+            broker
+                .observer
+                .snapshot()
+                .unwrap()
+                .session
+                .active_task
+                .is_none()
         );
     }
 
@@ -20226,24 +19069,34 @@ mod test {
             cancel_continuation: true,
         });
         let error = broker
-            .set_goal(json!({"objective":"interrupt the second native turn"}))
-            .await
+            .dispatch_session_command(
+                "goal.set",
+                json!({"objective":"interrupt the second native turn"}),
+            )
             .unwrap_err();
         assert!(error.downcast_ref::<TurnCancelled>().is_some());
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 2);
         assert_eq!(exchanges[0].state(), ExchangeState::Complete);
         assert_eq!(exchanges[1].state(), ExchangeState::Cancelled);
-        assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Goal continued"));
+        assert!(matches!(
+            &exchanges[1].origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         broker.backend = Arc::new(NativeSettlementBackend {
             inner: backend,
             state: GoalState::Complete,
         });
-        broker.resume_goal(None, None, None).await.unwrap();
+        broker
+            .dispatch_session_command("goal.resume", json!({}))
+            .unwrap();
         let resumed = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(resumed.len(), 3);
-        assert_eq!(resumed[2].lifecycle.as_deref(), Some("Goal resumed"));
+        assert!(matches!(
+            &resumed[2].origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
         assert_eq!(
             serde_json::to_value(&resumed[..2]).unwrap(),
             serde_json::to_value(exchanges).unwrap()
@@ -20385,12 +19238,15 @@ mod test {
             .await;
         assert!(result.response.error().is_none());
         let interaction = broker.store.list_exchange(&broker.session.id).unwrap();
-        let task = interaction[0]
-            .task
+        let checklist = interaction[0]
+            .checklist
             .as_ref()
-            .expect("ordinary task snapshot");
-        assert_eq!(task.current[0].title, "Inspect ordinary chat");
-        assert_eq!(interaction[0].kind, ExchangeKind::Chat);
+            .expect("ordinary checklist snapshot");
+        assert_eq!(checklist.current[0].title, "Inspect ordinary chat");
+        assert!(!matches!(
+            &interaction[0].origin,
+            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
+        ));
     }
 
     #[tokio::test]

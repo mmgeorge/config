@@ -174,7 +174,7 @@ mod test {
                     text: None,
                     data: serde_json::Value::Null,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                     activity: Some(ToolActivity {
                         id: "edit".into(),
                         kind: ToolActivityKind::FileChange,
@@ -259,7 +259,7 @@ mod test {
                 data: serde_json::Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             exchange.observe_turn(&event, 0).unwrap();
             event.turn_boundary = None;

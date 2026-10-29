@@ -69,7 +69,9 @@ impl<'exchange> ExchangeLayout<'exchange> {
                 }
                 _ => true,
             },
-            ExchangeNode::ArtifactChange { .. } | ExchangeNode::ImplementationReport { .. } => {
+            ExchangeNode::ArtifactChange { .. }
+            | ExchangeNode::ImplementationReport { .. }
+            | ExchangeNode::VerificationResult { .. } => {
                 results.push(*node);
                 false
             }

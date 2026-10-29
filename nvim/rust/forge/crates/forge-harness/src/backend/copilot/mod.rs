@@ -1070,15 +1070,21 @@ impl Backend for CopilotBackend {
                 request.workspace.clone(),
                 event_sink.clone(),
             )?;
-        self.permission_context(&request.runtime_key()?)
-            .await
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
-            .checkpoint = request
-            .control_context
-            .as_ref()
-            .and_then(|context| context.checkpoint.clone());
+        {
+            let permission = self.permission_context(&request.runtime_key()?).await;
+            let mut state = permission
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?;
+            state.checkpoint = request
+                .control_context
+                .as_ref()
+                .and_then(|context| context.checkpoint.clone());
+            state.task_authority = request
+                .control_context
+                .as_ref()
+                .and_then(crate::control_tools::TaskAuthority::capture);
+        }
         let session = self.session(&request).await?;
         let mut subscription = event_stream::SessionEventStream::new(
             &session,
@@ -1199,7 +1205,7 @@ impl Backend for CopilotBackend {
                                 received_at_ms: None, address: Some(failure.address.clone()),
                                 turn_boundary: Some(super::TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Failed }),
                                 kind: "turn_completed".into(), text: None, data: failure.detail.clone(),
-                                activity: None, summary: None, task_update: None,
+                                activity: None, summary: None, checklist_update: None,
                             };
                             if !output.event.iter().any(|event| event.address == completed.address && matches!(event.turn_boundary, Some(super::TurnBoundary::Finished { .. }))) {
                                 if let Some(sink) = &event_sink { sink.send_wait(completed.clone()).await?; }
@@ -1805,11 +1811,8 @@ impl Backend for CopilotBackend {
         self.turn_event(session_id)
             .await
             .steer(async {
-                let submission = match &input {
-                    super::SteeringInput::User { submission, .. } => submission.as_ref(),
-                    _ => None,
-                };
-                if let Some(submission) = submission {
+                let submission = input.submission();
+                if let Some(submission) = &submission {
                     let history = session
                         .rpc()
                         .event_log()
@@ -1829,7 +1832,7 @@ impl Backend for CopilotBackend {
                     .send(message)
                     .await
                     .context("steer active Copilot turn")?;
-                if let Some(submission) = submission {
+                if let Some(submission) = &submission {
                     let accepted = receipt.clone();
                     submission
                         .persist(move |submission| submission.accepted(accepted))
@@ -1838,17 +1841,15 @@ impl Backend for CopilotBackend {
                 Ok(receipt)
             })
             .await?;
-        if matches!(input, super::SteeringInput::User { .. }) {
-            let input_message_id = match &input {
-                super::SteeringInput::User {
-                    submission: Some(submission),
-                    ..
-                } => submission.record()?.input_message_id,
-                _ => None,
-            };
+        if !matches!(input, super::SteeringInput::AgentResult(_)) {
+            let input_message_id = input
+                .submission()
+                .map(|submission| submission.record())
+                .transpose()?
+                .and_then(|record| record.input_message_id);
             self.turn_event(session_id)
                 .await
-                .publish_steering(text, input_message_id)
+                .publish_steering(text, input_message_id, input.task_start().cloned())
                 .await?;
         }
         Ok(())
@@ -2237,6 +2238,7 @@ impl ToolHandler for CopilotControlToolHandler {
         let result = self
             .router
             .route(ControlToolInvocation {
+                task_permit: None,
                 name: name.clone(),
                 arguments: invocation.arguments,
             })
@@ -2249,6 +2251,7 @@ impl ToolHandler for CopilotControlToolHandler {
 }
 
 struct CopilotPermissionState {
+    task_authority: Option<crate::control_tools::TaskAuthority>,
     cancelled: bool,
     checkpoint: Option<crate::checkpoint::ToolGate>,
     owner: Option<crate::backend::ExecutionOwner>,
@@ -2268,6 +2271,7 @@ impl CopilotPermissionContext {
         Self {
             coordinator,
             state: StandardMutex::new(CopilotPermissionState {
+                task_authority: None,
                 cancelled: false,
                 checkpoint: None,
                 owner: None,
@@ -2292,6 +2296,7 @@ impl CopilotPermissionContext {
             .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?;
         let session_directory = state.session_directory.take();
         *state = CopilotPermissionState {
+            task_authority: None,
             cancelled: false,
             checkpoint: None,
             owner: Some(owner),
@@ -2348,7 +2353,7 @@ impl PermissionHandler for CopilotPermissionHandler {
         request_id: RequestId,
         data: PermissionRequestData,
     ) -> PermissionResult {
-        let (approval_mode, workspace, event_sink, owner, session_directory) =
+        let (approval_mode, workspace, event_sink, owner, session_directory, task_authority) =
             match self.context.state.lock() {
                 Ok(state) => (
                     state.approval_mode,
@@ -2356,6 +2361,7 @@ impl PermissionHandler for CopilotPermissionHandler {
                     state.event_sink.clone(),
                     state.owner.clone(),
                     state.session_directory.clone(),
+                    state.task_authority.clone(),
                 ),
                 Err(_) => {
                     return rejection::deny(
@@ -2365,6 +2371,13 @@ impl PermissionHandler for CopilotPermissionHandler {
                 }
             };
         let deny = |reason: &str| rejection::deny(reason, Some(approval_mode));
+        if let Some(authority) = &task_authority
+            && let Err(error) = authority.validate()
+        {
+            return deny(&format!(
+                "Task authority changed before permission approval: {error:#}"
+            ));
+        }
         let kind = permission_kind(data.kind);
         let params = serde_json::to_value(data).unwrap_or(Value::Null);
         let request = permission_from_copilot(request_id.to_string(), kind, params, &workspace);
@@ -2459,7 +2472,16 @@ impl PermissionHandler for CopilotPermissionHandler {
                 ApprovalResolution::AllowOnce
                 | ApprovalResolution::AllowExact
                 | ApprovalResolution::AllowBroad,
-            ) => PermissionResult::approve_once(),
+            ) => {
+                if let Some(authority) = &task_authority
+                    && let Err(error) = authority.validate()
+                {
+                    return deny(&format!(
+                        "Task authority changed while permission approval was pending: {error:#}"
+                    ));
+                }
+                PermissionResult::approve_once()
+            }
             Ok(ApprovalResolution::TimedOut) => deny(
                 "Automatically rejected because the approval timeout expired. The user may be unavailable.",
             ),
@@ -2588,26 +2610,34 @@ mod test {
     async fn routes_control_tools_without_provider_specific_schemas() {
         let router = Arc::new(ControlToolRouter::default());
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.has_active_goal = true;
+        let (_task_root, _task_store, task_controller) =
+            crate::task::SessionTaskController::test_goal();
+        context.task_controller = Some(task_controller);
         let mut stream = router.activate(context).unwrap();
         router
             .route(ControlToolInvocation {
+                task_permit: None,
                 name: "goal_complete".into(),
                 arguments: serde_json::json!({ "summary": "Complete" }),
             })
             .await
             .unwrap();
-        assert_eq!(stream.receive().await.unwrap().name, "goal_complete");
+        let invocation = stream.receive().await.unwrap();
+        assert_eq!(invocation.name, "goal_complete");
+        assert!(invocation.task_permit.is_some());
     }
 
     #[tokio::test]
     async fn collecting_control_stream_cancels_pending_runtime_work() -> Result<()> {
         let router = Arc::new(ControlToolRouter::default());
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.has_active_goal = true;
+        let (_task_root, _task_store, task_controller) =
+            crate::task::SessionTaskController::test_goal();
+        context.task_controller = Some(task_controller);
         context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
         let mut stream = router.activate(context)?;
         let mut pending = Box::pin(router.route(ControlToolInvocation {
+            task_permit: None,
             name: "goal_complete".into(),
             arguments: json!({"summary":"complete"}),
         }));
@@ -2621,10 +2651,13 @@ mod test {
         assert!(stream.try_receive().is_err());
         drop(stream);
         let mut replacement = ControlTurnContext::inactive(PromptMode::Chat);
-        replacement.has_active_goal = true;
+        let (_task_root, _task_store, task_controller) =
+            crate::task::SessionTaskController::test_goal();
+        replacement.task_controller = Some(task_controller);
         let mut stream = router.activate(replacement)?;
         router
             .route(ControlToolInvocation {
+                task_permit: None,
                 name: "goal_complete".into(),
                 arguments: json!({"summary":"replacement"}),
             })
@@ -2637,11 +2670,14 @@ mod test {
     async fn returns_control_failures_as_provider_neutral_json() {
         let router = Arc::new(ControlToolRouter::default());
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.has_active_goal = true;
+        let (_task_root, _task_store, task_controller) =
+            crate::task::SessionTaskController::test_goal();
+        context.task_controller = Some(task_controller);
         let mut stream = router.activate(context).unwrap();
 
         let response = router
             .route(ControlToolInvocation {
+                task_permit: None,
                 name: "goal_complete".into(),
                 arguments: serde_json::json!({}),
             })
@@ -2661,11 +2697,14 @@ mod test {
     async fn control_admission_rejects_before_terminal_mutation() {
         let router = Arc::new(ControlToolRouter::default());
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.has_active_goal = true;
+        let (_task_root, _task_store, task_controller) =
+            crate::task::SessionTaskController::test_goal();
+        context.task_controller = Some(task_controller);
         let mut stream = router.activate(context).unwrap();
         for _ in 0..32 {
             router
                 .route(ControlToolInvocation {
+                    task_permit: None,
                     name: "goal_status".into(),
                     arguments: serde_json::json!({ "status": "working" }),
                 })
@@ -2673,6 +2712,7 @@ mod test {
                 .unwrap();
         }
         let terminal = ControlToolInvocation {
+            task_permit: None,
             name: "goal_complete".into(),
             arguments: serde_json::json!({ "summary": "finished" }),
         };
@@ -2700,12 +2740,15 @@ mod test {
     async fn large_control_invocation_preserves_runtime_and_content() {
         let router = Arc::new(ControlToolRouter::default());
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.has_active_goal = true;
+        let (_task_root, _task_store, task_controller) =
+            crate::task::SessionTaskController::test_goal();
+        context.task_controller = Some(task_controller);
         let mut stream = router.activate(context).unwrap();
         let summary = "λ".repeat(256 * 1024 + 1);
         assert_eq!(
             router
                 .route(ControlToolInvocation {
+                    task_permit: None,
                     name: "goal_complete".into(),
                     arguments: serde_json::json!({"summary":summary}),
                 })
@@ -2888,7 +2931,7 @@ mod test {
         let turn_guard = turn_event.activate(Some(event_sink), None).unwrap();
 
         turn_event
-            .publish_steering("accepted".into(), Some("message-identity".into()))
+            .publish_steering("accepted".into(), Some("message-identity".into()), None)
             .await
             .unwrap();
         let event = event_stream.try_recv().unwrap();
@@ -2898,7 +2941,7 @@ mod test {
 
         drop(turn_guard);
         turn_event
-            .publish_steering("late".into(), None)
+            .publish_steering("late".into(), None, None)
             .await
             .unwrap();
         assert!(event_stream.try_recv().is_err());

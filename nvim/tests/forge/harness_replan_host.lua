@@ -73,7 +73,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_set_current_win(state.transcript_win)
   invoke("or")
   await(function() return not state.aborting_plan and not state.state_sync_pending
-    and not state.active_plan and not state.session.current_task_id end, "abort did not clear the planning task")
+    and not state.active_plan and not state.session.active_task end, "abort did not clear the planning task")
   assert(not state.active_elicitation, "abort retained input status")
   await(function()
     return not table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")

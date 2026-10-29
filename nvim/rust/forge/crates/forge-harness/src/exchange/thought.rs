@@ -223,7 +223,7 @@ mod tests {
             data: json!({"params":{"itemId":"thought","phase":"commentary"}}),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 1)?;
         event.kind = "tool".into();
@@ -292,7 +292,7 @@ mod tests {
             data: json!({"provider_message_id":"first","phase":"commentary"}),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 1)?;
         event.kind = "tool".into();
@@ -448,7 +448,7 @@ mod tests {
                     data: json!({"phase":phase}),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 };
                 exchange.observe_turn(&event, 1)?;
                 exchange.append_input(intent, "New input".into(), 2)?;

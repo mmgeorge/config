@@ -1038,7 +1038,7 @@ mod test {
             text: None,
             data: serde_json::Value::Null,
             summary: None,
-            task_update: None,
+            checklist_update: None,
             activity: Some(ToolActivity {
                 id: "patch".into(),
                 kind: ToolActivityKind::FileChange,

@@ -72,9 +72,6 @@ function HarnessSnapshot.apply(state, result)
   state.artifact = vim.deepcopy(result.artifact or {})
   state.no_checkpoint = result.no_checkpoint == true
   state.restore_recovery = result.restore_recovery
-  state.task = result.task or {}
-  state.goal = result.goal
-  state.goal_execution = result.goal_execution
   state.active_plan = result.active_plan
   if result.active_elicitation and result.active_elicitation ~= vim.NIL then
     require("forge.views.harness.question_presentation").receive(state, result.active_elicitation, true)

@@ -338,7 +338,7 @@ end
 ---@param retracted? fun(): boolean
 function M.submit(state, text, attachments, intent, config, callback, retracted)
   local message = { id = identity(), revision = 0, text = text, attachments = attachments,
-    task_id = state.session.current_task_id, config = config, intent = intent, delivery = "queued" }
+    purpose = { kind = "user" }, config = config, intent = intent, delivery = "queued" }
   if intent == "auto" and not config and not state.busy and not state.execution_busy
     and #(state.queue or {}) == 0 and #(state.pending_steer or {}) == 0 and #(state.pending_submit or {}) == 0 then
     state.input.direct_submission[message.id] = true

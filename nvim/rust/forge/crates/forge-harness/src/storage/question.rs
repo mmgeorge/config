@@ -13,6 +13,16 @@ pub(super) fn preserve_answers(
     encoded: String,
 ) -> Result<String> {
     let mut incoming: Value = serde_json::from_str(&encoded)?;
+    let stored: Option<String> = transaction
+        .query_row(
+            &format!("SELECT payload FROM {table} WHERE id=?1"),
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(stored) = stored {
+        preserve_withdrawals(table, &mut incoming, &serde_json::from_str(&stored)?)?;
+    }
     for (pointer, path) in [
         ("/elicitation", "$.elicitation"),
         ("/acceptance/elicitation", "$.acceptance.elicitation()"),
@@ -44,10 +54,325 @@ pub(super) fn preserve_answers(
     Ok(serde_json::to_string(&incoming)?)
 }
 
+fn preserve_withdrawals(table: &str, incoming: &mut Value, stored: &Value) -> Result<()> {
+    if table == "exchange_record" {
+        for withdrawal in stored["node_list"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|node| node["kind"] == "question_withdrawn")
+        {
+            if incoming["elicitation"]["question_set"]["id"] == withdrawal["question"]["id"] {
+                incoming["elicitation"] = Value::Null;
+                incoming["awaiting_input"] = json!(false);
+                incoming["check_setup"] = Value::Null;
+            }
+            let nodes = incoming["node_list"]
+                .as_array_mut()
+                .context("exchange source nodes are missing")?;
+            if !nodes.iter().any(|node| node["id"] == withdrawal["id"]) {
+                nodes.push(withdrawal.clone());
+            }
+        }
+    } else if table == "plan_record" {
+        let withdrawn: Vec<_> = stored["question_ledger"]["resolution"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|resolution| resolution["kind"] == "withdrawn")
+            .cloned()
+            .collect();
+        for pointer in ["/elicitation", "/acceptance/elicitation"] {
+            let retired = incoming
+                .pointer(pointer)
+                .and_then(|elicitation| elicitation["question_set"]["questions"].as_array())
+                .is_some_and(|questions| {
+                    questions.iter().any(|question| {
+                        withdrawn
+                            .iter()
+                            .any(|resolution| resolution["question_id"] == question["id"])
+                    })
+                });
+            if retired {
+                if pointer == "/elicitation" {
+                    incoming["elicitation"] = Value::Null;
+                    if incoming["state"] == "awaiting_input" {
+                        incoming["state"] = stored["state"].clone();
+                    }
+                } else {
+                    incoming["acceptance"] = Value::Null;
+                }
+            }
+        }
+        if !withdrawn.is_empty() {
+            if incoming["question_ledger"].is_null() {
+                incoming["question_ledger"] = json!({"resolution":[]});
+            }
+            if incoming["question_ledger"]["resolution"].is_null() {
+                incoming["question_ledger"]["resolution"] = json!([]);
+            }
+            let resolution = incoming["question_ledger"]["resolution"]
+                .as_array_mut()
+                .context("plan question resolutions are missing")?;
+            for withdrawal in withdrawn {
+                if let Some(existing) = resolution
+                    .iter_mut()
+                    .find(|item| item["question_id"] == withdrawal["question_id"])
+                {
+                    *existing = withdrawal;
+                } else {
+                    resolution.push(withdrawal);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn retire_task_questions(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    previous: Option<&crate::task::ActiveTask>,
+    now_ms: i64,
+) -> Result<()> {
+    let reason = "The task was replaced or cleared";
+    let mut statement = transaction.prepare("SELECT id,payload FROM exchange_record WHERE session_id=?1 AND agent_id=?2 AND (json_extract(payload,'$.awaiting_input')=1 OR json_type(payload,'$.elicitation')='object')")?;
+    let pending = statement
+        .query_map(
+            params![
+                session_id,
+                crate::session::HarnessSession::primary_agent_id(session_id)
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (id, payload) in pending {
+        let mut exchange: Value = super::decode(&payload)?;
+        if let Some(question) = exchange
+            .pointer("/elicitation/question_set")
+            .filter(|question| question.is_object())
+            .cloned()
+        {
+            let answer = exchange["elicitation"]
+                .get("answer")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let nodes = exchange["node_list"]
+                .as_array_mut()
+                .context("pending exchange source nodes are missing")?;
+            let withdrawal = format!(
+                "{id}:withdrawn:{}",
+                question["id"]
+                    .as_str()
+                    .context("pending question identity is missing")?
+            );
+            if !nodes.iter().any(|node| node["id"] == withdrawal) {
+                nodes.push(json!({"kind":"question_withdrawn","id":withdrawal,"question":question,"answer":answer,"reason":reason}));
+            }
+        }
+        exchange["awaiting_input"] = json!(false);
+        exchange["elicitation"] = Value::Null;
+        exchange["check_setup"] = Value::Null;
+        transaction.execute(
+            "UPDATE exchange_record SET payload=?2 WHERE id=?1",
+            params![id, super::encode(&exchange)?],
+        )?;
+    }
+    let plan_id = previous.and_then(|task| match &task.workflow {
+        crate::task::TaskWorkflow::Plan { plan } => Some(plan.artifact.id.as_str()),
+        crate::task::TaskWorkflow::Execute { execution } => Some(execution.record.plan_id.as_str()),
+        crate::task::TaskWorkflow::Goal { .. } => None,
+    });
+    let Some(plan_id) = plan_id else {
+        return Ok(());
+    };
+    let Some(mut plan): Option<crate::plan::PlanRecord> =
+        super::task::read_record(transaction, "plan_record", plan_id)?
+    else {
+        return Ok(());
+    };
+    let mut question = Vec::new();
+    if let Some(elicitation) = plan.elicitation.take() {
+        question.push(elicitation);
+    }
+    if let Some(acceptance) = plan.acceptance.take() {
+        question.push(acceptance.elicitation);
+    }
+    if question.is_empty() {
+        return Ok(());
+    }
+    if plan.state == crate::plan::PlanState::AwaitingInput {
+        plan.state = crate::plan::PlanState::Cancelled;
+    }
+    plan.updated_at_ms = now_ms;
+    let latest: Option<String> = transaction.query_row("SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal DESC LIMIT 1", params![session_id,crate::session::HarnessSession::primary_agent_id(session_id)],|row|row.get(0)).optional()?;
+    let anchor = latest
+        .map(|payload| -> Result<_> {
+            let exchange: crate::exchange::Exchange = super::decode(&payload)?;
+            Ok(crate::plan::ExchangeAnchor::capture(&exchange))
+        })
+        .transpose()?;
+    for elicitation in question {
+        let question = elicitation.question_set;
+        for item in &question.questions {
+            plan.question_ledger.resolve(item, None, now_ms);
+            if let Some(resolution) =
+                plan.question_ledger
+                    .resolution
+                    .iter_mut()
+                    .find(|resolution| {
+                        resolution.question_id == item.id
+                            && resolution.kind == crate::plan::PlanQuestionResolutionKind::Withdrawn
+                    })
+            {
+                resolution.response = elicitation
+                    .answer
+                    .iter()
+                    .find(|answer| answer.question_id == item.id)
+                    .map(|answer| answer.response.clone());
+            }
+        }
+        let lifecycle = crate::plan::PlanLifecycleRecord {
+            id: format!("{plan_id}:withdrawn:{}", question.id),
+            session_id: session_id.into(),
+            plan_id: plan_id.into(),
+            title: plan.title.clone(),
+            anchor: anchor.clone(),
+            kind: crate::plan::PlanLifecycleKind::QuestionWithdrawn,
+            model_revision: plan.model_revision,
+            user_revision: plan.user_revision,
+            overall_comment: None,
+            annotation: Vec::new(),
+            question: Some(question),
+            answer: Some(reason.into()),
+            created_at_ms: now_ms,
+        };
+        let mut payload = serde_json::to_value(&lifecycle)?;
+        payload["schema_version"] = json!(crate::plan::PLAN_SCHEMA_VERSION);
+        transaction.execute("INSERT INTO plan_lifecycle_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO NOTHING",params![lifecycle.id,session_id,super::encode(&payload)?])?;
+    }
+    let mut payload = serde_json::to_value(&plan)?;
+    payload["schema_version"] = json!(crate::plan::PLAN_SCHEMA_VERSION);
+    transaction.execute(
+        "UPDATE plan_record SET payload=?2 WHERE id=?1",
+        params![plan.id, super::encode(&payload)?],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::SessionStore;
+
+    #[test]
+    fn replacement_and_clear_retire_questions_atomically() -> Result<()> {
+        for clear in [false, true] {
+            let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+            let question =
+                crate::plan::PlanQuestionSet::freeform("Which scope should be implemented?".into())
+                    .normalize()?;
+            let elicitation = PlanElicitation::new(question.clone());
+            let plan: crate::plan::PlanRecord = serde_json::from_value(json!({
+                "id":"plan","session_id":"session","request":"Plan the change","state":"awaiting_input",
+                "working_path":"","model_revision":1,"user_revision":0,"created_at_ms":0,"updated_at_ms":0,
+                "elicitation":elicitation
+            }))?;
+            let current = controller.current()?.unwrap();
+            controller.change(
+                &mut store,
+                Some(&current.revision),
+                crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::plan(
+                    plan.clone(),
+                    1,
+                ))),
+                1,
+            )?;
+            let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+                "id":"exchange","session_id":"session","agent_id":"session:agent:primary","ordinal":1,
+                "prompt":"Preserve original prompt","state":"complete","created_at_ms":1,"node_list":[],"attributed_matches_checkpoint":false
+            }))?;
+            exchange.set_elicitation(Some(elicitation));
+            exchange.set_awaiting_input(true);
+            store.save_exchange(&exchange)?;
+            let active = controller.current()?.unwrap();
+            controller.change(
+                &mut store,
+                Some(&active.revision),
+                crate::task::TaskChange::Pause,
+                2,
+            )?;
+            assert!(
+                store
+                    .session_admission("session")?
+                    .snapshot()?
+                    .has_elicitation
+            );
+            let paused = controller.current()?.unwrap();
+            let change = || {
+                if clear {
+                    crate::task::TaskChange::Clear
+                } else {
+                    crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+                        "Replacement".into(),
+                        Default::default(),
+                        false,
+                        3,
+                    )))
+                }
+            };
+            store.connection.execute_batch("CREATE TRIGGER reject_retirement BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'retirement unavailable'); END;")?;
+            assert!(
+                controller
+                    .change(&mut store, Some(&paused.revision), change(), 3)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .load_exchange("exchange")?
+                    .unwrap()
+                    .elicitation()
+                    .is_some()
+            );
+            assert!(store.load_plan("plan")?.unwrap().elicitation.is_some());
+            store
+                .connection
+                .execute_batch("DROP TRIGGER reject_retirement")?;
+            controller.change(&mut store, Some(&paused.revision), change(), 3)?;
+            assert!(
+                !store
+                    .session_admission("session")?
+                    .snapshot()?
+                    .has_elicitation
+            );
+            let retired = store.load_exchange("exchange")?.unwrap();
+            assert_eq!(retired.prompt, "Preserve original prompt");
+            assert!(retired.elicitation().is_none() && !retired.awaiting_input());
+            assert!(retired.node_list.iter().any(|node| matches!(node,crate::exchange::ExchangeNode::QuestionWithdrawn { question: retired,.. } if retired == &question)));
+            assert!(store.load_plan("plan")?.unwrap().elicitation.is_none());
+            assert!(
+                store
+                    .list_plan_lifecycle("session")?
+                    .iter()
+                    .any(
+                        |event| event.kind == crate::plan::PlanLifecycleKind::QuestionWithdrawn
+                            && event.question.as_ref() == Some(&question)
+                    )
+            );
+            store.save_exchange(&exchange)?;
+            store.save_plan(&plan)?;
+            assert!(
+                store
+                    .load_exchange("exchange")?
+                    .unwrap()
+                    .elicitation()
+                    .is_none()
+            );
+            assert!(store.load_plan("plan")?.unwrap().elicitation.is_none());
+        }
+        Ok(())
+    }
 
     #[test]
     fn answer_receipt_is_atomic_and_preserves_newer_answers() -> Result<()> {
@@ -234,6 +559,15 @@ impl SqliteStore {
             &format!("UPDATE {table} SET payload=json_set(payload,?3,json(?4)) WHERE session_id=?1 AND id=?2"),
             params![session_id, target.id, pointer, serde_json::to_string(&elicitation)?],
         )?;
+        if table == "plan_record" {
+            let plan: crate::plan::PlanRecord =
+                super::task::read_record(&transaction, table, &target.id)?
+                    .context("answered plan disappeared")?;
+            let active: String = transaction.query_row("SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1", [session_id], |row| row.get(0))?;
+            let mut active: crate::task::ActiveTask = super::decode(&active)?;
+            crate::task::SessionTaskController::apply_plan_answer(&mut active, plan)?;
+            transaction.execute("UPDATE session_record SET payload=json_set(payload,'$.session.active_task',json(?2)) WHERE id=?1", params![session_id,super::encode(&active)?])?;
+        }
         let result = json!({"operation_id":identity,"active_elicitation":{
             "owner":owner,
             "exchange_id":if owner == "interaction" { Some(&target.id) } else { None },

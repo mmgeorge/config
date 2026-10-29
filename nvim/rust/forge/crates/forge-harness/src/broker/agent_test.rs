@@ -331,7 +331,7 @@ fn child_event(kind: &str) -> BackendEvent {
         data: Value::Null,
         activity: None,
         summary: None,
-        task_update: None,
+        checklist_update: None,
     }
 }
 
@@ -837,42 +837,16 @@ async fn child_tool_configuration_resumes_the_same_goal_exchange() -> Result<()>
     // Mock write turns report progress and keep this goal active across configuration changes.
     broker.session.approval_mode = ApprovalMode::Ask;
     let child = admit_child_fixture(&mut broker, "config-child")?;
-    let goal = GoalRecord {
-        id: "configuration-goal".into(),
-        session_id: broker.session.id.clone(),
-        objective: "Continue work".into(),
-        state: GoalState::Active,
-        continuation: Default::default(),
-        native: false,
-        created_at_ms: 1,
-        updated_at_ms: 1,
-    };
-    broker.store.save_goal(&goal)?;
-    let mut task = crate::task::TaskRecord::new(
-        broker.session.id.clone(),
-        goal.objective.clone(),
-        crate::task::TaskKind::Goal,
-        broker.session.access.clone(),
-        broker.session.approval_mode,
-        1,
-    );
-    task.goal_id = Some(goal.id.clone());
-    task.begin(1)?;
-    broker.store.save_task(&task)?;
-    broker.session.current_task_id = Some(task.id.clone());
-    broker.session.goal_id = Some(goal.id.clone());
-    broker.save_session()?;
+    broker.create_goal("Continue work".into(), false)?;
     let mut parent = broker
         .store
         .load_exchange(&child.task.parent_exchange_id)?
         .unwrap();
-    parent.kind = ExchangeKind::Chat;
     parent.phase = crate::exchange::ExchangePhase::fixture(
         ExchangeState::Running,
         parent.completed_at_ms(),
         parent.finalization_outcome(),
     );
-    parent.goal_id = Some(goal.id.clone());
     parent.clock = crate::exchange::ExchangeClock::Paused {
         elapsed_ms: parent.duration_ms(),
     };
@@ -893,7 +867,7 @@ async fn child_tool_configuration_resumes_the_same_goal_exchange() -> Result<()>
             parent.id
         );
         assert_eq!(
-            broker.current_task()?.unwrap().status,
+            broker.task_controller.current()?.unwrap().status(),
             crate::task::TaskStatus::Running
         );
         assert_eq!(broker.active_goal()?.state, GoalState::Active);
@@ -1306,7 +1280,7 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
         data: Value::Null,
         activity: None,
         summary: None,
-        task_update: None,
+        checklist_update: None,
     };
     for admitted in &admission {
         let owner = crate::backend::ExecutionOwner {
@@ -1597,7 +1571,7 @@ impl Backend for RoutingBackend {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             })
             .await?;
         }
@@ -1892,7 +1866,7 @@ impl Backend for ResultReceivingBackend {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             })
             .await?;
         }
@@ -2185,7 +2159,7 @@ impl Backend for SuspendedParentBackend {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             })
             .await?;
         }

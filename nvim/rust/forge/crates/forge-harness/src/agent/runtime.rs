@@ -118,7 +118,7 @@ impl AgentRuntime {
                     data: serde_json::json!({"thread_id":provider_thread_id}),
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 },
             )
             .await?;

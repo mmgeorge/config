@@ -2282,7 +2282,7 @@ mod tests {
             data: serde_json::Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         exchange.observe_turn(&event, 2)?;
         event.turn_boundary = None;
@@ -3267,7 +3267,7 @@ mod tests {
                 text: None,
                 data: serde_json::json!({"emittedAtMs":10+iteration}),
                 summary: None,
-                task_update: None,
+                checklist_update: None,
                 activity: Some(ToolActivity {
                     id: "tool".into(),
                     kind: ToolActivityKind::Command,
@@ -3382,7 +3382,7 @@ mod tests {
             text: Some("First [link](https://example.com)".into()),
             data: serde_json::json!({"provider_message_id":"message"}),
             summary: None,
-            task_update: None,
+            checklist_update: None,
             activity: None,
         };
         exchange.observe_turn(&event, 2)?;
@@ -3469,7 +3469,7 @@ mod tests {
             text: Some("First [link](https://example.com)".into()),
             data: serde_json::json!({"provider_message_id":"message","phase":"commentary"}),
             summary: None,
-            task_update: None,
+            checklist_update: None,
             activity: None,
         };
         exchange.observe_turn(&event, 2)?;
@@ -3650,7 +3650,7 @@ mod tests {
                 text: Some("Inspect settings.".into()),
                 data: serde_json::json!({"provider_message_id":"thought"}),
                 summary: None,
-                task_update: None,
+                checklist_update: None,
                 activity: None,
             };
             exchange.observe_turn(&event, 2)?;
@@ -3838,7 +3838,7 @@ mod tests {
             text: None,
             data: serde_json::json!({"emittedAtMs":10}),
             summary: None,
-            task_update: None,
+            checklist_update: None,
             activity: Some(ToolActivity {
                 id: "tool".into(),
                 kind: ToolActivityKind::Command,
@@ -3944,7 +3944,7 @@ mod tests {
             text: None,
             data: Value::Null,
             summary: None,
-            task_update: None,
+            checklist_update: None,
             activity: None,
         };
         for (batch, (range, _count)) in [(0..2, 2), (2..5, 5), (5..6, 6), (0..1, 6)]
@@ -4429,7 +4429,7 @@ mod tests {
             text: None,
             data: Value::Null,
             summary: None,
-            task_update: None,
+            checklist_update: None,
             activity: Some(ToolActivity {
                 id: "latest".into(),
                 kind: ToolActivityKind::Command,
@@ -4717,7 +4717,7 @@ mod tests {
                 data: serde_json::Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             exchange.observe_turn(&event, 1).unwrap();
             event.turn_boundary = None;
@@ -4778,6 +4778,7 @@ mod tests {
             .node_list
             .push(crate::exchange::ExchangeNode::ArtifactChange {
                 change: crate::exchange::ArtifactChange {
+                    revision_request: false,
                     id: "saved-diff".into(),
                     path: "test.rs".into(),
                     diff_text: source.into(),
@@ -4847,6 +4848,7 @@ mod tests {
         };
         exchange.node_list.push(crate::exchange::ExchangeNode::ArtifactChange {
             change: crate::exchange::ArtifactChange {
+                        revision_request: false,
                 id: "saved-diff".into(),
                 path: "test.mjs".into(),
                 diff_text: "--- a/test.mjs\n+++ b/test.mjs\n@@ -1 +1 @@\n-const old = 1;\n+const next = 2;\n".into(),
@@ -4929,14 +4931,12 @@ mod tests {
         use crate::backend::{
             BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
         };
-        use crate::exchange::ExchangeKind;
         let address = ProviderAddress {
             owner: None,
             thread_id: "thread".into(),
             turn_id: identity.into(),
         };
         let mut interaction = Exchange {
-            lifecycle: None,
             finalization_error: None,
             check_owner: None,
             output_store: None,
@@ -4948,12 +4948,10 @@ mod tests {
             session_id: "session".into(),
             ordinal: 1,
             prompt: format!("Prompt {identity}"),
-            kind: ExchangeKind::Chat,
+            origin: crate::exchange::ExchangeOrigin::User,
+
             approval_mode: None,
-            plan_id: None,
-            execution_id: None,
-            execution_phase: None,
-            goal_id: None,
+
             phase: crate::exchange::ExchangePhase::Running,
             checkpoint_before: None,
             checkpoint_after: None,
@@ -4969,7 +4967,7 @@ mod tests {
             node_list: Vec::new(),
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
-            task: None,
+            checklist: None,
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 1 },
@@ -4983,7 +4981,7 @@ mod tests {
             data: serde_json::Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         interaction.observe_turn(&event, 0).unwrap();
         event.turn_boundary = None;
@@ -5166,7 +5164,7 @@ mod tests {
                 text: None,
                 data: serde_json::json!({"emittedAtMs":10}),
                 summary: None,
-                task_update: None,
+                checklist_update: None,
                 activity: Some(ToolActivity {
                     id: "tool".into(),
                     kind: ToolActivityKind::Command,
@@ -5462,7 +5460,7 @@ mod tests {
                 data: serde_json::Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             exchange.observe_turn(&event, 2)?;
             event.turn_boundary = None;
@@ -5655,7 +5653,7 @@ mod tests {
                 change: Default::default(),
             }),
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         child.observe_turn(&event, 2)?;
         owner
@@ -5854,7 +5852,7 @@ mod tests {
                 change: Default::default(),
             }),
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         interaction.observe_turn(&event, 2)?;
         owner

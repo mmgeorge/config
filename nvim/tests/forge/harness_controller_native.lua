@@ -47,7 +47,8 @@ client.request_for = function(session_id, method, params, callback)
   assert(method == "harness.document")
   if params.operation == "open" then
     initial[#initial + 1] = params
-    vim.schedule(function() callback({ transcript = snapshot(params.document, "Native transcript") }) end)
+    vim.schedule(function() callback({ transcript = snapshot(params.document, "Native transcript"),
+      status = snapshot(params.document .. ":status", "Idle") }) end)
   elseif params.operation == "navigate_prompt" then
     navigated = params.input
     vim.schedule(function() callback({ anchor = { block = "body", position = { row = 0, column = 0 } } }) end)
@@ -388,39 +389,26 @@ local success, failure = xpcall(function()
   assert(state.recap == nil and state.busy, "provider continuation retained recap or changed busy state")
   controller.refresh_winbar()
   assert(vim.wo[state.composer_win].winbar == "", "busy composer restored key hints")
-  state.goal = { state = "paused", created_at_ms = 1000 }
   receive("backend_event", { kind = "execution_state", data = {
-    session = { id = "native-controller", backend = "mock", model = "mock", approval_mode = "ask", current_task_id = "execution" },
-    task = { { id = "execution", kind = "execute", phase = "implement", status = "running" } },
-    goal = { state = "active", created_at_ms = 1000 },
-    goal_execution = { state = "active", created_at_ms = 1000, scheduler = { task = { { state = "active" } } } },
+    session = { id = "native-controller", backend = "mock", model = "mock", approval_mode = "ask",
+      active_task = { revision = "execution", kind = "execute", execution = {
+        title = "Implement the design", record = { state = "active", phase = "implement" } } } },
   } }, "native-controller")
-  assert(state.busy and state.goal.state == "active" and state.session.approval_mode == "ask")
+  assert(state.busy and state.session.active_task.kind == "execute" and state.session.approval_mode == "ask")
   title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str
   assert(title:find("execute · implement", 1, true))
   assert(not title:find("running", 1, true))
-  receive("backend_event", { kind = "execution_state", data = {
-    session = state.session, goal = vim.NIL, goal_execution = vim.NIL,
-  } }, "native-controller")
-  assert(state.goal == nil and state.goal_execution == nil, "absent execution state retained stale goal labels")
   state.busy = false
-  state.session.approval_mode = "ask"
-  for _, kind in ipairs({ "plan", "execute", "goal" }) do
-    for _, status in ipairs({ "paused", "blocked", "failed", "waiting" }) do
-      state.task = { { id = "execution", kind = kind, phase = "review", status = status } }
-      controller.refresh_winbar()
-      local winbar = vim.wo[state.transcript_win].winbar
-      title = vim.api.nvim_eval_statusline(winbar, { use_winbar = true, maxwidth = 200 }).str
-      assert(title:find(kind .. " · review · " .. status, 1, true),
-        "durable task lifecycle disappeared from the winbar")
-      local _, dots = title:gsub("·", "")
-      local _, gray_dots = winbar:gsub("%%#ForgeStatusHint# · %%%*", "")
-      assert(gray_dots == dots, "lifecycle separator inherited a value's highlight")
-    end
+  for _, status in ipairs({ "paused", "blocked" }) do
+    state.session.active_task.execution.record.state = status
+    controller.refresh_winbar()
+    title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+      { use_winbar = true, maxwidth = 200 }).str
+    assert(title:find("execute · implement · " .. status, 1, true),
+      "active task lifecycle disappeared from the winbar")
   end
-  state.goal, state.goal_execution, state.task = nil, nil, {}
-  state.session.current_task_id = nil
+  state.session.active_task = nil
   controller.refresh_winbar()
   local original_window = state.transcript_win
   vim.api.nvim_set_current_win(original_window)
@@ -643,9 +631,7 @@ local success, failure = xpcall(function()
     goal_request[#goal_request].callback({ state = "accepted" })
     assert(state.busy, "goal acknowledgement cleared the running turn state")
   end
-  state.goal = { state = "active" }
   receive("goal_changed", { state = "cleared" }, "native-controller")
-  assert(state.goal == nil, "cleared goal survived its lifecycle event")
   local profiles = require("forge.views.harness.subagent_profiles")
   local original_profile_open, original_spawn, original_spawn_picker = profiles.open, controller.spawn_agent, controller.open_spawn_picker
   local original_agents, original_select = controller.open_agent_picker, controller.select_agent

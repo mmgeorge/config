@@ -2079,7 +2079,7 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
         data: serde_json::Value::Null,
         activity: None,
         summary: None,
-        task_update: None,
+        checklist_update: None,
     };
     while let Ok(result) =
         tokio::time::timeout(Duration::from_millis(20), sink.send_wait(filler.clone())).await

@@ -285,7 +285,7 @@ impl ToolOutputView {
         self.heading = Some(crate::turn::ToolCall {
             started_at_ms: call.started_at_ms,
             completed_at_ms: call.completed_at_ms,
-            task_id: None,
+            checklist_item_id: None,
             id: call.id.clone(),
             kind: call.kind.clone(),
             title: call.title.clone(),

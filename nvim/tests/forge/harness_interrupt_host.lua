@@ -73,7 +73,7 @@ local success, failure = xpcall(function()
     settled = result
   end)
   assert(vim.wait(5000, function() return settled ~= nil end, 10))
-  assert(settled.goal.state == "paused", "goal stop was not persisted")
+  assert(settled.session.active_task.goal.state == "paused", "goal stop was not persisted")
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)
 client.stop()

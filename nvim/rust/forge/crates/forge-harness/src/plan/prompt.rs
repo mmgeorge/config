@@ -14,6 +14,12 @@ pub enum PlanExecutionPromptKind {
 }
 
 impl PlanPrompt {
+    pub(crate) fn checks_setup(request: &str) -> String {
+        format!(
+            "The user requested a plan. Project checks are missing or invalid, so use the harness-checks skill to configure them before beginning that plan. Do not design or implement the requested feature yet. Use the original request only to identify the intended tooling. Harness will resume the original planning request after successful configuration publication.\n\nOriginal planning request:\n{request}"
+        )
+    }
+
     /// Include persisted user edits when a provider accepts, revises, or resumes a reviewed plan.
     pub(crate) fn with_manual_changes(prompt: String, changes: &[String]) -> String {
         if changes.is_empty() {

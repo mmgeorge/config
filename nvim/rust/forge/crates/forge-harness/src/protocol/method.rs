@@ -254,14 +254,9 @@ impl HarnessMethod {
                 | Self::ChecksComplete
                 | Self::AgentStart
                 | Self::ExchangeResume
-                | Self::PlanAccept
-                | Self::PlanRequestChanges
                 | Self::PlanAnswerQuestions
                 | Self::QuestionAsk
                 | Self::QuestionContinue
-                | Self::GoalSet
-                | Self::GoalResume
-                | Self::GoalContinue
                 | Self::ExchangeRequestChanges
                 | Self::SessionCompact
         )

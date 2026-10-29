@@ -35,17 +35,17 @@ local success, failure = xpcall(function()
   assert(vim.wait(10000, function() return state.ready and state.session end, 10), "Harness did not open")
   local first = submit_plan("First review")
   local second = submit_plan("Second review", first.active_plan.id)
-  local selected = second.session.current_task_id
+  local selected = second.session.active_task.revision
   for _, params in ipairs({ { plan_id = first.active_plan.id }, { plan_id = first.active_plan.id, revision = 1 } }) do
     assert(request("plan.get", params).id == first.active_plan.id)
     local observed = request("state.get", {})
-    assert(observed.session.current_task_id == selected and observed.active_plan.id == second.active_plan.id,
+    assert(observed.session.active_task.revision == selected and observed.active_plan.id == second.active_plan.id,
       "viewing the earlier plan changed workflow ownership")
   end
   request("session.preview", { session_id = "missing-session" }, true)
   request("plan.get", { plan_id = "missing-plan" }, true)
   local observed = request("state.get", {})
-  assert(observed.session.current_task_id == selected and observed.active_plan.id == second.active_plan.id)
+  assert(observed.session.active_task.revision == selected and observed.active_plan.id == second.active_plan.id)
   for _, task in ipairs(observed.task) do
     if task.id == selected then assert(task.status == "waiting", "failed lookup changed task status") end
   end

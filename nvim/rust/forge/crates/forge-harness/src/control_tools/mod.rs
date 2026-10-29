@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use tokio::io::{AsyncWriteExt, BufReader};
 
+mod authority;
 mod executor;
+pub(crate) use authority::TaskAuthority;
 mod failure;
 pub(crate) mod harness;
 pub(crate) mod lsp;
@@ -490,6 +492,74 @@ impl ControlToolRegistry {
 pub struct ControlToolInvocation {
     pub name: String,
     pub arguments: Value,
+    #[serde(skip)]
+    pub(crate) task_permit: Option<crate::task::TaskPermit>,
+}
+
+impl ControlToolInvocation {
+    pub(crate) fn admit_task_control(
+        &mut self,
+        controller: Option<&crate::task::SessionTaskController>,
+    ) -> Result<()> {
+        if !matches!(
+            self.name.as_str(),
+            "goal_complete" | "goal_blocked" | "goal_status"
+        ) {
+            return Ok(());
+        }
+        let controller = controller.context("goal control requires a session task controller")?;
+        let current = controller.admit_goal_control(self.name == "goal_complete")?;
+        if self
+            .task_permit
+            .as_ref()
+            .is_some_and(|permit| permit.revision() != current.revision())
+        {
+            return Err(crate::task::StaleTask.into());
+        }
+        self.task_permit = Some(current);
+        Ok(())
+    }
+
+    /// Captures task authority before a turn-scoped control can wait for execution.
+    pub(crate) fn admit_turn_control(
+        &mut self,
+        controller: Option<&crate::task::SessionTaskController>,
+        turn_permit: Option<&crate::task::TaskPermit>,
+        mode: crate::backend::PromptMode,
+    ) -> Result<()> {
+        self.admit_task_control(controller)?;
+        let Some(controller) = controller else {
+            return Ok(());
+        };
+        let scoped = self.name.starts_with("plan_") && self.name != "plan_review_answer"
+            || matches!(
+                self.name.as_str(),
+                "design_patch" | "question_ask" | "question_answer" | "question_withdraw"
+            );
+        let kind = match mode {
+            crate::backend::PromptMode::Plan | crate::backend::PromptMode::PlanDiscussion
+                if scoped =>
+            {
+                crate::task::TaskKind::Plan
+            }
+            crate::backend::PromptMode::ExecutePlan if scoped => crate::task::TaskKind::Execute,
+            _ => return Ok(()),
+        };
+        let captured = turn_permit.context("task control has no admitted turn permit")?;
+        let current = controller.admit(kind)?;
+        if captured.revision() != current.revision() {
+            return Err(crate::task::StaleTask.into());
+        }
+        if self
+            .task_permit
+            .as_ref()
+            .is_some_and(|permit| permit.revision() != captured.revision())
+        {
+            return Err(crate::task::StaleTask.into());
+        }
+        self.task_permit = Some(captured.clone());
+        Ok(())
+    }
 }
 
 struct ControlToolValidator {
@@ -562,8 +632,24 @@ pub fn apply_invocation(
         | "check_status"
         | "check_detail"
         | "check_cancel" => {}
-        "goal_complete" => output.evidence.structured_complete = true,
-        "goal_blocked" => output.evidence.structured_blocked = true,
+        "goal_complete" => {
+            output.evidence.structured_complete = true;
+            if let Some(permit) = &invocation.task_permit {
+                output.goal_control = Some(crate::goal::GoalControl {
+                    permit: permit.clone(),
+                    termination: crate::goal::GoalTermination::Complete,
+                });
+            }
+        }
+        "goal_blocked" => {
+            output.evidence.structured_blocked = true;
+            if let Some(permit) = &invocation.task_permit {
+                output.goal_control = Some(crate::goal::GoalControl {
+                    permit: permit.clone(),
+                    termination: crate::goal::GoalTermination::Blocked,
+                });
+            }
+        }
         "goal_status" => output.evidence.tool_called = true,
         "repository_status"
         | "repository_changed_paths"
@@ -807,6 +893,7 @@ mod test {
     fn repository_schema_preserves_complete_offsets_and_path_identities() {
         assert!(
             validate_arguments(&ControlToolInvocation {
+                task_permit: None,
                 name: "repository_file_diff".into(),
                 arguments: json!({"offset":65537,"path_hex":"61".repeat(4097)}),
             })
@@ -829,6 +916,7 @@ mod test {
             };
             assert!(
                 validate_arguments(&ControlToolInvocation {
+                    task_permit: None,
                     name: name.into(),
                     arguments: arguments.clone()
                 })
@@ -844,6 +932,7 @@ mod test {
                 arguments[field] = json!("forged");
                 assert!(
                     validate_arguments(&ControlToolInvocation {
+                        task_permit: None,
                         name: name.into(),
                         arguments: arguments.clone()
                     })
@@ -854,6 +943,7 @@ mod test {
         }
         assert!(
             validate_arguments(&ControlToolInvocation {
+                task_permit: None,
                 name: "repository_file_diff".into(),
                 arguments: json!({})
             })
@@ -861,6 +951,7 @@ mod test {
         );
         assert!(
             validate_arguments(&ControlToolInvocation {
+                task_permit: None,
                 name: "repository_status".into(),
                 arguments: json!({ "side": "staged" })
             })
@@ -868,6 +959,7 @@ mod test {
         );
         assert!(
             validate_arguments(&ControlToolInvocation {
+                task_permit: None,
                 name: "repository_diff".into(),
                 arguments: json!({ "side": "other" })
             })
@@ -914,6 +1006,7 @@ mod test {
         ] {
             assert!(
                 validate_arguments(&ControlToolInvocation {
+                    task_permit: None,
                     name: name.into(),
                     arguments,
                 })
@@ -943,6 +1036,7 @@ mod test {
             );
             apply_invocation(
                 &ControlToolInvocation {
+                    task_permit: None,
                     name: name.into(),
                     arguments: arguments.clone(),
                 },
@@ -953,6 +1047,7 @@ mod test {
             invalid["workspace"] = json!("untrusted");
             assert!(
                 validate_arguments(&ControlToolInvocation {
+                    task_permit: None,
                     name: name.into(),
                     arguments: invalid
                 })
@@ -996,6 +1091,7 @@ mod test {
             "harness_plan_edit" | "harness_plan_deviation" | "harness_plan_task_report"
         )));
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "design_patch".into(),
             arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}),
         };
@@ -1211,6 +1307,7 @@ mod test {
     #[cfg(any())]
     fn decodes_the_advertised_plan_edit_shape() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "harness_plan_edit".into(),
             arguments: json!({
                 "plan_id": "plan",
@@ -1427,6 +1524,7 @@ mod test {
     #[cfg(any())]
     fn rejects_internal_identity_fields_from_model_edits() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "harness_plan_edit".into(),
             arguments: json!({
                 "plan_id": "plan",
@@ -1456,6 +1554,7 @@ mod test {
     #[cfg(any())]
     fn rejects_harness_resolved_dependency_versions_from_model_edits() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "harness_plan_edit".into(),
             arguments: json!({
                 "plan_id": "plan",
@@ -1486,6 +1585,7 @@ mod test {
     #[cfg(any())]
     fn reports_the_exact_nested_json_path_for_invalid_arguments() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "harness_plan_edit".into(),
             arguments: json!({
                 "plan_id": "plan",
@@ -1526,6 +1626,7 @@ mod test {
     #[cfg(any())]
     fn reports_every_independent_structural_violation_in_one_response() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "harness_plan_edit".into(),
             arguments: json!({
                 "expected_version": 0,
@@ -1555,6 +1656,7 @@ mod test {
     #[cfg(any())]
     fn rejects_member_properties_from_enum_variants_before_plan_mutation() {
         let invocation = ControlToolInvocation {
+            task_permit: None,
             name: "harness_plan_edit".into(),
             arguments: json!({
                 "plan_id": "plan",

@@ -27,10 +27,21 @@ pub enum ExchangeNode {
         #[serde(skip)]
         report: Option<std::sync::Arc<crate::plan::implementation_report::ImplementationReport>>,
     },
+    VerificationResult {
+        id: String,
+        result: Box<VerificationResult>,
+    },
     QuestionPresented {
         id: String,
         question: crate::plan::PlanQuestionSet,
         answer: Option<String>,
+    },
+    QuestionWithdrawn {
+        id: String,
+        question: crate::plan::PlanQuestionSet,
+        reason: String,
+        #[serde(default)]
+        answer: Vec<crate::plan::PlanQuestionAnswer>,
     },
     PlanEvent {
         event: Box<crate::plan::ExchangePlanEvent>,
@@ -61,7 +72,9 @@ impl ExchangeNode {
             Self::SkillRead { id, .. } => id,
             Self::Compaction { id, .. } => id,
             Self::ImplementationReport { id, .. } => id,
+            Self::VerificationResult { id, .. } => id,
             Self::QuestionPresented { id, .. } => id,
+            Self::QuestionWithdrawn { id, .. } => id,
             Self::PlanEvent { event } => &event.id,
             Self::TurnContent { id, .. } => id,
             Self::AgentReference { agent } => &agent.id,
@@ -87,8 +100,26 @@ pub struct ArtifactChange {
     pub path: String,
     pub diff_text: String,
     pub created_at_ms: i64,
+    #[serde(default)]
+    pub revision_request: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration: Option<DeclarationRevision>,
+}
+
+/// Owns published verification evidence independently of the current execution task.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerificationResult {
+    pub outcome: crate::plan::execution::VerificationOutcome,
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    pub verification: Option<crate::plan::execution::VerificationReport>,
+    #[serde(default)]
+    pub declaration_findings: Vec<String>,
+    #[serde(default)]
+    pub declaration_changes: Vec<crate::plan::execution::DeclarationMismatch>,
+    #[serde(default)]
+    pub verification_tools: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

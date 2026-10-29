@@ -14,7 +14,7 @@ require("forge.infra.notifications").error = function(message) errors[#errors + 
 require("forge.views.harness.prompt_history").record = function() end
 question.open = function(_, callbacks) picker = callbacks end
 state.session = { id = "question-input", backend = "mock", model = "mock", approval_mode = "ask" }
-state.task, state.queue = {}, {}
+state.queue = {}
 state.active_elicitation = { owner = "interaction", exchange_id = "exchange",
   elicitation = { question_set = { id = "set", questions = {
     { id = "choice", question = "Choose?", options = {} },

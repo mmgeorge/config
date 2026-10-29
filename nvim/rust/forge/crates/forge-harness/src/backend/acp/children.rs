@@ -116,7 +116,7 @@ impl AcpChildren {
             data: serde_json::to_value(lifecycle)?,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         let boundary = BackendEvent {
             received_at_ms: None,
@@ -132,7 +132,7 @@ impl AcpChildren {
             data: Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         Ok(Some(if starts_child {
             vec![lifecycle, boundary]
@@ -186,7 +186,7 @@ impl AcpChildren {
                 data: Value::Null,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             });
             events.push(BackendEvent {
                 received_at_ms: None,
@@ -207,7 +207,7 @@ impl AcpChildren {
                 })?,
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             });
         }
         for child in self.child.values_mut() {
@@ -277,7 +277,7 @@ mod test {
             data: Value::Null,
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         assert!(!children.route("unannounced", &mut content));
         assert!(children.route("child", &mut content));

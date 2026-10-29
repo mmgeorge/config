@@ -175,7 +175,6 @@ local function new_harness_state()
   prompt_line = {},
   activity_range = {},
   active_plan = nil,
-  goal_execution = nil,
   active_elicitation = nil,
   active_wait = nil,
   approval = {},

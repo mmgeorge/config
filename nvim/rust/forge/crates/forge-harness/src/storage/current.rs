@@ -23,10 +23,6 @@ pub(crate) struct CurrentExchangeState {
 pub(crate) struct AdmissionExchange {
     pub(crate) id: String,
     pub(crate) state: crate::exchange::ExchangeState,
-    pub(crate) kind: crate::exchange::ExchangeKind,
-    pub(crate) plan_id: Option<String>,
-    pub(crate) execution_id: Option<String>,
-    pub(crate) goal_id: Option<String>,
     pub(crate) disposition: crate::exchange::HistoryDisposition,
     pub(crate) check_setup: Option<crate::checks::CheckSetupState>,
     pub(crate) created_at_ms: i64,
@@ -114,9 +110,7 @@ impl SqliteStore {
     fn read_current_exchange_state(&self, session_id: &str) -> Result<CurrentExchangeState> {
         let latest = self.load_payload(
             "SELECT json_object('id',id,'state',json_extract(payload,'$.state'), \
-             'kind',coalesce(json_extract(payload,'$.kind'),'chat'), \
-             'plan_id',json_extract(payload,'$.plan_id'),'execution_id',json_extract(payload,'$.execution_id'), \
-             'goal_id',json_extract(payload,'$.goal_id'),'disposition',coalesce(json_extract(payload,'$.disposition'),'current'), \
+             'disposition',coalesce(json_extract(payload,'$.disposition'),'current'), \
              'check_setup',json_extract(payload,'$.check_setup'),'created_at_ms',json_extract(payload,'$.created_at_ms')) \
              FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal DESC LIMIT 1",
             params![session_id, HarnessSession::primary_agent_id(session_id)],

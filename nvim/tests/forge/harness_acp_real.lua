@@ -601,7 +601,8 @@ local succeeded, failure = xpcall(function()
   if vim.g.forge_acp_test_control then
     request("goal.set", { objective = "Verify the Harness control connection by calling goal_complete with a short summary. No files or shell commands are needed. Complete this goal only through that tool." })
     local completed = request("state.get")
-    assert(completed.goal and completed.goal.state == "complete", "control tool did not complete the Goal task: " .. vim.inspect(completed.goal))
+    assert(completed.session.active_task == nil or completed.session.active_task == vim.NIL,
+      "control tool did not clear the completed Goal task: " .. vim.inspect(completed.session.active_task))
     print("ACP Harness control workflow passed: " .. backend)
   end
   if vim.g.forge_acp_test_questions then

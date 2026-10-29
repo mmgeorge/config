@@ -23,8 +23,6 @@ pub(crate) struct PlanReviewStore {
 
 /// Captures one unanswered question and the immutable design context used to answer it.
 pub(crate) struct PlanReviewQuestion {
-    /// Plan that owns the captured annotation and design.
-    pub plan_id: String,
     /// Stable identity of the question's annotation.
     pub id: String,
     /// Exact editable text captured at submission.
@@ -627,7 +625,6 @@ impl EditablePlanReview<'_> {
                 annotation.source.body
             );
             question.push(PlanReviewQuestion {
-                plan_id: document.source.document.plan_id.clone(),
                 id: annotation.id.clone(),
                 body: annotation.source.body.clone(),
                 prompt,

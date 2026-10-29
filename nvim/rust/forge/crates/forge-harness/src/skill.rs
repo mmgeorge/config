@@ -493,7 +493,7 @@ mod tests {
                 output_delta: false,
             }),
             summary: None,
-            task_update: None,
+            checklist_update: None,
         }
     }
 

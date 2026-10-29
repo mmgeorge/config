@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 3;
+pub(super) const VERSION: i64 = 5;
 const APPLICATION: i64 = 0x464f5247;
 
 /// Serializes bootstrap pragmas across processes before SQLite can acquire its own write lock.
@@ -74,6 +74,7 @@ pub(super) fn initialize(
         }
         initialize_query_indexes(&transaction)?;
         super::tool_output::initialize_positions(&transaction)?;
+        super::migration::migrate(&transaction)?;
         transaction.pragma_update(None, "user_version", VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -251,6 +252,7 @@ pub(super) fn initialize(
     initialize_query_indexes(&transaction)?;
     super::archive::migrate(&transaction, objects)?;
     initialize_commands(&transaction)?;
+    super::migration::migrate(&transaction)?;
     transaction.pragma_update(None, "application_id", APPLICATION)?;
     transaction.pragma_update(None, "user_version", VERSION)?;
     transaction.commit()?;
@@ -263,8 +265,8 @@ fn initialize_query_indexes(connection: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS exchange_agent_order ON exchange_record(agent_id,ordinal);
          CREATE INDEX IF NOT EXISTS exchange_state_order ON exchange_record(session_id,agent_id,json_extract(payload,'$.state'),ordinal);
          CREATE INDEX IF NOT EXISTS execution_plan_order ON plan_execution_record(session_id,json_extract(payload,'$.plan_id'));
-         CREATE INDEX IF NOT EXISTS exchange_execution_order ON exchange_record(session_id,agent_id,json_extract(payload,'$.execution_id'),ordinal);
-         CREATE INDEX IF NOT EXISTS task_session_updated ON task_record(session_id,json_extract(payload,'$.updated_at_ms'));")?;
+         DROP INDEX IF EXISTS exchange_execution_order;
+         DROP INDEX IF EXISTS task_session_updated;")?;
     Ok(())
 }
 

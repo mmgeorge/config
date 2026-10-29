@@ -5,9 +5,9 @@ use super::request_execution::{ExecutedRequest, RequestExecutor};
 use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
 use crate::backend::approval::PermissionCoordinator;
 use crate::backend::{
-    BackendEvent, BackendEventSink, BackendOutput, ProviderChangeKind, ProviderChangeSet,
-    ProviderFileChange, ProviderTaskEntry, ProviderTaskUpdate, TaskStatus, ToolActivity,
-    ToolActivityKind,
+    BackendEvent, BackendEventSink, BackendOutput, ChecklistStatus, ProviderChangeKind,
+    ProviderChangeSet, ProviderChecklistEntry, ProviderChecklistUpdate, ProviderFileChange,
+    ToolActivity, ToolActivityKind,
 };
 use crate::control_tools::{
     ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext,
@@ -1058,7 +1058,7 @@ async fn normalize_event_in_workspace(
             data: json!({ "method": method, "params": params }),
             activity: None,
             summary: None,
-            task_update: None,
+            checklist_update: None,
         };
         if let Some(event_sink) = event_sink {
             let _ = event_sink.send_wait(event.clone()).await;
@@ -1078,7 +1078,7 @@ async fn normalize_event_in_workspace(
                 data: serde_json::to_value(lifecycle).unwrap_or(Value::Null),
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(event_sink) = event_sink {
                 let _ = event_sink.send_wait(event.clone()).await;
@@ -1104,7 +1104,7 @@ async fn normalize_event_in_workspace(
                 data: serde_json::to_value(update).expect("usage update is JSON serializable"),
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(event_sink) = event_sink {
                 let _ = event_sink.send_wait(event.clone()).await;
@@ -1122,7 +1122,7 @@ async fn normalize_event_in_workspace(
                 data: serde_json::to_value(context_usage).unwrap_or(Value::Null),
                 activity: None,
                 summary: None,
-                task_update: None,
+                checklist_update: None,
             };
             if let Some(event_sink) = event_sink {
                 let _ = event_sink.send_wait(event.clone()).await;
@@ -1188,8 +1188,8 @@ async fn normalize_event_in_workspace(
         if activity.as_ref().is_some_and(successful_file_change) {
             output.evidence.workspace_changed = true;
         }
-        let task_update = plan_event
-            .then(|| normalize_task_update(method, &params))
+        let checklist_update = plan_event
+            .then(|| normalize_checklist_update(method, &params))
             .flatten();
         let data = json!({ "method": method, "params": params });
         let event = BackendEvent {
@@ -1201,7 +1201,7 @@ async fn normalize_event_in_workspace(
             data,
             activity,
             summary: None,
-            task_update,
+            checklist_update,
         };
         if let Some(event_sink) = event_sink {
             let _ = event_sink.send_wait(event.clone()).await;
@@ -1262,7 +1262,7 @@ fn normalize_reasoning(
                     data,
                     activity: None,
                     summary: None,
-                    task_update: None,
+                    checklist_update: None,
                 }
             })
             .collect(),
@@ -1307,7 +1307,7 @@ fn normalize_message(
         data: json!({ "method": method, "params": params }),
         activity: None,
         summary: None,
-        task_update: None,
+        checklist_update: None,
     };
     if event.message_phase().is_none()
         && let Some(id) = event.message_id()
@@ -1660,6 +1660,7 @@ pub(super) fn control_invocation(
     let arguments = find_control_arguments(value, control_name)
         .with_context(|| format!("{control_name} omitted its arguments object"))?;
     Ok(Some(ControlToolInvocation {
+        task_permit: None,
         name: control_name.to_owned(),
         arguments,
     }))
@@ -1707,16 +1708,16 @@ fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
         previous.data = event.data;
         return;
     }
-    if let Some(update) = event.task_update.as_ref()
+    if let Some(update) = event.checklist_update.as_ref()
         && let Some(index) = output.event.iter().rposition(|previous| {
             previous
-                .task_update
+                .checklist_update
                 .as_ref()
                 .is_some_and(|previous_update| previous_update.scope_id == update.scope_id)
         })
     {
         let mut previous = output.event.remove(index);
-        merge_task_update(&mut previous, event);
+        merge_checklist_update(&mut previous, event);
         output.event.push(previous);
         return;
     }
@@ -1749,11 +1750,11 @@ fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
     output.event.push(event);
 }
 
-fn merge_task_update(previous: &mut BackendEvent, incoming: BackendEvent) {
-    let Some(incoming_update) = incoming.task_update else {
+fn merge_checklist_update(previous: &mut BackendEvent, incoming: BackendEvent) {
+    let Some(incoming_update) = incoming.checklist_update else {
         return;
     };
-    let Some(previous_update) = previous.task_update.as_mut() else {
+    let Some(previous_update) = previous.checklist_update.as_mut() else {
         return;
     };
     if incoming_update.name.is_some() {
@@ -1767,7 +1768,7 @@ fn merge_task_update(previous: &mut BackendEvent, incoming: BackendEvent) {
     previous.data = incoming.data;
 }
 
-fn normalize_task_update(method: &str, params: &Value) -> Option<ProviderTaskUpdate> {
+fn normalize_checklist_update(method: &str, params: &Value) -> Option<ProviderChecklistUpdate> {
     let envelope = params.get("update").unwrap_or(params);
     let entry_list = envelope
         .get("plan")
@@ -1790,11 +1791,11 @@ fn normalize_task_update(method: &str, params: &Value) -> Option<ProviderTaskUpd
                 .to_ascii_lowercase()
                 .as_str()
             {
-                "inprogress" | "in_progress" | "active" => TaskStatus::InProgress,
-                "completed" | "complete" | "done" => TaskStatus::Completed,
-                _ => TaskStatus::Pending,
+                "inprogress" | "in_progress" | "active" => ChecklistStatus::InProgress,
+                "completed" | "complete" | "done" => ChecklistStatus::Completed,
+                _ => ChecklistStatus::Pending,
             };
-            Some(ProviderTaskEntry {
+            Some(ProviderChecklistEntry {
                 provider_id: entry
                     .get("id")
                     .or_else(|| entry.get("taskId"))
@@ -1836,7 +1837,7 @@ fn normalize_task_update(method: &str, params: &Value) -> Option<ProviderTaskUpd
         .and_then(Value::as_str)
         .filter(|name| !name.trim().is_empty())
         .map(str::to_owned);
-    Some(ProviderTaskUpdate {
+    Some(ProviderChecklistUpdate {
         scope_id,
         name,
         complete: completed,
@@ -3049,7 +3050,7 @@ mod test {
         .await;
         assert!(output.plan_edit.is_empty());
         assert_eq!(output.event.len(), 1);
-        let update = output.event[0].task_update.as_ref().unwrap();
+        let update = output.event[0].checklist_update.as_ref().unwrap();
         assert!(update.complete);
         assert_eq!(update.entry_list.len(), 1);
         assert_eq!(update.entry_list[0].content, "Inspect the change");

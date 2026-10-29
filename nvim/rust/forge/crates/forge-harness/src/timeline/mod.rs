@@ -14,10 +14,17 @@ mod planning;
 pub mod stream;
 pub use ownership::{TimelineEvent, TimelineOwner};
 
-/// Represents one durable session action projected outside model interactions.
+/// Records a durable session action at its captured session or exchange boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventKind {
+    TaskFinished {
+        outcome: crate::task::TaskOutcome,
+    },
+    TaskStarted {
+        start: crate::exchange::TaskStart,
+        prompt: String,
+    },
     /// Retains one configuration operation at a stable position throughout restart and resumption.
     Configuration {
         /// Identifies the durable task transition that owns cleanup and application.
@@ -42,7 +49,7 @@ pub enum SessionEventKind {
     },
 }
 
-/// Represents one durable session-level action shown outside model interactions.
+/// Retains a session action and the timeline boundary that owns its presentation.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionEventRecord {
     pub id: String,
@@ -630,7 +637,7 @@ mod test {
     use super::{TimelineEntry, TimelineProjection, TimelineProjector};
     use crate::{
         agent::{Agent, AgentState},
-        exchange::{Exchange, ExchangeKind, ExchangeState},
+        exchange::{Exchange, ExchangeState},
         plan::PlanFileStore,
     };
 
@@ -688,7 +695,6 @@ mod test {
 
     fn interaction(id: &str) -> Exchange {
         Exchange {
-            lifecycle: None,
             finalization_error: None,
             check_owner: None,
             output_store: None,
@@ -700,12 +706,10 @@ mod test {
             session_id: "session".into(),
             ordinal: 1,
             prompt: "inspect".into(),
-            kind: ExchangeKind::Chat,
+            origin: crate::exchange::ExchangeOrigin::User,
+
             approval_mode: None,
-            plan_id: None,
-            execution_id: None,
-            execution_phase: None,
-            goal_id: None,
+
             phase: crate::exchange::ExchangePhase::fixture(ExchangeState::Complete, Some(2), None),
             checkpoint_before: None,
             checkpoint_after: None,
@@ -721,7 +725,7 @@ mod test {
             node_list: Vec::new(),
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
-            task: None,
+            checklist: None,
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 1 },
