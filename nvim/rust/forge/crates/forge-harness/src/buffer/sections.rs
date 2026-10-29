@@ -940,8 +940,11 @@ fn render(
         }
         let source_block = source[cursor];
         if let Some(node) = &source_block.metadata.node
-            && node.kind == forge_buffer::node::NodeKind::Message
             && !source_block.metadata.fold.is_empty()
+            && (node.kind == forge_buffer::node::NodeKind::Message
+                || node.kind == forge_buffer::node::NodeKind::Group
+                    && source_block.metadata.fold[0].heading_start.is_some()
+                    && source_block.metadata.fold[0].end.block == source_block.id)
         {
             let id = &node.id.0;
             let block = super::message::project(source_block, node, intent.get(id).copied())?;
@@ -1249,6 +1252,77 @@ mod tests {
             id: entry.id.to_owned(),
             block: entry.block.into_iter().cloned().collect(),
         })
+    }
+
+    #[test]
+    fn wrapped_event_preview_expands_and_recollapses_with_its_action() -> Result<()> {
+        use super::super::transcript::TranscriptRenderer;
+        use forge_buffer::block::{TargetRange, TextRange};
+        use forge_buffer::identity::TargetId;
+        let width = WidthProfile {
+            columns: 28,
+            ..Default::default()
+        };
+        let mut block = TranscriptRenderer::new(&width)?.literal(
+            BlockId("event".into()),
+            "◇ Plan started: a simple bevy game with 2 systems and 5 components",
+            2,
+        )?;
+        TranscriptRenderer::heading_marker(&mut block, "Normal");
+        TranscriptRenderer::prepare_event(&mut block);
+        TranscriptRenderer::resolve_marker(&mut block)?;
+        block.metadata.target.push(TargetRange {
+            id: TargetId("open-plan".into()),
+            range: TextRange {
+                start: TextPosition { row: 0, column: 0 },
+                end: TextPosition {
+                    row: block.text.row_count(),
+                    column: 0,
+                },
+            },
+        });
+        let expected = block.text.clone();
+        let mut source = TranscriptDocument::initialize(
+            DocumentId("source".into()),
+            "session".into(),
+            0,
+            vec![TranscriptEntry {
+                id: "entry".into(),
+                block: vec![block],
+            }],
+        )?;
+        let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;
+        let view = ViewId("view".into());
+        visible.register(view.clone());
+        for (sequence, expanded) in [(0, false), (1, true), (2, false)] {
+            if sequence != 0 {
+                visible.set(
+                    &mut source,
+                    SectionRequest {
+                        view: view.clone(),
+                        sequence,
+                        id: "event",
+                        expanded,
+                        more: false,
+                        page: None,
+                    },
+                )?;
+                visible.refresh(&mut source)?;
+            }
+            let snapshot = visible.document.snapshot()?;
+            let event = &snapshot.block[0];
+            assert_eq!(event.metadata.target.len(), 1);
+            assert_eq!(event.metadata.fold[0].closed, !expanded);
+            if expanded {
+                assert_eq!(event.text, expected);
+            } else {
+                assert_eq!(event.text.row_count(), 1);
+                assert_eq!(event.text.row(0), expected.row(0));
+                assert_eq!(event.metadata.target[0].range.end.row, 1);
+            }
+        }
+        assert_eq!(source.source_entry("entry")?.block[0].text, expected);
+        Ok(())
     }
 
     #[test]

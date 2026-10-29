@@ -13,31 +13,50 @@ pub(super) async fn answer(
         .lock()
         .await
         .prepare_review_questions(&request.params)?;
-    if !questions.is_empty() {
-        let (child, gate) = start_session_fork(
-            Arc::clone(&registry),
-            session_id,
-            json!({"name":"Plan Review answers"}),
-            None,
-            crate::session::SessionPurpose::PlanReviewAnswer,
-            message_sink,
-        )
-        .await?;
-        gate.wait().await?;
-        let _execution = child
-            .coordinator
-            .execution
-            .clone()
-            .acquire_owned()
-            .await
-            .context("review answer session is closed")?;
-        let mut broker = child.broker.lock().await;
-        for question in questions {
-            let scope =
-                ReviewAnswerScope::new(Arc::clone(&source.plan_review), document.clone(), question);
-            broker.run_review_question(scope, &selection).await?;
+    let mut pending = tokio::task::JoinSet::new();
+    for question in questions {
+        let registry = Arc::clone(&registry);
+        let source = Arc::clone(&source);
+        let session_id = session_id.clone();
+        let document = document.clone();
+        let selection = selection.clone();
+        let message_sink = message_sink.clone();
+        pending.spawn(async move {
+            let (child, gate) = start_session_fork(
+                registry,
+                session_id,
+                json!({"name":"Plan Review answer"}),
+                None,
+                crate::session::SessionPurpose::PlanReviewAnswer,
+                &message_sink,
+            )
+            .await?;
+            gate.wait().await?;
+            let _execution = child
+                .coordinator
+                .execution
+                .clone()
+                .acquire_owned()
+                .await
+                .context("review answer session is closed")?;
+            let scope = ReviewAnswerScope::new(Arc::clone(&source.plan_review), document, question);
+            child
+                .broker
+                .lock()
+                .await
+                .run_review_question(scope, &selection)
+                .await
+        });
+    }
+    let mut failures = Vec::new();
+    while let Some(result) = pending.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("{error:#}")),
+            Err(error) => failures.push(format!("review answer task failed: {error}")),
         }
     }
+    ensure!(failures.is_empty(), "{}", failures.join("\n"));
     message_sink
         .send_response(Response::success(
             request.id,

@@ -79,35 +79,56 @@ fn status_lifetime_and_actions_are_independent_of_transcript_rows() -> Result<()
 }
 
 #[test]
-fn long_reasoning_is_complete_and_does_not_create_transcript_rows() -> Result<()> {
-    let mut owner = SessionPresentation::new("session".into());
-    let reasoning = "unicode λ detail ".repeat(4096);
-    owner.initialize(vec![status(SessionPhase::Working {
-        duration_ms: 0,
-        started_at_ms: None,
-        activity: crate::session::state_machine::WorkflowActivity::Working,
-        reasoning_summary: Some(reasoning.clone()),
-        execution: None,
-    })])?;
-    let opened = owner.open(
-        DocumentId("presentation".into()),
-        ViewId("view".into()),
-        WidthProfile {
-            columns: 20,
+fn long_reasoning_preview_is_one_line_and_preserves_the_complete_summary() -> Result<()> {
+    for columns in [1, 2, 3, 20, 80] {
+        let mut owner = SessionPresentation::new("session".into());
+        let reasoning = "unicode λ detail ".repeat(4096);
+        owner.initialize(vec![status(SessionPhase::Working {
+            duration_ms: 0,
+            started_at_ms: None,
+            activity: crate::session::state_machine::WorkflowActivity::Working,
+            reasoning_summary: Some(reasoning.clone()),
+            execution: None,
+        })])?;
+        let width = WidthProfile {
+            columns,
             ..Default::default()
-        },
-    )?;
-    let preview = opened.status.block[0].text.wire_rows()[1..].join("");
-    assert_eq!(preview.replace(' ', ""), reasoning.replace(' ', ""));
-    assert!(
-        opened
-            .transcript
-            .block
+        };
+        let opened = owner.open(
+            DocumentId("presentation".into()),
+            ViewId("view".into()),
+            width.clone(),
+        )?;
+        let block = &opened.status.block[0];
+        let preview_start = block
+            .metadata
+            .decoration
             .iter()
-            .all(|block| block.text.row_count() == 0)
-    );
-    owner.reconcile(Vec::new())?;
-    assert!(owner.snapshot(&opened.status.document)?.block.is_empty());
+            .find(|decoration| decoration.capture == "ForgeHarnessCommentary")
+            .unwrap()
+            .range
+            .start
+            .row;
+        let rows = block.text.wire_rows();
+        assert_eq!(rows.len(), preview_start + 1);
+        let preview = &rows[preview_start];
+        assert!(preview.ends_with(&".".repeat(columns.min(3))));
+        assert!(width.cells(preview, 0)? <= columns);
+        assert!(
+            matches!(&owner.timeline.entry_list()[0], TimelineEntry::Status {
+        status: SessionPhase::Working { reasoning_summary: Some(retained), .. }, ..
+    } if retained == &reasoning)
+        );
+        assert!(
+            opened
+                .transcript
+                .block
+                .iter()
+                .all(|block| block.text.row_count() == 0)
+        );
+        owner.reconcile(Vec::new())?;
+        assert!(owner.snapshot(&opened.status.document)?.block.is_empty());
+    }
     Ok(())
 }
 
@@ -137,10 +158,17 @@ fn queued_inputs_keep_status_visible_through_phase_changes() -> Result<()> {
         duration_ms: 0,
         started_at_ms: None,
         activity: crate::session::state_machine::WorkflowActivity::Working,
-        reasoning_summary: None,
+        reasoning_summary: Some("Active thought".into()),
         execution: None,
     })])?;
-    assert_eq!(owner.snapshot(&opened.status.document)?.block.len(), 2);
+    let working = owner.snapshot(&opened.status.document)?;
+    assert_eq!(working.block.len(), 3);
+    assert_eq!(
+        working.block[0].text.wire_rows().last().copied(),
+        Some("Active thought")
+    );
+    assert_eq!(working.block[1].text.wire_rows(), [""]);
+    assert_eq!(working.block[2].id.0, "harness:staging");
     owner.reconcile(vec![status(SessionPhase::Idle)])?;
     assert_eq!(
         owner.snapshot(&opened.status.document)?.block[0]

@@ -109,6 +109,9 @@ pub(crate) fn replacement_exchange(
         .collect();
     let mut replacement = replacement.clone();
     insert_events(&mut replacement, events);
+    for run in current.checks() {
+        replacement.record_check(run.clone())?;
+    }
     for node in &current.node_list {
         if let ExchangeNode::TimelineEvent { event } = node {
             crate::timeline::ownership::insert_event(&mut replacement, (**event).clone())?;

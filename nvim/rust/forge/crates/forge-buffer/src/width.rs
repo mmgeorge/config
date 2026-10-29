@@ -44,15 +44,24 @@ impl Default for WidthProfile {
 }
 
 impl WidthProfile {
-    /// Fits a literal line to the viewport, marking omitted text with an ellipsis.
+    /// Fits a literal line to the viewport, marking omitted text with the supplied ellipsis.
     /// Grapheme clusters and tab widths follow this profile. The caller retains the full source.
-    pub fn clip_plain(&self, text: &str) -> Result<String, ContractError> {
+    pub fn clip_plain(&self, text: &str, ellipsis: &str) -> Result<String, ContractError> {
         self.validate()?;
-        if text.contains(['\r', '\n', '\0']) {
+        if text.contains(['\r', '\n', '\0']) || ellipsis.contains(['\r', '\n', '\0']) {
             return Err(ContractError("clipped preview requires one text row"));
         }
-        let suffix = "…";
-        let suffix_cells = self.cells(suffix, 0)?;
+        let mut suffix_end = 0;
+        let mut suffix_cells = 0;
+        for (offset, cluster) in ellipsis.grapheme_indices(true) {
+            let cells = self.cells(cluster, suffix_cells)?;
+            if suffix_cells + cells > self.columns {
+                break;
+            }
+            suffix_cells += cells;
+            suffix_end = offset + cluster.len();
+        }
+        let suffix = &ellipsis[..suffix_end];
         let mut column = 0;
         let mut suffix_offset = 0;
         for (offset, cluster) in text.grapheme_indices(true) {
@@ -307,7 +316,7 @@ mod tests {
         };
         assert_eq!(profile.cells("\t", 0).unwrap(), usize::MAX);
         assert_eq!(profile.cells("\t", usize::MAX - 1).unwrap(), 1);
-        assert_eq!(profile.clip_plain("\t").unwrap(), "\t");
+        assert_eq!(profile.clip_plain("\t", "…").unwrap(), "\t");
         assert_eq!(profile.wrap_plain("\t", 0).unwrap(), vec!["\t"]);
         assert_eq!(profile.wrapped_prefix("\t", 1, 0).unwrap(), (1, 1));
         assert_eq!(
@@ -369,19 +378,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            profile.clip_plain("• abcdefghijklmnop").unwrap(),
+            profile.clip_plain("• abcdefghijklmnop", "…").unwrap(),
             "• abcdefghi…"
         );
-        assert_eq!(profile.clip_plain("• short").unwrap(), "• short");
-        assert_eq!(profile.clip_plain("a\tb").unwrap(), "a\tb");
+        assert_eq!(profile.clip_plain("• short", "…").unwrap(), "• short");
+        assert_eq!(profile.clip_plain("a\tb", "…").unwrap(), "a\tb");
         profile.columns = 5;
-        assert_eq!(profile.clip_plain("• 🇺🇸🇯🇵").unwrap(), "• 🇺🇸…");
-        assert_eq!(profile.clip_plain("• éééé").unwrap(), "• éé…");
-        assert_eq!(profile.clip_plain("a\tb").unwrap(), "a…");
+        assert_eq!(profile.clip_plain("• 🇺🇸🇯🇵", "…").unwrap(), "• 🇺🇸…");
+        assert_eq!(profile.clip_plain("• éééé", "…").unwrap(), "• éé…");
+        assert_eq!(profile.clip_plain("a\tb", "…").unwrap(), "a…");
+        assert_eq!(profile.clip_plain("abcdef", "...").unwrap(), "ab...");
+        profile.columns = 2;
+        assert_eq!(profile.clip_plain("abcdef", "...").unwrap(), "..");
         profile.columns = 1;
-        assert_eq!(profile.clip_plain("界").unwrap(), "…");
-        assert_eq!(profile.clip_plain("").unwrap(), "");
-        assert!(profile.clip_plain("first\nsecond").is_err());
+        assert_eq!(profile.clip_plain("界", "…").unwrap(), "…");
+        assert_eq!(profile.clip_plain("", "…").unwrap(), "");
+        assert!(profile.clip_plain("first\nsecond", "…").is_err());
     }
 
     #[test]

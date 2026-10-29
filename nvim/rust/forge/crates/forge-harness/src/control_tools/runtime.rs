@@ -29,7 +29,6 @@ pub struct ControlTurnContext {
     pub(crate) harness: Option<Arc<super::harness::HarnessInspectionScope>>,
     pub(crate) lsp: Option<Arc<super::lsp::LspScope>>,
     pub execution: Option<crate::plan::execution::ExecutionControlSender>,
-    pub(crate) review_answer: Option<Arc<crate::plan::review_answer::ReviewAnswerScope>>,
 }
 
 impl std::fmt::Debug for ControlTurnContext {
@@ -77,7 +76,6 @@ impl ControlTurnContext {
             harness: None,
             lsp: None,
             execution: None,
-            review_answer: None,
         }
     }
 }
@@ -239,21 +237,6 @@ impl ControlToolRuntime {
             execution.require_revision_phase()?;
         }
         match invocation.name.as_str() {
-            "plan_review_answer" => {
-                let scope = self
-                    .context
-                    .review_answer
-                    .as_ref()
-                    .context("no active forked review question")?;
-                scope.submit(serde_json::from_value(invocation.arguments)?)?;
-                let message = "Review answer saved. End this turn.".to_owned();
-                self.terminal = true;
-                self.completion = Some((identity, message.clone()));
-                Ok(ControlToolResult {
-                    invocation: None,
-                    message,
-                })
-            }
             name if super::harness::is_tool(name) => {
                 let scope = self
                     .context
@@ -963,7 +946,6 @@ mod test {
         crate::checks::configure_fixture(&workspace);
         ControlTurnContext {
             native_goal: None,
-            review_answer: None,
             submission_cancelled: None,
             checkpoint: None,
             agent: None,

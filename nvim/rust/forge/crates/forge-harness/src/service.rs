@@ -2169,7 +2169,7 @@ async fn route_request(
                     &registry.initialize.backend.kind,
                 )?
                 .desired;
-            let enabled = effective.status_thoughts.unwrap_or(false);
+            let enabled = effective.status_thoughts.unwrap_or(true);
             let patch = presentation.set_status_thoughts(enabled)?;
             controller
                 .observer
@@ -4258,22 +4258,31 @@ mod tests {
             .to_owned();
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
-        let plan = {
-            let mut broker = controller.broker.lock().await;
-            let result = broker
-                .dispatch(Request {
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        controller.attach_input(&sink).await?;
+        service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
                     id: 2,
-                    method: "session.prompt.submit".into(),
-                    params: json!({"text":"/plan explain the interface"}),
-                })
-                .await;
-            assert!(
-                result.response.error().is_none(),
-                "{:?}",
-                result.response.error()
-            );
-            broker.snapshot()?.active_plan.unwrap()
-        };
+                    method: "session.input.apply".into(),
+                    params: json!({"id":"ask-plan","action":{"kind":"submit","message":{
+                        "id":"ask-plan","text":"/plan explain the interface","intent":"auto","attachments":[]}}}),
+                },
+                &sink,
+            )
+            .await?;
+        let plan = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(plan) = controller.broker.lock().await.snapshot()?.active_plan
+                    && plan.review_digest.is_some()
+                {
+                    break Ok::<_, anyhow::Error>(plan);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
         let mut projection = service.document(Some(session_id.clone()), serde_json::from_value(json!({
             "operation":"plan_open", "document":"ask-review", "view":"ask-view", "plan_id":plan.id,
             "digest":plan.review_digest, "width":{"columns":100,"tabstop":4}
@@ -4287,7 +4296,16 @@ mod tests {
             .unwrap()
             .clone();
         let before = controller.broker.lock().await.snapshot()?;
-        let (sink, mut output) = forge_protocol::outbound::channel();
+        let source_execution = Arc::clone(&controller.coordinator.execution)
+            .acquire_owned()
+            .await?;
+        assert!(
+            service
+                .prepare(Some(&session_id), RuntimeMethod::SessionPlanQuestionAnswer)
+                .await?
+                .is_none()
+        );
+        drop(source_execution);
         for (iteration, selection) in [
             json!({}),
             json!({"model":"mock-model","effort":"high","service_tier":"fast"}),
@@ -4306,14 +4324,21 @@ mod tests {
                     &sink,
                 )
                 .await?;
-            let configured: Response =
-                serde_json::from_slice(output.recv().await.unwrap().unwrap().bytes())?;
+            let configured: Response = loop {
+                let value: Value =
+                    serde_json::from_slice(output.recv().await.unwrap().unwrap().bytes())?;
+                if value["id"] == 3 {
+                    break serde_json::from_value(value)?;
+                }
+            };
             assert!(configured.error().is_none());
             let before_child = registry.controller_by_id.read().await.len();
             service.dispatch(Some(session_id.clone()), Request { id: 4, method: "session.plan.question.answer".into(),
                 params: json!({"draft_source_digest":projection["saved_source_digest"],
                     "draft_annotation":[{"id":format!("question-{iteration}"),"kind":"question","source":{
-                        "start_line":row["source_line"],"end_line":row["source_line"],"body":"Why this interface?"}}],
+                        "start_line":row["source_line"],"end_line":row["source_line"],"body":"Why this interface?"}},
+                        {"id":format!("second-question-{iteration}"),"kind":"question","source":{
+                            "start_line":row["source_line"],"end_line":row["source_line"],"body":"Which caller uses it?"}}],
                     "review":{"document":"ask-review","view":"ask-view","sequence":iteration+1,
                         "revision":projection["snapshot"]["revision"],"block":row["block"],"position":row["position"],
                         "target":row["target"],"action":"session.plan.question.answer"}}) }, &sink).await?;
@@ -4325,15 +4350,23 @@ mod tests {
                 }
             };
             assert!(response.get("error").is_none(), "{response}");
-            assert!(
-                response["result"]["annotation"][0]["reply"]["body"]
-                    .as_str()
-                    .unwrap()
-                    .contains("This declaration")
-            );
+            let annotation = response["result"]["annotation"].as_array().unwrap();
+            assert_eq!(annotation.len(), 2);
+            for question in annotation {
+                assert!(
+                    question["reply"]["body"]
+                        .as_str()
+                        .unwrap()
+                        .contains("This declaration")
+                );
+                assert_eq!(
+                    question["reply"]["question_body"],
+                    question["source"]["body"]
+                );
+            }
             assert_eq!(
                 registry.controller_by_id.read().await.len(),
-                before_child + 1
+                before_child + 2
             );
             let after = controller.broker.lock().await.snapshot()?;
             assert_eq!(after.exchange.len(), before.exchange.len());
@@ -5184,7 +5217,8 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        assert_eq!(opened.result().unwrap()["status_thoughts"], false);
+        assert_eq!(opened.result().unwrap()["status_thoughts"], true);
+        assert_eq!(opened.result().unwrap()["automatic_checks"], false);
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
         let execution = controller.coordinator.execution.acquire().await?;

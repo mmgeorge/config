@@ -16,20 +16,23 @@ impl HarnessBroker {
                 .cloned()
                 .context("plan question requires its review identity")?,
         )?;
-        let digest = params
-            .get("draft_source_digest")
-            .and_then(Value::as_str)
-            .context("plan question requires its source digest")?;
-        let annotation = serde_json::from_value(
-            params
-                .get("draft_annotation")
-                .cloned()
-                .context("plan questions require captured annotations")?,
-        )?;
         let document = input.document.clone();
-        self.plan_review
-            .save_annotations(&document, digest, annotation)?;
-        let questions = self.plan_review.questions(input)?;
+        if let Some(annotation) = params.get("draft_annotation") {
+            let digest = params
+                .get("draft_source_digest")
+                .and_then(Value::as_str)
+                .context("plan question requires its source digest")?;
+            self.plan_review.save_annotations(
+                &document,
+                digest,
+                serde_json::from_value(annotation.clone())?,
+            )?;
+        }
+        let mut questions = self.plan_review.questions(input)?;
+        if let Some(selected) = params.get("question_ids") {
+            let selected: Vec<String> = serde_json::from_value(selected.clone())?;
+            questions.retain(|question| selected.contains(&question.id));
+        }
         let settings = crate::settings::SettingsStore::read_only(&self.data_root)?
             .get(
                 &self.session.workspace,
@@ -73,7 +76,7 @@ impl HarnessBroker {
         Ok(json!({"ask_model":selection}))
     }
 
-    /// Continue only this fork until its dedicated tool accepts the captured review answer.
+    /// Save the completed fork's final response on its unchanged source question.
     pub(crate) async fn run_review_question(
         &mut self,
         scope: Arc<ReviewAnswerScope>,
@@ -99,101 +102,38 @@ impl HarnessBroker {
         self.session.service_tier = selected.service_tier.unwrap_or_default();
         self.session.access.write_access = crate::session::WriteScope::Off;
         self.save_session()?;
-        self.review_answer = Some(Arc::clone(&scope));
-        let result = self.review_question_turns(&scope).await;
-        self.review_answer = None;
-        result
-    }
-
-    async fn review_question_turns(&mut self, scope: &ReviewAnswerScope) -> Result<()> {
-        let mut prompt = format!(
-            "Answer this Plan Review question in 1-2 sentences. Call plan_review_answer with question_id {} and the answer, then end the turn. Do not edit files or the plan.\n\n{}",
-            scope.question.id, scope.question.prompt
+        scope.check()?;
+        let prompt = format!(
+            "Answer this Plan Review question in 1-2 sentences in your final response. Do not edit files or the plan.\n\n{}",
+            scope.question.prompt
         );
-        loop {
-            scope.check()?;
-            let admission = ExchangeAdmission::chat(scope.question.body.clone());
-            let (result, _) = self
-                .run_interaction(prompt, PromptMode::PlanQuestion, Some(admission))
-                .await?;
-            if scope.answered()? {
-                return Ok(());
-            }
-            let exchange = result
-                .pointer("/exchange/id")
-                .and_then(Value::as_str)
-                .context("review question turn has no exchange")?;
-            let exchange = self
-                .store
-                .load_exchange(exchange)?
-                .context("review question exchange is missing")?;
-            anyhow::ensure!(
-                exchange.phase.state() == crate::exchange::ExchangeState::Complete,
-                "review question stopped before its answer was submitted"
-            );
-            prompt = format!(
-                "The answer has not been submitted. Call plan_review_answer with question_id {} and your answer. A final message alone does not complete this request.",
-                scope.question.id
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-pub(super) mod test {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    pub(crate) struct RetryReviewBackend {
-        delegate: Arc<dyn Backend>,
-        pub(crate) attempts: AtomicUsize,
-    }
-
-    impl RetryReviewBackend {
-        pub(crate) fn new(delegate: Arc<dyn Backend>) -> Self {
-            Self {
-                delegate,
-                attempts: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for RetryReviewBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            self.delegate.descriptor()
-        }
-        async fn shutdown(&self) -> Result<()> {
-            self.delegate.shutdown().await
-        }
-        async fn has_active_turn(&self, session: &str) -> bool {
-            self.delegate.has_active_turn(session).await
-        }
-        async fn active_session_id_for(&self, session: &str) -> Option<String> {
-            self.delegate.active_session_id_for(session).await
-        }
-        async fn cleanup_execution(&self, session: &str) -> Result<()> {
-            self.delegate.cleanup_execution(session).await
-        }
-        async fn prompt_stream(
-            &self,
-            mut request: BackendRequest,
-            sink: Option<BackendEventSink>,
-        ) -> Result<crate::backend::BackendOutput> {
-            if request.mode == PromptMode::PlanQuestion {
-                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-                if attempt == 0 {
-                    request.control_context.as_mut().unwrap().review_answer = None;
-                } else {
-                    assert!(
-                        request
-                            .input
-                            .text()
-                            .contains("The answer has not been submitted")
-                    );
-                }
-            }
-            self.delegate.prompt_stream(request, sink).await
-        }
+        let admission = ExchangeAdmission::chat(scope.question.body.clone());
+        let (result, _) = self
+            .run_interaction(prompt, PromptMode::PlanQuestion, Some(admission))
+            .await?;
+        let exchange = result
+            .pointer("/exchange/id")
+            .and_then(Value::as_str)
+            .context("review question turn has no exchange")?;
+        let exchange = self
+            .store
+            .load_exchange(exchange)?
+            .context("review question exchange is missing")?;
+        anyhow::ensure!(
+            exchange.phase.state() == crate::exchange::ExchangeState::Complete,
+            "review question stopped before its answer completed"
+        );
+        let answer = exchange
+            .turn
+            .iter()
+            .flat_map(|turn| turn.messages())
+            .filter(|message| {
+                message.kind() == crate::turn::MessageKind::Assistant
+                    && message.delivery() == crate::turn::MessageDelivery::Final
+            })
+            .map(|message| message.text())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        scope.submit(answer)
     }
 }

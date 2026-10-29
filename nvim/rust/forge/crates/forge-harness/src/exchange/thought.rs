@@ -19,11 +19,12 @@ pub(crate) struct CommentaryView<'source> {
     pub message: Option<&'source Message>,
     pub tools: ThoughtGroup<'source>,
     pub writes: ThoughtGroup<'source>,
+    pub checks: &'source [crate::checks::CheckRun],
 }
 
 impl CommentaryView<'_> {
     pub fn has_activity(&self) -> bool {
-        !self.tools.call.is_empty() || !self.writes.call.is_empty()
+        !self.tools.call.is_empty() || !self.writes.call.is_empty() || !self.checks.is_empty()
     }
 }
 
@@ -43,6 +44,7 @@ impl Exchange {
     pub(crate) fn content<'source>(
         &'source self,
         nodes: &[&'source ExchangeNode],
+        include_initial: bool,
     ) -> Result<ExchangeContentView<'source>> {
         let visible: HashMap<_, _> = nodes
             .iter()
@@ -76,7 +78,11 @@ impl Exchange {
             let ExchangeEntry::Commentary { commentary } = entry else {
                 continue;
             };
-            let Some((position, _)) = visible.get(entry.anchor()) else {
+            let position = if entry.anchor() == self.id && include_initial {
+                0
+            } else if let Some((position, _)) = visible.get(entry.anchor()) {
+                *position
+            } else {
                 continue;
             };
             let message = match &commentary.source {
@@ -100,6 +106,7 @@ impl Exchange {
             let mut view = CommentaryView {
                 id: &commentary.id,
                 message,
+                checks: &commentary.check,
                 tools: ThoughtGroup {
                     call: Vec::new(),
                     live,
@@ -162,7 +169,7 @@ impl Exchange {
             }
             let index = content.commentary.len();
             content.commentary.push(view);
-            ordered.push((*position, EntryPart::Commentary(index)));
+            ordered.push((position, EntryPart::Commentary(index)));
         }
         for (position, node) in nodes.iter().enumerate() {
             if let ExchangeNode::TurnContent { turn_id, item, .. } = node {
@@ -248,7 +255,7 @@ mod tests {
         exchange.observe_turn(&event, 5)?;
         exchange.observe_turn(&event, 6)?;
         let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
-        let content = restored.content(&restored.node_list.iter().collect::<Vec<_>>())?;
+        let content = restored.content(&restored.node_list.iter().collect::<Vec<_>>(), true)?;
         assert_eq!(content.commentary.len(), 1);
         assert_eq!(
             content.commentary[0].message.unwrap().text(),
@@ -360,7 +367,7 @@ mod tests {
         let reopened: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
 
         for source in [&running, &settled_group, &reopened] {
-            let content = source.content(&source.node_list.iter().collect::<Vec<_>>())?;
+            let content = source.content(&source.node_list.iter().collect::<Vec<_>>(), true)?;
             let owner = content
                 .commentary
                 .iter()
@@ -464,7 +471,8 @@ mod tests {
                     change: Default::default(),
                 });
                 exchange.observe_turn(&event, 3)?;
-                let content = exchange.content(&exchange.node_list.iter().collect::<Vec<_>>())?;
+                let content =
+                    exchange.content(&exchange.node_list.iter().collect::<Vec<_>>(), true)?;
                 let retained = intent == InputIntent::Steering && phase == "commentary";
                 assert_eq!(
                     content.commentary.len(),

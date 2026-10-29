@@ -183,13 +183,14 @@ Action-target snapshots remain separate and only validate whether a response sti
 ## Timeline node projection
 
 The exchange owns an ordered `ExchangeEntry` list of commentary, steering, responses, and
-typed event references. Commentary owns tool records and their reported file changes. Provider
+typed event references. Commentary owns tool records, their reported file changes, and completed
+check runs. Provider
 turns retain execution metadata and message identities, without a second tool store.
 `Exchange::content` borrows those owners into `CommentaryView` sections for projection.
 
 Steering and events remain siblings of commentary under the exchange activity heading.
 Each commentary with activity is collapsed by default. Its heading preserves commentary text,
-and expanding it reveals its tool and change groups. Collapsing it cannot hide steering.
+and expanding it reveals its tool, change, and combined check groups. Collapsing it cannot hide steering.
 Tool updates retain their original commentary owner after new commentary or steering arrives.
 Tools received without an active commentary create an internally marked synthetic
 “Considering initial steps” commentary. Empty provider messages do not create extra entries.
@@ -198,6 +199,12 @@ Commentary folds keep stable identities through streaming, completion, and reloa
 change headings aggregate the commentary-owned records. Exchange tool counters remain in
 memory, update from state transitions, and rebuild on reload without persisting duplicate
 records. Question interactions keep their clarification history outside collapsed commentary.
+Check admission captures its source position. Completion attaches the run to the commentary at
+that position, even after later commentary arrives. Repeated runs accumulate under one stable
+check group per commentary and one aggregate exchange summary. Reload migrates legacy standalone
+check events into those owners, and provider updates preserve them. Runs admitted before any
+commentary belong to the initial commentary. Every attempt and output source remains available.
+
 Individual tool completion and provider-turn boundaries keep the trailing group live
 while its exchange can append more tools. Its label and fold use that same lifecycle. Timer
 refreshes aggregate every call in the group across provider turns. An active group shows its
@@ -408,13 +415,14 @@ following message, while its predecessor's editable region ends at that divider.
 Parent deletion requires removing its follow-ups first.
 
 `session.plan.question.answer` captures native review identity and semantic anchors,
-then forks the source session through the shared same-provider fork coordinator.
-The fork retains conversation history and receives the saved declaration design
+then forks the source session once per question through the shared same-provider
+fork coordinator. Each fork retains conversation history and receives the saved declaration design
 and selected source excerpt without appending work to the main timeline. Its
-instruction requests one or two sentences through `plan_review_answer`, bound to
-the captured question identity and exact body. A final message without that tool
-causes another turn in the fork with a submission reminder. Cancellation, provider
-failures, and stale review identities stop the request. The fork cannot write files
+instruction requests one or two sentences in the final response. Harness binds
+the completed response to the captured question identity and exact body. Questions
+run independently, and each answer appears when its fork completes. Cancellation,
+provider failures, empty final responses, and stale review identities stop that
+question without retrying completed turns. The fork cannot write files
 or mutate plans. `/config` exposes a provider-local Ask model, thinking, and speed
 override. Without an override, the fork inherits the planning session's selection.
 Accepted answers persist in the annotation store with their measured answer

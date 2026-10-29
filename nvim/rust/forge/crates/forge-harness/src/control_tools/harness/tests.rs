@@ -505,6 +505,20 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     duplicate["id"] = json!("second-local-turn");
     duplicate["provider"]["turn_id"] = json!("two");
     raw["turn"].as_array_mut().unwrap().push(duplicate);
+    let tools = raw["entry"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .filter_map(|entry| entry.get_mut("commentary")?.get_mut("tool")?.as_array_mut())
+        .find(|tools| !tools.is_empty())
+        .unwrap();
+    let mut duplicate_tools = tools[0].clone();
+    duplicate_tools["turn_id"] = json!("second-local-turn");
+    tools.push(duplicate_tools);
+    raw["node_list"].as_array_mut().unwrap().push(json!({
+        "kind":"turn_content", "id":"second-local-turn:tool:reused",
+        "turn_id":"second-local-turn", "item":{"kind":"tool","id":"reused"}
+    }));
     let duplicated: Exchange = serde_json::from_value(raw)?;
     store.save_exchange(&duplicated)?;
     assert!(

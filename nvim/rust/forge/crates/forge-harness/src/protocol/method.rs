@@ -228,7 +228,6 @@ impl RuntimeMethod {
             Self::SessionPromptSubmit
                 | Self::SessionCheckComplete
                 | Self::SessionAgentStart
-                | Self::SessionPlanQuestionAnswer
                 | Self::SessionQuestionAsk
                 | Self::SessionQuestionContinue
                 | Self::SessionCompact

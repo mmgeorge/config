@@ -2226,13 +2226,15 @@ Verified, and Resolved. Idle remains the primary label when only independent che
 Active status headings show the phase and elapsed time. The portable
 `status_thoughts` preference controls whether the latest reasoning preview appears
 below independent check progress in italics, aligned with the phase label and
-wrapped within the content width. It defaults to false. Reasoning messages never render
+wrapped within the content width. It defaults to true. Reasoning messages never render
 as timeline commentary regardless of this preference. Copilot's concise reasoning deltas
 and completed snapshots normalize as readable reasoning summaries for this status path.
 A presentation-only `session.configure` request persists the
 preference and updates the observer and status entry without acquiring the provider
-execution owner or interrupting its response. The preview renders at most two
-rows of the complete normalized summary without retaining its emphasis markers. Execution comparisons may
+execution owner or interrupting its response. The preview renders one line of the
+normalized summary, ending in `...` when it exceeds the viewport, without retaining
+its emphasis markers. The complete summary remains in state. A blank row separates
+the status and thought from queued inputs. Execution comparisons may
 add their file-attention summary. Lua appends the interrupt hint to the heading.
 
 `health.notice` resolves local failures before user approval waits and otherwise preserves the

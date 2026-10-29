@@ -2137,7 +2137,7 @@ fn append_staging_section(
         let start = rows.len();
         if preview {
             let first = value.split(['\r', '\n']).next().unwrap_or_default();
-            rows.push(width.clip_plain(&format!("• {first}"))?);
+            rows.push(width.clip_plain(&format!("• {first}"), "…")?);
         } else {
             rows.extend(width.wrap_plain(
                 &format!("• {value}"),
@@ -4182,24 +4182,11 @@ mod tests {
                 })
                 .collect();
             assert_eq!(groups.len(), 1);
-            let summary = snapshot
-                .block
-                .iter()
-                .find(|block| block.id.0 == "writes:results:changes")
-                .unwrap();
             assert!(
-                summary
-                    .metadata
-                    .node
-                    .as_ref()
-                    .is_none_or(|node| node.parent.is_none())
-            );
-            assert!(
-                summary
-                    .text
-                    .wire_rows()
-                    .join("")
-                    .contains("Workspace changes pending")
+                !snapshot
+                    .block
+                    .iter()
+                    .any(|block| block.id.0 == "writes:results:changes")
             );
             let (position, group) = groups[0];
             assert!(
@@ -4272,9 +4259,15 @@ mod tests {
             .position(|block| &block.id.0 == identity)
             .unwrap();
         assert!(
-            thought_position < event_position
-                && event_position < tools_position
+            thought_position < tools_position
                 && tools_position < changes_position
+                && changes_position < event_position,
+            "thought={thought_position}, event={event_position}, tools={tools_position}, changes={changes_position}: {:?}",
+            snapshot
+                .block
+                .iter()
+                .map(|block| &block.id)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             snapshot.block[event_position]
@@ -4289,7 +4282,6 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .indent
-                + 2
         );
         let tools: Vec<_> = snapshot
             .block

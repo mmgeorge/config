@@ -540,7 +540,6 @@ impl ExchangeAdmission {
 /// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
 pub struct HarnessBroker {
     pub(crate) task_controller: Arc<crate::task::SessionTaskController>,
-    review_answer: Option<Arc<crate::plan::review_answer::ReviewAnswerScope>>,
     context_usage_fresh: bool,
     pub(crate) lsp: Arc<crate::control_tools::lsp::LspService>,
     checkpoint: Option<GitCheckpoint>,
@@ -879,7 +878,7 @@ impl HarnessBroker {
             admission: store.session_admission(&session.id)?,
             input_schedule: tokio::sync::watch::channel(Default::default()).0,
             lsp: runtime.lsp.clone(),
-            status_thoughts: AtomicBool::new(shared.desired.status_thoughts.unwrap_or(false)),
+            status_thoughts: AtomicBool::new(shared.desired.status_thoughts.unwrap_or(true)),
             check_editing: Arc::new(AtomicBool::new(
                 shared.desired.check_editing.unwrap_or(false),
             )),
@@ -910,7 +909,6 @@ impl HarnessBroker {
             task_controller: Arc::new(crate::task::SessionTaskController::new(
                 observer.admission.clone(),
             )?),
-            review_answer: None,
             submission_store: crate::backend::submission::SubmissionStore::open(
                 &data_root,
                 trace.clone(),
@@ -1056,7 +1054,6 @@ impl HarnessBroker {
                 .ok()
                 .flatten()
                 .map(|task| task.permit()),
-            review_answer: self.review_answer.clone(),
             submission_cancelled: Some(Arc::clone(&self.turn_cancellation.submission_cancelled)),
             checkpoint: self
                 .exchange_runtime
@@ -14069,7 +14066,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn review_question_answers_require_the_scoped_tool_without_revising_the_source() {
+    async fn review_question_answers_capture_final_responses_without_revising_the_source() {
         use crate::plan::review_document::ReadOnlyPlanReview;
         use forge_buffer::identity::{DocumentId, InputSequence, ViewId};
         use forge_buffer::input::DocumentInput;
@@ -14088,6 +14085,7 @@ mod test {
             .submit_prompt_inner(json!({"text":"/plan revise the API"}))
             .await
             .unwrap();
+        run_plan_to_input_boundary(&mut broker).await.unwrap();
         let before = broker.snapshot().unwrap().active_plan.unwrap();
         let thread = broker.session.backend_session_id.clone();
         let source = broker
@@ -14156,48 +14154,40 @@ mod test {
         let count = broker.snapshot().unwrap().exchange.len();
         let (document, mut questions, _) = broker.prepare_review_questions(&params).unwrap();
         assert_eq!(questions.len(), 1);
+        let mut reordered = params.clone();
+        reordered["review"]["sequence"] = json!(3);
+        assert_eq!(
+            broker.prepare_review_questions(&reordered).unwrap().1.len(),
+            1
+        );
+        reordered["review"]["sequence"] = json!(2);
+        assert_eq!(
+            broker.prepare_review_questions(&reordered).unwrap().1.len(),
+            1
+        );
         let scope = crate::plan::review_answer::ReviewAnswerScope::new(
             Arc::clone(&broker.plan_review),
             document.clone(),
             questions.remove(0),
         );
-        let mut context =
-            crate::control_tools::ControlTurnContext::inactive(PromptMode::PlanQuestion);
-        context.review_answer = Some(Arc::clone(&scope));
+        let context = crate::control_tools::ControlTurnContext::inactive(PromptMode::PlanQuestion);
         let names = crate::control_tools::ControlToolRegistry
             .definition_list_for_context(Some(&context), true)
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        assert!(names.contains(&"plan_review_answer"));
+        assert!(!names.contains(&"plan_review_answer"));
         assert!(!names.contains(&"design_patch"));
         assert!(!names.contains(&"question_ask"));
-        let mut runtime = crate::control_tools::ControlToolRuntime::new(context);
         assert!(
-            runtime
-                .invoke(crate::control_tools::ControlToolInvocation {
-                    task_permit: None,
-                    name: "plan_review_answer".into(),
-                    arguments: json!({"question_id":"wrong", "answer":"wrong"})
-                })
-                .await
-                .is_err()
+            broker.plan_review.annotations(&document).unwrap()[0]
+                .reply
+                .is_none()
         );
-        assert!(!scope.answered().unwrap());
-        assert!(
-            runtime
-                .invoke(crate::control_tools::ControlToolInvocation {
-                    task_permit: None,
-                    name: "plan_review_answer".into(),
-                    arguments: json!({"question_id":"question", "answer":"   "})
-                })
-                .await
-                .is_err()
-        );
-        runtime.invoke(crate::control_tools::ControlToolInvocation { task_permit: None,
-            name: "plan_review_answer".into(), arguments: json!({"question_id":"question", "answer":"The declaration preserves the caller contract."})
-        }).await.unwrap();
-        assert!(scope.answered().unwrap());
+        assert!(scope.submit("   ".into()).is_err());
+        scope
+            .submit("The declaration preserves the caller contract.".into())
+            .unwrap();
         let snapshot = broker.snapshot().unwrap();
         assert_eq!(snapshot.exchange.len(), count);
         assert_eq!(snapshot.active_plan.as_ref().unwrap().id, other.id);
@@ -14260,19 +14250,20 @@ mod test {
         assert!(scope.check().is_err());
         let scope = crate::plan::review_answer::ReviewAnswerScope::new(
             Arc::clone(&broker.plan_review),
-            document,
+            document.clone(),
             questions.remove(0),
         );
-        let backend = Arc::new(super::review_question::test::RetryReviewBackend::new(
-            Arc::clone(&broker.backend),
-        ));
-        broker.backend = backend.clone();
+        let count = broker.snapshot().unwrap().exchange.len();
         broker
             .run_review_question(Arc::clone(&scope), &crate::settings::AskModel::default())
             .await
             .unwrap();
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
-        assert!(scope.answered().unwrap());
+        assert_eq!(broker.snapshot().unwrap().exchange.len(), count + 1);
+        assert!(
+            broker.plan_review.annotations(&document).unwrap()[0]
+                .reply
+                .is_some()
+        );
     }
 
     fn submit_test_plan(

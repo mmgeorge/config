@@ -102,7 +102,25 @@ fn workspace_results_ignore_incomplete_provider_reports() {
 #[test]
 fn workspace_results_render_pending_previous_and_failed_capture() {
     let mut exchange = exchange();
-    assert!(text(&render(&exchange)).contains("Workspace changes pending"));
+    for state in [
+        crate::exchange::ExchangeState::Queued,
+        crate::exchange::ExchangeState::Running,
+        crate::exchange::ExchangeState::Finalizing,
+    ] {
+        exchange.phase = crate::exchange::ExchangePhase::fixture(state, None, None);
+        let restored: Exchange =
+            serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+        let projected = render(&restored);
+        assert!(!text(&projected).contains("Workspace changes pending"));
+        assert!(
+            !projected
+                .entry
+                .block
+                .iter()
+                .any(|block| block.id.0 == "workspace:results:changes")
+        );
+    }
+    exchange.phase = crate::exchange::ExchangePhase::Running;
     capture(&mut exchange, saved_patch("file.rs", "captured"));
     exchange.phase = crate::exchange::ExchangePhase::Running;
     let projected = render(&exchange);

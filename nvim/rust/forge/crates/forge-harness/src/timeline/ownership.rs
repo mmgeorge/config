@@ -110,7 +110,7 @@ impl TimelineEvent {
     }
 }
 
-fn source_node(node: &ExchangeNode) -> bool {
+pub(crate) fn source_node(node: &ExchangeNode) -> bool {
     !matches!(
         node,
         ExchangeNode::PlanEvent { .. } | ExchangeNode::TimelineEvent { .. }
@@ -137,6 +137,9 @@ impl AnchoredEvent {
 
 /// Rebuilds event positions from immutable source anchors without moving provider nodes.
 pub(crate) fn insert_event(exchange: &mut Exchange, event: TimelineEvent) -> Result<()> {
+    if let TimelineEvent::Check { run } = event {
+        return exchange.record_check(*run);
+    }
     let event = AnchoredEvent::new(exchange, event)?;
     let mut events: Vec<_> = exchange
         .node_list
@@ -284,8 +287,9 @@ mod tests {
         let TimelineEntry::Exchange { exchange, .. } = &agent_by_id["child"] else {
             unreachable!()
         };
-        assert_eq!(exchange.node_list.len(), 1);
-        assert_eq!(exchange.node_list[0].id(), "checks");
+        assert!(exchange.node_list.is_empty());
+        assert_eq!(exchange.checks().count(), 1);
+        assert_eq!(exchange.checks().next().unwrap().id, "checks");
         assert!(TimelineProjector::with_checks(Vec::new(), vec![run.clone()]).is_err());
         let mut stream = super::super::stream::TimelineStream::new("session".into());
         stream.initialize(vec![parent])?;
@@ -302,6 +306,91 @@ mod tests {
                 .iter()
                 .all(|entry| matches!(entry, TimelineEntry::Status { .. }))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn check_admission_retains_commentary_owner_through_late_completion_and_replay() -> Result<()> {
+        use crate::backend::{BackendEvent, ProviderAddress};
+        use crate::exchange::ExchangeEntry;
+        let mut source = exchange("work");
+        source.resume(0)?;
+        let address = ProviderAddress {
+            owner: None,
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        source.start_turn(address.clone(), 0)?;
+        let commentary = |id: &str| BackendEvent {
+            received_at_ms: None,
+            address: Some(address.clone()),
+            turn_boundary: None,
+            kind: "assistant_message".into(),
+            text: Some(id.into()),
+            data: serde_json::json!({"provider_message_id":id,"phase":"commentary"}),
+            activity: None,
+            summary: None,
+            checklist_update: None,
+        };
+        source.observe_turn(&commentary("first"), 1)?;
+        let admitted = run(TimelineOwner::exchange(&source));
+        source.observe_turn(&commentary("second"), 2)?;
+        insert_event(
+            &mut source,
+            TimelineEvent::Check {
+                run: Box::new(admitted.clone()),
+            },
+        )?;
+        insert_event(
+            &mut source,
+            TimelineEvent::Check {
+                run: Box::new(admitted.clone()),
+            },
+        )?;
+        let mut next = run(TimelineOwner::exchange(&source));
+        next.id = "next".into();
+        insert_event(
+            &mut source,
+            TimelineEvent::Check {
+                run: Box::new(next),
+            },
+        )?;
+        let mut restored: Exchange = serde_json::from_value(serde_json::to_value(&source)?)?;
+        insert_event(
+            &mut restored,
+            TimelineEvent::Check {
+                run: Box::new(admitted.clone()),
+            },
+        )?;
+        let counts: Vec<_> = restored
+            .entry
+            .iter()
+            .filter_map(|entry| match entry {
+                ExchangeEntry::Commentary { commentary } => Some(commentary.check.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(counts, vec![1, 1]);
+        assert_eq!(restored.checks().count(), 2);
+        assert!(
+            restored
+                .node_list
+                .iter()
+                .all(|node| !matches!(node, ExchangeNode::TimelineEvent { .. }))
+        );
+        let before = serde_json::to_value(&restored)?;
+        let mut reassigned = admitted;
+        reassigned.owner = Box::new(TimelineOwner::exchange(&restored));
+        assert!(
+            insert_event(
+                &mut restored,
+                TimelineEvent::Check {
+                    run: Box::new(reassigned)
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_value(&restored)?, before);
         Ok(())
     }
 

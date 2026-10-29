@@ -287,11 +287,14 @@ impl HarnessInspectionScope {
                     for decision in &exchange.approval_resolution {
                         page.push(json!({"kind":"approval","id":decision.id,"resolution_source":decision.resolution_source}))?;
                     }
+                    for run in exchange.checks() {
+                        page.push(json!({"kind":"check","run_id":run.id,"state":run.state}))?;
+                    }
                     for node in &exchange.node_list {
                         match node {
                             ExchangeNode::TimelineEvent { event } => match event.as_ref() {
-                                crate::timeline::TimelineEvent::Check { run } =>
-                                    page.push(json!({"kind":"check","run_id":run.id,"state":run.state}))?,
+                                crate::timeline::TimelineEvent::Check { .. } =>
+                                    anyhow::bail!("exchange checks must belong to commentary"),
                                 crate::timeline::TimelineEvent::Session { event } =>
                                     page.push(json!({"kind":"session_event","id":event.id,"detail":event.detail}))?,
                             },

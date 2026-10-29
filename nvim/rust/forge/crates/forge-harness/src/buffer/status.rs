@@ -128,12 +128,15 @@ impl StatusDocument {
     }
 
     fn publish(&mut self, content: StatusContent) -> Result<()> {
-        let blocks = content
-            .phase
-            .iter()
-            .chain(content.staging.iter())
-            .cloned()
-            .collect();
+        let mut blocks: Vec<_> = content.phase.iter().cloned().collect();
+        if content.phase.is_some() && content.staging.is_some() {
+            blocks.push(BufferBlock {
+                id: BlockId(format!("{}:staging-gap", self.id.0)),
+                text: BufferText::from_rows(vec![String::new()])?,
+                metadata: Default::default(),
+            });
+        }
+        blocks.extend(content.staging.iter().cloned());
         self.document.edit(0..self.document.block_count(), blocks)?;
         self.content = content;
         Ok(())
@@ -441,9 +444,10 @@ fn append_reasoning_preview(
         &normalized,
         width,
     )?;
+    let preview = width.clip_plain(&rendered.block.text.wire_rows().join(" "), "...")?;
     let start = block.text.row_count();
     let mut rows = block.text.wire_rows();
-    rows.extend(rendered.block.text.wire_rows());
+    rows.push(&preview);
     block.text = forge_buffer::text::BufferText::from_rows(rows)?;
     block.metadata.decoration.push(Decoration {
         range: TextRange {

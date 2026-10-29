@@ -142,6 +142,44 @@ local function reopen(scene)
 end
 
 local cases = {
+  { name = "later question completes while the first fork is pending", run = function(scene)
+    local first = add_message(scene, "A", "Why does the first caller own this behavior?")
+    begin_answer(scene, first.source.body)
+    local first_hold = scene.hold
+    local first_session = scene.answer_session_id
+    focus_source(scene)
+    local second = add_message(scene, "A", "Which second caller uses this interface?")
+    begin_answer(scene, second.source.body)
+    assert(scene.answer_session_id ~= first_session, "questions shared one fork")
+    local second_hold = scene.hold
+    scene.hold = first_hold
+    second_hold:release()
+    await(function() return scene.review.owner.reply_by_id[tostring(second.id)] ~= nil end,
+      "second answer waited for the first fork")
+    assert(scene.review.owner.reply_by_id[tostring(first.id)] == nil, "first fork did not remain pending")
+    assert(scene.review.owner.saving, "first pending answer lost its lifecycle owner")
+    finish_answer(scene)
+    assert_answer(scene, first)
+    assert_answer(scene, second)
+  end },
+  { name = "one save starts a separate fork for each question", run = function(scene)
+    local first = add_message(scene, "A", "Why does the first declaration exist?")
+    focus_source(scene)
+    local second = add_message(scene, "A", "Why does the second declaration exist?")
+    local first_hold = mock.hold(scene.review.session_id, "plan_question", true)
+    local second_hold = mock.hold(scene.review.session_id, "plan_question", true)
+    scene.hold = first_hold
+    press(scene, ":write<CR>")
+    local first_pending = first_hold:wait()
+    local second_pending = second_hold:wait()
+    assert(first_pending.session_id ~= second_pending.session_id, "saved questions shared one fork")
+    second_hold:release()
+    await(function() return next(scene.review.owner.reply_by_id) ~= nil end,
+      "completed fork did not publish its answer independently")
+    finish_answer(scene)
+    assert_answer(scene, first)
+    assert_answer(scene, second)
+  end },
   { name = "answer while question remains focused", run = function(scene)
     ask(scene, "Why does requested_change own this behavior?")
   end },
@@ -271,7 +309,9 @@ for _, case in ipairs(cases) do
       "isolated Harness session did not open")
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan build the feature" })
     controller.submit()
-    await(function() return not state.busy and state.active_plan end, "mock plan did not arrive")
+    await(function()
+      return not state.busy and state.active_plan and type(state.active_plan.review_digest) == "string"
+    end, "submitted mock plan did not arrive")
     scene.plan = state.active_plan
     scene.canonical = vim.fn.readfile(scene.plan.working_path, "b")
     review_view.open(scene.plan)
@@ -282,6 +322,7 @@ for _, case in ipairs(cases) do
   end, debug.traceback)
   if not success then
     local diagnostic = case.name .. ": " .. tostring(failure)
+    if #errors > 0 then diagnostic = diagnostic .. "\n" .. table.concat(errors, "\n") end
     if scene.review and vim.api.nvim_buf_is_valid(scene.review.buf) then diagnostic = diagnostic .. "\n" .. text(scene) end
     failures[#failures + 1] = diagnostic
     print("FAIL: " .. case.name)

@@ -997,7 +997,7 @@ mod test {
         let patch = stream.update_checks(&run)?;
         assert!(patch.operation.iter().any(|operation| matches!(operation,
             TimelineOperation::Replace { entry:TimelineEntry::Exchange { id,exchange,.. },.. }
-                if id == "work" && exchange.node_list.iter().filter(|node| matches!(node,crate::exchange::ExchangeNode::TimelineEvent {..})).count() == 1)));
+                if id == "work" && exchange.checks().count() == 1)));
         assert!(
             !stream
                 .entry_list()
@@ -1007,14 +1007,14 @@ mod test {
         assert!(stream.update_checks(&run)?.is_empty());
         stream.update_live(Some(&exchange), None, SessionPhase::Idle, false)?;
         assert!(
-            matches!(&stream.entry_list()[0],TimelineEntry::Exchange { exchange,.. } if exchange.node_list.len() == 1)
+            matches!(&stream.entry_list()[0],TimelineEntry::Exchange { exchange,.. } if exchange.checks().count() == 1)
         );
         let rebuilt = crate::timeline::TimelineProjector::with_checks(
             vec![entry],
             vec![run.clone(), run.clone()],
         )?;
         assert!(
-            matches!(rebuilt.as_slice(),[TimelineEntry::Exchange { exchange,.. }] if exchange.node_list.len() == 1)
+            matches!(rebuilt.as_slice(),[TimelineEntry::Exchange { exchange,.. }] if exchange.checks().count() == 1)
         );
         assert!(
             crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run]).is_err(),

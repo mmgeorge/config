@@ -14,11 +14,13 @@ pub enum ExchangeEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-/// Owns tool records for one commentary without duplicating provider payloads.
+/// Owns activity records for one commentary without duplicating provider payloads.
 pub struct Commentary {
     pub id: String,
     pub source: CommentarySource,
     pub tool: Vec<CommentaryTools>,
+    #[serde(default)]
+    pub check: Vec<crate::checks::CheckRun>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -97,6 +99,19 @@ impl Exchange {
 
     /// Integrates new timeline identities without changing existing tool ownership.
     pub(crate) fn reconcile_entries(&mut self) -> Result<()> {
+        let legacy_checks: Vec<_> = self
+            .node_list
+            .iter()
+            .filter_map(|node| match node {
+                ExchangeNode::TimelineEvent { event } => match event.as_ref() {
+                    crate::timeline::TimelineEvent::Check { run } => Some((**run).clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        self.node_list.retain(|node| !matches!(node,
+            ExchangeNode::TimelineEvent { event } if matches!(event.as_ref(), crate::timeline::TimelineEvent::Check { .. })));
         let positions: std::collections::HashMap<_, _> = self
             .node_list
             .iter()
@@ -105,7 +120,7 @@ impl Exchange {
             .collect();
         let previous_entry_count = self.entry.len();
         self.entry
-            .retain(|entry| positions.contains_key(entry.anchor()));
+            .retain(|entry| entry.anchor() == self.id || positions.contains_key(entry.anchor()));
         if self.entry.len() != previous_entry_count {
             self.rebuild_tool_counter();
         }
@@ -148,6 +163,7 @@ impl Exchange {
                                     message_id: message_id.clone(),
                                 },
                                 tool: Vec::new(),
+                                check: Vec::new(),
                             },
                         }
                     }
@@ -169,6 +185,80 @@ impl Exchange {
         }
         self.entry
             .sort_by_key(|entry| positions.get(entry.anchor()).copied());
+        for run in legacy_checks {
+            self.own_check(run)?;
+        }
+        Ok(())
+    }
+
+    /// Enumerates completed check records through their persisted commentary owners.
+    pub fn checks(&self) -> impl Iterator<Item = &crate::checks::CheckRun> {
+        self.entry
+            .iter()
+            .filter_map(|entry| match entry {
+                ExchangeEntry::Commentary { commentary } => Some(&commentary.check),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    /// Attaches a check to the commentary present at admission, retaining replay identities.
+    pub(crate) fn record_check(&mut self, run: crate::checks::CheckRun) -> Result<()> {
+        run.owner.validate_exchange(self)?;
+        self.reconcile_entries()?;
+        self.own_check(run)
+    }
+
+    fn own_check(&mut self, run: crate::checks::CheckRun) -> Result<()> {
+        run.owner.validate_exchange(self)?;
+        for entry in &mut self.entry {
+            if let ExchangeEntry::Commentary { commentary } = entry
+                && let Some(previous) = commentary.check.iter_mut().find(|check| check.id == run.id)
+            {
+                ensure!(previous.owner == run.owner, "check ownership cannot change");
+                *previous = run;
+                return Ok(());
+            }
+        }
+        let crate::timeline::TimelineOwner::Exchange { node_count, .. } = run.owner.as_ref() else {
+            unreachable!()
+        };
+        let anchors: std::collections::HashSet<_> = self
+            .node_list
+            .iter()
+            .filter(|node| crate::timeline::ownership::source_node(node))
+            .take(*node_count)
+            .map(ExchangeNode::id)
+            .collect();
+        let owner = self.entry.iter().rposition(|entry| {
+            matches!(entry, ExchangeEntry::Commentary { .. })
+                && (entry.anchor() == self.id || anchors.contains(entry.anchor()))
+        });
+        let owner = owner.unwrap_or_else(|| {
+            self.entry.insert(
+                0,
+                ExchangeEntry::Commentary {
+                    commentary: Commentary {
+                        id: format!("{}:initial", self.id),
+                        source: CommentarySource::Initial {
+                            anchor: self.id.clone(),
+                        },
+                        tool: Vec::new(),
+                        check: Vec::new(),
+                    },
+                },
+            );
+            0
+        });
+        let ExchangeEntry::Commentary { commentary } = &mut self.entry[owner] else {
+            unreachable!()
+        };
+        commentary.check.push(run);
+        commentary.check.sort_by(|left, right| {
+            left.started_at_ms
+                .cmp(&right.started_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Ok(())
     }
 
@@ -260,10 +350,12 @@ impl Exchange {
                 .position(|node| node.id() == anchor)
                 .unwrap();
             let candidate = self.entry.iter().enumerate().rev().find(|(_, entry)| {
-                self.node_list
+                (self
+                    .node_list
                     .iter()
                     .position(|node| node.id() == entry.anchor())
                     .is_some_and(|entry_position| entry_position <= position)
+                    || entry.anchor() == self.id)
                     && match entry {
                         ExchangeEntry::Steering { .. } => false,
                         ExchangeEntry::Event { id } => self.node_list.iter().any(|node| {
@@ -285,6 +377,7 @@ impl Exchange {
                         id: format!("{anchor}:initial"),
                         source: CommentarySource::Initial { anchor },
                         tool: Vec::new(),
+                        check: Vec::new(),
                     },
                 });
                 self.reconcile_entries()?;
@@ -465,7 +558,7 @@ mod tests {
                 .count(),
             2
         );
-        let view = restored.content(&restored.node_list.iter().collect::<Vec<_>>())?;
+        let view = restored.content(&restored.node_list.iter().collect::<Vec<_>>(), true)?;
         assert_eq!(view.commentary[0].tools.call.len(), 2);
         assert!(matches!(
             view.part[1],

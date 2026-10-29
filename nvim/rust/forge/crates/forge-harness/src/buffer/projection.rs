@@ -706,6 +706,9 @@ fn project_at_with_separator(
         .into_iter()
         .map(RenderBlock::into_block)
         .collect();
+    for block in &mut blocks {
+        TranscriptRenderer::prepare_event(block);
+    }
     super::nodes::link(&mut blocks);
     for block in &mut blocks {
         TranscriptRenderer::resolve_marker(block)?;
@@ -1222,6 +1225,7 @@ impl TimelineRenderer<'_> {
                 &interaction.node_list.iter().collect::<Vec<_>>(),
                 None,
                 MarkdownRole::Response,
+                true,
             );
         }
         if depth == 0 && self.leading_separator {
@@ -1235,6 +1239,7 @@ impl TimelineRenderer<'_> {
             &layout.opening,
             Some(&layout.questions),
             MarkdownRole::Response,
+            false,
         )?;
         if let crate::exchange::ExchangeOrigin::TaskStarted { start } = &interaction.origin {
             self.task_started(&interaction.id, start, &interaction.prompt)?;
@@ -1295,6 +1300,7 @@ impl TimelineRenderer<'_> {
             &layout.activity,
             Some(&layout.questions),
             MarkdownRole::Response,
+            true,
         )?;
         let exchange_start = section.start;
         self.finish_section(
@@ -1318,6 +1324,7 @@ impl TimelineRenderer<'_> {
             &layout.results,
             Some(&layout.questions),
             MarkdownRole::Response,
+            false,
         )?;
         self.content(
             interaction,
@@ -1326,6 +1333,7 @@ impl TimelineRenderer<'_> {
             &layout.conclusion,
             Some(&layout.questions),
             MarkdownRole::Response,
+            false,
         )?;
         let mut continuation = layout.continuation.as_slice();
         while let Some(node) = continuation.first() {
@@ -1347,6 +1355,7 @@ impl TimelineRenderer<'_> {
                 content,
                 Some(&layout.questions),
                 MarkdownRole::Response,
+                false,
             )?;
             drop(margin);
             self.offset_layout(start, indent / 2);
@@ -1359,26 +1368,28 @@ impl TimelineRenderer<'_> {
     fn interaction_results(&mut self, interaction: &Exchange) -> Result<()> {
         let identity = format!("{}:results", interaction.id);
         self.workspace_changes(&format!("{identity}:changes"), interaction)?;
-        let runs = interaction
-            .node_list
-            .iter()
-            .filter_map(|node| match node {
-                ExchangeNode::TimelineEvent { event } => match event.as_ref() {
-                    crate::timeline::TimelineEvent::Check { run }
-                        if run.state != crate::checks::CheckState::Running =>
-                    {
-                        Some(run.as_ref())
-                    }
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        self.check_group(&identity, interaction.checks())
+    }
+
+    /// Combines attempts under a stable owner while preserving each command's output source.
+    fn check_group<'run>(
+        &mut self,
+        identity: &str,
+        runs: impl Iterator<Item = &'run crate::checks::CheckRun>,
+    ) -> Result<()> {
+        let mut runs: Vec<_> = runs
+            .filter(|run| run.state != crate::checks::CheckState::Running)
+            .collect();
+        runs.sort_by(|left, right| {
+            left.started_at_ms
+                .cmp(&right.started_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         let Some(latest) = runs.last() else {
             return Ok(());
         };
         let mut combined = (**latest).clone();
-        combined.id = identity;
+        combined.id = identity.to_owned();
         combined.completed_plan = None;
         combined.commands = runs
             .iter()
@@ -1398,7 +1409,7 @@ impl TimelineRenderer<'_> {
         let heading = format!(
             "Checks finished · {} · {:.1}s",
             checks::check_summary(&combined),
-            combined.duration_ms() as f64 / 1000.0
+            runs.iter().map(|run| run.duration_ms()).sum::<u64>() as f64 / 1000.0
         );
         self.checks(&combined, false, Some(&heading))
     }
@@ -1669,8 +1680,9 @@ impl TimelineRenderer<'_> {
         visible: &[&'exchange ExchangeNode],
         questions: Option<&super::question::QuestionHistory<'exchange>>,
         response_role: MarkdownRole,
+        include_initial: bool,
     ) -> Result<()> {
-        let content = interaction.content(visible)?;
+        let content = interaction.content(visible, include_initial)?;
         for part in &content.part {
             match part {
                 crate::exchange::EntryPart::Event(nodes) => {
@@ -1730,6 +1742,7 @@ impl TimelineRenderer<'_> {
             let calls = thought.writes.call.iter().collect::<Vec<_>>();
             self.file_change_group(first.id, &calls, interaction)?;
         }
+        self.check_group(&format!("{}:results", thought.id), thought.checks.iter())?;
         if let Some(section) = section {
             self.finish_section(section, thought.id, true).kind = NodeKind::Thought;
         }
@@ -1815,8 +1828,8 @@ impl TimelineRenderer<'_> {
             }
             match node {
                 ExchangeNode::TimelineEvent { event } => match event.as_ref() {
-                    crate::timeline::TimelineEvent::Check { run } => {
-                        self.checks(run, false, None)?
+                    crate::timeline::TimelineEvent::Check { .. } => {
+                        anyhow::bail!("exchange checks must belong to commentary")
                     }
                     crate::timeline::TimelineEvent::Session { event } => {
                         self.session_event(event)?
@@ -2441,6 +2454,7 @@ impl TimelineRenderer<'_> {
             &clarification.content,
             None,
             MarkdownRole::Message,
+            false,
         )?;
         self.finish_section(section, &id, closed);
         Ok(())
@@ -2455,9 +2469,7 @@ impl TimelineRenderer<'_> {
             ExchangeChangeResult::Pending {
                 previous: Some(comparison),
             } => self.workspace_comparison(identity, comparison, " · previous capture · pending"),
-            ExchangeChangeResult::Pending { previous: None } => {
-                self.literal(identity, "◇ Workspace changes pending", None)
-            }
+            ExchangeChangeResult::Pending { previous: None } => Ok(()),
             ExchangeChangeResult::Unavailable {
                 previous: Some(comparison),
                 reason,
@@ -2642,18 +2654,15 @@ impl TimelineRenderer<'_> {
         start: &crate::exchange::TaskStart,
         prompt: &str,
     ) -> Result<()> {
-        self.literal(
-            &format!("{id}:start"),
-            &format!("◇ {}", start.heading()),
-            None,
-        )?;
-        let prompt = TranscriptRenderer::new(&self.content_width())?.literal(
-            BlockId(format!("{id}:prompt")),
-            prompt,
-            0,
-        )?;
-        self.prompt.push(prompt.id.clone());
-        self.push(prompt)
+        let identity = format!("{id}:start");
+        let mut text = format!("◇ {}", start.heading());
+        if !prompt.is_empty() {
+            text.push('\n');
+            text.push_str(prompt);
+        }
+        self.literal(&identity, &text, None)?;
+        self.prompt.push(BlockId(identity));
+        Ok(())
     }
 
     fn tool(
@@ -7349,8 +7358,15 @@ mod tests {
     }
 
     #[test]
-    fn working_status_retains_complete_reasoning_and_omits_empty_previews() {
-        for summary in ["", " \n\t ", "short thought", "界界界界界", "overflow"] {
+    fn working_status_clips_reasoning_and_omits_empty_previews() {
+        for summary in [
+            "",
+            " \n\t ",
+            "ok",
+            "short thought",
+            "界界界界界",
+            "overflow",
+        ] {
             let projection = project_at(
                 &TimelineEntry::Status {
                     id: "status".into(),
@@ -7385,7 +7401,9 @@ mod tests {
             if normalized.is_empty() {
                 assert!(preview_start.is_none());
             } else {
-                assert_eq!(rows[preview_start.unwrap()..].join(""), normalized);
+                let start = preview_start.unwrap();
+                assert_eq!(rows.len(), start + 1);
+                assert_eq!(rows[start], if normalized == "ok" { "ok" } else { ".." });
             }
             assert!(
                 projection
@@ -7976,7 +7994,7 @@ mod tests {
                 let summary = blocks
                     .iter()
                     .find(|block| block.id.0 == "transient:results:changes");
-                if complete && !persistent {
+                if !complete || !persistent {
                     assert!(summary.is_none());
                 } else {
                     assert!(
@@ -7985,11 +8003,7 @@ mod tests {
                             .text
                             .wire_rows()
                             .join("")
-                            .contains(if complete {
-                                "Workspace changes 1 file"
-                            } else {
-                                "Workspace changes pending"
-                            })
+                            .contains("Workspace changes 1 file")
                     );
                 }
                 assert_eq!(
@@ -8072,8 +8086,7 @@ mod tests {
             });
             exchange.observe_turn(&event, index * 10 + 2)?;
             let run: crate::checks::CheckRun = serde_json::from_value(json!({
-                "id":format!("run-{index}"), "owner":{"kind":"exchange","session_id":"session",
-                    "exchange_id":"combined","node_count":exchange.node_list.len()},
+                "id":format!("run-{index}"), "owner":crate::timeline::TimelineOwner::exchange(&exchange),
                 "revision":1,"completed_plan":null,"shell":"system","executable":null,
                 "workspace":".","environment_digest":"environment", "started_at_ms":index * 10 + 3,
                 "completed_at_ms":index * 10 + 5,"state":if index == 0 { "failed" } else { "passed" },
@@ -8084,14 +8097,22 @@ mod tests {
                     "error":null,"stdout":"","stderr":"","output":"","output_bytes":0,"preview":""
                 }]
             }))?;
+            let mut retry = run.clone();
+            retry.id = format!("run-{index}-retry");
+            retry.commands[0].id = format!("{}:command", retry.id);
             exchange.node_list.push(ExchangeNode::TimelineEvent {
                 event: Box::new(crate::timeline::TimelineEvent::Check { run: Box::new(run) }),
             });
+            exchange.record_check(retry.clone())?;
+            exchange.record_check(retry)?;
             exchange.checkpoint_before = Some("before".into());
             exchange.checkpoint_after = Some("after".into());
             exchange.checkpoint_diff_text =
                 Some("--- /dev/null\n+++ b/result.txt\n@@ -0,0 +1 @@\n+captured\n".into());
             let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+            assert_eq!(restored.checks().count(), (index as usize + 1) * 2);
+            assert!(!restored.node_list.iter().any(|node| matches!(node,
+                ExchangeNode::TimelineEvent { event } if matches!(event.as_ref(), crate::timeline::TimelineEvent::Check { .. }))));
             let projected = project_at(
                 &TimelineEntry::Exchange {
                     id: "combined".into(),
@@ -8127,14 +8148,14 @@ mod tests {
                 .find(|block| block.id.0 == "combined:results:checks")
                 .unwrap();
             assert!(summary.text.wire_rows().join("").contains(if index == 0 {
-                "0/1 passed · 1 failed · 1 attempt"
+                "0/1 passed · 1 failed · 2 attempts"
             } else {
-                "1/1 passed · 2 attempts"
+                "1/1 passed · 4 attempts"
             }));
-            for (thought_index, thought_id) in thought_ids.iter().enumerate() {
+            for thought_id in &thought_ids {
                 let run = blocks
                     .iter()
-                    .find(|block| block.id.0 == format!("run-{thought_index}:checks"))
+                    .find(|block| block.id.0 == format!("{thought_id}:results:checks"))
                     .unwrap();
                 assert_eq!(
                     run.metadata
@@ -8149,6 +8170,13 @@ mod tests {
                     "individual check run lost its subthought owner"
                 );
             }
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|block| block.id.0.ends_with(":checks"))
+                    .count(),
+                thought_ids.len() + 1
+            );
             let changes = blocks
                 .iter()
                 .find(|block| block.id.0 == "combined:results:changes")
@@ -8222,7 +8250,7 @@ mod tests {
             let blocks = &projected.entry.block;
             let checks = blocks
                 .iter()
-                .position(|block| block.id.0 == "checks:checks")
+                .position(|block| block.id.0 == "work:initial:results:checks")
                 .unwrap();
             let response = blocks
                 .iter()
@@ -8240,10 +8268,10 @@ mod tests {
                     .unwrap()
                     .parent
                     .as_ref(),
-                Some(&forge_buffer::identity::FoldId("work:exchange".into())),
-                "check results must retain their exchange owner without an assistant thought"
+                Some(&forge_buffer::identity::FoldId("work:initial".into())),
+                "checks without an assistant message belong to initial commentary"
             );
-            assert_eq!(blocks[checks].metadata.layout.as_ref().unwrap().indent, 4);
+            assert_eq!(blocks[checks].metadata.layout.as_ref().unwrap().indent, 6);
         }
         Ok(())
     }

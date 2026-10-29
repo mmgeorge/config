@@ -152,7 +152,7 @@ function M.attach(options, callback)
     if #updates > 0 then comments.update(options.buffer, updates) end
   end
   local function enqueue_operation(operation)
-    if owner.saving or owner.submission_pending or owner.completing then
+    if owner.annotation_saving or owner.submission_pending or owner.completing then
       table.insert(owner.pending_operation, operation)
       trace_operation(operation, "queued", { queue_count = #owner.pending_operation })
     else dispatch_operation(operation) end
@@ -163,7 +163,8 @@ function M.attach(options, callback)
     local function complete(result, failure)
       trace_operation(operation, "response", { duration_ms = perf.elapsed_ms(request_started),
         status = failure and "failed" or "completed" })
-      owner.saving, owner.submission_pending = false, false
+      owner.annotation_saving, owner.submission_pending = false, false
+      owner.saving = next(owner.pending_reply_by_id) ~= nil
       if not failure then
         perf.trace("harness", "ui.plan.edit.comments_saved", {
           operation_id = operation.params and operation.params.operation_id, document = owner.document,
@@ -196,35 +197,46 @@ function M.attach(options, callback)
         else complete(result, failure) end
       end)
     else
-      owner.saving = true
+      owner.annotation_saving, owner.saving = true, true
       local pending = {}
       for _, annotation in ipairs(operation.capture) do
         local reply = owner.reply_by_id[tostring(annotation.id)]
+        local answering = owner.pending_reply_by_id[tostring(annotation.id)]
         if annotation.kind == "question" and vim.trim(annotation.source.body) ~= ""
-          and (not reply or reply.question_body ~= annotation.source.body) then
+          and (not reply or reply.question_body ~= annotation.source.body)
+          and (not answering or answering.replies_body ~= annotation.source.body) then
           pending[#pending + 1] = { id = annotation.id, replies_body = annotation.source.body,
             replies = { { heading = "Plan answer", body_lines = { "Answering…" } } } }
         end
       end
-      if #pending == 0 then
-        request({ operation = "plan_save_annotations", document = owner.document,
-          saved_source_digest = owner.saved_source_digest, annotation = operation.capture }, complete)
-      else
-        local captured, failure = input.capture(owner.replica, owner.current_view(), "session.plan.question.answer")
-        if not captured then complete(nil, failure) return end
+      request({ operation = "plan_save_annotations", document = owner.document,
+        saved_source_digest = owner.saved_source_digest, annotation = operation.capture }, function(result, failure)
+        if failure then complete(nil, failure) return end
         for _, update in ipairs(pending) do owner.pending_reply_by_id[tostring(update.id)] = update end
         comments.update(options.buffer, pending)
-        client.request({ session_id = options.session_id, method = "session.plan.question.answer", params = { review = captured,
-          draft_source_digest = owner.saved_source_digest, draft_annotation = operation.capture } }, function(result, error)
-          if not alive() then complete(nil, "Plan host is unavailable. The local draft remains in its buffer.") return end
-          for _, update in ipairs(pending) do owner.pending_reply_by_id[tostring(update.id)] = nil end
-          if error then
-            for _, update in ipairs(pending) do update.replies = {} end
-            comments.update(options.buffer, pending)
-          else show_answers(result.annotation) end
-          complete(result, error)
-        end)
-      end
+        for _, update in ipairs(pending) do
+          local captured, capture_failure = input.capture(owner.replica, owner.current_view(), "session.plan.question.answer")
+          local function answer_received(answer_result, answer_failure)
+            if not alive() then return end
+            local id = tostring(update.id)
+            if owner.pending_reply_by_id[id] ~= update then return end
+            owner.pending_reply_by_id[id] = nil
+            owner.saving = owner.annotation_saving or next(owner.pending_reply_by_id) ~= nil
+            if answer_failure then
+              update.replies = {}
+              comments.update(options.buffer, { update })
+              if options.notice then options.notice(answer_failure) end
+            else
+              show_answers(answer_result.annotation)
+            end
+          end
+          if captured then
+            client.request({ session_id = options.session_id, method = "session.plan.question.answer",
+              params = { review = captured, question_ids = { tostring(update.id) } } }, answer_received)
+          else answer_received(nil, capture_failure) end
+        end
+        complete(result, nil)
+      end)
     end
   end
   function owner.submit(method, params, receive)

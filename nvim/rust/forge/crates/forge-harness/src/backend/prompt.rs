@@ -28,7 +28,7 @@ impl BackendRequest {
                 "Discuss the active plan. Edit virtual proposals only when the user requests a revision. Do not implement it."
             }
             PromptMode::PlanQuestion => {
-                "Answer the anchored plan review question in this forked session. Submit the answer with plan_review_answer using the supplied question_id, then end the turn. A final message alone does not complete the request. Do not edit, submit, implement, or ask follow-up questions."
+                "Answer the anchored plan review question in this forked session with a concise final response. Harness saves that response on the original question. Do not edit, submit, implement, or ask follow-up questions."
             }
             PromptMode::ExecutePlan => {
                 "Continue the Execute task at its supplied phase and accepted revision. Use plan_phase_done, not goal completion, to advance execution."
@@ -170,7 +170,7 @@ mod test {
                 PromptMode::PlanDiscussion,
                 "when the user requests a revision",
             ),
-            (PromptMode::PlanQuestion, "plan_review_answer"),
+            (PromptMode::PlanQuestion, "concise final response"),
             (PromptMode::ExecutePlan, "plan_phase_done"),
             (PromptMode::GoalContinuation, "active Goal task"),
             (PromptMode::RequestChanges, "supplied review"),

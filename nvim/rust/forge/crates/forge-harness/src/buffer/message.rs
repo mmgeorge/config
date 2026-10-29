@@ -93,7 +93,7 @@ pub(super) fn settle(block: &mut BufferBlock) {
     }
 }
 
-/// Keeps a message's full source in the transcript while projecting its selected preview.
+/// Keeps full source in the transcript while projecting a message or event preview.
 pub(super) fn project(
     source: &BufferBlock,
     node: &forge_buffer::node::NodeState,
@@ -108,6 +108,9 @@ pub(super) fn project(
         return Ok(block);
     };
     if !preview {
+        for fold in &mut block.metadata.fold {
+            fold.closed = false;
+        }
         return Ok(block);
     }
     let end = fold.start;
@@ -136,7 +139,7 @@ pub(super) fn project(
     block
         .metadata
         .target
-        .retain(|target| target.range.end <= end);
+        .retain_mut(|target| clip(&mut target.range));
     block
         .metadata
         .conceal
@@ -152,6 +155,7 @@ pub(super) fn project(
         column: 0,
     };
     block.metadata.fold[0].closed = true;
+    block.metadata.fold[0].heading_start = None;
     node.loaded_rows = block.text.row_count();
     node.loaded_bytes = block.text.byte_count();
     node.more = true;

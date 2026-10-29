@@ -1,10 +1,11 @@
 use anyhow::Result;
 use forge_buffer::block::{
-    BlockMetadata, BufferBlock, Conceal, ContentLayout, Decoration, TargetRange, TextChunk,
-    TextPosition, TextRange,
+    BlockAnchor, BlockMetadata, BufferBlock, Conceal, ContentLayout, Decoration, FoldRange,
+    TargetRange, TextChunk, TextPosition, TextRange,
 };
-use forge_buffer::identity::{BlockId, TargetId};
+use forge_buffer::identity::{BlockId, FoldId, TargetId};
 use forge_buffer::markdown::{MarkdownRenderer, RenderedMarkdown};
+use forge_buffer::node::{NodeDisplay, NodeKind, NodeState};
 use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 
@@ -341,6 +342,48 @@ impl<'profile> TranscriptRenderer<'profile> {
             text: "▸".into(),
             capture,
         });
+    }
+
+    /// Gives wrapped events a closed fold while retaining their complete source and actions.
+    pub(super) fn prepare_event(block: &mut BufferBlock) {
+        if block.text.row_count() <= 1
+            || block.metadata.node.is_some()
+            || !block.metadata.fold.is_empty()
+            || !block
+                .metadata
+                .layout
+                .as_ref()
+                .and_then(|layout| layout.marker.as_ref())
+                .is_some_and(|marker| marker.text == "◇")
+        {
+            return;
+        }
+        let identity = FoldId(block.id.0.clone());
+        block.metadata.fold.push(FoldRange {
+            id: identity.clone(),
+            start: TextPosition { row: 1, column: 0 },
+            end: BlockAnchor {
+                block: block.id.clone(),
+                position: TextPosition {
+                    row: block.text.row_count(),
+                    column: 0,
+                },
+            },
+            closed: true,
+            heading_start: Some(BlockAnchor {
+                block: block.id.clone(),
+                position: TextPosition { row: 0, column: 0 },
+            }),
+            collapsed_suffix: None,
+            collapse_children: false,
+            expand_children: false,
+        });
+        block.metadata.node = Some(NodeState::new(
+            identity,
+            NodeKind::Group,
+            NodeDisplay::Heading,
+        ));
+        Self::fold_marker(block);
     }
 
     /// Resolves bodyless headings to events without shifting their byte coordinates.

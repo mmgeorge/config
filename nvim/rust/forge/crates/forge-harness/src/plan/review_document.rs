@@ -593,7 +593,12 @@ impl EditablePlanReview<'_> {
 
     fn questions(self, input: DocumentInput) -> Result<Vec<PlanReviewQuestion>> {
         let document = self.0;
-        document.validate_input(input)?;
+        // Independent answer forks read the same snapshot without consuming each other's input sequence.
+        ensure!(
+            document.view.contains_key(&input.view),
+            "plan review view is closed"
+        );
+        document.input_target(&input)?;
         let design = document
             .source
             .document

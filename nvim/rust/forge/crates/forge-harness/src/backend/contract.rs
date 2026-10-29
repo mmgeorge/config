@@ -1834,16 +1834,6 @@ branches: Vec::new()
         {
             let _ = event_sink.send_wait(event.clone()).await;
         }
-        if request.mode == PromptMode::PlanQuestion
-            && let Some(context) = request.control_context.as_ref()
-            && let Some(scope) = context.review_answer.as_ref()
-        {
-            let executor = crate::control_tools::ControlToolExecutor::new(context.clone());
-            executor.execute(crate::control_tools::ControlToolInvocation { task_permit: None,
-                name: "plan_review_answer".into(),
-                arguments: serde_json::json!({"question_id":scope.question.id,"answer":event.text}),
-            }).await?.result?;
-        }
         let plan_question: Option<PlanQuestionSet> =
             if request.input.text() == "Ask a fixture question." {
                 Some(PlanQuestionSet::freeform(

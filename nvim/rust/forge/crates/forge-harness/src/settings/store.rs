@@ -94,7 +94,7 @@ pub struct PortableSettings {
     pub lsp_tools: Option<bool>,
     /// Exposes read-only session history tools independently of configuration inspection.
     pub session_tools: Option<bool>,
-    /// Shows the latest thought beneath live status without changing timeline messages.
+    /// Shows the latest thought beneath live status, enabled by default.
     pub status_thoughts: Option<bool>,
     #[serde(default)]
     /// Records selection by source identity, independent of provider display names.
