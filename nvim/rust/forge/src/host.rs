@@ -59,6 +59,8 @@ type TaskOutcome = std::result::Result<(Id, Result<()>), JoinError>;
 #[derive(Deserialize)]
 pub(crate) struct RoutedRequestEnvelope {
     #[serde(skip)]
+    pub(crate) generation_lease: Option<crate::runtime::commit_message::GenerationLease>,
+    #[serde(skip)]
     pub(crate) harness_admission: Option<forge_harness::command::ExecutionPermit>,
     #[serde(default)]
     pub(crate) session_id: Option<String>,
@@ -417,6 +419,21 @@ impl ConnectionHost {
             };
             if envelope.request.method == "host.shutdown" {
                 return Ok(Some(envelope.request.id));
+            }
+            if envelope.request.method == "repository.generation" {
+                match envelope
+                    .validate_context()
+                    .and_then(|()| self.runtime.generation.admit(&envelope.request))
+                {
+                    Ok(lease) => envelope.generation_lease = lease,
+                    Err(error) => {
+                        sink.send(Message::Response(request_failure_response(
+                            envelope.request.id,
+                            &error,
+                        )))?;
+                        continue;
+                    }
+                }
             }
             let router = Arc::clone(&self.router);
             let sink = sink.clone();

@@ -4,7 +4,7 @@
 
 ## `request(spec, callback, progress)`
 
-Send one asynchronous operation. The function returns no value and supplies no generic cancellation handle.
+Send one asynchronous operation. Requests without session-command recovery return their transport correlation ID after admission. Validation or admission failure, and session commands managed by recovery, return nil. The function supplies no generic cancellation handle.
 
 | Argument | Contract |
 | --- | --- |
@@ -157,6 +157,8 @@ Resolve backend launch data, model, reasoning effort, service tier, compaction p
 
 ### `generation_request(params, callback, on_model, selection)`
 
-Resolve generation settings and send `repository.generation`. `params` retains the generation operation's fields. The helper adds `generation`, calls optional `on_model(text)` before dispatch and on model/status progress, and delivers the terminal outcome to `callback`. Configuration failure reaches `callback` without launching a provider. The function returns no cancellation handle. Provider invocation and local writes depend on the selected generation operation.
+Resolve generation settings and send `repository.generation`. `params` retains the generation operation's fields. The helper adds `generation`, calls optional `on_model(text)` before dispatch and on model/status progress, and delivers the terminal outcome to `callback`. Configuration failure reaches `callback` without launching a provider.
+
+The returned idempotent function cancels only this request. Before dispatch, cancellation removes the queued request and calls `callback` with a cancellation error. After dispatch, it sends the original request ID to the generation cancellation operation. The original callback reports the eventual terminal outcome, and further progress is suppressed. Cancellation does not stop the shared host. Provider invocation and local writes depend on the selected generation operation.
 
 The source contract is in [client.lua](../../../lua/forge/client.lua), with context policy in [protocol_contract.json](../../../lua/forge/protocol_contract.json). Focused regressions cover [request ownership](../../../tests/forge/client_request_contract.lua), [callback isolation](../../../tests/forge/client_callback_isolation.lua), and [receive-credit ordering](../../../tests/forge/forge_client.lua).

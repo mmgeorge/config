@@ -53,7 +53,7 @@ local function run()
   assert_true(vim.uv.fs_chmod(repository .. "/.git/hooks/pre-commit", 493), "pre-commit hook could not become executable")
 
   ai_commit.ensure(repository, { ref = "HEAD" })
-  assert_true(request_list[1].params.operation == "generate" and request_list[1].params.comparison == "head",
+  assert_true(request_list[1].params.operation == "generate" and request_list[1].params.comparison == "status",
     "cold Status draft did not generate directly")
 
   git_write.execute = function(workspace, action, callback, progress)

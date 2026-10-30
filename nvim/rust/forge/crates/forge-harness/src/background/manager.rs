@@ -21,6 +21,8 @@ use crate::{
 
 /// Captures all immutable inputs for a single Background exchange.
 pub struct BackgroundRequest {
+    /// Request cancellation retained through admission and provider cleanup.
+    pub cancellation: super::CancellationToken,
     /// Current response contract, independent of the conversation's preceding task.
     pub purpose: crate::backend::TextGeneration,
     /// Explicit provider settings, independent of the selected chat.
@@ -107,12 +109,23 @@ impl BackgroundManager {
             .entry(key.clone())
             .or_default()
             .clone();
-        let _admission = gate.lock().await;
-        let _runtime = self
-            .runtime_admission
-            .acquire()
-            .await
-            .expect("Background admission remains open while draining");
+        let admitted = async {
+            let admission = gate.lock().await;
+            let runtime = self
+                .runtime_admission
+                .acquire()
+                .await
+                .expect("Background admission remains open while draining");
+            (admission, runtime)
+        };
+        let (_admission, _runtime) = tokio::select! {
+            biased;
+            _ = request.cancellation.cancelled() => {
+                let _ = sender.send(Err(anyhow::anyhow!("Background generation cancelled")));
+                return;
+            }
+            admitted = admitted => admitted,
+        };
         let prepared = self.prepare(&request, &key).await;
         let (mut broker, runtime, _ownership) = match prepared {
             Ok(prepared) => prepared,
@@ -203,15 +216,26 @@ impl BackgroundManager {
                 .reason,
         };
         let cancellation = broker.turn_cancellation();
+        let deadline_cancellation = Arc::clone(&cancellation);
         let timeout = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
-            cancellation.request(false);
+            deadline_cancellation.request(false);
         });
         let input = request.purpose.background_input(&request.input);
-        let result = broker
-            .generate_background(input, identity, request.config, policy, sink)
-            .await
-            .and_then(|text| request.purpose.validate(&text));
+        let result = {
+            let generation =
+                broker.generate_background(input, identity, request.config, policy, sink);
+            tokio::pin!(generation);
+            tokio::select! {
+                biased;
+                _ = request.cancellation.cancelled() => {
+                    cancellation.request(false);
+                    let _ = generation.await;
+                    Err(anyhow::anyhow!("Background generation cancelled"))
+                }
+                result = &mut generation => result.and_then(|text| request.purpose.validate(&text)),
+            }
+        };
         timeout.abort();
         let _ = forward.await;
         if let Err(error) = &result
@@ -573,6 +597,55 @@ async fn report(delivery: &Option<(MessageSender, u64)>, session: &str, error: S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_admission_never_starts_provider() {
+        let diff = DiffEngine::new(Default::default(), 1);
+        let manager = BackgroundManager::new(
+            Arc::new(RepositoryStore::default()),
+            Arc::clone(&diff),
+            forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()),
+        );
+        let permits = manager.runtime_admission.acquire_many(4).await.unwrap();
+        let cancellation = super::super::CancellationToken::new();
+        let request = BackgroundRequest {
+            cancellation: cancellation.clone(),
+            purpose: crate::backend::TextGeneration::CommitMessage,
+            config: TextGenerationConfig {
+                backend: crate::backend::BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec![],
+                },
+                model: "mock-model".into(),
+                reasoning_effort: None,
+                service_tier: Default::default(),
+                data_root: PathBuf::new(),
+                auto_compaction: Default::default(),
+            },
+            context: BackgroundContext {
+                workspace: "not-a-repository".into(),
+                branch: None,
+                head: None,
+                history: String::new(),
+            },
+            input: "cancel before preparation".into(),
+            delivery: None,
+        };
+        let task = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.generate(request).await }
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        let error = task
+            .await
+            .unwrap()
+            .err()
+            .expect("cancelled request succeeded");
+        assert_eq!(error.to_string(), "Background generation cancelled");
+        drop(permits);
+        manager.shutdown().await;
+    }
 
     #[tokio::test]
     async fn background_failure_is_delivered_to_the_owner() {

@@ -1,6 +1,6 @@
 local M = {}
 
----@alias ForgeCommitComparison 'head'|'staged'|'latest_commit'
+---@alias ForgeCommitComparison 'status'|'head'|'staged'|'latest_commit'
 ---@class ForgeCommitPromptPreviewOptions
 ---@field comparison? ForgeCommitComparison
 ---@field workspace? string
@@ -18,14 +18,14 @@ local M = {}
 ---@field source_requests integer
 
 --- Opens exact native commit input in a read-only scratch buffer, without provider access.
---- Defaults to HEAD versus the current workspace. Closing the buffer discards late responses.
+--- Defaults to staged changes, otherwise non-ignored worktree changes. Closing discards late responses.
 ---@param options? ForgeCommitPromptPreviewOptions
 ---@return integer? buffer
 function M.open(options)
   options = options or {}
-  local comparison = options.comparison or "head"
-  if comparison ~= "head" and comparison ~= "staged" and comparison ~= "latest_commit" then
-    vim.notify("Expected head, staged, or latest_commit", vim.log.levels.ERROR, { title = "ForgeDebugCommitPromptPreview" })
+  local comparison = options.comparison or "status"
+  if comparison ~= "status" and comparison ~= "head" and comparison ~= "staged" and comparison ~= "latest_commit" then
+    vim.notify("Expected status, head, staged, or latest_commit", vim.log.levels.ERROR, { title = "ForgeDebugCommitPromptPreview" })
     return nil
   end
   local workspace = options.workspace or vim.b.forge_workspace or vim.fn.getcwd()

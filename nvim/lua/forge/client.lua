@@ -38,6 +38,7 @@ local send_request
 ---@field progress? fun(payload: table)
 ---@field session_id? string
 ---@field timing? table
+---@field dispatched? boolean
 
 ---@class ForgeClient
 ---@field process table?
@@ -882,15 +883,21 @@ end
 ---@param callback ForgeCallback
 ---@param on_model? fun(model: string) Receives the configured generation model before request dispatch.
 ---@param selection? ForgeBackgroundSelection
+---@return fun() cancel Cancels this generation without stopping the shared host.
 function M.generation_request(params, callback, on_model, selection)
   local generation, failure = M.generation_get_config(selection)
-  if not generation then callback(nil, failure) return end
+  if not generation then callback(nil, failure) return function() end end
   if on_model then
     local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
     on_model(generation.model .. effort .. " (" .. generation.backend.kind .. ")")
   end
   local label = generation.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
-  M.request({ method = "repository.generation", params = vim.tbl_extend("force", params, { generation = generation }) }, callback, function(progress)
+  local owner, finished = host_state(), false
+  local request_id = M.request({ method = "repository.generation", params = vim.tbl_extend("force", params, { generation = generation }) }, function(...)
+    finished = true
+    callback(...)
+  end, function(progress)
+    if finished then return end
     local event = progress.event
     if not on_model or type(event) ~= "table" then return end
     if event.kind == "runtime_resolved" and event.data and event.data.model then
@@ -902,6 +909,21 @@ function M.generation_request(params, callback, on_model, selection)
       on_model(label .. "\n" .. event.data.reasoning_summary)
     end
   end)
+  return function()
+    if finished then return end
+    finished = true
+    if host_state() ~= owner or not request_id then return end
+    local pending = owner.pending[request_id]
+    if not pending then return end
+    if not pending.dispatched then
+      owner.pending[request_id] = nil
+      callback(nil, "Background generation cancelled")
+      return
+    end
+    M.request({ method = "repository.generation", params = { operation = "cancel", request_id = request_id } }, function(_, cancel_failure)
+      if cancel_failure then notifications.error("Could not cancel Background generation: " .. cancel_failure) end
+    end)
+  end
 end
 
 ---@param action string
@@ -973,6 +995,7 @@ send_request = function(session_id, method, params, callback, sending, progress)
     vim.schedule(function()
       if host_state() ~= client or client.generation ~= generation or not client.pending[id] then return end
       if sending then sending(generation) end
+      client.pending[id].dispatched = true
       host_write_request(id, method, params or {}, session_id)
     end)
   end
@@ -981,6 +1004,7 @@ send_request = function(session_id, method, params, callback, sending, progress)
   else
     M.session_initialize(ready, { services_only = true })
   end
+  return id
 end
 
 ---@class ForgeRequestSpec
@@ -992,6 +1016,7 @@ end
 ---@param spec ForgeRequestSpec
 ---@param callback? ForgeCallback
 ---@param progress? fun(payload: table)
+---@return integer? request_id Transport identity for requests without command recovery.
 function M.request(spec, callback, progress)
   callback = callback or function() end
   local valid, policy = pcall(contract.validate_request, spec)
@@ -1000,12 +1025,12 @@ function M.request(spec, callback, progress)
     return
   end
   local function transport(session_id, method, params, receive, sending)
-    send_request(session_id, method, params, receive, sending, progress)
+    return send_request(session_id, method, params, receive, sending, progress)
   end
   if policy.recovery == "session_command" and spec.session_id then
     require("forge.command").dispatch(transport, spec.session_id, spec.method, spec.params, callback)
   else
-    transport(spec.session_id, spec.method, spec.params, callback)
+    return transport(spec.session_id, spec.method, spec.params, callback)
   end
 end
 

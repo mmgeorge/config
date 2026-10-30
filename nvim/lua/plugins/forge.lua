@@ -55,10 +55,10 @@ return {
         forge.open_background_timeline(command.args ~= "" and command.args or nil)
       end, { nargs = "?", desc = "Inspect the Background session timeline" })
       vim.api.nvim_create_user_command("ForgeDebugCommitPromptPreview", function(command)
-        require("forge.views.commit_prompt_preview").open({ comparison = command.args ~= "" and command.args or "head" })
+        require("forge.views.commit_prompt_preview").open({ comparison = command.args ~= "" and command.args or "status" })
       end, {
         nargs = "?",
-        complete = function() return { "head", "staged", "latest_commit" } end,
+        complete = function() return { "status", "head", "staged", "latest_commit" } end,
         desc = "Preview the exact commit-generation prompt without calling a model",
       })
       vim.api.nvim_create_user_command("ForgeGitConfigCacheReset", function()

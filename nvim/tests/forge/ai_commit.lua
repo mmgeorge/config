@@ -32,14 +32,16 @@ local function run()
   ai_commit.reset_backend()
   ai_commit.set_backend({ request_async = function(params, callback)
     if params.operation == "generate" then generated = generated + 1 end
-    requests[#requests + 1] = { params = params, callback = callback }
+    local request = { params = params, callback = callback, cancelled = false }
+    requests[#requests + 1] = request
+    return function() request.cancelled = true end
   end })
   local function take(operation, comparison)
     local request = table.remove(requests, 1)
     assert(request, "missing " .. operation)
     assert_equal(request.params.operation, operation)
     assert_equal(request.params.comparison, comparison)
-    return request.callback
+    return request.callback, request
   end
   local cwd = "D:/ai-commit-fixture"
   ai_commit.ensure(cwd, { ref = "HEAD", ignored_paths = { "excluded.txt" } })
@@ -47,7 +49,7 @@ local function run()
   assert_equal(#notices, 0, "starting generation displayed a notification")
   vim.wait(250, function() return false end)
   assert_equal(#notices, 0, "waiting for generation displayed a notification")
-  local finish_draft = take("generate", "head")
+  local finish_draft = take("generate", "status")
   local buffer = vim.api.nvim_create_buf(false, true)
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd)
   assert_equal(#requests, 0, "pending draft performed validation or generation")
@@ -68,13 +70,14 @@ local function run()
   vim.api.nvim_win_set_cursor(0, { 3, 4 })
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
   assert_equal(requests[1].params.ignored_paths[1], nil, "staged regeneration excluded a staged path")
-  local first = take("generate", "staged")
+  local first, first_request = take("generate", "staged")
   assert_progress(buffer)
   local progress_line = vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1]
   assert(vim.wait(1000, function() return vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1] ~= progress_line end, 10),
     "generation spinner did not animate")
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 3, 4 }), "spinner moved the cursor")
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
+  assert(first_request.cancelled, "regeneration did not cancel the preceding staged request")
   local second = take("generate", "staged")
   first({ state = "ready", message = "obsolete request" })
   assert_progress(buffer)
@@ -127,17 +130,33 @@ local function run()
   vim.api.nvim_buf_delete(buffer, { force = true })
 
   ai_commit.ensure("D:/pending", { ref = "HEAD" })
-  local pending = take("generate", "head")
+  local pending, pending_request = take("generate", "status")
   buffer = vim.api.nvim_create_buf(false, true)
   ai_commit.populate_commit_buffer_when_ready(buffer, "D:/pending")
   ai_commit.populate_commit_buffer_when_ready(buffer, "D:/pending", true)
+  assert(pending_request.cancelled, "regeneration did not cancel the pending About request")
   local explicit = take("generate", "staged")
   explicit({ state = "ready", message = "explicit wins" })
   pending({ state = "ready", message = "late About" })
   assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "explicit wins")
   vim.api.nvim_buf_delete(buffer, { force = true })
+
+  local settings = package.loaded["forge.integrations.background_settings"]
+  local original_request, resolution = settings.request, {}
+  settings.request = function(_, _, callback) resolution[#resolution + 1] = callback end
+  ai_commit.ensure("D:/delayed-settings", { ref = "HEAD" })
+  buffer = vim.api.nvim_create_buf(false, true)
+  ai_commit.populate_commit_buffer_when_ready(buffer, "D:/delayed-settings")
+  ai_commit.populate_commit_buffer_when_ready(buffer, "D:/delayed-settings", true)
+  original_request(nil, nil, resolution[1])
+  assert_equal(#requests, 0, "cancelled settings resolution started a provider request")
+  original_request(nil, nil, resolution[2])
+  take("generate", "staged")({ state = "ready", message = "resolved replacement" })
+  assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "resolved replacement")
+  settings.request = original_request
+  vim.api.nvim_buf_delete(buffer, { force = true })
   ai_commit.ensure(cwd, { ref = "HEAD", force = true })
-  local obsolete = take("generate", "head")
+  local obsolete = take("generate", "status")
   local invalidated
   ai_commit.ensure(cwd, { ref = "HEAD" }, function(state) invalidated = state end)
   local cancelled_count = #notices
@@ -150,20 +169,20 @@ local function run()
   obsolete({ state = "ready", message = "late consumed draft" })
   assert_equal(ai_commit.state(cwd, "HEAD"), nil, "late completion restored a consumed draft")
   ai_commit.ensure(cwd, { ref = "HEAD", force = true })
-  take("generate", "head")({ state = "ready", message = "new draft" })
+  take("generate", "status")({ state = "ready", message = "new draft" })
   assert_equal(ai_commit.state(cwd, "HEAD").message, "new draft")
   ai_commit.ensure("D:/another-workspace", { ref = "HEAD" })
-  take("generate", "head")({ state = "ready", message = "other draft" })
+  take("generate", "status")({ state = "ready", message = "other draft" })
   ai_commit.clear(cwd)
   assert_equal(ai_commit.state(cwd, "HEAD"), nil)
   assert_equal(ai_commit.state().message, "other draft", "clearing one workspace removed another draft")
   assert_equal(#requests, 0)
 
   ai_commit.ensure(cwd, { ref = "HEAD" })
-  take("generate", "head")({ state = "ready", message = "new draft" })
+  take("generate", "status")({ state = "ready", message = "new draft" })
   for _, result in ipairs({ {}, { state = "ready", message = "  " }, { state = "error", error = "upstream rejection" }, "invalid", true }) do
     ai_commit.ensure(cwd, { ref = "HEAD", force = true })
-    take("generate", "head")(result)
+    take("generate", "status")(result)
     assert_equal(ai_commit.state(cwd, "HEAD").state, "error", "invalid response was accepted")
     assert_equal(ai_commit.state(cwd, "HEAD").message, "new draft", "failure erased the previous draft")
     assert_equal(notices[#notices].level, vim.log.levels.ERROR, "invalid response failed silently")

@@ -35,6 +35,7 @@ async fn generate(
     let context = BackgroundContext::read(&manager.repositories, root.to_str().unwrap()).await?;
     manager
         .generate(BackgroundRequest {
+            cancellation: CancellationToken::new(),
             purpose: crate::backend::TextGeneration::CommitMessage,
             config: crate::service::TextGenerationConfig {
                 backend: BackendLaunch {
@@ -185,6 +186,7 @@ async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -
         let context = BackgroundContext::read(&owner.repositories, root.to_str().unwrap()).await?;
         let result = owner
             .generate(BackgroundRequest {
+                cancellation: CancellationToken::new(),
                 purpose,
                 context,
                 input: "Current fixture evidence".into(),

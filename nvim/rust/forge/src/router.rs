@@ -723,6 +723,7 @@ impl HostRouter {
                         request.params,
                         &self.host.harness,
                         Some((sink.clone(), request.id)),
+                        envelope.generation_lease,
                     )
                     .await?;
                 send_completed_result(sink, request.id, result).await?;

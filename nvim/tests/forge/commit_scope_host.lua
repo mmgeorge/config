@@ -1,0 +1,78 @@
+vim.loader.enable(false)
+local client = require("forge.client")
+local generator = require("forge.integrations.ai_commit")
+local builder = require("forge.builder")
+local fixture, data = vim.fn.tempname(), vim.fn.tempname()
+assert(vim.fn.mkdir(fixture, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
+local binary = data .. "/forge-scope-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
+assert(vim.uv.fs_copyfile(builder.binary_path(), binary))
+builder.ensure = function(callback) callback({ ok = true, path = binary }) return function() end end
+client._host_set_launcher_for_test(vim.system)
+local original_stdpath = vim.fn.stdpath
+vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
+local requests = 0
+local generation_request = client.generation_request
+client.generation_request = function(...)
+  requests = requests + 1
+  return generation_request(...)
+end
+local function await(predicate, message)
+  assert(vim.wait(10000, predicate, 10), message)
+end
+local function git(arguments)
+  local result = vim.system(vim.list_extend({ "git", "-C", fixture }, arguments), { text = true }):wait()
+  assert(result.code == 0, result.stderr)
+end
+local function generate()
+  generator.ensure(fixture, { force = true })
+  await(function() return generator.state(fixture, "HEAD").state ~= "generating" end, "About did not settle")
+  local state = generator.state(fixture, "HEAD")
+  assert(state.state == "ready", vim.inspect(state))
+  return state.message
+end
+local success, failure = xpcall(function()
+  git({ "init", "--quiet" })
+  git({ "config", "user.name", "Forge Fixture" })
+  git({ "config", "user.email", "forge@example.invalid" })
+  vim.fn.writefile({ "scope-before" }, fixture .. "/tracked.txt")
+  vim.fn.writefile({ "ignored.txt" }, fixture .. "/.gitignore")
+  git({ "add", "." })
+  git({ "commit", "--quiet", "-m", "initial" })
+  vim.fn.writefile({ "scope-staged" }, fixture .. "/tracked.txt")
+  git({ "add", "tracked.txt" })
+  vim.fn.writefile({ "scope-unstaged" }, fixture .. "/tracked.txt")
+  vim.fn.writefile({ "scope-untracked" }, fixture .. "/untracked.txt")
+  vim.fn.writefile({ "scope-ignored" }, fixture .. "/ignored.txt")
+  require("forge.infra.config").setup({ harness = { backend = "mock" },
+    background_generation = { mock = { model = "mock-model", reasoning_effort = "low",
+      auto_compaction = { enabled = false, threshold_tokens = 128000 } } } })
+  local about = generate()
+  assert(about:find("+ scope-staged", 1, true), about)
+  assert(not about:find("scope-unstaged", 1, true) and not about:find("scope-untracked", 1, true)
+    and not about:find("scope-ignored", 1, true), about)
+  local buffer = vim.api.nvim_create_buf(false, true)
+  generator.populate_commit_buffer_when_ready(buffer, fixture)
+  assert(requests == 1, "commit editor regenerated instead of reusing About")
+  assert(vim.trim(table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n")) == vim.trim(about))
+  generator.populate_commit_buffer_when_ready(buffer, fixture, true)
+  await(function() return generator.state(fixture, "staged").state ~= "generating" end, "Ctrl-A did not settle")
+  local staged = generator.state(fixture, "staged")
+  assert(staged.state == "ready" and staged.message:find("+ scope-staged", 1, true), vim.inspect(staged))
+  assert(not staged.message:find("scope-unstaged", 1, true) and not staged.message:find("scope-untracked", 1, true))
+  git({ "reset", "--quiet" })
+  about = generate()
+  assert(about:find("+ scope-unstaged", 1, true) and about:find("+ scope-untracked", 1, true), about)
+  assert(not about:find("scope-ignored", 1, true) and not about:find("scope-staged", 1, true), about)
+  local previous = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
+  generator.populate_commit_buffer_when_ready(buffer, fixture, true)
+  await(function() return generator.state(fixture, "staged").state ~= "generating" end, "empty staged request did not settle")
+  assert(generator.state(fixture, "staged").state == "none", "Ctrl-A fell back to unstaged changes")
+  assert(vim.deep_equal(previous, vim.api.nvim_buf_get_lines(buffer, 0, -1, false)), "empty staged request changed the draft")
+  vim.api.nvim_buf_delete(buffer, { force = true })
+end, debug.traceback)
+generator.reset_backend()
+client.host_stop()
+await(function() return client._client.process == nil end, "scope test host was not collected")
+vim.fn.stdpath = original_stdpath
+assert(success, failure)
+print("commit_scope_host: staged About, unstaged fallback, reuse, and staged-only regeneration passed")

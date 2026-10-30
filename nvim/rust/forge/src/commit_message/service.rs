@@ -1,7 +1,10 @@
 use super::context;
 
-use std::sync::Arc;
 use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result, ensure};
 use forge_diff::engine::DiffEngine;
@@ -9,11 +12,34 @@ use forge_diff::syntax::SyntaxEngine;
 use forge_git::store::RepositoryStore;
 use forge_harness::{
     backend::TextGeneration,
+    background::CancellationToken,
     service::{HarnessService, TextGenerationConfig},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+
+pub(crate) struct GenerationLease {
+    request_id: u64,
+    cancellation: CancellationToken,
+    registry: Arc<Mutex<HashMap<u64, CancellationToken>>>,
+}
+
+impl Drop for GenerationLease {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .expect("generation cancellation registry poisoned")
+            .remove(&self.request_id);
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelRequest {
+    operation: String,
+    request_id: u64,
+}
 
 pub(super) struct GenerationPermit {
     permit: Option<OwnedSemaphorePermit>,
@@ -30,6 +56,8 @@ impl Drop for GenerationPermit {
 #[derive(Clone, Copy, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Comparison {
+    /// Staged changes when present, otherwise non-ignored worktree changes.
+    Status,
     Head,
     Staged,
     LatestCommit,
@@ -84,6 +112,7 @@ pub struct GenerationService {
     syntax: Arc<SyntaxEngine>,
     admission: Arc<Semaphore>,
     completed: Arc<Notify>,
+    cancellation: Arc<Mutex<HashMap<u64, CancellationToken>>>,
 }
 
 impl GenerationService {
@@ -98,15 +127,73 @@ impl GenerationService {
             syntax,
             admission: Arc::new(Semaphore::new(4)),
             completed: Arc::new(Notify::new()),
+            cancellation: Arc::default(),
         })
     }
 
-    pub async fn dispatch(
+    /// Register or cancel generation in transport order before request tasks can run.
+    pub(crate) fn admit(
+        &self,
+        request: &forge_protocol::message::Request,
+    ) -> Result<Option<GenerationLease>> {
+        let mut registry = self
+            .cancellation
+            .lock()
+            .expect("generation cancellation registry poisoned");
+        match request.params.get("operation").and_then(Value::as_str) {
+            Some("cancel") => {
+                let cancel: CancelRequest = serde_json::from_value(request.params.clone())?;
+                ensure!(
+                    cancel.operation == "cancel",
+                    "invalid generation cancellation operation"
+                );
+                if let Some(cancellation) = registry.get(&cancel.request_id) {
+                    cancellation.cancel();
+                }
+                Ok(None)
+            }
+            Some("generate" | "pull_request") => {
+                let cancellation = CancellationToken::new();
+                ensure!(
+                    !registry.contains_key(&request.id),
+                    "duplicate generation request identity"
+                );
+                registry.insert(request.id, cancellation.clone());
+                Ok(Some(GenerationLease {
+                    request_id: request.id,
+                    cancellation,
+                    registry: Arc::clone(&self.cancellation),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) async fn dispatch(
         &self,
         params: Value,
         harness: &HarnessService,
         delivery: Option<(forge_protocol::outbound::MessageSender, u64)>,
+        lease: Option<GenerationLease>,
     ) -> Result<GenerationResponse> {
+        if params.get("operation").and_then(Value::as_str) == Some("cancel") {
+            return Ok(GenerationResponse {
+                session_id: None,
+                state: "none".into(),
+                message: None,
+                source_requests: 0,
+                diff_pairs: 0,
+                prompt: None,
+            });
+        }
+        let cancellation = lease
+            .as_ref()
+            .map(|lease| lease.cancellation.clone())
+            .unwrap_or_default();
+        ensure!(
+            !cancellation.is_cancelled(),
+            "Background generation cancelled"
+        );
         let request: GenerationRequest = serde_json::from_value(params)?;
         let preview = request.operation == "preview";
         let context_only = request.operation == "context";
@@ -185,6 +272,7 @@ impl GenerationService {
             let generated = harness
                 .background
                 .generate(forge_harness::background::BackgroundRequest {
+                    cancellation,
                     purpose: TextGeneration::PullRequestDescription,
                     config: request
                         .generation
@@ -270,6 +358,7 @@ impl GenerationService {
         let generated = harness
             .background
             .generate(forge_harness::background::BackgroundRequest {
+                cancellation,
                 purpose: TextGeneration::CommitMessage,
                 config: request
                     .generation
@@ -305,5 +394,35 @@ impl GenerationService {
                 .await
                 .context("detached generation drain deadline exceeded")?;
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use forge_protocol::message::Request;
+    use serde_json::json;
+
+    #[test]
+    fn cancellation_targets_admitted_request_before_execution_and_releases_registry() {
+        let repository = Arc::new(RepositoryStore::default());
+        let diff = DiffEngine::new(Default::default(), 1);
+        let syntax = SyntaxEngine::new(diff.analysis_pool());
+        let service = GenerationService::new(repository, diff, syntax).unwrap();
+        let request = |id, operation, target| -> Request {
+            serde_json::from_value(json!({"id":id,"method":"repository.generation",
+                "params": if operation == "cancel" { json!({"operation":operation,"request_id":target}) }
+                    else { json!({"operation":operation}) }})).unwrap()
+        };
+        let first = service.admit(&request(1, "generate", 0)).unwrap().unwrap();
+        let second = service.admit(&request(2, "generate", 0)).unwrap().unwrap();
+        service.admit(&request(3, "cancel", 1)).unwrap();
+        assert!(first.cancellation.is_cancelled());
+        assert!(!second.cancellation.is_cancelled());
+        drop(first);
+        service.admit(&request(4, "cancel", 1)).unwrap();
+        assert!(!second.cancellation.is_cancelled());
+        drop(second);
+        assert!(service.cancellation.lock().unwrap().is_empty());
     }
 }

@@ -76,14 +76,17 @@ their source view preserves that historical comparison after worktree edits.
 
 ## Generated commit messages
 
-Automatic About drafts and commit-message regeneration send a compact diff to the
-selected model without progress, waiting, or completion popups. Generation failures
+Automatic About drafts use only staged changes when any exist. With no staged
+changes, they use unstaged tracked changes and untracked files, excluding ignored
+files. A partially staged file contributes its staged contents only. Commit-message
+generation sends a compact diff to the selected model without progress, waiting, or completion popups. Generation failures
 produce error notifications and preserve the existing draft, including edits made while waiting.
 For a new commit, the editor copies the existing About draft or waits for its in-progress
 generation. It does not start another generation. About and the commit editor's first
 line show an animated `Generating with <model>` status, including thinking and speed.
-Failures and cancellation restore the previous subject. `Ctrl-A` explicitly regenerates from
-staged changes, or from the latest commit when amending.
+Failures and cancellation restore the previous subject. `Ctrl-A` cancels the previous
+generation request before regenerating from staged changes, or from the latest commit
+when amending. Late results from the cancelled request cannot replace the new draft.
 
 Git LFS files are excluded from both the changed-file inventory and compact diff before
 Forge reads their content. This applies to automatic drafts, staged regeneration, amend
@@ -572,7 +575,7 @@ case removes its empty file group without deleting project source files.
 | `:ForgeStartupLog [harness]` | Optional `harness` | Open host diagnostics, or the current editor's detailed Harness startup timings |
 | `:ForgeGitConfigCacheReset` | None | Clear the cached Git configuration location |
 | `:ForgeDebugBackgroundTimeline [session_id]` | Optional saved Background session ID | Inspect generation history, provider status, failures, and compaction |
-| `:ForgeDebugCommitPromptPreview [comparison]` | Optional `head`, `staged`, or `latest_commit` | Inspect the exact system instructions and compact commit context without calling a model |
+| `:ForgeDebugCommitPromptPreview [comparison]` | Optional `status` (default), `head`, `staged`, or `latest_commit` | Inspect the exact system instructions and compact commit context without calling a model |
 
 `ForgeDebugCommitPromptPreview` defaults to `head`, including staged, unstaged,
 and untracked changes. It uses the current Forge Status workspace when invoked

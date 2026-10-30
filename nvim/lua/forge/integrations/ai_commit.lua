@@ -1,5 +1,5 @@
 ---@class ForgeAICommitBackend
----@field request_async? fun(params: table, callback: fun(result: table?, failure: string?))
+---@field request_async? fun(params: table, callback: fun(result: table?, failure: string?)): fun()?
 ---@class ForgeAICommitState
 ---@field state "none"|"generating"|"ready"|"error"
 ---@field cwd? string
@@ -7,6 +7,7 @@
 ---@field message? string
 ---@field error? string
 ---@field model? string
+---@field cancel? fun()
 ---@field waiters fun(result: ForgeAICommitState)[]
 
 ---@class ForgeAICommitModule
@@ -14,7 +15,7 @@
 ---@field _state ForgeAICommitState?
 ---@field _states table<string, ForgeAICommitState>
 ---@field _request_ids table<string, integer>
----@field _buffer_generation table<integer, fun()>
+---@field _buffer_generation table<integer, fun(supersede?: boolean)>
 
 local M = { _request_ids = {}, _states = {}, _buffer_generation = {} }
 local notifications = require("forge.infra.notifications")
@@ -23,8 +24,12 @@ local notifications = require("forge.infra.notifications")
 function M.set_backend(backend) M._backend = backend end
 function M.reset_backend()
   for _, cancel in pairs(M._buffer_generation) do cancel() end
+  local previous = M._states
   M._backend, M._state = nil, nil
   M._states, M._request_ids = {}, {}
+  for _, state in pairs(previous) do
+    if state.cancel then state.cancel() end
+  end
 end
 
 local function text_to_lines(text)
@@ -33,12 +38,15 @@ end
 
 local function native_request(cwd, ref, ignored, callback, is_current, on_model)
   local lifetime = M._states
+  local cancelled, cancel_request = false, nil
   local function receive(result, failure)
-    if M._states ~= lifetime or (is_current and not is_current()) then return end
+    if cancelled or M._states ~= lifetime or (is_current and not is_current()) then return end
     if type(result) == "table" and result.state == "retry" then
       vim.defer_fn(function()
-        if M._states == lifetime and (not is_current or is_current()) then
-          local ok, failure = pcall(native_request, cwd, ref, ignored, callback, is_current, on_model)
+        if not cancelled and M._states == lifetime and (not is_current or is_current()) then
+          local ok, failure = pcall(function()
+            cancel_request = native_request(cwd, ref, ignored, callback, is_current, on_model)
+          end)
           if not ok then callback(nil, tostring(failure)) end
         end
       end, 120)
@@ -47,7 +55,7 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     callback(result, failure)
   end
   local function resolved(snapshot, failure)
-    if M._states ~= lifetime or (is_current and not is_current()) then return end
+    if cancelled or M._states ~= lifetime or (is_current and not is_current()) then return end
     if not snapshot then callback(nil, failure) return end
     local client = require("forge.client")
     local generation, configuration_failure = client.generation_get_config()
@@ -59,11 +67,11 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     end
     publish_model(choice.model .. (choice.thinking ~= nil and (" · thinking " .. choice.thinking) or ""))
     local params = { operation = "generate", workspace = cwd,
-      comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "head",
+      comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "status",
       ignored_paths = ignored or {} }
-    if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
+    if M._backend and M._backend.request_async then cancel_request = M._backend.request_async(params, receive)
     else
-      client.generation_request(params, receive, publish_model, { model = choice.model,
+      cancel_request = client.generation_request(params, receive, publish_model, { model = choice.model,
         reasoning_effort = choice.thinking, service_tier = choice.service_tier,
         auto_compaction = snapshot.settings.auto_compaction })
     end
@@ -72,6 +80,11 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     local ok, failure = pcall(resolved, ...)
     if not ok then callback(nil, tostring(failure)) end
   end)
+  return function()
+    if cancelled then return end
+    cancelled = true
+    if cancel_request then cancel_request() end
+  end
 end
 
 ---@param state ForgeAICommitState
@@ -167,6 +180,7 @@ function M.ensure(cwd, opts, cb)
     notify_waiters(state)
     return
   end
+  if current and current.cancel then current.cancel() end
   if opts.on_start then opts.on_start(state) end
   local function complete(result, failure)
     if M._request_ids[key] ~= request_id or get_state(cwd, ref) ~= state or state.state ~= "generating" then return end
@@ -185,10 +199,10 @@ function M.ensure(cwd, opts, cb)
     if failure then notifications.error("Commit generation failed: " .. failure, "Forge commit") end
     notify_waiters(state)
   end
-  local ok, failure = pcall(native_request, cwd, ref, opts.ignored_paths, complete,
+  local ok, cancel_or_failure = pcall(native_request, cwd, ref, opts.ignored_paths, complete,
     function() return M._request_ids[key] == request_id and get_state(cwd, ref) == state and state.state == "generating" end,
     function(model) state.model = model end)
-  if not ok then complete(nil, tostring(failure)) end
+  if ok then state.cancel = cancel_or_failure else complete(nil, tostring(cancel_or_failure)) end
 end
 
 ---@param cwd? string
@@ -209,6 +223,7 @@ function M.clear(cwd, ref)
   M._states[key] = nil
   if ref == "HEAD" and M._state == current then M._state = nil end
   if current and current.state == "generating" then
+    if current.cancel then current.cancel() end
     current.state, current.message = "none", nil
     notify_waiters(current)
   end
@@ -225,9 +240,10 @@ function M.subject(message)
 end
 
 ---@param buf integer
-function M.cancel_buffer_generation(buf)
+---@param supersede? boolean Cancels the request supplying this editor before regeneration.
+function M.cancel_buffer_generation(buf, supersede)
   local cancel = M._buffer_generation[buf]
-  if cancel then cancel() end
+  if cancel then cancel(supersede) end
   if vim.api.nvim_buf_is_valid(buf) then
     vim.b[buf].forge_ai_commit_revision = (vim.b[buf].forge_ai_commit_revision or 0) + 1
   end
@@ -244,7 +260,11 @@ function M.populate_commit_buffer_when_ready(buf, cwd, regenerate, comparison)
   vim.b[buf].ai_commit_generated = true
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   if not regenerate and lines[1] and lines[1] ~= "" then return end
-  M.cancel_buffer_generation(buf)
+  M.cancel_buffer_generation(buf, regenerate == true)
+  if regenerate and not comparison then
+    local about = get_state(cwd, "HEAD")
+    if about and about.state == "generating" then M.clear(cwd, "HEAD") end
+  end
   lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local revision = (vim.b[buf].forge_ai_commit_revision or 0) + 1
   vim.b[buf].forge_ai_commit_revision = revision
@@ -285,11 +305,12 @@ function M.populate_commit_buffer_when_ready(buf, cwd, regenerate, comparison)
       replace(0, 1, { lines[1] or "" })
     end
   end
-  local function cancel()
+  local function cancel(supersede)
     if abandoned then return end
     abandoned = true
     cleanup()
     restore_subject()
+    if supersede then M.clear(cwd, comparison or (regenerate and "staged" or "HEAD")) end
   end
   local function current()
     return not abandoned and vim.api.nvim_buf_is_valid(buf)

@@ -1031,8 +1031,12 @@ function M.open(options)
         get_about_source = function()
           local inventory = state.replica.inventory
           local source = { head = inventory.head and inventory.head.object, file = {} }
+          local has_staged = false
           for _, file in ipairs(inventory.file) do
-            if file.section ~= "ignored" then
+            if file.section == "staged" then has_staged = true break end
+          end
+          for _, file in ipairs(inventory.file) do
+            if file.section == "staged" or not has_staged and file.section ~= "ignored" then
               source.file[#source.file + 1] = { id = file.id, generation = file.generation, section = file.section }
             end
           end

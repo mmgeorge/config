@@ -72,6 +72,17 @@ pub async fn collect(
             .value
             .path
     };
+    let comparison = match request.comparison {
+        Comparison::Status
+            if paths
+                .iter()
+                .any(|record| record.staged != ChangeKind::Unchanged) =>
+        {
+            Comparison::Staged
+        }
+        Comparison::Status => Comparison::Head,
+        comparison => comparison,
+    };
     let lfs_paths = {
         let root = repository
             .identity
@@ -113,7 +124,7 @@ pub async fn collect(
         {
             continue;
         }
-        if request.comparison == Comparison::Staged && record.staged == ChangeKind::Unchanged {
+        if comparison == Comparison::Staged && record.staged == ChangeKind::Unchanged {
             continue;
         }
         let (head, index, relocation) = match &record.state {
@@ -122,7 +133,7 @@ pub async fn collect(
                 index,
                 relocation,
             } => (Some(head), Some(index), relocation.as_ref()),
-            PathState::Untracked if request.comparison == Comparison::Head => (None, None, None),
+            PathState::Untracked if comparison == Comparison::Head => (None, None, None),
             PathState::Conflict { .. } => bail!("generation requires resolved index conflicts"),
             _ => continue,
         };
@@ -149,7 +160,7 @@ pub async fn collect(
             continue;
         }
         let old_mode = head.map_or(0, |head| head.mode);
-        let new_mode = if request.comparison != Comparison::Head {
+        let new_mode = if comparison != Comparison::Head {
             index.unwrap().mode
         } else if matches!(record.state, PathState::Untracked) {
             let path = forge_git::identity::validate_path(
@@ -197,7 +208,7 @@ pub async fn collect(
             .filter(|index| !index.object.is_null())
             .map(|index| index.object);
         let missing = new_mode == 0;
-        let use_index = request.comparison != Comparison::Head
+        let use_index = comparison != Comparison::Head
             || (record.unstaged == ChangeKind::Unchanged && indexed.is_some());
         if use_index && old_object == indexed && old_mode == new_mode && relocation.is_none() {
             continue;
@@ -208,13 +219,13 @@ pub async fn collect(
         } else {
             empty()?
         };
-        let new = match request.comparison {
+        let new = if matches!(
+            comparison,
             Comparison::Staged | Comparison::LatestCommit | Comparison::PullRequest
-                if index.is_none_or(|index| index.object.is_null()) =>
-            {
+        ) {
+            if index.is_none_or(|index| index.object.is_null()) {
                 empty()?
-            }
-            Comparison::Staged | Comparison::LatestCommit | Comparison::PullRequest => {
+            } else {
                 source(
                     store,
                     &repository,
@@ -222,30 +233,25 @@ pub async fn collect(
                 )
                 .await?
             }
-            Comparison::Head
-                if record.unstaged == ChangeKind::Deleted || record.worktree_mode == Some(0) =>
-            {
-                empty()?
-            }
-            Comparison::Head if use_index => {
-                source(
-                    store,
-                    &repository,
-                    ContentSource::Object(index.unwrap().object),
-                )
-                .await?
-            }
-            Comparison::Head => {
-                source(
-                    store,
-                    &repository,
-                    ContentSource::Worktree {
-                        path: record.path.clone(),
-                        conversion: WorktreeConversion::GitCanonical,
-                    },
-                )
-                .await?
-            }
+        } else if record.unstaged == ChangeKind::Deleted || record.worktree_mode == Some(0) {
+            empty()?
+        } else if use_index {
+            source(
+                store,
+                &repository,
+                ContentSource::Object(index.unwrap().object),
+            )
+            .await?
+        } else {
+            source(
+                store,
+                &repository,
+                ContentSource::Worktree {
+                    path: record.path.clone(),
+                    conversion: WorktreeConversion::GitCanonical,
+                },
+            )
+            .await?
         };
         let (Some(old), Some(new)) = (old.text, new.text) else {
             files.push(ChangedFile {
@@ -741,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn draft_uses_all_changes_and_explicit_regeneration_uses_only_staged() {
+    async fn status_draft_prefers_staged_and_falls_back_to_non_ignored_unstaged() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         git(root, &["init", "--quiet"]);
@@ -766,7 +772,7 @@ mod tests {
         let mut request = GenerationRequest {
             operation: "generate".into(),
             workspace: root.to_string_lossy().into_owned(),
-            comparison: Comparison::Head,
+            comparison: Comparison::Status,
             base: None,
             head: None,
             max_bytes: None,
@@ -779,12 +785,13 @@ mod tests {
             .unwrap()
             .prompt
             .unwrap();
+        assert!(prompt.contains("+ staged value"));
         assert!(
-            prompt.contains("+ worktree value")
-                && prompt.contains("+ new value")
-                && prompt.contains("- removed")
+            !prompt.contains("worktree value")
+                && !prompt.contains("new value")
+                && !prompt.contains("- removed")
+                && !prompt.contains("ignored value")
         );
-        assert!(!prompt.contains("staged value") && !prompt.contains("ignored value"));
         request.comparison = Comparison::Staged;
         request.ignored_paths.clear();
         let staged = collect(&store, &diff, &syntax, &request)
@@ -821,6 +828,28 @@ mod tests {
                 .unwrap()
                 .prompt
                 .is_none()
+        );
+        request.comparison = Comparison::Status;
+        request.ignored_paths = vec!["excluded.txt".into()];
+        let fallback = collect(&store, &diff, &syntax, &request)
+            .await
+            .unwrap()
+            .prompt
+            .unwrap();
+        assert!(
+            fallback.contains("+ worktree value")
+                && fallback.contains("+ new value")
+                && fallback.contains("- removed")
+        );
+        assert!(!fallback.contains("staged value") && !fallback.contains("ignored value"));
+        git(root, &["add", "excluded.txt"]);
+        assert!(
+            collect(&store, &diff, &syntax, &request)
+                .await
+                .unwrap()
+                .prompt
+                .is_none(),
+            "filtered staged changes must not fall back to unrelated unstaged changes"
         );
     }
 }
