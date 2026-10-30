@@ -37,6 +37,30 @@ function M.current(state,occurrence)
   return true
 end
 
+---Replace a prose-ending slash after a typed space or newline in the current transaction.
+---@param state table
+---@param occurrence table
+---@return boolean
+function M.replace_question_slash(state,occurrence)
+  if not occurrence.context.question_slash or not M.current(state,occurrence) then return false end
+  local finish=position(state.buffer,occurrence.end_mark)
+  local view=vim.fn.winsaveview()
+  state.applying=true
+  vim.api.nvim_buf_set_text(state.buffer,finish.row,finish.column,finish.row,finish.column+1,{"?"})
+  -- The word-end anchor must not absorb punctuation inserted at its boundary.
+  vim.api.nvim_buf_set_extmark(state.buffer,namespace,finish.row,finish.column,
+    {id=occurrence.end_mark,right_gravity=true})
+  occurrence.delimiter="?"..occurrence.delimiter:sub(2)
+  local delimiter=position(state.buffer,occurrence.delimiter_mark)
+  vim.api.nvim_win_set_cursor(0,{delimiter.row+1,delimiter.column})
+  vim.fn.winrestview({topline=view.topline,leftcol=view.leftcol,topfill=view.topfill})
+  state.own_tick=vim.api.nvim_buf_get_changedtick(state.buffer)
+  state.applying=false
+  occurrence.slash_applied=true
+  state.armed=occurrence
+  return true
+end
+
 ---@param state table
 ---@param occurrence table
 ---@return boolean
@@ -98,7 +122,7 @@ function M.reject(state)
   state.applying=false
   state.suppressed={row=start.row,column=start.column,original=occurrence.context.original,
     spelling=occurrence.replacement~=nil or occurrence.spelling_suppressed,
-    punctuation=occurrence.spacing_applied==true}
+    punctuation=occurrence.spacing_applied==true or occurrence.slash_applied==true}
   state.armed,state.occurrence=nil,nil
   state.generation=state.generation+1
   return true

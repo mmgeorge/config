@@ -1,5 +1,5 @@
 {
-  "revision": "en-US-bigram-2",
+  "revision": "en-US-bigram-3",
   "upstream_revision": "62131c2ca5bfd7fe8432e28b17b24dd98d959ee0",
   "assets": [
     {
@@ -28,6 +28,6 @@
     "distribution": "SymSpell, MIT"
   },
   "tokenization": "Unicode UAX #29 words, protected source spans, immediate word bigrams within sentence",
-  "contractions": "Protect dictionary-recognized apostrophe words, recognizing curly apostrophes without changing typography. Force im to I'm and cant to can't, and capitalize first-person contractions.",
+  "contractions": "Protect dictionary-recognized apostrophe words, recognizing curly apostrophes without changing typography. Force im to I'm and cant, dont, wont, isnt, arent, wasnt, werent, doesnt, didnt, havent, hasnt, hadnt, couldnt, wouldnt, shouldnt, mustnt, and neednt to their apostrophized negative contractions. Capitalize first-person contractions.",
   "smoothing": "Equal interpolation between observed conditional bigrams and add-one unigram probabilities"
 }

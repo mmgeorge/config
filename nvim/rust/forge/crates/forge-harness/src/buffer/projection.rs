@@ -1724,6 +1724,7 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
+    /// Keep active commentary open so its existing latest-tool preview remains visible.
     fn commentary<'exchange>(
         &mut self,
         interaction: &'exchange Exchange,
@@ -1753,7 +1754,14 @@ impl TimelineRenderer<'_> {
         }
         self.check_group(&format!("{}:results", thought.id), thought.checks.iter())?;
         if let Some(section) = section {
-            self.finish_section(section, &thought.id, true).kind = NodeKind::Thought;
+            let live = thought.tools.live || thought.writes.live;
+            let node = self.finish_section(section, &thought.id, !live);
+            node.kind = NodeKind::Thought;
+            node.lifecycle = if live {
+                NodeLifecycle::Live
+            } else {
+                NodeLifecycle::Settled
+            };
         }
         Ok(())
     }

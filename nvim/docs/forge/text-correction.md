@@ -33,11 +33,27 @@ Space, punctuation, Tab, and an inserted newline can complete a word. Pressing B
 
 Continuing to type, moving the cursor, leaving Insert mode, switching buffers, or submitting text invalidates a pending result. Paste, generated text, completion edits, macros, undo, and redo do not independently trigger correction. A later ordinary typed delimiter can evaluate the word you are currently completing.
 
-Standalone `im` becomes `I'm` and `cant` becomes `can't` in eligible prose, including mid-sentence. The `cant` rule intentionally takes precedence over that word's uncommon standalone meanings and dictionary exemptions. Dictionary-recognized contractions keep their spelling and straight or curly apostrophe, so `can't` and `can’t` cannot become `cant` or `can`. First-person contractions such as `I'm`, `I'll`, `I've`, and `I'd` capitalize `I` anywhere in a sentence. These rules do not expand ambiguous words such as `ill`, `well`, or `were` into contractions.
+Standalone `im` becomes `I'm` in eligible prose, including mid-sentence.
+Negative contractions always receive their missing apostrophe: `cant`, `dont`,
+`wont`, `isnt`, `arent`, `wasnt`, `werent`, `doesnt`, `didnt`, `havent`, `hasnt`,
+`hadnt`, `couldnt`, `wouldnt`, `shouldnt`, `mustnt`, and `neednt`.
+These rules take precedence over frequency scoring, dictionary exemptions, and
+uncommon standalone meanings such as `cant` and `wont`. Existing case and normal
+sentence-start capitalization still apply. Dictionary-recognized contractions keep their spelling and straight or curly apostrophe, so `can't` and `can’t` cannot become `cant` or `can`. First-person contractions such as `I'm`, `I'll`, `I've`, and `I'd` capitalize `I` anywhere in a sentence. These rules do not expand ambiguous words such as `ill`, `well`, or `were` into contractions.
+
+The shared personal vocabulary includes `codex`, preventing replacement with
+`code` in both automatic correction and Harper.
 
 Standalone `i` and alphabetic sentence starts also receive automatic capitalization. Opening quotes, digits, and punctuation prevent sentence-start capitalization. Forge does not add proper-name, acronym, brand, or title capitalization. Protected code and technical tokens remain excluded, and Backspace can still reject an individual correction.
 
 Typing `.`, `,`, `;`, `:`, `!`, or `?` after spaces following an eligible word removes those spaces: `This is a sentence .` becomes `This is a sentence.`. Immediate Backspace removes the punctuation and restores the original spacing, together with any spelling change in that transaction. Retyping the rejected punctuation keeps the original spacing for that occurrence. This rule uses the same prose and editable-region protection as spelling.
+
+Typing a space or newline after a slash immediately following a letter changes
+that slash to `?` in eligible prose: `foo/ ` becomes `foo? `. Typing the slash
+alone does nothing, so `foo/bar`, `@rust/skill`, URLs, code, and `1/2` remain
+unchanged. A standalone directory reference such as `foo/ ` also converts.
+Immediate Backspace restores the slash and any spelling change, consumes the
+space or newline, and suppresses repeat correction at that occurrence.
 
 ## Eligible text
 

@@ -55,13 +55,15 @@ function FileSource:get_completions(_, callback)
     finish(callback, {})
     return
   end
-  load_workspace_files(workspace_root(), function(files)
+  local root = workspace_root()
+  load_workspace_files(root, function(files)
     local items = {}
     for _, path in ipairs(files) do
       local label = "@" .. path
       items[#items + 1] = {
         label = label,
         filterText = label,
+        data = { workspace = root, path = path },
         detail = "Workspace file",
         kind = vim.lsp.protocol.CompletionItemKind.File,
         textEdit = {
@@ -75,6 +77,17 @@ function FileSource:get_completions(_, callback)
     end
     finish(callback, items)
   end)
+end
+
+---Record an accepted workspace file without changing Blink's insertion behavior.
+---@param context table
+---@param item table
+---@param callback fun()
+---@param default_implementation fun()
+function FileSource:execute(context, item, callback, default_implementation)
+  default_implementation()
+  require("forge.views.harness.completion.file_rank").record(item.data.workspace, item.data.path)
+  callback()
 end
 
 function FileSource._clear_cache()

@@ -166,6 +166,24 @@ file list but have no excerpts, including license files with Markdown or text ex
 
 ## Harness and permissions
 
+`@` file completion shows paths relative to the Harness session's workspace.
+Long menu labels use Snacks middle shortening, retaining the first directory and
+the trailing path components that fit. Extremely long filenames can shorten too.
+Matching and insertion always use the complete workspace-relative path.
+Queries without `/` search both filenames and directories. Exact filenames and
+stems rank first, followed by filename prefixes, exact directory components, and
+weaker substring or fuzzy matches. A query such as `@rust/skill` favors a trailing
+`rust/SKILL.md` match at any depth. A trailing `/` favors direct children of the
+matching directory. Matching ignores case, with exact case breaking ties.
+Recent file selections within the current editor and workspace, open buffers,
+shorter paths, and alphabetical order break remaining ties. Bare `@` uses that
+contextual ordering without a filename preference.
+
+Ctrl-Q queues `/model <model> [effort]` without changing the active turn, even
+when the command contains no follow-up prompt. The model change applies when its
+entry reaches the front of the follow-up queue. Ctrl-S submits a settings-only
+model change immediately through the configuration coordinator.
+
 New interactive sessions start with full reads, workspace writes, and `ask` approval.
 Reopening a session preserves its filesystem access and tool approval independently.
 The winbar separates every field with a small gray `·`. One gray access/approval code
@@ -335,11 +353,19 @@ while the transcript scrolls through history, and disappears when no work, pendi
 message, or local notice remains. The split keeps **Working** visible while handing
 off to the next queued message. Check progress, queued messages, pending steering,
 and local notices share the status split. Paused queues remain visible.
-Normal window cycling skips status. Delivered messages remain in conversation history.
+Normal window cycling skips status. Its viewport stays fixed at the first row,
+including during mouse-wheel input. Use `oS` for a scrollable view of full status
+content that exceeds the available screen space.
+Delivered messages remain in conversation history.
 Each entry previews only its first line on one display row, with an ellipsis when
 that line exceeds the available width. Editing opens the complete message in the
 prompt while live status remains above the composer.
-Live tool output occupies four rows, including blank padding.
+Live tool output uses only the rows it needs, up to four preview rows, without
+blank padding. Tools with no output reserve no preview space.
+The latest active commentary stays unfolded to expose that preview, including
+the initial "Considering initial steps" group. Earlier commentary folds when its
+activity settles, and exchange completion collapses the activity. You can reopen
+completed commentary explicitly.
 Shell-backed tool headings show the underlying command rather than the shell tool
 wrapper, both while running and after completion. Expanding the call retains its
 full arguments. Native tools such as `rg` keep their structured call headings.
@@ -356,10 +382,19 @@ Reasoning completion updates the existing summary without restarting Thinking,
 even when its snapshot arrives after response text. Received-byte progress and
 tool-argument streaming do not count as reasoning text. Copilot remains active
 until its session becomes idle, including native background work.
-Timeline updates preserve the current cursor and reading position, including when the thought
-preview changes. Active selections retain both endpoints and their selection type.
+While the prompt buffer is focused, new activity in the current live exchange
+automatically scrolls the transcript to its end, exposing running tools and progress.
+While the transcript is focused, updates preserve the cursor and reading position,
+including when the thought preview changes. Active selections retain both endpoints and their selection type.
 If selected text disappears, each endpoint moves to the nearest surviving position.
 Submitting a prompt positions the transcript at its tail once.
+When an exchange finishes, Harness reveals it if focus is outside that transcript.
+If the prompt and response fit in the visible transcript window, Harness aligns
+the exchange to the bottom. Otherwise, it places the prompt at the top so you can
+read the response from its beginning.
+This decision uses current focus, not previous scrolling or cursor movement.
+Focused transcripts and folded responses keep their reading position.
+Skipped reveals do not run later when focus changes.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.
 Claude and Antigravity retain provider-defined summary detail through their current ACP integrations.
 Assistant commentary marked with an open circle is separate from the reasoning-summary setting.

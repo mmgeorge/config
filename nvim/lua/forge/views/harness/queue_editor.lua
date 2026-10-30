@@ -26,6 +26,16 @@ local function position(queue, entry)
   end
 end
 
+---Expose configuration-only entries as model commands without changing queued payloads.
+---@param entry ForgeQueuedPrompt
+---@return string
+local function queued_text(entry)
+  if entry.text ~= "" or not (entry.config and entry.config.model) then return entry.text end
+  local text = "/model " .. entry.config.model
+  if entry.config.effort then text = text .. " " .. entry.config.effort end
+  return text
+end
+
 ---Move through queued entries without changing order or advancing the earliest edit barrier.
 ---@param state table
 ---@param draft string
@@ -41,7 +51,7 @@ function M.move(state, draft, direction)
     state.queue_edit = edit
     edit.original_draft = draft
     edit.original_attachments = attachment.capture(state.composer_buf).attachments
-    return edit.drafts[edit.entry] or edit.entry.text, nil, edit.attachments[edit.entry] or edit.entry.attachments
+    return edit.drafts[edit.entry] or queued_text(edit.entry), nil, edit.attachments[edit.entry] or edit.entry.attachments
   end
   if direction > 0 and not edit then return nil, "No queued prompt is being edited" end
   ---@type integer?
@@ -70,7 +80,7 @@ function M.move(state, draft, direction)
       if failure and state.queue_edit == edit then edit.failure = failure end
     end)
   end
-  return edit.drafts[entry] or entry.text, nil, edit.attachments[entry] or entry.attachments
+  return edit.drafts[entry] or queued_text(entry), nil, edit.attachments[entry] or entry.attachments
 end
 
 ---Save the active draft without changing its reserved position.
@@ -141,8 +151,8 @@ function M.staging(state, draft, entries)
   local edit = state.queue_edit
   local staged = {}
   for _, entry in ipairs(entries or state.queue) do
-    local text = edit and edit.drafts[entry] or entry.text
-    if edit and entry == edit.entry then text = "[editing] " .. (draft or edit.drafts[entry] or entry.text)
+    local text = edit and edit.drafts[entry] or queued_text(entry)
+    if edit and entry == edit.entry then text = "[editing] " .. (draft or edit.drafts[entry] or queued_text(entry))
     elseif entry.error then
       local keys = require("forge.shared.keymaps").view_keys_for("harness", "retry_input")
       local retry = keys[1] and (" " .. keys[1] .. " retry") or ""

@@ -44,6 +44,9 @@ function StatusView.new(options)
   vim.api.nvim_create_autocmd({ "WinResized", "VimResized", "TabEnter", "BufWinEnter" }, {
     group = self.group, callback = function() self:resize() end,
   })
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = self.group, callback = function() self:pin_view() end,
+  })
   vim.api.nvim_create_autocmd("BufWipeout", { group = self.group, buffer = self.buffer, once = true,
     callback = function() self:close(true) end })
   vim.api.nvim_create_autocmd("WinLeave", { group = self.group, callback = function()
@@ -57,6 +60,20 @@ function StatusView.new(options)
     if target and vim.api.nvim_win_is_valid(target) then vim.api.nvim_set_current_win(target) end
   end })
   return self
+end
+
+---Keep the owned status split at its origin without changing focus or other views.
+function StatusView:pin_view()
+  local window = self.window
+  if self.closed or not window or not vim.api.nvim_win_is_valid(window)
+    or vim.api.nvim_win_get_buf(window) ~= self.buffer then return end
+  vim.api.nvim_win_call(window, function()
+    local view = vim.fn.winsaveview()
+    if view.lnum == 1 and view.col == 0 and view.coladd == 0 and view.topline == 1
+      and view.topfill == 0 and view.leftcol == 0 and view.skipcol == 0 then return end
+    vim.fn.winrestview({ lnum = 1, col = 0, coladd = 0, curswant = 0,
+      topline = 1, topfill = 0, leftcol = 0, skipcol = 0 })
+  end)
 end
 
 ---@param snapshot table
@@ -169,6 +186,9 @@ function StatusView:resize()
       vim.wo[window].winfixbuf = true
       vim.wo[window].winfixheight = true
       vim.wo[window].scrolloff = 0
+      vim.wo[window].sidescrolloff = 0
+      vim.wo[window].scrollbind = false
+      vim.wo[window].cursorbind = false
       vim.wo[window].foldenable = false
       self.separator = { fillchars = vim.wo[options.transcript_window].fillchars,
         winhighlight = vim.wo[options.transcript_window].winhighlight }
@@ -184,6 +204,7 @@ function StatusView:resize()
     local available = vim.api.nvim_win_get_height(options.transcript_window) + vim.api.nvim_win_get_height(self.window) - 1
     local height = math.max(1, math.min(wanted, available))
     if vim.api.nvim_win_get_height(self.window) ~= height then vim.api.nvim_win_set_height(self.window, height) end
+    self:pin_view()
   end, debug.traceback)
   position.restore(options.transcript, retained)
   self.resizing = false

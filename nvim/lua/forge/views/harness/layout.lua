@@ -161,6 +161,14 @@ function M.resize_composer(composer_buf, composer_win)
   if composer_observer[composer_win] then composer_observer[composer_win]() end
 end
 
+---Align the final display row without changing the focused window.
+---@param transcript_buf integer
+---@param transcript_win integer
+function M.position_tail(transcript_buf, transcript_win)
+  vim.api.nvim_win_set_cursor(transcript_win, { vim.api.nvim_buf_line_count(transcript_buf), 0 })
+  vim.api.nvim_win_call(transcript_win, function() vim.cmd("normal! $zb") end)
+end
+
 ---@param transcript_buf integer
 ---@param transcript_win integer
 ---@return integer

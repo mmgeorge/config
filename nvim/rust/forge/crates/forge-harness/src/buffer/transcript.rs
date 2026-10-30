@@ -89,11 +89,8 @@ impl<'profile> TranscriptRenderer<'profile> {
             rows
         } else {
             let mut rows = preview_rows(self.profile, &output.preview(false)?)?.0;
-            if output.live_preview {
-                if output.preview(false)?.total_rows == 0 {
-                    rows.clear();
-                }
-                rows.resize(4, String::new());
+            if output.live_preview && output.preview(false)?.total_rows == 0 {
+                rows.clear();
             }
             rows
         };
@@ -1128,8 +1125,9 @@ mod test {
         Ok(())
     }
 
+    /// Keep live previews content-sized without padding or losing expandable output.
     #[test]
-    fn live_tool_preview_reserves_four_rows_without_an_overflow_row() -> Result<()> {
+    fn live_tool_preview_uses_available_rows_without_an_overflow_row() -> Result<()> {
         for columns in [12, 80] {
             let width = WidthProfile {
                 columns,
@@ -1138,11 +1136,13 @@ mod test {
             let renderer = TranscriptRenderer::new(&width)?;
             let mut output = ToolOutputView::new(crate::buffer::identity::DisplayId::test(), "");
             output.live_preview = true;
-            for delta in [
-                "",
-                "one",
-                "\ntwo\nthree\nfour\nfive",
-                "\n界".repeat(200).as_str(),
+            for (delta, expected_rows) in [
+                ("", 0),
+                ("one", 1),
+                ("\ntwo", 2),
+                ("\nthree", 3),
+                ("\nfour\nfive", 4),
+                ("\n界".repeat(200).as_str(), 4),
             ] {
                 output.append(delta)?;
                 let body = renderer.tool_body(
@@ -1151,7 +1151,11 @@ mod test {
                     false,
                     0,
                 )?;
-                assert_eq!(body.text.row_count(), 4);
+                assert_eq!(body.text.row_count(), expected_rows);
+                assert!(
+                    body.text.wire_rows().iter().all(|row| !row.is_empty()),
+                    "live output must not reserve blank preview rows"
+                );
                 assert!(
                     body.text
                         .wire_rows()

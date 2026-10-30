@@ -11,3 +11,9 @@ nvim
 luna
 
 autocorrection
+
+mcp
+
+cwd
+
+codex

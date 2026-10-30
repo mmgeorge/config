@@ -19,6 +19,11 @@ assert(not source.accepts_prompt("/checks edit on extra"))
 assert(source.accepts_prompt("Explain /sess"))
 assert(not source.queues_execution("/plan inspect screenshot.png"),
   "filename arguments must not override supported command routing")
+assert(not source.queues_execution("/model"), "the model picker must remain an immediate command")
+for _, command in ipairs({ "/model chosen", "/model chosen high", "/model chosen high follow up",
+  "  /model chosen high  " }) do
+  assert(source.queues_execution(command), "queueing a model change became an immediate command: " .. command)
+end
 assert(not source.accepts_prompt("/spawn\nscreenshot.png"),
   "an extension on a later line must not unlock an unknown slash command")
 local state = require("forge.session").harness

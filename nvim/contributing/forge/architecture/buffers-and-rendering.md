@@ -20,6 +20,13 @@ The writer captures every attached window's cursor and viewport immediately befo
 
 The replica's `before_commit` and `after_commit` callbacks run at that same boundary. Harness uses them to save outgoing timeline views and align status spacing, without overriding cursor restoration.
 
+Harness applies presentation-level navigation after successful transcript and
+status publication. New live-exchange revisions follow the tail while the owning
+composer is focused. When focus is outside the transcript, a newly completed
+exchange aligns to the bottom if its prompt through tail fits, or places its
+prompt at the top otherwise. Both decisions use current focus and geometry, never
+a saved cursor or viewport. See [Timeline](timeline.md#transcript-window-and-pickers).
+
 Transcript synchronization coalesces event bursts at a 60 Hz target and keeps one trailing refresh for events that arrive mid-update. Closing the view cancels its timer, and host replacement cancels preparation before publication.
 
 ## Editable regions

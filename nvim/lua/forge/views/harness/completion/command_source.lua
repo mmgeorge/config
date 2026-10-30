@@ -105,7 +105,7 @@ end
 ---@return boolean
 function CommandSource.queues_execution(text)
   local token = command_token(text)
-  if token == "/model" then return text:match("^%s*/model%s+%S+%s+%S+%s+%S") ~= nil end
+  if token == "/model" then return text:match("^%s*/model%s+%S+") ~= nil end
   return not token or token == "/compact"
 end
 

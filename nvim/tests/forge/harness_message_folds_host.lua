@@ -192,6 +192,71 @@ local success, failure = xpcall(function()
   await(function() return messages("ForgeHarnessResponse")[6].entry.metadata.node.display == "full" end, "list response did not reopen")
   render_response()
   await(function() return bullet_count() == 3 end, "reopening did not restore the complete list")
+
+  local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")
+  local hold = mock.hold(state.session.id, "chat")
+  vim.api.nvim_set_current_win(state.composer_win)
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Reveal this completed response", "Including its last line" })
+  controller.submit()
+  hold:wait()
+  vim.api.nvim_win_set_cursor(state.transcript_win, { 1, 0 })
+  vim.api.nvim_win_call(state.transcript_win, function() vim.cmd("normal! zt") end)
+  hold:release()
+  await(function() return not state.busy and #messages("ForgeHarnessResponse") == 7 end, "reveal response did not settle")
+  vim.cmd("redraw!")
+  local revealed = messages("ForgeHarnessResponse")[7]
+  local _, revealed_row = state.presentation.transcript.sequence:position(revealed.id)
+  local final_row = vim.api.nvim_buf_line_count(state.transcript_buf)
+  assert(vim.api.nvim_win_get_cursor(state.transcript_win)[1] == final_row,
+    "native completion did not reveal the response while composer was focused")
+  assert(vim.fn.screenpos(state.transcript_win, revealed_row + 1, 1).row > 0
+    and vim.fn.screenpos(state.transcript_win, final_row, 1).row > 0,
+    "native completion clipped the response after status layout and Markdown rendering")
+  assert(vim.api.nvim_get_current_win() == state.composer_win, "native completion stole focus")
+
+  hold = mock.hold(state.session.id, "chat")
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Keep the active selection" })
+  controller.submit()
+  hold:wait()
+  vim.api.nvim_set_current_win(state.transcript_win)
+  vim.api.nvim_win_set_cursor(state.transcript_win, { 1, 0 })
+  vim.cmd("normal! ztvll")
+  local selected_cursor, selected_anchor = vim.api.nvim_win_get_cursor(state.transcript_win), vim.fn.getpos("v")
+  local selected_topline = vim.fn.winsaveview().topline
+  hold:release()
+  await(function() return not state.busy and #messages("ForgeHarnessResponse") == 8 end, "selected response did not settle")
+  assert(vim.fn.mode() == "v" and vim.deep_equal(vim.fn.getpos("v"), selected_anchor)
+    and vim.deep_equal(vim.api.nvim_win_get_cursor(state.transcript_win), selected_cursor)
+    and vim.fn.winsaveview().topline == selected_topline, "native completion changed the active selection or viewport")
+  vim.cmd("normal! \27")
+
+  hold = mock.hold(state.session.id, "chat")
+  vim.api.nvim_set_current_win(state.composer_win)
+  local long_response = {}
+  for row = 1, 100 do long_response[row] = "Long response line " .. row end
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, long_response)
+  controller.submit()
+  hold:wait()
+  vim.api.nvim_win_set_cursor(state.transcript_win, { 1, 0 })
+  vim.api.nvim_win_call(state.transcript_win, function() vim.cmd("normal! zt") end)
+  hold:release()
+  await(function() return not state.busy and #messages("ForgeHarnessResponse") == 9 end, "long response did not settle")
+  vim.cmd("redraw!")
+  local _, prompt_row = state.presentation.transcript.sequence:position(messages("ForgeHarnessPrompt")[9].id)
+  vim.api.nvim_win_call(state.transcript_win, function()
+    local view = vim.fn.winsaveview()
+    assert(view.topline == prompt_row + 1 and view.skipcol == 0,
+      "long native completion did not place its prompt at the top: " .. vim.inspect({
+        view = view, prompt_row = prompt_row, response = messages("ForgeHarnessResponse")[9].entry.metadata.node,
+        response_rows = messages("ForgeHarnessResponse")[9].entry.row_count,
+        scrolloff = vim.wo[state.transcript_win].scrolloff,
+        last_row = vim.api.nvim_buf_line_count(state.transcript_buf),
+        height = vim.api.nvim_win_get_height(state.transcript_win),
+      }))
+  end)
+  assert(vim.fn.screenpos(state.transcript_win, vim.api.nvim_buf_line_count(state.transcript_buf), 1).row == 0,
+    "long native completion jumped to the end of the response")
+  assert(vim.api.nvim_get_current_win() == state.composer_win, "long native completion stole focus")
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 unsubscribe_errors()

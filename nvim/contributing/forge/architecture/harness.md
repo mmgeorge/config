@@ -44,7 +44,20 @@ Sessions and preferences load only at the exact current format, defined by `SESS
 
 ## Input delivery
 
+Harness file completion leaves candidate filtering and insertion with Blink.
+`completion/file_rank.lua` creates a query-scoped comparator for `@` searches in
+the composer, ranking full workspace-relative paths before Blink's generic score.
+It caches each candidate's rank for that sorting pass. Accepted file selections
+are recorded per workspace for the editor lifetime. Shortened labels remain a
+separate presentation concern, and other buffers retain Blink's default sorting.
+
 Accepted input must survive a closed window or a crash without ever being sent twice. `SessionCoordinator` owns accepted messages through `SessionInputQueue`, and the `session.input.*` methods work without the provider execution lock. Ctrl-S sends input that steers an active turn as soon as the provider allows, and Ctrl-Q queues an explicit follow-up. Each group stays in FIFO order. Steering never bypasses uncertain delivery, pending configuration, or a pause.
+
+Ctrl-Q retains `/model` arguments as configuration on the queued entry, including
+configuration-only entries with empty prompt text. Lua reconstructs the command
+for queue display and editing. Rust applies the configuration only when that entry
+is eligible for delivery and consumes an empty prompt without starting a turn.
+Ctrl-S settings-only model commands use the immediate configuration coordinator.
 
 Provider acceptance and queue acknowledgement are separate facts. `SubmissionStore` persists a `Prepared → Sending → Accepted` journal, and restart recovery never treats `Sending` as permission to replay. A turn that ends before dispatch keeps the message for the next eligible interaction. A failed message stays visible and blocks later follow-ups until the user retries or removes it. `SessionAdmission` keeps a compact task, operation, question, and exchange projection in memory, republished after every committed mutation, so submission never reopens SQLite.
 

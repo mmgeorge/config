@@ -106,6 +106,7 @@ impl NodeMap {
             source.kind,
             forge_buffer::node::NodeKind::Exchange
                 | forge_buffer::node::NodeKind::Message
+                | forge_buffer::node::NodeKind::Thought
                 | forge_buffer::node::NodeKind::ToolGroup
         ) && source.lifecycle == forge_buffer::node::NodeLifecycle::Settled
             && previous

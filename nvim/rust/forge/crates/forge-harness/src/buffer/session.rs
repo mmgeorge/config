@@ -2306,6 +2306,233 @@ mod tests {
         assert!(find_agent_exchanges(&source, "missing").is_none());
     }
 
+    /// Keep the latest preview reachable through commentary, including synthetic initial activity.
+    #[test]
+    fn live_commentary_reveals_latest_tool_until_settlement() -> Result<()> {
+        use crate::backend::{
+            BackendEvent, MessageRole, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome,
+            ToolStatus, ToolUpdate, TurnUpdate,
+        };
+        use forge_buffer::node::{NodeDisplay, NodeKind, NodeLifecycle};
+
+        let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id":"stream", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Inspect files", "kind":"chat", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(Vec::new())?;
+        let document = DocumentId("live-commentary".into());
+        let view = ViewId("view".into());
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let publish = |owner: &mut SessionPresentation, exchange: &Exchange| -> Result<_> {
+            owner.reconcile(vec![TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange: exchange.clone().into(),
+                agent_by_id: HashMap::new(),
+            }])?;
+            owner.snapshot(&document)
+        };
+        let text = |snapshot: &BufferSnapshot| {
+            snapshot
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (tool_id, output) in [("first", "first-output"), ("second", "second-output")] {
+            crate::turn::test_support::tool(
+                &mut exchange,
+                &address,
+                tool_id,
+                ToolInvocation {
+                    kind: ToolActivityKind::Command,
+                    name: "inspect".into(),
+                    arguments: serde_json::json!({}),
+                    title: format!("Inspect {tool_id}"),
+                },
+                crate::turn::test_support::tool_updates(
+                    ToolStatus::Succeeded,
+                    Some(output.into()),
+                    Default::default(),
+                ),
+                1,
+            )?;
+            let snapshot = publish(&mut owner, &exchange)?;
+            assert!(
+                text(&snapshot).contains(output),
+                "latest completed tool preview is hidden"
+            );
+            if tool_id == "second" {
+                assert!(!text(&snapshot).contains("first-output"));
+            }
+            let thought = snapshot
+                .block
+                .iter()
+                .find_map(|block| {
+                    block
+                        .metadata
+                        .node
+                        .as_ref()
+                        .filter(|node| node.kind == NodeKind::Thought)
+                })
+                .unwrap();
+            assert_eq!(thought.lifecycle, NodeLifecycle::Live);
+            assert_eq!(thought.display, NodeDisplay::Full);
+        }
+
+        exchange.observe_turn(
+            &crate::turn::test_support::message(
+                &address,
+                "next",
+                Some(MessageRole::Commentary),
+                "Inspect the next file",
+            ),
+            2,
+        )?;
+        crate::turn::test_support::tool(
+            &mut exchange,
+            &address,
+            "third",
+            ToolInvocation {
+                kind: ToolActivityKind::Command,
+                name: "inspect".into(),
+                arguments: serde_json::json!({}),
+                title: "Inspect third".into(),
+            },
+            crate::turn::test_support::tool_updates(
+                ToolStatus::Running,
+                Some("third-output".into()),
+                Default::default(),
+            ),
+            3,
+        )?;
+        let snapshot = publish(&mut owner, &exchange)?;
+        assert!(text(&snapshot).contains("third-output"));
+        assert!(!text(&snapshot).contains("second-output"));
+        let event = BackendEvent::Tool {
+            address: crate::backend::ToolAddress {
+                turn: address.clone(),
+                tool_id: "third".into(),
+            },
+            update: ToolUpdate::Output {
+                update: TextUpdate::Append("\nstreamed-output".into()),
+            },
+        };
+        exchange.observe_turn(&event, 4)?;
+        assert!(owner.append_tool_output(&exchange, &event)?.is_some());
+        assert!(text(&owner.snapshot(&document)?).contains("streamed-output"));
+        let thoughts = snapshot
+            .block
+            .iter()
+            .filter_map(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .filter(|node| node.kind == NodeKind::Thought)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(thoughts.len(), 2);
+        assert_eq!(thoughts[0].display, NodeDisplay::Heading);
+        assert_eq!(thoughts[1].display, NodeDisplay::Full);
+        let latest = thoughts[1].id.0.clone();
+        owner
+            .open
+            .as_mut()
+            .unwrap()
+            .sections
+            .nodes
+            .choice
+            .insert(latest.clone(), true);
+
+        exchange.observe_turn(
+            &BackendEvent::Tool {
+                address: crate::backend::ToolAddress {
+                    turn: address.clone(),
+                    tool_id: "third".into(),
+                },
+                update: ToolUpdate::Finished {
+                    outcome: ToolOutcome::Succeeded,
+                },
+            },
+            5,
+        )?;
+        exchange.observe_turn(
+            &BackendEvent::Turn {
+                address,
+                update: TurnUpdate::Finished {
+                    outcome: crate::turn::TurnOutcome::Completed,
+                    completed_at_ms: 6,
+                },
+            },
+            6,
+        )?;
+        assert!(text(&publish(&mut owner, &exchange)?).contains("streamed-output"));
+        exchange.finish(crate::exchange::ExchangeOutcome::Complete, 7)?;
+        let snapshot = publish(&mut owner, &exchange)?;
+        assert!(!text(&snapshot).contains("third-output"));
+        let open = owner.open.as_mut().unwrap();
+        assert!(
+            !open.sections.nodes.choice.contains_key(&latest),
+            "completion retained an expansion from the live commentary"
+        );
+        open.sections.set(
+            &mut open.transcript,
+            super::super::sections::SectionRequest {
+                view: view.clone(),
+                sequence: 1,
+                id: "stream:exchange",
+                expanded: true,
+                more: false,
+                page: None,
+            },
+        )?;
+        retain_patches(open, Vec::new())?;
+        let snapshot = owner.snapshot(&document)?;
+        let latest_node = snapshot
+            .block
+            .iter()
+            .find_map(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .filter(|node| node.id.0 == latest)
+            })
+            .unwrap();
+        assert_eq!(latest_node.lifecycle, NodeLifecycle::Settled);
+        assert_eq!(latest_node.display, NodeDisplay::Heading);
+        let open = owner.open.as_mut().unwrap();
+        open.sections.set(
+            &mut open.transcript,
+            super::super::sections::SectionRequest {
+                view,
+                sequence: 2,
+                id: &latest,
+                expanded: true,
+                more: false,
+                page: None,
+            },
+        )?;
+        retain_patches(open, Vec::new())?;
+        let snapshot = publish(&mut owner, &exchange)?;
+        assert!(
+            snapshot.block.iter().any(|block| block
+                .metadata
+                .node
+                .as_ref()
+                .is_some_and(|node| node.id.0 == latest && node.display == NodeDisplay::Full)),
+            "an explicit expansion after completion was not retained"
+        );
+        Ok(())
+    }
+
     #[test]
     fn long_messages_keep_two_previous_responses_and_reopen_after_resize() -> anyhow::Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};

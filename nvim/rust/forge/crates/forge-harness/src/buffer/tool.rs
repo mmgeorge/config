@@ -35,7 +35,7 @@ pub struct ToolOutputView {
     heading: Option<crate::turn::ToolCall>,
     owner: String,
     pub(super) group: String,
-    /// Keeps the current tool preview at a fixed height during its exchange.
+    /// Show the current tool's output without an empty placeholder or overflow row.
     pub(super) live_preview: bool,
 }
 

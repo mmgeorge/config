@@ -15,7 +15,7 @@ const UNIGRAM: &[u8] = include_bytes!("../assets/frequency_dictionary_en_82_765.
 const BIGRAM: &[u8] = include_bytes!("../assets/frequency_bigramdictionary_en_243_342.txt");
 const UNIGRAM_CHECKSUM: &str = "5eb7d9ca29ba3aee23d11b8b3d3aa048d7e94538b468eeffd9e07f76de7d5125";
 const BIGRAM_CHECKSUM: &str = "c7775c2d4d25930146ae07de85c228330f9b8b6a81c3cc8f6fa52e10246e3de8";
-pub(crate) const MODEL_REVISION: &str = "en-US-bigram-2";
+pub(crate) const MODEL_REVISION: &str = "en-US-bigram-3";
 
 /// Own the validated immutable lexical and contextual base shared by terminology profiles.
 pub(crate) struct Model {
@@ -184,6 +184,22 @@ impl Model {
         let contraction = match normalized.as_str() {
             "im" => Some("i'm"),
             "cant" => Some("can't"),
+            "dont" => Some("don't"),
+            "wont" => Some("won't"),
+            "isnt" => Some("isn't"),
+            "arent" => Some("aren't"),
+            "wasnt" => Some("wasn't"),
+            "werent" => Some("weren't"),
+            "doesnt" => Some("doesn't"),
+            "didnt" => Some("didn't"),
+            "havent" => Some("haven't"),
+            "hasnt" => Some("hasn't"),
+            "hadnt" => Some("hadn't"),
+            "couldnt" => Some("couldn't"),
+            "wouldnt" => Some("wouldn't"),
+            "shouldnt" => Some("shouldn't"),
+            "mustnt" => Some("mustn't"),
+            "neednt" => Some("needn't"),
             _ => None,
         };
         if let Some(contraction) = contraction {
@@ -432,6 +448,42 @@ mod tests {
             ("Fill out the form", "form", "form"),
         ] {
             assert_eq!(decide(context, target), expected, "{context}");
+        }
+    }
+
+    /// Expand missing-apostrophe negatives independently of context and preserve case.
+    #[test]
+    fn negative_contractions_override_frequency_with_original_case() {
+        for (original, expected) in [
+            ("dont", "don't"),
+            ("wont", "won't"),
+            ("isnt", "isn't"),
+            ("arent", "aren't"),
+            ("wasnt", "wasn't"),
+            ("werent", "weren't"),
+            ("doesnt", "doesn't"),
+            ("didnt", "didn't"),
+            ("havent", "haven't"),
+            ("hasnt", "hasn't"),
+            ("hadnt", "hadn't"),
+            ("couldnt", "couldn't"),
+            ("wouldnt", "wouldn't"),
+            ("shouldnt", "shouldn't"),
+            ("mustnt", "mustn't"),
+            ("neednt", "needn't"),
+        ] {
+            assert_eq!(decide(&format!("Say {original} "), original), expected);
+            assert_eq!(
+                decide(
+                    &format!("Say {} ", original.to_uppercase()),
+                    &original.to_uppercase()
+                ),
+                expected.to_uppercase()
+            );
+            assert_eq!(
+                decide(&format!("{original} "), original),
+                format!("{}{}", expected[..1].to_uppercase(), &expected[1..])
+            );
         }
     }
 

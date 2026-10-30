@@ -12,7 +12,7 @@ Each session controller owns one `TimelineStream`. It compares stable entry iden
 
 An exchange owns an ordered `ExchangeEntry` list of commentary, steering, responses, and typed event references. Commentary owns its tool records, reported file changes, and completed check runs. Steering and events stay siblings of commentary, so collapsing commentary never hides steering. A tool keeps its original commentary owner after later commentary arrives, and a tool with no active commentary creates a synthetic "Considering initial steps" commentary.
 
-While an exchange runs, the trailing tool group shows its count, the latest tool heading, and that tool's last four output rows. Full output stays available for expansion. After the exchange completes, the activity node collapses, and the final response stays outside the fold.
+While an exchange runs, active commentary stays expanded so its trailing tool group can show its count, the latest tool heading, and up to that tool's last four output rows. Previews use their actual row count without blank padding, and tools with no output reserve no preview rows. This includes the synthetic "Considering initial steps" commentary. A completed tool keeps its preview until a successor or commentary boundary replaces it. Commentary settles and folds when its activity is no longer live, and live expansion overrides clear at that transition. Full output stays available for expansion. After the exchange completes, the activity node collapses, and the final response stays outside the fold.
 
 File writes in one activity section share a `Changed N files` node that composes reported hunks into an original-to-final diff, without reading the workspace. Failed and interrupted edits keep their diagnostic but never count as changes. Commands, formatters, and generators stay ordinary tools, because their filesystem effects come only from checkpoint comparison.
 
@@ -49,6 +49,16 @@ The outer duration covers tools and delegated waits during active execution, and
 The Harness controller binds a native transcript document, a native status document, and a Lua-owned composer buffer, all owned by `OpenPresentation`. The status document has its own revision, so status-only updates leave transcript rows unchanged. `HarnessStatusView` owns the split above the composer and a separate display buffer, so local notices never modify the native replica. Lua fills unused transcript space with virtual rows, so the live tail ends at the bottom without changing native text.
 
 Composer height follows wrapped rows within the configured bounds, and `smoothscroll` lets tall drafts scroll within one physical line. If the whole draft fits, the viewport starts at the first line, which stops Insert-mode scrolling from hiding the top of a short draft.
+
+The status split has a fixed viewport at row one. Its owner resets vertical and horizontal scroll offsets after layout and scroll events without moving focus or the transcript. Status sizing remains content-driven, bounded by available window space, and the separate status-details view retains normal scrolling for overflow.
+
+`HarnessResponseReveal` observes the latest top-level exchange's committed node lifecycle.
+After transcript, status, and local status layout publication, a new transcript
+revision in a live exchange follows the tail when the owning composer window is
+focused, including tool activity before any response text. Focus is checked at
+publication, and unchanged revisions do not replay navigation. Focused transcripts
+retain the shared cursor and selection preservation contract.
+A newly settled exchange reveals its response only when focus is outside the transcript. Each visible window measures from the exchange's prompt through the tail in screen rows, including wrapping and the winbar. An exchange that fits aligns to the bottom. A taller exchange places its prompt at the top, exposing the beginning rather than the end of the response. Folded responses retain their positions. Initial adoption and timeline switches establish a baseline without replaying navigation, and skipped reveals are consumed rather than deferred.
 
 Harness Markdown handlers clip decorations to the current message ranges before `render-markdown` caches them, because incremental parser trees can otherwise restore deleted list bullets onto a separator.
 

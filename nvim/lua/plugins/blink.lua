@@ -139,6 +139,7 @@ return {
     ---@type blink.cmp.Config
     opts = {
       fuzzy = {
+        sorts = require("forge.views.harness.completion.file_rank").sorts,
         -- use_frecency = true,
         -- use_proximity = true,
         -- max_typos = function(str)
@@ -242,6 +243,12 @@ return {
           border = "none",
           draw = {
             -- treesitter = { 'lsp' },
+            components = {
+              label = {
+                text = require("forge.views.harness.completion.file_label").text,
+                highlight = require("forge.views.harness.completion.file_label").highlight,
+              },
+            },
             columns = {
               { "kind_icon" }, { "label", "label_description", gap = 1 },
               -- { "kind_icon", "label", "label_description", gap = 1 },

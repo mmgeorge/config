@@ -49,9 +49,29 @@ controller.task_transition = function(action)
   assert(action.action == "configure")
   configured = action.config
 end
+state.busy, state.execution_busy = true, true
 compose("/model settings-only high")
 controller.queue_submit()
-assert(#state.queue == 1 and configured.model == "settings-only", "model-only selection was queued as empty input")
+assert(#state.queue == 2 and configured == nil, "queueing a model-only selection configured the active turn")
+local settings = state.queue[2]
+assert(settings.text == "" and settings.config.model == "settings-only" and settings.config.effort == "high")
+assert(settings.intent == "queue" and state.session.model == "old" and state.task_config == nil)
+assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "queued command stayed in the composer")
+host.flush()
+assert(state.queue[2] == settings and configured == nil, "queue acknowledgement configured the active turn")
+local editor = require("forge.views.harness.queue_editor")
+assert(editor.staging(state)[2].text == "/model settings-only high", "queued configuration was invisible")
+controller.edit_queued(-1)
+assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "/model settings-only high",
+  "editing lost the queued model command")
+controller.submit()
+host.flush()
+assert(state.queue[2] == settings and settings.config.model == "settings-only" and settings.text == "",
+  "saving a configuration-only entry removed it")
+assert(configured == nil and state.session.model == "old", "editing configured the active turn")
+compose("/model immediate high")
+controller.submit()
+assert(#state.queue == 2 and configured.model == "immediate", "steering a model change did not configure the active turn")
 assert(#warnings == 1)
 print("harness_queued_model: passed")
 vim.cmd("qa!")

@@ -69,7 +69,7 @@ local function changed(state)
     if not same_suppression then state.suppressed=nil end
     local identity=table.concat({captured.start.row,captured.start.column,captured.original},":")
     local already_evaluated=state.last_occurrence==identity or same_suppression
-    if already_evaluated and not captured.punctuation_space then return end
+    if already_evaluated and not captured.punctuation_space and not captured.question_slash then return end
     state.last_occurrence=identity
     sequence=sequence+1
     local occurrence={id=tostring(sequence),generation=generation,context=captured,started=pending.started,
@@ -77,6 +77,7 @@ local function changed(state)
       host_generation=require("forge.client").host_get_generation()}
     state.occurrence=occurrence
     transaction.anchor(state,occurrence)
+    transaction.replace_question_slash(state,occurrence)
     transaction.remove_punctuation_space(state,occurrence)
     if already_evaluated then return end
     service.correct(state.owner,occurrence,function() return transaction.current(state,occurrence) end,function(result,failure)

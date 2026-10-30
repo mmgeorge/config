@@ -172,13 +172,22 @@ function M.capture(index,boundary,owner,current,callback)
       checkpoint()
     end
     local context=table.concat(parts,"\n")
+    local before_boundary=original_line:sub(finish+1,column)
+    local final_character=vim.fn.strcharpart(word,vim.fn.strchars(word)-1,1)
+    local question_slash=before_boundary=="/"
+      and (boundary.key==" " or boundary.key=="\r" or boundary.key=="\n")
+      and prose.word_character(final_character) and not final_character:match("%d")
+    if question_slash then
+      -- Only the proposed punctuation loses path protection, not any other slash.
+      local slash=target_start+#word+1
+      context=context:sub(1,slash-1).."?"..context:sub(slash+1)
+    end
     local protected=prose.protected(context)
     for _,range in ipairs(protected) do if target_start<range["end"] and range.start<target_start+#word then return nil end end
-    local before_boundary=original_line:sub(finish+1,column)
     local punctuation_space=boundary.key and boundary.key:match("^[.,;:!?]$") and before_boundary:match("[ \t]+$") or nil
     return { text=context,target={start=target_start,["end"]=target_start+#word},protected=protected,
       original=word,start={row=row,column=start},finish={row=row,column=finish},delimiter_end=boundary.after,
-      before_boundary=before_boundary,punctuation_space=punctuation_space }
+      before_boundary=before_boundary,punctuation_space=punctuation_space,question_slash=question_slash }
   end)
   local function resume()
     if not current() or not index.active or index.revision~=revision then return callback(nil) end

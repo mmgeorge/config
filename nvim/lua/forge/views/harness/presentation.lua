@@ -32,6 +32,7 @@ function M.open(options, callback)
     session_id = options.session_id, host_generation = client.host_get_generation(), views = {},
     timeline_key = "main", timeline_view = {}, epoch = 0,
     staging = { queue = {}, steering = {} }, applied_staging = { queue = {}, steering = {} } }
+  local response_reveal = require("forge.views.harness.response_reveal").new(options.composer_window)
   local function alive()
     return not owner.closed and owner.host_generation == client.host_get_generation()
       and client.host_is_accepting() and options.is_alive()
@@ -362,6 +363,7 @@ function M.open(options, callback)
     owner.status_view:apply(opened.status, guard(function(applied)
     if not applied then reject_open("Harness status could not be adopted") return end
     owner.ready = true
+    response_reveal:publish(owner.transcript, owner.views, true)
     owner.diff_view = opened.diff_view and opened.diff_view ~= vim.NIL and opened.diff_view or { visibility = "all", presentation = "full" }
     flush_staging()
     render_markdown()
@@ -551,7 +553,7 @@ function M.open(options, callback)
       end
       owner.sync_failure = nil
       owner.applying = true
-      local function complete()
+      local function complete(status_applied)
         owner.applying, owner.syncing = false, false
         if result.diff_view and result.diff_view ~= vim.NIL then owner.diff_view = result.diff_view end
         publish_openings()
@@ -567,12 +569,13 @@ function M.open(options, callback)
         render_markdown(switched_timeline)
         owner.observe_sections()
         if options.on_update then options.on_update() end
+        response_reveal:publish(owner.transcript, owner.views, switched_timeline or not status_applied)
         if result.syntax_pending then owner.highlight() end
         if owner.pending then owner.sync() end
         dispatch_next()
       end
       local function complete_status()
-        owner.status_view:apply(result.status, guard(function() complete() end))
+        owner.status_view:apply(result.status, guard(complete))
       end
       local snapshot = type(result.snapshot) == "table" and result.snapshot or nil
       local update = snapshot or { patch = result.patch or {} }
@@ -948,8 +951,7 @@ function M.open(options, callback)
     if not alive() or not owner.ready then return end
     for window in pairs(owner.views) do
       if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == owner.transcript.buffer then
-        vim.api.nvim_win_set_cursor(window, { vim.api.nvim_buf_line_count(owner.transcript.buffer), 0 })
-        vim.api.nvim_win_call(window, function() vim.cmd("normal! $zb") end)
+        require("forge.views.harness.layout").position_tail(owner.transcript.buffer, window)
       end
     end
   end
