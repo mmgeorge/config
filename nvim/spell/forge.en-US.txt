@@ -7,3 +7,7 @@ opt
 perf
 
 nvim
+
+luna
+
+autocorrection
