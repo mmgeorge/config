@@ -55,7 +55,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             tool_ran: tool_ran.clone(),
             active: Default::default(),
         });
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) = publication::channel();
         broker.event_sink = Some(sink);
         let session_id = broker.session.id.clone();
         let cancellation = broker.turn_cancellation();
@@ -64,7 +64,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             preparation.started.notified().await;
             let mut published = false;
             while let Ok(event) = stream.try_recv() {
-                published |= event.kind == "execution_state";
+                published |= matches!(event, SessionUpdate::ExecutionState { .. });
             }
             assert!(published, "working publication waited for preparation");
             let store = SqliteStore::read_only(data.path())?;

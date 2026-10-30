@@ -1,5 +1,48 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ToolInvocation {
+    pub kind: super::ToolActivityKind,
+    pub name: String,
+    pub title: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ToolDiagnostic {
+    pub code: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "text", rename_all = "snake_case")]
+pub enum TextUpdate {
+    Append(String),
+    Replace(String),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolOutcome {
+    Succeeded,
+    Failed { diagnostic: ToolDiagnostic },
+    Denied { reason: String },
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolUpdate {
+    Requested { invocation: ToolInvocation },
+    Input { update: TextUpdate },
+    Started,
+    Output { update: TextUpdate },
+    Changes { changes: super::ProviderChangeSet },
+    SkillRead { read: Vec<crate::skill::SkillRead> },
+    Finished { outcome: ToolOutcome },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Provider-independent tool execution status. Late output does not reopen execution.

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::backend::BackendError;
 use crate::backend::submission::{Submission, SubmissionTarget};
 
 #[async_trait]
@@ -42,7 +43,10 @@ impl AcpTransport {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        let mut process = crate::process::spawn_owned(launch).context("launch ACP provider")?;
+        let mut process =
+            crate::process::spawn_owned(launch).map_err(|error| BackendError::Transport {
+                message: format!("launch ACP provider: {error}"),
+            })?;
         let outgoing = process.stdin().take().context("ACP stdin missing")?;
         let incoming = process.stdout().take().context("ACP stdout missing")?;
         let transport = ByteStreams::new(outgoing.compat_write(), incoming.compat());
@@ -92,8 +96,12 @@ impl AcpTransport {
         });
         let connection = tokio::time::timeout(std::time::Duration::from_secs(10), ready)
             .await
-            .context("ACP connection startup exceeded 10 seconds")?
-            .context("ACP driver exited before connection startup")?;
+            .map_err(|error| BackendError::Transport {
+                message: format!("ACP connection startup exceeded 10 seconds: {error}"),
+            })?
+            .map_err(|error| BackendError::Transport {
+                message: format!("ACP driver exited before connection startup: {error}"),
+            })?;
         Ok(Self {
             connection,
             process: Mutex::new(process),
@@ -105,10 +113,20 @@ impl AcpTransport {
     pub(super) async fn request(&self, method: &str, parameter: Value) -> Result<Value> {
         let request = self
             .connection
-            .send_request(UntypedMessage::new(method, parameter)?)
+            .send_request(UntypedMessage::new(method, parameter).map_err(|error| {
+                BackendError::Protocol {
+                    message: format!("encode ACP {method}: {error}"),
+                }
+            })?)
             .block_task();
         if method == "session/prompt" {
-            Ok(request.await?)
+            request.await.map_err(|error| {
+                BackendError::Provider {
+                    code: None,
+                    message: format!("ACP {method} failed: {error}"),
+                }
+                .into()
+            })
         } else {
             let seconds = if method == "authenticate" { 120 } else { 30 };
             Ok(
@@ -155,7 +173,11 @@ impl AcpTransport {
                 serde_json::from_value::<agent_client_protocol::schema::v1::PromptResponse>(
                     response.clone(),
                 )
-                .context("ACP prompt response does not confirm a completed turn")?;
+                .map_err(|error| BackendError::Protocol {
+                    message: format!(
+                        "ACP prompt response does not confirm a completed turn: {error}"
+                    ),
+                })?;
             } else {
                 match response["outcome"].as_str() {
                     Some("injected" | "startedNewTurn") => {}
@@ -171,9 +193,17 @@ impl AcpTransport {
                                 .persist(move |submission| submission.rejected(error.into()))
                                 .await?;
                         }
-                        anyhow::bail!(error);
+                        return Err(BackendError::Rejected {
+                            message: error.into(),
+                        }
+                        .into());
                     }
-                    _ => anyhow::bail!("ACP steering acceptance is unknown: {response}"),
+                    _ => {
+                        return Err(BackendError::Protocol {
+                            message: format!("ACP steering acceptance is unknown: {response}"),
+                        }
+                        .into());
+                    }
                 }
             }
             if let Some(submission) = submission {

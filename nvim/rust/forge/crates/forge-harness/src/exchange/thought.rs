@@ -107,7 +107,10 @@ impl Exchange {
                         })
                         .context("commentary references a missing provider message")?,
                 )
-                .filter(|message| message.role() == Some(crate::backend::MessageRole::Commentary)),
+                .filter(|message| {
+                    message.role() == Some(crate::backend::MessageRole::Commentary)
+                        && !message.text().trim().is_empty()
+                }),
             };
             if message.is_none() && commentary.tool.is_empty() && commentary.check.is_empty() {
                 continue;
@@ -203,7 +206,8 @@ impl Exchange {
                         if !matches!(
                             message.role(),
                             None | Some(crate::backend::MessageRole::Response)
-                        ) {
+                        ) || message.text().trim().is_empty()
+                        {
                             continue;
                         }
                     }
@@ -220,7 +224,10 @@ impl Exchange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+    use crate::backend::{
+        BackendEvent, MessageRole, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome,
+        ToolUpdate,
+    };
     use crate::exchange::InputIntent;
     use serde_json::json;
 
@@ -232,50 +239,47 @@ mod tests {
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
         exchange.resume(0)?;
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "assistant_message".into(),
-            text: Some("Inspect files".into()),
-            data: json!({"params":{"itemId":"thought","phase":"commentary"}}),
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        };
-        crate::turn::test_support::set_message(
-            &mut event,
+        let event = crate::turn::test_support::message(
+            &address,
             "thought",
-            crate::backend::MessageRole::Commentary,
+            Some(MessageRole::Commentary),
+            "Inspect files",
         );
         exchange.observe_turn(&event, 1)?;
-        event.kind = "tool".into();
-        event.message = None;
-        event.text = None;
-        event.data = serde_json::Value::Null;
-        event.activity = Some(ToolActivity {
-            id: "before".into(),
-            title: "inspect".into(),
-            kind: ToolActivityKind::Command,
-            output: None,
-            output_delta: false,
-            status: Some(crate::backend::ToolStatus::Running),
-            change: Default::default(),
-        });
+        let mut event = BackendEvent::Tool {
+            address: crate::backend::ToolAddress {
+                turn: address,
+                tool_id: "before".into(),
+            },
+            update: ToolUpdate::Requested {
+                invocation: ToolInvocation {
+                    title: "inspect".into(),
+                    name: "inspect".into(),
+                    kind: ToolActivityKind::Command,
+                    arguments: json!({}),
+                },
+            },
+        };
         exchange.observe_turn(&event, 2)?;
         exchange.append_input(InputIntent::Steering, "Include tests".into(), 3)?;
-        event.activity.as_mut().unwrap().id = "after".into();
+        if let BackendEvent::Tool { address, .. } = &mut event {
+            address.tool_id = "after".into();
+        }
         exchange.observe_turn(&event, 4)?;
-        event.activity.as_mut().unwrap().id = "before".into();
-        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
-        event.activity.as_mut().unwrap().output = Some("Late result".into());
+        if let BackendEvent::Tool { address, update } = &mut event {
+            address.tool_id = "before".into();
+            *update = ToolUpdate::Output {
+                update: TextUpdate::Replace("Late result".into()),
+            };
+        }
+        exchange.observe_turn(&event, 5)?;
+        if let BackendEvent::Tool { update, .. } = &mut event {
+            *update = ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            };
+        }
         exchange.observe_turn(&event, 5)?;
         exchange.observe_turn(&event, 6)?;
         let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
@@ -308,100 +312,99 @@ mod tests {
             "prompt":"Work", "state":"running", "created_at_ms":0,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "assistant_message".into(),
-            text: Some("Initial work".into()),
-            data: json!({"provider_message_id":"first","phase":"commentary"}),
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        };
-        crate::turn::test_support::set_message(
-            &mut event,
+        let event = crate::turn::test_support::message(
+            &address,
             "first",
-            crate::backend::MessageRole::Commentary,
+            Some(MessageRole::Commentary),
+            "Initial work",
         );
         exchange.observe_turn(&event, 1)?;
-        event.kind = "tool".into();
-        event.message = None;
-        event.text = None;
-        event.activity = Some(ToolActivity {
-            id: "earlier".into(),
-            kind: ToolActivityKind::Command,
-            title: "earlier".into(),
-            output: None,
-            output_delta: false,
-            status: Some(crate::backend::ToolStatus::Succeeded),
-            change: Default::default(),
-        });
-        exchange.observe_turn(&event, 2)?;
+        crate::turn::test_support::tool(
+            &mut exchange,
+            &address,
+            "earlier",
+            ToolInvocation {
+                kind: ToolActivityKind::Command,
+                name: "earlier".into(),
+                title: "earlier".into(),
+                arguments: json!({}),
+            },
+            [
+                ToolUpdate::Started,
+                ToolUpdate::Finished {
+                    outcome: ToolOutcome::Succeeded,
+                },
+            ],
+            2,
+        )?;
         exchange.append_input(InputIntent::Steering, "Run checks".into(), 3)?;
-        event.kind = "assistant_message".into();
-        event.text = Some("I will run the relevant checks".into());
-        event.activity = None;
-        event.data = json!({"provider_message_id":"ack","phase":"commentary"});
-        crate::turn::test_support::set_message(
-            &mut event,
+        let event = crate::turn::test_support::message(
+            &address,
             "ack",
-            crate::backend::MessageRole::Commentary,
+            Some(MessageRole::Commentary),
+            "I will run the relevant checks",
         );
         exchange.observe_turn(&event, 4)?;
         let acknowledgement = exchange.node_list.last().unwrap().id().to_owned();
         exchange.append_input(InputIntent::Steering, "That was temporary".into(), 5)?;
-        event.kind = "tool".into();
-        event.message = None;
-        event.text = None;
-        event.data = serde_json::Value::Null;
         for index in 0..6 {
-            event.activity = Some(ToolActivity {
-                id: format!("command-{index}"),
-                kind: ToolActivityKind::Command,
-                title: format!("inspect {index}"),
-                output: None,
-                output_delta: false,
-                status: Some(crate::backend::ToolStatus::Succeeded),
-                change: Default::default(),
-            });
-            exchange.observe_turn(&event, index + 6)?;
+            crate::turn::test_support::tool(
+                &mut exchange,
+                &address,
+                &format!("command-{index}"),
+                ToolInvocation {
+                    kind: ToolActivityKind::Command,
+                    name: "inspect".into(),
+                    title: format!("inspect {index}"),
+                    arguments: json!({}),
+                },
+                [
+                    ToolUpdate::Started,
+                    ToolUpdate::Finished {
+                        outcome: ToolOutcome::Succeeded,
+                    },
+                ],
+                index + 6,
+            )?;
         }
-        event.activity = Some(ToolActivity {
-            id: "write".into(),
-            kind: ToolActivityKind::FileChange,
-            title: "edit".into(),
-            output: None,
-            output_delta: false,
-            status: Some(crate::backend::ToolStatus::Succeeded),
-            change: ProviderChangeSet {
-                file: (0..9)
-                    .map(|index| ProviderFileChange {
-                        path: format!("file-{index}.rs"),
-                        move_path: None,
-                        kind: ProviderChangeKind::Add,
-                        diff: format!("@@ -0,0 +1 @@\n+file {index}\n"),
-                    })
-                    .collect(),
+        crate::turn::test_support::tool(
+            &mut exchange,
+            &address,
+            "write",
+            ToolInvocation {
+                kind: ToolActivityKind::FileChange,
+                name: "edit".into(),
+                title: "edit".into(),
+                arguments: json!({}),
             },
-        });
-        exchange.observe_turn(&event, 12)?;
+            [
+                ToolUpdate::Started,
+                ToolUpdate::Changes {
+                    changes: ProviderChangeSet {
+                        file: (0..9)
+                            .map(|index| ProviderFileChange {
+                                path: format!("file-{index}.rs"),
+                                move_path: None,
+                                kind: ProviderChangeKind::Add,
+                                diff: format!("@@ -0,0 +1 @@\n+file {index}\n"),
+                            })
+                            .collect(),
+                    },
+                },
+                ToolUpdate::Finished {
+                    outcome: ToolOutcome::Succeeded,
+                },
+            ],
+            12,
+        )?;
         let running = exchange.clone();
-        event.kind = "assistant_message".into();
-        event.text = Some("Admission now reads committed state".into());
-        event.activity = None;
-        event.data = json!({"provider_message_id":"next","phase":"commentary"});
-        crate::turn::test_support::set_message(
-            &mut event,
+        let event = crate::turn::test_support::message(
+            &address,
             "next",
-            crate::backend::MessageRole::Commentary,
+            Some(MessageRole::Commentary),
+            "Admission now reads committed state",
         );
         exchange.observe_turn(&event, 13)?;
         let settled_group = exchange.clone();
@@ -482,48 +485,38 @@ mod tests {
                     "prompt":"Work", "state":"running", "created_at_ms":0,
                     "attributed_matches_checkpoint":false, "node_list":[]
                 }))?;
-                let address = ProviderAddress {
-                    owner: None,
-                    thread_id: "thread".into(),
-                    turn_id: "turn".into(),
-                };
+                let address = crate::turn::test_support::address(&exchange, "turn");
                 exchange.start_turn(address.clone(), 0)?;
-                let mut event = BackendEvent {
-                    message: None,
-                    received_at_ms: None,
-                    address: Some(address),
-                    turn_boundary: None,
-                    kind: "assistant_message".into(),
-                    text: Some("Existing message".into()),
-                    data: json!({"phase":phase}),
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                };
-                crate::turn::test_support::set_message(
-                    &mut event,
+                let event = crate::turn::test_support::message(
+                    &address,
                     "existing",
-                    if phase == "commentary" {
+                    Some(if phase == "commentary" {
                         crate::backend::MessageRole::Commentary
                     } else {
                         crate::backend::MessageRole::Response
-                    },
+                    }),
+                    "Existing message",
                 );
                 exchange.observe_turn(&event, 1)?;
                 exchange.append_input(intent, "New input".into(), 2)?;
-                event.kind = "tool".into();
-                event.message = None;
-                event.text = None;
-                event.activity = Some(ToolActivity {
-                    id: "later".into(),
-                    kind: ToolActivityKind::Command,
-                    title: "later".into(),
-                    output: None,
-                    output_delta: false,
-                    status: Some(crate::backend::ToolStatus::Succeeded),
-                    change: Default::default(),
-                });
-                exchange.observe_turn(&event, 3)?;
+                crate::turn::test_support::tool(
+                    &mut exchange,
+                    &address,
+                    "later",
+                    ToolInvocation {
+                        kind: ToolActivityKind::Command,
+                        name: "later".into(),
+                        title: "later".into(),
+                        arguments: json!({}),
+                    },
+                    [
+                        ToolUpdate::Started,
+                        ToolUpdate::Finished {
+                            outcome: ToolOutcome::Succeeded,
+                        },
+                    ],
+                    3,
+                )?;
                 let content =
                     exchange.content(&exchange.node_list.iter().collect::<Vec<_>>(), true)?;
                 let retained = intent == InputIntent::Steering && phase == "commentary";

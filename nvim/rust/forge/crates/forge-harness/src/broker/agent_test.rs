@@ -317,22 +317,84 @@ fn admitted_request_fixture(
     }
 }
 
-fn child_event(kind: &str) -> BackendEvent {
-    BackendEvent {
-        message: None,
-        received_at_ms: None,
-        address: Some(crate::backend::ProviderAddress {
-            owner: None,
-            thread_id: "durable-child-conversation".into(),
-            turn_id: "child-turn".into(),
-        }),
-        turn_boundary: (kind == "turn_started").then_some(crate::backend::TurnBoundary::Started),
-        kind: kind.into(),
-        text: None,
-        data: Value::Null,
-        activity: None,
-        summary: None,
-        checklist_update: None,
+fn child_address() -> crate::backend::TurnAddress {
+    crate::backend::test_support::address(
+        &crate::backend::test_support::scope(),
+        "durable-child-conversation",
+        "child-turn",
+    )
+}
+
+fn child_event(update: crate::backend::TurnUpdate) -> BackendEvent {
+    BackendEvent::Turn {
+        address: child_address(),
+        update,
+    }
+}
+
+fn child_message(
+    id: impl Into<String>,
+    role: crate::backend::MessageRole,
+    text: impl Into<String>,
+) -> Vec<BackendEvent> {
+    completed_message(&child_address(), id, role, text)
+}
+
+fn child_tool(output: String, status: crate::backend::ToolStatus) -> Vec<BackendEvent> {
+    crate::backend::test_support::tool(
+        &child_address(),
+        "same-provider-call".into(),
+        crate::backend::ToolInvocation {
+            kind: crate::backend::ToolActivityKind::Command,
+            name: "inspect".into(),
+            title: "Inspect compilation diagnostics".into(),
+            arguments: Value::Null,
+        },
+        crate::turn::test_support::tool_updates(status, Some(output), Default::default()),
+    )
+}
+
+impl HarnessBroker {
+    async fn observe_child_fixture(
+        &mut self,
+        owner: crate::backend::ExecutionOwner,
+        task_id: &str,
+        batch: impl Into<crate::backend::test_support::FixtureBatch>,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        use crate::backend::test_support::FixtureBatch;
+        let updates = match batch.into() {
+            FixtureBatch::Event(event) => vec![event],
+            FixtureBatch::Sequence(event) => event,
+        };
+        let scope = crate::backend::InvocationScope {
+            owner: owner.clone(),
+            exchange_id: task_id.into(),
+            invocation_id: format!("fixture:{task_id}").into(),
+        };
+        for mut update in updates {
+            match &mut update {
+                BackendEvent::Message { address, .. } => address.turn.scope = scope.clone(),
+                BackendEvent::Tool { address, .. } => address.turn.scope = scope.clone(),
+                BackendEvent::Turn { address, .. }
+                | BackendEvent::Usage { address, .. }
+                | BackendEvent::Checklist { address, .. } => address.scope = scope.clone(),
+                BackendEvent::Runtime { scope: binding, .. }
+                | BackendEvent::Agent { scope: binding, .. }
+                | BackendEvent::Approval { scope: binding, .. }
+                | BackendEvent::DirectoryAccess { scope: binding, .. }
+                | BackendEvent::InputAccepted { scope: binding, .. }
+                | BackendEvent::Retry { scope: binding, .. }
+                | BackendEvent::ParentBoundary { scope: binding, .. } => *binding = scope.clone(),
+                BackendEvent::Compaction { scope: binding, .. }
+                | BackendEvent::Diagnostic { scope: binding, .. } => {
+                    *binding = scope.clone().into()
+                }
+            }
+            self.observe_managed_agent(owner.clone(), task_id, update, event)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -366,37 +428,31 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         agent_id: (admission.agent.id.clone()).into(),
     };
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event("turn_started"),
+            child_event(crate::backend::TurnUpdate::Started { started_at_ms: 0 }),
             &mut Vec::new(),
         )
         .await?;
     for ordinal in 0..6 {
-        let mut thought = child_event("assistant_message");
-        thought.text = Some(if ordinal == 5 {
-            "思".repeat(4001)
-        } else {
-            format!("Thought {ordinal}")
-        });
-        thought.message = Some(completed_message(
+        let thought = child_message(
             format!("thought-{ordinal}"),
             crate::backend::MessageRole::Commentary,
-            thought.text.as_deref().unwrap(),
-        ));
+            if ordinal == 5 {
+                "思".repeat(4001)
+            } else {
+                format!("Thought {ordinal}")
+            },
+        );
         broker
-            .observe_managed_agent(owner.clone(), &admission.task.id, thought, &mut Vec::new())
+            .observe_child_fixture(owner.clone(), &admission.task.id, thought, &mut Vec::new())
             .await?;
     }
     let source = format!("{}\0tail", "output-é😀".repeat(9000));
-    let mut update = child_event("tool");
-    update.activity = Some(serde_json::from_value(
-        json!({"id":"same-provider-call","kind":"command",
-        "title":"Inspect compilation diagnostics","status":"running","output":source}),
-    )?);
+    let mut update = child_tool(source.clone(), crate::backend::ToolStatus::Running);
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
             update.clone(),
@@ -426,17 +482,16 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         agent_id: (sibling.agent.id.clone()).into(),
     };
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             sibling_owner.clone(),
             &sibling.task.id,
-            child_event("turn_started"),
+            child_event(crate::backend::TurnUpdate::Started { started_at_ms: 0 }),
             &mut Vec::new(),
         )
         .await?;
-    let mut sibling_tool = update.clone();
-    sibling_tool.activity.as_mut().unwrap().output = Some("SIBLING OUTPUT".into());
+    let sibling_tool = child_tool("SIBLING OUTPUT".into(), crate::backend::ToolStatus::Running);
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             sibling_owner,
             &sibling.task.id,
             sibling_tool,
@@ -495,10 +550,17 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
     .await?;
     assert_eq!(tail["output"], "\0tail");
     assert!(tail["next_offset"].is_null());
-    update.activity.as_mut().unwrap().output = Some("APPENDED".into());
-    update.activity.as_mut().unwrap().output_delta = true;
+    update = vec![BackendEvent::Tool {
+        address: crate::backend::ToolAddress {
+            turn: child_address(),
+            tool_id: "same-provider-call".into(),
+        },
+        update: crate::backend::ToolUpdate::Output {
+            update: crate::backend::TextUpdate::Append("APPENDED".into()),
+        },
+    }];
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
             update.clone(),
@@ -624,26 +686,22 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         "queued follow-up must not hide active progress"
     );
 
-    update.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Failed);
-    update.activity.as_mut().unwrap().output_delta = false;
-    update.activity.as_mut().unwrap().output = Some("failure details".into());
+    update = child_tool("failure details".into(), crate::backend::ToolStatus::Failed);
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
             update.clone(),
             &mut Vec::new(),
         )
         .await?;
-    let mut final_message = child_event("assistant_message");
-    final_message.text = Some("FINAL ANSWER MUST NOT ENTER ACTIVITY".into());
-    final_message.message = Some(completed_message(
+    let final_message = child_message(
         "final",
         crate::backend::MessageRole::Response,
         "FINAL ANSWER MUST NOT ENTER ACTIVITY",
-    ));
+    );
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
             final_message,
@@ -794,10 +852,10 @@ async fn child_summary_preserves_running_exchange_when_followup_is_queued() -> R
         agent_id: (admission.agent.id.clone()).into(),
     };
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             owner,
             &admission.task.id,
-            child_event("turn_started"),
+            child_event(crate::backend::TurnUpdate::Started { started_at_ms: 0 }),
             &mut Vec::new(),
         )
         .await?;
@@ -966,7 +1024,7 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let first = admit_child_fixture(&mut broker, "approval-first")?;
     let sibling = admit_child_fixture(&mut broker, "approval-sibling")?;
-    let (sink, mut stream) = crate::backend::events::channel();
+    let mut approval_streams = Vec::new();
     let mut waiters = Vec::new();
     let mut event = Vec::new();
     for admission in [&first, &sibling] {
@@ -975,15 +1033,20 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
             agent_id: (admission.agent.id.clone()).into(),
         };
         broker
-            .observe_managed_agent(
+            .observe_child_fixture(
                 owner.clone(),
                 &admission.task.id,
-                child_event("turn_started"),
+                child_event(crate::backend::TurnUpdate::Started { started_at_ms: 0 }),
                 &mut event,
             )
             .await?;
         let permission = broker.permission_coordinator.clone();
-        let sink = sink.clone();
+        let scope = crate::backend::InvocationScope {
+            owner: owner.clone(),
+            exchange_id: admission.task.id.clone().into(),
+            invocation_id: format!("fixture:{}", admission.task.id).into(),
+        };
+        let (sink, mut stream) = crate::backend::events::channel(scope.clone());
         waiters.push(tokio::spawn(async move {
             permission
                 .authorize(
@@ -997,8 +1060,8 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
                             shell: None,
                         }],
                     },
-                    Some(crate::backend::ProviderAddress {
-                        owner: Some(owner),
+                    Some(crate::backend::TurnAddress {
+                        scope,
                         thread_id: "durable-child-conversation".into(),
                         turn_id: "child-turn".into(),
                     }),
@@ -1009,12 +1072,13 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
         let requested = tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv())
             .await??
             .context("approval event missing")?;
+        approval_streams.push(stream);
         let owner = crate::backend::ExecutionOwner {
             session_id: (broker.session.id.clone()).into(),
             agent_id: (admission.agent.id.clone()).into(),
         };
         broker
-            .observe_managed_agent(owner, &admission.task.id, requested, &mut event)
+            .observe_child_fixture(owner, &admission.task.id, requested, &mut event)
             .await?;
         let activity = query_child(
             &mut broker,
@@ -1106,10 +1170,10 @@ async fn interrupted_child_retains_conversation_and_all_children_guard_workspace
     };
     let mut event = Vec::new();
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event("turn_started"),
+            child_event(crate::backend::TurnUpdate::Started { started_at_ms: 0 }),
             &mut event,
         )
         .await?;
@@ -1275,29 +1339,16 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
         admission.push(admitted);
     }
     let mut event = Vec::new();
-    let mut update = BackendEvent {
-        message: None,
-        received_at_ms: None,
-        address: Some(crate::backend::ProviderAddress {
-            owner: None,
-            thread_id: "shared-native-id".into(),
-            turn_id: "turn".into(),
-        }),
-        turn_boundary: Some(crate::backend::TurnBoundary::Started),
-        kind: "turn_started".into(),
-        text: None,
-        data: Value::Null,
-        activity: None,
-        summary: None,
-        checklist_update: None,
-    };
+    let mut update = vec![child_event(crate::backend::TurnUpdate::Started {
+        started_at_ms: 0,
+    })];
     for admitted in &admission {
         let owner = crate::backend::ExecutionOwner {
             session_id: (broker.session.id.clone()).into(),
             agent_id: (admitted.agent.id.clone()).into(),
         };
         broker
-            .observe_managed_agent(owner, &admitted.task.id, update.clone(), &mut event)
+            .observe_child_fixture(owner, &admitted.task.id, update.clone(), &mut event)
             .await?;
     }
     let first = &admission[0];
@@ -1305,19 +1356,16 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
         session_id: (broker.session.id.clone()).into(),
         agent_id: (first.agent.id.clone()).into(),
     };
-    update.turn_boundary = None;
-    update.kind = "assistant_message".into();
-    update.text = Some("First child thought".into());
-    update.message = Some(completed_message(
+    update = child_message(
         "thought",
         crate::backend::MessageRole::Commentary,
         "First child thought",
-    ));
+    );
     broker
-        .observe_managed_agent(owner.clone(), &first.task.id, update.clone(), &mut event)
+        .observe_child_fixture(owner.clone(), &first.task.id, update.clone(), &mut event)
         .await?;
     broker
-        .observe_managed_agent(owner.clone(), &first.task.id, update.clone(), &mut event)
+        .observe_child_fixture(owner.clone(), &first.task.id, update.clone(), &mut event)
         .await?;
     let retained = broker.store.load_exchange(&first.task.id)?.unwrap();
     assert_eq!(
@@ -1339,13 +1387,15 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
             .is_empty()
     );
     let mut foreign = update.clone();
-    foreign.address.as_mut().unwrap().owner = Some(crate::backend::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (admission[1].agent.id.clone()).into(),
-    });
+    if let BackendEvent::Message { address, .. } = &mut foreign[0] {
+        address.turn.scope.owner = crate::backend::ExecutionOwner {
+            session_id: broker.session.id.clone().into(),
+            agent_id: admission[1].agent.id.clone().into(),
+        };
+    }
     assert!(
         broker
-            .observe_managed_agent(owner.clone(), &first.task.id, foreign, &mut event)
+            .observe_managed_agent(owner.clone(), &first.task.id, foreign.remove(0), &mut event)
             .await
             .is_err()
     );
@@ -1377,14 +1427,13 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
         broker.agent_coordinator.resolve(&first.agent.id)?.inbox[0].message,
         "Retain after rejected steering"
     );
-    update.text = Some("Child final response".into());
-    update.message = Some(completed_message(
+    update = child_message(
         "final",
         crate::backend::MessageRole::Response,
         "Child final response",
-    ));
+    );
     broker
-        .observe_managed_agent(owner.clone(), &first.task.id, update.clone(), &mut event)
+        .observe_child_fixture(owner.clone(), &first.task.id, update.clone(), &mut event)
         .await?;
     broker
         .complete_managed_agent(
@@ -1428,35 +1477,32 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
             work
         }
     };
-    update.turn_boundary = Some(crate::backend::TurnBoundary::Started);
-    update.text = None;
-    update.message = None;
+    update = vec![child_event(crate::backend::TurnUpdate::Started {
+        started_at_ms: 0,
+    })];
     broker
-        .observe_managed_agent(owner.clone(), &next.task.id, update.clone(), &mut event)
+        .observe_child_fixture(owner.clone(), &next.task.id, update.clone(), &mut event)
         .await?;
-    update.turn_boundary = None;
-    update.text = Some("New task thought".into());
-    update.message = Some(completed_message(
+    update = child_message(
         "next-thought",
         crate::backend::MessageRole::Commentary,
         "New task thought",
-    ));
+    );
     broker
-        .observe_managed_agent(owner.clone(), &next.task.id, update.clone(), &mut event)
+        .observe_child_fixture(owner.clone(), &next.task.id, update.clone(), &mut event)
         .await?;
     assert_eq!(
         broker.store.load_exchange(&next.task.id)?.unwrap().turn[0].messages()[0].text(),
         "New task thought"
     );
     let saved_next = serde_json::to_value(broker.store.load_exchange(&next.task.id)?)?;
-    update.text = Some("LATE OLD TASK".into());
-    update.message = Some(completed_message(
+    update = child_message(
         "late-old-task",
         crate::backend::MessageRole::Commentary,
         "LATE OLD TASK",
-    ));
+    );
     broker
-        .observe_managed_agent(owner.clone(), &first.task.id, update, &mut event)
+        .observe_child_fixture(owner.clone(), &first.task.id, update, &mut event)
         .await?;
     broker
         .complete_managed_agent(
@@ -1543,8 +1589,13 @@ impl Backend for RoutingBackend {
         &self,
         request: BackendRequest,
         sink: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion> {
-        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+    ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+        let fixture_scope = sink.invocation_scope()?.clone();
+        let fixture = crate::backend::test_support::FixtureStream::new(sink);
+        let sink = fixture.clone();
+        let result: anyhow::Result<crate::backend::BackendCompletion> = async {
+
+        let output: anyhow::Result<crate::backend::BackendCompletion> = async {
 let sink = Some(sink);
         let ordinal = self.turn.fetch_add(1, Ordering::AcqRel);
         let response = if request.owner()?.is_root() {
@@ -1590,32 +1641,27 @@ let sink = Some(sink);
             "CHILD_RESULT"
         };
         if let Some(sink) = sink {
-            sink.send_wait(BackendEvent { message: Some(completed_message(
+            sink.send_wait(completed_message(&crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
                 "routing-response", crate::backend::MessageRole::Response, response,
-            )),
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "assistant_message".into(),
-                text: Some(response.into()),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            })
+            ))
             .await?;
         }
-        Ok(crate::backend::BackendOutput { event: Vec::new(), completion: crate::backend::BackendCompletion { backend_session_id: Some(
+        Ok(crate::backend::BackendCompletion { backend_session_id: Some(
                 if request.owner()?.is_root() {
                     "root-history"
                 } else {
                     "child-history"
                 }
                 .into(),
-            ), capability: self.descriptor().capability, ..Default::default() } })
+            ), capability: self.descriptor().capability, ..Default::default() })
 
         }.await;
-        Ok(output?.into_completion())
+        Ok(output?)
+
+        }.await;
+        let result = result.map_err(crate::backend::BackendError::from);
+        fixture.finish(&result).await?;
+        result
     }
 }
 
@@ -1854,69 +1900,65 @@ impl Backend for ResultReceivingBackend {
         &self,
         request: BackendRequest,
         sink: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion> {
-        let output: anyhow::Result<crate::backend::BackendOutput> = async {
-            let sink = Some(sink);
-            self.turn.fetch_add(1, Ordering::AcqRel);
-            self.input.lock().unwrap().push(request.input.text());
-            self.active.store(true, Ordering::Release);
-            if !request.input.text().starts_with("EXPLICIT_NEXT_TURN") {
-                let scope = request
-                    .control_context
-                    .as_ref()
-                    .and_then(|context| context.agent.as_ref())
-                    .context("root authority missing")?;
-                for task in ["first", "second"] {
-                    scope
-                        .invoke(
-                            "agent_spawn",
-                            json!({"profile":"worker","text":format!("CHILD_REPORT_{task}")}),
-                        )
-                        .await?;
-                }
-                loop {
-                    let notified = self.incoming.notified();
-                    for (message, receipt) in self.receipt.lock().unwrap().drain(..) {
-                        self.message.lock().unwrap().push(message);
-                        let _ = receipt.send(());
+    ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+        let fixture_scope = sink.invocation_scope()?.clone();
+        let fixture = crate::backend::test_support::FixtureStream::new(sink);
+        let sink = fixture.clone();
+        let result: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+                let sink = Some(sink);
+                self.turn.fetch_add(1, Ordering::AcqRel);
+                self.input.lock().unwrap().push(request.input.text());
+                self.active.store(true, Ordering::Release);
+                if !request.input.text().starts_with("EXPLICIT_NEXT_TURN") {
+                    let scope = request
+                        .control_context
+                        .as_ref()
+                        .and_then(|context| context.agent.as_ref())
+                        .context("root authority missing")?;
+                    for task in ["first", "second"] {
+                        scope
+                            .invoke(
+                                "agent_spawn",
+                                json!({"profile":"worker","text":format!("CHILD_REPORT_{task}")}),
+                            )
+                            .await?;
                     }
-                    if self.message.lock().unwrap().len() == 2 {
-                        break;
+                    loop {
+                        let notified = self.incoming.notified();
+                        for (message, receipt) in self.receipt.lock().unwrap().drain(..) {
+                            self.message.lock().unwrap().push(message);
+                            let _ = receipt.send(());
+                        }
+                        if self.message.lock().unwrap().len() == 2 {
+                            break;
+                        }
+                        notified.await;
                     }
-                    notified.await;
                 }
-            }
-            self.active.store(false, Ordering::Release);
-            if let Some(sink) = sink {
-                sink.send_wait(BackendEvent {
-                    message: Some(completed_message(
+                self.active.store(false, Ordering::Release);
+                if let Some(sink) = sink {
+                    sink.send_wait(completed_message(
+                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
                         "synthesized-response",
                         crate::backend::MessageRole::Response,
                         "SYNTHESIZED_RESULT",
-                    )),
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "assistant_message".into(),
-                    text: Some("SYNTHESIZED_RESULT".into()),
-                    data: Value::Null,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                })
-                .await?;
-            }
-            Ok(crate::backend::BackendOutput {
-                event: Vec::new(),
-                completion: crate::backend::BackendCompletion {
+                    ))
+                    .await?;
+                }
+                Ok(crate::backend::BackendCompletion {
                     backend_session_id: Some("result-parent-history".into()),
                     capability: self.descriptor().capability,
                     ..Default::default()
-                },
-            })
+                })
+            }
+            .await;
+            Ok(output?)
         }
         .await;
-        Ok(output?.into_completion())
+        let result = result.map_err(crate::backend::BackendError::from);
+        fixture.finish(&result).await?;
+        result
     }
 }
 
@@ -2001,29 +2043,27 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
     };
     let mut event = Vec::new();
     broker
-        .observe_managed_agent(
+        .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event("turn_started"),
+            child_event(crate::backend::TurnUpdate::Started { started_at_ms: 0 }),
             &mut event,
         )
         .await?;
-    let mut response = child_event("assistant_message");
-    response.text = Some("RETAINED_CHILD_REPORT".into());
-    response.message = Some(completed_message(
+    let response = child_message(
         "result",
         crate::backend::MessageRole::Response,
         "RETAINED_CHILD_REPORT",
-    ));
+    );
     broker
-        .observe_managed_agent(owner.clone(), &admission.task.id, response, &mut event)
+        .observe_child_fixture(owner.clone(), &admission.task.id, response, &mut event)
         .await?;
-    let mut finished = child_event("turn_completed");
-    finished.turn_boundary = Some(crate::backend::TurnBoundary::Finished {
+    let finished = child_event(crate::backend::TurnUpdate::Finished {
         outcome: crate::turn::TurnOutcome::Completed,
+        completed_at_ms: 100,
     });
     broker
-        .observe_managed_agent(owner.clone(), &admission.task.id, finished, &mut event)
+        .observe_child_fixture(owner.clone(), &admission.task.id, finished, &mut event)
         .await?;
     broker
         .complete_managed_agent(
@@ -2168,71 +2208,67 @@ impl Backend for SuspendedParentBackend {
         &self,
         request: BackendRequest,
         sink: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion> {
-        let output: anyhow::Result<crate::backend::BackendOutput> = async {
-            let sink = Some(sink);
-            let response = if request.owner()?.is_root() {
-                self.input.lock().unwrap().push(request.input.text());
-                let ordinal = self.root_turn.fetch_add(1, Ordering::AcqRel);
-                if ordinal == 0 {
-                    let scope = request
-                        .control_context
-                        .as_ref()
-                        .and_then(|context| context.agent.as_ref())
-                        .context("root authority missing")?;
-                    for name in ["ONE", "TWO"] {
-                        scope
-                            .invoke(
-                                "agent_spawn",
-                                json!({"profile":"worker","text":format!("CHILD_{name}")}),
-                            )
-                            .await?;
+    ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+        let fixture_scope = sink.invocation_scope()?.clone();
+        let fixture = crate::backend::test_support::FixtureStream::new(sink);
+        let sink = fixture.clone();
+        let result: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+                let sink = Some(sink);
+                let response = if request.owner()?.is_root() {
+                    self.input.lock().unwrap().push(request.input.text());
+                    let ordinal = self.root_turn.fetch_add(1, Ordering::AcqRel);
+                    if ordinal == 0 {
+                        let scope = request
+                            .control_context
+                            .as_ref()
+                            .and_then(|context| context.agent.as_ref())
+                            .context("root authority missing")?;
+                        for name in ["ONE", "TWO"] {
+                            scope
+                                .invoke(
+                                    "agent_spawn",
+                                    json!({"profile":"worker","text":format!("CHILD_{name}")}),
+                                )
+                                .await?;
+                        }
                     }
-                }
-                self.root_started.add_permits(1);
-                "PARENT_RESPONSE".to_owned()
-            } else {
-                let index = usize::from(request.input.text().ends_with("CHILD_TWO"));
-                self.child_started.add_permits(1);
-                self.child_release[index].acquire().await?.forget();
-                format!("RESULT_{}", if index == 0 { "ONE" } else { "TWO" })
-            };
-            if let Some(sink) = sink {
-                sink.send_wait(BackendEvent {
-                    message: Some(completed_message(
+                    self.root_started.add_permits(1);
+                    "PARENT_RESPONSE".to_owned()
+                } else {
+                    let index = usize::from(request.input.text().ends_with("CHILD_TWO"));
+                    self.child_started.add_permits(1);
+                    self.child_release[index].acquire().await?.forget();
+                    format!("RESULT_{}", if index == 0 { "ONE" } else { "TWO" })
+                };
+                if let Some(sink) = sink {
+                    sink.send_wait(completed_message(
+                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
                         "suspended-response",
                         crate::backend::MessageRole::Response,
                         response.clone(),
-                    )),
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "assistant_message".into(),
-                    text: Some(response),
-                    data: Value::Null,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                })
-                .await?;
-            }
-            let mut output = crate::backend::BackendOutput {
-                event: Vec::new(),
-                completion: crate::backend::BackendCompletion {
+                    ))
+                    .await?;
+                }
+                let mut output = crate::backend::BackendCompletion {
                     backend_session_id: Some("suspended-history".into()),
                     capability: self.descriptor().capability,
                     ..Default::default()
-                },
-            };
-            if self.blocked.load(Ordering::Acquire) && request.input.text() == "Research both" {
-                output.plan_question = Some(crate::plan::PlanQuestionSet::freeform(
-                    "Which research scope?".into(),
-                ));
+                };
+                if self.blocked.load(Ordering::Acquire) && request.input.text() == "Research both" {
+                    output.plan_question = Some(crate::plan::PlanQuestionSet::freeform(
+                        "Which research scope?".into(),
+                    ));
+                }
+                Ok(output)
             }
-            Ok(output)
+            .await;
+            Ok(output?)
         }
         .await;
-        Ok(output?.into_completion())
+        let result = result.map_err(crate::backend::BackendError::from);
+        fixture.finish(&result).await?;
+        result
     }
 }
 

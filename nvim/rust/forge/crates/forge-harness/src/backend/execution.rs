@@ -60,6 +60,9 @@ execution_identity!(SessionId);
 execution_identity!(AgentId);
 execution_identity!(ExchangeId);
 execution_identity!(TaskId);
+execution_identity!(InvocationId);
+execution_identity!(ProviderTurnId);
+execution_identity!(ToolId);
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 /// Identifies the root session and the single agent that owns a provider runtime.
@@ -104,27 +107,90 @@ impl ExecutionOwner {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-/// Identifies exactly one execution in one provider conversation.
-pub struct ProviderAddress {
-    /// Retains exact agent ownership when multiple conversations share a provider.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<ExecutionOwner>,
-    /// Provider conversation containing the turn.
-    pub thread_id: String,
-    /// Provider execution identifier, never inferred from a UI segment.
-    pub turn_id: String,
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct InvocationScope {
+    pub owner: ExecutionOwner,
+    pub exchange_id: ExchangeId,
+    pub invocation_id: InvocationId,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+impl InvocationScope {
+    pub fn new(owner: ExecutionOwner, exchange_id: impl Into<ExchangeId>) -> Self {
+        Self {
+            owner,
+            exchange_id: exchange_id.into(),
+            invocation_id: uuid::Uuid::new_v4().to_string().into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-/// A provider lifecycle boundary normalized before broker routing.
-pub enum TurnBoundary {
-    /// The provider admitted a new execution.
-    Started,
-    /// The provider permanently settled an execution.
+pub enum EventScope {
+    Invocation {
+        invocation: InvocationScope,
+    },
+    SessionOperation {
+        owner: ExecutionOwner,
+        operation_id: String,
+    },
+}
+
+impl From<InvocationScope> for EventScope {
+    fn from(invocation: InvocationScope) -> Self {
+        Self::Invocation { invocation }
+    }
+}
+
+impl EventScope {
+    pub fn owner(&self) -> &ExecutionOwner {
+        match self {
+            Self::Invocation { invocation } => &invocation.owner,
+            Self::SessionOperation { owner, .. } => owner,
+        }
+    }
+
+    pub fn invocation(&self) -> Option<&InvocationScope> {
+        match self {
+            Self::Invocation { invocation } => Some(invocation),
+            Self::SessionOperation { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct TurnAddress {
+    pub scope: InvocationScope,
+    pub thread_id: String,
+    pub turn_id: ProviderTurnId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct MessageAddress {
+    pub turn: TurnAddress,
+    pub message_id: super::MessageId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct ToolAddress {
+    pub turn: TurnAddress,
+    pub tool_id: ToolId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnUpdate {
+    Started {
+        started_at_ms: i64,
+    },
+    CallFinished {
+        completed_at_ms: i64,
+    },
+    Summary {
+        summary: super::TurnSummary,
+    },
     Finished {
-        /// Execution outcome reported by the adapter.
         outcome: TurnOutcome,
+        completed_at_ms: i64,
     },
 }

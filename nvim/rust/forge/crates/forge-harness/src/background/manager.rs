@@ -125,15 +125,17 @@ impl BackgroundManager {
             .expect("prepared Background snapshot")
             .session
             .id;
-        let (sink, mut events) = crate::backend::events::channel();
+        let (sink, mut events) = crate::broker::publication::channel();
         let delivery = request.delivery.clone();
         let progress_session = session_id.clone();
         let forward = tokio::spawn(async move {
             while let Ok(Some(event)) = events.recv().await {
-                let progress = match event.kind.as_str() {
-                    "runtime_resolved" | "reasoning_summary" => Some(json!(event)),
-                    "document_changed" => event
-                        .data
+                let progress = match &event {
+                    crate::broker::publication::SessionUpdate::Runtime { .. } => {
+                        crate::broker::publication::encode_session_update(&event).ok()
+                    }
+                    crate::broker::publication::SessionUpdate::DocumentChanged { patch } => patch
+                        .notification()
                         .get("status")
                         .map(|status| json!({"kind":"status","data":status})),
                     _ => None,
@@ -152,7 +154,7 @@ impl BackgroundManager {
         });
         let mut compaction_stream = match runtime
             .backend_handle()
-            .compaction_stream(&session_id)
+            .compaction_stream(crate::backend::ExecutionOwner::root(&session_id))
             .await
         {
             Ok(stream) => stream,
@@ -239,11 +241,14 @@ impl BackgroundManager {
                 };
                 match tokio::time::timeout_at(until, stream.recv()).await {
                     Ok(Ok(Some(event))) => {
-                        if let Ok(Some(compaction)) = event.compaction() {
+                        if let crate::backend::BackendEvent::Compaction {
+                            update: compaction, ..
+                        } = &event
+                        {
                             native_compaction_observed = true;
                             pending =
                                 if compaction.state == crate::backend::CompactionState::Running {
-                                    Some(compaction)
+                                    Some(*compaction.clone())
                                 } else {
                                     None
                                 };
@@ -263,7 +268,13 @@ impl BackgroundManager {
                             compaction.result.error =
                                 Some("Provider compaction completion was not confirmed".into());
                             let _ = broker.observe_external_compaction(
-                                crate::backend::BackendEvent::from_compaction(compaction, None),
+                                crate::backend::BackendEvent::Compaction {
+                                    scope: crate::backend::EventScope::SessionOperation {
+                                        owner: crate::backend::ExecutionOwner::root(&session_id),
+                                        operation_id: compaction.id.clone(),
+                                    },
+                                    update: Box::new(compaction),
+                                },
                             );
                             report(
                                 &request.delivery,

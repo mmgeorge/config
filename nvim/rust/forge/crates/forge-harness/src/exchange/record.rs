@@ -193,69 +193,10 @@ impl<'de> Deserialize<'de> for Exchange {
     fn deserialize<Deserializer: serde::Deserializer<'de>>(
         deserializer: Deserializer,
     ) -> Result<Self, Deserializer::Error> {
-        let mut value = serde_json::Value::deserialize(deserializer)?;
-        let mut legacy = std::collections::HashMap::new();
-        for turn in value
-            .get_mut("turn")
-            .and_then(serde_json::Value::as_array_mut)
-            .into_iter()
-            .flatten()
-        {
-            let id = turn["id"].as_str().unwrap_or_default().to_owned();
-            if let Some(tool) = turn
-                .as_object_mut()
-                .and_then(|turn| turn.remove("tool"))
-                .filter(|tool| !tool.is_null())
-            {
-                legacy.insert(
-                    id,
-                    serde_json::from_value::<crate::turn::ToolStore>(tool)
-                        .map_err(serde::de::Error::custom)?,
-                );
-            }
-        }
-        let mut exchange = ExchangeRecord::deserialize(value).map_err(serde::de::Error::custom)?;
-        for turn in &exchange.turn {
-            if let Some(store) = legacy.get(turn.id()) {
-                for tool in store.iter() {
-                    let present = exchange.node_list.iter().any(|node| matches!(node,
-                        ExchangeNode::TurnContent { turn_id, item: crate::turn::TurnItem::Tool { id }, .. }
-                        if turn_id == turn.id() && id == &tool.id));
-                    if !present {
-                        exchange.node_list.push(ExchangeNode::TurnContent {
-                            id: format!("{}:content:{}", turn.id(), tool.id),
-                            turn_id: turn.id().to_owned(),
-                            item: crate::turn::TurnItem::Tool {
-                                id: tool.id.clone(),
-                            },
-                        });
-                    }
-                }
-            }
-        }
+        let mut exchange = ExchangeRecord::deserialize(deserializer)?;
         exchange
             .reconcile_entries()
             .map_err(serde::de::Error::custom)?;
-        let positions: Vec<_> = exchange
-            .node_list
-            .iter()
-            .filter_map(|node| match node {
-                ExchangeNode::TurnContent {
-                    turn_id,
-                    item: crate::turn::TurnItem::Tool { id },
-                    ..
-                } => Some((turn_id.clone(), id.clone())),
-                _ => None,
-            })
-            .collect();
-        for (turn_id, id) in positions {
-            if let Some(tool) = legacy.get_mut(&turn_id).and_then(|store| store.take(&id)) {
-                exchange
-                    .tool_store_mut(&turn_id, &id)
-                    .map_err(serde::de::Error::custom)?
-                    .insert(tool);
-            }
-        }
         exchange.rebuild_tool_counter();
         Ok(exchange)
     }
@@ -475,38 +416,38 @@ impl Exchange {
         event: &crate::backend::BackendEvent,
         now_ms: i64,
     ) -> anyhow::Result<bool> {
-        use crate::backend::TurnBoundary;
+        use crate::backend::{BackendEvent, TurnUpdate};
         use crate::turn::TurnState;
-        if event.kind == "provider_retry" {
+        let event_scope = event.scope();
+        let Some(scope) = event_scope.invocation() else {
+            return Ok(false);
+        };
+        if (scope.exchange_id != self.id
+            && !self.turn.iter().any(|turn| &turn.provider().scope == scope))
+            || scope.owner.session_id != self.session_id
+            || scope.owner.agent_id != self.agent_id
+        {
+            return Ok(false);
+        }
+        if let BackendEvent::Retry { update, .. } = event {
             if self.state() != ExchangeState::Running
                 || self.is_finished()
-                || !event
-                    .address
-                    .as_ref()
-                    .is_some_and(|address| self.turn.iter().any(|turn| turn.provider() == address))
+                || !self.turn.iter().any(|turn| &turn.provider().scope == scope)
             {
                 return Ok(false);
             }
-            self.provider_retry = serde_json::from_value(event.data.clone())?;
+            self.provider_retry = update.clone();
             return Ok(true);
         }
-        let Some(address) = &event.address else {
-            anyhow::ensure!(
-                event.turn_boundary.is_none(),
-                "provider turn boundary has no execution address"
-            );
+        let Some(address) = event.turn_address() else {
             self.metrics.observe_elapsed(self.elapsed(now_ms));
             return Ok(true);
         };
-        if event.kind == "usage" {
+        if let BackendEvent::Usage { update, .. } = event {
             let Some(index) = self.turn.iter().position(|turn| turn.provider() == address) else {
                 return Ok(false);
             };
-            let update = serde_json::from_value(event.data.clone())?;
-            if let Some(usage) = self
-                .metrics
-                .usage(&address.thread_id, &address.turn_id, update)
-            {
+            if let Some(usage) = self.metrics.usage(address, update.clone()) {
                 self.turn[index].record_usage(usage);
                 self.metrics
                     .record_throughput(self.usage().output, self.elapsed(now_ms));
@@ -514,20 +455,50 @@ impl Exchange {
             self.metrics.observe_elapsed(self.elapsed(now_ms));
             return Ok(true);
         }
-        match event.turn_boundary {
-            Some(TurnBoundary::Started) => {
-                self.start_turn(address.clone(), now_ms)?;
+        match event {
+            BackendEvent::Turn {
+                update: TurnUpdate::Started { started_at_ms },
+                ..
+            } => {
+                self.start_turn(address.clone(), *started_at_ms)?;
             }
-            Some(TurnBoundary::Finished { outcome }) => {
+            BackendEvent::Turn {
+                update: TurnUpdate::CallFinished { completed_at_ms },
+                ..
+            } => {
+                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
+                else {
+                    return Ok(false);
+                };
+                turn.finish_call(*completed_at_ms);
+            }
+            BackendEvent::Turn {
+                update: TurnUpdate::Summary { summary },
+                ..
+            } => {
+                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
+                else {
+                    return Ok(false);
+                };
+                turn.record_summary(summary);
+            }
+            BackendEvent::Turn {
+                update:
+                    TurnUpdate::Finished {
+                        outcome,
+                        completed_at_ms,
+                    },
+                ..
+            } => {
                 let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
                 else {
                     return Ok(false);
                 };
                 let turn_id = turn.id().to_owned();
-                turn.finish(outcome, now_ms)?;
-                self.finish_tools(&turn_id, outcome, now_ms);
+                turn.finish(*outcome, *completed_at_ms)?;
+                self.finish_tools(&turn_id, *outcome, *completed_at_ms);
                 self.rebuild_tool_counter();
-                let prefix = format!("tool:{}:{}:", address.thread_id, address.turn_id);
+                let prefix = format!("tool:{turn_id}:");
                 let elapsed = self.elapsed(now_ms);
                 for id in self
                     .turn
@@ -541,26 +512,48 @@ impl Exchange {
                     self.metrics.block(id, false, elapsed);
                 }
             }
-            None => {
+            BackendEvent::Message { .. }
+            | BackendEvent::Tool { .. }
+            | BackendEvent::Checklist { .. } => {
+                let existing_tool = match event {
+                    BackendEvent::Tool {
+                        address: tool_address,
+                        ..
+                    } => self
+                        .turn
+                        .iter()
+                        .find(|turn| turn.provider() == address)
+                        .is_some_and(|turn| {
+                            self.tools_for_turn(turn.id())
+                                .any(|tool| tool.id == tool_address.tool_id.as_str())
+                        }),
+                    _ => false,
+                };
                 let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
                 else {
                     return Ok(false);
                 };
-                if turn.state() != TurnState::Running {
+                let late_update = existing_tool
+                    && matches!(
+                        event,
+                        BackendEvent::Tool {
+                            update: crate::backend::ToolUpdate::Output { .. }
+                                | crate::backend::ToolUpdate::Changes { .. }
+                                | crate::backend::ToolUpdate::SkillRead { .. },
+                            ..
+                        }
+                    );
+                if turn.state() != TurnState::Running && !late_update {
                     return Ok(false);
                 }
                 let item_count = turn.items().len();
-                let mut new_tool = false;
-                if let Some(tool_event) = event.tool_event() {
-                    let tool = tool_event.activity();
-                    new_tool = !turn.items().iter().any(|item| {
-                        matches!(item,
-                        crate::turn::TurnItem::Tool { id } if id == &tool.id)
-                    });
-                    turn.admit_tool(&tool.id)?;
+                if let BackendEvent::Tool { address, .. } = event
+                    && !existing_tool
+                {
+                    turn.admit_tool(address.tool_id.as_str())?;
                 }
-                if let Some(message) = &event.message {
-                    turn.record_message(message)?;
+                if let BackendEvent::Message { address, update } = event {
+                    turn.record_message(address, update)?;
                 }
                 let turn_id = turn.id().to_owned();
                 for item in turn.items()[item_count..].iter().cloned() {
@@ -575,55 +568,36 @@ impl Exchange {
                     });
                 }
                 self.reconcile_entries()?;
-                if let Some(tool_event) = event.tool_event() {
-                    self.record_tool_event(&turn_id, tool_event, now_ms)?;
-                    let activity = tool_event.activity();
-                    let running = self
+                if let BackendEvent::Tool { address, update } = event {
+                    self.record_tool_event(&turn_id, address, update, now_ms)?;
+                    let tool = self
                         .tools_for_turn(&turn_id)
-                        .find(|tool| tool.id == activity.id)
-                        .is_some_and(|tool| tool.state() == crate::turn::ToolState::Running);
-                    if new_tool && !running {
+                        .find(|tool| tool.id == address.tool_id.as_str())
+                        .expect("admitted tool has a durable record");
+                    let terminal = tool.state() != crate::turn::ToolState::Running;
+                    let started = tool.started_at_ms.is_some();
+                    let running = !terminal && started;
+                    if terminal && !started {
                         self.metrics.timing_complete = false;
                     }
-                    let id = format!(
-                        "tool:{}:{}:{}",
-                        address.thread_id, address.turn_id, activity.id
-                    );
-                    let elapsed = self.clock.elapsed(event.observed_at_ms(now_ms));
+                    let id = format!("tool:{turn_id}:{}", address.tool_id);
+                    let elapsed = self.clock.elapsed(now_ms);
                     self.metrics.block(id, running, elapsed);
-                }
-                if let Some(reads) = event.data.get("skill_reads") {
-                    let reads: Vec<crate::skill::SkillRead> =
-                        serde_json::from_value(reads.clone())?;
-                    for read in reads {
-                        let successful = self
-                            .turn
-                            .iter()
-                            .find(|turn| turn.id() == turn_id)
-                            .and_then(|turn| {
-                                self.tools_for_turn(turn.id())
-                                    .find(|tool| tool.id == read.tool_id)
-                            })
-                            .is_some_and(|tool| {
-                                tool.state() == crate::turn::ToolState::Completed && !tool.failed
-                            });
-                        if !successful
-                            || self.node_list.iter().any(|node| {
-                                matches!(node,
-                            ExchangeNode::SkillRead {turn_id:owner,read:existing,..}
-                                if owner == &turn_id && existing.resource_id == read.resource_id)
-                            })
-                        {
-                            continue;
+                    if let crate::backend::ToolUpdate::SkillRead { read } = update {
+                        for read in read {
+                            let id = format!("{turn_id}:skill:{}", read.resource_id);
+                            if !self.node_list.iter().any(|node| node.id() == id) {
+                                self.node_list.push(ExchangeNode::SkillRead {
+                                    id,
+                                    turn_id: turn_id.clone(),
+                                    read: read.clone(),
+                                });
+                            }
                         }
-                        self.node_list.push(ExchangeNode::SkillRead {
-                            id: format!("{turn_id}:skill:{}", read.resource_id),
-                            turn_id: turn_id.clone(),
-                            read,
-                        });
                     }
                 }
             }
+            _ => {}
         }
         self.reconcile_entries()?;
         self.metrics.observe_elapsed(self.elapsed(now_ms));
@@ -632,7 +606,7 @@ impl Exchange {
     /// Record provider execution, including late start evidence received during cleanup.
     pub fn start_turn(
         &mut self,
-        address: crate::backend::ProviderAddress,
+        address: crate::backend::TurnAddress,
         now_ms: i64,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -645,6 +619,17 @@ impl Exchange {
         anyhow::ensure!(
             !address.thread_id.is_empty() && !address.turn_id.is_empty(),
             "provider turn address is incomplete"
+        );
+        anyhow::ensure!(
+            (address.scope.exchange_id == self.id
+                || self
+                    .turn
+                    .iter()
+                    .any(|turn| turn.provider().scope == address.scope))
+                && address.scope.owner.session_id == self.session_id
+                && address.scope.owner.agent_id == self.agent_id
+                && !address.scope.invocation_id.is_empty(),
+            "provider invocation does not belong to this exchange"
         );
         if let Some(index) = self
             .turn
@@ -668,10 +653,37 @@ impl Exchange {
         Ok(())
     }
 
+    pub(crate) fn inherit_native_turn(
+        &mut self,
+        address: crate::backend::TurnAddress,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(self.origin, super::ExchangeOrigin::TaskContinuation { .. })
+                && self.state() == ExchangeState::Running
+                && self.turn.is_empty(),
+            "native invocation binding requires a new running continuation exchange"
+        );
+        anyhow::ensure!(
+            address.scope.owner.session_id == self.session_id
+                && address.scope.owner.agent_id == self.agent_id
+                && !address.scope.invocation_id.is_empty()
+                && !address.thread_id.is_empty()
+                && !address.turn_id.is_empty(),
+            "native continuation invocation has a different execution owner"
+        );
+        self.turn.push(crate::turn::Turn::new(
+            format!("{}:turn:1", self.id),
+            address,
+            now_ms,
+        ));
+        Ok(())
+    }
+
     /// Resolve an execution address without creating work from a late content event.
     pub fn turn_mut(
         &mut self,
-        address: &crate::backend::ProviderAddress,
+        address: &crate::backend::TurnAddress,
     ) -> anyhow::Result<&mut crate::turn::Turn> {
         self.turn
             .iter_mut()
@@ -1161,31 +1173,19 @@ mod test {
 
     #[test]
     fn retry_state_requires_known_turn_and_clears_after_recovery() -> anyhow::Result<()> {
-        use crate::backend::{BackendEvent, ProviderAddress};
+        use crate::backend::BackendEvent;
         use crate::session::state_machine::SessionPhase;
         let mut exchange = interaction();
         exchange.resume(1000)?;
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "failed-turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "failed-turn");
         let retry = crate::backend::retry::ProviderRetry {
             attempt: 1,
             max_attempts: 5,
             retry_at_ms: Some(2000),
         };
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address.clone()),
-            turn_boundary: None,
-            kind: "provider_retry".into(),
-            text: None,
-            data: serde_json::to_value(&retry)?,
-            activity: None,
-            summary: None,
-            checklist_update: None,
+        let mut event = BackendEvent::Retry {
+            scope: address.scope.clone(),
+            update: Some(retry.clone()),
         };
         assert!(!exchange.observe_turn(&event, 1000)?);
         exchange.start_turn(address.clone(), 1000)?;
@@ -1197,13 +1197,17 @@ mod test {
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::RetryingProvider { .. }
         ));
-        event.data = serde_json::Value::Null;
+        if let BackendEvent::Retry { update, .. } = &mut event {
+            *update = None;
+        }
         assert!(exchange.observe_turn(&event, 2000)?);
         assert!(matches!(
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::Working { .. }
         ));
-        event.data = serde_json::to_value(&retry)?;
+        if let BackendEvent::Retry { update, .. } = &mut event {
+            *update = Some(retry);
+        }
         exchange.finish(crate::exchange::ExchangeOutcome::Failed, 2001)?;
         assert!(!exchange.observe_turn(&event, 2002)?);
         assert!(exchange.provider_retry.is_none());
@@ -1212,34 +1216,17 @@ mod test {
 
     #[test]
     fn tool_timing_excludes_user_input_pauses_and_rejects_missing_start_evidence() {
-        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        use crate::backend::{BackendEvent, ToolOutcome, ToolUpdate};
         let mut exchange = interaction();
         exchange.resume(1000).unwrap();
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "parent".into(),
-            turn_id: "one".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "one");
         exchange.start_turn(address.clone(), 1000).unwrap();
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "tool".into(),
-            text: None,
-            data: serde_json::json!({}),
-            activity: Some(ToolActivity {
-                id: "call".into(),
-                kind: ToolActivityKind::ToolCall,
-                title: "command".into(),
-                output: None,
-                status: Some(crate::backend::ToolStatus::Running),
-                change: Default::default(),
-                output_delta: false,
-            }),
-            summary: None,
-            checklist_update: None,
+        let mut event = BackendEvent::Tool {
+            address: crate::backend::ToolAddress {
+                turn: address,
+                tool_id: "call".into(),
+            },
+            update: ToolUpdate::Started,
         };
         exchange.observe_turn(&event, 2000).unwrap();
         exchange.pause(3000);
@@ -1249,69 +1236,61 @@ mod test {
             Some(1000)
         );
         exchange.resume(90000).unwrap();
-        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
+        if let BackendEvent::Tool { update, .. } = &mut event {
+            *update = ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            };
+        }
         exchange.observe_turn(&event, 92000).unwrap();
         assert_eq!(exchange.elapsed(93000), 5000);
         assert_eq!(exchange.metrics.response_ms(5000), Some(2000));
-        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Running);
+        if let BackendEvent::Tool { update, .. } = &mut event {
+            *update = ToolUpdate::Started;
+        }
         exchange.observe_turn(&event, 93000).unwrap();
         assert_eq!(exchange.metrics.response_ms(6000), Some(3000));
-        event.activity.as_mut().unwrap().id = "missing-start".into();
-        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
+        if let BackendEvent::Tool { address, update } = &mut event {
+            address.tool_id = "missing-start".into();
+            *update = ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            };
+        }
         exchange.observe_turn(&event, 94000).unwrap();
         assert_eq!(exchange.metrics.response_ms(6000), None);
     }
 
     #[test]
     fn message_snapshots_reconcile_without_duplicating_or_reordering_content() {
-        use crate::backend::{BackendEvent, ProviderAddress};
+        use crate::backend::{BackendEvent, MessageRole, MessageUpdate};
         let mut exchange = interaction();
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "parent".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 10).unwrap();
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "assistant_message".into(),
-            text: Some("Checking".into()),
-            data: serde_json::json!({"params":{"itemId":"one"}}),
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        };
-        crate::turn::test_support::set_message(
-            &mut event,
+        let mut event = crate::turn::test_support::message(
+            &address,
             "one",
-            crate::backend::MessageRole::Commentary,
+            Some(MessageRole::Commentary),
+            "Checking",
         );
         exchange.observe_turn(&event, 11).unwrap();
         exchange
             .append_input(InputIntent::Steering, "Also tests".into(), 12)
             .unwrap();
-        event.text = Some("Done".into());
-        event.data = serde_json::json!({"params":{"itemId":"two","phase":"final_answer"}});
-        crate::turn::test_support::set_message(
-            &mut event,
-            "two",
-            crate::backend::MessageRole::Response,
-        );
-        exchange.observe_turn(&event, 13).unwrap();
-        event.text = Some("Checking files.".into());
-        event.data = serde_json::json!({"message_update":"snapshot", "params":{
-            "item":{"id":"one","phase":"commentary"}
-        }});
-        event.message = Some(crate::backend::ProviderMessage {
-            id: crate::backend::MessageId("one".into()),
-            role: Some(crate::backend::MessageRole::Commentary),
-            update: crate::backend::MessageUpdate::Completed {
+        exchange
+            .observe_turn(
+                &crate::turn::test_support::message(
+                    &address,
+                    "two",
+                    Some(MessageRole::Response),
+                    "Done",
+                ),
+                13,
+            )
+            .unwrap();
+        if let BackendEvent::Message { update, .. } = &mut event {
+            *update = MessageUpdate::Completed {
                 text: "Checking files.".into(),
-            },
-        });
+            };
+        }
         exchange.observe_turn(&event, 14).unwrap();
         exchange.observe_turn(&event, 15).unwrap();
         assert_eq!(exchange.node_list.len(), 3);
@@ -1329,49 +1308,33 @@ mod test {
         exchange.turn[0]
             .finish(crate::turn::TurnOutcome::Completed, 16)
             .unwrap();
-        event.text = Some("Late correction".into());
-        event.message.as_mut().unwrap().update = crate::backend::MessageUpdate::Completed {
-            text: "Late correction".into(),
-        };
+        if let BackendEvent::Message { update, .. } = &mut event {
+            *update = MessageUpdate::Completed {
+                text: "Late correction".into(),
+            };
+        }
         assert!(!exchange.observe_turn(&event, 17).unwrap());
         assert_eq!(exchange.turn[0].messages()[0].text(), "Checking files.");
     }
 
     #[test]
     fn active_turn_exposes_only_its_latest_readable_reasoning_summary() {
-        use crate::backend::{BackendEvent, ProviderAddress};
+        use crate::backend::MessageRole;
         let mut exchange = interaction();
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "parent".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 10).unwrap();
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "reasoning_summary".into(),
-            text: Some("Inspecting the repository".into()),
-            data: serde_json::json!({"provider_message_id":"reasoning:summary:0"}),
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        };
-        crate::turn::test_support::set_message(
-            &mut event,
+        let event = crate::turn::test_support::message(
+            &address,
             "reasoning:summary:0",
-            crate::backend::MessageRole::Thought,
+            Some(MessageRole::ThoughtSummary),
+            "Inspecting the repository",
         );
         exchange.observe_turn(&event, 11).unwrap();
-        event.kind = "reasoning".into();
-        event.text = Some("private chain of thought".into());
-        event.data = serde_json::json!({"params":{"itemId":"reasoning"}});
-        crate::turn::test_support::set_message(
-            &mut event,
+        let event = crate::turn::test_support::message(
+            &address,
             "reasoning",
-            crate::backend::MessageRole::Thought,
+            Some(MessageRole::Thought),
+            "private chain of thought",
         );
         exchange.observe_turn(&event, 12).unwrap();
 
@@ -1442,37 +1405,22 @@ mod test {
 
     #[test]
     fn provider_turn_identity_survives_steering_and_rejects_late_tools() {
-        use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
+        use crate::backend::{
+            BackendEvent, MessageRole, ToolInvocation, ToolOutcome, ToolUpdate, TurnUpdate,
+        };
         use crate::turn::{TurnOutcome, TurnState};
         let mut exchange = interaction();
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "parent".into(),
-            turn_id: "first".into(),
-        };
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address.clone()),
-            turn_boundary: Some(TurnBoundary::Started),
-            kind: "turn_started".into(),
-            text: None,
-            data: serde_json::Value::Null,
-            activity: None,
-            summary: None,
-            checklist_update: None,
+        let address = crate::turn::test_support::address(&exchange, "first");
+        let mut event = BackendEvent::Turn {
+            address: address.clone(),
+            update: TurnUpdate::Started { started_at_ms: 10 },
         };
         assert!(exchange.observe_turn(&event, 10).unwrap());
-        event.turn_boundary = None;
-        event.kind = "assistant_message".into();
-        event.text = Some("Before steering".into());
-        event.data = serde_json::json!({
-            "params": { "item": { "id": "message-one", "phase": "commentary" } }
-        });
-        crate::turn::test_support::set_message(
-            &mut event,
+        event = crate::turn::test_support::message(
+            &address,
             "message-one",
-            crate::backend::MessageRole::Commentary,
+            Some(MessageRole::Commentary),
+            "Before steering",
         );
         assert!(exchange.observe_turn(&event, 10).unwrap());
         exchange
@@ -1482,20 +1430,17 @@ mod test {
                 11,
             )
             .unwrap();
-        event.text = Some("After steering".into());
-        event.data = serde_json::json!({
-            "params": { "item": { "id": "message-two", "phase": "final_answer" } }
-        });
-        crate::turn::test_support::set_message(
-            &mut event,
+        event = crate::turn::test_support::message(
+            &address,
             "message-two",
-            crate::backend::MessageRole::Response,
+            Some(MessageRole::Response),
+            "After steering",
         );
         assert!(exchange.observe_turn(&event, 11).unwrap());
         assert_eq!(exchange.turn[0].messages().len(), 2);
         assert_eq!(
             exchange.turn[0].messages()[0].provider_id(),
-            Some("message-one")
+            &crate::backend::MessageId::Native("message-one".into())
         );
         assert_eq!(
             exchange.turn[0].messages()[0].delivery(),
@@ -1504,34 +1449,43 @@ mod test {
         assert_eq!(exchange.turn[0].messages()[1].text(), "After steering");
         assert_eq!(
             exchange.turn[0].messages()[1].provider_id(),
-            Some("message-two")
+            &crate::backend::MessageId::Native("message-two".into())
         );
         assert_eq!(
             exchange.turn[0].messages()[1].delivery(),
             crate::turn::MessageDelivery::Final
         );
-        event.text = None;
         assert_eq!(exchange.turn.len(), 1);
-        event.message = None;
         let first_id = exchange.turn[0].id().to_owned();
-        event.turn_boundary = None;
-        event.activity = Some(crate::backend::ToolActivity {
-            id: "change".into(),
-            kind: crate::backend::ToolActivityKind::FileChange,
-            title: "edit".into(),
-            output: None,
-            output_delta: false,
-            status: Some(crate::backend::ToolStatus::Succeeded),
-            change: crate::backend::ProviderChangeSet {
-                file: vec![crate::backend::ProviderFileChange {
-                    path: "owned.rs".into(),
-                    move_path: None,
-                    kind: crate::backend::ProviderChangeKind::Add,
-                    diff: "+owned".into(),
-                }],
+        crate::turn::test_support::tool(
+            &mut exchange,
+            &address,
+            "change",
+            ToolInvocation {
+                kind: crate::backend::ToolActivityKind::FileChange,
+                name: "edit".into(),
+                title: "edit".into(),
+                arguments: serde_json::json!({}),
             },
-        });
-        assert!(exchange.observe_turn(&event, 12).unwrap());
+            [
+                ToolUpdate::Started,
+                ToolUpdate::Changes {
+                    changes: crate::backend::ProviderChangeSet {
+                        file: vec![crate::backend::ProviderFileChange {
+                            path: "owned.rs".into(),
+                            move_path: None,
+                            kind: crate::backend::ProviderChangeKind::Add,
+                            diff: "+owned".into(),
+                        }],
+                    },
+                },
+                ToolUpdate::Finished {
+                    outcome: ToolOutcome::Succeeded,
+                },
+            ],
+            12,
+        )
+        .unwrap();
         let mut changes = ProviderChangeIndex::default();
         changes.record(&exchange);
         assert!(
@@ -1539,14 +1493,21 @@ mod test {
             "attribution depended on presentation segments"
         );
         assert_eq!(exchange.tools_for_turn(exchange.turn[0].id()).count(), 1);
-        event.activity = None;
-
-        event.turn_boundary = Some(TurnBoundary::Finished {
-            outcome: TurnOutcome::Completed,
-        });
+        event = BackendEvent::Turn {
+            address: address.clone(),
+            update: TurnUpdate::Finished {
+                outcome: TurnOutcome::Completed,
+                completed_at_ms: 20,
+            },
+        };
         assert!(exchange.observe_turn(&event, 20).unwrap());
-        event.turn_boundary = None;
-        event.kind = "tool".into();
+        event = BackendEvent::Tool {
+            address: crate::backend::ToolAddress {
+                turn: address.clone(),
+                tool_id: "late".into(),
+            },
+            update: ToolUpdate::Started,
+        };
         assert!(!exchange.observe_turn(&event, 30).unwrap());
         assert_eq!(
             exchange.turn[0].state(),
@@ -1556,14 +1517,7 @@ mod test {
         );
         assert!(exchange.start_turn(address, 40).is_err());
         exchange
-            .start_turn(
-                ProviderAddress {
-                    owner: None,
-                    thread_id: "parent".into(),
-                    turn_id: "second".into(),
-                },
-                50,
-            )
+            .start_turn(crate::turn::test_support::address(&exchange, "second"), 50)
             .unwrap();
         assert_eq!(exchange.turn.len(), 2);
         assert_ne!(exchange.turn[1].id(), first_id);
@@ -1587,11 +1541,7 @@ mod test {
     fn interrupted_exchange_settles_provider_turns_permanently() {
         let mut exchange = interaction();
         exchange.resume(100).unwrap();
-        let address = crate::backend::ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address, 100).unwrap();
         exchange
             .finish(crate::exchange::ExchangeOutcome::Interrupted, 150)
@@ -1684,11 +1634,7 @@ mod test {
     #[test]
     fn terminal_exchange_cannot_restart() {
         let mut exchange = interaction();
-        let address = crate::backend::ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 10).unwrap();
         exchange
             .turn_mut(&address)
@@ -1715,11 +1661,7 @@ mod test {
     #[test]
     fn finalization_settles_running_turn_without_changing_completed_turns() {
         let mut exchange = interaction();
-        let first = crate::backend::ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "first".into(),
-        };
+        let first = crate::turn::test_support::address(&exchange, "first");
         exchange.start_turn(first.clone(), 10).unwrap();
         exchange
             .turn_mut(&first)
@@ -1727,14 +1669,7 @@ mod test {
             .finish(crate::turn::TurnOutcome::Completed, 20)
             .unwrap();
         exchange
-            .start_turn(
-                crate::backend::ProviderAddress {
-                    owner: None,
-                    thread_id: "thread".into(),
-                    turn_id: "second".into(),
-                },
-                30,
-            )
+            .start_turn(crate::turn::test_support::address(&exchange, "second"), 30)
             .unwrap();
         exchange
             .finish(crate::exchange::ExchangeOutcome::Cancelled, 50)
@@ -1873,11 +1808,7 @@ mod test {
     #[test]
     fn plan_artifact_does_not_affect_provider_turn_lifecycle() {
         let mut interaction = interaction();
-        let address = crate::backend::ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&interaction, "turn");
         interaction.start_turn(address.clone(), 10).unwrap();
         interaction.node_list.push(ExchangeNode::ArtifactChange {
             change: ArtifactChange {

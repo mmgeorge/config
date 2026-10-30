@@ -84,7 +84,10 @@ impl Exchange {
                         .iter()
                         .find(|message| message.id() == message_id)
                 })
-                .is_some_and(|message| message.role() == Some(MessageRole::Commentary)),
+                .is_some_and(|message| {
+                    message.role() == Some(MessageRole::Commentary)
+                        && !message.text().trim().is_empty()
+                }),
         }
     }
 
@@ -150,7 +153,7 @@ impl Exchange {
             else {
                 return true;
             };
-            let role = self
+            let message = self
                 .turn
                 .iter()
                 .find(|turn| turn.id() == turn_id)
@@ -158,12 +161,15 @@ impl Exchange {
                     turn.messages()
                         .iter()
                         .find(|message| message.id() == message_id)
-                })
-                .and_then(|message| message.role());
+                });
+            let role = message.and_then(|message| message.role());
             if matches!(entry, ExchangeEntry::Commentary { commentary }
                 if !commentary.tool.is_empty() || !commentary.check.is_empty())
             {
                 return true;
+            }
+            if message.is_none_or(|message| message.text().trim().is_empty()) {
+                return false;
             }
             match role {
                 Some(MessageRole::Commentary) => {
@@ -219,6 +225,9 @@ impl Exchange {
                                 .find(|message| message.id() == message_id)
                         })
                         .context("entry references a missing provider message")?;
+                    if message.text().trim().is_empty() {
+                        continue;
+                    }
                     if message.role() == Some(MessageRole::Response) {
                         ExchangeEntry::Response { id: id.clone() }
                     } else if message.role() == Some(MessageRole::Commentary) {
@@ -482,30 +491,39 @@ impl Exchange {
     pub(crate) fn record_tool_event(
         &mut self,
         turn_id: &str,
-        event: crate::backend::ToolEvent<'_>,
+        address: &crate::backend::ToolAddress,
+        update: &crate::backend::ToolUpdate,
         now_ms: i64,
     ) -> Result<()> {
-        ensure!(self.turn.iter().any(|turn| turn.id() == turn_id && turn.state() == crate::turn::TurnState::Running),
-            "completed turn rejects tool events");
-        let activity = event.activity();
-        let store = self.tool_store_mut(turn_id, &activity.id)?;
-        let previous = store
-            .get(&activity.id)
-            .map(|tool| (tool.state(), tool.failed));
-        let settled = store
-            .get(&activity.id)
-            .is_some_and(|tool| tool.state() != crate::turn::ToolState::Running);
-        store.merge(activity, event.observed_at_ms(now_ms));
-        if !settled {
-            store.timing(
-                &activity.id,
-                event.timestamp("/params/startedAtMs"),
-                event.timestamp("/params/completedAtMs"),
-                event.timestamp("/params/item/durationMs"),
+        let existing = self
+            .tools_for_turn(turn_id)
+            .any(|tool| tool.id == address.tool_id.as_str());
+        let late = existing
+            && matches!(
+                update,
+                crate::backend::ToolUpdate::Output { .. }
+                    | crate::backend::ToolUpdate::Changes { .. }
+                    | crate::backend::ToolUpdate::SkillRead { .. }
             );
+        ensure!(
+            self.turn.iter().any(|turn| turn.id() == turn_id
+                && turn.provider() == &address.turn
+                && (turn.state() == crate::turn::TurnState::Running || late))
+                && !address.tool_id.is_empty(),
+            "completed turn rejects tool events"
+        );
+        if !existing && !matches!(update, crate::backend::ToolUpdate::Requested { .. }) {
+            return Err(crate::backend::BackendError::Protocol {
+                message: "provider tool update arrived before its request".into(),
+            }
+            .into());
         }
+        let tool_id = address.tool_id.as_str();
+        let store = self.tool_store_mut(turn_id, tool_id)?;
+        let previous = store.get(tool_id).map(|tool| (tool.state(), tool.failed));
+        store.merge(address, update, now_ms)?;
         let current = store
-            .get(&activity.id)
+            .get(tool_id)
             .map(|tool| (tool.state(), tool.failed))
             .unwrap();
         if let Some((state, failed)) = previous {
@@ -544,72 +562,131 @@ impl Exchange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+    use crate::backend::{BackendEvent, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
     use serde_json::json;
 
     #[test]
+    fn empty_snapshots_remove_text_without_admitting_empty_commentary() -> Result<()> {
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"empty", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Work", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let mut message = crate::turn::test_support::message(
+            &address,
+            "commentary",
+            Some(MessageRole::Commentary),
+            "Visible",
+        );
+        assert!(exchange.entry.is_empty());
+        assert!(exchange.turn[0].messages().is_empty());
+        let tool = BackendEvent::Tool {
+            address: crate::backend::ToolAddress {
+                turn: address.clone(),
+                tool_id: "call".into(),
+            },
+            update: ToolUpdate::Requested {
+                invocation: ToolInvocation {
+                    kind: ToolActivityKind::Command,
+                    name: "inspect".into(),
+                    title: "inspect".into(),
+                    arguments: json!({}),
+                },
+            },
+        };
+        exchange.observe_turn(&tool, 2)?;
+        let owner = exchange.entry[0].id().to_owned();
+        exchange.observe_turn(&message, 3)?;
+        assert_eq!(exchange.entry.len(), 2);
+        if let BackendEvent::Message { update, .. } = &mut message {
+            *update = crate::backend::MessageUpdate::Completed {
+                text: String::new(),
+            };
+        }
+        exchange.observe_turn(&message, 4)?;
+        let restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
+        assert_eq!(restored.entry.len(), 1);
+        assert_eq!(restored.entry[0].id(), owner);
+        assert_eq!(restored.tools().count(), 1);
+        assert!(restored.turn[0].messages()[0].text().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn typed_classification_preserves_activity_without_duplicate_message_blocks() -> Result<()> {
-        use crate::backend::{MessageId, MessageUpdate, ProviderMessage};
+        use crate::backend::MessageUpdate;
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"classification", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Work", "state":"running", "created_at_ms":0,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
-        let mut event = BackendEvent {
-            message: Some(ProviderMessage {
-                id: MessageId("answer".into()),
-                role: None,
-                update: MessageUpdate::Delta {
-                    text: "Canonical answer".into(),
-                },
-            }),
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "not_a_message_hint".into(),
-            text: Some("Noncanonical mirror".into()),
-            data: json!({"phase":"commentary","params":{"itemId":"wrong"}}),
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        };
+        let mut event =
+            crate::turn::test_support::message(&address, "answer", None, "Canonical answer");
         exchange.observe_turn(&event, 1)?;
         assert!(exchange.entry.is_empty());
-        event.message.as_mut().unwrap().role = Some(MessageRole::Commentary);
-        event.message.as_mut().unwrap().update = MessageUpdate::Classified;
+        if let BackendEvent::Message { update, .. } = &mut event {
+            *update = MessageUpdate::Classified {
+                role: MessageRole::Commentary,
+            };
+        }
         exchange.observe_turn(&event, 2)?;
-        let mut tool = event.clone();
-        tool.message = None;
-        tool.activity = Some(ToolActivity {
-            id: "original".into(),
-            title: "inspect".into(),
-            kind: ToolActivityKind::Command,
-            output: None,
-            output_delta: false,
-            status: Some(crate::backend::ToolStatus::Running),
-            change: Default::default(),
-        });
+        let mut tool = BackendEvent::Tool {
+            address: crate::backend::ToolAddress {
+                turn: address.clone(),
+                tool_id: "original".into(),
+            },
+            update: ToolUpdate::Requested {
+                invocation: ToolInvocation {
+                    title: "inspect".into(),
+                    name: "inspect".into(),
+                    kind: ToolActivityKind::Command,
+                    arguments: json!({}),
+                },
+            },
+        };
         exchange.observe_turn(&tool, 3)?;
         let provider_owner = exchange.entry[0].id().to_owned();
-        event.message.as_mut().unwrap().role = Some(MessageRole::Response);
-        event.message.as_mut().unwrap().update = MessageUpdate::Completed {
-            text: "Canonical final answer".into(),
-        };
+        if let BackendEvent::Message { update, .. } = &mut event {
+            *update = MessageUpdate::Classified {
+                role: MessageRole::Response,
+            };
+        }
+        let before_conflict = serde_json::to_value(&exchange)?;
+        let error = exchange.observe_turn(&event, 4).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<crate::backend::BackendError>(),
+            Some(crate::backend::BackendError::Protocol { .. })
+        ));
+        assert_eq!(serde_json::to_value(&exchange)?, before_conflict);
+        if let BackendEvent::Message { update, .. } = &mut event {
+            *update = MessageUpdate::Completed {
+                text: "Canonical final answer".into(),
+            };
+        }
         exchange.observe_turn(&event, 4)?;
         exchange.observe_turn(&event, 5)?;
         let mut restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
         assert_eq!(restored.turn[0].messages().len(), 1);
         assert_eq!(
             restored.turn[0].messages()[0].role(),
-            Some(MessageRole::Response)
+            Some(MessageRole::Commentary)
         );
-        tool.activity.as_mut().unwrap().id = "later".into();
+        restored.observe_turn(
+            &crate::turn::test_support::message(
+                &address,
+                "next-inspection",
+                Some(MessageRole::Commentary),
+                "Next inspection",
+            ),
+            6,
+        )?;
+        if let BackendEvent::Tool { address, .. } = &mut tool {
+            address.tool_id = "later".into();
+        }
         restored.observe_turn(&tool, 6)?;
         let original = restored
             .entry
@@ -666,35 +743,27 @@ mod tests {
             "prompt":"Work", "state":"running", "created_at_ms":0,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "tool".into(),
-            text: None,
-            data: json!(null),
-            activity: Some(ToolActivity {
-                id: "first".into(),
-                title: "inspect".into(),
-                kind: ToolActivityKind::Command,
-                output: None,
-                output_delta: false,
-                status: Some(crate::backend::ToolStatus::Running),
-                change: Default::default(),
-            }),
-            summary: None,
-            checklist_update: None,
+        let mut event = BackendEvent::Tool {
+            address: crate::backend::ToolAddress {
+                turn: address.clone(),
+                tool_id: "first".into(),
+            },
+            update: ToolUpdate::Requested {
+                invocation: ToolInvocation {
+                    title: "inspect".into(),
+                    name: "inspect".into(),
+                    kind: ToolActivityKind::Command,
+                    arguments: json!({}),
+                },
+            },
         };
         exchange.observe_turn(&event, 1)?;
         exchange.append_input(InputIntent::Steering, "more".into(), 2)?;
-        event.activity.as_mut().unwrap().id = "second".into();
+        if let BackendEvent::Tool { address, .. } = &mut event {
+            address.tool_id = "second".into();
+        }
         exchange.observe_turn(&event, 3)?;
         assert_eq!(exchange.tool_counter.total, 2);
         assert_eq!(exchange.tool_counter.running, 2);
@@ -703,25 +772,21 @@ mod tests {
             matches!(&exchange.entry[0], ExchangeEntry::Commentary { commentary }
             if matches!(commentary.source, CommentarySource::Initial { .. }))
         );
-        event.kind = "assistant_message".into();
-        event.activity = None;
-        event.text = Some("Now check results".into());
-        event.data = json!({"provider_message_id":"commentary", "phase":"commentary"});
-        crate::turn::test_support::set_message(&mut event, "commentary", MessageRole::Commentary);
-        exchange.observe_turn(&event, 4)?;
-        event.kind = "tool".into();
-        event.message = None;
-        event.text = None;
-        event.data = json!(null);
-        event.activity = Some(ToolActivity {
-            id: "first".into(),
-            title: "inspect".into(),
-            kind: ToolActivityKind::Command,
-            output: Some("complete".into()),
-            output_delta: false,
-            status: Some(crate::backend::ToolStatus::Succeeded),
-            change: Default::default(),
-        });
+        exchange.observe_turn(
+            &crate::turn::test_support::message(
+                &address,
+                "commentary",
+                Some(MessageRole::Commentary),
+                "Now check results",
+            ),
+            4,
+        )?;
+        if let BackendEvent::Tool { address, update } = &mut event {
+            address.tool_id = "first".into();
+            *update = ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            };
+        }
         exchange.observe_turn(&event, 5)?;
         exchange.observe_turn(&event, 6)?;
         assert_eq!(exchange.tool_counter.total, 2);
@@ -730,9 +795,31 @@ mod tests {
         let serialized = serde_json::to_value(&exchange)?;
         assert!(serialized["turn"][0].get("tool").is_none());
         assert!(serialized.get("tool_counter").is_none());
-        let restored: Exchange = serde_json::from_value(serialized)?;
+        let mut restored: Exchange = serde_json::from_value(serialized)?;
         assert_eq!(restored.tool_counter.total, 2);
         assert_eq!(restored.tool_counter.completed, 1);
+        restored.observe_turn(
+            &BackendEvent::Turn {
+                address: address.clone(),
+                update: crate::backend::TurnUpdate::Finished {
+                    outcome: crate::turn::TurnOutcome::Completed,
+                    completed_at_ms: 6,
+                },
+            },
+            6,
+        )?;
+        restored.observe_turn(
+            &BackendEvent::Tool {
+                address: crate::backend::ToolAddress {
+                    turn: address.clone(),
+                    tool_id: "first".into(),
+                },
+                update: ToolUpdate::Output {
+                    update: crate::backend::TextUpdate::Append("late output".into()),
+                },
+            },
+            6,
+        )?;
         let owner = restored
             .entry
             .iter()
@@ -749,6 +836,11 @@ mod tests {
                 .count(),
             2
         );
+        assert_eq!(
+            commentary.tool[0].store.get("first").unwrap().output,
+            "late output"
+        );
+        assert_eq!(restored.tool_counter.completed, 1);
         let view = restored.content(&restored.node_list.iter().collect::<Vec<_>>(), true)?;
         assert_eq!(view.commentary[0].tools.call.len(), 2);
         assert!(matches!(
@@ -785,8 +877,28 @@ mod tests {
                 .iter()
                 .all(|fold| fold.end.block != steering.id)
         );
-        event.activity.as_mut().unwrap().id = "failed-call".into();
-        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Failed);
+        if let BackendEvent::Tool { address, update } = &mut event {
+            address.tool_id = "failed-call".into();
+            *update = ToolUpdate::Requested {
+                invocation: ToolInvocation {
+                    kind: ToolActivityKind::Command,
+                    name: "check".into(),
+                    title: "check".into(),
+                    arguments: json!({}),
+                },
+            };
+        }
+        exchange.observe_turn(&event, 7)?;
+        if let BackendEvent::Tool { update, .. } = &mut event {
+            *update = ToolUpdate::Finished {
+                outcome: ToolOutcome::Failed {
+                    diagnostic: crate::backend::ToolDiagnostic {
+                        code: None,
+                        message: "failed".into(),
+                    },
+                },
+            };
+        }
         exchange.observe_turn(&event, 7)?;
         exchange.observe_turn(&event, 8)?;
         assert_eq!(exchange.tool_counter.total, 3);

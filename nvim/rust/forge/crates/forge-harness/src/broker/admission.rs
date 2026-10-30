@@ -8,7 +8,7 @@ impl HarnessBroker {
         new_runtime: bool,
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
-    ) -> Result<crate::backend::BackendOutput> {
+    ) -> Result<crate::backend::BackendCompletion> {
         let trace = self.trace.clone();
         let session_id = self.session.id.clone();
         let exchange_id = interaction.id.clone();

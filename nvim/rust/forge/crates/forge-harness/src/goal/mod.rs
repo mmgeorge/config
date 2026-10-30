@@ -155,7 +155,7 @@ mod test {
                     ..Default::default()
                 },
             };
-            let (evidence, permit) = output.goal_evidence();
+            let (evidence, permit) = output.completion.goal_evidence();
             assert_eq!(
                 evidence.structured_complete,
                 termination == GoalTermination::Complete

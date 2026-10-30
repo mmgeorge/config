@@ -1,12 +1,14 @@
 use forge_harness::backend::codex::CodexBackend;
 use forge_harness::backend::{
-    Backend, BackendCatalogRequest, BackendForkRequest, BackendInput, BackendLaunch,
-    BackendRequest, PromptMode, ToolActivityKind,
+    AgentUpdate, Backend, BackendCatalogRequest, BackendEvent, BackendForkRequest, BackendInput,
+    BackendLaunch, BackendRequest, InvocationScope, MessageAddress, MessageClassification,
+    MessageRole, MessageUpdate, PromptMode, ToolActivityKind, ToolOutcome, ToolUpdate, TurnUpdate,
 };
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::plan::PlanPrompt;
 use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -38,6 +40,34 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         recovered_input: Vec::new(),
         control_context: None,
     }
+}
+
+fn observe_assistant_text(
+    event: &BackendEvent,
+    classification: &mut HashMap<MessageAddress, MessageClassification>,
+) -> bool {
+    let BackendEvent::Message { address, update } = event else {
+        return false;
+    };
+    match update {
+        MessageUpdate::Started {
+            classification: value,
+            ..
+        } => {
+            classification.insert(address.clone(), *value);
+        }
+        MessageUpdate::Classified { role } => {
+            classification.insert(address.clone(), MessageClassification::Known(*role));
+        }
+        _ => {}
+    }
+    matches!(
+        classification.get(address),
+        Some(
+            MessageClassification::Unclassified
+                | MessageClassification::Known(MessageRole::Commentary | MessageRole::Response)
+        )
+    ) && update.text().is_some_and(|text| !text.trim().is_empty())
 }
 
 #[tokio::test]
@@ -155,20 +185,21 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .app_server_process_id()
         .await
         .expect("Codex app-server PID");
-    let (answer_event_sink, mut answer_event_stream) = forge_harness::backend::events::channel();
-    let mut answer_future = Box::pin(backend.prompt_stream(
-        BackendRequest {
-            execution_owner: None,
-            model: "default".into(),
-            ..request(
-                repository.path(),
-                PromptMode::Chat,
-                "What is this repo? Answer in one sentence after reading README.md.",
-            )
-        },
-        answer_event_sink,
-    ));
+    let answer_request = BackendRequest {
+        execution_owner: None,
+        model: "default".into(),
+        ..request(
+            repository.path(),
+            PromptMode::Chat,
+            "What is this repo? Answer in one sentence after reading README.md.",
+        )
+    };
+    let (answer_event_sink, mut answer_event_stream) = forge_harness::backend::events::channel(
+        InvocationScope::new(answer_request.owner().unwrap(), "answer"),
+    );
+    let mut answer_future = Box::pin(backend.prompt_stream(answer_request, answer_event_sink));
     let mut answer_events = Vec::new();
+    let mut answer_classification = HashMap::new();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             tokio::select! {
@@ -177,9 +208,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
                 }
                 event = answer_event_stream.recv() => {
                     let event = event.expect("event delivery failed").expect("Codex closed the event stream before completion");
-                    if event.kind == "assistant_message"
-                        && event.text.as_deref().is_some_and(|text| !text.trim().is_empty())
-                    {
+                    if observe_assistant_text(&event, &mut answer_classification) {
                         answer_events.push(event);
                         break;
                     }
@@ -213,13 +242,12 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     {
         answer_events.push(event);
     }
-    assert!(answer_events.iter().any(|event| {
-        event.kind == "assistant_message"
-            && event
-                .text
-                .as_deref()
-                .is_some_and(|text| !text.trim().is_empty())
-    }));
+    answer_classification.clear();
+    assert!(
+        answer_events
+            .iter()
+            .any(|event| observe_assistant_text(event, &mut answer_classification))
+    );
     assert_eq!(answered.runtime.provider, "Codex CLI");
     assert!(
         answered
@@ -229,12 +257,10 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
             .is_some_and(|model| model != "default" && !model.is_empty())
     );
     assert!(
-        answer_events.iter().any(|event| event.kind == "usage"
-            && event
-                .data
-                .pointer("/usage/output")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|output| output > 0)),
+        answer_events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::Usage { update, .. }
+            if update.usage.output.is_some_and(|output| output > 0))),
         "Codex should report final turn token usage"
     );
     let model_list = backend
@@ -272,10 +298,10 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let planned = planned.unwrap();
     steered.unwrap();
     assert!(
-        !planned.plan_edit.is_empty(),
+        !planned.completion.plan_edit.is_empty(),
         "Codex planning did not edit the broker-owned structured plan"
     );
-    let plan_edit_json = serde_json::to_string_pretty(&planned.plan_edit).unwrap();
+    let plan_edit_json = serde_json::to_string_pretty(&planned.completion.plan_edit).unwrap();
     assert!(
         plan_edit_json.contains("STEERING_CONSTRAINT_7B3D"),
         "Codex planning ignored the active-turn steering constraint: {plan_edit_json}"
@@ -288,27 +314,66 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         "Execute the accepted plan now. Create harness-integration.txt containing exactly `verified` followed by a newline, then call goal_complete.",
     );
     execute.approval_mode = ApprovalMode::Allow;
-    execute.backend_session_id = planned.backend_session_id.clone();
-    let (event_sink, mut event_stream) = forge_harness::backend::events::channel();
-    let executed = tokio::time::timeout(
-        Duration::from_secs(90),
-        backend.prompt_stream(execute.clone(), event_sink),
-    )
+    execute.backend_session_id = planned.completion.backend_session_id.clone();
+    let (event_sink, mut event_stream) = forge_harness::backend::events::channel(
+        InvocationScope::new(execute.owner().unwrap(), "execution"),
+    );
+    let (executed, streamed_event_list) = tokio::time::timeout(Duration::from_secs(90), async {
+        let execution = backend.prompt_stream(execute.clone(), event_sink);
+        tokio::pin!(execution);
+        let mut streamed_event_list = Vec::new();
+        let mut stream_open = true;
+        let executed = loop {
+            tokio::select! {
+                output = &mut execution => break output.unwrap(),
+                event = event_stream.recv(), if stream_open => {
+                    if let Some(event) = event.expect("execution event delivery failed") {
+                        streamed_event_list.push(event);
+                    } else {
+                        stream_open = false;
+                    }
+                }
+            }
+        };
+        while let Some(event) = event_stream
+            .try_next()
+            .expect("final execution event delivery failed")
+        {
+            streamed_event_list.push(event);
+        }
+        (executed, streamed_event_list)
+    })
     .await
-    .expect("Codex execution prompt timed out after provider-side completion")
-    .unwrap();
-    let streamed_event_list: Vec<_> = std::iter::from_fn(|| event_stream.try_recv().ok()).collect();
+    .expect("Codex execution prompt timed out after provider-side completion");
     assert!(!streamed_event_list.is_empty());
+    let mut tool_kind = HashMap::new();
+    let mut tool_change = HashMap::new();
+    let mut tool_outcome = HashMap::new();
+    for event in &streamed_event_list {
+        if let BackendEvent::Tool { address, update } = event {
+            match update {
+                ToolUpdate::Requested { invocation } => {
+                    tool_kind.insert(address.clone(), invocation.kind);
+                }
+                ToolUpdate::Changes { changes } => {
+                    tool_change.insert(address.clone(), changes);
+                }
+                ToolUpdate::Finished { outcome } => {
+                    tool_outcome.insert(address.clone(), outcome);
+                }
+                _ => {}
+            }
+        }
+    }
     assert!(
-        streamed_event_list.iter().any(|event| {
-            event.kind == "tool"
-                && event.activity.as_ref().is_some_and(|tool| {
-                    tool.kind == ToolActivityKind::FileChange
-                        && tool.status.as_deref() == Some("completed")
-                        && tool.change.file.iter().any(|change| {
-                            change.path.replace('\\', "/") == "harness-integration.txt"
-                                && !change.diff.trim().is_empty()
-                        })
+        tool_kind.iter().any(|(address, kind)| {
+            *kind == ToolActivityKind::FileChange
+                && matches!(tool_outcome.get(address), Some(ToolOutcome::Succeeded))
+                && tool_change.get(address).is_some_and(|changes| {
+                    changes.file.iter().any(|change| {
+                        change.path.replace('\\', "/") == "harness-integration.txt"
+                            && !change.diff.trim().is_empty()
+                    })
                 })
         }),
         "Codex did not stream a completed structured file change: {streamed_event_list:#?}"
@@ -378,20 +443,25 @@ async fn streams_structured_child_agent_lifecycle() {
         .expect("Codex subagent turn exceeded 90 seconds")
         .unwrap();
     assert!(
-        output
-            .event
-            .iter()
-            .any(|event| event.kind == "agent_lifecycle"),
+        output.event.iter().any(|event| matches!(
+            event,
+            BackendEvent::Agent {
+                update: AgentUpdate::Lifecycle { .. },
+                ..
+            }
+        )),
         "Codex did not emit a structured child lifecycle event: {:#?}",
         output.event
     );
     let lifecycle_list = output
         .event
         .iter()
-        .filter(|event| event.kind == "agent_lifecycle")
-        .map(|event| {
-            serde_json::from_value::<forge_harness::agent::AgentLifecycleEvent>(event.data.clone())
-                .unwrap()
+        .filter_map(|event| match event {
+            BackendEvent::Agent {
+                update: AgentUpdate::Lifecycle { event },
+                ..
+            } => Some(event),
+            _ => None,
         })
         .collect::<Vec<_>>();
     let child_thread_list = lifecycle_list
@@ -408,34 +478,34 @@ async fn streams_structured_child_agent_lifecycle() {
         .event
         .iter()
         .position(|event| {
-            event.kind == "turn_completed"
-                && event
-                    .data
-                    .pointer("/params/threadId")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(child_thread_id)
+            matches!(event, BackendEvent::Turn {
+            address, update: TurnUpdate::Finished { .. },
+        } if address.thread_id == child_thread_id)
         })
         .expect("the explorer must emit a terminal turn event for its provider identity");
     let parent_thread_id = output
+        .completion
         .backend_session_id
         .as_deref()
         .expect("the parent turn must preserve its provider thread identity");
+    let mut message_classification = HashMap::new();
+    for event in &output.event {
+        observe_assistant_text(event, &mut message_classification);
+    }
     let parent_response_index = output
         .event
         .iter()
         .enumerate()
         .skip(child_completion_index + 1)
         .find_map(|(index, event)| {
-            (event.kind == "assistant_message"
-                && event
-                    .data
-                    .pointer("/params/threadId")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(parent_thread_id)
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("Child lifecycle")))
+            matches!(event, BackendEvent::Message {
+                address, update: MessageUpdate::Completed { text },
+            } if address.turn.thread_id == parent_thread_id
+                && message_classification.get(address).is_some_and(|classification| matches!(
+                    classification, MessageClassification::Unclassified
+                        | MessageClassification::Known(MessageRole::Commentary | MessageRole::Response)
+                ))
+                && text.contains("Child lifecycle"))
             .then_some(index)
         })
         .expect("the parent must synthesize the child result after the child completes");
@@ -445,12 +515,9 @@ async fn streams_structured_child_agent_lifecycle() {
         .enumerate()
         .skip(parent_response_index + 1)
         .find_map(|(index, event)| {
-            (event.kind == "turn_completed"
-                && event
-                    .data
-                    .pointer("/params/threadId")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(parent_thread_id))
+            matches!(event, BackendEvent::Turn {
+                address, update: TurnUpdate::Finished { .. },
+            } if address.thread_id == parent_thread_id)
             .then_some(index)
         })
         .expect("the parent turn must complete after reporting the child result");

@@ -15,6 +15,7 @@ use crate::permissions::store::PermissionStore;
 use crate::session::{ApprovalMode, InputDeadline, InputTimeout, ResolutionSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
@@ -386,12 +387,13 @@ impl PermissionCoordinator {
         &self,
         approval_mode: ApprovalMode,
         mut request: PermissionRequest,
-        address: Option<crate::backend::ProviderAddress>,
+        address: Option<crate::backend::TurnAddress>,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalResolution> {
         let directory_policy = address
             .as_ref()
-            .and_then(|address| address.owner.as_ref())
+            .map(|address| &address.scope.owner)
+            .or_else(|| event_sink.map(|sink| sink.scope().owner()))
             .map(|owner| {
                 self.directory_by_owner
                     .lock()
@@ -423,17 +425,13 @@ impl PermissionCoordinator {
             Ok(evaluation) => evaluation,
             Err(error) => {
                 if let Some(sink) = event_sink {
-                    sink.send_wait(BackendEvent {
-                        message: None,
-                        received_at_ms: None,
-                        address: address.clone(),
-                        turn_boundary: None,
-                        kind: "error".into(),
-                        text: Some(format!("Permission evaluation failed: {error:#}")),
-                        data: json!({"error":format!("{error:#}")}),
-                        activity: None,
-                        summary: None,
-                        checklist_update: None,
+                    sink.send_wait(BackendEvent::Diagnostic {
+                        scope: sink.scope().clone(),
+                        diagnostic: crate::backend::ProviderDiagnostic {
+                            code: Some("permission_evaluation_failed".into()),
+                            message: format!("Permission evaluation failed: {error:#}"),
+                            fatal: false,
+                        },
                     })
                     .await?;
                 }
@@ -447,7 +445,8 @@ impl PermissionCoordinator {
                 .map_err(|_| anyhow::anyhow!("skill permission lock poisoned"))?;
             let access = address
                 .as_ref()
-                .and_then(|address| address.owner.as_ref())
+                .map(|address| &address.scope.owner)
+                .or_else(|| event_sink.map(|sink| sink.scope().owner()))
                 .and_then(|owner| scopes.get(owner).cloned());
             drop(scopes);
             if let Some(access) = access {
@@ -514,7 +513,10 @@ impl PermissionCoordinator {
                 ApprovalMode::Ask => {}
             },
         }
-        let execution_owner = address.as_ref().and_then(|address| address.owner.clone());
+        let execution_owner = address
+            .as_ref()
+            .map(|address| address.scope.owner.clone())
+            .or_else(|| event_sink.map(|sink| sink.scope().owner().clone()));
         if let Some(owner) = &execution_owner {
             request.id = format!("{}:{}:{}", owner.session_id, owner.agent_id, request.id);
         }
@@ -610,13 +612,13 @@ impl PermissionCoordinator {
         &self,
         title: String,
         detail: String,
-        address: crate::backend::ProviderAddress,
+        scope: crate::backend::InvocationScope,
         event_sink: &BackendEventSink,
     ) -> Result<ApprovalResolution> {
         let view = ApprovalRequestView {
             id: Uuid::new_v4().to_string(),
-            execution_owner: address.owner.clone(),
-            exchange_id: Some(address.turn_id.clone()),
+            execution_owner: Some(scope.owner.clone()),
+            exchange_id: Some(scope.exchange_id.to_string()),
             turn_id: None,
             provider: "Harness".into(),
             reason: None,
@@ -652,14 +654,14 @@ impl PermissionCoordinator {
                 ],
             }],
         };
-        self.wait_for_approval(view, Some(address), Some(event_sink), None)
+        self.wait_for_approval(view, None, Some(event_sink), None)
             .await
     }
 
     async fn wait_for_approval(
         &self,
         mut view: ApprovalRequestView,
-        address: Option<crate::backend::ProviderAddress>,
+        _address: Option<crate::backend::TurnAddress>,
         event_sink: Option<&BackendEventSink>,
         directory_policy: Option<Arc<DirectoryPolicy>>,
     ) -> Result<ApprovalResolution> {
@@ -713,17 +715,9 @@ impl PermissionCoordinator {
         };
         if let Some(event_sink) = event_sink {
             event_sink
-                .send_wait(BackendEvent {
-                    message: None,
-                    received_at_ms: None,
-                    address: address.clone(),
-                    turn_boundary: None,
-                    kind: "approval_requested".into(),
-                    text: None,
-                    data: serde_json::to_value(&view)?,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
+                .send_wait(BackendEvent::Approval {
+                    scope: event_sink.invocation_scope()?.clone(),
+                    update: crate::backend::ApprovalUpdate::Requested(view.clone()),
                 })
                 .await?;
         }
@@ -924,17 +918,9 @@ impl PermissionCoordinator {
         if !directory_list.is_empty()
             && let Some(sink) = event_sink
         {
-            sink.send_wait(BackendEvent {
-                message: None,
-                address: None,
-                turn_boundary: None,
-                received_at_ms: None,
-                kind: "directory_access_granted".into(),
-                text: None,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-                data: serde_json::to_value(&directory_list)?,
+            sink.send_wait(BackendEvent::DirectoryAccess {
+                scope: sink.invocation_scope()?.clone(),
+                grant: directory_list,
             })
             .await?;
         }
@@ -1027,20 +1013,17 @@ impl PermissionCoordinator {
         view: &ApprovalRequestView,
     ) -> Result<()> {
         if let Some(event_sink) = event_sink {
-            let _ = event_sink
-                .send_wait(BackendEvent {
-                    message: None,
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: kind.into(),
-                    text: None,
-                    data: serde_json::to_value(view)?,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
+            let update = match kind {
+                "approval_resolved" => crate::backend::ApprovalUpdate::Resolved(view.clone()),
+                "approval_cancelled" => crate::backend::ApprovalUpdate::Cancelled(view.clone()),
+                _ => anyhow::bail!("unsupported approval lifecycle: {kind}"),
+            };
+            event_sink
+                .send_wait(BackendEvent::Approval {
+                    scope: event_sink.invocation_scope()?.clone(),
+                    update,
                 })
-                .await;
+                .await?;
         }
         Ok(())
     }
@@ -1303,7 +1286,29 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 mod test {
     use crate::backend::codex::approval::{codex_response, permission_from_provider};
     use crate::backend::copilot::approval::permission_from_copilot;
+    use crate::backend::{ApprovalUpdate, ExecutionOwner, InvocationScope, TurnAddress};
     use crate::permissions::matcher::CommandAnalysisError;
+
+    fn scope() -> InvocationScope {
+        InvocationScope {
+            owner: ExecutionOwner::root("approval"),
+            exchange_id: "exchange".into(),
+            invocation_id: "invocation".into(),
+        }
+    }
+
+    fn approval(event: BackendEvent) -> ApprovalRequestView {
+        let BackendEvent::Approval {
+            scope,
+            update: ApprovalUpdate::Requested(view),
+        } = event
+        else {
+            panic!("expected requested approval");
+        };
+        assert_eq!(view.execution_owner.as_ref(), Some(&scope.owner));
+        view
+    }
+
     #[tokio::test]
     async fn approval_modes_resolve_rules_without_persisting_automatic_decisions() -> Result<()> {
         for mode in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {
@@ -1320,7 +1325,7 @@ mod test {
                     decision,
                 )])?;
                 let before = coordinator.store.read().unwrap().open().1;
-                let (sink, mut stream) = crate::backend::events::channel();
+                let (sink, mut stream) = crate::backend::events::channel(scope());
                 let waiting_coordinator = coordinator.clone();
                 let waiting = tokio::spawn(async move {
                     waiting_coordinator
@@ -1352,8 +1357,7 @@ mod test {
                                 .await?
                                 .context("approval stream closed")?
                                 .context("approval event missing")?;
-                        assert_eq!(event.kind, "approval_requested");
-                        let view: ApprovalRequestView = serde_json::from_value(event.data)?;
+                        let view = approval(event);
                         coordinator
                             .resolve(
                                 &view.id,
@@ -1421,8 +1425,11 @@ mod test {
             recovered_input: Vec::new(),
             control_context: None,
         };
-        let address = Some(crate::backend::ProviderAddress {
-            owner: Some(request.owner()?),
+        let address = Some(TurnAddress {
+            scope: InvocationScope {
+                owner: request.owner()?,
+                ..scope()
+            },
             thread_id: "native".into(),
             turn_id: "turn".into(),
         });
@@ -1454,7 +1461,8 @@ mod test {
         );
         permission.target_list.extend(write.target_list);
         let original = permission.clone();
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) =
+            crate::backend::events::channel(address.as_ref().unwrap().scope.clone());
         let waiting_coordinator = coordinator.clone();
         let waiting_address = address.clone();
         let waiter = tokio::spawn(async move {
@@ -1466,8 +1474,7 @@ mod test {
             .await?
             .unwrap()
             .unwrap();
-        assert_eq!(event.kind, "approval_requested");
-        let approval: ApprovalRequestView = serde_json::from_value(event.data)?;
+        let approval = approval(event);
         assert_eq!(approval.item_list.len(), 3);
         let answers = approval
             .item_list
@@ -1547,11 +1554,14 @@ mod test {
         assert_eq!(global.writable_directory.len(), 1);
         assert_eq!(waiter.await??, ApprovalResolution::AllowOnce);
         let first = stream.recv().await.unwrap().unwrap();
-        assert_eq!(first.kind, "directory_access_granted");
-        assert_eq!(
-            stream.recv().await.unwrap().unwrap().kind,
-            "approval_resolved"
-        );
+        assert!(matches!(first, BackendEvent::DirectoryAccess { grant, .. } if !grant.is_empty()));
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap(),
+            BackendEvent::Approval {
+                update: ApprovalUpdate::Resolved(_),
+                ..
+            }
+        ));
         assert_eq!(
             coordinator
                 .authorize(ApprovalMode::Ask, original.clone(), address.clone(), None)
@@ -1668,20 +1678,26 @@ mod test {
                 path: String::new(),
             }],
         };
-        let (sink, mut stream) = crate::backend::events::channel();
-        let address = Some(crate::backend::ProviderAddress {
-            owner: Some(request.owner()?),
+        let address = Some(TurnAddress {
+            scope: InvocationScope {
+                owner: request.owner()?,
+                ..scope()
+            },
             thread_id: "native".into(),
             turn_id: "turn".into(),
         });
+        let (sink, mut stream) =
+            crate::backend::events::channel(address.as_ref().unwrap().scope.clone());
         let failure = coordinator
             .authorize(ApprovalMode::Ask, invalid, address, Some(&sink))
             .await
             .unwrap_err();
         assert!(failure.to_string().contains("empty"));
         let event = stream.recv().await.unwrap().unwrap();
-        assert_eq!(event.kind, "error");
-        assert!(event.text.unwrap().contains("empty"));
+        assert!(matches!(
+            event,
+            BackendEvent::Diagnostic { diagnostic, .. } if diagnostic.message.contains("empty")
+        ));
         Ok(())
     }
 
@@ -1724,8 +1740,11 @@ mod test {
             recovered_input: Vec::new(),
             control_context: None,
         };
-        let address = Some(crate::backend::ProviderAddress {
-            owner: Some(request.owner()?),
+        let address = Some(TurnAddress {
+            scope: InvocationScope {
+                owner: request.owner()?,
+                ..scope()
+            },
             thread_id: "provider".into(),
             turn_id: "turn".into(),
         });
@@ -1915,7 +1934,7 @@ mod test {
         let before = std::fs::read(&path).unwrap();
         let store = PermissionStore::load(&path, directory.path()).unwrap();
         let coordinator = PermissionCoordinator::new(Arc::new(RwLock::new(store)));
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) = crate::backend::events::channel(scope());
         for mode in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {
             for _callback in 0..1 {
                 let request = PermissionRequest {
@@ -1943,8 +1962,11 @@ mod test {
                 assert!(failure.to_string().contains("split independent operations"));
                 assert!(coordinator.pending_list().unwrap().is_empty());
                 let event = stream.try_recv().unwrap();
-                assert_eq!(event.kind, "error");
-                assert!(event.text.unwrap().contains("shell_command_parse_error"));
+                assert!(matches!(
+                    event,
+                    BackendEvent::Diagnostic { diagnostic, .. }
+                        if diagnostic.message.contains("shell_command_parse_error")
+                ));
                 assert!(stream.try_recv().is_err());
             }
             let corrected = PermissionRequest {
@@ -2002,12 +2024,14 @@ mod test {
                 },
             )
             .unwrap();
-        let (sink, mut stream) = crate::backend::events::channel();
         let mut tasks = Vec::new();
+        let mut streams = Vec::new();
         for session in ["expired", "waiting"] {
             let owner = crate::backend::ExecutionOwner::root(session);
             let coordinator = coordinator.clone();
-            let sink = sink.clone();
+            let (sink, stream) =
+                crate::backend::events::channel(InvocationScope { owner, ..scope() });
+            streams.push(stream);
             tasks.push(tokio::spawn(async move {
                 coordinator
                     .authorize(
@@ -2021,8 +2045,8 @@ mod test {
                                 shell: None,
                             }],
                         },
-                        Some(crate::backend::ProviderAddress {
-                            owner: Some(owner),
+                        Some(TurnAddress {
+                            scope: sink.invocation_scope().unwrap().clone(),
                             thread_id: session.into(),
                             turn_id: "turn".into(),
                         }),
@@ -2032,11 +2056,8 @@ mod test {
                     .unwrap()
             }));
         }
-        for _ in 0..2 {
-            assert_eq!(
-                stream.recv().await.unwrap().unwrap().kind,
-                "approval_requested"
-            );
+        for stream in &mut streams {
+            approval(stream.recv().await.unwrap().unwrap());
         }
         let pending = coordinator.pending_list().unwrap();
         let original = pending
@@ -2066,12 +2087,18 @@ mod test {
                 .expires_at_ms,
             original_deadline
         );
-        let expired = tokio::time::timeout(std::time::Duration::from_secs(3), stream.recv())
+        let expired = tokio::time::timeout(std::time::Duration::from_secs(3), streams[0].recv())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(expired.data["resolution_source"], "timeout");
+        assert!(matches!(
+            expired,
+            BackendEvent::Approval {
+                update: ApprovalUpdate::Resolved(view),
+                ..
+            } if view.resolution_source == ResolutionSource::Timeout
+        ));
         assert!(expired_feedback.has_changed().unwrap());
         assert!(*expired_feedback.borrow_and_update());
         assert!(!waiting_feedback.has_changed().unwrap());
@@ -2125,7 +2152,7 @@ mod test {
     #[tokio::test]
     async fn input_timeout_registration_is_removed_when_provider_wait_is_dropped() {
         let coordinator = PermissionCoordinator::transient(".").unwrap();
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) = crate::backend::events::channel(scope());
         let provider = coordinator.clone();
         let waiter = tokio::spawn(async move {
             provider
@@ -2158,15 +2185,17 @@ mod test {
     #[tokio::test]
     async fn cancelling_one_owned_child_preserves_sibling_approval_with_the_same_provider_id() {
         let coordinator = PermissionCoordinator::transient(".").unwrap();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
         let mut waiter = Vec::new();
+        let mut channels = Vec::new();
         for agent_id in ["first", "second"] {
             let coordinator = coordinator.clone();
-            let sink = event_sink.clone();
             let owner = crate::backend::ExecutionOwner {
                 session_id: "root".into(),
                 agent_id: agent_id.into(),
             };
+            let (sink, mut stream) =
+                crate::backend::events::channel(InvocationScope { owner, ..scope() });
+            let waiting_sink = sink.clone();
             waiter.push(tokio::spawn(async move {
                 coordinator
                     .authorize(
@@ -2180,20 +2209,18 @@ mod test {
                                 shell: None,
                             }],
                         },
-                        Some(crate::backend::ProviderAddress {
-                            owner: Some(owner),
+                        Some(TurnAddress {
+                            scope: waiting_sink.invocation_scope().unwrap().clone(),
                             thread_id: "thread".into(),
                             turn_id: "turn".into(),
                         }),
-                        Some(&sink),
+                        Some(&waiting_sink),
                     )
                     .await
                     .unwrap()
             }));
-            assert_eq!(
-                event_stream.recv().await.unwrap().unwrap().kind,
-                "approval_requested"
-            );
+            approval(stream.recv().await.unwrap().unwrap());
+            channels.push((sink, stream));
         }
         assert_eq!(coordinator.pending_list().unwrap().len(), 2);
         coordinator
@@ -2202,14 +2229,17 @@ mod test {
                     session_id: "root".into(),
                     agent_id: "first".into(),
                 },
-                Some(&event_sink),
+                Some(&channels[0].0),
             )
             .await
             .unwrap();
-        assert_eq!(
-            event_stream.recv().await.unwrap().unwrap().kind,
-            "approval_cancelled"
-        );
+        assert!(matches!(
+            channels[0].1.recv().await.unwrap().unwrap(),
+            BackendEvent::Approval {
+                update: ApprovalUpdate::Cancelled(_),
+                ..
+            }
+        ));
         assert_eq!(waiter.remove(0).await.unwrap(), ApprovalResolution::Cancel);
         assert!(!waiter[0].is_finished());
         let pending = coordinator.pending_list().unwrap();
@@ -2367,7 +2397,7 @@ mod test {
         let original = permission_store.open().1;
         let store = Arc::new(RwLock::new(permission_store));
         let coordinator = Arc::new(PermissionCoordinator::new(Arc::clone(&store)));
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(scope());
         let waiting_coordinator = Arc::clone(&coordinator);
         let waiting = tokio::spawn(async move {
             waiting_coordinator.authorize(ApprovalMode::Ask, PermissionRequest {
@@ -2378,7 +2408,7 @@ mod test {
             }, None, Some(&event_sink)).await.unwrap()
         });
         let event = event_stream.recv().await.unwrap().unwrap();
-        let view: ApprovalRequestView = serde_json::from_value(event.data).unwrap();
+        let view = approval(event);
         assert_eq!(
             view.item_list
                 .iter()
@@ -2415,7 +2445,7 @@ mod test {
         ];
         assert!(
             coordinator
-                .resolve("versions", &answer_list[..1], None)
+                .resolve(&view.id, &answer_list[..1], None)
                 .await
                 .is_err()
         );
@@ -2423,22 +2453,17 @@ mod test {
         duplicate[2].item_id = "1".into();
         assert!(
             coordinator
-                .resolve("versions", &duplicate, None)
+                .resolve(&view.id, &duplicate, None)
                 .await
                 .is_err()
         );
         let mut unknown = answer_list.clone();
         unknown[1].choice_id = "allow_everything".into();
-        assert!(
-            coordinator
-                .resolve("versions", &unknown, None)
-                .await
-                .is_err()
-        );
+        assert!(coordinator.resolve(&view.id, &unknown, None).await.is_err());
         assert_eq!(store.read().unwrap().open().1, original);
         assert_eq!(coordinator.pending_list().unwrap().len(), 1);
         coordinator
-            .resolve("versions", &answer_list, None)
+            .resolve(&view.id, &answer_list, None)
             .await
             .unwrap();
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyOnce);
@@ -2701,7 +2726,7 @@ mod test {
         let directory = tempfile::tempdir()?;
         let coordinator = PermissionCoordinator::transient(directory.path())?;
         let before = coordinator.store.read().unwrap().open().1;
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) = crate::backend::events::channel(scope());
         let resolution = coordinator
             .authorize(
                 ApprovalMode::Allow,
@@ -2736,7 +2761,7 @@ mod test {
         ));
         let original = store.read().unwrap().open().1;
         let coordinator = Arc::new(PermissionCoordinator::new(Arc::clone(&store)));
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(scope());
         let waiting_coordinator = Arc::clone(&coordinator);
         let waiting = tokio::spawn(async move {
             waiting_coordinator
@@ -2757,10 +2782,10 @@ mod test {
                 .await
                 .unwrap()
         });
-        event_stream.recv().await.unwrap().unwrap();
+        let view = approval(event_stream.recv().await.unwrap().unwrap());
         coordinator
             .resolve(
-                "cancel-versions",
+                &view.id,
                 &[
                     ApprovalAnswer {
                         item_id: "0".into(),
@@ -2795,7 +2820,7 @@ mod test {
                 shell: None,
             }],
         };
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(scope());
         let waiting_event_sink = event_sink.clone();
         let waiting_coordinator = Arc::clone(&coordinator);
         let waiting = tokio::spawn(async move {
@@ -2805,9 +2830,9 @@ mod test {
                 .unwrap()
         });
         let event = event_stream.recv().await.unwrap().unwrap();
-        assert_eq!(event.kind, "approval_requested");
+        let view = approval(event);
         let owned = coordinator
-            .bind_owner("approval-one", "child-exchange", Some("child-turn"))
+            .bind_owner(&view.id, "child-exchange", Some("child-turn"))
             .unwrap()
             .unwrap();
         assert_eq!(owned.exchange_id.as_deref(), Some("child-exchange"));
@@ -2816,12 +2841,12 @@ mod test {
         assert_eq!(snapshot[0].turn_id.as_deref(), Some("child-turn"));
         assert!(
             coordinator
-                .bind_owner("approval-one", "other-exchange", Some("other-turn"))
+                .bind_owner(&view.id, "other-exchange", Some("other-turn"))
                 .is_err()
         );
         coordinator
             .resolve(
-                "approval-one",
+                &view.id,
                 &[ApprovalAnswer {
                     item_id: "0".into(),
                     choice_id: "allow_broad".into(),
@@ -2836,8 +2861,13 @@ mod test {
             .expect("manual resolution must reach the requesting execution")
             .unwrap()
             .unwrap();
-        assert_eq!(resolved.kind, "approval_resolved");
-        let resolved_view: ApprovalRequestView = serde_json::from_value(resolved.data).unwrap();
+        let BackendEvent::Approval {
+            update: ApprovalUpdate::Resolved(resolved_view),
+            ..
+        } = resolved
+        else {
+            panic!("expected resolved approval");
+        };
         assert_eq!(resolved_view.exchange_id, owned.exchange_id);
         assert_eq!(resolved_view.turn_id, owned.turn_id);
         let source = store.read().unwrap().open().1;
@@ -2851,7 +2881,7 @@ mod test {
             PermissionStore::load(directory.path().join("permissions.json"), "D:/repo").unwrap(),
         ));
         let coordinator = Arc::new(PermissionCoordinator::new(Arc::clone(&store)));
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(scope());
         let waiting_event_sink = event_sink.clone();
         let waiting_coordinator = Arc::clone(&coordinator);
         let waiting = tokio::spawn(async move {
@@ -2873,13 +2903,10 @@ mod test {
                 .await
                 .unwrap()
         });
-        assert_eq!(
-            event_stream.recv().await.unwrap().unwrap().kind,
-            "approval_requested"
-        );
+        let view = approval(event_stream.recv().await.unwrap().unwrap());
         coordinator
             .resolve(
-                "approval-deny",
+                &view.id,
                 &[ApprovalAnswer {
                     item_id: "0".into(),
                     choice_id: "deny_broad".into(),
@@ -2898,7 +2925,7 @@ mod test {
     #[tokio::test]
     async fn cancellation_clears_every_pending_approval_and_emits_lifecycle_events() {
         let coordinator = PermissionCoordinator::transient("D:/repo").unwrap();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(scope());
         let waiting_event_sink = event_sink.clone();
         let waiting_coordinator = Arc::clone(&coordinator);
         let waiting = tokio::spawn(async move {
@@ -2920,15 +2947,15 @@ mod test {
                 .await
                 .unwrap()
         });
-        assert_eq!(
-            event_stream.recv().await.unwrap().unwrap().kind,
-            "approval_requested"
-        );
+        approval(event_stream.recv().await.unwrap().unwrap());
         coordinator.cancel_all(Some(&event_sink)).await.unwrap();
-        assert_eq!(
-            event_stream.recv().await.unwrap().unwrap().kind,
-            "approval_cancelled"
-        );
+        assert!(matches!(
+            event_stream.recv().await.unwrap().unwrap(),
+            BackendEvent::Approval {
+                update: ApprovalUpdate::Cancelled(_),
+                ..
+            }
+        ));
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::Cancel);
         assert!(coordinator.pending_list().unwrap().is_empty());
     }

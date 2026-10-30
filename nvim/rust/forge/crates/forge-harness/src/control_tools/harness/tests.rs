@@ -397,9 +397,7 @@ fn search_respects_workspace_read_boundary_and_explicit_denials() -> Result<()> 
 
 #[test]
 fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> Result<()> {
-    use crate::backend::{
-        BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
-    };
+    use crate::backend::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
     let fixture = Fixture::new()?;
     let mut store = SqliteStore::open(fixture.root.path())?;
     let mut exchange = exchange(&fixture.scope.session, "exchange", "Initial question");
@@ -410,31 +408,13 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
         exchange.finalization_outcome(),
     );
     exchange.resume(0)?;
-    let mut event = BackendEvent {
-        message: None,
-        received_at_ms: None,
-        address: Some(ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "one".into(),
-        }),
-        turn_boundary: Some(TurnBoundary::Started),
-        kind: "turn_started".into(),
-        text: None,
-        data: Value::Null,
-        activity: None,
-        summary: None,
-        checklist_update: None,
-    };
-    exchange.observe_turn(&event, 0)?;
-    event.turn_boundary = None;
-    event.kind = "assistant_message".into();
-    event.text = Some("progress excluded".into());
-    event.data = json!({"phase":"commentary"});
-    crate::turn::test_support::set_message(
-        &mut event,
+    let address = crate::turn::test_support::address(&exchange, "one");
+    exchange.start_turn(address.clone(), 0)?;
+    let event = crate::turn::test_support::message(
+        &address,
         "progress",
-        crate::backend::MessageRole::Commentary,
+        Some(crate::backend::MessageRole::Commentary),
+        "progress excluded",
     );
     exchange.observe_turn(&event, 1)?;
     exchange.append_input(
@@ -442,29 +422,35 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
         "Follow-up question".into(),
         2,
     )?;
-    event.text = Some("Final answer".into());
-    event.data = json!({"phase":"final_answer"});
-    crate::turn::test_support::set_message(
-        &mut event,
+    let event = crate::turn::test_support::message(
+        &address,
         "answer",
-        crate::backend::MessageRole::Response,
+        Some(crate::backend::MessageRole::Response),
+        "Final answer",
     );
     exchange.observe_turn(&event, 3)?;
-    event.text = None;
-    event.data = Value::Null;
-    event.kind = "tool".into();
-    event.message = None;
     let output = format!("{}NEEDLE\0{}", "x".repeat(15998), "\u{96ea}".repeat(20000));
-    event.activity = Some(ToolActivity {
-        id: "reused".into(),
-        kind: ToolActivityKind::ToolCall,
-        title: "inspect".into(),
-        output: Some(output.clone()),
-        output_delta: false,
-        status: Some(crate::backend::ToolStatus::Succeeded),
-        change: Default::default(),
-    });
-    exchange.observe_turn(&event, 4)?;
+    crate::turn::test_support::tool(
+        &mut exchange,
+        &address,
+        "reused",
+        ToolInvocation {
+            kind: ToolActivityKind::ToolCall,
+            name: "inspect".into(),
+            title: "inspect".into(),
+            arguments: json!({}),
+        },
+        [
+            ToolUpdate::Started,
+            ToolUpdate::Output {
+                update: TextUpdate::Replace(output.clone()),
+            },
+            ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            },
+        ],
+        4,
+    )?;
     store.save_exchange(&exchange)?;
     let messages = fixture.invoke("harness_session_exchange_list", json!({}))?;
     assert_eq!(

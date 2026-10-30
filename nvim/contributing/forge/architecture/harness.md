@@ -525,10 +525,13 @@ The exchange activity section owns the shared child indentation for all event ki
 including skill reads and file-change failures or interruptions. Late skill and tool
 events from the response's own turn remain inside its activity fold. Later turns
 retain their chronological position and nest their activity between outer responses.
-Copilot assistant deltas render as commentary until the completed message supplies its tool
-requests. Messages that request tools retain commentary styling. Completed messages without
-tool requests become final responses. Completion replaces the streamed message by provider
-identity, preserving its position without appending duplicate text.
+Copilot message-start metadata supplies the phase before text deltas. Commentary
+and response can stream under separate identities before either completed snapshot
+arrives. Snapshots replace text on their own identity, without inferring phase from
+tool requests or snapshot arrival order. Unknown or absent phase stays unclassified.
+Successful processing that ends with commentary and no explicit final answer emits
+a distinct synthetic response with the same text. Its intentional text duplication
+does not reuse a block identity or move tools from the commentary.
 Tool timings round to the nearest tenth in a fixed five-cell column, accommodating `99.9s`.
 Rounded values reaching 100 advance to the next unit, starting with minutes, so timer
 updates never shift command columns.
@@ -645,10 +648,12 @@ Legacy activity following an intermediate final
 answer retains its relative order. Streaming, completion, and reload use the same layout and node IDs.
 Thoughts and tool groups nest one two-column level below their exchange summary. Tool calls and output
 retain their additional nesting. Adjacent visible tools share one group across provider-turn boundaries.
-Each exchange retains an ordered `ExchangeEntry` list with commentary, steering, response,
-and event variants. Commentary owns the only tool store, grouped by provider turn to preserve
+Each exchange retains an ordered `ExchangeEntry` list with commentary, steering,
+response, and event variants. Unclassified message nodes render as non-owning
+content without becoming commentary entries. Commentary owns the only tool store, grouped by provider turn to preserve
 native call identity. Provider turns retain execution lifecycle, messages, and first-seen
-references, but do not retain a second tool store. New tools attach to the current commentary.
+references, but do not retain a second tool store. New tools attach to the latest
+nonempty, known commentary. Unclassified text remains visible without owning tools.
 Repeated progress and completion update the original owner even after later commentary or
 steering. Tools arriving without a commentary create a synthetic “Considering initial steps”
 entry. Hidden reasoning and empty messages do not create commentary.
@@ -661,9 +666,9 @@ for rendering, so steering cannot become a child of a commentary fold.
 The exchange keeps total, completed, and running tool counters in memory. Tool updates apply
 the difference between the previous and current state. Repeated completion does not increment
 totals again. Reload reconstructs the counters from commentary-owned records. Counters are
-omitted from durable payloads. Existing turn-owned tool stores migrate into commentary on
-read, preserving source order and provider IDs. Output chunks and archived output retain their
-existing exchange/turn/tool identity.
+omitted from durable payloads. Current-format storage preserves source order and
+provider IDs. Other private session formats remain invisible rather than migrating
+on read. Output chunks and archived output retain their exchange/turn/tool identity.
 
 Each grouped tool keeps its original turn identity for output lookup, actions, and expansion.
 Final answers remain outside the activity fold. Tool invocation headings retain one display row in both collapsed and expanded states. The shared width-bounded title formatting preserves the duration column and truncates the displayed command or arguments. Full provider titles remain in durable tool state. Active tool previews display the latest four wrapped rows from the incremental output index. New output replaces only the preview body and earlier-line count at the existing presentation cadence. Explicit expansion still reads the full output from its beginning, and settled exchanges remove the automatic preview.

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind},
+    backend::{BackendEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolUpdate},
     exchange::{Exchange, ExchangeState},
 };
 
@@ -10,31 +10,29 @@ fn output_exchange(text: &str) -> Result<(Exchange, BackendEvent)> {
         "prompt":"run","kind":"chat","state":"running","turn":[],"node_list":[],"created_at_ms":1,
         "attributed_matches_checkpoint":false
     }))?;
-    let address = ProviderAddress {
-        owner: None,
-        thread_id: "thread".into(),
-        turn_id: "turn".into(),
-    };
+    let address = crate::turn::test_support::address(&exchange, "turn");
     exchange.start_turn(address.clone(), 1)?;
-    let event = BackendEvent {
-        message: None,
-        received_at_ms: None,
-        address: Some(address),
-        turn_boundary: None,
-        kind: "tool".into(),
-        text: None,
-        data: serde_json::json!({}),
-        summary: None,
-        checklist_update: None,
-        activity: Some(ToolActivity {
-            id: "call".into(),
+    crate::turn::test_support::tool(
+        &mut exchange,
+        &address,
+        "call",
+        ToolInvocation {
             kind: ToolActivityKind::Command,
+            name: "read".into(),
             title: "read".into(),
-            output: Some(text.into()),
-            status: Some(crate::backend::ToolStatus::Running),
-            change: Default::default(),
-            output_delta: false,
-        }),
+            arguments: serde_json::json!({}),
+        },
+        [ToolUpdate::Started],
+        2,
+    )?;
+    let event = BackendEvent::Tool {
+        address: crate::backend::ToolAddress {
+            turn: address,
+            tool_id: "call".into(),
+        },
+        update: ToolUpdate::Output {
+            update: TextUpdate::Replace(text.into()),
+        },
     };
     exchange.observe_turn(&event, 2)?;
     Ok((exchange, event))
@@ -62,8 +60,11 @@ fn output_saves_pages_and_migration_preserve_content_without_history_reads() -> 
     store
         .connection
         .execute_batch("DROP TRIGGER no_output_rewrite")?;
-    event.activity.as_mut().unwrap().output_delta = true;
-    event.activity.as_mut().unwrap().output = Some("追加🙂".into());
+    if let BackendEvent::Tool { update, .. } = &mut event {
+        *update = ToolUpdate::Output {
+            update: TextUpdate::Append("追加🙂".into()),
+        };
+    }
     exchange.observe_turn(&event, 3)?;
     store.connection.execute_batch("CREATE TRIGGER reject_summary BEFORE UPDATE ON tool_output_summary BEGIN SELECT RAISE(ABORT,'failed commit'); END;")?;
     assert!(store.save_tool_output_delta(&exchange, &event).is_err());
@@ -342,8 +343,11 @@ fn legacy_empty_output_can_append_after_migration() -> Result<()> {
     store.connection.execute_batch("DELETE FROM tool_output_owner; UPDATE exchange_record SET payload=json_remove(payload,'$.tool_output_format'); PRAGMA user_version=0;")?;
     drop(store);
     let mut store = SqliteStore::open(root.path())?;
-    event.activity.as_mut().unwrap().output_delta = true;
-    event.activity.as_mut().unwrap().output = Some("first λ".into());
+    if let BackendEvent::Tool { update, .. } = &mut event {
+        *update = ToolUpdate::Output {
+            update: TextUpdate::Append("first λ".into()),
+        };
+    }
     exchange.observe_turn(&event, 3)?;
     store.save_tool_output_delta(&exchange, &event)?;
     assert_eq!(

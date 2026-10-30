@@ -1,4 +1,4 @@
-use crate::backend::MessageRole;
+use crate::backend::{MessageClassification, MessageRole};
 use serde::{Deserialize, Serialize};
 
 /// Distinguishes provider reasoning from user-visible assistant text.
@@ -32,10 +32,17 @@ pub enum MessageState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Message {
     pub(crate) id: String,
-    pub(crate) provider_id: Option<String>,
-    pub(crate) role: Option<MessageRole>,
+    pub(crate) provider_id: crate::backend::MessageId,
+    pub(crate) classification: MessageClassification,
+    pub(crate) start: MessageStart,
     pub(crate) state: MessageState,
     pub(crate) text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct MessageStart {
+    pub classification: MessageClassification,
+    pub text: String,
 }
 
 impl Message {
@@ -46,7 +53,7 @@ impl Message {
 
     /// Return the normalized provider message role.
     pub fn kind(&self) -> MessageKind {
-        match self.role {
+        match self.role() {
             None => MessageKind::Unknown,
             Some(MessageRole::ThoughtSummary) => MessageKind::ReasoningSummary,
             Some(MessageRole::Thought) => MessageKind::Reasoning,
@@ -55,13 +62,13 @@ impl Message {
     }
 
     /// Return the provider identity used to coalesce replayed message deltas.
-    pub fn provider_id(&self) -> Option<&str> {
-        self.provider_id.as_deref()
+    pub fn provider_id(&self) -> &crate::backend::MessageId {
+        &self.provider_id
     }
 
     /// Return whether the message is progress commentary or the final answer.
     pub fn delivery(&self) -> MessageDelivery {
-        match self.role {
+        match self.role() {
             None => MessageDelivery::Unknown,
             Some(MessageRole::Response) => MessageDelivery::Final,
             Some(MessageRole::Thought | MessageRole::ThoughtSummary | MessageRole::Commentary) => {
@@ -71,7 +78,14 @@ impl Message {
     }
 
     pub fn role(&self) -> Option<MessageRole> {
-        self.role
+        match self.classification {
+            MessageClassification::Unclassified => None,
+            MessageClassification::Known(role) => Some(role),
+        }
+    }
+
+    pub fn classification(&self) -> MessageClassification {
+        self.classification
     }
 
     pub fn state(&self) -> MessageState {

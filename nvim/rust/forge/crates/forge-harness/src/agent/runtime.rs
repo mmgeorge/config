@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 
 use super::{AgentCommand, AgentCommandSender};
-use crate::backend::{Backend, BackendEvent, BackendOutput, BackendRequest, ExecutionOwner};
+use crate::backend::{Backend, BackendCompletion, BackendEvent, BackendRequest, ExecutionOwner};
 
 /// Runs one child turn without retaining a broker, storage, or presentation lock.
 pub struct AgentRuntime {
@@ -29,8 +29,8 @@ impl AgentRuntime {
             !owner.is_root(),
             "child runtime cannot own the root conversation"
         );
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
-        let event_sink = event_sink.owned(owner.clone());
+        let scope = crate::backend::InvocationScope::new(owner.clone(), self.task_id.clone());
+        let (event_sink, mut event_stream) = crate::backend::events::channel(scope.clone());
         let mut request = self.request.clone();
         let mut stream_open = true;
         let mut cancelled = *self.cancellation.borrow();
@@ -100,26 +100,29 @@ impl AgentRuntime {
                 None
             }
         };
-        while let Ok(event) = event_stream.try_recv() {
-            if let Err(error) = self.publish(&owner, event).await {
-                output = Err(error);
-                break;
+        loop {
+            match event_stream.try_next() {
+                Ok(Some(event)) => {
+                    if let Err(error) = self.publish(&owner, event).await {
+                        output = Err(error);
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    output = Err(error.into());
+                    break;
+                }
             }
         }
         if let Some(provider_thread_id) = &retained {
             self.publish(
                 &owner,
-                BackendEvent {
-                    message: None,
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "agent_conversation_resolved".into(),
-                    text: None,
-                    data: serde_json::json!({"thread_id":provider_thread_id}),
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
+                BackendEvent::Agent {
+                    scope: scope.clone(),
+                    update: crate::backend::AgentUpdate::ConversationResolved {
+                        thread_id: provider_thread_id.clone(),
+                    },
                 },
             )
             .await?;
@@ -140,7 +143,7 @@ impl AgentRuntime {
             failure
         })
         .await;
-        let output = output.map(|mut output: BackendOutput| {
+        let output = output.map(|mut output: BackendCompletion| {
             if output.backend_session_id.is_none() {
                 output.backend_session_id = retained;
             }
@@ -155,28 +158,22 @@ impl AgentRuntime {
             .send(AgentCommand::Completed {
                 owner,
                 task_id: self.task_id.clone(),
-                output,
+                output: Box::new(output),
                 cleanup_error,
             })
             .await
     }
 
-    async fn publish(&self, owner: &ExecutionOwner, mut event: BackendEvent) -> Result<()> {
-        if let Some(address) = &mut event.address {
-            anyhow::ensure!(
-                address
-                    .owner
-                    .as_ref()
-                    .is_none_or(|observed| observed == owner),
-                "provider event crosses child execution ownership"
-            );
-            address.owner = Some(owner.clone());
-        }
+    async fn publish(&self, owner: &ExecutionOwner, event: BackendEvent) -> Result<()> {
+        anyhow::ensure!(
+            event.scope().owner() == owner,
+            "provider event crosses child execution ownership"
+        );
         self.sender
             .send(AgentCommand::Event {
                 owner: owner.clone(),
                 task_id: self.task_id.clone(),
-                event,
+                event: Box::new(event),
             })
             .await
     }

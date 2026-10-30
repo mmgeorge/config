@@ -1,7 +1,4 @@
-use super::{
-    BackendEvent, BackendEventSink, BackendOutput, CopilotEventDecoder, CopilotTurnEvent,
-    SharedCopilotSession,
-};
+use super::{BackendEvent, BackendEventSink, CopilotTurnEvent, SharedCopilotSession};
 use crate::backend::{Compaction, CompactionState};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -45,7 +42,7 @@ impl ManualCompactionMap {
 pub(super) struct CompactionSubscription {
     /// Receives normalized evidence independently of the active prompt reader.
     pub sink: BackendEventSink,
-    output: Arc<Mutex<BackendOutput>>,
+    state: Arc<Mutex<std::collections::HashMap<String, Compaction>>>,
     manual: Arc<Mutex<ManualCompactionMap>>,
 }
 
@@ -54,7 +51,7 @@ impl CompactionSubscription {
     pub fn new(sink: BackendEventSink) -> Self {
         Self {
             sink,
-            output: Arc::new(Mutex::new(BackendOutput::default())),
+            state: Arc::new(Mutex::new(Default::default())),
             manual: Arc::new(Mutex::new(ManualCompactionMap::default())),
         }
     }
@@ -84,36 +81,35 @@ impl CompactionMonitor {
                     "session.compaction_start" | "session.compaction_complete"
                 )
             },
-            trace,
-            harness_session_id,
+            Arc::clone(&trace),
+            harness_session_id.clone(),
         );
         let manual = Arc::clone(&subscription_state.manual);
         let correlation = Arc::clone(&manual);
         let thread_id = session.id().to_string();
         let task = tokio::spawn(async move {
-            let decoder = CopilotEventDecoder::default();
             let sink = subscription_state.sink;
-            subscription_state.output.lock().await.backend_session_id = Some(thread_id);
             loop {
                 let event = match subscription.recv().await {
                     Ok(event) => event,
                     Err(error) => {
-                        let _ = sink
-                            .send_wait(BackendEvent {
-                                message: None,
-                                received_at_ms: None,
-                                address: None,
-                                turn_boundary: None,
-                                kind: "error".into(),
-                                text: Some(format!(
+                        let diagnostic = BackendEvent::Diagnostic {
+                            scope: sink.scope().clone(),
+                            diagnostic: crate::backend::ProviderDiagnostic {
+                                code: Some("copilot_compaction_subscription_failed".into()),
+                                message: format!(
                                     "Copilot compaction subscription failed: {error:#}"
-                                )),
-                                data: serde_json::Value::Null,
-                                activity: None,
-                                summary: None,
-                                checklist_update: None,
-                            })
-                            .await;
+                                ),
+                                fatal: true,
+                            },
+                        };
+                        if let Err(delivery) = sink.send_wait(diagnostic).await {
+                            trace.record(
+                                &harness_session_id,
+                                "copilot.compaction.delivery_failed",
+                                serde_json::json!({"error":delivery.to_string()}),
+                            );
+                        }
                         return;
                     }
                 };
@@ -123,38 +119,68 @@ impl CompactionMonitor {
                 ) {
                     continue;
                 }
-                let mut output = subscription_state.output.lock().await;
-                decoder.decode(&event, &mut output, None).await;
-                let normalized = output
-                    .event
-                    .iter()
-                    .rev()
-                    .find(|normalized| {
-                        normalized
-                            .data
-                            .get("provider_event_id")
-                            .or_else(|| normalized.data.get("id"))
-                            .and_then(serde_json::Value::as_str)
-                            == Some(event.id.as_str())
-                    })
-                    .cloned();
-                let thread_id = output.backend_session_id.clone();
-                drop(output);
-                if let Some(mut normalized) = normalized {
-                    if let Ok(Some(mut compaction)) = normalized.compaction() {
-                        if thread_id.as_deref() == Some(compaction.thread_id.as_str()) {
-                            correlation.lock().await.correlate(&mut compaction);
+                let event_thread = event.agent_id.as_deref().unwrap_or(&thread_id);
+                let mut state = subscription_state.state.lock().await;
+                let update = super::event_decoder::decode_compaction(
+                    &event,
+                    event_thread,
+                    state.get(event_thread),
+                );
+                let mut update = match update {
+                    Ok(update) => update,
+                    Err(error) => {
+                        drop(state);
+                        let diagnostic = BackendEvent::Diagnostic {
+                            scope: sink.scope().clone(),
+                            diagnostic: crate::backend::ProviderDiagnostic {
+                                code: Some("invalid_copilot_compaction".into()),
+                                message: error.to_string(),
+                                fatal: false,
+                            },
+                        };
+                        if let Err(delivery) = sink.send_wait(diagnostic).await {
+                            trace.record(
+                                &harness_session_id,
+                                "copilot.compaction.delivery_failed",
+                                serde_json::json!({"error":delivery.to_string()}),
+                            );
+                            return;
                         }
-                        normalized.data = serde_json::to_value(compaction)
-                            .expect("compaction is JSON serializable");
+                        continue;
                     }
-                    let active_sink = turn_event.event_sink();
-                    if let Some(active_sink) = active_sink {
-                        let _ = active_sink.send_wait(normalized.clone()).await;
-                    }
-                    if sink.send_wait(normalized).await.is_err() {
-                        return;
-                    }
+                };
+                state.insert(event_thread.into(), update.clone());
+                drop(state);
+                if event.agent_id.is_none() {
+                    correlation.lock().await.correlate(&mut update);
+                }
+                if let Some(active_sink) = turn_event.event_sink()
+                    && let Err(error) = active_sink
+                        .send_wait(BackendEvent::Compaction {
+                            scope: active_sink.scope().clone(),
+                            update: update.clone().into(),
+                        })
+                        .await
+                {
+                    trace.record(
+                        &harness_session_id,
+                        "copilot.compaction.active_delivery_failed",
+                        serde_json::json!({"error":error.to_string()}),
+                    );
+                }
+                if let Err(error) = sink
+                    .send_wait(BackendEvent::Compaction {
+                        scope: sink.scope().clone(),
+                        update: update.into(),
+                    })
+                    .await
+                {
+                    trace.record(
+                        &harness_session_id,
+                        "copilot.compaction.delivery_failed",
+                        serde_json::json!({"error":error.to_string()}),
+                    );
+                    return;
                 }
             }
         });
@@ -174,10 +200,13 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_identity_survives_turn_and_subscription_rebinding() {
-        let (sink, _stream) = crate::backend::events::channel();
+        let (sink, _stream) =
+            crate::backend::events::channel(crate::backend::EventScope::SessionOperation {
+                owner: crate::backend::ExecutionOwner::root("session"),
+                operation_id: "compaction-observer".into(),
+            });
         let subscription = CompactionSubscription::new(sink);
         let rebound = subscription.clone();
-        subscription.output.lock().await.backend_session_id = Some("thread".into());
         let start = github_copilot_sdk::SessionEvent {
             id: "native-start".into(),
             timestamp: "2026-10-10T00:00:00Z".into(),
@@ -195,15 +224,22 @@ mod tests {
             data: serde_json::json!({"success":true,"summaryContent":"Keep the task constraints."}),
             ..start.clone()
         };
-        CopilotEventDecoder::default()
-            .decode(&start, &mut *subscription.output.lock().await, None)
-            .await;
-        CopilotEventDecoder::default()
-            .decode(&complete, &mut *rebound.output.lock().await, None)
-            .await;
-        let output = rebound.output.lock().await;
-        assert_eq!(output.event.len(), 1);
-        let compaction = output.event[0].compaction().unwrap().unwrap();
+        let update =
+            super::super::event_decoder::decode_compaction(&start, "thread", None).unwrap();
+        subscription
+            .state
+            .lock()
+            .await
+            .insert("thread".into(), update);
+        let mut state = rebound.state.lock().await;
+        let compaction = super::super::event_decoder::decode_compaction(
+            &complete,
+            "thread",
+            state.get("thread"),
+        )
+        .unwrap();
+        state.insert("thread".into(), compaction.clone());
+        assert_eq!(state.len(), 1);
         assert_eq!(compaction.id, start.id);
         assert_eq!(compaction.state, CompactionState::Completed);
         assert_eq!(compaction.result.model.as_deref(), Some("summary-model"));

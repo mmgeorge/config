@@ -1,5 +1,5 @@
 use super::{ControlToolInvocation, apply_invocation};
-use crate::backend::{BackendOutput, PromptMode};
+use crate::backend::{BackendCompletion, PromptMode};
 use crate::plan::{PlanDocument, PlanState, render_plan, validate_workspace_references};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
@@ -174,7 +174,7 @@ impl ControlToolRuntime {
                 arguments: serde_json::json!({"plan_id":document.plan_id,"expected_version":document.version,"patch":patch}),
             };
         }
-        let mut output = BackendOutput::default();
+        let mut output = BackendCompletion::default();
         apply_invocation(&invocation, &mut output)?;
         let mut result = self.invoke_decoded(invocation, output).await?;
         if adding_checks
@@ -200,7 +200,7 @@ impl ControlToolRuntime {
     pub(crate) async fn invoke_decoded(
         &mut self,
         mut invocation: ControlToolInvocation,
-        mut output: BackendOutput,
+        mut output: BackendCompletion,
     ) -> Result<ControlToolResult> {
         if invocation.name == "plan_checks_add" {
             return Box::pin(self.invoke(invocation)).await;
@@ -781,9 +781,9 @@ mod test {
             .unwrap();
         let serialized = serde_json::to_value(&accepted).unwrap();
         assert!(serialized.get("task_permit").is_none());
-        let mut output = BackendOutput::default();
+        let mut output = BackendCompletion::default();
         apply_invocation(&accepted, &mut output).unwrap();
-        let permit = output.completion.goal_control.unwrap().permit;
+        let permit = output.goal_control.unwrap().permit;
         permit.validate(Some(&goal)).unwrap();
         let replacement = controller
             .change(
@@ -807,7 +807,7 @@ mod test {
                     exchange_ordinal: 1,
                     turn_ordinal: 1,
                 },
-                output.completion.evidence,
+                output.evidence,
                 5,
             )
             .unwrap_err();
@@ -869,7 +869,7 @@ mod test {
             staged.design.as_ref().unwrap().document.checks,
             vec!["manual"]
         );
-        let mut output = BackendOutput::default();
+        let mut output = BackendCompletion::default();
         apply_invocation(&accepted.invocation.unwrap(), &mut output).unwrap();
         assert_eq!(
             initial
@@ -927,7 +927,7 @@ mod test {
         assert_eq!(runtime.plan_document(), Some(&initial));
         runtime.invoke(read).await.unwrap();
         let accepted = runtime.invoke(edit).await.unwrap().invocation.unwrap();
-        let mut output = BackendOutput::default();
+        let mut output = BackendCompletion::default();
         apply_invocation(&accepted, &mut output).unwrap();
         let request = output.design_patch.pop().unwrap();
         assert!(request.source_digests.contains_key("Foo.rs"));
@@ -1127,7 +1127,7 @@ mod test {
         let initial = context.plan_document.clone().unwrap();
         let workspace = context.workspace_root.clone().unwrap();
         let mut runtime = ControlToolRuntime::new(context);
-        let mut output = BackendOutput::default();
+        let mut output = BackendCompletion::default();
         let submit = |version| ControlToolInvocation {
             task_permit: None,
             name: "plan_submit".into(),
@@ -1161,11 +1161,11 @@ mod test {
         );
         let accepted = runtime.invoke(submit(2)).await.unwrap();
         apply_invocation(&accepted.invocation.unwrap(), &mut output).unwrap();
-        let submission = output.completion.plan_submit.unwrap();
+        let submission = output.plan_submit.unwrap();
         assert_eq!(submission.expected_version, 2);
         assert!(!runtime.terminal);
         let mut replayed = initial;
-        for patch in output.completion.design_patch {
+        for patch in output.design_patch {
             replayed = replayed.patch_design(&workspace, patch).unwrap();
         }
         let files = crate::plan::PlanFileStore::new(workspace.join("data"), &workspace);

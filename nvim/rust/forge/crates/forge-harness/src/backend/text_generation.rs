@@ -273,8 +273,12 @@ mod tests {
     fn history_keeps_visible_message_order_and_excludes_reasoning_and_reverted_work() {
         let mut turn = crate::turn::Turn::new(
             "turn".into(),
-            crate::backend::ProviderAddress {
-                owner: None,
+            crate::backend::TurnAddress {
+                scope: crate::backend::InvocationScope {
+                    owner: crate::backend::ExecutionOwner::root("session"),
+                    exchange_id: "exchange".into(),
+                    invocation_id: "invocation".into(),
+                },
                 thread_id: "thread".into(),
                 turn_id: "provider-turn".into(),
             },

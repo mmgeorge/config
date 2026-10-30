@@ -1067,19 +1067,28 @@ impl SessionController {
                 return Ok(());
             }
             let params = json!({"text":message.text,"attachments":message.attachments});
-            let (event_sink, mut events) = crate::backend::events::channel();
+            let (event_sink, mut events) = crate::broker::publication::channel();
             let output = sink.clone();
             let session_id = catalog.harness_session_id.clone();
             let input = self.coordinator.submissions.clone();
             let forwarder = tokio::spawn(async move {
                 while let Some(event) = events.recv().await? {
-                    if event.kind == "execution_state" || event.kind == "turn_started" {
+                    if event.wakes_input() {
                         input.changed.notify_one();
                     }
-                    let (event_name, payload) = if event.kind == "document_changed" {
-                        ("document_changed", event.data)
+                    let (event_name, payload) = if matches!(
+                        &event,
+                        crate::broker::publication::SessionUpdate::DocumentChanged { .. }
+                    ) {
+                        (
+                            "document_changed",
+                            crate::broker::publication::encode_session_update(&event)?,
+                        )
                     } else {
-                        ("backend_event", serde_json::to_value(event)?)
+                        (
+                            "backend_event",
+                            crate::broker::publication::encode_session_update(&event)?,
+                        )
                     };
                     output
                         .send_event(SessionEvent {

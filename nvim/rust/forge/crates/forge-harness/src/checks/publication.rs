@@ -1,5 +1,5 @@
 use super::CheckRun;
-use crate::backend::{BackendEvent, BackendEventSink};
+use crate::broker::publication::{SessionUpdate, SessionUpdateSink};
 use anyhow::{Context, Result};
 use std::{path::PathBuf, sync::Arc};
 use tokio::{sync::watch, task::JoinHandle};
@@ -53,8 +53,8 @@ pub(super) struct CheckNotification {
 
 #[derive(Default)]
 struct PendingNotice {
-    latest: Option<(BackendEventSink, serde_json::Value)>,
-    error: Vec<(BackendEventSink, BackendEvent)>,
+    latest: Option<(SessionUpdateSink, crate::timeline::stream::TimelinePatch)>,
+    error: Vec<(SessionUpdateSink, SessionUpdate)>,
 }
 
 impl CheckNotification {
@@ -80,19 +80,8 @@ impl CheckNotification {
                         );
                     }
                 }
-                if let Some((sink, data)) = latest {
-                    let event = BackendEvent {
-                        message: None,
-                        received_at_ms: None,
-                        address: None,
-                        turn_boundary: None,
-                        kind: "document_changed".into(),
-                        text: None,
-                        data,
-                        activity: None,
-                        summary: None,
-                        checklist_update: None,
-                    };
+                if let Some((sink, patch)) = latest {
+                    let event = SessionUpdate::DocumentChanged { patch };
                     // Finish an admitted multipart transfer before replacing pending progress.
                     if let Err(error) = sink.send_wait(event).await {
                         worker_trace.record(
@@ -114,16 +103,20 @@ impl CheckNotification {
     }
 
     /// Retains the latest complete view invalidation without waiting for transport capacity.
-    pub(super) fn publish(&self, sink: &BackendEventSink, data: serde_json::Value) {
+    pub(super) fn publish(
+        &self,
+        sink: &SessionUpdateSink,
+        patch: crate::timeline::stream::TimelinePatch,
+    ) {
         self.pending
             .lock()
             .expect("check notification lock poisoned")
-            .latest = Some((sink.clone(), data));
+            .latest = Some((sink.clone(), patch));
         self.signal();
     }
 
     /// Queues a unique error separately from replaceable progress updates.
-    pub(super) fn error(&self, sink: &BackendEventSink, event: BackendEvent) {
+    pub(super) fn error(&self, sink: &SessionUpdateSink, event: SessionUpdate) {
         self.pending
             .lock()
             .expect("check notification lock poisoned")

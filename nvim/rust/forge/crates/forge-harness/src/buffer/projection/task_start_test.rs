@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+use crate::backend::{ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
 use crate::exchange::{ExchangeOrigin, TaskStart};
 use crate::timeline::{SessionEventRecord, TimelineEvent, TimelineOwner};
 use serde_json::json;
@@ -216,28 +216,14 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
             "prompt":"Inspect startup", "state":"running", "created_at_ms":0,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&active, "turn");
         active.start_turn(address.clone(), 0)?;
-        let commentary = BackendEvent {
-            message: Some(crate::turn::test_support::message(
-                "commentary",
-                Some(crate::backend::MessageRole::Commentary),
-                "Inspecting startup",
-            )),
-            received_at_ms: None,
-            address: Some(address.clone()),
-            turn_boundary: None,
-            kind: "assistant_message".into(),
-            text: Some("Inspecting startup".into()),
-            data: json!({"provider_message_id":"commentary","phase":"commentary"}),
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        };
+        let commentary = crate::turn::test_support::message(
+            &address,
+            "commentary",
+            Some(crate::backend::MessageRole::Commentary),
+            "Inspecting startup",
+        );
         if !before_commentary {
             active.observe_turn(&commentary, 1)?;
         }
@@ -256,27 +242,22 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
         if before_commentary {
             active.observe_turn(&commentary, 3)?;
         }
-        active.observe_turn(
-            &BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: Some(address),
-                turn_boundary: None,
-                kind: "tool".into(),
-                text: None,
-                data: serde_json::Value::Null,
-                activity: Some(ToolActivity {
-                    id: "inspect".into(),
-                    kind: ToolActivityKind::Command,
-                    title: "Inspect files".into(),
-                    output: None,
-                    output_delta: false,
-                    status: Some(crate::backend::ToolStatus::Succeeded),
-                    change: Default::default(),
-                }),
-                summary: None,
-                checklist_update: None,
+        crate::turn::test_support::tool(
+            &mut active,
+            &address,
+            "inspect",
+            ToolInvocation {
+                kind: ToolActivityKind::Command,
+                name: "inspect".into(),
+                title: "Inspect files".into(),
+                arguments: json!({}),
             },
+            [
+                ToolUpdate::Started,
+                ToolUpdate::Finished {
+                    outcome: ToolOutcome::Succeeded,
+                },
+            ],
             4,
         )?;
         crate::timeline::ownership::insert_event(&mut active, event)?;

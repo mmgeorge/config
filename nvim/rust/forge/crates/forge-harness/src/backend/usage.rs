@@ -68,7 +68,7 @@ impl TokenUsage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Identifies one usage report independently of text and tool lifecycle replay.
-pub(crate) struct UsageUpdate {
+pub struct UsageUpdate {
     /// Provider call identity or cumulative snapshot identity.
     pub id: String,
     /// Usage reported for the last completed model call.

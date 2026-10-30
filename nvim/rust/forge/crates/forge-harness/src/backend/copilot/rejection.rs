@@ -1,4 +1,4 @@
-use crate::backend::BackendOutput;
+use crate::backend::BackendCompletion;
 use crate::session::ApprovalMode;
 use anyhow::Result;
 use github_copilot_sdk::{SessionEvent, handler::PermissionResult};
@@ -77,7 +77,7 @@ impl RejectionState {
     }
 
     /// Requires an answer or control handoff after a denied operation.
-    pub(super) fn finish(&self, output: &BackendOutput) -> Result<()> {
+    pub(super) fn finish(&self, output: &BackendCompletion) -> Result<()> {
         if output.evidence.structured_complete
             || output.evidence.structured_blocked
             || output.plan_submit.is_some()
@@ -115,7 +115,7 @@ mod tests {
             }),
         );
         let mut state = RejectionState::default();
-        let output = BackendOutput::default();
+        let output = BackendCompletion::default();
         state.observe(&event(
             "assistant.message",
             json!({"content":"Earlier answer","phase":"final_answer"}),
@@ -152,7 +152,7 @@ mod tests {
         assert!(state.answered);
         state.observe(&rejected);
         assert!(!state.answered);
-        let mut control = BackendOutput::default();
+        let mut control = BackendCompletion::default();
         control.evidence.structured_complete = true;
         assert!(state.finish(&control).is_ok());
         control.evidence.structured_complete = false;
@@ -186,7 +186,10 @@ mod tests {
                 assert_eq!(is_denied(&data), expected);
                 let mut state = RejectionState::default();
                 state.observe(&event("tool.execution_complete", data));
-                assert_eq!(state.finish(&BackendOutput::default()).is_err(), expected);
+                assert_eq!(
+                    state.finish(&BackendCompletion::default()).is_err(),
+                    expected
+                );
             }
         }
     }

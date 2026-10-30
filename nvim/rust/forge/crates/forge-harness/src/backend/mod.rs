@@ -29,16 +29,21 @@ pub use catalog::{
     McpStatus, McpToolDefinition, ResourceScope, SkillDefinition,
 };
 pub use execution::{
-    AgentId, ExchangeId, ExecutionOwner, ProviderAddress, SessionId, TaskId, TurnBoundary,
+    AgentId, EventScope, ExchangeId, ExecutionOwner, InvocationId, InvocationScope, MessageAddress,
+    ProviderTurnId, SessionId, TaskId, ToolAddress, ToolId, TurnAddress, TurnUpdate,
 };
 pub(crate) use steering::{ActiveSteering, SteerCommand, SteeringLane};
 pub use steering::{SteerTarget, SteeringInput};
 
 mod contract;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub use contract::*;
 mod message;
-pub use message::{MessageId, MessageRole, MessageUpdate, ProviderMessage};
+pub use message::{MessageClassification, MessageId, MessageRole, MessageUpdate};
 mod tool_status;
-pub use tool_status::ToolStatus;
+pub use tool_status::{
+    TextUpdate, ToolDiagnostic, ToolInvocation, ToolOutcome, ToolStatus, ToolUpdate,
+};
 mod capability;
 pub use capability::{CapabilityManifest, UnsupportedCapability};

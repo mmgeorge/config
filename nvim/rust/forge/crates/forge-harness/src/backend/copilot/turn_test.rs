@@ -1,5 +1,7 @@
 use super::*;
-use crate::backend::ExecutionOwner;
+use crate::backend::{
+    ApprovalUpdate, ExecutionOwner, InvocationScope, ToolOutcome, ToolUpdate, TurnUpdate,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -8,6 +10,15 @@ enum NativeUserDelivery {
     HistoryOnly,
     NotRecorded,
     ExpiredHistory,
+}
+
+fn event_channel(
+    request: &BackendRequest,
+) -> Result<(BackendEventSink, crate::backend::events::BackendEventStream)> {
+    Ok(crate::backend::events::channel(InvocationScope::new(
+        request.owner()?,
+        "exchange",
+    )))
 }
 
 #[tokio::test]
@@ -24,7 +35,7 @@ async fn copilot_retry_waits_for_idle_and_keeps_the_native_session() -> Result<(
         client_write,
         PathBuf::from(&request.workspace),
     )?);
-    let (sink, mut events) = crate::backend::events::channel();
+    let (sink, mut events) = event_channel(&request)?;
     let server = async {
         let create = read_request(&mut server_read).await?;
         assert_eq!(create["method"], "session.create");
@@ -113,19 +124,27 @@ async fn copilot_retry_waits_for_idle_and_keeps_the_native_session() -> Result<(
     let mut retry_count = 0;
     let mut failed_turn = false;
     while let Ok(event) = events.try_recv() {
-        assert_ne!(
-            event.kind, "error",
+        assert!(
+            !matches!(event, BackendEvent::Diagnostic { .. }),
             "transient error escaped as a terminal notification"
         );
-        if event.kind == "provider_retry" && !event.data.is_null() {
-            assert_eq!(event.data["attempt"], 1);
+        if let BackendEvent::Retry {
+            update: Some(update),
+            ..
+        } = &event
+        {
+            assert_eq!(update.attempt, 1);
             retry_count += 1;
         }
         failed_turn |= matches!(
-            event.turn_boundary,
-            Some(super::super::TurnBoundary::Finished {
-                outcome: crate::turn::TurnOutcome::Failed
-            })
+            event,
+            BackendEvent::Turn {
+                update: TurnUpdate::Finished {
+                    outcome: crate::turn::TurnOutcome::Failed,
+                    ..
+                },
+                ..
+            }
         );
     }
     assert_eq!(retry_count, 2);
@@ -186,7 +205,7 @@ async fn copilot_disables_tool_search_and_binds_session_files_on_create_and_resu
             tokio::try_join!(backend.session(&request), server)
         })
         .await??;
-        let (sink, mut events) = crate::backend::events::channel();
+        let (sink, mut events) = event_channel(&request)?;
         let context = backend.permission_context(&request.runtime_key()?).await;
         context.configure(
             request.owner()?,
@@ -233,7 +252,7 @@ async fn copilot_file_callbacks_apply_directory_scopes_without_sandbox() -> Resu
     assert!(!request.access.sandbox);
     let coordinator = backend.permission_coordinator.clone();
     let _directories = coordinator.directories(Some(&root.path().join("settings")), &request)?;
-    let (sink, mut events) = crate::backend::events::channel();
+    let (sink, mut events) = event_channel(&request)?;
     let context = Arc::new(CopilotPermissionContext::new(coordinator.clone()));
     context.configure(
         request.owner()?,
@@ -263,9 +282,13 @@ async fn copilot_file_callbacks_apply_directory_scopes_without_sandbox() -> Resu
             .await?
             .unwrap()
             .unwrap();
-        assert_eq!(event.kind, "approval_requested");
-        let approval: crate::backend::approval::ApprovalRequestView =
-            serde_json::from_value(event.data)?;
+        let BackendEvent::Approval {
+            update: ApprovalUpdate::Requested(approval),
+            ..
+        } = event
+        else {
+            panic!("expected requested approval");
+        };
         coordinator
             .resolve(
                 &approval.id,
@@ -280,14 +303,17 @@ async fn copilot_file_callbacks_apply_directory_scopes_without_sandbox() -> Resu
             panic!("approval returned no decision")
         };
         assert_eq!(serde_json::to_value(decision)?, expected);
-        assert_eq!(
-            events.recv().await.unwrap().unwrap().kind,
-            "directory_access_granted"
-        );
-        assert_eq!(
-            events.recv().await.unwrap().unwrap().kind,
-            "approval_resolved"
-        );
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            BackendEvent::DirectoryAccess { .. }
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            BackendEvent::Approval {
+                update: ApprovalUpdate::Resolved(_),
+                ..
+            }
+        ));
         let repeat = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             handler.handle(
@@ -311,7 +337,7 @@ async fn cancellation_during_copilot_startup_does_not_wait_or_send() -> Result<(
     let session_id = request.runtime_key()?;
     let slot = backend.session_slot(&session_id).await;
     let startup = slot.lock().await;
-    let (sink, _events) = crate::backend::events::channel();
+    let (sink, _events) = event_channel(&request)?;
     let mut prompt = Box::pin(backend.prompt_stream(request, sink));
     assert!(futures_util::poll!(prompt.as_mut()).is_pending());
     assert!(backend.has_active_turn(&session_id).await);
@@ -587,7 +613,7 @@ async fn native_rewind(first_failure: Option<Value>, delivery: NativeUserDeliver
         write_frame(&mut server_write, json!({
             "jsonrpc":"2.0", "method":"session.event", "params":{
                 "sessionId":native_session_id, "event":{
-                    "id":"idle", "type":"assistant.idle", "timestamp":"2026-10-15T17:00:01Z", "data":{}
+                    "id":"idle", "type":"session.idle", "timestamp":"2026-10-15T17:00:01Z", "data":{"aborted":true}
                 }
             }
         })).await?;
@@ -635,13 +661,15 @@ async fn native_rewind(first_failure: Option<Value>, delivery: NativeUserDeliver
         Ok::<_, anyhow::Error>(())
     };
     let execution = async {
-        let (sink, _events) = crate::backend::events::channel();
+        let (sink, _events) = event_channel(&request)?;
         let prompt = backend.prompt_stream(request, sink);
         let cleanup = async {
             sent_ready.await?;
             backend.cleanup_execution(&session_id).await
         };
-        tokio::try_join!(prompt, cleanup)?;
+        let (result, cleanup) = tokio::join!(prompt, cleanup);
+        cleanup?;
+        assert!(matches!(result, Err(BackendError::Cancelled)));
         if delivery == NativeUserDelivery::ExpiredHistory {
             let error = backend
                 .rollback_cancelled_turn_for(&session_id)
@@ -697,7 +725,7 @@ fn fixture() -> Result<(tempfile::TempDir, CopilotBackend, BackendRequest)> {
 
 #[tokio::test]
 async fn copilot_rejection_feedback_preserves_denial_origin_and_cancellation() -> Result<()> {
-    use crate::backend::approval::{ApprovalAnswer, ApprovalRequestView};
+    use crate::backend::approval::ApprovalAnswer;
     use crate::permissions::document::{CATEGORY_TOOL, PermissionDecision};
 
     for scenario in [
@@ -734,7 +762,7 @@ async fn copilot_rejection_feedback_preserves_denial_origin_and_cancellation() -
             },
         )?;
         let before = coordinator.store().read().unwrap().open().1;
-        let (sink, mut events) = crate::backend::events::channel();
+        let (sink, mut events) = event_channel(&request)?;
         let context = backend.permission_context(&request.runtime_key()?).await;
         context.configure(
             request.owner()?,
@@ -763,7 +791,13 @@ async fn copilot_rejection_feedback_preserves_denial_origin_and_cancellation() -
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
                 .await??
                 .context("approval event missing")?;
-            let view: ApprovalRequestView = serde_json::from_value(event.data)?;
+            let BackendEvent::Approval {
+                update: ApprovalUpdate::Requested(view),
+                ..
+            } = event
+            else {
+                panic!("expected requested approval");
+            };
             if scenario != "timeout" {
                 coordinator
                     .resolve(
@@ -881,7 +915,7 @@ async fn copilot_rejection_without_answer_fails_instead_of_completing() -> Resul
                 client_write,
                 PathBuf::from(&request.workspace),
             )?);
-            let (sink, mut events) = crate::backend::events::channel();
+            let (sink, mut events) = event_channel(&request)?;
             let server = async {
                 let create = read_request(&mut server_read).await?;
                 assert_eq!(create["method"], "session.create");
@@ -993,7 +1027,7 @@ async fn copilot_rejection_without_answer_fails_instead_of_completing() -> Resul
                 "final" => {
                     result?;
                 }
-                "cancel" => assert!(result.unwrap_err().is::<crate::broker::TurnCancelled>()),
+                "cancel" => assert!(matches!(result.unwrap_err(), BackendError::Cancelled)),
                 _ => assert!(
                     result
                         .unwrap_err()
@@ -1003,14 +1037,18 @@ async fn copilot_rejection_without_answer_fails_instead_of_completing() -> Resul
             }
             let mut latest = None;
             while let Ok(event) = events.try_recv() {
-                if let Some(activity) = event.activity {
-                    latest = Some(activity);
+                if let BackendEvent::Tool {
+                    update: ToolUpdate::Finished { outcome },
+                    ..
+                } = event
+                {
+                    latest = Some(outcome);
                 }
             }
-            assert_eq!(
-                latest.context("tool status missing")?.status.as_deref(),
-                Some("denied")
-            );
+            assert!(matches!(
+                latest.context("tool status missing")?,
+                ToolOutcome::Denied { .. }
+            ));
             assert_eq!(
                 backend
                     .permission_coordinator

@@ -205,18 +205,23 @@ impl CopilotTurnEvent {
             }
         };
         if let Some(event_sink) = event_sink {
-            let mut event = match task_start {
-                Some(start) => BackendEvent::task_started(start, text),
-                None => BackendEvent::steering_input(text),
+            let acknowledgement = match task_start {
+                Some(start) => crate::backend::InputAcknowledgement::TaskStarted {
+                    input_id: input_message_id,
+                    start,
+                    prompt: text,
+                },
+                None => crate::backend::InputAcknowledgement::Steering {
+                    input_id: input_message_id,
+                    text,
+                },
             };
-            if !event.data.is_object() {
-                event.data = serde_json::json!({});
-            }
-            event.data["input_message_id"] = serde_json::json!(input_message_id);
             event_sink
-                .send_wait(event)
-                .await
-                .map_err(|_| anyhow::anyhow!("Copilot turn event receiver closed"))?;
+                .send_wait(BackendEvent::InputAccepted {
+                    scope: event_sink.invocation_scope()?.clone(),
+                    acknowledgement,
+                })
+                .await?;
         }
         Ok(())
     }

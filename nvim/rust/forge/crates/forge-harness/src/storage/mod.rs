@@ -36,7 +36,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 54;
+const SESSION_FORMAT_VERSION: u32 = 55;
 const PREFERENCE_FORMAT_VERSION: u32 = 41;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.
@@ -638,15 +638,19 @@ impl SqliteStore {
     pub(crate) fn load_provider_exchange(
         &self,
         session_id: &str,
-        address: &crate::backend::ProviderAddress,
+        address: &crate::backend::TurnAddress,
     ) -> Result<Option<Exchange>> {
         Ok(self
             .list_exchange_payload(
-                "SELECT payload FROM exchange_record WHERE session_id=?1 AND EXISTS(\
+                "SELECT payload FROM exchange_record WHERE session_id=?1 AND id=?4 AND agent_id=?5 AND EXISTS(\
                 SELECT 1 FROM json_each(exchange_record.payload, '$.turn') AS provider_turn \
                 WHERE json_extract(provider_turn.value, '$.provider.thread_id')=?2 \
-                AND json_extract(provider_turn.value, '$.provider.turn_id')=?3) LIMIT 1",
-                params![session_id, address.thread_id, address.turn_id],
+                AND json_extract(provider_turn.value, '$.provider.turn_id')=?3 \
+                AND json_extract(provider_turn.value, '$.provider.scope.invocation_id')=?6 \
+                AND json_extract(provider_turn.value, '$.provider.scope.owner.session_id')=?7) LIMIT 1",
+                params![session_id, address.thread_id, address.turn_id.as_str(),
+                    address.scope.exchange_id.as_str(), address.scope.owner.agent_id.as_str(),
+                    address.scope.invocation_id.as_str(), address.scope.owner.session_id.as_str()],
             )?
             .pop())
     }
@@ -1558,7 +1562,9 @@ mod test {
 
     #[test]
     fn streamed_output_reopens_migrates_and_commits_completion_atomically() -> Result<()> {
-        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        use crate::backend::{
+            BackendEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
+        };
         let directory = tempfile::tempdir()?;
         let mut store = SqliteStore::open(directory.path())?;
         store.save_session(&session("session", "D:/work"))?;
@@ -1569,37 +1575,38 @@ mod test {
             "awaiting_input":false,"duration_ms":0,"metrics":{},"comment":[],
             "attributed_matches_checkpoint":false
         }))?;
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "provider-turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "provider-turn");
         exchange.start_turn(address.clone(), 1)?;
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "tool".into(),
-            text: None,
-            data: serde_json::json!({}),
-            summary: None,
-            checklist_update: None,
-            activity: Some(ToolActivity {
-                id: "call".into(),
+        crate::turn::test_support::tool(
+            &mut exchange,
+            &address,
+            "call",
+            ToolInvocation {
                 kind: ToolActivityKind::Command,
+                name: "read".into(),
                 title: "read".into(),
-                output: None,
-                status: Some(crate::backend::ToolStatus::Running),
-                change: Default::default(),
-                output_delta: false,
-            }),
+                arguments: serde_json::json!({}),
+            },
+            [ToolUpdate::Started],
+            2,
+        )?;
+        let mut event = BackendEvent::Tool {
+            address: crate::backend::ToolAddress {
+                turn: address,
+                tool_id: "call".into(),
+            },
+            update: ToolUpdate::Output {
+                update: TextUpdate::Append(String::new()),
+            },
         };
         exchange.observe_turn(&event, 2)?;
         store.save_exchange(&exchange)?;
-        event.activity.as_mut().unwrap().output_delta = true;
         for chunk in ["\u{1b}[31", "mλ\r\n", "tail"] {
-            event.activity.as_mut().unwrap().output = Some(chunk.into());
+            if let BackendEvent::Tool { update, .. } = &mut event {
+                *update = ToolUpdate::Output {
+                    update: TextUpdate::Append(chunk.into()),
+                };
+            }
             exchange.observe_turn(&event, 3)?;
             store.save_tool_output_delta(&exchange, &event)?;
         }
@@ -1646,9 +1653,17 @@ mod test {
                 .output,
             expected
         );
-        event.activity.as_mut().unwrap().output_delta = false;
-        event.activity.as_mut().unwrap().output = Some("authoritative λ\n".into());
-        event.activity.as_mut().unwrap().status = Some(crate::backend::ToolStatus::Succeeded);
+        if let BackendEvent::Tool { update, .. } = &mut event {
+            *update = ToolUpdate::Output {
+                update: TextUpdate::Replace("authoritative λ\n".into()),
+            };
+        }
+        exchange.observe_turn(&event, 4)?;
+        if let BackendEvent::Tool { update, .. } = &mut event {
+            *update = ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            };
+        }
         exchange.observe_turn(&event, 4)?;
         store.connection.execute_batch("CREATE TRIGGER reject_chunk BEFORE INSERT ON tool_output_chunk BEGIN SELECT RAISE(ABORT,'storage failure'); END;")?;
         assert!(store.save_exchange(&exchange).is_err());

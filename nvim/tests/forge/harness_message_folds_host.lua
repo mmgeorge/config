@@ -36,10 +36,35 @@ package.loaded["forge.builder"] = { ensure = function(callback) callback({ ok = 
 local client = require("forge.client")
 client._host_set_launcher_for_test(vim.system)
 local state, errors = require("forge.session").harness, {}
+local backend_errors = {}
+local unsubscribe_errors = client.session_events_subscribe(function(event, payload)
+  if event == "backend_event" and payload.kind == "error" then
+    backend_errors[#backend_errors + 1] = payload
+  end
+end)
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local controller = require("forge.views.harness.controller")
+local function settled()
+  local presentation = state.presentation
+  if presentation and presentation.applying then return false end
+  local transcript = presentation and presentation.transcript
+  if transcript then
+    for index = 0, transcript.sequence:count() - 1 do
+      local node = transcript.sequence:at(index).entry.metadata.node
+      if node and node.kind == "exchange" and node.lifecycle ~= "settled" then return false end
+    end
+  end
+  return true
+end
 local function await(predicate, reason)
-  assert(vim.wait(15000, function() return #errors > 0 or predicate() end, 10), reason)
+  local ready = vim.wait(15000, function() return #errors > 0 or predicate() and settled() end, 10)
+  assert(ready, reason .. ": " .. vim.inspect({
+    busy = state.busy, status = state.status, diagnostic = state.diagnostic,
+    session_id = state.session and state.session.id,
+    backend_errors = backend_errors,
+    transcript = state.transcript_buf and vim.api.nvim_buf_is_valid(state.transcript_buf)
+      and vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false) or nil,
+  }))
   assert(#errors == 0, table.concat(errors, "\n"))
 end
 local function messages(capture)
@@ -169,9 +194,11 @@ local success, failure = xpcall(function()
   await(function() return bullet_count() == 3 end, "reopening did not restore the complete list")
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
+unsubscribe_errors()
 if state.presentation then state.presentation.close() end
 client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath
 assert(success and collected, failure or "message-fold host was not collected")
+dofile(root .. "/nvim/tests/forge/support/provider_stream_host.lua")

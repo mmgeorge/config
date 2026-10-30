@@ -231,7 +231,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         thread_id: &'a str,
     ) -> Self {
         let provider_goal_active =
-            output.evidence.native_state == Some(crate::goal::GoalState::Active);
+            output.completion.evidence.native_state == Some(crate::goal::GoalState::Active);
         Self {
             backend,
             process,
@@ -350,27 +350,27 @@ impl<'a> CodexTurnCoordinator<'a> {
                         if is_parent_wait_message(&message, self.thread_id)
                             && self.descendant.active_count() > 0
                         {
-                            if self.waiting { self.refresh_wait().await; } else { self.begin_wait().await; }
+                            if self.waiting { self.refresh_wait().await?; } else { self.begin_wait().await?; }
                         } else if self.waiting
                             && (self.descendant.active_count() == 0
                                 || is_parent_activity_message(&message, self.thread_id))
                         {
-                            self.clear_wait().await;
+                            self.clear_wait().await?;
                         }
                         active.observe(&message, self.thread_id);
                         if let Some(completion) = active.completion.take() {
                             last_completion = completion;
                             parent_turn = None;
                             if self.descendant.active_count() == 0 && pending_command.is_empty() && self.cleanup.is_none() && (self.stopping || self.native_goal != NativeGoalLifetime::Active) {
-                                self.clear_wait().await;
+                                self.clear_wait().await?;
                                 return Ok(last_completion);
                             }
                             if self.descendant.active_count() == 0 {
-                                self.clear_wait().await;
+                                self.clear_wait().await?;
                             } else if self.waiting {
-                                self.refresh_wait().await;
+                                self.refresh_wait().await?;
                             } else {
-                                self.begin_wait().await;
+                                self.begin_wait().await?;
                             }
                         }
                     }
@@ -396,7 +396,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                         let text = steering_prompt(&command);
                         match self.start_parent_turn(text, command.submission.clone()).await {
                             Ok(mut turn) => {
-                                self.clear_wait().await;
+                                self.clear_wait().await?;
                                 command.complete(Ok(())).await;
                                 if let Some(completion) = turn.completion.take() {
                                     last_completion = completion;
@@ -419,26 +419,26 @@ impl<'a> CodexTurnCoordinator<'a> {
                     self.complete_cleanup_request(&message).await?;
                     if let Some(turn_id) = CodexBackend::notification_thread_turn_id(&message, "turn/started", self.thread_id) {
                         parent_turn = Some(ParentTurn { id: turn_id.to_owned(), provider_started: true, completion: None });
-                        self.clear_wait().await;
+                        self.clear_wait().await?;
                         continue;
                     }
                     if self.descendant.active_count() > 0 {
-                        if self.waiting { self.refresh_wait().await; } else { self.begin_wait().await; }
+                        if self.waiting { self.refresh_wait().await?; } else { self.begin_wait().await?; }
                         continue;
                     }
                     if self.native_goal == NativeGoalLifetime::Active && !self.stopping {
-                        self.clear_wait().await;
+                        self.clear_wait().await?;
                         continue;
                     }
                     if self.native_goal == NativeGoalLifetime::Settled {
-                        self.clear_wait().await;
+                        self.clear_wait().await?;
                         if pending_command.is_empty() { return Ok(last_completion); }
                         continue;
                     }
                     if !had_active {
                         continue;
                     }
-                    self.clear_wait().await;
+                    self.clear_wait().await?;
                     if self.stopping {
                         return Ok(Value::Null);
                     }
@@ -855,42 +855,40 @@ impl<'a> CodexTurnCoordinator<'a> {
         }
     }
 
-    async fn begin_wait(&mut self) {
+    async fn begin_wait(&mut self) -> Result<()> {
         self.waiting = true;
-        self.emit_boundary("wait_started").await;
+        self.emit_boundary(crate::backend::ParentBoundaryUpdate::WaitStarted {
+            agent_count: self.descendant.active_count(),
+        })
+        .await
     }
 
-    async fn refresh_wait(&self) {
-        self.emit_boundary("wait_updated").await;
+    async fn refresh_wait(&self) -> Result<()> {
+        self.emit_boundary(crate::backend::ParentBoundaryUpdate::WaitUpdated {
+            agent_count: self.descendant.active_count(),
+        })
+        .await
     }
 
-    async fn clear_wait(&mut self) {
+    async fn clear_wait(&mut self) -> Result<()> {
         if self.waiting {
             self.waiting = false;
-            self.emit_boundary("wait_ended").await;
+            self.emit_boundary(crate::backend::ParentBoundaryUpdate::WaitFinished)
+                .await?;
         }
+        Ok(())
     }
 
-    async fn emit_boundary(&self, boundary: &str) {
+    async fn emit_boundary(&self, update: crate::backend::ParentBoundaryUpdate) -> Result<()> {
         if let Some(event_sink) = self.event_sink.as_ref() {
-            let _ = event_sink
-                .send_wait(BackendEvent {
-                    message: None,
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "parent_boundary".into(),
-                    text: None,
-                    data: json!({
-                        "boundary": boundary,
-                        "agent_count": self.descendant.active_count(),
-                    }),
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
+            event_sink
+                .send_wait(BackendEvent::ParentBoundary {
+                    scope: event_sink.invocation_scope()?.clone(),
+                    update,
                 })
-                .await;
+                .await?;
         }
+        Ok(())
     }
 }
 
@@ -1052,7 +1050,11 @@ mod test {
             }
             Ok::<_, anyhow::Error>(())
         });
-        let (events, mut event_stream) = crate::backend::events::channel();
+        let (events, mut event_stream) =
+            crate::backend::events::channel(crate::backend::InvocationScope::new(
+                crate::backend::ExecutionOwner::root("session"),
+                "exchange",
+            ));
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
@@ -1103,7 +1105,7 @@ mod test {
                     .recv()
                     .await?
                     .context("provider events stopped behind LSP")?;
-                if event.kind == "assistant_message" {
+                if matches!(event, BackendEvent::Message { .. }) {
                     break;
                 }
             }
@@ -1198,6 +1200,12 @@ mod test {
             "session".into(),
         )
         .await?;
+        process
+            .normalization
+            .bind(Some(crate::backend::InvocationScope::new(
+                crate::backend::ExecutionOwner::root("session"),
+                "exchange",
+            )));
         let request = BackendRequest {
             execution_owner: None,
             harness_session_id: "session".into(),
@@ -1286,6 +1294,12 @@ mod test {
             "session".into(),
         )
         .await?;
+        process
+            .normalization
+            .bind(Some(crate::backend::InvocationScope::new(
+                crate::backend::ExecutionOwner::root("session"),
+                "exchange",
+            )));
         let request = BackendRequest {
             execution_owner: None,
             harness_session_id: "session".into(),
@@ -1441,6 +1455,12 @@ mod test {
                 "session".into(),
             )
             .await?;
+            process
+                .normalization
+                .bind(Some(crate::backend::InvocationScope::new(
+                    crate::backend::ExecutionOwner::root("session"),
+                    "exchange",
+                )));
             let request = BackendRequest {
                 execution_owner: None,
                 harness_session_id: "session".into(),
@@ -1508,10 +1528,10 @@ mod test {
                 output
                     .event
                     .iter()
-                    .any(|event| event.text.as_deref() == Some("second turn retained"))
+                    .any(|event| matches!(event, BackendEvent::Message { update, .. } if update.text() == Some("second turn retained")))
             );
             assert_eq!(
-                output.evidence.native_state,
+                output.completion.evidence.native_state,
                 Some(match status {
                     "complete" => crate::goal::GoalState::Complete,
                     "paused" => crate::goal::GoalState::Paused,

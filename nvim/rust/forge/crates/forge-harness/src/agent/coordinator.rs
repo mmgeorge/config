@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{Agent, AgentSelection, AgentSource, AgentTask};
 use crate::{
-    backend::{BackendEvent, BackendOutput, ExecutionOwner},
+    backend::{BackendCompletion, BackendEvent, ExecutionOwner},
     exchange::ExchangeState,
 };
 
@@ -68,19 +68,19 @@ pub enum AgentOperation {
 /// Serializes durable mutations without reacquiring an in-flight prompt's broker lock.
 pub enum AgentCommand {
     Request {
-        request: AgentRequest,
+        request: Box<AgentRequest>,
         authority: Option<AgentRequestAuthority>,
         response: oneshot::Sender<Result<serde_json::Value>>,
     },
     Event {
         owner: ExecutionOwner,
         task_id: String,
-        event: BackendEvent,
+        event: Box<BackendEvent>,
     },
     Completed {
         owner: ExecutionOwner,
         task_id: String,
-        output: Result<BackendOutput>,
+        output: Box<Result<BackendCompletion>>,
         cleanup_error: Option<String>,
     },
 }
@@ -113,7 +113,7 @@ impl AgentCommandSender {
     pub async fn request(&self, request: AgentRequest) -> Result<serde_json::Value> {
         let (response, receiver) = oneshot::channel();
         self.send(AgentCommand::Request {
-            request,
+            request: Box::new(request),
             authority: None,
             response,
         })
@@ -130,7 +130,7 @@ impl AgentCommandSender {
     ) -> Result<serde_json::Value> {
         let (response, receiver) = oneshot::channel();
         self.send(AgentCommand::Request {
-            request,
+            request: Box::new(request),
             authority: Some(authority),
             response,
         })

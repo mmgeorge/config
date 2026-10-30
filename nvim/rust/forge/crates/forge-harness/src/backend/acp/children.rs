@@ -1,5 +1,5 @@
 use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
-use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
+use crate::backend::{AgentUpdate, BackendEvent, InvocationScope, TurnAddress, TurnUpdate};
 use crate::turn::TurnOutcome;
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
@@ -9,14 +9,16 @@ use std::collections::HashMap;
 /// Routes native child sessions into separate Harness execution lifecycles.
 pub(super) struct AcpChildren {
     root: String,
+    scope: Option<InvocationScope>,
     child: HashMap<String, ChildExecution>,
 }
 
 impl AcpChildren {
     /// Start one prompt's routing without retaining children from an earlier prompt.
-    pub(super) fn new(root: String) -> Self {
+    pub(super) fn new(root: String, scope: InvocationScope) -> Self {
         Self {
             root,
+            scope: Some(scope),
             child: HashMap::new(),
         }
     }
@@ -57,10 +59,13 @@ impl AcpChildren {
                 ensure!(ancestor != id, "ACP child cannot become its own ancestor");
                 ancestor = &child.parent;
             }
-            let address = ProviderAddress {
-                owner: None,
+            let address = TurnAddress {
+                scope: self
+                    .scope
+                    .clone()
+                    .context("ACP children have no invocation")?,
                 thread_id: id.into(),
-                turn_id: format!("acp-child:{}", uuid::Uuid::new_v4()),
+                turn_id: format!("acp-child:{}", uuid::Uuid::new_v4()).into(),
             };
             self.child.insert(
                 id.into(),
@@ -70,7 +75,13 @@ impl AcpChildren {
                     closed: false,
                 },
             );
-            (AgentExecutionState::Running, TurnBoundary::Started, address)
+            (
+                AgentExecutionState::Running,
+                TurnUpdate::Started {
+                    started_at_ms: timestamp(),
+                },
+                address,
+            )
         } else {
             let Some(child) = self.child.get_mut(id) else {
                 return Ok(Some(Vec::new()));
@@ -89,7 +100,10 @@ impl AcpChildren {
             child.closed = true;
             (
                 state,
-                TurnBoundary::Finished { outcome },
+                TurnUpdate::Finished {
+                    outcome,
+                    completed_at_ms: timestamp(),
+                },
                 child.address.clone(),
             )
         };
@@ -98,7 +112,7 @@ impl AcpChildren {
             starts_child,
             parent_thread_id: Some(parent.into()),
             provider_thread_id: Some(id.into()),
-            turn_id: Some(address.turn_id.clone()),
+            turn_id: Some(address.turn_id.to_string()),
             definition: update["name"].as_str().map(str::to_owned),
             nickname: update["name"].as_str().map(str::to_owned),
             task: update["task"]
@@ -107,34 +121,13 @@ impl AcpChildren {
                 .map(str::to_owned),
             status: state,
         };
-        let lifecycle = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: None,
-            turn_boundary: None,
-            kind: "agent_lifecycle".into(),
-            text: None,
-            data: serde_json::to_value(lifecycle)?,
-            activity: None,
-            summary: None,
-            checklist_update: None,
+        let lifecycle = BackendEvent::Agent {
+            scope: address.scope.clone(),
+            update: AgentUpdate::Lifecycle { event: lifecycle },
         };
-        let boundary = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: Some(boundary),
-            kind: if starts_child {
-                "turn_started"
-            } else {
-                "turn_completed"
-            }
-            .into(),
-            text: None,
-            data: Value::Null,
-            activity: None,
-            summary: None,
-            checklist_update: None,
+        let boundary = BackendEvent::Turn {
+            address,
+            update: boundary,
         };
         Ok(Some(if starts_child {
             vec![lifecycle, boundary]
@@ -144,18 +137,24 @@ impl AcpChildren {
     }
 
     /// Attribute child content and drop unknown or completed child streams.
-    pub(super) fn route(&self, session: &str, event: &mut BackendEvent) -> bool {
+    pub(super) fn address(&self, session: &str, allow_closed: bool) -> Option<TurnAddress> {
         if self.is_root(session) {
-            return true;
+            return Some(TurnAddress {
+                scope: self.scope.clone()?,
+                thread_id: if self.root.is_empty() {
+                    session.into()
+                } else {
+                    self.root.clone()
+                },
+                turn_id: format!("acp:{}", self.scope.as_ref()?.invocation_id).into(),
+            });
         }
-        let Some(child) = self.child.get(session) else {
-            return false;
-        };
-        if child.closed && event.kind != "usage" {
-            return false;
-        }
-        event.address = Some(child.address.clone());
-        true
+        let child = self.child.get(session)?;
+        (!child.closed || allow_closed).then(|| child.address.clone())
+    }
+
+    pub(super) fn root_address(&self) -> Option<TurnAddress> {
+        self.address(&self.root, false)
     }
 
     /// Interrupt unclosed child runs when their owning prompt stops being observed.
@@ -177,41 +176,28 @@ impl AcpChildren {
         pending.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(right.1)));
         let mut events = Vec::new();
         for (_, id, child) in pending {
-            events.push(BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: Some(child.address.clone()),
-                turn_boundary: Some(TurnBoundary::Finished {
+            events.push(BackendEvent::Turn {
+                address: child.address.clone(),
+                update: TurnUpdate::Finished {
                     outcome: TurnOutcome::Interrupted,
-                }),
-                kind: "turn_completed".into(),
-                text: None,
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
+                    completed_at_ms: timestamp(),
+                },
             });
-            events.push(BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "agent_lifecycle".into(),
-                text: None,
-                data: serde_json::to_value(AgentLifecycleEvent {
-                    operation: "subagent_state_update".into(),
-                    starts_child: false,
-                    parent_thread_id: Some(child.parent.clone()),
-                    provider_thread_id: Some(id.clone()),
-                    turn_id: Some(child.address.turn_id.clone()),
-                    definition: None,
-                    nickname: None,
-                    task: None,
-                    status: AgentExecutionState::Interrupted,
-                })?,
-                activity: None,
-                summary: None,
-                checklist_update: None,
+            events.push(BackendEvent::Agent {
+                scope: child.address.scope.clone(),
+                update: AgentUpdate::Lifecycle {
+                    event: AgentLifecycleEvent {
+                        operation: "subagent_state_update".into(),
+                        starts_child: false,
+                        parent_thread_id: Some(child.parent.clone()),
+                        provider_thread_id: Some(id.clone()),
+                        turn_id: Some(child.address.turn_id.to_string()),
+                        definition: None,
+                        nickname: None,
+                        task: None,
+                        status: AgentExecutionState::Interrupted,
+                    },
+                },
             });
         }
         for child in self.child.values_mut() {
@@ -222,9 +208,16 @@ impl AcpChildren {
 }
 
 struct ChildExecution {
-    address: ProviderAddress,
+    address: TurnAddress,
     parent: String,
     closed: bool,
+}
+
+pub(super) fn timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 #[cfg(test)]
@@ -234,7 +227,10 @@ mod test {
 
     #[test]
     fn child_routing_preserves_all_sessions_beyond_former_limit() -> Result<()> {
-        let mut children = AcpChildren::new("root".into());
+        let mut children = AcpChildren::new(
+            "root".into(),
+            InvocationScope::new(crate::backend::ExecutionOwner::root("test"), "exchange"),
+        );
         for index in 0..300 {
             let id = format!("child-{index}");
             let events = children
@@ -247,14 +243,14 @@ mod test {
                 )?
                 .unwrap();
             assert_eq!(events.len(), 2);
-            assert_eq!(events[1].address.as_ref().unwrap().thread_id, id);
+            assert_eq!(events[1].turn_address().unwrap().thread_id, id);
         }
         let events = children.finish()?;
         assert_eq!(events.len(), 600);
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.turn_boundary.is_some())
+                .filter(|event| matches!(event, BackendEvent::Turn { .. }))
                 .count(),
             300
         );
@@ -264,29 +260,34 @@ mod test {
 
     #[test]
     fn child_generations_keep_content_and_completion_out_of_the_root() -> Result<()> {
-        let mut children = AcpChildren::new("root".into());
+        let mut children = AcpChildren::new(
+            "root".into(),
+            InvocationScope::new(crate::backend::ExecutionOwner::root("test"), "exchange"),
+        );
         let spawn = json!({"sessionUpdate":"subagent_spawned","subagentSessionId":"child","name":"Reviewer","task":"Review"});
         let admitted = children.lifecycle("root", &spawn)?.unwrap();
-        assert_eq!(admitted[0].kind, "agent_lifecycle");
-        assert_eq!(admitted[1].turn_boundary, Some(TurnBoundary::Started));
-        let lifecycle: AgentLifecycleEvent = serde_json::from_value(admitted[0].data.clone())?;
+        assert!(matches!(admitted[0], BackendEvent::Agent { .. }));
+        assert!(matches!(
+            admitted[1],
+            BackendEvent::Turn {
+                update: TurnUpdate::Started { .. },
+                ..
+            }
+        ));
+        let BackendEvent::Agent {
+            update: AgentUpdate::Lifecycle { event: lifecycle },
+            ..
+        } = &admitted[0]
+        else {
+            panic!("expected child lifecycle")
+        };
         assert!(lifecycle.starts_child);
         assert_eq!(lifecycle.provider_thread_id.as_deref(), Some("child"));
-        let mut content = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: None,
-            turn_boundary: None,
-            kind: "assistant_message".into(),
-            text: Some("Child output".into()),
-            data: Value::Null,
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        };
-        assert!(!children.route("unannounced", &mut content));
-        assert!(children.route("child", &mut content));
-        assert_eq!(content.address, admitted[1].address);
+        assert!(children.address("unannounced", false).is_none());
+        assert_eq!(
+            children.address("child", false).as_ref(),
+            admitted[1].turn_address()
+        );
         assert!(children.lifecycle("root", &spawn)?.unwrap().is_empty());
         let nested = children
             .lifecycle(
@@ -294,8 +295,10 @@ mod test {
                 &json!({"sessionUpdate":"subagent_spawned","subagentSessionId":"nested"}),
             )?
             .unwrap();
-        assert!(children.route("nested", &mut content));
-        assert_eq!(content.address, nested[1].address);
+        assert_eq!(
+            children.address("nested", false).as_ref(),
+            nested[1].turn_address()
+        );
         let finish = json!({"sessionUpdate":"subagent_state_update","subagentSessionId":"child","state":"failed"});
         assert!(
             children
@@ -304,32 +307,38 @@ mod test {
                 .is_empty()
         );
         let finished = children.lifecycle("root", &finish)?.unwrap();
-        assert_eq!(
-            finished[0].turn_boundary,
-            Some(TurnBoundary::Finished {
-                outcome: TurnOutcome::Failed
-            })
-        );
-        assert!(!children.route("child", &mut content));
-        content.kind = "usage".into();
-        assert!(children.route("child", &mut content));
+        assert!(matches!(
+            finished[0],
+            BackendEvent::Turn {
+                update: TurnUpdate::Finished {
+                    outcome: TurnOutcome::Failed,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(children.address("child", false).is_none());
+        assert!(children.address("child", true).is_some());
         assert!(children.lifecycle("root", &finish)?.unwrap().is_empty());
         assert!(children.lifecycle("nested", &spawn).is_err());
         let restarted = children.lifecycle("root", &spawn)?.unwrap();
-        assert_ne!(restarted[1].address, admitted[1].address);
+        assert_ne!(restarted[1].turn_address(), admitted[1].turn_address());
         let interrupted = children.finish()?;
         assert_eq!(interrupted.len(), 4);
-        assert_eq!(interrupted[0].address, nested[1].address);
-        assert_eq!(interrupted[2].address, restarted[1].address);
-        assert_eq!(
-            interrupted[0].turn_boundary,
-            Some(TurnBoundary::Finished {
-                outcome: TurnOutcome::Interrupted
-            })
-        );
+        assert_eq!(interrupted[0].turn_address(), nested[1].turn_address());
+        assert_eq!(interrupted[2].turn_address(), restarted[1].turn_address());
+        assert!(matches!(
+            interrupted[0],
+            BackendEvent::Turn {
+                update: TurnUpdate::Finished {
+                    outcome: TurnOutcome::Interrupted,
+                    ..
+                },
+                ..
+            }
+        ));
         assert!(children.finish()?.is_empty());
-        content.kind = "assistant_message".into();
-        assert!(!children.route("nested", &mut content));
+        assert!(children.address("nested", false).is_none());
         Ok(())
     }
 }

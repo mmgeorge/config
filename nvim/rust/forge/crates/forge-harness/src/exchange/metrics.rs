@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +31,7 @@ pub struct ExchangeMetrics {
     pub(crate) approval_resume: bool,
     tool: BTreeSet<String>,
     blocker: BTreeSet<String>,
-    sample: BTreeSet<String>,
+    sample: HashSet<UsageSample>,
     cursor: HashMap<String, UsageCursor>,
 }
 
@@ -39,6 +39,14 @@ pub struct ExchangeMetrics {
 struct UsageCursor {
     usage: TokenUsage,
     total: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+struct UsageSample {
+    scope: crate::backend::InvocationScope,
+    thread_id: String,
+    turn_id: Option<crate::backend::ProviderTurnId>,
+    id: String,
 }
 
 impl ExchangeMetrics {
@@ -127,14 +135,14 @@ impl ExchangeMetrics {
     /// Admit a new report once, excluding synthetic context adjustments and repeated snapshots.
     pub(crate) fn usage(
         &mut self,
-        thread_id: &str,
-        turn_id: &str,
+        address: &crate::backend::TurnAddress,
         update: UsageUpdate,
     ) -> Option<TokenUsage> {
-        let id = if update.cumulative.is_some() {
-            format!("{thread_id}:{turn_id}:{}", update.id)
-        } else {
-            format!("{thread_id}:{}", update.id)
+        let id = UsageSample {
+            scope: address.scope.clone(),
+            thread_id: address.thread_id.clone(),
+            turn_id: update.cumulative.as_ref().map(|_| address.turn_id.clone()),
+            id: update.id.clone(),
         };
         if !self.sample.insert(id) {
             return None;
@@ -144,7 +152,8 @@ impl ExchangeMetrics {
             return Some(update.usage);
         };
         let previous = self.cursor.insert(
-            thread_id.to_owned(),
+            serde_json::to_string(&(&address.scope.owner, &address.thread_id))
+                .expect("usage cursor identity contains serializable strings"),
             UsageCursor {
                 usage: cumulative.clone(),
                 total: update.cumulative_total,
@@ -198,7 +207,7 @@ impl Default for ExchangeMetrics {
             approval_resume: false,
             tool: BTreeSet::new(),
             blocker: BTreeSet::new(),
-            sample: BTreeSet::new(),
+            sample: HashSet::new(),
             cursor: HashMap::new(),
         }
     }
@@ -207,6 +216,18 @@ impl Default for ExchangeMetrics {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn address(thread: &str, turn: &str) -> crate::backend::TurnAddress {
+        crate::backend::TurnAddress {
+            scope: crate::backend::InvocationScope {
+                owner: crate::backend::ExecutionOwner::root("session"),
+                exchange_id: "exchange".into(),
+                invocation_id: "invocation".into(),
+            },
+            thread_id: thread.into(),
+            turn_id: turn.into(),
+        }
+    }
 
     fn report(id: &str, input: u64, total: Option<u64>) -> UsageUpdate {
         let usage = TokenUsage {
@@ -227,42 +248,64 @@ mod test {
     }
 
     #[test]
+    fn usage_reused_provider_ids_remain_distinct_across_invocations() {
+        let mut metrics = ExchangeMetrics::default();
+        let first = address("thread", "turn");
+        let mut second = first.clone();
+        second.scope.invocation_id = "next-invocation".into();
+        assert!(metrics.usage(&first, report("report", 10, None)).is_some());
+        assert!(metrics.usage(&second, report("report", 10, None)).is_some());
+        assert!(metrics.usage(&first, report("report", 10, None)).is_none());
+        let mut restored: ExchangeMetrics =
+            serde_json::from_value(serde_json::to_value(metrics).unwrap()).unwrap();
+        assert!(
+            restored
+                .usage(&second, report("report", 10, None))
+                .is_none()
+        );
+        assert_eq!(restored.request_count, 2);
+    }
+
+    #[test]
     fn usage_deduplicates_snapshots_recovers_increments_and_handles_resets() {
         let mut metrics = ExchangeMetrics::default();
         assert_eq!(
             metrics
-                .usage("parent", "one", report("first", 100, Some(1000)))
+                .usage(&address("parent", "one"), report("first", 100, Some(1000)))
                 .unwrap()
                 .input,
             Some(100)
         );
         assert!(
             metrics
-                .usage("parent", "one", report("first", 100, Some(1000)))
+                .usage(&address("parent", "one"), report("first", 100, Some(1000)))
                 .is_none()
         );
         assert!(
             metrics
-                .usage("parent", "one", report("refresh", 100, Some(1000)))
+                .usage(
+                    &address("parent", "one"),
+                    report("refresh", 100, Some(1000))
+                )
                 .is_none()
         );
         assert_eq!(
             metrics
-                .usage("parent", "one", report("next", 100, Some(1300)))
+                .usage(&address("parent", "one"), report("next", 100, Some(1300)))
                 .unwrap()
                 .input,
             Some(300)
         );
         assert_eq!(
             metrics
-                .usage("parent", "two", report("reset", 40, Some(40)))
+                .usage(&address("parent", "two"), report("reset", 40, Some(40)))
                 .unwrap()
                 .input,
             Some(40)
         );
         assert_eq!(
             metrics
-                .usage("child", "one", report("first", 200, Some(1000)))
+                .usage(&address("child", "one"), report("first", 200, Some(1000)))
                 .unwrap()
                 .input,
             Some(200)
@@ -273,7 +316,7 @@ mod test {
         assert_eq!(metrics.request_count, 4);
         assert!(
             metrics
-                .usage("parent", "two", report("reset", 40, Some(40)))
+                .usage(&address("parent", "two"), report("reset", 40, Some(40)))
                 .is_none()
         );
         assert_eq!(metrics.request_count, 4);
@@ -283,14 +326,18 @@ mod test {
     fn usage_excludes_synthetic_context_adjustment_and_preserves_missing_counts() {
         let mut metrics = ExchangeMetrics::default();
         metrics
-            .usage("parent", "one", report("first", 100, Some(1000)))
+            .usage(&address("parent", "one"), report("first", 100, Some(1000)))
             .unwrap();
         let mut synthetic = report("compact", 0, Some(500));
         synthetic.usage.output = Some(0);
-        assert!(metrics.usage("parent", "one", synthetic).is_none());
+        assert!(
+            metrics
+                .usage(&address("parent", "one"), synthetic)
+                .is_none()
+        );
         assert_eq!(
             metrics
-                .usage("parent", "one", report("next", 100, Some(600)))
+                .usage(&address("parent", "one"), report("next", 100, Some(600)))
                 .unwrap()
                 .input,
             Some(100)
@@ -298,10 +345,10 @@ mod test {
         let mut partial = report("copilot", 100, None);
         partial.usage.reasoning = None;
         let replay = partial.clone();
-        let usage = metrics.usage("parent", "two", partial).unwrap();
+        let usage = metrics.usage(&address("parent", "two"), partial).unwrap();
         assert_eq!(usage.input, Some(100));
         assert_eq!(usage.non_reasoning_output(), None);
-        assert!(metrics.usage("parent", "three", replay).is_none());
+        assert!(metrics.usage(&address("parent", "three"), replay).is_none());
         assert_eq!(metrics.request_count, 3);
     }
 

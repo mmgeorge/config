@@ -138,24 +138,21 @@ impl SkillAccess {
     }
 
     fn reads(&self, event: &BackendEvent) -> Vec<SkillRead> {
-        let Some(activity) = &event.activity else {
+        let BackendEvent::Tool {
+            address,
+            update: crate::backend::ToolUpdate::Requested { invocation },
+        } = event
+        else {
             return Vec::new();
         };
-        let data = event.data.get("data").unwrap_or(&event.data);
-        let input = data
-            .get("rawInput")
-            .or_else(|| data.get("arguments"))
-            .or_else(|| data.pointer("/params/item/arguments"))
-            .unwrap_or(data);
+        let input = &invocation.arguments;
         let input = if let Some(encoded) = input.as_str() {
             serde_json::from_str(encoded).unwrap_or(Value::Null)
         } else {
             input.clone()
         };
-        let directory = string_at(&input, &["/cwd", "/workdir"])
-            .or_else(|| string_at(data, &["/params/item/cwd", "/params/cwd"]));
-        let command = string_at(&input, &["/command", "/commandLine", "/CommandLine"])
-            .or_else(|| string_at(data, &["/params/item/command", "/params/command"]));
+        let directory = string_at(&input, &["/cwd", "/workdir"]);
+        let command = string_at(&input, &["/command", "/commandLine", "/CommandLine"]);
         let mut path = Vec::new();
         if let Some(command) = command {
             let shell = string_at(&input, &["/shell"])
@@ -168,23 +165,17 @@ impl SkillAccess {
                 }
             }
         } else {
-            let name = data
-                .get("toolName")
-                .and_then(Value::as_str)
-                .unwrap_or(&activity.title);
-            let name = name
+            let name = invocation
+                .name
                 .split('(')
                 .next()
-                .unwrap_or(name)
+                .unwrap_or(&invocation.name)
                 .trim()
                 .to_ascii_lowercase();
-            let read = match data.get("kind").and_then(Value::as_str) {
-                Some(kind) => kind == "read",
-                None => matches!(
-                    name.as_str(),
-                    "read" | "read_file" | "readfile" | "view" | "view_file" | "viewfile"
-                ),
-            };
+            let read = matches!(
+                name.as_str(),
+                "read" | "read_file" | "readfile" | "view" | "view_file" | "viewfile"
+            );
             if read {
                 if let Some(value) = string_at(
                     &input,
@@ -198,7 +189,7 @@ impl SkillAccess {
                     ],
                 ) {
                     path.push(value.to_owned());
-                } else if let Some(locations) = data.get("locations").and_then(Value::as_array) {
+                } else if let Some(locations) = input.get("locations").and_then(Value::as_array) {
                     path.extend(
                         locations
                             .iter()
@@ -216,7 +207,7 @@ impl SkillAccess {
                     resource_id: skill.resource.id.clone(),
                     name: skill.resource.name.clone(),
                     path: skill.source.display().to_string(),
-                    tool_id: activity.id.clone(),
+                    tool_id: address.tool_id.to_string(),
                 })
             })
             .collect()
@@ -226,7 +217,7 @@ impl SkillAccess {
 /// Reconciles sparse tool input and completion before attaching confirmed read metadata.
 pub(crate) struct SkillObserver {
     access: Arc<SkillAccess>,
-    pending: HashMap<String, Vec<SkillRead>>,
+    pending: HashMap<crate::backend::ToolAddress, Vec<SkillRead>>,
 }
 
 impl SkillObserver {
@@ -239,66 +230,22 @@ impl SkillObserver {
     }
 
     /// Annotate successful completions without treating progress or filenames in output as reads.
-    pub(crate) fn observe(&mut self, event: &mut BackendEvent) {
-        let Some(activity) = &event.activity else {
-            return;
+    pub(crate) fn observe(&mut self, event: &BackendEvent) -> Vec<SkillRead> {
+        let BackendEvent::Tool { address, update } = event else {
+            return Vec::new();
         };
-        let Some(address) = &event.address else {
-            return;
-        };
-        let identity = format!(
-            "{}\0{}\0{}",
-            address.thread_id, address.turn_id, activity.id
-        );
         let reads = self.access.reads(event);
         if !reads.is_empty() {
-            self.pending.insert(identity.clone(), reads);
+            self.pending.insert(address.clone(), reads);
         }
-        let status = activity
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !matches!(
-            status.as_str(),
-            "completed"
-                | "complete"
-                | "success"
-                | "succeeded"
-                | "failed"
-                | "error"
-                | "cancelled"
-                | "canceled"
-                | "interrupted"
-                | "denied"
-                | "declined"
-                | "rejected"
-        ) {
-            return;
-        }
-        let Some(reads) = self.pending.remove(&identity) else {
-            return;
+        let crate::backend::ToolUpdate::Finished { outcome } = update else {
+            return Vec::new();
         };
-        let data = event.data.get("data").unwrap_or(&event.data);
-        let exit = data
-            .pointer("/params/item/exitCode")
-            .or_else(|| data.pointer("/rawOutput/exitCode"))
-            .or_else(|| data.pointer("/result/exitCode"))
-            .and_then(Value::as_i64);
-        if !matches!(
-            status.as_str(),
-            "completed" | "complete" | "success" | "succeeded"
-        ) || exit.is_some_and(|exit| exit != 0)
-            || data.get("success") == Some(&Value::Bool(false))
-            || data.get("isError") == Some(&Value::Bool(true))
-        {
-            return;
-        }
-        if let Some(fields) = event.data.as_object_mut() {
-            fields.insert(
-                "skill_reads".into(),
-                serde_json::to_value(reads).expect("skill reads serialize"),
-            );
+        let reads = self.pending.remove(address).unwrap_or_default();
+        if matches!(outcome, crate::backend::ToolOutcome::Succeeded) {
+            reads
+        } else {
+            Vec::new()
         }
     }
 }
@@ -315,18 +262,6 @@ impl SkillExecution {
     /// Attach the shared observer to streamed delivery or annotate collected fallback events.
     pub(crate) fn sink(&self, sink: Option<BackendEventSink>) -> Option<BackendEventSink> {
         sink.map(|sink| sink.skills(self.observer.clone()))
-    }
-
-    /// Apply the same detection contract to callers without a live event sink.
-    pub(crate) fn output(&self, output: &mut crate::backend::BackendOutput) -> Result<()> {
-        let mut observer = self
-            .observer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("skill observer lock poisoned"))?;
-        for event in &mut output.event {
-            observer.observe(event);
-        }
-        Ok(())
     }
 }
 
@@ -448,7 +383,7 @@ fn script_path(invocation: &CommandInvocation) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{ProviderAddress, ToolActivity, ToolActivityKind};
+    use crate::backend::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
     use serde_json::json;
 
     fn fixture() -> (tempfile::TempDir, Arc<SkillAccess>, PathBuf) {
@@ -471,107 +406,117 @@ mod tests {
         (directory, access, bundle)
     }
 
-    fn event(id: &str, data: Value, status: &str) -> BackendEvent {
-        BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(ProviderAddress {
-                owner: None,
-                thread_id: "provider".into(),
-                turn_id: "turn".into(),
-            }),
-            turn_boundary: None,
-            kind: "tool".into(),
-            text: None,
-            data,
-            activity: Some(ToolActivity {
-                id: id.into(),
-                kind: ToolActivityKind::ToolCall,
-                title: "Read".into(),
-                output: Some("Instructions".into()),
-                status: Some(crate::backend::ToolStatus::parse(status).unwrap()),
-                change: Default::default(),
-                output_delta: false,
-            }),
-            summary: None,
-            checklist_update: None,
+    fn event(id: &str, update: ToolUpdate) -> BackendEvent {
+        BackendEvent::Tool {
+            address: crate::backend::ToolAddress {
+                turn: crate::backend::TurnAddress {
+                    scope: crate::backend::InvocationScope {
+                        owner: ExecutionOwner::root("session"),
+                        exchange_id: "exchange".into(),
+                        invocation_id: "invocation".into(),
+                    },
+                    thread_id: "provider".into(),
+                    turn_id: "turn".into(),
+                },
+                tool_id: id.into(),
+            },
+            update,
         }
     }
 
+    fn requested(id: &str, name: &str, arguments: Value) -> BackendEvent {
+        event(
+            id,
+            ToolUpdate::Requested {
+                invocation: ToolInvocation {
+                    kind: ToolActivityKind::ToolCall,
+                    name: name.into(),
+                    title: name.into(),
+                    arguments,
+                },
+            },
+        )
+    }
+
     #[test]
-    fn skill_reads_reconcile_each_provider_payload_without_using_activation_events() {
+    fn skill_reads_reconcile_normalized_invocations_without_using_activation_events() {
         let (_directory, access, bundle) = fixture();
         let path = bundle.join("SKILL.md").display().to_string();
         let command = format!("Get-Content -LiteralPath '{path}' -TotalCount 5");
-        for (start, completed) in [
-            (
-                json!({"params":{"item":{"type":"commandExecution","command":command}}}),
-                json!({"params":{"item":{"exitCode":0}}}),
-            ),
-            (
-                json!({"data":{"toolName":"view","arguments":{"path":path}}}),
-                json!({"data":{"success":true}}),
-            ),
-            (
-                json!({"kind":"read","rawInput":{"file_path":path}}),
-                json!({"kind":"read"}),
-            ),
-            (
-                json!({"kind":"read","rawInput":{"AbsolutePath":path}}),
-                json!({"kind":"read"}),
-            ),
+        for (name, arguments) in [
+            ("powershell", json!({"command":command})),
+            ("view", json!({"path":path})),
+            ("read", json!({"file_path":path})),
+            ("read", json!({"AbsolutePath":path})),
         ] {
             let mut observer = SkillObserver::new(access.clone());
-            let mut start = event("read", start, "in_progress");
-            observer.observe(&mut start);
-            assert!(start.data.get("skill_reads").is_none());
-            let mut progress = event(
-                "read",
-                json!({"params":{"delta":"partial output"}}),
-                "in_progress",
+            assert!(
+                observer
+                    .observe(&requested("read", name, arguments))
+                    .is_empty()
             );
-            progress.activity.as_mut().unwrap().status = None;
-            observer.observe(&mut progress);
-            assert!(progress.data.get("skill_reads").is_none());
+            assert!(
+                observer
+                    .observe(&event(
+                        "read",
+                        ToolUpdate::Output {
+                            update: TextUpdate::Append("partial output".into()),
+                        }
+                    ))
+                    .is_empty()
+            );
             assert_eq!(observer.pending.len(), 1);
-            let mut completed = event("read", completed, "completed");
-            observer.observe(&mut completed);
-            let reads: Vec<SkillRead> =
-                serde_json::from_value(completed.data["skill_reads"].clone()).unwrap();
+            let reads = observer.observe(&event(
+                "read",
+                ToolUpdate::Finished {
+                    outcome: ToolOutcome::Succeeded,
+                },
+            ));
             assert_eq!(reads.len(), 1);
             assert_eq!(reads[0].resource_id, "fixture-id");
             assert_eq!(reads[0].tool_id, "read");
             assert!(observer.pending.is_empty());
         }
-        for data in [
-            json!({"kind":"search","rawInput":{"path":path}}),
-            json!({"toolName":"list_directory","arguments":{"path":bundle}}),
-            json!({"toolName":"skill.invoked","path":path}),
-            json!({"rawInput":{"command":format!("Write-Output '{path}'")}}),
+        for (name, arguments) in [
+            ("search", json!({"path":path})),
+            ("list_directory", json!({"path":bundle})),
+            ("skill.invoked", json!({"path":path})),
+            (
+                "powershell",
+                json!({"command":format!("Write-Output '{path}'")}),
+            ),
         ] {
             let mut observer = SkillObserver::new(access.clone());
-            let mut unrelated = event("unrelated", data, "completed");
-            observer.observe(&mut unrelated);
-            assert!(unrelated.data.get("skill_reads").is_none());
-        }
-        for status in ["failed", "cancelled", "interrupted"] {
-            let mut observer = SkillObserver::new(access.clone());
-            let mut failed = event(
-                "failed",
-                json!({"kind":"read","rawInput":{"path":path}}),
-                status,
+            observer.observe(&requested("unrelated", name, arguments));
+            assert!(
+                observer
+                    .observe(&event(
+                        "unrelated",
+                        ToolUpdate::Finished {
+                            outcome: ToolOutcome::Succeeded
+                        }
+                    ))
+                    .is_empty()
             );
-            observer.observe(&mut failed);
-            assert!(failed.data.get("skill_reads").is_none());
         }
-        let mut observer = SkillObserver::new(access);
-        let mut failed = event(
-            "exit",
-            json!({"params":{"item":{"command":command,"exitCode":1}}}),
-            "completed",
-        );
-        observer.observe(&mut failed);
-        assert!(failed.data.get("skill_reads").is_none());
+        for outcome in [
+            ToolOutcome::Failed {
+                diagnostic: crate::backend::ToolDiagnostic {
+                    code: None,
+                    message: "exit 1".into(),
+                },
+            },
+            ToolOutcome::Cancelled,
+            ToolOutcome::Interrupted,
+        ] {
+            let mut observer = SkillObserver::new(access.clone());
+            observer.observe(&requested("failed", "read", json!({"path":path})));
+            assert!(
+                observer
+                    .observe(&event("failed", ToolUpdate::Finished { outcome }))
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -618,14 +563,19 @@ mod tests {
             std::os::unix::fs::symlink(&outside, bundle.join("escape")).unwrap();
         }
         let mut observer = SkillObserver::new(access.clone());
-        let mut read = event(
+        observer.observe(&requested(
             "alias",
-            json!({"kind":"read","rawInput":{"path":alias.join("SKILL.md")}}),
-            "completed",
-        );
-        observer.observe(&mut read);
+            "read",
+            json!({"path":alias.join("SKILL.md")}),
+        ));
+        let reads = observer.observe(&event(
+            "alias",
+            ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            },
+        ));
         assert_eq!(
-            read.data["skill_reads"][0]["path"],
+            reads[0].path,
             dunce::canonicalize(bundle.join("SKILL.md"))
                 .unwrap()
                 .display()
@@ -644,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn skill_diamonds_keep_turn_ownership_tool_history_and_file_actions_after_reload()
     -> Result<()> {
-        use crate::backend::TurnBoundary;
+        use crate::backend::{TurnAddress, TurnUpdate};
         use crate::buffer::projection::{ProjectionSource, TranscriptAction};
         use crate::exchange::{Exchange, ExchangeNode};
         let (_directory, access, bundle) = fixture();
@@ -654,31 +604,60 @@ mod tests {
             "attributed_matches_checkpoint":false,"node_list":[]
         }))?;
         exchange.resume(0)?;
-        let (sink, mut stream) = crate::backend::events::channel();
+        let binding = crate::turn::test_support::address(&exchange, "first").scope;
+        let (sink, mut stream) = crate::backend::events::channel(binding.clone());
         let sink = sink.skills(Arc::new(Mutex::new(SkillObserver::new(access))));
         for turn_id in ["first", "second"] {
-            let mut started = event("start", Value::Null, "in_progress");
-            started.activity = None;
-            started.address.as_mut().unwrap().turn_id = turn_id.into();
-            started.turn_boundary = Some(TurnBoundary::Started);
-            sink.send_wait(started.clone()).await?;
-            exchange.observe_turn(&stream.recv().await?.unwrap(), 1)?;
+            let turn = TurnAddress {
+                scope: binding.clone(),
+                thread_id: "provider".into(),
+                turn_id: turn_id.into(),
+            };
+            exchange.observe_turn(
+                &BackendEvent::Turn {
+                    address: turn.clone(),
+                    update: TurnUpdate::Started { started_at_ms: 1 },
+                },
+                1,
+            )?;
             for tool_id in ["read-one", "read-two"] {
-                let mut read = event(
-                    tool_id,
-                    json!({"kind":"read","rawInput":{"path":bundle.join("SKILL.md")}}),
-                    "completed",
-                );
-                read.address.as_mut().unwrap().turn_id = turn_id.into();
-                sink.send_wait(read).await?;
-                let read = stream.recv().await?.unwrap();
-                exchange.observe_turn(&read, 2)?;
-                exchange.observe_turn(&read, 3)?;
+                let address = crate::backend::ToolAddress {
+                    turn: turn.clone(),
+                    tool_id: tool_id.into(),
+                };
+                sink.send_wait(BackendEvent::Tool {
+                    address: address.clone(),
+                    update: ToolUpdate::Requested {
+                        invocation: ToolInvocation {
+                            kind: ToolActivityKind::ToolCall,
+                            name: "read".into(),
+                            title: "Read".into(),
+                            arguments: json!({"path":bundle.join("SKILL.md")}),
+                        },
+                    },
+                })
+                .await?;
+                sink.send_wait(BackendEvent::Tool {
+                    address,
+                    update: ToolUpdate::Finished {
+                        outcome: ToolOutcome::Succeeded,
+                    },
+                })
+                .await?;
+                while let Some(observation) = stream.try_next()? {
+                    exchange.observe_turn(&observation, 2)?;
+                }
             }
-            started.turn_boundary = Some(TurnBoundary::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-            });
-            exchange.observe_turn(&started, 4)?;
+            exchange.observe_turn(
+                &BackendEvent::Turn {
+                    address: turn,
+                    update: TurnUpdate::Finished {
+                        outcome: crate::turn::TurnOutcome::Completed,
+                        completed_at_ms: 4,
+                    },
+                },
+                4,
+            )?;
         }
         let exchange: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
         assert_eq!(

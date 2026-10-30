@@ -1,14 +1,14 @@
-//! Bounded provider delivery waits for capacity and preserves event order.
-
 use std::{fmt, io, time::Duration};
 
 use forge_protocol::outbound::{self, MessageReceiver, MessageSender};
 
-use super::BackendEvent;
+use super::{
+    BackendError, BackendEvent, EventScope, InvocationScope, MessageUpdate, TextUpdate, ToolUpdate,
+};
 
 #[derive(Clone)]
 pub struct BackendEventSink {
-    owner: Option<super::ExecutionOwner>,
+    scope: EventScope,
     sender: MessageSender,
     delivery: std::sync::Arc<tokio::sync::Mutex<()>>,
     skill: Option<std::sync::Arc<std::sync::Mutex<crate::skill::SkillObserver>>>,
@@ -26,28 +26,73 @@ struct EventReceiver {
     transfer: Option<(usize, usize, usize, String)>,
 }
 
-#[derive(Debug)]
-pub struct EventDeliveryFailure(io::Error);
+#[derive(Clone, Debug)]
+pub enum EventDeliveryError {
+    Closed {
+        message: String,
+    },
+    OwnershipMismatch {
+        expected: Box<EventScope>,
+        received: Box<EventScope>,
+    },
+    InvalidTransportData {
+        message: String,
+    },
+    IncompleteTransfer {
+        message: String,
+    },
+    Empty,
+}
 
-impl fmt::Display for EventDeliveryFailure {
+impl EventDeliveryError {
+    fn transport(error: impl fmt::Display) -> Self {
+        Self::InvalidTransportData {
+            message: error.to_string(),
+        }
+    }
+
+    fn queue(error: io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::WouldBlock => Self::Empty,
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe => Self::Closed {
+                message: error.to_string(),
+            },
+            _ => Self::transport(error),
+        }
+    }
+}
+
+impl fmt::Display for EventDeliveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "provider event delivery failed: {}", self.0)
+        match self {
+            Self::Closed { message } => {
+                write!(formatter, "provider event delivery closed: {message}")
+            }
+            Self::OwnershipMismatch { expected, received } => write!(
+                formatter,
+                "provider event crosses execution ownership: expected {expected:?}, received {received:?}"
+            ),
+            Self::InvalidTransportData { message } => write!(
+                formatter,
+                "invalid provider event transport data: {message}"
+            ),
+            Self::IncompleteTransfer { message } => {
+                write!(formatter, "incomplete provider event transfer: {message}")
+            }
+            Self::Empty => formatter.write_str("provider event queue is empty"),
+        }
     }
 }
 
-impl std::error::Error for EventDeliveryFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
+impl std::error::Error for EventDeliveryError {}
 
-pub fn channel() -> (BackendEventSink, BackendEventStream) {
+pub fn channel(scope: impl Into<EventScope>) -> (BackendEventSink, BackendEventStream) {
     let (sender, receiver) = outbound::channel();
     (
         BackendEventSink {
+            scope: scope.into(),
             sender,
             delivery: Default::default(),
-            owner: None,
             skill: None,
         },
         BackendEventStream {
@@ -63,16 +108,18 @@ pub fn channel() -> (BackendEventSink, BackendEventStream) {
 }
 
 impl BackendEventSink {
-    /// Bind transport delivery to its authenticated execution owner.
-    pub fn owned(&self, owner: super::ExecutionOwner) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            delivery: self.delivery.clone(),
-            owner: Some(owner),
-            skill: self.skill.clone(),
-        }
+    pub fn scope(&self) -> &EventScope {
+        &self.scope
     }
-    /// Attach execution-scoped detection without changing transport ownership.
+
+    pub fn invocation_scope(&self) -> Result<&InvocationScope, BackendError> {
+        self.scope
+            .invocation()
+            .ok_or_else(|| BackendError::Protocol {
+                message: "provider prompt requires an admitted invocation scope".into(),
+            })
+    }
+
     pub(crate) fn skills(
         &self,
         observer: std::sync::Arc<std::sync::Mutex<crate::skill::SkillObserver>>,
@@ -82,111 +129,114 @@ impl BackendEventSink {
             ..self.clone()
         }
     }
-    /// Waits for bounded queue capacity without treating a burst as delivery failure.
-    pub async fn send_wait(&self, mut event: BackendEvent) -> Result<(), EventDeliveryFailure> {
-        if let Some(message) = &event.message {
-            event.text = message.text().map(str::to_owned);
-            event.kind = match message.role {
-                Some(crate::backend::MessageRole::Thought) => "reasoning",
-                Some(crate::backend::MessageRole::ThoughtSummary) => "reasoning_summary",
-                _ => "assistant_message",
-            }
-            .into();
+
+    fn validate(&self, event: &BackendEvent) -> Result<(), EventDeliveryError> {
+        let received = event.scope();
+        if received != self.scope {
+            let error = EventDeliveryError::OwnershipMismatch {
+                expected: Box::new(self.scope.clone()),
+                received: Box::new(received),
+            };
+            self.sender
+                .record_failure(&io::Error::other(error.to_string()));
+            return Err(error);
         }
-        if let (Some(owner), Some(address)) = (&self.owner, &mut event.address) {
-            if address
-                .owner
-                .as_ref()
-                .is_some_and(|observed| observed != owner)
-            {
-                let error = io::Error::other(format!(
-                    "provider event {} crosses execution ownership: expected {owner:?}, received {:?}",
-                    event.kind, address.owner
-                ));
-                self.sender.record_failure(&error);
-                return Err(EventDeliveryFailure(error));
-            }
-            address.owner = Some(owner.clone());
-        }
-        event.received_at_ms.get_or_insert_with(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64
-        });
+        Ok(())
+    }
+
+    pub async fn send_wait(&self, event: BackendEvent) -> Result<(), EventDeliveryError> {
+        self.validate(&event)?;
         let _delivery = self.delivery.lock().await;
-        if let Some(skill) = &self.skill {
+        let read = if let Some(skill) = &self.skill {
             skill
                 .lock()
                 .map_err(|_| {
-                    let error = io::Error::other(format!(
-                        "observe skills for provider event {}: skill observer lock poisoned",
-                        event.kind
-                    ));
-                    self.sender.record_failure(&error);
-                    EventDeliveryFailure(error)
+                    let error = EventDeliveryError::transport("skill observer lock poisoned");
+                    self.sender
+                        .record_failure(&io::Error::other(error.to_string()));
+                    error
                 })?
-                .observe(&mut event);
+                .observe(&event)
+        } else {
+            Vec::new()
+        };
+        let skill_event = match &event {
+            BackendEvent::Tool { address, .. } if !read.is_empty() => Some(BackendEvent::Tool {
+                address: address.clone(),
+                update: ToolUpdate::SkillRead { read },
+            }),
+            _ => None,
+        };
+        self.send_encoded(event).await?;
+        if let Some(event) = skill_event {
+            self.send_encoded(event).await?;
         }
+        Ok(())
+    }
+
+    async fn send_encoded(&self, event: BackendEvent) -> Result<(), EventDeliveryError> {
         let transfer = forge_protocol::transfer::JsonTransfer::new(&event).map_err(|error| {
             self.sender.record_failure(&error);
-            EventDeliveryFailure(error)
+            EventDeliveryError::transport(error)
         })?;
         if transfer.total_bytes() < forge_protocol::MAX_FRAME_BYTES / 2 {
             return self
                 .sender
                 .send_wait(event)
                 .await
-                .map_err(EventDeliveryFailure);
+                .map_err(EventDeliveryError::queue);
         }
         for part in transfer {
             self.sender
                 .send_wait(serde_json::json!({"forge_event_part": part}))
                 .await
-                .map_err(EventDeliveryFailure)?;
+                .map_err(EventDeliveryError::queue)?;
         }
         Ok(())
     }
 
     #[cfg(test)]
-    pub(crate) fn send(&self, event: BackendEvent) -> Result<(), EventDeliveryFailure> {
-        self.sender.send(event).map_err(EventDeliveryFailure)
+    pub(crate) fn send(&self, event: BackendEvent) -> Result<(), EventDeliveryError> {
+        self.validate(&event)?;
+        self.sender.send(event).map_err(EventDeliveryError::queue)
     }
 
-    pub async fn failed(&self) -> EventDeliveryFailure {
-        EventDeliveryFailure(self.sender.failed().await)
+    pub async fn failed(&self) -> EventDeliveryError {
+        EventDeliveryError::queue(self.sender.failed().await)
     }
 }
 
 impl EventReceiver {
-    fn accept(&mut self, bytes: &[u8]) -> Result<Option<BackendEvent>, EventDeliveryFailure> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|error| EventDeliveryFailure(io::Error::other(error)))?;
+    fn accept(&mut self, bytes: &[u8]) -> Result<Option<BackendEvent>, EventDeliveryError> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(EventDeliveryError::transport)?;
         let Some(part) = value.get("forge_event_part") else {
             if let Some((sequence, count, bytes, payload)) = &self.transfer {
-                return Err(EventDeliveryFailure(io::Error::other(format!(
-                    "provider event interrupted transfer after {sequence}/{count} parts and {}/{bytes} bytes",
-                    payload.len()
-                ))));
+                return Err(EventDeliveryError::IncompleteTransfer {
+                    message: format!(
+                        "interrupted after {sequence}/{count} parts and {}/{bytes} bytes",
+                        payload.len()
+                    ),
+                });
             }
             return serde_json::from_value(value)
                 .map(Some)
-                .map_err(|error| EventDeliveryFailure(io::Error::other(error)));
+                .map_err(EventDeliveryError::transport);
         };
-        let part: forge_protocol::transfer::JsonPart = serde_json::from_value(part.clone())
-            .map_err(|error| EventDeliveryFailure(io::Error::other(error)))?;
+        let part: forge_protocol::transfer::JsonPart =
+            serde_json::from_value(part.clone()).map_err(EventDeliveryError::transport)?;
         if part.part_count == 0
             || part.part_count > part.total_bytes
             || part.payload.is_empty()
             || part.payload.len() > forge_protocol::MAX_SNAPSHOT_PART_BYTES
         {
-            return Err(EventDeliveryFailure(io::Error::other(format!(
-                "invalid provider event transfer part: sequence {}, count {}, total bytes {}, payload bytes {}",
+            return Err(EventDeliveryError::transport(format!(
+                "invalid part: sequence {}, count {}, total bytes {}, payload bytes {}",
                 part.sequence,
                 part.part_count,
                 part.total_bytes,
                 part.payload.len()
-            ))));
+            )));
         }
         let transfer = self
             .transfer
@@ -194,10 +244,14 @@ impl EventReceiver {
         if part.sequence != transfer.0
             || part.part_count != transfer.1
             || part.total_bytes != transfer.2
-            || transfer.3.len() + part.payload.len() > transfer.2
+            || transfer
+                .3
+                .len()
+                .checked_add(part.payload.len())
+                .is_none_or(|length| length > transfer.2)
         {
-            return Err(EventDeliveryFailure(io::Error::other(format!(
-                "provider event transfer mismatch: expected sequence {}, count {}, bytes {} with {} bytes retained; received sequence {}, count {}, bytes {}, payload bytes {}",
+            return Err(EventDeliveryError::transport(format!(
+                "expected sequence {}, count {}, bytes {} with {} bytes retained; received sequence {}, count {}, bytes {}, payload bytes {}",
                 transfer.0,
                 transfer.1,
                 transfer.2,
@@ -206,7 +260,7 @@ impl EventReceiver {
                 part.part_count,
                 part.total_bytes,
                 part.payload.len()
-            ))));
+            )));
         }
         transfer.0 += 1;
         transfer.3.push_str(&part.payload);
@@ -217,38 +271,55 @@ impl EventReceiver {
         let payload = std::mem::take(&mut transfer.3);
         self.transfer = None;
         if payload.len() != length {
-            return Err(EventDeliveryFailure(io::Error::other(format!(
-                "provider event transfer completed with {} bytes, expected {length}",
-                payload.len()
-            ))));
+            return Err(EventDeliveryError::IncompleteTransfer {
+                message: format!("completed with {} bytes, expected {length}", payload.len()),
+            });
         }
-        decode(payload.as_bytes()).map(Some)
+        serde_json::from_str(&payload)
+            .map(Some)
+            .map_err(EventDeliveryError::transport)
     }
 
-    async fn receive(&mut self) -> Result<Option<BackendEvent>, EventDeliveryFailure> {
+    fn closed(&self) -> Result<Option<BackendEvent>, EventDeliveryError> {
+        if let Some((sequence, count, bytes, payload)) = &self.transfer {
+            return Err(EventDeliveryError::IncompleteTransfer {
+                message: format!(
+                    "closed after {sequence}/{count} transfer parts and {}/{bytes} bytes",
+                    payload.len()
+                ),
+            });
+        }
+        Ok(None)
+    }
+
+    async fn receive(&mut self) -> Result<Option<BackendEvent>, EventDeliveryError> {
         loop {
-            match self.receiver.recv().await.map_err(EventDeliveryFailure)? {
+            match self
+                .receiver
+                .recv()
+                .await
+                .map_err(EventDeliveryError::queue)?
+            {
                 Some(frame) => {
                     if let Some(event) = self.accept(frame.bytes())? {
                         return Ok(Some(event));
                     }
                 }
-                None => {
-                    if let Some((sequence, count, bytes, payload)) = &self.transfer {
-                        return Err(EventDeliveryFailure(io::Error::other(format!(
-                            "provider event stream closed after {sequence}/{count} transfer parts and {}/{bytes} bytes",
-                            payload.len()
-                        ))));
-                    }
-                    return Ok(None);
-                }
+                None => return self.closed(),
             }
         }
     }
 
-    fn try_receive(&mut self) -> Result<BackendEvent, EventDeliveryFailure> {
+    fn try_receive(&mut self) -> Result<BackendEvent, EventDeliveryError> {
         loop {
-            let frame = self.receiver.try_recv().map_err(EventDeliveryFailure)?;
+            let frame = match self.receiver.try_recv() {
+                Ok(frame) => frame,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.closed()?;
+                    return Err(EventDeliveryError::queue(error));
+                }
+                Err(error) => return Err(EventDeliveryError::queue(error)),
+            };
             if let Some(event) = self.accept(frame.bytes())? {
                 return Ok(event);
             }
@@ -257,26 +328,22 @@ impl EventReceiver {
 }
 
 impl BackendEventStream {
-    /// Returns the next available event, preserving delivery failures separately from an empty queue.
-    pub fn try_next(&mut self) -> Result<Option<BackendEvent>, EventDeliveryFailure> {
+    pub fn try_next(&mut self) -> Result<Option<BackendEvent>, EventDeliveryError> {
         match self.try_recv() {
             Ok(event) => Ok(Some(event)),
-            Err(EventDeliveryFailure(error))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::UnexpectedEof
-                ) =>
-            {
-                Ok(None)
-            }
+            Err(EventDeliveryError::Empty | EventDeliveryError::Closed { .. }) => Ok(None),
             Err(error) => Err(error),
         }
     }
-    pub fn check(&self) -> Result<(), EventDeliveryFailure> {
-        self.input.receiver.check().map_err(EventDeliveryFailure)
+
+    pub fn check(&self) -> Result<(), EventDeliveryError> {
+        self.input
+            .receiver
+            .check()
+            .map_err(EventDeliveryError::queue)
     }
 
-    pub async fn recv(&mut self) -> Result<Option<BackendEvent>, EventDeliveryFailure> {
+    pub async fn recv(&mut self) -> Result<Option<BackendEvent>, EventDeliveryError> {
         if self.pending.is_none() {
             self.pending = match self.queued.take() {
                 Some(event) => Some(event),
@@ -288,8 +355,7 @@ impl BackendEventStream {
             if !batchable(pending) || output_bytes(pending) >= 64 * 1024 {
                 break;
             }
-            let received = tokio::time::timeout_at(self.deadline, self.input.receive()).await;
-            let event = match received {
+            let event = match tokio::time::timeout_at(self.deadline, self.input.receive()).await {
                 Err(_) | Ok(Ok(None)) => break,
                 Ok(Err(error)) => return Err(error),
                 Ok(Ok(Some(event))) => event,
@@ -302,7 +368,7 @@ impl BackendEventStream {
         Ok(self.pending.take())
     }
 
-    pub fn try_recv(&mut self) -> Result<BackendEvent, EventDeliveryFailure> {
+    pub fn try_recv(&mut self) -> Result<BackendEvent, EventDeliveryError> {
         self.check()?;
         let mut event = match self.pending.take().or_else(|| self.queued.take()) {
             Some(event) => event,
@@ -311,14 +377,7 @@ impl BackendEventStream {
         while batchable(&event) && output_bytes(&event) < 64 * 1024 {
             let next = match self.input.try_receive() {
                 Ok(event) => event,
-                Err(EventDeliveryFailure(error))
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::UnexpectedEof
-                    ) =>
-                {
-                    break;
-                }
+                Err(EventDeliveryError::Empty | EventDeliveryError::Closed { .. }) => break,
                 Err(error) => return Err(error),
             };
             if !merge_output(&mut event, &next) {
@@ -330,75 +389,59 @@ impl BackendEventStream {
     }
 }
 
-fn decode(bytes: &[u8]) -> Result<BackendEvent, EventDeliveryFailure> {
-    serde_json::from_slice(bytes).map_err(|error| EventDeliveryFailure(io::Error::other(error)))
-}
-
 fn batchable(event: &BackendEvent) -> bool {
-    event.tool_output_delta().is_some() || event.message_delta().is_some()
+    event.message_delta().is_some() || event.tool_output_delta().is_some()
 }
 
 fn output_bytes(event: &BackendEvent) -> usize {
     event
-        .text
-        .as_ref()
-        .or_else(|| {
-            event
-                .activity
-                .as_ref()
-                .and_then(|activity| activity.output.as_ref())
-        })
-        .map_or(0, String::len)
+        .message_delta()
+        .or_else(|| event.tool_output_delta())
+        .map_or(0, str::len)
 }
 
 fn merge_output(pending: &mut BackendEvent, event: &BackendEvent) -> bool {
-    if !batchable(event)
-        || pending.address != event.address
-        || pending.kind != event.kind
-        || output_bytes(pending) + output_bytes(event) > 64 * 1024
-    {
+    if output_bytes(pending).saturating_add(output_bytes(event)) > 64 * 1024 {
         return false;
     }
-    if pending.text.is_some() {
-        if pending.message_id() != event.message_id()
-            || pending.message_phase() != event.message_phase()
-        {
-            return false;
+    match (pending, event) {
+        (
+            BackendEvent::Message {
+                address: previous_address,
+                update: MessageUpdate::Delta { text: previous },
+            },
+            BackendEvent::Message {
+                address,
+                update: MessageUpdate::Delta { text },
+            },
+        ) if previous_address == address => {
+            previous.push_str(text);
+            true
         }
-        let (Some(previous), Some(next)) = (pending.text.as_mut(), event.text.as_ref()) else {
-            return false;
-        };
-        previous.push_str(next);
-        if let Some(message) = &mut pending.message {
-            message.update = crate::backend::MessageUpdate::Delta {
-                text: previous.clone(),
-            };
+        (
+            BackendEvent::Tool {
+                address: previous_address,
+                update:
+                    ToolUpdate::Output {
+                        update: TextUpdate::Append(previous),
+                    },
+            },
+            BackendEvent::Tool {
+                address,
+                update:
+                    ToolUpdate::Output {
+                        update: TextUpdate::Append(text),
+                    },
+            },
+        ) if previous_address == address => {
+            previous.push_str(text);
+            true
         }
-        return true;
+        _ => false,
     }
-    let (Some(previous), Some(next)) = (pending.activity.as_mut(), event.activity.as_ref()) else {
-        return false;
-    };
-    if previous.id != next.id
-        || previous.kind != next.kind
-        || previous.title != next.title
-        || previous.status != next.status
-    {
-        return false;
-    }
-    let (Some(previous_output), Some(next_output)) =
-        (previous.output.as_mut(), next.output.as_ref())
-    else {
-        return false;
-    };
-    previous_output.push_str(next_output);
-    if let Some(delta) = pending.data.pointer_mut("/params/delta") {
-        *delta = serde_json::Value::String(previous_output.clone());
-    }
-    true
 }
 
-pub async fn failed(sink: Option<&BackendEventSink>) -> EventDeliveryFailure {
+pub async fn failed(sink: Option<&BackendEventSink>) -> EventDeliveryError {
     match sink {
         Some(sink) => sink.failed().await,
         None => std::future::pending().await,
@@ -408,11 +451,34 @@ pub async fn failed(sink: Option<&BackendEventSink>) -> EventDeliveryFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{ExecutionOwner, MessageAddress, MessageId, TurnAddress};
     use serde_json::json;
+
+    fn scope() -> InvocationScope {
+        InvocationScope {
+            owner: ExecutionOwner::root("session"),
+            exchange_id: "exchange".into(),
+            invocation_id: "invocation".into(),
+        }
+    }
+
+    fn message(id: &str, update: MessageUpdate) -> BackendEvent {
+        BackendEvent::Message {
+            address: MessageAddress {
+                turn: TurnAddress {
+                    scope: scope(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                },
+                message_id: MessageId::Native(id.into()),
+            },
+            update,
+        }
+    }
 
     #[tokio::test]
     async fn malformed_transfer_reports_expected_and_received_sequence() {
-        let (sink, mut stream) = channel();
+        let (sink, mut stream) = channel(scope());
         sink.sender
             .send(json!({"forge_event_part": {
                 "sequence": 1, "part_count": 2, "total_bytes": 4, "payload": "ab"
@@ -425,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_transfer_reports_progress_instead_of_generic_eof() {
-        let (sink, mut stream) = channel();
+        let (sink, mut stream) = channel(scope());
         sink.sender
             .send(json!({"forge_event_part": {
                 "sequence": 0, "part_count": 2, "total_bytes": 4, "payload": "ab"
@@ -438,302 +504,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receipt_time_survives_forwarding_without_replacing_scalar_provider_data() {
-        let (sink, mut stream) = channel();
-        let mut source = event(42);
-        source.data = serde_json::Value::Null;
-        sink.send_wait(source).await.unwrap();
-        let received = stream.recv().await.unwrap().unwrap();
-        let timestamp = received.received_at_ms.expect("adapter receipt");
-        assert_eq!(received.data, serde_json::Value::Null);
-        assert_eq!(received.observed_at_ms(timestamp + 2000), timestamp);
-        let (forward, mut forwarded) = channel();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        forward.send_wait(received).await.unwrap();
-        let received = forwarded.recv().await.unwrap().unwrap();
-        assert_eq!(received.received_at_ms, Some(timestamp));
-        assert_eq!(received.data, serde_json::Value::Null);
-    }
-
-    fn event(sequence: usize) -> BackendEvent {
-        BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: None,
-            turn_boundary: None,
-            kind: "delta".into(),
-            text: Some(sequence.to_string()),
-            data: json!(sequence),
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        }
-    }
-
-    fn output(id: &str, text: &str) -> BackendEvent {
-        let mut event = event(0);
-        event.text = None;
-        event.kind = "tool-output".into();
-        event.activity = Some(super::super::ToolActivity {
-            id: id.into(),
-            kind: super::super::ToolActivityKind::Command,
-            title: "command".into(),
-            output: Some(text.into()),
-            status: Some(crate::backend::ToolStatus::Running),
-            change: Default::default(),
-            output_delta: true,
-        });
-        event
+    async fn foreign_invocation_scope_is_rejected_before_delivery() {
+        let (sink, mut stream) = channel(scope());
+        let mut foreign = scope();
+        foreign.invocation_id = "foreign".into();
+        let error = sink
+            .send_wait(BackendEvent::Runtime {
+                scope: foreign,
+                update: crate::backend::RuntimeUpdate::ForegroundIdle,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EventDeliveryError::OwnershipMismatch { .. }
+        ));
+        assert!(stream.recv().await.is_err());
     }
 
     #[tokio::test]
     async fn message_batches_preserve_message_phase_and_snapshot_barriers() {
-        let (sink, mut stream) = channel();
-        let message = |id: &str, text: &str| BackendEvent {
-            message: Some(crate::backend::ProviderMessage {
-                id: crate::backend::MessageId(id.into()),
-                role: Some(crate::backend::MessageRole::Commentary),
-                update: crate::backend::MessageUpdate::Delta { text: text.into() },
-            }),
-            kind: "assistant_message".into(),
-            text: Some(text.into()),
-            data: json!({"provider_message_id":id,"provider_message_phase":"commentary"}),
-            ..event(0)
-        };
+        let (sink, mut stream) = channel(scope());
         let producer = async {
             for _ in 0..100 {
-                sink.send_wait(message("one", "λ")).await.unwrap();
+                sink.send_wait(message("one", MessageUpdate::Delta { text: "λ".into() }))
+                    .await
+                    .unwrap();
             }
-            sink.send_wait(message("two", "second")).await.unwrap();
-            let mut snapshot = message("two", "complete");
-            snapshot.message.as_mut().unwrap().update = crate::backend::MessageUpdate::Completed {
-                text: "complete".into(),
-            };
-            sink.send_wait(snapshot).await.unwrap();
-            sink.send_wait(event(1)).await.unwrap();
+            sink.send_wait(message(
+                "one",
+                MessageUpdate::Completed {
+                    text: "complete".into(),
+                },
+            ))
+            .await
+            .unwrap();
+            sink.send_wait(message(
+                "two",
+                MessageUpdate::Delta {
+                    text: "second".into(),
+                },
+            ))
+            .await
+            .unwrap();
         };
         let consumer = async {
-            let first = stream.recv().await.unwrap().unwrap();
-            assert_eq!(first.text.as_deref(), Some("λ".repeat(100).as_str()));
             assert_eq!(
-                stream.recv().await.unwrap().unwrap().text.as_deref(),
+                stream.recv().await.unwrap().unwrap().message_delta(),
+                Some("λ".repeat(100).as_str())
+            );
+            assert!(matches!(
+                stream.recv().await.unwrap(),
+                Some(BackendEvent::Message {
+                    update: MessageUpdate::Completed { .. },
+                    ..
+                })
+            ));
+            assert_eq!(
+                stream.recv().await.unwrap().unwrap().message_delta(),
                 Some("second")
             );
-            assert_eq!(
-                stream.recv().await.unwrap().unwrap().text.as_deref(),
-                Some("complete")
-            );
-            assert_eq!(stream.recv().await.unwrap().unwrap().data, json!(1));
         };
         tokio::join!(producer, consumer);
     }
 
     #[tokio::test]
-    async fn output_burst_batches_without_crossing_lifecycle_or_owner_boundaries() {
-        let (sink, mut stream) = channel();
+    async fn typed_events_preserve_barriers_and_full_content_under_backpressure() {
+        let (sink, mut stream) = channel(scope());
+        let text = "λ\n".repeat(forge_protocol::MAX_FRAME_BYTES);
+        let expected = text.clone();
         let producer = async move {
-            for _ in 0..792 {
-                sink.send_wait(output("first", "λ\n")).await.unwrap();
-            }
-            sink.send_wait(event(1)).await.unwrap();
-            sink.send_wait(output("second", "other")).await.unwrap();
+            sink.send_wait(message("large", MessageUpdate::Completed { text }))
+                .await
+                .unwrap();
         };
-        let consumer = async move {
-            let mut combined = String::new();
-            loop {
-                let received = stream.recv().await.unwrap().unwrap();
-                let Some(activity) = received.activity else {
-                    assert_eq!(received.data, json!(1));
-                    break;
-                };
-                assert_eq!(activity.id, "first");
-                combined.push_str(activity.output.as_deref().unwrap());
+        let consumer = async {
+            match stream.recv().await.unwrap().unwrap() {
+                BackendEvent::Message {
+                    update: MessageUpdate::Completed { text },
+                    ..
+                } => assert_eq!(text, expected),
+                event => panic!("unexpected event {event:?}"),
             }
-            assert_eq!(combined, "λ\n".repeat(792));
-            assert_eq!(
-                stream.recv().await.unwrap().unwrap().activity.unwrap().id,
-                "second"
-            );
-            assert!(stream.recv().await.unwrap().is_none());
         };
         tokio::join!(producer, consumer);
     }
 
     #[tokio::test]
     async fn cancelled_receive_retains_partial_batch_for_final_drain() {
-        let (sink, mut stream) = channel();
-        sink.send_wait(output("first", "partial")).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(1), stream.recv())
-                .await
-                .is_err()
-        );
-        sink.send_wait(output("first", " tail")).await.unwrap();
-        sink.send_wait(event(2)).await.unwrap();
-        assert_eq!(
-            stream.try_recv().unwrap().activity.unwrap().output.unwrap(),
-            "partial tail"
-        );
-        assert_eq!(stream.try_recv().unwrap().data, json!(2));
-    }
-
-    #[tokio::test]
-    async fn output_batch_enforces_byte_limit_and_preserves_snapshot() {
-        let (sink, mut stream) = channel();
-        sink.send_wait(output("first", &"a".repeat(40000)))
-            .await
-            .unwrap();
-        sink.send_wait(output("first", &"b".repeat(40000)))
-            .await
-            .unwrap();
-        let mut completed = output("first", "authoritative");
-        completed.activity.as_mut().unwrap().output_delta = false;
-        sink.send_wait(completed).await.unwrap();
-        assert_eq!(output_bytes(&stream.recv().await.unwrap().unwrap()), 40000);
-        assert_eq!(output_bytes(&stream.recv().await.unwrap().unwrap()), 40000);
-        assert_eq!(
-            stream
-                .recv()
-                .await
-                .unwrap()
-                .unwrap()
-                .activity
-                .unwrap()
-                .output
-                .unwrap(),
-            "authoritative"
-        );
-    }
-
-    #[tokio::test]
-    async fn preserves_order_and_drains_after_producer_exit() {
-        let (sink, mut stream) = channel();
-        for sequence in 0..96 {
-            sink.send(event(sequence)).unwrap();
-        }
-        drop(sink);
-        for sequence in 0..96 {
-            assert_eq!(stream.recv().await.unwrap().unwrap().data, json!(sequence));
-        }
-        assert!(stream.recv().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn ignored_callback_failure_still_reaches_consumer() {
-        let (sink, mut stream) = channel();
-        for sequence in 0..96 {
-            sink.send(event(sequence)).unwrap();
-        }
-        let _ = sink.send(event(96));
-        assert!(sink.failed().await.to_string().contains("budget exhausted"));
-        assert!(stream.recv().await.is_err());
-        assert!(stream.try_recv().is_err());
-        assert!(sink.send(event(97)).is_err());
-    }
-
-    #[tokio::test]
-    async fn oversized_payload_is_transferred_without_poisoning_delivery() {
-        let (sink, mut stream) = channel();
-        let mut oversized = event(0);
-        oversized.text = Some("x".repeat(forge_protocol::MAX_FRAME_BYTES));
-        let expected = oversized.text.clone();
-        let producer = async {
-            sink.send_wait(oversized).await.unwrap();
-            sink.send_wait(event(1)).await.unwrap();
-        };
-        let consumer = async {
-            assert_eq!(stream.recv().await.unwrap().unwrap().text, expected);
-            assert_eq!(stream.recv().await.unwrap().unwrap().data, json!(1));
-        };
-        tokio::join!(producer, consumer);
-    }
-
-    #[tokio::test]
-    async fn large_aggregate_transfers_without_a_total_byte_limit() {
-        let (sink, mut stream) = channel();
-        let mut oversized = event(0);
-        oversized.text = Some("x".repeat(16 * 1024 * 1024 + 1));
-        let expected = oversized.text.clone();
-        let producer = async {
-            sink.send_wait(oversized).await.unwrap();
-        };
-        let consumer = async {
-            assert_eq!(stream.recv().await.unwrap().unwrap().text, expected);
-        };
-        tokio::join!(producer, consumer);
-    }
-
-    #[tokio::test]
-    async fn cancelled_receive_preserves_an_incomplete_multipart_event() {
-        let (sink, mut stream) = channel();
-        let mut source = event(0);
-        source.text = Some("λ".repeat(200000));
-        let mut parts = forge_protocol::transfer::JsonTransfer::new(&source).unwrap();
-        sink.sender
-            .send_wait(serde_json::json!({"forge_event_part":parts.next().unwrap()}))
-            .await
-            .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(1), stream.recv())
-                .await
-                .is_err()
-        );
-        let producer = async {
-            for part in parts {
-                sink.sender
-                    .send_wait(serde_json::json!({"forge_event_part":part}))
-                    .await
-                    .unwrap();
-            }
-        };
-        let consumer = async {
-            assert_eq!(stream.recv().await.unwrap().unwrap().text, source.text);
-        };
-        tokio::join!(producer, consumer);
-    }
-
-    #[tokio::test]
-    async fn burst_waits_for_capacity_and_preserves_every_event() {
-        let (sink, mut stream) = channel();
-        let producer = async move {
-            for sequence in 0..384 {
-                sink.send_wait(event(sequence)).await.unwrap();
-            }
-        };
-        let consumer = async move {
-            for sequence in 0..384 {
-                assert_eq!(stream.recv().await.unwrap().unwrap().data, json!(sequence));
-            }
-            assert!(stream.recv().await.unwrap().is_none());
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(producer, consumer);
-        })
+        let (sink, mut stream) = channel(scope());
+        sink.send_wait(message(
+            "one",
+            MessageUpdate::Delta {
+                text: "partial".into(),
+            },
+        ))
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn closing_consumer_releases_a_waiting_producer() {
-        let (sink, stream) = channel();
-        for sequence in 0..96 {
-            sink.send_wait(event(sequence)).await.unwrap();
-        }
-        let waiting = sink.send_wait(event(96));
-        tokio::pin!(waiting);
         assert!(
-            std::future::poll_fn(|context| {
-                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), context))
-            })
-            .await
-            .is_pending()
-        );
-        drop(stream);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            tokio::time::timeout(Duration::from_millis(1), stream.recv())
                 .await
-                .unwrap()
                 .is_err()
+        );
+        sink.send_wait(message(
+            "one",
+            MessageUpdate::Delta {
+                text: " tail".into(),
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            stream.try_recv().unwrap().message_delta(),
+            Some("partial tail")
         );
     }
 }

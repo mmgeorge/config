@@ -4,7 +4,7 @@ use super::{Message, MessageKind, MessageState, TurnItem};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::ProviderAddress;
+use crate::backend::TurnAddress;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,10 +37,11 @@ pub enum TurnState {
 /// Owns the identity and lifecycle of one provider turn within an exchange.
 pub struct Turn {
     id: String,
-    provider: ProviderAddress,
+    provider: TurnAddress,
     state: TurnState,
     started_at_ms: i64,
     completed_at_ms: Option<i64>,
+    reported_duration_ms: Option<u64>,
     #[serde(default)]
     usage: Option<crate::backend::usage::TokenUsage>,
     message: Vec<Message>,
@@ -50,13 +51,14 @@ pub struct Turn {
 
 impl Turn {
     /// Admit one provider start event into the owning exchange.
-    pub(crate) fn new(id: String, provider: ProviderAddress, now_ms: i64) -> Self {
+    pub(crate) fn new(id: String, provider: TurnAddress, now_ms: i64) -> Self {
         Self {
             id,
             provider,
             state: TurnState::Running,
             started_at_ms: now_ms,
             completed_at_ms: None,
+            reported_duration_ms: None,
             usage: None,
             message: Vec::new(),
             item: Vec::new(),
@@ -70,7 +72,7 @@ impl Turn {
     }
 
     /// Return the provider address used for event and control admission.
-    pub fn provider(&self) -> &ProviderAddress {
+    pub fn provider(&self) -> &TurnAddress {
         &self.provider
     }
 
@@ -86,9 +88,18 @@ impl Turn {
 
     /// Return the frozen provider execution duration after completion.
     pub fn duration_ms(&self) -> u64 {
-        self.completed_at_ms.map_or(0, |completed| {
-            completed.saturating_sub(self.started_at_ms) as u64
+        self.reported_duration_ms.unwrap_or_else(|| {
+            self.completed_at_ms.map_or(0, |completed| {
+                completed.saturating_sub(self.started_at_ms) as u64
+            })
         })
+    }
+
+    pub(crate) fn record_summary(&mut self, summary: &crate::backend::TurnSummary) {
+        self.reported_duration_ms = Some(summary.duration_ms);
+        if let Some(usage) = &summary.usage {
+            self.record_usage(usage.clone());
+        }
     }
 
     /// Attach terminal usage without reopening the settled execution.
@@ -156,11 +167,13 @@ impl Turn {
         delivery: MessageDelivery,
         snapshot: bool,
     ) -> Result<()> {
-        use crate::backend::{MessageId, MessageRole, MessageUpdate, ProviderMessage};
+        use crate::backend::{
+            MessageAddress, MessageClassification, MessageId, MessageRole, MessageUpdate,
+        };
         let provider_id = provider_id.unwrap_or_else(|| {
             self.current_message
                 .filter(|index| self.message[*index].kind() == kind && !snapshot)
-                .and_then(|index| self.message[index].provider_id.clone())
+                .map(|index| self.message[index].provider_id.as_str().to_owned())
                 .unwrap_or_else(|| format!("test-message:{}", self.message.len() + 1))
         });
         let role = match kind {
@@ -173,75 +186,155 @@ impl Turn {
                 MessageDelivery::Final => Some(MessageRole::Response),
             },
         };
-        self.record_message(&ProviderMessage {
-            id: MessageId(provider_id),
-            role,
-            update: if snapshot {
+        let address = MessageAddress {
+            turn: self.provider.clone(),
+            message_id: MessageId::Native(provider_id),
+        };
+        if !self
+            .message
+            .iter()
+            .any(|message| message.provider_id == address.message_id)
+        {
+            self.record_message(
+                &address,
+                &MessageUpdate::Started {
+                    classification: role.map_or(
+                        MessageClassification::Unclassified,
+                        MessageClassification::Known,
+                    ),
+                    text: text.into(),
+                },
+            )?;
+            if !snapshot {
+                return Ok(());
+            }
+        } else if let Some(role) = role {
+            self.record_message(&address, &MessageUpdate::Classified { role })?;
+        }
+        Ok(self.record_message(
+            &address,
+            &if snapshot {
                 MessageUpdate::Completed { text: text.into() }
             } else {
                 MessageUpdate::Delta { text: text.into() }
             },
-        })
+        )?)
     }
 
     pub(crate) fn record_message(
         &mut self,
-        update: &crate::backend::ProviderMessage,
-    ) -> Result<()> {
-        use crate::backend::MessageUpdate;
-        ensure!(
-            self.state == TurnState::Running,
-            "completed turn rejects message events"
-        );
-        ensure!(
-            !update.id.0.is_empty(),
-            "provider message identity is empty"
-        );
-        ensure!(
-            !matches!(update.update, MessageUpdate::Classified) || update.role.is_some(),
-            "provider message classification omitted its role"
-        );
-        let index = self
+        address: &crate::backend::MessageAddress,
+        update: &crate::backend::MessageUpdate,
+    ) -> Result<(), crate::backend::BackendError> {
+        use crate::backend::{BackendError, MessageClassification, MessageUpdate};
+        let protocol = |message: &str| BackendError::Protocol {
+            message: message.into(),
+        };
+        if address.turn != self.provider || address.message_id.as_str().is_empty() {
+            return Err(protocol(
+                "provider message identity does not belong to this execution",
+            ));
+        }
+        let existing = self
             .message
             .iter()
-            .position(|message| message.provider_id.as_deref() == Some(update.id.0.as_str()))
-            .unwrap_or_else(|| {
-                let index = self.message.len();
-                let id = format!("{}:message:{}", self.id, index + 1);
-                self.message.push(Message {
-                    id: id.clone(),
-                    provider_id: Some(update.id.0.clone()),
-                    role: None,
-                    state: MessageState::Streaming,
-                    text: String::new(),
-                });
-                self.item.push(TurnItem::Message { id });
-                index
-            });
-        let message = &mut self.message[index];
-        if let Some(role) = update.role {
-            message.role = Some(role);
-        }
-        match &update.update {
-            MessageUpdate::Started | MessageUpdate::Classified => {}
-            MessageUpdate::Delta { text } if message.state == MessageState::Streaming => {
-                message.text.push_str(text);
+            .position(|message| message.provider_id == address.message_id);
+        if let MessageUpdate::Started {
+            classification,
+            text,
+        } = update
+        {
+            if text.is_empty() {
+                return Err(protocol("provider message start requires actual text"));
             }
-            MessageUpdate::Completed { text } => {
-                ensure!(
-                    message.state != MessageState::Interrupted,
-                    "interrupted message rejects completion"
-                );
-                message.text = text.clone();
+            if let Some(index) = existing {
+                let start = &self.message[index].start;
+                return if start.classification == *classification && start.text == *text {
+                    Ok(())
+                } else {
+                    Err(protocol(
+                        "provider message start replay changed its original content or classification",
+                    ))
+                };
+            }
+            if self.state != TurnState::Running {
+                return Err(protocol("completed turn rejects new messages"));
+            }
+            let index = self.message.len();
+            let id = format!("{}:message:{}", self.id, index + 1);
+            self.message.push(Message {
+                id: id.clone(),
+                provider_id: address.message_id.clone(),
+                classification: *classification,
+                start: super::message::MessageStart {
+                    classification: *classification,
+                    text: text.clone(),
+                },
+                state: MessageState::Streaming,
+                text: text.clone(),
+            });
+            self.item.push(TurnItem::Message { id });
+            self.current_message = Some(index);
+            return Ok(());
+        }
+        let index = existing
+            .ok_or_else(|| protocol("provider message update arrived before its text start"))?;
+        let message = &mut self.message[index];
+        match update {
+            MessageUpdate::Started { .. } => unreachable!(),
+            MessageUpdate::Classified { role } => match message.classification {
+                MessageClassification::Unclassified => {
+                    message.classification = MessageClassification::Known(*role)
+                }
+                MessageClassification::Known(previous) if previous == *role => {}
+                MessageClassification::Known(_) => {
+                    return Err(protocol("provider message classification changed"));
+                }
+            },
+            MessageUpdate::Delta { text } if message.state == MessageState::Streaming => {
+                if self.state != TurnState::Running {
+                    return Err(protocol("completed turn rejects message deltas"));
+                }
+                message.text.push_str(text);
+                if self.current_message.is_none_or(|current| index >= current) {
+                    self.current_message = Some(index);
+                }
+            }
+            MessageUpdate::Completed { text } if message.state == MessageState::Streaming => {
+                message.text.clone_from(text);
                 message.state = MessageState::Completed;
+                if self.current_message == Some(index) {
+                    self.current_message = None;
+                }
+            }
+            MessageUpdate::Completed { text }
+                if message.state == MessageState::Completed && message.text == *text => {}
+            MessageUpdate::Completed { .. } => {
+                return Err(protocol(
+                    "provider message terminal snapshot contradicts its settled state",
+                ));
             }
             MessageUpdate::Interrupted if message.state == MessageState::Streaming => {
                 message.state = MessageState::Interrupted;
+                if self.current_message == Some(index) {
+                    self.current_message = None;
+                }
             }
-            MessageUpdate::Delta { .. } | MessageUpdate::Interrupted => {}
+            MessageUpdate::Interrupted if message.state == MessageState::Interrupted => {}
+            MessageUpdate::Interrupted => {
+                return Err(protocol("completed provider message rejects interruption"));
+            }
+            MessageUpdate::Delta { .. } => {
+                return Err(protocol("terminal provider message rejects text deltas"));
+            }
         }
-        self.current_message = Some(index);
         Ok(())
+    }
+
+    pub(crate) fn finish_call(&mut self, completed_at_ms: i64) {
+        if self.completed_at_ms.is_none() {
+            self.completed_at_ms = Some(completed_at_ms.max(self.started_at_ms));
+        }
     }
 
     /// Permanently settle execution while accepting an identical completion replay.
@@ -258,7 +351,7 @@ impl Turn {
                 }
                 self.current_message = None;
                 self.state = TurnState::Finished { outcome };
-                self.completed_at_ms = Some(now_ms.max(self.started_at_ms));
+                self.finish_call(now_ms);
             }
         }
         Ok(())
@@ -277,61 +370,281 @@ fn default_delivery(kind: MessageKind) -> MessageDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{TextUpdate, ToolOutcome, ToolUpdate};
     use crate::turn::test_support::TestTurn as Turn;
+
+    fn scope() -> crate::backend::InvocationScope {
+        crate::backend::InvocationScope {
+            owner: crate::backend::ExecutionOwner::root("session"),
+            exchange_id: "exchange".into(),
+            invocation_id: "invocation".into(),
+        }
+    }
+
+    #[test]
+    fn call_completion_freezes_time_without_closing_message_admission() -> Result<()> {
+        let address = TurnAddress {
+            scope: scope(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        let mut turn = super::Turn::new("local".into(), address.clone(), 10);
+        turn.finish_call(20);
+        turn.finish_call(90);
+        assert_eq!(turn.duration_ms(), 10);
+        assert_eq!(turn.state(), TurnState::Running);
+        let message = crate::backend::MessageAddress {
+            turn: address,
+            message_id: crate::backend::MessageId::Native("late".into()),
+        };
+        turn.record_message(
+            &message,
+            &crate::backend::MessageUpdate::Started {
+                classification: crate::backend::MessageClassification::Known(
+                    crate::backend::MessageRole::Response,
+                ),
+                text: "drained response".into(),
+            },
+        )?;
+        turn.record_message(
+            &message,
+            &crate::backend::MessageUpdate::Completed {
+                text: "drained response".into(),
+            },
+        )?;
+        turn.finish(TurnOutcome::Completed, 100)?;
+        assert_eq!(turn.duration_ms(), 10);
+        assert_eq!(turn.messages()[0].text(), "drained response");
+        Ok(())
+    }
+
+    #[test]
+    fn native_and_synthetic_messages_with_equal_text_identity_remain_distinct() -> Result<()> {
+        let address = TurnAddress {
+            scope: scope(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        let mut turn = super::Turn::new("local".into(), address.clone(), 10);
+        for id in [
+            crate::backend::MessageId::Native("same".into()),
+            crate::backend::MessageId::Synthetic("same".into()),
+        ] {
+            let message = crate::backend::MessageAddress {
+                turn: address.clone(),
+                message_id: id,
+            };
+            turn.record_message(
+                &message,
+                &crate::backend::MessageUpdate::Started {
+                    classification: crate::backend::MessageClassification::Known(
+                        crate::backend::MessageRole::Response,
+                    ),
+                    text: "answer".into(),
+                },
+            )?;
+            turn.record_message(
+                &message,
+                &crate::backend::MessageUpdate::Completed {
+                    text: "answer".into(),
+                },
+            )?;
+        }
+        let restored: super::Turn = serde_json::from_value(serde_json::to_value(turn)?)?;
+        assert_eq!(restored.messages().len(), 2);
+        assert_ne!(
+            restored.messages()[0].provider_id(),
+            restored.messages()[1].provider_id()
+        );
+        assert_eq!(restored.provider().scope, address.scope);
+        Ok(())
+    }
+
+    #[test]
+    fn late_reasoning_completion_does_not_replace_the_active_message() -> Result<()> {
+        use crate::backend::{
+            MessageAddress, MessageClassification, MessageId, MessageRole, MessageUpdate,
+        };
+        let address = TurnAddress {
+            scope: scope(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        let mut turn = super::Turn::new("local".into(), address.clone(), 0);
+        let reasoning = MessageAddress {
+            turn: address.clone(),
+            message_id: MessageId::Native("reasoning".into()),
+        };
+        let response = MessageAddress {
+            turn: address,
+            message_id: MessageId::Native("response".into()),
+        };
+        turn.record_message(
+            &reasoning,
+            &MessageUpdate::Started {
+                classification: MessageClassification::Known(MessageRole::ThoughtSummary),
+                text: "Inspecting".into(),
+            },
+        )?;
+        turn.record_message(
+            &response,
+            &MessageUpdate::Started {
+                classification: MessageClassification::Known(MessageRole::Response),
+                text: "Answer".into(),
+            },
+        )?;
+        turn.record_message(
+            &reasoning,
+            &MessageUpdate::Delta {
+                text: " the source".into(),
+            },
+        )?;
+        assert_eq!(turn.current_message, Some(1));
+        turn.record_message(
+            &response,
+            &MessageUpdate::Completed {
+                text: "Final answer".into(),
+            },
+        )?;
+        assert_eq!(turn.current_message, None);
+        turn.record_message(
+            &reasoning,
+            &MessageUpdate::Completed {
+                text: "Reconciled summary".into(),
+            },
+        )?;
+        assert_eq!(turn.current_message, None);
+        assert_eq!(turn.latest_reasoning_summary(), Some("Reconciled summary"));
+        Ok(())
+    }
+
+    #[test]
+    fn message_replays_are_idempotent_and_invalid_updates_preserve_the_record() -> Result<()> {
+        use crate::backend::{
+            BackendError, MessageAddress, MessageClassification, MessageId, MessageRole,
+            MessageUpdate,
+        };
+        let address = TurnAddress {
+            scope: scope(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        let mut turn = super::Turn::new("local".into(), address.clone(), 0);
+        let message = MessageAddress {
+            turn: address,
+            message_id: MessageId::Native("message".into()),
+        };
+        assert!(matches!(
+            turn.record_message(
+                &message,
+                &MessageUpdate::Delta {
+                    text: "orphan".into()
+                }
+            ),
+            Err(BackendError::Protocol { .. })
+        ));
+        assert!(turn.messages().is_empty());
+        let started = MessageUpdate::Started {
+            classification: MessageClassification::Unclassified,
+            text: "first".into(),
+        };
+        turn.record_message(&message, &started)?;
+        turn.record_message(
+            &message,
+            &MessageUpdate::Delta {
+                text: " second".into(),
+            },
+        )?;
+        turn.record_message(&message, &started)?;
+        assert_eq!(turn.messages()[0].text(), "first second");
+        turn.record_message(
+            &message,
+            &MessageUpdate::Classified {
+                role: MessageRole::Commentary,
+            },
+        )?;
+        let completed = MessageUpdate::Completed {
+            text: "authoritative".into(),
+        };
+        turn.record_message(&message, &completed)?;
+        turn.record_message(&message, &completed)?;
+        assert!(matches!(
+            turn.record_message(
+                &message,
+                &MessageUpdate::Completed {
+                    text: "contradictory".into()
+                }
+            ),
+            Err(BackendError::Protocol { .. })
+        ));
+        assert_eq!(turn.messages()[0].text(), "authoritative");
+        let restored: super::Turn = serde_json::from_value(serde_json::to_value(turn)?)?;
+        assert_eq!(
+            restored.messages()[0].classification(),
+            MessageClassification::Known(MessageRole::Commentary)
+        );
+        Ok(())
+    }
 
     #[test]
     fn typed_message_retains_identity_role_and_terminal_lifecycle() -> Result<()> {
-        use crate::backend::{MessageId, MessageRole, MessageUpdate, ProviderMessage};
+        use crate::backend::{
+            MessageAddress, MessageClassification, MessageId, MessageRole, MessageUpdate,
+        };
         let mut turn = super::Turn::new(
             "local".into(),
-            ProviderAddress {
-                owner: None,
+            TurnAddress {
+                scope: scope(),
                 thread_id: "thread".into(),
                 turn_id: "provider".into(),
             },
             0,
         );
-        let mut update = ProviderMessage {
-            id: MessageId("message".into()),
-            role: None,
-            update: MessageUpdate::Started,
+        let mut address = MessageAddress {
+            turn: turn.provider().clone(),
+            message_id: MessageId::Native("message".into()),
         };
-        turn.record_message(&update)?;
-        assert_eq!(turn.messages()[0].kind(), MessageKind::Unknown);
-        assert_eq!(turn.messages()[0].delivery(), MessageDelivery::Unknown);
-        update.update = MessageUpdate::Delta {
+        let mut update = MessageUpdate::Started {
+            classification: MessageClassification::Unclassified,
             text: "Draft".into(),
         };
-        turn.record_message(&update)?;
+        turn.record_message(&address, &update)?;
+        assert_eq!(turn.messages()[0].kind(), MessageKind::Unknown);
+        assert_eq!(turn.messages()[0].delivery(), MessageDelivery::Unknown);
+        update = MessageUpdate::Delta {
+            text: " outline".into(),
+        };
+        turn.record_message(&address, &update)?;
+        assert_eq!(turn.messages()[0].text(), "Draft outline");
         let mut turn: super::Turn = serde_json::from_value(serde_json::to_value(turn)?)?;
         assert_eq!(turn.messages()[0].state(), MessageState::Streaming);
         assert_eq!(turn.messages()[0].role(), None);
-        update.update = MessageUpdate::Completed {
+        update = MessageUpdate::Completed {
             text: "Final answer".into(),
         };
-        turn.record_message(&update)?;
-        update.role = Some(MessageRole::Response);
-        update.update = MessageUpdate::Classified;
-        turn.record_message(&update)?;
-        update.role = None;
-        update.update = MessageUpdate::Delta {
+        turn.record_message(&address, &update)?;
+        update = MessageUpdate::Classified {
+            role: MessageRole::Response,
+        };
+        turn.record_message(&address, &update)?;
+        update = MessageUpdate::Delta {
             text: "late delta".into(),
         };
-        turn.record_message(&update)?;
-        update.update = MessageUpdate::Interrupted;
-        turn.record_message(&update)?;
+        assert!(turn.record_message(&address, &update).is_err());
+        update = MessageUpdate::Interrupted;
+        assert!(turn.record_message(&address, &update).is_err());
         assert_eq!(turn.items().len(), 1);
         assert_eq!(turn.messages().len(), 1);
         assert_eq!(turn.messages()[0].id(), "local:message:1");
         assert_eq!(turn.messages()[0].role(), Some(MessageRole::Response));
         assert_eq!(turn.messages()[0].state(), MessageState::Completed);
         assert_eq!(turn.messages()[0].text(), "Final answer");
-        update.id = MessageId("unfinished".into());
-        update.role = Some(MessageRole::Commentary);
-        update.update = MessageUpdate::Delta {
+        address.message_id = MessageId::Native("unfinished".into());
+        update = MessageUpdate::Started {
+            classification: MessageClassification::Known(MessageRole::Commentary),
             text: "Partial".into(),
         };
-        turn.record_message(&update)?;
+        turn.record_message(&address, &update)?;
         turn.finish(TurnOutcome::Interrupted, 10)?;
         let restored: super::Turn = serde_json::from_value(serde_json::to_value(turn)?)?;
         assert_eq!(restored.messages()[0].state(), MessageState::Completed);
@@ -344,45 +657,25 @@ mod tests {
     fn provider_duration_excludes_delivery_delay_and_stays_frozen() {
         let mut turn = Turn::new(
             "turn".into(),
-            ProviderAddress {
-                owner: None,
+            TurnAddress {
+                scope: scope(),
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
             },
             1000,
         );
-        let event = crate::backend::BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(turn.provider().clone()),
-            turn_boundary: None,
-            kind: "tool".into(),
-            text: None,
-            data: serde_json::json!({"emittedAtMs":1383,"params":{
-                "item":{"durationMs":383},"completedAtMs":1383 }}),
-            activity: Some(activity("call")),
-            summary: None,
-            checklist_update: None,
-        };
-        turn.record_tool_event(event.tool_event().unwrap(), 10000)
-            .unwrap();
+        turn.record_tool("call", ToolUpdate::Started, 1000).unwrap();
+        turn.record_tool("call", succeeded(), 1383).unwrap();
         assert_eq!(turn.tools().next().unwrap().elapsed_ms(20000), Some(383));
-        let mut late = event;
-        late.data = serde_json::json!({"params":{"startedAtMs":1,"completedAtMs":20000,"item":{"durationMs":19999}}});
-        turn.record_tool_event(late.tool_event().unwrap(), 20000)
+        turn.record_tool("call", ToolUpdate::Started, 20000)
             .unwrap();
+        turn.record_tool("call", succeeded(), 20000).unwrap();
         assert_eq!(turn.tools().next().unwrap().elapsed_ms(30000), Some(383));
     }
 
-    fn activity(id: &str) -> crate::backend::ToolActivity {
-        crate::backend::ToolActivity {
-            id: id.into(),
-            kind: crate::backend::ToolActivityKind::Command,
-            title: "command".into(),
-            output: Some("result".into()),
-            status: Some(crate::backend::ToolStatus::Succeeded),
-            change: Default::default(),
-            output_delta: false,
+    fn succeeded() -> ToolUpdate {
+        ToolUpdate::Finished {
+            outcome: ToolOutcome::Succeeded,
         }
     }
 
@@ -390,30 +683,37 @@ mod tests {
     fn tool_runtime_ticks_independently_and_freezes_through_replay_and_reopening() {
         let mut turn = Turn::new(
             "turn".into(),
-            ProviderAddress {
-                owner: None,
+            TurnAddress {
+                scope: scope(),
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
             },
             1000,
         );
-        let mut first = activity("first");
-        first.status = Some(crate::backend::ToolStatus::Running);
-        let mut second = first.clone();
-        second.id = "second".into();
-        turn.record_tool(&first, 1000).unwrap();
-        turn.record_tool(&second, 2000).unwrap();
-        turn.record_tool(&first, 3000).unwrap();
+        turn.record_tool("first", ToolUpdate::Started, 1000)
+            .unwrap();
+        turn.record_tool("second", ToolUpdate::Started, 2000)
+            .unwrap();
+        turn.record_tool("first", ToolUpdate::Started, 3000)
+            .unwrap();
         assert_eq!(
             turn.tools()
                 .map(|tool| tool.elapsed_ms(3500))
                 .collect::<Vec<_>>(),
             vec![Some(2500), Some(1500)]
         );
-        first.status = Some(crate::backend::ToolStatus::Failed);
-        turn.record_tool(&first, 3500).unwrap();
-        turn.record_tool(&first, 6000).unwrap();
-        turn.record_tool(&activity("missing-start"), 6000).unwrap();
+        let failed = ToolUpdate::Finished {
+            outcome: ToolOutcome::Failed {
+                diagnostic: crate::backend::ToolDiagnostic {
+                    code: None,
+                    message: "failed".into(),
+                },
+            },
+        };
+        turn.record_tool("first", failed.clone(), 3500).unwrap();
+        turn.record_tool("first", failed, 6000).unwrap();
+        turn.record_tool("missing-start", succeeded(), 6000)
+            .unwrap();
         turn.finish(TurnOutcome::Interrupted, 7000).unwrap();
         let restored: Turn = serde_json::from_value(serde_json::to_value(&turn).unwrap()).unwrap();
         assert_eq!(
@@ -430,8 +730,8 @@ mod tests {
     fn messages_and_tools_keep_order_across_boundaries_and_freeze_at_completion() {
         let mut turn = Turn::new(
             "local".into(),
-            ProviderAddress {
-                owner: None,
+            TurnAddress {
+                scope: scope(),
                 thread_id: "thread".into(),
                 turn_id: "provider".into(),
             },
@@ -441,7 +741,7 @@ mod tests {
             .unwrap();
         turn.record_text(MessageKind::Reasoning, "ownership")
             .unwrap();
-        turn.record_tool(&activity("tool"), 1000).unwrap();
+        turn.record_tool("tool", succeeded(), 1000).unwrap();
         turn.record_text(MessageKind::Assistant, "First response")
             .unwrap();
         turn.close_message();
@@ -480,8 +780,8 @@ mod tests {
     fn latest_reasoning_summary_uses_the_newest_readable_section() {
         let mut turn = Turn::new(
             "local".into(),
-            ProviderAddress {
-                owner: None,
+            TurnAddress {
+                scope: scope(),
                 thread_id: "thread".into(),
                 turn_id: "provider".into(),
             },
@@ -522,18 +822,23 @@ mod tests {
     fn tool_records_survive_serialization_without_accepting_late_progress() {
         let mut turn = Turn::new(
             "local".into(),
-            ProviderAddress {
-                owner: None,
+            TurnAddress {
+                scope: scope(),
                 thread_id: "thread".into(),
                 turn_id: "execution".into(),
             },
             10,
         );
-        let mut tool = activity("call");
-        turn.record_tool(&tool, 1000).unwrap();
-        tool.status = Some(crate::backend::ToolStatus::Running);
-        tool.output = Some("late output".into());
-        turn.record_tool(&tool, 1000).unwrap();
+        turn.record_tool("call", succeeded(), 1000).unwrap();
+        turn.record_tool("call", ToolUpdate::Started, 1000).unwrap();
+        turn.record_tool(
+            "call",
+            ToolUpdate::Output {
+                update: TextUpdate::Replace("late output".into()),
+            },
+            1000,
+        )
+        .unwrap();
         assert_eq!(turn.tools().count(), 1);
         assert_eq!(
             turn.tools().next().unwrap().state(),
@@ -561,23 +866,25 @@ mod tests {
         ] {
             let mut turn = Turn::new(
                 "local".into(),
-                ProviderAddress {
-                    owner: None,
+                TurnAddress {
+                    scope: scope(),
                     thread_id: "thread".into(),
                     turn_id: "execution".into(),
                 },
                 10,
             );
-            turn.record_tool(&activity("completed"), 1000).unwrap();
-            let mut running = activity("running");
-            running.status = Some(crate::backend::ToolStatus::Running);
-            turn.record_tool(&running, 1000).unwrap();
+            turn.record_tool("completed", succeeded(), 1000).unwrap();
+            turn.record_tool("running", ToolUpdate::Started, 1000)
+                .unwrap();
             turn.finish(outcome, 20).unwrap();
             let state: Vec<_> = turn.tools().map(|tool| tool.state()).collect();
             assert_eq!(state, [crate::turn::ToolState::Completed, expected]);
             let encoded = serde_json::to_string(&turn).unwrap();
             turn.finish(outcome, 90).unwrap();
-            assert!(turn.record_tool(&running, 1000).is_err());
+            assert!(
+                turn.record_tool("running", ToolUpdate::Started, 1000)
+                    .is_err()
+            );
             assert_eq!(serde_json::to_string(&turn).unwrap(), encoded);
         }
     }
@@ -586,8 +893,8 @@ mod tests {
     fn recovered_turn_cannot_finish_before_its_start() {
         let mut turn = Turn::new(
             "local".into(),
-            ProviderAddress {
-                owner: None,
+            TurnAddress {
+                scope: scope(),
                 thread_id: "thread".into(),
                 turn_id: "continuation".into(),
             },
@@ -603,15 +910,15 @@ mod tests {
     fn completed_turn_rejects_late_content_and_freezes_completion() {
         let mut turn = Turn::new(
             "local".into(),
-            ProviderAddress {
-                owner: None,
+            TurnAddress {
+                scope: scope(),
                 thread_id: "thread".into(),
                 turn_id: "provider-turn".into(),
             },
             10,
         );
-        turn.record_tool(&activity("tool"), 1000).unwrap();
-        turn.record_tool(&activity("tool"), 1000).unwrap();
+        turn.record_tool("tool", succeeded(), 1000).unwrap();
+        turn.record_tool("tool", succeeded(), 1000).unwrap();
         assert!(turn.attribute_tool("tool", "original-task").unwrap());
         assert!(!turn.attribute_tool("tool", "another-task").unwrap());
         assert_eq!(
@@ -628,7 +935,7 @@ mod tests {
         assert_eq!(turn.usage().unwrap().output, Some(128));
         turn.finish(TurnOutcome::Completed, 90).unwrap();
         assert_eq!(turn.completed_at_ms, Some(20));
-        assert!(turn.record_tool(&activity("late"), 1000).is_err());
+        assert!(turn.record_tool("late", succeeded(), 1000).is_err());
         assert!(turn.attribute_tool("tool", "late-task").is_err());
         assert!(turn.finish(TurnOutcome::Failed, 90).is_err());
     }

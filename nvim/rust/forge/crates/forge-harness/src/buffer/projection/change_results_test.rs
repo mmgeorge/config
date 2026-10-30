@@ -1,7 +1,7 @@
 use super::*;
 use crate::backend::{
-    BackendEvent, ProviderAddress, ProviderChangeKind, ProviderChangeSet, ProviderFileChange,
-    ToolActivity, ToolActivityKind,
+    ProviderChangeKind, ProviderChangeSet, ProviderFileChange, TextUpdate, ToolActivityKind,
+    ToolInvocation, ToolOutcome, ToolUpdate,
 };
 use serde_json::json;
 
@@ -144,11 +144,7 @@ fn workspace_results_render_pending_previous_and_failed_capture() {
 #[test]
 fn reported_edit_groups_preserve_operation_order_and_failures() {
     let mut exchange = exchange();
-    let address = ProviderAddress {
-        owner: None,
-        thread_id: "thread".into(),
-        turn_id: "turn".into(),
-    };
+    let address = crate::turn::test_support::address(&exchange, "turn");
     exchange.start_turn(address.clone(), 0).unwrap();
     for (index, status) in [
         "completed",
@@ -162,24 +158,13 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
     .into_iter()
     .enumerate()
     {
-        let event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address.clone()),
-            turn_boundary: None,
-            kind: "tool".into(),
-            text: None,
-            data: serde_json::Value::Null,
-            summary: None,
-            checklist_update: None,
-            activity: Some(ToolActivity {
-                id: format!("write-{index}"),
-                kind: ToolActivityKind::FileChange,
-                title: "edit".into(),
-                output: Some(format!("operation-{index}")),
-                output_delta: false,
-                status: Some(crate::backend::ToolStatus::parse(status).unwrap()),
-                change: if index == 5 {
+        let mut update = vec![
+            ToolUpdate::Started,
+            ToolUpdate::Output {
+                update: TextUpdate::Replace(format!("operation-{index}")),
+            },
+            ToolUpdate::Changes {
+                changes: if index == 5 {
                     ProviderChangeSet::default()
                 } else {
                     ProviderChangeSet {
@@ -191,9 +176,40 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
                         }],
                     }
                 },
+            },
+        ];
+        let outcome = match status {
+            "completed" => Some(ToolOutcome::Succeeded),
+            "failed" => Some(ToolOutcome::Failed {
+                diagnostic: crate::backend::ToolDiagnostic {
+                    code: None,
+                    message: "write failed".into(),
+                },
             }),
+            "denied" => Some(ToolOutcome::Denied {
+                reason: "write denied".into(),
+            }),
+            "cancelled" => Some(ToolOutcome::Cancelled),
+            "interrupted" => Some(ToolOutcome::Interrupted),
+            _ => None,
         };
-        exchange.observe_turn(&event, index as i64 + 1).unwrap();
+        if let Some(outcome) = outcome {
+            update.push(ToolUpdate::Finished { outcome });
+        }
+        crate::turn::test_support::tool(
+            &mut exchange,
+            &address,
+            &format!("write-{index}"),
+            ToolInvocation {
+                kind: ToolActivityKind::FileChange,
+                name: "edit".into(),
+                title: "edit".into(),
+                arguments: serde_json::json!({}),
+            },
+            update,
+            index as i64 + 1,
+        )
+        .unwrap();
     }
     let projected = render(&exchange);
     let rendered = text(&projected);

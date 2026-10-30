@@ -215,6 +215,14 @@ return {
       vim.lsp.config('rust_analyzer', {
         cmd = { "rust-analyzer" },
         capabilities = capabilities,
+        before_init = function(_, config)
+          local root = config.root_dir
+          if root and vim.fs.basename(vim.fs.normalize(root)) == "librust" then
+            local settings = config.settings["rust-analyzer"]
+            settings.cargo.target = "wasm32-unknown-unknown"
+            settings.check.targets = { "wasm32-unknown-unknown", "host-tuple" }
+          end
+        end,
         settings = {
           ["rust-analyzer"] = {
             cargo = {
@@ -228,7 +236,7 @@ return {
             cachePriming = {
               enable = true,
             },
-            diagnostiscs = {
+            diagnostics = {
               -- For tsify
               -- https://github.com/madonoharu/tsify/issues/42#issuecomment-2088746822
               disabled = { "non_snake_case" }

@@ -49,23 +49,56 @@ callers. The broker binds the sink to the admitted execution and drains accepted
 updates before settling that exchange. Provider turn completion does not admit a
 new Harness exchange or finish an exchange awaiting user input.
 
-`ProviderMessage` carries a scoped message identity, optional typed role, and
-`MessageUpdate`. Start, delta, complete snapshot, classification, and interruption
-update one message. A complete snapshot replaces its accumulated text. Thought,
-thought summary, commentary, and response are semantic roles rather than
-streaming states. Unclassified text remains visible without becoming a commentary
-owner. `ToolActivity` carries normalized tool kind, typed `ToolStatus`, output
-append/replacement semantics, and reported changes. Shared consumers never decode
-provider JSON to discover message identity, role, or snapshot semantics.
+`BackendEvent` is an exhaustive enum. Its message, tool, turn, usage, runtime,
+compaction, agent, checklist, approval, directory access, acknowledged input,
+retry, diagnostic, and parent-boundary variants carry typed payloads. Required
+invocation scope binds updates to their admitted owner and exchange. No shared
+consumer decodes provider JSON to discover event kind, identity, role, or lifecycle.
+Manual and background compaction retain a separate typed session-operation scope,
+with an execution owner and operation identity, rather than inventing an exchange.
 
 Copilot consumes `assistant.message_start` metadata before deltas and reconciles
-the matching `assistant.message` snapshot. When no phase is supplied, tool
-admission resolves preceding unclassified text as commentary, and provider turn
-completion resolves the remaining last message as the response. Codex retains the
-phase from `item/started` for matching deltas and complete snapshots. ACP assigns
-message identities within its execution, classifies text at tool and execution
-boundaries, and completes accumulated text before publishing terminal execution
-events. Cancelled or failed ACP work interrupts messages instead.
+the matching `assistant.message` snapshot by message identity. Recognized phases
+are `commentary` and `final_answer`. Missing and unknown phase metadata remain
+explicitly unclassified, with unknown values reported diagnostically. Tool
+admission and idle do not guess the phase. Message starts without text and empty
+tool-request envelopes remain adapter state rather than visible commentary.
+The first actual text emits a normalized message start. Deltas append and the
+completed snapshot replaces the accumulated text, including an empty replacement.
+
+Copilot retains its latest nonempty commentary while streaming it immediately.
+If the invocation succeeds without any explicit final-answer phase, and its last
+nonempty assistant message is commentary, the adapter emits a new response with
+the same text and a distinct identity. This intentional text duplication leaves
+the commentary and its tool ownership unchanged. An explicit empty final answer
+suppresses the fallback. Failure, cancellation, unresolved denial, and delivery
+failure cannot synthesize success. First-start order selects the candidate, not
+snapshot-arrival order, because commentary and response lifecycles can overlap.
+
+Copilot reasoning uses `reasoningId` independently of message phase.
+`assistant.reasoning_delta` updates thought-summary state, and
+`assistant.reasoning` reconciles its completed snapshot without restarting
+Thinking. That snapshot can arrive after a final response. Empty reasoning
+metadata creates no status text. `assistant.streaming_delta` reports received-byte
+progress across message, reasoning, and tool-input deltas, not reasoning activity.
+
+Root `session.idle` ends Copilot processing. Foreground `assistant.idle` does not
+end the invocation while native background work remains, and child idle cannot
+end the root invocation. Provider success still requires the separate completion
+result and a final drain of accepted events. Message phase never establishes
+successful execution.
+
+Codex retains the phase from `item/started` for matching deltas and complete
+snapshots. ACP assigns message identities within its execution, classifies text
+at its protocol's tool and execution boundaries, and completes accumulated text
+before publishing terminal execution events. Cancelled or failed ACP work
+interrupts messages instead. These adapters do not interpret Copilot phase strings.
+
+Tool requests, input fragments, execution attempts, output, reported changes, and
+outcomes have separate typed updates. Copilot execution-start can precede permission
+denial without executing the tool body. One scoped tool identity correlates request
+and execution events. Output append/replacement semantics are independent of
+terminal outcome, and later output cannot move a tool or restart its execution.
 
 Adapters do not assign tools or Harness checks to commentary. `Exchange` captures
 each activity's owner at admission and retains that owner across later commentary,
@@ -464,8 +497,8 @@ title enters durable timeline state, the transport recursively replaces values n
 `[REDACTED]`. It does not guess from value shape, preserving useful hashes and identifiers.
 `item/mcpToolCall/progress` replaces mutable previews, while completed result JSON is pretty
 printed before rendering. MCP payload details stop at the Codex transport boundary, so
-`ToolActivity`, `Turn`, and the Rust timeline projection represent every provider action as a
-generic tool.
+`ToolInvocation`, `ToolUpdate`, `Turn`, and the Rust timeline renderer represent
+each tool through the shared lifecycle contract.
 
 Codex activity classification reads the top-level item type rather than searching serialized
 payload text. Errors, messages, reasoning, plans, compaction, review transitions, and native

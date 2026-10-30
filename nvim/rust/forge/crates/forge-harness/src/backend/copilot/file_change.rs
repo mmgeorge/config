@@ -151,44 +151,34 @@ mod test {
     }
 
     fn assert_creation_report_renders(changes: ProviderChangeSet) {
-        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        use crate::backend::{ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
         let mut exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
             "id":"creation", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Edit", "state":"running", "created_at_ms":0,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))
         .unwrap();
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0).unwrap();
-        exchange
-            .observe_turn(
-                &BackendEvent {
-                    message: None,
-                    received_at_ms: None,
-                    address: Some(address),
-                    turn_boundary: None,
-                    kind: "tool".into(),
-                    text: None,
-                    data: serde_json::Value::Null,
-                    summary: None,
-                    checklist_update: None,
-                    activity: Some(ToolActivity {
-                        id: "edit".into(),
-                        kind: ToolActivityKind::FileChange,
-                        title: "edit".into(),
-                        output: None,
-                        output_delta: false,
-                        status: Some(crate::backend::ToolStatus::Succeeded),
-                        change: changes,
-                    }),
+        crate::turn::test_support::tool(
+            &mut exchange,
+            &address,
+            "edit",
+            ToolInvocation {
+                kind: ToolActivityKind::FileChange,
+                name: "edit".into(),
+                title: "edit".into(),
+                arguments: serde_json::Value::Null,
+            },
+            [
+                ToolUpdate::Changes { changes },
+                ToolUpdate::Finished {
+                    outcome: ToolOutcome::Succeeded,
                 },
-                1,
-            )
-            .unwrap();
+            ],
+            1,
+        )
+        .unwrap();
         let projected = crate::buffer::projection::project(
             crate::buffer::projection::ProjectionSource::Exchange(&exchange),
             &forge_buffer::width::WidthProfile::default(),
@@ -217,7 +207,7 @@ mod test {
     #[test]
     fn prefixed_null_markers_render_as_additions_and_deletions() {
         use crate::backend::{
-            BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
+            TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
         };
         use crate::buffer::projection::{ProjectionSource, project};
         use crate::exchange::Exchange;
@@ -247,35 +237,30 @@ mod test {
             }))
             .unwrap();
             exchange.resume(0).unwrap();
-            let mut event = BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: Some(ProviderAddress {
-                    owner: None,
-                    thread_id: "thread".into(),
-                    turn_id: "turn".into(),
-                }),
-                turn_boundary: Some(TurnBoundary::Started),
-                kind: "turn_started".into(),
-                text: None,
-                data: serde_json::Value::Null,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            };
-            exchange.observe_turn(&event, 0).unwrap();
-            event.turn_boundary = None;
-            event.kind = "tool".into();
-            event.activity = Some(ToolActivity {
-                id: "edit".into(),
-                kind: ToolActivityKind::FileChange,
-                title: "apply_patch".into(),
-                output: Some(source),
-                output_delta: false,
-                status: Some(crate::backend::ToolStatus::Succeeded),
-                change: changes,
-            });
-            exchange.observe_turn(&event, 1).unwrap();
+            let address = crate::turn::test_support::address(&exchange, "turn");
+            exchange.start_turn(address.clone(), 0).unwrap();
+            crate::turn::test_support::tool(
+                &mut exchange,
+                &address,
+                "edit",
+                ToolInvocation {
+                    kind: ToolActivityKind::FileChange,
+                    name: "apply_patch".into(),
+                    title: "apply_patch".into(),
+                    arguments: serde_json::Value::Null,
+                },
+                [
+                    ToolUpdate::Output {
+                        update: TextUpdate::Replace(source),
+                    },
+                    ToolUpdate::Changes { changes },
+                    ToolUpdate::Finished {
+                        outcome: ToolOutcome::Succeeded,
+                    },
+                ],
+                1,
+            )
+            .unwrap();
             let saved = serde_json::to_string(&exchange).unwrap();
             let reopened: Exchange = serde_json::from_str(&saved).unwrap();
             let projected = project(

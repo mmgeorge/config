@@ -1,12 +1,12 @@
 use std::{fmt, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    Backend, BackendEvent, BackendEventSink, BackendInput, BackendOutput, BackendRequest,
-    ProviderAddress,
+    Backend, BackendCompletion, BackendEvent, BackendEventSink, BackendInput, BackendRequest,
+    TurnAddress,
 };
 use crate::trace::TraceStore;
 
@@ -25,9 +25,9 @@ pub struct ProviderRetry {
 
 /// Adapter proof that a terminal transient failure produced no replay-sensitive output.
 #[derive(Debug)]
-pub(crate) struct RetryableFailure {
+pub struct RetryableFailure {
     /// Completed native turn that retains the original request in provider history.
-    pub address: ProviderAddress,
+    pub address: TurnAddress,
     /// Structured provider error code used by the adapter's allowlist.
     pub code: String,
     /// Complete provider error payload retained in diagnostic logs.
@@ -45,17 +45,9 @@ impl fmt::Display for RetryableFailure {
 impl std::error::Error for RetryableFailure {}
 
 /// Rejects replay after tools, control results, or model output have been observed.
-pub(crate) fn replay_safe(output: &BackendOutput) -> bool {
+pub(crate) fn replay_safe(output: &super::BackendCompletion) -> bool {
     !output.evidence.tool_called
         && !output.evidence.workspace_changed
-        && !output.event.iter().any(|event| {
-            event.activity.is_some()
-                || event.checklist_update.is_some()
-                || matches!(
-                    event.kind.as_str(),
-                    "assistant_message" | "reasoning" | "reasoning_summary" | "plan"
-                ) && event.text.as_ref().is_some_and(|text| !text.is_empty())
-        })
         && output.plan_edit.is_empty()
         && output.design_patch.is_empty()
         && output.plan_submit.is_none()
@@ -79,7 +71,7 @@ pub(crate) async fn prompt(
     event_sink: Option<BackendEventSink>,
     trace: &TraceStore,
     submission_store: &std::sync::Arc<super::submission::SubmissionStore>,
-) -> Result<BackendOutput> {
+) -> Result<BackendCompletion> {
     let mut progress = RetryProgress {
         trace,
         session_id: request.harness_session_id.clone(),
@@ -93,11 +85,11 @@ pub(crate) async fn prompt(
             submit(backend, &mut request, event_sink.clone(), submission_store).await
         } else {
             match event_sink.clone() {
-                Some(sink) => backend
-                    .prompt_stream(request.clone(), sink)
+                Some(sink) => backend.prompt_stream(request.clone(), sink).await,
+                None => backend
+                    .prompt(request.clone())
                     .await
-                    .map(super::BackendCompletion::into_output),
-                None => backend.prompt(request.clone()).await,
+                    .map(|output| output.completion),
             }
         };
         let error = match result {
@@ -111,13 +103,13 @@ pub(crate) async fn prompt(
             }
             Err(error) => error,
         };
-        let Some(failure) = error.downcast_ref::<RetryableFailure>() else {
+        let super::BackendError::Retryable(failure) = &error else {
             if progress.attempt > 0 {
                 progress.record("stopped", json!({"error":format!("{error:#}")}));
                 publish(&event_sink, address.clone(), None).await?;
             }
             progress.pending = false;
-            return Err(error);
+            return Err(error.into());
         };
         progress.record(
             "failed",
@@ -131,7 +123,7 @@ pub(crate) async fn prompt(
             );
             publish(&event_sink, address.clone(), None).await?;
             progress.pending = false;
-            return Err(error);
+            return Err(error.into());
         };
         address = Some(failure.address.clone());
         request.backend_session_id = Some(failure.address.thread_id.clone());
@@ -178,7 +170,7 @@ async fn submit(
     request: &mut BackendRequest,
     sink: Option<BackendEventSink>,
     store: &std::sync::Arc<super::submission::SubmissionStore>,
-) -> Result<BackendOutput> {
+) -> Result<BackendCompletion, super::BackendError> {
     let submission = match request.submission.take() {
         Some(submission) => submission,
         None => store.prepare(request, backend.descriptor().kind)?,
@@ -199,16 +191,16 @@ async fn submit(
         }
     }
     let result = match sink {
-        Some(sink) => backend
-            .prompt_stream(request.clone(), sink)
+        Some(sink) => backend.prompt_stream(request.clone(), sink).await,
+        None => backend
+            .prompt(request.clone())
             .await
-            .map(super::BackendCompletion::into_output),
-        None => backend.prompt(request.clone()).await,
+            .map(|output| output.completion),
     };
     if result.is_ok()
         || result
             .as_ref()
-            .is_err_and(|error| error.is::<RetryableFailure>())
+            .is_err_and(|error| matches!(error, super::BackendError::Retryable(_)))
     {
         submission.accepted("adapter completed submission".into())?;
     }
@@ -244,28 +236,20 @@ impl Drop for RetryProgress<'_> {
 
 async fn publish(
     sink: &Option<BackendEventSink>,
-    address: Option<ProviderAddress>,
+    _address: Option<TurnAddress>,
     retry: Option<ProviderRetry>,
 ) -> Result<()> {
     if let Some(sink) = sink {
-        sink.send_wait(BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address,
-            turn_boundary: None,
-            kind: "provider_retry".into(),
-            text: None,
-            data: serde_json::to_value(retry).context("encode provider retry state")?,
-            activity: None,
-            summary: None,
-            checklist_update: None,
+        sink.send_wait(BackendEvent::Retry {
+            scope: sink.invocation_scope()?.clone(),
+            update: retry,
         })
         .await?;
     }
     Ok(())
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -275,7 +259,9 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendDescriptor, BackendKind, PromptMode};
+    use crate::backend::{
+        BackendDescriptor, BackendError, BackendKind, ExecutionOwner, InvocationScope, PromptMode,
+    };
     use std::sync::Mutex;
 
     struct FailureBackend {
@@ -308,9 +294,9 @@ mod tests {
         async fn prompt_stream(
             &self,
             request: BackendRequest,
-            _: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion> {
-            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+            sink: BackendEventSink,
+        ) -> Result<BackendCompletion, BackendError> {
+            let output: anyhow::Result<BackendCompletion> = async {
                 let mut requests = self.request.lock().unwrap();
                 requests.push((request, tokio::time::Instant::now()));
                 if self.permanent {
@@ -318,10 +304,10 @@ mod tests {
                 }
                 if requests.len() <= self.failure_count {
                     return Err(RetryableFailure {
-                        address: ProviderAddress {
-                            owner: None,
+                        address: TurnAddress {
+                            scope: sink.invocation_scope()?.clone(),
                             thread_id: "retained-thread".into(),
-                            turn_id: format!("turn-{}", requests.len()),
+                            turn_id: format!("turn-{}", requests.len()).into(),
                         },
                         code: "serverOverloaded".into(),
                         detail: json!({"message":format!("capacity failure {}", requests.len())}),
@@ -329,10 +315,18 @@ mod tests {
                     }
                     .into());
                 }
-                Ok(BackendOutput::default())
+                Ok(BackendCompletion::default())
             }
             .await;
-            Ok(output?.into_completion())
+            output.map_err(BackendError::from)
+        }
+    }
+
+    fn scope() -> InvocationScope {
+        InvocationScope {
+            owner: ExecutionOwner::root("retry-fixture"),
+            exchange_id: "exchange".into(),
+            invocation_id: "invocation".into(),
         }
     }
 
@@ -365,27 +359,19 @@ mod tests {
     }
 
     #[test]
-    fn replay_rejects_model_output_tools_and_control_mutations() {
-        let mut output = BackendOutput::default();
+    fn replay_rejects_tools_and_control_mutations() {
+        let mut output = BackendCompletion::default();
         assert!(replay_safe(&output));
         output.evidence.tool_called = true;
         assert!(!replay_safe(&output));
-        output = BackendOutput::default();
+        output = BackendCompletion::default();
         output.plan_read = Some("plan".into());
         assert!(!replay_safe(&output));
-        output = BackendOutput::default();
-        output.event.push(BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: None,
-            turn_boundary: None,
-            kind: "assistant_message".into(),
-            text: Some("Partial response".into()),
-            data: Value::Null,
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        });
+        output = BackendCompletion::default();
+        output.evidence.workspace_changed = true;
+        assert!(!replay_safe(&output));
+        output = BackendCompletion::default();
+        output.evidence.structured_complete = true;
         assert!(!replay_safe(&output));
     }
 
@@ -435,7 +421,7 @@ mod tests {
         let submission_store =
             super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
         let recovered_backend = backend(1);
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) = crate::backend::events::channel(scope());
         prompt(
             &recovered_backend,
             request(),
@@ -445,11 +431,29 @@ mod tests {
         )
         .await?;
         let waiting = stream.try_recv()?;
-        assert_eq!(waiting.kind, "provider_retry");
-        assert_eq!(waiting.data["attempt"], 1);
-        assert!(waiting.data["retry_at_ms"].is_i64());
-        assert!(stream.try_recv()?.data["retry_at_ms"].is_null());
-        assert!(stream.try_recv()?.data.is_null());
+        let BackendEvent::Retry {
+            update: Some(waiting),
+            ..
+        } = waiting
+        else {
+            panic!("expected scheduled retry");
+        };
+        assert_eq!(waiting.attempt, 1);
+        assert!(waiting.retry_at_ms.is_some());
+        assert!(matches!(
+            stream.try_recv()?,
+            BackendEvent::Retry {
+                update: Some(ProviderRetry {
+                    retry_at_ms: None,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            stream.try_recv()?,
+            BackendEvent::Retry { update: None, .. }
+        ));
         let backend = FailureBackend {
             permanent: true,
             ..backend(0)
@@ -473,13 +477,15 @@ mod tests {
             super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
         trace.configure(true)?;
         let backend = backend(6);
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) = crate::backend::events::channel(scope());
         {
             let pending = prompt(&backend, request(), Some(sink), &trace, &submission_store);
             tokio::pin!(pending);
             tokio::select! {
                 result = &mut pending => panic!("retry settled before cancellation: {result:?}"),
-                event = stream.recv() => { assert_eq!(event?.unwrap().kind, "provider_retry"); }
+                event = stream.recv() => {
+                    assert!(matches!(event?.unwrap(), BackendEvent::Retry { update: Some(_), .. }));
+                }
             }
         }
         tokio::time::advance(Duration::from_secs(120)).await;

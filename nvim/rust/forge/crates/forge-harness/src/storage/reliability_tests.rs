@@ -170,7 +170,7 @@ fn sqlite_contention_produces_an_actionable_error() -> Result<()> {
 
 #[test]
 fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
-    use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+    use crate::backend::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&session("session", "workspace"))?;
@@ -179,34 +179,30 @@ fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
         "prompt":"run","kind":"chat","state":"running","turn":[],"node_list":[],"created_at_ms":1,
         "attributed_matches_checkpoint":false
     }))?;
-    let address = ProviderAddress {
-        owner: None,
-        thread_id: "thread".into(),
-        turn_id: "turn".into(),
-    };
+    let address = crate::turn::test_support::address(&exchange, "turn");
     exchange.start_turn(address.clone(), 1)?;
     let source = "λ unicode output\n".repeat(100_000);
-    let event = BackendEvent {
-        message: None,
-        received_at_ms: None,
-        address: Some(address),
-        turn_boundary: None,
-        kind: "tool".into(),
-        text: None,
-        data: serde_json::json!({}),
-        summary: None,
-        checklist_update: None,
-        activity: Some(ToolActivity {
-            id: "call".into(),
+    crate::turn::test_support::tool(
+        &mut exchange,
+        &address,
+        "call",
+        ToolInvocation {
             kind: ToolActivityKind::Command,
+            name: "read".into(),
             title: "read".into(),
-            output: Some(source.clone()),
-            status: Some(crate::backend::ToolStatus::Succeeded),
-            change: Default::default(),
-            output_delta: false,
-        }),
-    };
-    exchange.observe_turn(&event, 2)?;
+            arguments: serde_json::json!({}),
+        },
+        [
+            ToolUpdate::Started,
+            ToolUpdate::Output {
+                update: TextUpdate::Replace(source.clone()),
+            },
+            ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            },
+        ],
+        2,
+    )?;
     store.save_exchange(&exchange)?;
     let metadata = store.list_exchange_metadata("session")?;
     assert!(

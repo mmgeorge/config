@@ -704,7 +704,8 @@ impl Submission {
 mod tests {
     use super::*;
     use crate::backend::{
-        BackendDescriptor, BackendEventSink, BackendInput, BackendKind, BackendOutput, PromptMode,
+        BackendCompletion, BackendDescriptor, BackendError, BackendEventSink, BackendInput,
+        BackendKind, PromptMode,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -863,8 +864,8 @@ mod tests {
             &self,
             request: BackendRequest,
             _: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion> {
-            let output: anyhow::Result<crate::backend::BackendOutput> = async {
+        ) -> Result<BackendCompletion, BackendError> {
+            let output: anyhow::Result<BackendCompletion> = async {
                 if self.fail_before_send.swap(false, Ordering::SeqCst) {
                     anyhow::bail!("provider startup failed");
                 }
@@ -878,10 +879,10 @@ mod tests {
                     anyhow::bail!("connection lost after write");
                 }
                 submission.accepted("native-ack".into())?;
-                Ok(BackendOutput::default())
+                Ok(BackendCompletion::default())
             }
             .await;
-            Ok(output?.into_completion())
+            output.map_err(BackendError::from)
         }
     }
 

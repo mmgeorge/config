@@ -151,9 +151,12 @@ senders wait for a slot. Aggregate content size does not reject a transfer.
 
 `forge/protocol_contract.json` defines the versioned event vocabulary, routing policy, required
 payload fields, and node enum spellings. Rust embeds it at compile time and Lua loads it from the
-runtime directory. The broker forwards only the normalized backend events declared there. Raw
-provider events remain in Rust, where document projection consumes them. Serialization rejects
-undeclared UI events or missing required fields before transmission.
+runtime directory. The broker consumes an exhaustive typed provider event enum and
+publishes editor notifications through a separate typed session-update boundary.
+Raw provider envelopes remain inside adapters and diagnostic traces, not document
+rendering. Serialization rejects undeclared UI events or missing required fields
+before transmission. Internal provider types and the editor wire vocabulary have
+separate owners.
 
 Direct frames and reassembled messages use the same Lua envelope and event validator. Responses
 carry exactly one result or structured error. Unknown variants, conflicting identities, and invalid

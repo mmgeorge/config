@@ -110,20 +110,22 @@ impl TimelineStream {
         let Some(index) = self.exchange_owner.get(&exchange.id).copied() else {
             return Ok(None);
         };
-        let Some(address) = event.address.as_ref() else {
+        let crate::backend::BackendEvent::Message {
+            address: message_address,
+            ..
+        } = event
+        else {
             return Ok(None);
         };
+        let address = &message_address.turn;
         let Some(source) = exchange.turn.iter().find(|turn| turn.provider() == address) else {
-            return Ok(None);
-        };
-        let Some(update) = &event.message else {
             return Ok(None);
         };
         let Some(message) = source
             .messages()
             .iter()
             .rev()
-            .find(|message| message.provider_id() == Some(update.id.0.as_str()))
+            .find(|message| message.provider_id() == &message_address.message_id)
         else {
             return Ok(None);
         };
@@ -201,14 +203,28 @@ impl TimelineStream {
         let Some(index) = self.exchange_owner.get(&exchange.id).copied() else {
             return Ok(None);
         };
-        let Some(address) = event.address.as_ref() else {
+        let crate::backend::BackendEvent::Tool {
+            address: tool_address,
+            update,
+        } = event
+        else {
             return Ok(None);
         };
-        let Some(tool_event) = event.tool_event() else {
+        let Some(output) = event.tool_output_delta() else {
             return Ok(None);
         };
-        let activity = tool_event.activity();
-        if activity.kind == crate::backend::ToolActivityKind::FileChange {
+        let address = &tool_address.turn;
+        if exchange
+            .turn
+            .iter()
+            .find(|turn| turn.provider() == address)
+            .and_then(|turn| {
+                exchange
+                    .tools_for_turn(turn.id())
+                    .find(|tool| tool.id == tool_address.tool_id.as_str())
+            })
+            .is_some_and(|tool| tool.kind == "file_change")
+        {
             return Ok(None);
         }
         let entry_id = self.entry_list[index].id();
@@ -225,12 +241,12 @@ impl TimelineStream {
         let turn_id = turn.id().to_owned();
         if !target
             .tools_for_turn(&turn_id)
-            .any(|tool| tool.id == activity.id)
+            .any(|tool| tool.id == tool_address.tool_id.as_str())
         {
             return Ok(None);
         }
-        let call = crate::turn::ToolAddress::new(&turn_id, &activity.id);
-        target.record_tool_event(&turn_id, tool_event, exchange.created_at_ms)?;
+        let call = crate::turn::ToolAddress::new(&turn_id, tool_address.tool_id.as_str());
+        target.record_tool_event(&turn_id, tool_address, update, exchange.created_at_ms)?;
         target.metrics = exchange.metrics.clone();
         let base_revision = self.revision;
         ensure!(
@@ -248,7 +264,7 @@ impl TimelineStream {
                 entry_id,
                 exchange_id: exchange.id.clone(),
                 call,
-                delta: activity.output.clone().unwrap_or_default(),
+                delta: output.to_owned(),
             }],
         }))
     }
@@ -1022,40 +1038,31 @@ mod test {
 
     #[test]
     fn file_edit_output_reconciles_the_change_node_without_a_tool_cache() -> anyhow::Result<()> {
-        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        use crate::backend::{
+            BackendEvent, TextUpdate, ToolActivityKind, ToolDiagnostic, ToolInvocation,
+            ToolOutcome, ToolUpdate,
+        };
         let mut exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
             "id":"edit", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Implement", "kind":"chat", "state":"running", "created_at_ms":0,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
         exchange.resume(0)?;
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
-        let mut event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "tool".into(),
-            text: None,
-            data: serde_json::Value::Null,
-            summary: None,
-            checklist_update: None,
-            activity: Some(ToolActivity {
-                id: "patch".into(),
+        crate::turn::test_support::tool(
+            &mut exchange,
+            &address,
+            "patch",
+            ToolInvocation {
                 kind: ToolActivityKind::FileChange,
+                name: "patch".into(),
+                arguments: serde_json::json!({}),
                 title: "file changes".into(),
-                output: None,
-                output_delta: false,
-                status: Some(crate::backend::ToolStatus::Running),
-                change: Default::default(),
-            }),
-        };
-        exchange.observe_turn(&event, 1)?;
+            },
+            [ToolUpdate::Started],
+            1,
+        )?;
         let mut stream = TimelineStream::new("session".into());
         stream.initialize(vec![TimelineEntry::Exchange {
             id: exchange.id.clone(),
@@ -1065,11 +1072,31 @@ mod test {
 
             agent_by_id: Default::default(),
         }])?;
-        let activity = event.activity.as_mut().unwrap();
-        activity.output = Some("Patch context did not match".into());
-        activity.output_delta = true;
-        activity.status = Some(crate::backend::ToolStatus::Failed);
+        let tool_address = crate::backend::ToolAddress {
+            turn: address,
+            tool_id: "patch".into(),
+        };
+        let event = BackendEvent::Tool {
+            address: tool_address.clone(),
+            update: ToolUpdate::Output {
+                update: TextUpdate::Append("Patch context did not match".into()),
+            },
+        };
         exchange.observe_turn(&event, 2)?;
+        exchange.observe_turn(
+            &BackendEvent::Tool {
+                address: tool_address,
+                update: ToolUpdate::Finished {
+                    outcome: ToolOutcome::Failed {
+                        diagnostic: ToolDiagnostic {
+                            code: None,
+                            message: "Patch context did not match".into(),
+                        },
+                    },
+                },
+            },
+            2,
+        )?;
         assert!(stream.append_tool_output(&exchange, &event)?.is_none());
         assert_eq!(stream.revision(), 1);
         let patch = stream.update_live(Some(&exchange), None, SessionPhase::Idle, true)?;

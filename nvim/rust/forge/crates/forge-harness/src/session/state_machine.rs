@@ -774,14 +774,7 @@ mod test {
     fn interrupted_restart_remains_paused_until_execution_resumes() {
         let mut exchange = exchange();
         exchange
-            .start_turn(
-                crate::backend::ProviderAddress {
-                    owner: None,
-                    thread_id: "thread".into(),
-                    turn_id: "turn".into(),
-                },
-                42,
-            )
+            .start_turn(crate::turn::test_support::address(&exchange, "turn"), 42)
             .unwrap();
         exchange.pause_for_restart(100).unwrap();
         assert_eq!(
@@ -838,14 +831,7 @@ mod test {
         }
         let mut exchange = exchange();
         exchange
-            .start_turn(
-                crate::backend::ProviderAddress {
-                    owner: None,
-                    thread_id: "thread".into(),
-                    turn_id: "turn".into(),
-                },
-                42,
-            )
+            .start_turn(crate::turn::test_support::address(&exchange, "turn"), 42)
             .unwrap();
         exchange.observe_blocker("approval:command".into(), true, 50);
         exchange.pause_for_restart(60).unwrap();

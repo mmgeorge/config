@@ -1,4 +1,4 @@
-use crate::backend::{BackendOutput, PlanSubmitRequest};
+use crate::backend::{BackendCompletion, PlanSubmitRequest};
 use crate::plan::{PlanQuestionAnswer, PlanQuestionSet, PlanQuestionWithdrawal};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -559,7 +559,7 @@ static CONTROL_TOOL_VALIDATOR_MAP: OnceLock<HashMap<&'static str, ControlToolVal
 /// Apply one provider-neutral control invocation to the normalized turn result.
 pub fn apply_invocation(
     invocation: &ControlToolInvocation,
-    output: &mut BackendOutput,
+    output: &mut BackendCompletion,
 ) -> Result<()> {
     validate_arguments(invocation)?;
     match invocation.name.as_str() {
@@ -1025,7 +1025,7 @@ mod test {
                     name: name.into(),
                     arguments: arguments.clone(),
                 },
-                &mut BackendOutput::default(),
+                &mut BackendCompletion::default(),
             )
             .unwrap();
             let mut invalid = arguments;
@@ -1080,12 +1080,12 @@ mod test {
             name: "design_patch".into(),
             arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}),
         };
-        let mut output = BackendOutput::default();
+        let mut output = BackendCompletion::default();
         apply_invocation(&invocation, &mut output).unwrap();
         assert_eq!(output.design_patch.len(), 1);
         let mut invalid = invocation;
         invalid.arguments["baseline"] = json!({});
-        assert!(apply_invocation(&invalid, &mut BackendOutput::default()).is_err());
+        assert!(apply_invocation(&invalid, &mut BackendCompletion::default()).is_err());
     }
 
     #[test]
@@ -1450,7 +1450,7 @@ mod test {
                 }
             }),
         };
-        let mut output = BackendOutput::default();
+        let mut output = BackendCompletion::default();
 
         apply_invocation(&invocation, &mut output).unwrap();
 
@@ -1527,7 +1527,7 @@ mod test {
             }),
         };
 
-        let error = apply_invocation(&invocation, &mut BackendOutput::default())
+        let error = apply_invocation(&invocation, &mut BackendCompletion::default())
             .unwrap_err()
             .to_string();
 
@@ -1558,7 +1558,7 @@ mod test {
             }),
         };
 
-        let error = apply_invocation(&invocation, &mut BackendOutput::default())
+        let error = apply_invocation(&invocation, &mut BackendCompletion::default())
             .unwrap_err()
             .to_string();
 
@@ -1597,7 +1597,7 @@ mod test {
         };
         let error = format!(
             "{:#}",
-            apply_invocation(&invocation, &mut BackendOutput::default()).unwrap_err()
+            apply_invocation(&invocation, &mut BackendCompletion::default()).unwrap_err()
         );
 
         assert!(
@@ -1623,7 +1623,7 @@ mod test {
         };
         let error = format!(
             "{:#}",
-            apply_invocation(&invocation, &mut BackendOutput::default()).unwrap_err()
+            apply_invocation(&invocation, &mut BackendCompletion::default()).unwrap_err()
         );
 
         assert!(
@@ -1667,7 +1667,7 @@ mod test {
 
         let error = format!(
             "{:#}",
-            apply_invocation(&invocation, &mut BackendOutput::default()).unwrap_err()
+            apply_invocation(&invocation, &mut BackendCompletion::default()).unwrap_err()
         );
 
         assert!(error.contains("entity_changes.add[0].variants[0]"));

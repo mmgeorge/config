@@ -6,7 +6,7 @@ mod tool;
 pub use execution::{Turn, TurnOutcome, TurnState};
 pub use identity::ToolAddress;
 pub use output::ToolOutputText;
-pub use tool::{ToolCall, ToolState, ToolStore};
+pub use tool::{ToolCall, ToolExecution, ToolState, ToolStore};
 
 pub use message::{Message, MessageDelivery, MessageKind, MessageState, TurnItem};
 mod identity;

@@ -5,6 +5,7 @@ mod event_decoder;
 mod event_stream;
 mod file_change;
 mod mcp;
+pub(crate) mod mock_stream;
 mod rejection;
 mod retry;
 mod session_directory;
@@ -16,10 +17,10 @@ mod turn_test;
 use crate::agent::AgentCapability;
 use crate::backend::approval::{ApprovalResolution, PermissionCoordinator, protected_target};
 use crate::backend::{
-    Backend, BackendCapability, BackendCatalogRequest, BackendContextWindow, BackendDescriptor,
-    BackendEvent, BackendEventSink, BackendForkRequest, BackendInput, BackendKind, BackendModel,
-    BackendOutput, BackendRequest, CatalogCapability, CatalogMutation, McpDefinition, McpStatus,
-    McpToolDefinition, PromptMode, SkillDefinition,
+    Backend, BackendCapability, BackendCatalogRequest, BackendCompletion, BackendContextWindow,
+    BackendDescriptor, BackendError, BackendEvent, BackendEventSink, BackendForkRequest,
+    BackendInput, BackendKind, BackendModel, BackendOutput, BackendRequest, CatalogCapability,
+    CatalogMutation, McpDefinition, McpStatus, McpToolDefinition, PromptMode, SkillDefinition,
 };
 use crate::control_tools::{
     ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext,
@@ -1044,8 +1045,8 @@ impl Backend for CopilotBackend {
         &self,
         request: BackendRequest,
         event_sink: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion> {
-        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+    ) -> std::result::Result<BackendCompletion, BackendError> {
+        let output: std::result::Result<BackendCompletion, BackendError> = async {
 let event_sink = Some(event_sink);
         let turn_event = self.turn_event(&request.runtime_key()?).await;
         let skills = self.permission_coordinator.skills(
@@ -1090,12 +1091,7 @@ let event_sink = Some(event_sink);
         let session = self.session(&request).await?;
         let mut subscription = event_stream::SessionEventStream::new(
             &session,
-            |event| {
-                !matches!(
-                    event.event_type.as_str(),
-                    "assistant.streaming_delta" | "assistant.tool_call_delta"
-                )
-            },
+            |_| true,
             Arc::clone(&self.trace),
             request.harness_session_id.clone(),
         );
@@ -1105,13 +1101,12 @@ let event_sink = Some(event_sink);
             .clone()
             .unwrap_or_else(|| ControlTurnContext::inactive(request.mode));
         let mut control_stream = control_router.activate(control_context)?;
-        let mut output = BackendOutput { event: Vec::new(), completion: crate::backend::BackendCompletion { backend_session_id: Some(session.id().to_string()), capability: capability(), runtime: crate::backend::BackendRuntime {
+        let sink = event_sink.as_ref().expect("active Copilot invocation has an event sink");
+        let mut output = BackendCompletion { backend_session_id: Some(session.id().to_string()), capability: capability(), runtime: crate::backend::BackendRuntime {
                 provider: "Copilot CLI".into(),
                 model: (request.model != "default").then(|| request.model.clone()),
-            }, ..Default::default() } };
-        let decoder = CopilotEventDecoder {
-            workspace: request.workspace.clone(),
-        };
+            }, ..Default::default() };
+        let mut decoder =         CopilotEventDecoder::new(sink.invocation_scope()?.clone(), request.workspace.clone());
         let initial_task_snapshot = session
             .rpc()
             .plan()
@@ -1129,9 +1124,9 @@ let event_sink = Some(event_sink);
                     initial_task_data,
                     "copilot-root".into(),
                     &mut output,
-                    event_sink.as_ref(),
+                    sink,
                 )
-                .await;
+                .await?;
         }
         let provider_text = Self::input_text(&session, &request.input).await?;
         let mut recovered = Vec::new();
@@ -1179,6 +1174,8 @@ let event_sink = Some(event_sink);
         let mut retry_failure = None;
         let mut retry_idle_deadline = None;
         let mut rejection = rejection::RejectionState::default();
+        let mut provider_aborted = false;
+        let processing: std::result::Result<(), BackendError> = async {
         loop {
             tokio::select! {
                 _ = async {
@@ -1188,28 +1185,29 @@ let event_sink = Some(event_sink);
                     }
                 } => {
                     let failure: super::retry::RetryableFailure = retry_failure.take().context("missing failed Copilot turn")?;
-                    anyhow::bail!("{}: provider did not confirm idle within 30 seconds", failure.message);
+                    return Err(BackendError::Transport {
+                        message: format!("{}: provider did not confirm idle within 30 seconds", failure.message),
+                    });
                 }
                 provider_event = subscription.recv() => {
                     let provider_event = provider_event.context("receive Copilot session event")?;
                     turn_event.observe(&provider_event)?;
                     rejection.observe(&provider_event);
-                    self.trace.record(&request.harness_session_id, "copilot.session.event", serde_json::to_value(&provider_event)?);
+                    if provider_event.agent_id.is_none()
+                        && provider_event.event_type == "assistant.idle"
+                    {
+                        provider_aborted |= provider_event.data.get("aborted").and_then(Value::as_bool) == Some(true);
+                    }
+                    self.trace.record(&request.harness_session_id, "copilot.session.event", serde_json::to_value(&provider_event).context("serialize Copilot event trace")?);
                     if completes_exchange(&provider_event) {
-                        if let Some(failure) = &retry_failure {
-                            let failure: &super::retry::RetryableFailure = failure;
-                            let completed = BackendEvent { message: None,
-                                received_at_ms: None, address: Some(failure.address.clone()),
-                                turn_boundary: Some(super::TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Failed }),
-                                kind: "turn_completed".into(), text: None, data: failure.detail.clone(),
-                                activity: None, summary: None, checklist_update: None,
-                            };
-                            if !output.event.iter().any(|event| event.address == completed.address && matches!(event.turn_boundary, Some(super::TurnBoundary::Finished { .. }))) {
-                                if let Some(sink) = &event_sink { sink.send_wait(completed.clone()).await?; }
-                                output.event.push(completed);
-                            }
+                        if !execution_turn_stopped && (provider_aborted || provider_event.data.get("aborted").and_then(Value::as_bool) == Some(true)) {
+                            decoder.finish_failure(crate::turn::TurnOutcome::Cancelled, sink).await?;
+                            return Err(BackendError::Cancelled);
                         }
-                        decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
+                        if decoder.root_address().is_none() {
+                            continue;
+                        }
+                        decoder.decode(&provider_event, &mut output, sink).await?;
                         output.provider_checkpoint_id = if provider_event.ephemeral == Some(true) {
                             provider_event.parent_id.clone()
                         } else {
@@ -1231,8 +1229,8 @@ let event_sink = Some(event_sink);
                                 .clone()
                                 .unwrap_or_else(|| "copilot-root".into()),
                             &mut output,
-                            event_sink.as_ref(),
-                        ).await;
+                            sink,
+                        ).await?;
                         continue;
                     }
                     let terminal_error = provider_event.event_type == "session.error"
@@ -1241,7 +1239,21 @@ let event_sink = Some(event_sink);
                         && self.compaction_subscription_by_harness.lock().await.contains_key(&request.runtime_key()?) {
                         continue;
                     }
-                    decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
+                    if terminal_error
+                        && let Some(code) = retry::transient_code(&provider_event.data)
+                        && provider_event.agent_id.is_none()
+                        && decoder.replay_safe()
+                        && super::retry::replay_safe(&output)
+                        && let Some(address) = decoder.root_address()
+                    {
+                        retry_failure = Some(super::retry::RetryableFailure {
+                            address, code, detail: provider_event.data.clone(),
+                            message: event_decoder::session_error(&provider_event, Some(session.id())),
+                        });
+                        retry_idle_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+                        continue;
+                    }
+                    decoder.decode(&provider_event, &mut output, sink).await?;
                     if request.mode == PromptMode::ExecutePlan && !execution_turn_stopped {
                         let call_id = provider_event.data.get("toolCallId").and_then(Value::as_str);
                         if provider_event.event_type == "tool.execution_start"
@@ -1260,18 +1272,11 @@ let event_sink = Some(event_sink);
                     }
                     if terminal_error {
                         let detail = event_decoder::session_error(&provider_event, Some(session.id()));
-                        if let Some(code) = retry::transient_code(&provider_event.data)
-                            && provider_event.agent_id.is_none()
-                            && super::retry::replay_safe(&output)
-                            && let Some(address) = output.event.iter().rev().find_map(|event| event.address.clone())
-                        {
-                            retry_failure = Some(super::retry::RetryableFailure {
-                                address, code, detail: provider_event.data.clone(), message: detail,
-                            });
-                            retry_idle_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-                            continue;
-                        }
-                        anyhow::bail!("{detail}");
+                        decoder.finish_failure(crate::turn::TurnOutcome::Failed, sink).await?;
+                        return Err(BackendError::Provider {
+                            code: provider_event.data.get("errorType").and_then(Value::as_str).map(str::to_owned),
+                            message: detail,
+                        });
                     }
                 }
                 invocation = control_stream.receive() => {
@@ -1282,19 +1287,30 @@ let event_sink = Some(event_sink);
                 }
             }
         }
+        Ok(())
+        }.await;
         control_router.close().await?;
         while let Ok(invocation) = control_stream.try_receive() {
             if let Err(error) = apply_invocation(&invocation, &mut output) {
                 output.control_error = Some(format!("{error:#}"));
             }
         }
-        if let Some(failure) = retry_failure {
-            if super::retry::replay_safe(&output) {
-                return Err(failure.into());
-            }
-            anyhow::bail!("{}", failure.message);
+        if let Err(error) = processing {
+            let outcome = if matches!(error, BackendError::Cancelled) {
+                crate::turn::TurnOutcome::Cancelled
+            } else {
+                crate::turn::TurnOutcome::Failed
+            };
+            decoder.finish_failure(outcome, sink).await?;
+            return Err(error);
         }
-        skills.output(&mut output)?;
+        if let Some(failure) = retry_failure {
+            decoder.finish_failure(crate::turn::TurnOutcome::Failed, sink).await?;
+            if decoder.replay_safe() && super::retry::replay_safe(&output) {
+                return Err(BackendError::Retryable(failure.into()));
+            }
+            return Err(BackendError::Provider { code: Some(failure.code), message: failure.message });
+        }
         if self
             .permission_context(&request.runtime_key()?)
             .await
@@ -1303,24 +1319,41 @@ let event_sink = Some(event_sink);
             .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
             .cancelled
         {
-            return Err(crate::broker::TurnCancelled.into());
+            decoder.finish_failure(crate::turn::TurnOutcome::Cancelled, sink).await?;
+            return Err(BackendError::Cancelled);
         }
-        if !execution_turn_stopped {
-            rejection.finish(&output)?;
+        if !execution_turn_stopped
+            && let Err(error) = rejection.finish(&output)
+        {
+            decoder.finish_failure(crate::turn::TurnOutcome::Failed, sink).await?;
+            return Err(BackendError::Rejected { message: format!("{error:#}") });
+        }
+        if let Some(error) = &output.control_error {
+            decoder.finish_failure(crate::turn::TurnOutcome::Failed, sink).await?;
+            return Err(BackendError::Protocol { message: error.clone() });
         }
         if rejection.answered {
             self.permission_coordinator
                 .take_timeout_feedback(&request.owner()?)?;
         }
+        if execution_turn_stopped {
+            decoder.finish_failure(crate::turn::TurnOutcome::Interrupted, sink).await?;
+        } else {
+            decoder.finish_success(sink).await?;
+        }
         Ok(output)
 
         }.await;
-        Ok(output?.into_completion())
+        output
     }
 
     async fn compact(&self, request: super::BackendCompactionRequest) -> Result<BackendOutput> {
         let id = request.id;
         let request = request.request;
+        let scope = super::EventScope::SessionOperation {
+            owner: request.owner()?,
+            operation_id: id.clone(),
+        };
         let session = self.session(&request).await?;
         let slot = self.session_slot(&request.runtime_key()?).await;
         let manual = slot
@@ -1375,7 +1408,10 @@ let event_sink = Some(event_sink);
                     .and_then(|(used, size)| crate::session::ContextUsage::reported(used, size))
             });
         Ok(BackendOutput {
-            event: vec![BackendEvent::from_compaction(compaction, None)],
+            event: vec![BackendEvent::Compaction {
+                scope,
+                update: compaction.into(),
+            }],
             completion: crate::backend::BackendCompletion {
                 backend_session_id: Some(session.id().to_string()),
                 capability: capability(),
@@ -1394,13 +1430,18 @@ let event_sink = Some(event_sink);
 
     async fn compaction_stream(
         &self,
-        session_id: &str,
+        owner: super::ExecutionOwner,
     ) -> Result<Option<super::events::BackendEventStream>> {
-        let (sink, stream) = super::events::channel();
-        self.compaction_subscription_by_harness.lock().await.insert(
-            session_id.to_owned(),
-            compaction::CompactionSubscription::new(sink),
-        );
+        let runtime_key = owner.runtime_key();
+        let scope = super::EventScope::SessionOperation {
+            owner,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let (sink, stream) = super::events::channel(scope);
+        self.compaction_subscription_by_harness
+            .lock()
+            .await
+            .insert(runtime_key, compaction::CompactionSubscription::new(sink));
         Ok(Some(stream))
     }
 
@@ -2458,16 +2499,7 @@ impl PermissionHandler for CopilotPermissionHandler {
         match self
             .context
             .coordinator
-            .authorize(
-                approval_mode,
-                request,
-                Some(crate::backend::ProviderAddress {
-                    owner,
-                    thread_id: session_id.to_string(),
-                    turn_id: String::new(),
-                }),
-                event_sink.as_ref(),
-            )
+            .authorize(approval_mode, request, None, event_sink.as_ref())
             .await
         {
             Ok(
@@ -2518,8 +2550,7 @@ impl PermissionHandler for CopilotPermissionHandler {
 
 /// Finish the main agent independently from attached background work.
 fn completes_exchange(event: &github_copilot_sdk::SessionEvent) -> bool {
-    event.agent_id.is_none()
-        && matches!(event.event_type.as_str(), "assistant.idle" | "session.idle")
+    event.agent_id.is_none() && event.event_type == "session.idle"
 }
 
 fn permission_kind(kind: Option<PermissionRequestKind>) -> &'static str {
@@ -2540,13 +2571,13 @@ fn permission_kind(kind: Option<PermissionRequestKind>) -> &'static str {
 #[cfg(test)]
 mod test {
     #[test]
-    fn main_agent_idle_finishes_without_waiting_for_background_session_idle() {
+    fn only_root_session_idle_finishes_the_provider_invocation() {
         let mut event: github_copilot_sdk::SessionEvent =
             serde_json::from_value(serde_json::json!({
                 "id":"idle", "type":"assistant.idle", "timestamp":"2026-09-18T00:00:00Z", "data":{}
             }))
             .unwrap();
-        assert!(super::completes_exchange(&event));
+        assert!(!super::completes_exchange(&event));
         event.agent_id = Some("child".into());
         assert!(!super::completes_exchange(&event));
         event.agent_id = None;
@@ -2554,6 +2585,8 @@ mod test {
         assert!(!super::completes_exchange(&event));
         event.event_type = "session.idle".into();
         assert!(super::completes_exchange(&event));
+        event.agent_id = Some("child".into());
+        assert!(!super::completes_exchange(&event));
     }
 
     #[tokio::test]
@@ -2929,7 +2962,11 @@ mod test {
     #[tokio::test]
     async fn publishes_steering_only_while_a_copilot_turn_is_active() {
         let turn_event = CopilotTurnEvent::default();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) =
+            crate::backend::events::channel(crate::backend::InvocationScope::new(
+                crate::backend::ExecutionOwner::root("session"),
+                "exchange",
+            ));
         let turn_guard = turn_event.activate(Some(event_sink), None).unwrap();
 
         turn_event
@@ -2937,9 +2974,9 @@ mod test {
             .await
             .unwrap();
         let event = event_stream.try_recv().unwrap();
-        assert_eq!(event.kind, "steering_input");
-        assert_eq!(event.text.as_deref(), Some("accepted"));
-        assert_eq!(event.data["input_message_id"], "message-identity");
+        assert!(matches!(event, BackendEvent::InputAccepted {
+            acknowledgement: crate::backend::InputAcknowledgement::Steering { input_id: Some(id), text }, ..
+        } if id == "message-identity" && text == "accepted"));
 
         drop(turn_guard);
         turn_event

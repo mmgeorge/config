@@ -20,6 +20,7 @@ use std::time::Instant;
 use tokio::sync::{Mutex, Notify};
 
 mod json_rpc;
+mod normalization;
 mod process;
 mod request_execution;
 mod resources;
@@ -393,7 +394,7 @@ impl CodexBackend {
                 .await
                 .process
                 .set_request_context(&request.workspace, request.approval_mode, event_sink)
-                .await;
+                .await?;
             return Ok(connection);
         }
         let connection = Arc::new(Mutex::new(self.connect(request, output, event_sink).await?));
@@ -1029,7 +1030,7 @@ impl CodexBackend {
                     activated = true;
                     if !settled {
                         settled = state != crate::goal::GoalState::Active;
-                        output.evidence.native_state = Some(state);
+                        output.completion.evidence.native_state = Some(state);
                     }
                 }
                 acknowledged = true;
@@ -1459,7 +1460,14 @@ impl Backend for CodexBackend {
         &self,
         mut request: BackendRequest,
         event_sink: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion> {
+    ) -> std::result::Result<crate::backend::BackendCompletion, super::BackendError> {
+        if request.owner().map_err(super::BackendError::from)?
+            != event_sink.invocation_scope()?.owner
+        {
+            return Err(super::BackendError::Rejected {
+                message: "Codex invocation scope does not match the requested owner".into(),
+            });
+        }
         let output: anyhow::Result<crate::backend::BackendOutput> = async {
             let event_sink = Some(event_sink);
             let skills = self.permission_coordinator.skills(
@@ -1503,13 +1511,16 @@ impl Backend for CodexBackend {
                 .definition_list_for_context(Some(&control_context), request.owner()?.is_root());
             process.set_control_context(control_context).await;
             request.model = self.resolve_model(&request, process, &mut output).await?;
-            output.runtime.provider = "Codex CLI".into();
-            output.runtime.model = Some(request.model.clone());
-            let runtime_event = output.runtime.resolved_event();
+            output.completion.runtime.provider = "Codex CLI".into();
+            output.completion.runtime.model = Some(request.model.clone());
             if let Some(sink) = coordinator_event_sink.as_ref() {
+                let runtime_event = crate::backend::BackendEvent::Runtime {
+                    scope: sink.invocation_scope()?.clone(),
+                    update: crate::backend::RuntimeUpdate::Resolved {
+                        runtime: output.completion.runtime.clone(),
+                    },
+                };
                 sink.send_wait(runtime_event).await?;
-            } else {
-                output.event.push(runtime_event);
             }
             let dynamic_tool_list = dynamic_tool_definition
                 .into_iter()
@@ -1548,7 +1559,7 @@ impl Backend for CodexBackend {
                     gate.wait().await?;
                 }
             }
-            output.backend_session_id = Some(thread_id.clone());
+            output.completion.backend_session_id = Some(thread_id.clone());
             let mut prompt = request_text.clone();
             let native_goal = request
                 .control_context
@@ -1705,18 +1716,23 @@ impl Backend for CodexBackend {
                         .or_else(|| completed.get("error"));
                     if let Some((error, code)) = error
                         .and_then(|error| retry::transient_code(error).map(|code| (error, code)))
-                        && super::retry::replay_safe(&output)
+                        && !process.normalization.replay_sensitive
+                        && super::retry::replay_safe(&output.completion)
                     {
                         return Err(super::retry::RetryableFailure {
-                            address: super::ProviderAddress {
-                                owner: Some(request.owner()?),
+                            address: super::TurnAddress {
+                                scope: coordinator_event_sink
+                                    .as_ref()
+                                    .context("Codex retry has no invocation")?
+                                    .invocation_scope()?
+                                    .clone(),
                                 thread_id: thread_id.clone(),
                                 turn_id: completed
                                     .pointer("/turn/id")
                                     .or_else(|| completed.get("turnId"))
                                     .and_then(Value::as_str)
                                     .unwrap_or(&current_turn_id)
-                                    .to_owned(),
+                                    .into(),
                             },
                             code,
                             detail: error.clone(),
@@ -1750,13 +1766,14 @@ impl Backend for CodexBackend {
                     .lock()
                     .await
                     .insert(request.runtime_key()?, turn_id.clone());
-                output.provider_checkpoint_id = Some(turn_id);
+                output.completion.provider_checkpoint_id = Some(turn_id);
             }
-            skills.output(&mut output)?;
             Ok(output)
         }
         .await;
-        Ok(output?.into_completion())
+        output
+            .map(BackendOutput::into_completion)
+            .map_err(super::BackendError::from)
     }
 
     async fn fork(&self, request: BackendForkRequest) -> Result<BackendForkResult> {
@@ -1853,6 +1870,10 @@ impl Backend for CodexBackend {
     }
 
     async fn compact(&self, request: super::BackendCompactionRequest) -> Result<BackendOutput> {
+        let scope = super::EventScope::SessionOperation {
+            owner: request.request.owner()?,
+            operation_id: request.id.clone(),
+        };
         let request = request.request;
         let thread_id = request
             .backend_session_id
@@ -1869,7 +1890,8 @@ impl Backend for CodexBackend {
         let mut process = self.connect(&request, &mut output, None).await?.process;
         self.load_thread(&mut process, &mut output, &request, false, Vec::new())
             .await?;
-        output.metrics.context_usage = None;
+        process.normalization.bind(Some(scope));
+        output.completion.metrics.context_usage = None;
         process
             .request(
                 "thread/compact/start",
@@ -1887,7 +1909,7 @@ impl Backend for CodexBackend {
             status.eq_ignore_ascii_case("completed"),
             "Codex compaction did not complete: {completed}"
         );
-        output.runtime.provider = "Codex CLI".into();
+        output.completion.runtime.provider = "Codex CLI".into();
         Ok(output)
     }
 
@@ -3051,9 +3073,15 @@ mod test {
                 submission.record()?.delivery,
                 super::super::submission::SubmissionState::Accepted { .. }
             ));
-            assert_eq!(output.runtime.model.as_deref(), Some(expected_model));
-            assert_eq!(output.provider_checkpoint_id.as_deref(), Some("current"));
-            assert_eq!(output.evidence.native_state, None);
+            assert_eq!(
+                output.completion.runtime.model.as_deref(),
+                Some(expected_model)
+            );
+            assert_eq!(
+                output.completion.provider_checkpoint_id.as_deref(),
+                Some("current")
+            );
+            assert_eq!(output.completion.evidence.native_state, None);
             let encoded = serde_json::to_string(&output.event)?;
             assert!(encoded.contains("CURRENT"));
             assert!(!encoded.contains("STALE"));
@@ -3062,25 +3090,42 @@ mod test {
                 .event
                 .iter()
                 .position(|event| {
-                    event.turn_boundary == Some(crate::backend::TurnBoundary::Started)
+                    matches!(
+                        event,
+                        crate::backend::BackendEvent::Turn {
+                            update: crate::backend::TurnUpdate::Started { .. },
+                            ..
+                        }
+                    )
                 })
                 .unwrap();
             let answer = output
                 .event
                 .iter()
-                .position(|event| event.text.as_deref() == Some("CURRENT"))
+                .position(|event| matches!(event, crate::backend::BackendEvent::Message { update, .. } if update.text() == Some("CURRENT")))
                 .unwrap();
             assert!(
                 start < answer,
                 "acknowledged turns must own their response without another start notification"
             );
+            let scope = output
+                .event
+                .iter()
+                .find_map(|event| event.scope().invocation().cloned())
+                .unwrap();
             let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
-                "id":"after-cancel", "session_id":"session", "agent_id":"primary", "ordinal":2,
+                "id":scope.exchange_id, "session_id":scope.owner.session_id, "agent_id":scope.owner.agent_id, "ordinal":2,
                 "prompt":"what is this repo?", "kind":"chat", "state":"running",
                 "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[]
             }))?;
             for event in &output.event {
-                assert!(exchange.observe_turn(event, 1)?);
+                if event.turn_address().is_some() {
+                    assert!(exchange.observe_turn(event, 1)?);
+                } else {
+                    let before = exchange.turn.len();
+                    assert!(!exchange.observe_turn(event, 1)?);
+                    assert_eq!(exchange.turn.len(), before);
+                }
             }
             assert_eq!(exchange.turn.len(), 1);
             let saved = serde_json::to_string(&exchange)?;
@@ -3310,11 +3355,11 @@ mod test {
             )
             .await??;
             assert_eq!(
-                output.evidence.native_state,
+                output.completion.evidence.native_state,
                 Some(crate::goal::GoalState::UsageLimited)
             );
             assert_eq!(
-                output.provider_checkpoint_id.as_deref(),
+                output.completion.provider_checkpoint_id.as_deref(),
                 starts_turn.then_some("resumed")
             );
             assert!(!backend.has_active_turn("session").await);

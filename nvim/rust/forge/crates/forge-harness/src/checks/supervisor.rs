@@ -5,7 +5,7 @@ use super::{
     ConfigSnapshot, RunRequest,
 };
 use crate::{
-    backend::{BackendEvent, BackendEventSink},
+    broker::publication::{SessionUpdate, SessionUpdateSink},
     buffer::session::SessionPresentation,
 };
 use anyhow::{Context, Result, ensure};
@@ -30,7 +30,7 @@ pub struct CheckSupervisorContext {
 }
 
 struct CheckPublicationTarget<'target> {
-    sink: Option<&'target BackendEventSink>,
+    sink: Option<&'target SessionUpdateSink>,
     publication: &'target CheckPublication,
 }
 
@@ -724,7 +724,7 @@ impl CheckSupervisor {
     pub(crate) async fn run(
         self: &Arc<Self>,
         run: PreparedCheckRun,
-        sink: Option<BackendEventSink>,
+        sink: Option<SessionUpdateSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<CheckRun> {
         let (_, completed) = self.launch(run, sink, external_cancelled, None).await?;
@@ -881,7 +881,7 @@ impl CheckSupervisor {
     async fn run_admitted(
         self: &Arc<Self>,
         admitted: AdmittedCheckRun,
-        sink: Option<BackendEventSink>,
+        sink: Option<SessionUpdateSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<CheckRun> {
         let AdmittedCheckRun {
@@ -942,7 +942,7 @@ impl CheckSupervisor {
     async fn run_inner(
         &self,
         run: &mut PreparedCheckRun,
-        sink: Option<&BackendEventSink>,
+        sink: Option<&SessionUpdateSink>,
         publication: &CheckPublication,
         cancelled: &Arc<CheckCancellation>,
         external_cancelled: Option<&Arc<AtomicBool>>,
@@ -1446,7 +1446,7 @@ impl CheckSupervisor {
     pub(crate) async fn publish(
         &self,
         run: &CheckRun,
-        sink: Option<&BackendEventSink>,
+        sink: Option<&SessionUpdateSink>,
     ) -> Result<()> {
         self.validate_owner(run)?;
         if let Some(previous) = self
@@ -1466,7 +1466,7 @@ impl CheckSupervisor {
         self.update(run, sink)
     }
 
-    fn update(&self, run: &CheckRun, sink: Option<&BackendEventSink>) -> Result<()> {
+    fn update(&self, run: &CheckRun, sink: Option<&SessionUpdateSink>) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -1511,24 +1511,16 @@ impl CheckSupervisor {
         {
             self.notification
                 .get_or_init(|| CheckNotification::new(self.trace.clone(), self.session_id.clone()))
-                .publish(sink, patch.notification());
+                .publish(sink, patch);
         }
         if let (Some(error), Some(sink)) = (error, sink) {
             self.notification
                 .get_or_init(|| CheckNotification::new(self.trace.clone(), self.session_id.clone()))
                 .error(
                     sink,
-                    BackendEvent {
-                        message: None,
-                        received_at_ms: None,
-                        address: None,
-                        turn_boundary: None,
-                        kind: "checks_configuration_error".into(),
-                        text: None,
-                        data: serde_json::json!({"run_id":run.id,"error":error.text}),
-                        activity: None,
-                        summary: None,
-                        checklist_update: None,
+                    SessionUpdate::CheckFailure {
+                        run_id: run.id.clone(),
+                        error: error.text.clone(),
                     },
                 );
         }
@@ -1540,7 +1532,7 @@ impl CheckSupervisor {
     pub(crate) async fn start(
         self: &Arc<Self>,
         run: PreparedCheckRun,
-        sink: Option<BackendEventSink>,
+        sink: Option<SessionUpdateSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
         admission: Option<crate::command::ExecutionPermit>,
     ) -> Result<String> {
@@ -1553,7 +1545,7 @@ impl CheckSupervisor {
     async fn launch(
         self: &Arc<Self>,
         run: PreparedCheckRun,
-        sink: Option<BackendEventSink>,
+        sink: Option<SessionUpdateSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
         admission: Option<crate::command::ExecutionPermit>,
     ) -> Result<(

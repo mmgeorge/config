@@ -115,23 +115,7 @@ impl HarnessBroker {
                     )?;
                     self.store.save_exchange(&interaction)?;
                     self.emit_live_interaction(
-                        BackendEvent {
-                            message: None,
-                            received_at_ms: None,
-                            address: None,
-                            turn_boundary: None,
-                            kind: if cancelled {
-                                "timeline_exchange_cancelled"
-                            } else {
-                                "timeline_exchange_failed"
-                            }
-                            .into(),
-                            text: Some(format!("{error:#}")),
-                            data: serde_json::to_value(&interaction)?,
-                            activity: None,
-                            summary: None,
-                            checklist_update: None,
-                        },
+                        publication::LiveUpdate::StateChanged,
                         &interaction,
                         &mut event,
                     )
@@ -211,18 +195,7 @@ impl HarnessBroker {
                         prompt: interaction.prompt,
                     }));
                 }
-                if let Some(runtime) = self.exchange_runtime.take() {
-                    finish_synthetic_turn(
-                        &mut interaction,
-                        runtime.synthetic_turn.as_ref(),
-                        if cancelled {
-                            crate::turn::TurnOutcome::Cancelled
-                        } else {
-                            crate::turn::TurnOutcome::Failed
-                        },
-                        self.clock.now_ms(),
-                    )?;
-                }
+                self.exchange_runtime.take();
                 let outcome = if cancelled {
                     crate::exchange::ExchangeOutcome::Cancelled
                 } else {
@@ -236,18 +209,7 @@ impl HarnessBroker {
                 self.save_session().context("persist stopped session")?;
                 if cancelled {
                     Box::pin(self.emit_live_interaction(
-                        BackendEvent {
-                            message: None,
-                            received_at_ms: None,
-                            address: None,
-                            turn_boundary: None,
-                            kind: "timeline_exchange_cancelled".into(),
-                            text: None,
-                            data: serde_json::to_value(&interaction)?,
-                            activity: None,
-                            summary: None,
-                            checklist_update: None,
-                        },
+                        publication::LiveUpdate::StateChanged,
                         &interaction,
                         &mut event,
                     ))
@@ -355,18 +317,7 @@ impl HarnessBroker {
             automatic.save()?;
         }
         Box::pin(self.emit_live_interaction(
-            BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "timeline_exchange_started".into(),
-                text: None,
-                data: serde_json::to_value(&interaction)?,
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            },
+            publication::LiveUpdate::StateChanged,
             &interaction,
             &mut event,
         ))
@@ -388,18 +339,9 @@ impl HarnessBroker {
         }
 
         self.session.active_task = self.task_controller.current()?;
-        Box::pin(self.emit_backend_event(
-            BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "execution_state".into(),
-                text: None,
-                data: json!({"session":self.session_view()?}),
-                activity: None,
-                summary: None,
-                checklist_update: None,
+        Box::pin(self.emit_session_update(
+            SessionUpdate::ExecutionState {
+                session: Box::new(self.session_view()?),
             },
             &mut event,
         ))
@@ -411,7 +353,7 @@ impl HarnessBroker {
     async fn complete_interaction(
         &mut self,
         mut interaction: Exchange,
-        mut output: crate::backend::BackendOutput,
+        mut output: crate::backend::BackendCompletion,
         mut mode: PromptMode,
         mut event: Vec<SessionEvent>,
     ) -> Result<(Value, Vec<SessionEvent>)> {
@@ -453,7 +395,6 @@ impl HarnessBroker {
         if output.runtime.model.is_some() {
             self.session.resolved_model = output.runtime.model.clone();
         }
-        output.event.clear();
 
         if let Some(control_error) = output.control_error.take() {
             anyhow::bail!(control_error);
@@ -835,17 +776,10 @@ impl HarnessBroker {
         } else {
             Box::pin(self.apply_goal_evidence(evidence, permit, completed_turn, &mut event)).await?
         };
-        let mut runtime = self
+        let runtime = self
             .exchange_runtime
             .take()
             .context("active interaction timeline is missing")?;
-        finish_synthetic_turn(
-            &mut interaction,
-            runtime.synthetic_turn.as_ref(),
-            crate::turn::TurnOutcome::Completed,
-            self.clock.now_ms(),
-        )?;
-        runtime.synthetic_turn = None;
         let remains_open = interaction.awaiting_input();
         if remains_open {
             self.exchange_runtime = Some(runtime);

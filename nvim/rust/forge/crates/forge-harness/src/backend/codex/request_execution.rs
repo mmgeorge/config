@@ -1,7 +1,7 @@
 use super::approval::{PreparedApproval, codex_response, permission_from_provider};
 use super::json_rpc::{DynamicToolTraceContext, control_invocation, rejects_question_resolution};
 use crate::backend::approval::{ApprovalResolution, PermissionCoordinator, protected_target};
-use crate::backend::{BackendEventSink, BackendOutput, ExecutionOwner};
+use crate::backend::{BackendCompletion, BackendEventSink, ExecutionOwner};
 use crate::control_tools::{
     ControlToolExecutor, ControlToolInvocation, ControlTurnContext, apply_invocation,
     control_tool_failure_json,
@@ -190,7 +190,7 @@ impl RequestExecutor {
                 let params = message.get("params").unwrap_or(message);
                 if let Some(invocation) = control_invocation(method, params)? {
                     let validation_started_at = Instant::now();
-                    let mut decoded_output = BackendOutput::default();
+                    let mut decoded_output = BackendCompletion::default();
                     if let Err(error) = apply_invocation(&invocation, &mut decoded_output) {
                         let failure_json = control_tool_failure_json(
                             &invocation,
@@ -315,7 +315,7 @@ impl RequestExecutor {
     async fn execute_control_invocation(
         &mut self,
         invocation: &ControlToolInvocation,
-        mut output: BackendOutput,
+        mut output: BackendCompletion,
     ) -> Result<Option<String>> {
         if let Some(runtime) = self.control_runtime.as_ref() {
             let outcome = runtime.execute(invocation.clone()).await?;
@@ -437,8 +437,13 @@ impl RequestExecutor {
             .authorize(
                 self.approval_mode,
                 request,
-                Some(crate::backend::ProviderAddress {
-                    owner: self.execution_owner.clone(),
+                Some(crate::backend::TurnAddress {
+                    scope: self
+                        .event_sink
+                        .as_ref()
+                        .context("Codex approval has no active invocation")?
+                        .invocation_scope()?
+                        .clone(),
                     thread_id: message
                         .pointer("/params/threadId")
                         .and_then(Value::as_str)
@@ -448,7 +453,7 @@ impl RequestExecutor {
                         .pointer("/params/turnId")
                         .and_then(Value::as_str)
                         .context("approval request omitted its provider turn")?
-                        .to_owned(),
+                        .into(),
                 }),
                 self.event_sink.as_ref(),
             )
@@ -551,10 +556,9 @@ mod tests {
         let invocation = result
             .invocation
             .context("accepted goal control was not retained")?;
-        let mut output = BackendOutput::default();
+        let mut output = BackendCompletion::default();
         apply_invocation(&invocation, &mut output)?;
         let permit = output
-            .completion
             .goal_control
             .context("goal control lost its task permit")?
             .permit;
@@ -575,7 +579,7 @@ mod tests {
                         exchange_ordinal: 1,
                         turn_ordinal: 1
                     },
-                    output.completion.evidence,
+                    output.evidence,
                     3
                 )
                 .unwrap_err()

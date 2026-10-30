@@ -311,31 +311,18 @@ mod tests {
 
     #[test]
     fn check_admission_retains_commentary_owner_through_late_completion_and_replay() -> Result<()> {
-        use crate::backend::{BackendEvent, ProviderAddress};
         use crate::exchange::ExchangeEntry;
         let mut source = exchange("work");
         source.resume(0)?;
-        let address = ProviderAddress {
-            owner: None,
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        };
+        let address = crate::turn::test_support::address(&source, "turn");
         source.start_turn(address.clone(), 0)?;
-        let commentary = |id: &str| BackendEvent {
-            message: Some(crate::turn::test_support::message(
+        let commentary = |id: &str| {
+            crate::turn::test_support::message(
+                &address,
                 id,
                 Some(crate::backend::MessageRole::Commentary),
                 id,
-            )),
-            received_at_ms: None,
-            address: Some(address.clone()),
-            turn_boundary: None,
-            kind: "assistant_message".into(),
-            text: Some(id.into()),
-            data: serde_json::json!({"provider_message_id":id,"phase":"commentary"}),
-            activity: None,
-            summary: None,
-            checklist_update: None,
+            )
         };
         source.observe_turn(&commentary("first"), 1)?;
         let admitted = run(TimelineOwner::exchange(&source));

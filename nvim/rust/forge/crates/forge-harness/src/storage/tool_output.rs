@@ -460,23 +460,24 @@ impl SqliteStore {
         exchange: &Exchange,
         event: &crate::backend::BackendEvent,
     ) -> Result<()> {
-        let address = event
-            .address
-            .as_ref()
-            .context("tool output has no provider owner")?;
-        let activity = event.activity.as_ref().context("tool output has no call")?;
-        let delta = activity
-            .output
-            .as_deref()
-            .context("tool output has no delta")?;
+        let crate::backend::BackendEvent::Tool {
+            address,
+            update:
+                crate::backend::ToolUpdate::Output {
+                    update: crate::backend::TextUpdate::Append(delta),
+                },
+        } = event
+        else {
+            anyhow::bail!("tool output event is not an append");
+        };
         let turn = exchange
             .turn
             .iter()
-            .find(|turn| turn.provider() == address)
+            .find(|turn| turn.provider() == &address.turn)
             .context("tool output turn is missing")?;
         let tool = exchange
             .tools_for_turn(turn.id())
-            .find(|tool| tool.id == activity.id)
+            .find(|tool| tool.id == address.tool_id.as_str())
             .context("tool output call is missing")?;
         let admitted: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM tool_output_owner WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3)",

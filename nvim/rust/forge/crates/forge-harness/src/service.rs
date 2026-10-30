@@ -1340,7 +1340,11 @@ impl SessionController {
             return Ok(());
         }
         let session_id = self.catalog_request.read().await.harness_session_id.clone();
-        let Some(mut stream) = self.backend.compaction_stream(&session_id).await? else {
+        let Some(mut stream) = self
+            .backend
+            .compaction_stream(crate::backend::ExecutionOwner::root(&session_id))
+            .await?
+        else {
             return Ok(());
         };
         let controller = Arc::downgrade(self);
@@ -1835,29 +1839,35 @@ async fn analyze_plan_source(
 fn checks_event_sink(
     output: MessageSender,
     session_id: String,
-) -> crate::backend::BackendEventSink {
-    let (sink, mut stream) = crate::backend::events::channel();
+) -> crate::broker::publication::SessionUpdateSink {
+    let (sink, mut stream) = crate::broker::publication::channel();
     tokio::spawn(async move {
-        while let Ok(Some(event)) = stream.recv().await {
-            let (event_name, payload) = if event.kind == "document_changed" {
-                ("document_changed".into(), event.data)
-            } else {
-                (
-                    "backend_event".into(),
-                    serde_json::to_value(event).unwrap_or(Value::Null),
-                )
-            };
-            if output
-                .send_event(SessionEvent {
-                    session_id: session_id.clone(),
-                    event: event_name,
-                    payload,
-                })
-                .await
-                .is_err()
-            {
-                break;
+        let delivery = async {
+            while let Some(event) = stream.recv().await? {
+                let event_name = if matches!(
+                    &event,
+                    crate::broker::publication::SessionUpdate::DocumentChanged { .. }
+                ) {
+                    "document_changed"
+                } else {
+                    "backend_event"
+                };
+                let payload = crate::broker::publication::encode_session_update(&event)?;
+                output
+                    .send_event(SessionEvent {
+                        session_id: session_id.clone(),
+                        event: event_name.into(),
+                        payload,
+                    })
+                    .await?;
             }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = delivery {
+            output.record_failure(&std::io::Error::other(format!(
+                "deliver check notification for {session_id}: {error:#}"
+            )));
         }
     });
     sink
@@ -2561,18 +2571,24 @@ async fn route_request(
         return Ok(());
     }
 
-    let (event_sink, mut event_stream) = crate::backend::events::channel();
+    let (event_sink, mut event_stream) = crate::broker::publication::channel();
     let (mut broker, _admission) = acquire_request_broker(&controller, method).await?;
     let message_sink_for_event = message_sink.clone();
     let routed_session_id = session_id.clone();
     let event_forwarder = tokio::spawn(async move {
         while let Some(event) = event_stream.recv().await? {
-            let (event_name, payload) = if event.kind == "document_changed" {
-                ("document_changed".to_owned(), event.data)
+            let (event_name, payload) = if matches!(
+                &event,
+                crate::broker::publication::SessionUpdate::DocumentChanged { .. }
+            ) {
+                (
+                    "document_changed".to_owned(),
+                    crate::broker::publication::encode_session_update(&event)?,
+                )
             } else {
                 (
                     "backend_event".to_owned(),
-                    serde_json::to_value(event).unwrap_or(Value::Null),
+                    crate::broker::publication::encode_session_update(&event)?,
                 )
             };
             message_sink_for_event
@@ -3164,28 +3180,22 @@ async fn dispatch_task_attempt(
     sink: &MessageSender,
     catalog_request: Arc<RwLock<crate::backend::BackendCatalogRequest>>,
 ) -> Result<bool> {
-    let (event_sink, mut event_stream) = crate::backend::events::channel();
+    let (event_sink, mut event_stream) = crate::broker::publication::channel();
     let output = sink.clone();
     let routed_session = session_id.to_owned();
     let data_root = broker.data_root().to_path_buf();
     let forwarder = tokio::spawn(async move {
         while let Some(event) = event_stream.recv().await? {
-            if event.kind == "configuration_progress" {
-                let operation_id = event.data["operation_id"]
-                    .as_str()
-                    .context("configuration operation is missing")?;
-                let state = event.data["state"]
-                    .as_str()
-                    .context("configuration state is missing")?;
-                anyhow::ensure!(
-                    matches!(state, "applying" | "verifying" | "resuming"),
-                    "invalid configuration state"
-                );
+            if let crate::broker::publication::SessionUpdate::ConfigurationProgress {
+                operation_id,
+                state,
+            } = &event
+            {
                 let mut store = SqliteStore::open(&data_root)?;
                 let mut operation = store
                     .load_task_operation(&routed_session, operation_id)?
                     .context("configuration operation is missing")?;
-                operation.state = state.into();
+                operation.state = state.as_str().into();
                 store.save_task_operation(&mut operation)?;
                 retain_configuration_event(&mut store, &operation)?;
                 output
@@ -3197,22 +3207,32 @@ async fn dispatch_task_attempt(
                     .await?;
                 continue;
             }
-            if event.kind == "configuration_applied" {
-                *catalog_request.write().await =
-                    serde_json::from_value(event.data["catalog"].clone())?;
+            if let crate::broker::publication::SessionUpdate::Configuration { catalog, .. } = &event
+            {
+                *catalog_request.write().await = catalog.as_ref().clone();
+                let payload = crate::broker::publication::encode_session_update(&event)?;
                 output
                     .send_event(SessionEvent {
                         session_id: routed_session.clone(),
                         event: "session_configured".into(),
-                        payload: event.data,
+                        payload: payload["data"].clone(),
                     })
                     .await?;
                 continue;
             }
-            let (name, payload) = if event.kind == "document_changed" {
-                ("document_changed", event.data)
+            let (name, payload) = if matches!(
+                &event,
+                crate::broker::publication::SessionUpdate::DocumentChanged { .. }
+            ) {
+                (
+                    "document_changed",
+                    crate::broker::publication::encode_session_update(&event)?,
+                )
             } else {
-                ("backend_event", serde_json::to_value(event)?)
+                (
+                    "backend_event",
+                    crate::broker::publication::encode_session_update(&event)?,
+                )
             };
             output
                 .send_event(SessionEvent {
@@ -4597,10 +4617,8 @@ mod tests {
             &self,
             _: BackendRequest,
             _: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion> {
-            let output: anyhow::Result<crate::backend::BackendOutput> =
-                async { anyhow::bail!("terminal fixture cannot prompt") }.await;
-            Ok(output?.into_completion())
+        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            Err(anyhow::anyhow!("terminal fixture cannot prompt").into())
         }
         async fn shutdown(&self) -> Result<()> {
             Ok(())
@@ -4728,12 +4746,8 @@ mod tests {
             &self,
             _: BackendRequest,
             _: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion> {
-            let output: anyhow::Result<crate::backend::BackendOutput> = async {
-                anyhow::bail!("isolated generation must not submit a conversational turn")
-            }
-            .await;
-            Ok(output?.into_completion())
+        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            Err(anyhow::anyhow!("isolated generation must not submit a conversational turn").into())
         }
         async fn shutdown(&self) -> Result<()> {
             self.shutdown.store(true, Ordering::Release);
@@ -5828,10 +5842,13 @@ mod tests {
             }
         }
         let completed = tokio::time::timeout(Duration::from_secs(2), prompt).await???;
-        assert_eq!(
-            completed.event[0].text.as_deref(),
-            Some("Mock response: held prompt")
-        );
+        assert!(completed.event.iter().any(|event| matches!(
+            event,
+            crate::backend::BackendEvent::Message {
+                update: crate::backend::MessageUpdate::Started { text, .. },
+                ..
+            } if text == "Mock response: held prompt"
+        )));
         drop(execution);
         drop(broker);
         service.shutdown(Duration::from_secs(1)).await?;
@@ -6520,10 +6537,8 @@ mod tests {
             &self,
             _: crate::backend::BackendRequest,
             _: crate::backend::BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion> {
-            let output: anyhow::Result<crate::backend::BackendOutput> =
-                async { anyhow::bail!("steering must not start another provider request") }.await;
-            Ok(output?.into_completion())
+        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            Err(anyhow::anyhow!("steering must not start another provider request").into())
         }
 
         async fn steer_session(
@@ -6586,8 +6601,12 @@ mod tests {
             agent_id: (agent_id.clone()).into(),
         };
         let permission = controller.permission.clone();
-        let (event_sink, mut events) = crate::backend::events::channel();
-        let approval_owner = owner.clone();
+        let (event_sink, mut events) =
+            crate::backend::events::channel(crate::backend::InvocationScope {
+                owner: owner.clone(),
+                exchange_id: task_id.clone().into(),
+                invocation_id: "approval-invocation".into(),
+            });
         let pending = tokio::spawn(async move {
             permission
                 .authorize(
@@ -6601,8 +6620,8 @@ mod tests {
                             shell: None,
                         }],
                     },
-                    Some(crate::backend::ProviderAddress {
-                        owner: Some(approval_owner),
+                    Some(crate::backend::TurnAddress {
+                        scope: event_sink.invocation_scope()?.clone(),
                         thread_id: "mock-session".into(),
                         turn_id: "mock-turn".into(),
                     }),
@@ -6619,7 +6638,7 @@ mod tests {
             .send(crate::agent::AgentCommand::Event {
                 owner,
                 task_id: task_id.clone(),
-                event: requested,
+                event: requested.into(),
             })
             .await?;
         let requested_view = tokio::time::timeout(Duration::from_secs(2), async {
@@ -6663,7 +6682,13 @@ mod tests {
         let resolved = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await??
             .unwrap();
-        assert_eq!(resolved.kind, "approval_resolved");
+        assert!(matches!(
+            &resolved,
+            crate::backend::BackendEvent::Approval {
+                update: crate::backend::ApprovalUpdate::Resolved(_),
+                ..
+            }
+        ));
         controller
             .agent_coordinator
             .sender()
@@ -6673,7 +6698,7 @@ mod tests {
                     agent_id: (agent_id.clone()).into(),
                 },
                 task_id: task_id.clone(),
-                event: resolved,
+                event: resolved.into(),
             })
             .await?;
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -7516,10 +7541,8 @@ mod tests {
             &self,
             _: crate::backend::BackendRequest,
             _: crate::backend::BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion> {
-            let output: anyhow::Result<crate::backend::BackendOutput> =
-                async { anyhow::bail!("cleanup must finish before another provider turn") }.await;
-            Ok(output?.into_completion())
+        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            Err(anyhow::anyhow!("cleanup must finish before another provider turn").into())
         }
     }
 

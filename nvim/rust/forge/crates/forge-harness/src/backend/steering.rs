@@ -389,27 +389,36 @@ impl SteerCommand {
             && self.operation == ActiveTurnOperation::Steer
             && let Some(event_sink) = self.event_sink.take()
         {
-            let mut event = match self.task_start.take() {
-                Some(start) => BackendEvent::task_started(start, self.text.clone()),
-                None => BackendEvent::steering_input(self.text.clone()),
-            };
-            if let Some(submission) = &self.submission {
-                match submission.record() {
-                    Ok(record) => {
-                        if !event.data.is_object() {
-                            event.data = serde_json::json!({});
-                        }
-                        event.data["input_message_id"] = serde_json::json!(record.input_message_id);
-                    }
-                    Err(error) => {
-                        result = Err(error);
-                    }
-                }
+            let event = (|| -> Result<BackendEvent> {
+                let input_id = self
+                    .submission
+                    .as_ref()
+                    .map(|submission| submission.record().map(|record| record.input_message_id))
+                    .transpose()?
+                    .flatten();
+                let acknowledgement = match self.task_start.take() {
+                    Some(start) => crate::backend::InputAcknowledgement::TaskStarted {
+                        input_id,
+                        start,
+                        prompt: self.text.clone(),
+                    },
+                    None => crate::backend::InputAcknowledgement::Steering {
+                        input_id,
+                        text: self.text.clone(),
+                    },
+                };
+                Ok(BackendEvent::InputAccepted {
+                    scope: event_sink.invocation_scope()?.clone(),
+                    acknowledgement,
+                })
+            })();
+            if let Err(error) = async {
+                event_sink.send_wait(event?).await?;
+                Ok::<(), anyhow::Error>(())
             }
-            if result.is_ok()
-                && let Err(error) = event_sink.send_wait(event).await
+            .await
             {
-                result = Err(error.into());
+                result = Err(error);
             }
         }
         if let Some(completion) = self.completion.take() {
@@ -431,6 +440,15 @@ impl Drop for SteerCommand {
 #[cfg(test)]
 mod test {
     use super::SteeringLane;
+    use crate::backend::{BackendEvent, ExecutionOwner, InputAcknowledgement, InvocationScope};
+
+    fn scope() -> InvocationScope {
+        InvocationScope {
+            owner: ExecutionOwner::root("steering"),
+            exchange_id: "exchange".into(),
+            invocation_id: "invocation".into(),
+        }
+    }
 
     #[tokio::test]
     async fn uncertain_steering_is_never_returned_to_the_fallback_queue() -> anyhow::Result<()> {
@@ -605,7 +623,7 @@ mod test {
     #[tokio::test]
     async fn child_results_reach_the_provider_without_user_steering_events() {
         let lane = SteeringLane::default();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(scope());
         let mut active = lane.activate(Some(event_sink)).unwrap();
         let sender = lane.clone();
         let delivery = tokio::spawn(async move {
@@ -650,7 +668,7 @@ mod test {
             Some("task-entry".into()),
         )?;
         let lane = SteeringLane::default();
-        let (event_sink, mut events) = crate::backend::events::channel();
+        let (event_sink, mut events) = crate::backend::events::channel(scope());
         let mut active = lane.activate(Some(event_sink))?;
         let mut delivery = Box::pin(lane.steer(super::SteeringInput::TaskEntry {
             start: start.clone(),
@@ -678,10 +696,22 @@ mod test {
         command.complete(Ok(())).await;
         delivery.await?;
         let event = events.recv().await?.unwrap();
-        assert_eq!(event.kind, "task_started");
-        assert_eq!(event.text.as_deref(), Some(prompt));
-        assert_eq!(event.data["start"], serde_json::to_value(start)?);
-        assert_eq!(event.data["input_message_id"], "task-entry");
+        let BackendEvent::InputAccepted {
+            scope: accepted_scope,
+            acknowledgement:
+                InputAcknowledgement::TaskStarted {
+                    input_id,
+                    start: accepted_start,
+                    prompt: accepted_prompt,
+                },
+        } = event
+        else {
+            panic!("expected acknowledged task entry");
+        };
+        assert_eq!(accepted_scope, scope());
+        assert_eq!(accepted_prompt, prompt);
+        assert_eq!(accepted_start, start);
+        assert_eq!(input_id.as_deref(), Some("task-entry"));
         assert!(events.try_recv().is_err());
         Ok(())
     }
@@ -689,7 +719,7 @@ mod test {
     #[tokio::test]
     async fn emits_only_provider_acknowledged_input() {
         let lane = SteeringLane::default();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(scope());
         let mut active = lane.activate(Some(event_sink)).unwrap();
         let accepted_lane = lane.clone();
         let accepted = tokio::spawn(async move { accepted_lane.steer("accepted".into()).await });
@@ -697,8 +727,13 @@ mod test {
         accepted_command.complete(Ok(())).await;
         accepted.await.unwrap().unwrap();
         let event = event_stream.recv().await.unwrap().expect("steering event");
-        assert_eq!(event.kind, "steering_input");
-        assert_eq!(event.text.as_deref(), Some("accepted"));
+        assert!(matches!(
+            event,
+            BackendEvent::InputAccepted {
+                scope: accepted_scope,
+                acknowledgement: InputAcknowledgement::Steering { input_id: None, text },
+            } if accepted_scope == scope() && text == "accepted"
+        ));
 
         let rejected_lane = lane.clone();
         let rejected = tokio::spawn(async move { rejected_lane.steer("rejected".into()).await });

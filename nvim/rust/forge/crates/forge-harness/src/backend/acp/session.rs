@@ -7,7 +7,7 @@ use crate::session::ApprovalMode;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -16,22 +16,36 @@ pub(super) struct AcpSessionState {
     pub(super) kind: BackendKind,
     pub(super) permission: Arc<PermissionCoordinator>,
     pub(super) active: RwLock<Option<ActiveTurn>>,
-    pub(super) output: Mutex<BackendOutput>,
+    operation: RwLock<Option<ActiveOperation>>,
+    pub(super) output: Mutex<BackendCompletion>,
     pub(super) control: Mutex<Option<Arc<ControlToolExecutor>>>,
     pub(super) catalog: RwLock<Value>,
     pub(super) tool_definition: RwLock<Vec<crate::control_tools::ControlToolDefinition>>,
     tool: Mutex<HashMap<(String, String), Value>>,
+    finished_tool: Mutex<HashSet<(String, String)>>,
     compaction: Mutex<HashMap<String, Compaction>>,
     children: Mutex<super::children::AcpChildren>,
+    message: Mutex<HashMap<TurnAddress, Vec<AcpMessage>>>,
 }
 
 #[derive(Clone)]
 /// Captures immutable callback routing for the admitted provider turn.
 pub(super) struct ActiveTurn {
     task_authority: Option<crate::control_tools::TaskAuthority>,
-    pub(super) owner: crate::backend::ExecutionOwner,
     pub(super) mode: ApprovalMode,
-    pub(super) sink: Option<BackendEventSink>,
+    pub(super) sink: BackendEventSink,
+}
+
+struct ActiveOperation {
+    session_id: String,
+    sink: BackendEventSink,
+}
+
+struct AcpMessage {
+    address: MessageAddress,
+    role: Option<MessageRole>,
+    text: String,
+    closed: bool,
 }
 
 impl AcpSessionState {
@@ -40,13 +54,16 @@ impl AcpSessionState {
             kind,
             permission,
             active: RwLock::new(None),
-            output: Mutex::new(BackendOutput::default()),
+            operation: RwLock::new(None),
+            output: Mutex::new(BackendCompletion::default()),
             control: Mutex::new(None),
             catalog: RwLock::new(json!({})),
             tool_definition: RwLock::new(Vec::new()),
             tool: Mutex::new(HashMap::new()),
+            finished_tool: Mutex::new(HashSet::new()),
             compaction: Mutex::new(HashMap::new()),
             children: Mutex::new(super::children::AcpChildren::default()),
+            message: Mutex::new(HashMap::new()),
         }
     }
 
@@ -54,13 +71,20 @@ impl AcpSessionState {
     pub(super) async fn begin(
         &self,
         request: &BackendRequest,
-        owner: crate::backend::ExecutionOwner,
         session_id: &str,
-        sink: Option<BackendEventSink>,
-    ) {
-        *self.output.lock().await = BackendOutput::default();
+        sink: BackendEventSink,
+    ) -> Result<()> {
+        ensure!(
+            self.operation.read().await.is_none(),
+            "ACP invocation cannot replace an active session operation"
+        );
+        *self.output.lock().await = BackendCompletion::default();
+        self.compaction.lock().await.clear();
         self.tool.lock().await.clear();
-        *self.children.lock().await = super::children::AcpChildren::new(session_id.into());
+        self.finished_tool.lock().await.clear();
+        self.message.lock().await.clear();
+        *self.children.lock().await =
+            super::children::AcpChildren::new(session_id.into(), sink.invocation_scope()?.clone());
         *self.control.lock().await = Some(Arc::new(ControlToolExecutor::new(
             request
                 .control_context
@@ -72,106 +96,175 @@ impl AcpSessionState {
                 .control_context
                 .as_ref()
                 .and_then(crate::control_tools::TaskAuthority::capture),
-            owner,
             mode: request.approval_mode,
             sink,
         });
+        Ok(())
     }
 
     pub(super) async fn emit(&self, event: BackendEvent) -> Result<()> {
-        let active = self.active.read().await.clone();
-        let Some(active) = active else { return Ok(()) };
-        self.output.lock().await.event.push(event.clone());
-        if let Some(sink) = &active.sink {
+        let sink = if let Some(active) = self.active.read().await.as_ref() {
+            Some(active.sink.clone())
+        } else {
+            self.operation
+                .read()
+                .await
+                .as_ref()
+                .map(|operation| operation.sink.clone())
+        };
+        if let Some(sink) = sink {
             sink.send_wait(event).await?;
         }
         Ok(())
     }
 
-    async fn emit_session(&self, session_id: &str, mut event: BackendEvent) -> Result<()> {
-        if !self.children.lock().await.route(session_id, &mut event) {
+    pub(super) async fn begin_compaction(
+        &self,
+        session_id: &str,
+        sink: BackendEventSink,
+    ) -> Result<()> {
+        ensure!(
+            sink.scope().invocation().is_none(),
+            "ACP compaction requires a session-operation scope"
+        );
+        ensure!(
+            self.active.read().await.is_none(),
+            "ACP compaction cannot replace an active invocation"
+        );
+        *self.output.lock().await = BackendCompletion::default();
+        self.compaction.lock().await.clear();
+        *self.operation.write().await = Some(ActiveOperation {
+            session_id: session_id.into(),
+            sink,
+        });
+        Ok(())
+    }
+
+    pub(super) async fn finish_compaction(&self) {
+        *self.operation.write().await = None;
+    }
+
+    pub(super) async fn has_active_work(&self) -> bool {
+        self.active.read().await.is_some() || self.operation.read().await.is_some()
+    }
+
+    async fn event_scope(&self) -> Result<EventScope> {
+        if let Some(active) = self.active.read().await.as_ref() {
+            return Ok(active.sink.scope().clone());
+        }
+        Ok(self
+            .operation
+            .read()
+            .await
+            .as_ref()
+            .context("ACP update has no active operation")?
+            .sink
+            .scope()
+            .clone())
+    }
+
+    async fn is_root(&self, session_id: &str) -> bool {
+        if let Some(operation) = self.operation.read().await.as_ref() {
+            return operation.session_id == session_id;
+        }
+        self.children.lock().await.is_root(session_id)
+    }
+
+    pub(super) async fn address(&self, session_id: &str) -> Option<TurnAddress> {
+        self.children.lock().await.address(session_id, false)
+    }
+
+    pub(super) async fn scope(&self) -> Result<InvocationScope> {
+        Ok(self
+            .active
+            .read()
+            .await
+            .as_ref()
+            .context("ACP update has no active invocation")?
+            .sink
+            .invocation_scope()?
+            .clone())
+    }
+
+    async fn message_chunk(
+        &self,
+        session_id: &str,
+        role: Option<MessageRole>,
+        text: &str,
+    ) -> Result<()> {
+        if text.is_empty() {
             return Ok(());
         }
-        if matches!(event.kind.as_str(), "assistant_message" | "reasoning") {
-            let output = self.output.lock().await;
-            let previous = output
-                .event
-                .iter()
-                .rev()
-                .find(|previous| previous.address == event.address);
-            let id = previous
-                .filter(|previous| previous.kind == event.kind)
-                .and_then(|previous| previous.message_id())
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("{session_id}:message:{}", output.event.len()));
-            event.message = Some(ProviderMessage {
-                id: MessageId(id),
-                role: (event.kind == "reasoning").then_some(MessageRole::Thought),
-                update: MessageUpdate::Delta {
-                    text: event.text.clone().unwrap_or_default(),
-                },
-            });
-        }
-        if event.activity.is_some() {
-            self.classify_messages(event.address.as_ref(), MessageRole::Commentary)
-                .await?;
-        }
+        let Some(turn) = self.address(session_id).await else {
+            return Ok(());
+        };
+        let event = {
+            let mut messages = self.message.lock().await;
+            let messages = messages.entry(turn.clone()).or_default();
+            if let Some(message) = messages
+                .last_mut()
+                .filter(|message| !message.closed && message.role == role)
+            {
+                message.text.push_str(text);
+                BackendEvent::Message {
+                    address: message.address.clone(),
+                    update: MessageUpdate::Delta { text: text.into() },
+                }
+            } else {
+                let address = MessageAddress {
+                    turn,
+                    message_id: MessageId::Synthetic(uuid::Uuid::new_v4().to_string()),
+                };
+                messages.push(AcpMessage {
+                    address: address.clone(),
+                    role,
+                    text: text.into(),
+                    closed: false,
+                });
+                BackendEvent::Message {
+                    address,
+                    update: MessageUpdate::Started {
+                        classification: role
+                            .map(MessageClassification::Known)
+                            .unwrap_or(MessageClassification::Unclassified),
+                        text: text.into(),
+                    },
+                }
+            }
+        };
         self.emit(event).await
     }
 
-    async fn classify_messages(
-        &self,
-        address: Option<&ProviderAddress>,
-        last_role: MessageRole,
-    ) -> Result<()> {
+    async fn classify_messages(&self, address: &TurnAddress, last_role: MessageRole) -> Result<()> {
         let updates = {
-            let mut output = self.output.lock().await;
-            let mut pending = Vec::new();
-            for event in &output.event {
-                if event.address.as_ref() == address
-                    && let Some(message) = event.message.as_ref()
-                    && message.role.is_none()
-                    && !pending.contains(&message.id)
-                {
-                    pending.push(message.id.clone());
-                }
-            }
-            let count = pending.len();
-            pending
-                .into_iter()
+            let mut messages = self.message.lock().await;
+            let pending = messages.entry(address.clone()).or_default();
+            let count = pending
+                .iter()
+                .filter(|message| message.role.is_none())
+                .count();
+            let updates = pending
+                .iter_mut()
+                .filter(|message| message.role.is_none())
                 .enumerate()
-                .map(|(index, id)| {
+                .map(|(index, message)| {
                     let role = if index + 1 == count {
                         last_role
                     } else {
                         MessageRole::Commentary
                     };
-                    for event in &mut output.event {
-                        if event.address.as_ref() == address
-                            && let Some(message) = &mut event.message
-                            && message.id == id
-                        {
-                            message.role = Some(role);
-                        }
-                    }
-                    BackendEvent {
-                        message: Some(ProviderMessage {
-                            id,
-                            role: Some(role),
-                            update: MessageUpdate::Classified,
-                        }),
-                        received_at_ms: None,
-                        address: address.cloned(),
-                        turn_boundary: None,
-                        kind: "assistant_message".into(),
-                        text: None,
-                        data: Value::Null,
-                        activity: None,
-                        summary: None,
-                        checklist_update: None,
+                    message.role = Some(role);
+                    message.closed = true;
+                    BackendEvent::Message {
+                        address: message.address.clone(),
+                        update: MessageUpdate::Classified { role },
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            for message in pending {
+                message.closed = true;
+            }
+            updates
         };
         for update in updates {
             self.emit(update).await?;
@@ -181,23 +274,37 @@ impl AcpSessionState {
 
     /// Close observed children and release callback state even when delivery fails.
     pub(super) async fn finish(&self, outcome: crate::turn::TurnOutcome) -> Result<()> {
+        if self.active.read().await.is_none() {
+            self.close_control().await;
+            self.finish_compaction().await;
+            return Ok(());
+        }
         let result = async {
             let addresses = {
-                let output = self.output.lock().await;
-                let mut addresses = Vec::new();
-                for event in &output.event {
-                    if event.message.is_some() && !addresses.contains(&event.address) {
-                        addresses.push(event.address.clone());
-                    }
-                }
-                addresses
+                self.message
+                    .lock()
+                    .await
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
             };
             for address in addresses {
-                self.finish_messages(address.as_ref(), outcome).await?;
+                self.finish_messages(&address, outcome).await?;
             }
             let events = self.children.lock().await.finish()?;
             for event in events {
                 self.emit(event).await?;
+            }
+            let root = self.children.lock().await.root_address();
+            if let Some(address) = root {
+                self.emit(BackendEvent::Turn {
+                    address,
+                    update: TurnUpdate::Finished {
+                        outcome,
+                        completed_at_ms: super::children::timestamp(),
+                    },
+                })
+                .await?;
             }
             Ok(())
         }
@@ -205,12 +312,13 @@ impl AcpSessionState {
         self.close_control().await;
         *self.active.write().await = None;
         self.tool.lock().await.clear();
+        self.finished_tool.lock().await.clear();
         result
     }
 
     async fn finish_messages(
         &self,
-        address: Option<&ProviderAddress>,
+        address: &TurnAddress,
         outcome: crate::turn::TurnOutcome,
     ) -> Result<()> {
         if outcome == crate::turn::TurnOutcome::Completed {
@@ -218,64 +326,21 @@ impl AcpSessionState {
                 .await?;
         }
         let updates = {
-            let output = self.output.lock().await;
-            let mut messages: Vec<ProviderMessage> = Vec::new();
-            for event in &output.event {
-                if event.address.as_ref() != address {
-                    continue;
-                }
-                let Some(message) = &event.message else {
-                    continue;
-                };
-                let index = messages
-                    .iter()
-                    .position(|previous| previous.id == message.id)
-                    .unwrap_or_else(|| {
-                        messages.push(ProviderMessage {
-                            id: message.id.clone(),
-                            role: message.role,
-                            update: MessageUpdate::Delta {
-                                text: String::new(),
-                            },
-                        });
-                        messages.len() - 1
-                    });
-                let previous = &mut messages[index];
-                previous.role = message.role.or(previous.role);
-                match (&mut previous.update, &message.update) {
-                    (MessageUpdate::Delta { text }, MessageUpdate::Delta { text: delta }) => {
-                        text.push_str(delta)
-                    }
-                    (_, MessageUpdate::Completed { .. } | MessageUpdate::Interrupted) => {
-                        previous.update = message.update.clone()
-                    }
-                    _ => {}
-                }
-            }
+            let mut messages = self.message.lock().await;
             messages
+                .remove(address)
+                .unwrap_or_default()
                 .into_iter()
-                .filter_map(|mut message| {
-                    let MessageUpdate::Delta { text } = message.update else {
-                        return None;
-                    };
-                    message.update = if outcome == crate::turn::TurnOutcome::Completed {
-                        MessageUpdate::Completed { text }
+                .map(|message| {
+                    let update = if outcome == crate::turn::TurnOutcome::Completed {
+                        MessageUpdate::Completed { text: message.text }
                     } else {
                         MessageUpdate::Interrupted
                     };
-                    let text = message.text().map(str::to_owned);
-                    Some(BackendEvent {
-                        message: Some(message),
-                        received_at_ms: None,
-                        address: address.cloned(),
-                        turn_boundary: None,
-                        kind: "assistant_message".into(),
-                        text,
-                        data: Value::Null,
-                        activity: None,
-                        summary: None,
-                        checklist_update: None,
-                    })
+                    BackendEvent::Message {
+                        address: message.address,
+                        update,
+                    }
                 })
                 .collect::<Vec<_>>()
         };
@@ -316,23 +381,10 @@ impl AcpSessionState {
             .await
             .clone()
             .context("ACP permission request has no active turn")?;
-        let mut approval = event("approval_requested", None, Value::Null);
-        ensure!(
-            self.children.lock().await.route(
-                parameter["sessionId"].as_str().unwrap_or_default(),
-                &mut approval
-            ),
-            "ACP permission request has no active session owner"
-        );
-        if let Some(address) = &mut approval.address {
-            address.owner = Some(active.owner.clone());
-        } else {
-            approval.address = Some(crate::backend::ProviderAddress {
-                owner: Some(active.owner.clone()),
-                thread_id: parameter["sessionId"].as_str().unwrap_or_default().into(),
-                turn_id: String::new(),
-            });
-        }
+        let address = self
+            .address(parameter["sessionId"].as_str().unwrap_or_default())
+            .await
+            .context("ACP permission request has no active session owner")?;
         let supplied = &parameter["toolCall"];
         let item_id = supplied["toolCallId"].as_str();
         let session_id = parameter["sessionId"].as_str().unwrap_or_default();
@@ -372,12 +424,7 @@ impl AcpSessionState {
                 .context("ACP agent did not advertise protected-target rejection")?;
             return Ok(json!({"outcome":{"outcome":"selected","optionId":option["optionId"]}}));
         }
-        let authority = if approval
-            .address
-            .as_ref()
-            .and_then(|address| address.owner.as_ref())
-            .is_some_and(|owner| owner.is_root())
-        {
+        let authority = if address.scope.owner.is_root() {
             active.task_authority.clone()
         } else {
             None
@@ -393,7 +440,7 @@ impl AcpSessionState {
             ApprovalResolution::AllowOnce
         } else {
             self.permission
-                .authorize(active.mode, request, approval.address, active.sink.as_ref())
+                .authorize(active.mode, request, Some(address), Some(&active.sink))
                 .await?
         };
         if matches!(
@@ -442,11 +489,10 @@ impl AcpSessionState {
 impl AcpHandler for AcpSessionState {
     async fn notification(&self, method: &str, parameter: Value) -> Result<()> {
         if method == "_claude/sdkMessage" && self.kind == BackendKind::Claude {
-            if !self
-                .children
-                .lock()
-                .await
-                .is_root(parameter["sessionId"].as_str().unwrap_or_default())
+            if self.active.read().await.is_none()
+                || !self
+                    .is_root(parameter["sessionId"].as_str().unwrap_or_default())
+                    .await
             {
                 return Ok(());
             }
@@ -473,16 +519,28 @@ impl AcpHandler for AcpSessionState {
                         cumulative: None,
                         cumulative_total: None,
                     };
-                    self.emit(event("usage", None, serde_json::to_value(update)?))
-                        .await?;
+                    if let Some(address) = self
+                        .address(parameter["sessionId"].as_str().unwrap_or_default())
+                        .await
+                    {
+                        self.emit(BackendEvent::Usage { address, update }).await?;
+                    }
                 }
-                if let Some(duration_ms) = message["duration_ms"].as_u64() {
-                    let mut summary = event("turn_summary", None, Value::Null);
-                    summary.summary = Some(TurnSummary {
-                        duration_ms,
-                        usage: Some(usage),
-                    });
-                    self.emit(summary).await?;
+                if let Some(duration_ms) = message["duration_ms"].as_u64()
+                    && let Some(address) = self
+                        .address(parameter["sessionId"].as_str().unwrap_or_default())
+                        .await
+                {
+                    self.emit(BackendEvent::Turn {
+                        address,
+                        update: TurnUpdate::Summary {
+                            summary: TurnSummary {
+                                duration_ms,
+                                usage: Some(usage),
+                            },
+                        },
+                    })
+                    .await?;
                 }
             }
             return Ok(());
@@ -492,19 +550,28 @@ impl AcpHandler for AcpSessionState {
         }
         let update = &parameter["update"];
         let session_id = parameter["sessionId"].as_str().unwrap_or_default();
-        if matches!(
-            update["sessionUpdate"].as_str(),
-            Some("subagent_spawned" | "subagent_state_update")
-        ) && self.active.read().await.is_none()
+        if self.active.read().await.is_none()
+            && !matches!(
+                update["sessionUpdate"].as_str(),
+                Some("available_commands_update" | "config_option_update" | "current_mode_update")
+            )
+            && !(self.operation.read().await.is_some()
+                && matches!(
+                    update["sessionUpdate"].as_str(),
+                    Some("compaction_update" | "compaction_summary_chunk" | "usage_update")
+                ))
         {
             return Ok(());
         }
         let lifecycle = self.children.lock().await.lifecycle(session_id, update)?;
         if let Some(events) = lifecycle {
             for event in events {
-                if let Some(TurnBoundary::Finished { outcome }) = event.turn_boundary {
-                    self.finish_messages(event.address.as_ref(), outcome)
-                        .await?;
+                if let BackendEvent::Turn {
+                    address,
+                    update: TurnUpdate::Finished { outcome, .. },
+                } = &event
+                {
+                    self.finish_messages(address, *outcome).await?;
                 }
                 self.emit(event).await?;
             }
@@ -512,14 +579,14 @@ impl AcpHandler for AcpSessionState {
         }
         match update["sessionUpdate"].as_str().unwrap_or_default() {
             "available_commands_update" => {
-                if !self.children.lock().await.is_root(session_id) {
+                if !self.is_root(session_id).await {
                     return Ok(());
                 }
                 self.catalog.write().await["availableCommands"] =
                     update["availableCommands"].clone();
             }
             "config_option_update" => {
-                if !self.children.lock().await.is_root(session_id) {
+                if !self.is_root(session_id).await {
                     return Ok(());
                 }
                 self.catalog.write().await["configOptions"] = update["configOptions"].clone();
@@ -530,21 +597,23 @@ impl AcpHandler for AcpSessionState {
                     .pointer("/content/text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let mut event = event("assistant_message", Some(text.into()), update.clone());
-                if thought {
-                    event.kind = "reasoning".into();
-                }
-                event.data = update.clone();
-                self.emit_session(session_id, event).await?;
+                self.message_chunk(session_id, thought.then_some(MessageRole::Thought), text)
+                    .await?;
             }
             "tool_call" | "tool_call_update" => {
                 let Some(id) = update["toolCallId"].as_str().filter(|id| !id.is_empty()) else {
                     return Ok(());
                 };
                 let mut tool_map = self.tool.lock().await;
+                let first = !tool_map.contains_key(&(session_id.to_owned(), id.to_owned()));
                 let snapshot = tool_map
                     .entry((session_id.to_owned(), id.to_owned()))
                     .or_insert_with(|| json!({}));
+                let invocation_changed = ["title", "kind", "rawInput"].into_iter().any(|field| {
+                    update
+                        .get(field)
+                        .is_some_and(|value| !value.is_null() && snapshot.get(field) != Some(value))
+                });
                 if let Some(field_map) = update.as_object() {
                     for (field, value) in field_map {
                         if !value.is_null() {
@@ -555,34 +624,103 @@ impl AcpHandler for AcpSessionState {
                 let snapshot = snapshot.clone();
                 drop(tool_map);
                 let update = &snapshot;
-                let mut event = event("tool_activity", None, update.clone());
-                event.kind = "tool_activity".into();
-                event.text = None;
+                let Some(turn) = self.address(session_id).await else {
+                    return Ok(());
+                };
+                self.classify_messages(&turn, MessageRole::Commentary)
+                    .await?;
+                let address = ToolAddress {
+                    turn,
+                    tool_id: id.into(),
+                };
                 let status = update["status"].as_str().unwrap_or("in_progress");
-                event.activity = Some(ToolActivity {
-                    id: update["toolCallId"].as_str().unwrap_or_default().into(),
+                let status = ToolStatus::parse(status).map_err(|error| BackendError::Protocol {
+                    message: format!("{error:#}"),
+                })?;
+                let invocation = ToolInvocation {
                     kind: match update["kind"].as_str() {
                         Some("edit" | "delete" | "move") => ToolActivityKind::FileChange,
                         Some("execute") => ToolActivityKind::Command,
                         _ => ToolActivityKind::ToolCall,
                     },
                     title: update["title"].as_str().unwrap_or("Tool").into(),
-                    output: tool_output(update)?,
-                    status: Some(ToolStatus::parse(status)?),
-                    change: file_changes(update),
-                    output_delta: false,
-                });
-                event.data = update.clone();
-                self.emit_session(session_id, event).await?;
+                    name: update["title"].as_str().unwrap_or("Tool").into(),
+                    arguments: update.get("rawInput").cloned().unwrap_or(Value::Null),
+                };
+                if first || invocation_changed {
+                    self.emit(BackendEvent::Tool {
+                        address: address.clone(),
+                        update: ToolUpdate::Requested { invocation },
+                    })
+                    .await?;
+                }
+                if first {
+                    self.emit(BackendEvent::Tool {
+                        address: address.clone(),
+                        update: ToolUpdate::Started,
+                    })
+                    .await?;
+                    self.output.lock().await.evidence.tool_called = true;
+                }
+                if let Some(output) = tool_output(update)? {
+                    self.emit(BackendEvent::Tool {
+                        address: address.clone(),
+                        update: ToolUpdate::Output {
+                            update: TextUpdate::Replace(output),
+                        },
+                    })
+                    .await?;
+                }
+                let changes = file_changes(update);
+                if !changes.is_empty() {
+                    if status == ToolStatus::Succeeded {
+                        self.output.lock().await.evidence.workspace_changed = true;
+                    }
+                    self.emit(BackendEvent::Tool {
+                        address: address.clone(),
+                        update: ToolUpdate::Changes { changes },
+                    })
+                    .await?;
+                }
+                let outcome = match status {
+                    ToolStatus::Running => None,
+                    ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
+                    ToolStatus::Failed => Some(ToolOutcome::Failed {
+                        diagnostic: ToolDiagnostic {
+                            code: None,
+                            message: tool_output(update)?
+                                .unwrap_or_else(|| "ACP tool failed".into()),
+                        },
+                    }),
+                    ToolStatus::Denied => Some(ToolOutcome::Denied {
+                        reason: tool_output(update)?.unwrap_or_else(|| "ACP tool denied".into()),
+                    }),
+                    ToolStatus::Cancelled => Some(ToolOutcome::Cancelled),
+                    ToolStatus::Interrupted => Some(ToolOutcome::Interrupted),
+                };
+                if let Some(outcome) = outcome
+                    && self
+                        .finished_tool
+                        .lock()
+                        .await
+                        .insert((session_id.to_owned(), id.to_owned()))
+                {
+                    self.emit(BackendEvent::Tool {
+                        address,
+                        update: ToolUpdate::Finished { outcome },
+                    })
+                    .await?;
+                }
             }
             "compaction_update" => {
-                if !self.children.lock().await.is_root(session_id) {
+                if !self.is_root(session_id).await {
                     return Ok(());
                 }
                 if let Some(mut compaction) = normalize_compaction(
                     update,
                     parameter["sessionId"].as_str().unwrap_or_default(),
                 ) {
+                    compaction.manual |= self.operation.read().await.is_some();
                     let mut compaction_map = self.compaction.lock().await;
                     if let Some(previous) = compaction_map.get(&compaction.id) {
                         compaction.manual |= previous.manual;
@@ -593,12 +731,15 @@ impl AcpHandler for AcpSessionState {
                     }
                     compaction_map.insert(compaction.id.clone(), compaction.clone());
                     drop(compaction_map);
-                    self.emit(BackendEvent::from_compaction(compaction, None))
-                        .await?;
+                    self.emit(BackendEvent::Compaction {
+                        scope: self.event_scope().await?,
+                        update: Box::new(compaction),
+                    })
+                    .await?;
                 }
             }
             "compaction_summary_chunk" => {
-                if !self.children.lock().await.is_root(session_id) {
+                if !self.is_root(session_id).await {
                     return Ok(());
                 }
                 if let (Some(id), Some(text)) = (
@@ -614,13 +755,16 @@ impl AcpHandler for AcpSessionState {
                             .push_str(text);
                         let compaction = compaction.clone();
                         drop(compaction_map);
-                        self.emit(BackendEvent::from_compaction(compaction, None))
-                            .await?;
+                        self.emit(BackendEvent::Compaction {
+                            scope: self.event_scope().await?,
+                            update: Box::new(compaction),
+                        })
+                        .await?;
                     }
                 }
             }
             "usage_update" => {
-                if !self.children.lock().await.is_root(session_id) {
+                if !self.is_root(session_id).await {
                     return Ok(());
                 }
                 if let Some(context) = update["used"]
@@ -629,8 +773,13 @@ impl AcpHandler for AcpSessionState {
                     .and_then(|(used, size)| crate::session::ContextUsage::reported(used, size))
                 {
                     self.output.lock().await.metrics.context_usage = Some(context.clone());
-                    self.emit(event("context_usage", None, serde_json::to_value(context)?))
+                    if self.active.read().await.is_some() {
+                        self.emit(BackendEvent::Runtime {
+                            scope: self.scope().await?,
+                            update: RuntimeUpdate::ContextUsage { usage: context },
+                        })
                         .await?;
+                    }
                 }
             }
             _ => {}
@@ -679,11 +828,14 @@ impl AcpHandler for AcpSessionState {
                             &error,
                             outcome.plan_document.as_ref(),
                         );
-                        self.emit(event(
-                            "error",
-                            Some(format!("Harness tool {name} failed: {failure}")),
-                            Value::Null,
-                        ))
+                        self.emit(BackendEvent::Diagnostic {
+                            scope: self.scope().await?.into(),
+                            diagnostic: ProviderDiagnostic {
+                                code: None,
+                                message: format!("Harness tool {name} failed: {failure}"),
+                                fatal: false,
+                            },
+                        })
                         .await?;
                         return Err(anyhow::anyhow!("{failure}"));
                     }
@@ -813,24 +965,121 @@ async fn ensure_active(active: &RwLock<Option<ActiveTurn>>) -> Result<()> {
     Ok(())
 }
 
-fn event(kind: &str, text: Option<String>, data: Value) -> BackendEvent {
-    BackendEvent {
-        message: None,
-        kind: kind.into(),
-        text,
-        data,
-        received_at_ms: None,
-        address: None,
-        turn_boundary: None,
-        activity: None,
-        summary: None,
-        checklist_update: None,
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
+
+    async fn activate(state: &AcpSessionState, session: &str) -> events::BackendEventStream {
+        let owner = ExecutionOwner::root(session);
+        let scope = InvocationScope::new(owner.clone(), "exchange");
+        let (sink, stream) = events::channel(scope.clone());
+        *state.children.lock().await =
+            super::super::children::AcpChildren::new(String::new(), scope);
+        *state.active.write().await = Some(ActiveTurn {
+            task_authority: None,
+            mode: ApprovalMode::Ask,
+            sink,
+        });
+        stream
+    }
+
+    fn drain(stream: &mut events::BackendEventStream) -> Vec<BackendEvent> {
+        std::iter::from_fn(|| stream.try_next().transpose())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn tool_events(
+        events: &[BackendEvent],
+        id: &str,
+    ) -> (
+        ToolInvocation,
+        Option<String>,
+        Option<ToolOutcome>,
+        ProviderChangeSet,
+    ) {
+        let mut invocation = None;
+        let mut output = None;
+        let mut outcome = None;
+        let mut changes = ProviderChangeSet::default();
+        for event in events {
+            if let BackendEvent::Tool { address, update } = event {
+                if address.tool_id.as_str() != id {
+                    continue;
+                }
+                match update {
+                    ToolUpdate::Requested { invocation: value } => invocation = Some(value.clone()),
+                    ToolUpdate::Output {
+                        update: TextUpdate::Replace(text),
+                    } => output = Some(text.clone()),
+                    ToolUpdate::Output {
+                        update: TextUpdate::Append(text),
+                    } => output.get_or_insert_default().push_str(text),
+                    ToolUpdate::Changes { changes: value } => changes = value.clone(),
+                    ToolUpdate::Finished { outcome: value } => outcome = Some(value.clone()),
+                    _ => {}
+                }
+            }
+        }
+        (
+            invocation.expect("requested ACP tool"),
+            output,
+            outcome,
+            changes,
+        )
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_retains_operation_scope_without_a_provider_turn() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let state = AcpSessionState::new(
+            BackendKind::Claude,
+            PermissionCoordinator::transient(fixture.path())?,
+        );
+        let scope = EventScope::SessionOperation {
+            owner: ExecutionOwner::root("session"),
+            operation_id: "compact".into(),
+        };
+        let (sink, mut stream) = events::channel(scope.clone());
+        state.begin_compaction("native", sink).await?;
+        assert!(state.has_active_work().await);
+        for update in [
+            json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Not a response"}}),
+            json!({"sessionUpdate":"compaction_update","compactionId":"native-compact","status":"in_progress"}),
+            json!({"sessionUpdate":"compaction_summary_chunk","compactionId":"native-compact","content":{"type":"text","text":"Retained"}}),
+            json!({"sessionUpdate":"compaction_update","compactionId":"native-compact","status":"completed"}),
+            json!({"sessionUpdate":"usage_update","used":20,"size":100}),
+        ] {
+            state
+                .notification(
+                    "session/update",
+                    json!({"sessionId":"native","update":update}),
+                )
+                .await?;
+        }
+        state.finish_compaction().await;
+        assert!(!state.has_active_work().await);
+        let events = drain(&mut stream);
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(
+            |event| matches!(event, BackendEvent::Compaction { update, .. } if update.manual)
+                && event.scope() == scope
+        ));
+        assert!(state.active.read().await.is_none());
+        assert_eq!(
+            state
+                .output
+                .lock()
+                .await
+                .metrics
+                .context_usage
+                .as_ref()
+                .unwrap()
+                .used,
+            20
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn message_chunks_complete_with_one_identity_and_preserve_interruption() -> Result<()> {
@@ -843,13 +1092,7 @@ mod test {
                 BackendKind::Claude,
                 PermissionCoordinator::transient(fixture.path())?,
             );
-            let (sink, mut stream) = crate::backend::events::channel();
-            *state.active.write().await = Some(ActiveTurn {
-                task_authority: None,
-                owner: ExecutionOwner::root("test"),
-                mode: ApprovalMode::Ask,
-                sink: Some(sink),
-            });
+            let mut stream = activate(&state, "test").await;
             for text in ["First ", "answer"] {
                 state.notification("session/update", json!({"update":{
                     "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}
@@ -858,20 +1101,29 @@ mod test {
             state.finish(outcome).await?;
             let mut messages = Vec::new();
             while let Some(update) = stream.try_next()? {
-                if let Some(message) = update.message {
-                    messages.push(message);
+                if let BackendEvent::Message { address, update } = update {
+                    messages.push((address, update));
                 }
             }
-            assert!(messages.iter().all(|message| message.id == messages[0].id));
+            assert!(messages.iter().all(|message| message.0 == messages[0].0));
             let last = messages.last().unwrap();
             if outcome == crate::turn::TurnOutcome::Completed {
-                assert_eq!(last.role, Some(MessageRole::Response));
+                assert!(messages.iter().any(|message| matches!(
+                    message.1,
+                    MessageUpdate::Classified {
+                        role: MessageRole::Response
+                    }
+                )));
                 assert!(
-                    matches!(&last.update, MessageUpdate::Completed { text } if text == "First answer")
+                    matches!(&last.1, MessageUpdate::Completed { text } if text == "First answer")
                 );
             } else {
-                assert_eq!(last.role, None);
-                assert!(matches!(last.update, MessageUpdate::Interrupted));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message.1, MessageUpdate::Classified { .. }))
+                );
+                assert!(matches!(last.1, MessageUpdate::Interrupted));
             }
         }
         Ok(())
@@ -883,12 +1135,7 @@ mod test {
             let fixture = tempfile::tempdir()?;
             let state =
                 AcpSessionState::new(kind, PermissionCoordinator::transient(fixture.path())?);
-            *state.active.write().await = Some(ActiveTurn {
-                task_authority: None,
-                owner: crate::backend::ExecutionOwner::root("root"),
-                mode: ApprovalMode::Ask,
-                sink: None,
-            });
+            let _stream = activate(&state, "root").await;
             let mut context = ControlTurnContext::inactive(PromptMode::Chat);
             let (_task_root, _task_store, task_controller) =
                 crate::task::SessionTaskController::test_goal();
@@ -935,12 +1182,7 @@ mod test {
             BackendKind::Antigravity,
             PermissionCoordinator::transient(fixture.path())?,
         );
-        *state.active.write().await = Some(ActiveTurn {
-            task_authority: None,
-            owner: crate::backend::ExecutionOwner::root("root"),
-            mode: ApprovalMode::Ask,
-            sink: None,
-        });
+        let mut stream = activate(&state, "root").await;
         *state.control.lock().await = Some(Arc::new(ControlToolExecutor::new(
             ControlTurnContext::inactive(crate::backend::PromptMode::Chat),
         )));
@@ -962,17 +1204,8 @@ mod test {
                 .iter()
                 .any(|item| item["path"] == "provider" && item["code"] == "unknown_field")
         );
-        let output = state.output.lock().await;
-        assert_eq!(output.event.last().unwrap().kind, "error");
         assert!(
-            output
-                .event
-                .last()
-                .unwrap()
-                .text
-                .as_ref()
-                .unwrap()
-                .contains("text")
+            matches!(drain(&mut stream).last(), Some(BackendEvent::Diagnostic { diagnostic, .. }) if diagnostic.message.contains("text"))
         );
         Ok(())
     }
@@ -990,13 +1223,9 @@ mod test {
             BackendKind::Claude,
             permission.clone(),
         ));
-        *state.children.lock().await = super::super::children::AcpChildren::new("root".into());
-        *state.active.write().await = Some(ActiveTurn {
-            task_authority: None,
-            owner: crate::backend::ExecutionOwner::root("test"),
-            mode: ApprovalMode::Ask,
-            sink: None,
-        });
+        let mut stream = activate(&state, "test").await;
+        *state.children.lock().await =
+            super::super::children::AcpChildren::new("root".into(), state.scope().await?);
         state
             .notification(
                 "session/update",
@@ -1023,9 +1252,8 @@ mod test {
         assert_eq!(*state.catalog.read().await, json!({}));
         assert!(state.output.lock().await.metrics.context_usage.is_none());
         assert!(state.compaction.lock().await.is_empty());
-        assert_eq!(state.output.lock().await.event.len(), 2);
-        let (sink, mut stream) = crate::backend::events::channel();
-        state.active.write().await.as_mut().unwrap().sink = Some(sink);
+        let initial = drain(&mut stream);
+        assert_eq!(initial.len(), 2);
         let waiting_state = state.clone();
         let waiting = tokio::spawn(async move {
             waiting_state.authorize(json!({"sessionId":"child",
@@ -1036,8 +1264,17 @@ mod test {
         let approval = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
             .await??
             .unwrap();
-        assert_eq!(approval.kind, "approval_requested");
-        assert_eq!(approval.address.as_ref().unwrap().thread_id, "child");
+        let BackendEvent::Approval {
+            scope,
+            update: ApprovalUpdate::Requested(approval),
+        } = approval
+        else {
+            panic!("expected approval")
+        };
+        let child = state.address("child").await.unwrap();
+        assert_eq!(child.thread_id, "child");
+        assert_eq!(scope, child.scope);
+        assert_eq!(approval.execution_owner.as_ref(), Some(&child.scope.owner));
         let pending = permission.pending_list()?.remove(0);
         permission
             .resolve(
@@ -1058,8 +1295,7 @@ mod test {
         );
         state.finish(crate::turn::TurnOutcome::Completed).await?;
         assert!(state.active.read().await.is_none());
-        let output = state.output.lock().await;
-        assert_eq!(output.event.last().unwrap().data["status"], "interrupted");
+        assert!(drain(&mut stream).iter().any(|event| matches!(event, BackendEvent::Agent { update: AgentUpdate::Lifecycle { event }, .. } if event.status == crate::agent::AgentExecutionState::Interrupted)));
         Ok(())
     }
 
@@ -1077,12 +1313,7 @@ mod test {
             BackendKind::Claude,
             permission.clone(),
         ));
-        *state.active.write().await = Some(ActiveTurn {
-            task_authority: None,
-            owner: crate::backend::ExecutionOwner::root("test"),
-            mode: ApprovalMode::Ask,
-            sink: None,
-        });
+        let _stream = activate(&state, "test").await;
         for (tool, expected) in [
             (
                 json!({"kind":"edit","rawInput":{"TargetFile":"target.txt"}}),
@@ -1159,12 +1390,7 @@ mod test {
         );
         state.notification("session/update", json!({"update":{"sessionUpdate":"available_commands_update","availableCommands":[]}})).await.unwrap();
         assert_eq!(state.catalog.read().await["availableCommands"], json!([]));
-        *state.active.write().await = Some(ActiveTurn {
-            task_authority: None,
-            owner: crate::backend::ExecutionOwner::root("test"),
-            mode: ApprovalMode::Ask,
-            sink: None,
-        });
+        let mut stream = activate(&state, "test").await;
         for update in [
             json!({"sessionUpdate":"tool_call","toolCallId":"command-1","title":"Run check","kind":"execute","status":"in_progress"}),
             json!({"sessionUpdate":"tool_call_update","toolCallId":"command-1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"passed"}}]}),
@@ -1181,14 +1407,17 @@ mod test {
                 .await
                 .unwrap();
         }
-        let output = state.output.lock().await;
-        let activity = output.event[1].activity.as_ref().unwrap();
-        assert_eq!(activity.title, "Run check");
-        assert!(matches!(activity.kind, ToolActivityKind::Command));
-        assert_eq!(activity.output.as_deref(), Some("passed"));
-        assert_eq!(activity.status.as_deref(), Some("completed"));
+        let events = drain(&mut stream);
+        let (invocation, output, outcome, _) = tool_events(&events, "command-1");
+        assert_eq!(invocation.title, "Run check");
+        assert!(matches!(invocation.kind, ToolActivityKind::Command));
+        assert_eq!(output.as_deref(), Some("passed"));
+        assert!(matches!(outcome, Some(ToolOutcome::Succeeded)));
         assert_eq!(
-            output
+            state
+                .output
+                .lock()
+                .await
                 .metrics
                 .context_usage
                 .as_ref()
@@ -1205,29 +1434,22 @@ mod test {
             Some("Retained summary")
         );
         assert_eq!(compaction.state, CompactionState::Completed);
-        drop(output);
         state.notification("_claude/sdkMessage", json!({"sessionId":"native-1","message":{
             "type":"result","uuid":"call-1","duration_ms":1234,
             "usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":40}
         }})).await.unwrap();
-        let output = state.output.lock().await;
-        let usage: crate::backend::usage::UsageUpdate =
-            serde_json::from_value(output.event[output.event.len() - 2].data.clone()).unwrap();
+        let events = drain(&mut stream);
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                BackendEvent::Usage { update, .. } => Some(update),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(usage.usage.input, Some(60));
         assert_eq!(usage.usage.cached_input, Some(20));
         assert_eq!(usage.usage.reasoning, None);
-        assert_eq!(
-            output
-                .event
-                .last()
-                .unwrap()
-                .summary
-                .as_ref()
-                .unwrap()
-                .duration_ms,
-            1234
-        );
-        drop(output);
+        assert!(events.iter().any(|event| matches!(event, BackendEvent::Turn { update: TurnUpdate::Summary { summary }, .. } if summary.duration_ms == 1234)));
         *state.active.write().await = None;
         assert!(
             state
@@ -1244,12 +1466,7 @@ mod test {
             BackendKind::Claude,
             PermissionCoordinator::transient(fixture.path()).unwrap(),
         );
-        *state.active.write().await = Some(ActiveTurn {
-            task_authority: None,
-            owner: crate::backend::ExecutionOwner::root("test"),
-            mode: ApprovalMode::Ask,
-            sink: None,
-        });
+        let mut stream = activate(&state, "test").await;
         state.notification("session/update", json!({"update":{
             "sessionUpdate":"tool_call","toolCallId":"edit-1","kind":"edit","title":"Edit files",
             "content":[
@@ -1268,15 +1485,15 @@ mod test {
             )
             .await
             .unwrap();
-        let output = state.output.lock().await;
-        let activity = output.event.last().unwrap().activity.as_ref().unwrap();
-        assert_eq!(activity.status.as_deref(), Some("completed"));
-        assert_eq!(activity.output.as_deref(), Some("Edited"));
-        assert_eq!(activity.change.file.len(), 2);
-        let changed = &activity.change.file[0];
+        let events = drain(&mut stream);
+        let (_, output, outcome, changes) = tool_events(&events, "edit-1");
+        assert!(matches!(outcome, Some(ToolOutcome::Succeeded)));
+        assert_eq!(output.as_deref(), Some("Edited"));
+        assert_eq!(changes.file.len(), 2);
+        let changed = &changes.file[0];
         assert_eq!(changed.kind, ProviderChangeKind::Update);
         assert!(changed.diff.contains("-before\n+after\n"));
-        let added = &activity.change.file[1];
+        let added = &changes.file[1];
         assert_eq!(added.kind, ProviderChangeKind::Add);
         assert!(added.diff.starts_with("--- /dev/null\n"));
         assert!(added.diff.contains("+created\n"));
@@ -1289,12 +1506,7 @@ mod test {
             BackendKind::Antigravity,
             PermissionCoordinator::transient(fixture.path()).unwrap(),
         );
-        *state.active.write().await = Some(ActiveTurn {
-            task_authority: None,
-            owner: crate::backend::ExecutionOwner::root("test"),
-            mode: ApprovalMode::Ask,
-            sink: None,
-        });
+        let mut stream = activate(&state, "test").await;
         for update in [
             json!({"sessionUpdate":"tool_call","toolCallId":"command","kind":"execute","title":"Check","status":"in_progress"}),
             json!({"sessionUpdate":"tool_call_update","toolCallId":"command","status":"completed","content":[],
@@ -1309,31 +1521,22 @@ mod test {
                 .await
                 .unwrap();
         }
-        let output = state.output.lock().await;
-        let command = output.event[1].activity.as_ref().unwrap();
+        let events = drain(&mut stream);
+        let (command, output, outcome, _) = tool_events(&events, "command");
         assert_eq!(command.title, "Check");
+        assert_eq!(output.as_deref(), Some("COMMAND_RESULT\nExit code: 7"));
+        assert!(matches!(outcome, Some(ToolOutcome::Succeeded)));
         assert_eq!(
-            command.output.as_deref(),
-            Some("COMMAND_RESULT\nExit code: 7")
-        );
-        assert_eq!(command.status.as_deref(), Some("completed"));
-        assert_eq!(
-            output.event[2].activity.as_ref().unwrap().output.as_deref(),
+            tool_events(&events, "error").1.as_deref(),
             Some("PROVIDER_ERROR")
         );
-        let structured = output.event[3]
-            .activity
-            .as_ref()
-            .unwrap()
-            .output
-            .as_ref()
-            .unwrap();
+        let structured = tool_events(&events, "structured").1.unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(structured).unwrap(),
+            serde_json::from_str::<Value>(&structured).unwrap(),
             json!({"result":[1,2]})
         );
         assert_eq!(
-            output.event[4].activity.as_ref().unwrap().output.as_deref(),
+            tool_events(&events, "explicit").1.as_deref(),
             Some("RENDERED_TEXT")
         );
     }
@@ -1348,12 +1551,7 @@ mod test {
             crate::permissions::document::PermissionDecision::Allow,
         )])?;
         let state = AcpSessionState::new(BackendKind::Claude, permission.clone());
-        *state.active.write().await = Some(ActiveTurn {
-            task_authority: None,
-            owner: crate::backend::ExecutionOwner::root("session"),
-            mode: ApprovalMode::Ask,
-            sink: None,
-        });
+        let _stream = activate(&state, "session").await;
         state.notification("session/update",json!({"sessionId":"native","update":{
             "sessionUpdate":"tool_call","toolCallId":"edit","kind":"edit","locations":[{"path":"one.rs"}]
         }})).await?;

@@ -190,187 +190,258 @@ impl BackendRequest {
     }
 }
 
-/// Represents a streamed backend update normalized for the interaction reducer.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BackendEvent {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<ProviderMessage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// First adapter receipt time, retained through queueing and forwarding.
-    pub received_at_ms: Option<i64>,
-    #[serde(default)]
-    /// Provider execution that owns this event, when exposed by the adapter.
-    pub address: Option<ProviderAddress>,
-    #[serde(default)]
-    /// Explicit execution admission or completion.
-    pub turn_boundary: Option<TurnBoundary>,
-    pub kind: String,
-    pub text: Option<String>,
-    pub data: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activity: Option<ToolActivity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<TurnSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checklist_update: Option<ProviderChecklistUpdate>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackendEvent {
+    Message {
+        address: MessageAddress,
+        update: MessageUpdate,
+    },
+    Tool {
+        address: ToolAddress,
+        update: ToolUpdate,
+    },
+    Turn {
+        address: TurnAddress,
+        update: TurnUpdate,
+    },
+    Usage {
+        address: TurnAddress,
+        update: usage::UsageUpdate,
+    },
+    Runtime {
+        scope: InvocationScope,
+        update: RuntimeUpdate,
+    },
+    Compaction {
+        scope: EventScope,
+        update: Box<Compaction>,
+    },
+    Agent {
+        scope: InvocationScope,
+        update: AgentUpdate,
+    },
+    Checklist {
+        address: TurnAddress,
+        update: ProviderChecklistUpdate,
+    },
+    Approval {
+        scope: InvocationScope,
+        update: ApprovalUpdate,
+    },
+    DirectoryAccess {
+        scope: InvocationScope,
+        grant: Vec<crate::permissions::directory::DirectoryGrant>,
+    },
+    InputAccepted {
+        scope: InvocationScope,
+        acknowledgement: InputAcknowledgement,
+    },
+    Retry {
+        scope: InvocationScope,
+        update: Option<retry::ProviderRetry>,
+    },
+    Diagnostic {
+        scope: EventScope,
+        diagnostic: ProviderDiagnostic,
+    },
+    ParentBoundary {
+        scope: InvocationScope,
+        update: ParentBoundaryUpdate,
+    },
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ToolEvent<'event> {
-    event: &'event BackendEvent,
-    activity: &'event ToolActivity,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeUpdate {
+    Resolved { runtime: BackendRuntime },
+    ContextUsage { usage: ContextUsage },
+    Progress { received_bytes: u64 },
+    ForegroundIdle,
 }
 
-impl<'event> ToolEvent<'event> {
-    pub(crate) fn activity(self) -> &'event ToolActivity {
-        self.activity
-    }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentUpdate {
+    Lifecycle {
+        event: crate::agent::AgentLifecycleEvent,
+    },
+    ConversationResolved {
+        thread_id: String,
+    },
+}
 
-    pub(crate) fn observed_at_ms(self, fallback: i64) -> i64 {
-        self.event.observed_at_ms(fallback)
-    }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "request", rename_all = "snake_case")]
+pub enum ApprovalUpdate {
+    Requested(approval::ApprovalRequestView),
+    Resolved(approval::ApprovalRequestView),
+    Cancelled(approval::ApprovalRequestView),
+}
 
-    pub(crate) fn timestamp(self, path: &str) -> Option<i64> {
-        self.event.data.pointer(path).and_then(Value::as_i64)
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputAcknowledgement {
+    Steering {
+        input_id: Option<String>,
+        text: String,
+    },
+    TaskStarted {
+        input_id: Option<String>,
+        start: crate::exchange::TaskStart,
+        prompt: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderDiagnostic {
+    pub code: Option<String>,
+    pub message: String,
+    pub fatal: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ParentBoundaryUpdate {
+    WaitStarted { agent_count: usize },
+    WaitUpdated { agent_count: usize },
+    WaitFinished,
+}
+
+#[derive(Debug)]
+pub enum BackendError {
+    Cancelled,
+    Transport {
+        message: String,
+    },
+    Protocol {
+        message: String,
+    },
+    Provider {
+        code: Option<String>,
+        message: String,
+    },
+    Rejected {
+        message: String,
+    },
+    Retryable(Box<retry::RetryableFailure>),
+    Delivery(events::EventDeliveryError),
+}
+
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("provider execution cancelled"),
+            Self::Transport { message }
+            | Self::Protocol { message }
+            | Self::Provider { message, .. }
+            | Self::Rejected { message } => formatter.write_str(message),
+            Self::Retryable(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Delivery(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for BackendError {}
+
+impl From<events::EventDeliveryError> for BackendError {
+    fn from(error: events::EventDeliveryError) -> Self {
+        Self::Delivery(error)
+    }
+}
+
+impl From<anyhow::Error> for BackendError {
+    fn from(error: anyhow::Error) -> Self {
+        let error = match error.downcast::<Self>() {
+            Ok(error) => return error,
+            Err(error) => error,
+        };
+        let error = match error.downcast::<events::EventDeliveryError>() {
+            Ok(error) => return Self::Delivery(error),
+            Err(error) => error,
+        };
+        let error = match error.downcast::<retry::RetryableFailure>() {
+            Ok(error) => return Self::Retryable(Box::new(error)),
+            Err(error) => error,
+        };
+        if error.is::<crate::broker::TurnCancelled>() {
+            return Self::Cancelled;
+        }
+        Self::Provider {
+            code: None,
+            message: format!("{error:#}"),
+        }
     }
 }
 
 impl BackendEvent {
-    pub fn with_message(mut self, message: ProviderMessage) -> Self {
-        self.text = message.text().map(str::to_owned);
-        self.message = Some(message);
-        self
-    }
-    pub(crate) fn tool_event(&self) -> Option<ToolEvent<'_>> {
-        self.activity.as_ref().map(|activity| ToolEvent {
-            event: self,
-            activity,
-        })
+    pub fn scope(&self) -> EventScope {
+        match self {
+            Self::Message { address, .. } => address.turn.scope.clone().into(),
+            Self::Tool { address, .. } => address.turn.scope.clone().into(),
+            Self::Turn { address, .. }
+            | Self::Usage { address, .. }
+            | Self::Checklist { address, .. } => address.scope.clone().into(),
+            Self::Compaction { scope, .. } | Self::Diagnostic { scope, .. } => scope.clone(),
+            Self::Runtime { scope, .. }
+            | Self::Agent { scope, .. }
+            | Self::Approval { scope, .. }
+            | Self::DirectoryAccess { scope, .. }
+            | Self::InputAccepted { scope, .. }
+            | Self::Retry { scope, .. }
+            | Self::ParentBoundary { scope, .. } => scope.clone().into(),
+        }
     }
 
-    /// Decode the provider-neutral compaction lifecycle payload.
-    pub(crate) fn compaction(&self) -> Result<Option<Compaction>> {
-        if self.kind != "compaction" {
-            return Ok(None);
+    pub fn turn_address(&self) -> Option<&TurnAddress> {
+        match self {
+            Self::Message { address, .. } => Some(&address.turn),
+            Self::Tool { address, .. } => Some(&address.turn),
+            Self::Turn { address, .. }
+            | Self::Usage { address, .. }
+            | Self::Checklist { address, .. } => Some(address),
+            _ => None,
         }
-        Ok(Some(serde_json::from_value(self.data.clone())?))
-    }
-
-    /// Publish one typed compaction update through the shared event transport.
-    pub(crate) fn from_compaction(
-        compaction: Compaction,
-        address: Option<ProviderAddress>,
-    ) -> Self {
-        Self {
-            message: None,
-            received_at_ms: None,
-            address,
-            turn_boundary: None,
-            kind: "compaction".into(),
-            text: None,
-            data: serde_json::to_value(compaction).expect("compaction is JSON serializable"),
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        }
-    }
-    pub(crate) fn tool_output_delta(&self) -> Option<&str> {
-        if self.turn_boundary.is_some()
-            || self.summary.is_some()
-            || self.checklist_update.is_some()
-            || self.text.is_some()
-        {
-            return None;
-        }
-        self.activity
-            .as_ref()
-            .filter(|activity| {
-                activity.output_delta
-                    && activity.change.is_empty()
-                    && activity
-                        .status
-                        .as_deref()
-                        .is_none_or(|status| status == "running")
-            })
-            .and_then(|activity| activity.output.as_deref())
     }
 
     pub(crate) fn message_delta(&self) -> Option<&str> {
-        if self.turn_boundary.is_some()
-            || self.summary.is_some()
-            || self.checklist_update.is_some()
-            || self.activity.is_some()
-        {
-            return None;
+        match self {
+            Self::Message {
+                update: MessageUpdate::Delta { text },
+                ..
+            } => Some(text),
+            _ => None,
         }
-        match &self.message.as_ref()?.update {
-            MessageUpdate::Delta { text } => Some(text),
+    }
+
+    pub(crate) fn tool_output_delta(&self) -> Option<&str> {
+        match self {
+            Self::Tool {
+                update:
+                    ToolUpdate::Output {
+                        update: TextUpdate::Append(text),
+                    },
+                ..
+            } => Some(text),
             _ => None,
         }
     }
 
     pub(crate) fn observed_at_ms(&self, fallback: i64) -> i64 {
-        [
-            "/params/completedAtMs",
-            "/params/startedAtMs",
-            "/emittedAtMs",
-            "/forge_received_at_ms",
-        ]
-        .into_iter()
-        .find_map(|path| self.data.pointer(path).and_then(Value::as_i64))
-        .or(self.received_at_ms)
-        .unwrap_or(fallback)
-    }
-
-    /// Borrow the provider message identity shared by lifecycle and delta events.
-    pub(crate) fn message_id(&self) -> Option<&str> {
-        self.message.as_ref().map(|message| message.id.0.as_str())
-    }
-
-    /// Borrow the provider delivery phase when the adapter has identified it.
-    pub(crate) fn message_phase(&self) -> Option<&str> {
-        self.message.as_ref()?.role.map(|role| match role {
-            MessageRole::Thought | MessageRole::ThoughtSummary => "thought",
-            MessageRole::Commentary => "commentary",
-            MessageRole::Response => "final_answer",
-        })
-    }
-
-    /// Distinguish authoritative message text from incremental text delivery.
-    pub(crate) fn message_snapshot(&self) -> bool {
-        self.message
-            .as_ref()
-            .is_some_and(ProviderMessage::is_snapshot)
-    }
-
-    /// Build the canonical event for provider-acknowledged active-turn input.
-    pub(crate) fn steering_input(text: String) -> Self {
-        Self {
-            message: None,
-            received_at_ms: None,
-            address: None,
-            turn_boundary: None,
-            kind: "steering_input".into(),
-            text: Some(text),
-            data: Value::Null,
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        }
-    }
-
-    pub(crate) fn task_started(start: crate::exchange::TaskStart, prompt: String) -> Self {
-        Self {
-            message: None,
-            received_at_ms: None,
-            address: None,
-            turn_boundary: None,
-            kind: "task_started".into(),
-            text: Some(prompt),
-            data: serde_json::json!({"start":start}),
-            activity: None,
-            summary: None,
-            checklist_update: None,
+        match self {
+            Self::Turn {
+                update: TurnUpdate::Started { started_at_ms },
+                ..
+            } => *started_at_ms,
+            Self::Turn {
+                update:
+                    TurnUpdate::CallFinished { completed_at_ms }
+                    | TurnUpdate::Finished {
+                        completed_at_ms, ..
+                    },
+                ..
+            } => *completed_at_ms,
+            _ => fallback,
         }
     }
 }
@@ -417,21 +488,7 @@ pub struct TurnSummary {
     pub usage: Option<usage::TokenUsage>,
 }
 
-/// Represents one provider tool invocation across its streamed lifecycle.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ToolActivity {
-    pub id: String,
-    pub kind: ToolActivityKind,
-    pub title: String,
-    pub output: Option<String>,
-    pub status: Option<ToolStatus>,
-    #[serde(default)]
-    pub change: ProviderChangeSet,
-    #[serde(default)]
-    pub output_delta: bool,
-}
-
-impl ToolActivity {
+impl ToolInvocation {
     /// Formats a call with sorted, credential-redacted arguments, decoding JSON strings first.
     /// Returns `None` for an empty name or invalid encoded JSON.
     pub(super) fn call_title(name: &str, arguments: &Value) -> Option<String> {
@@ -611,29 +668,6 @@ impl BackendOutput {
 }
 
 impl BackendCompletion {
-    pub(crate) fn into_output(self) -> BackendOutput {
-        BackendOutput {
-            event: Vec::new(),
-            completion: self,
-        }
-    }
-}
-
-impl std::ops::Deref for BackendOutput {
-    type Target = BackendCompletion;
-
-    fn deref(&self) -> &BackendCompletion {
-        &self.completion
-    }
-}
-
-impl std::ops::DerefMut for BackendOutput {
-    fn deref_mut(&mut self) -> &mut BackendCompletion {
-        &mut self.completion
-    }
-}
-
-impl BackendOutput {
     pub(crate) fn goal_evidence(&self) -> (TurnEvidence, Option<crate::task::TaskPermit>) {
         let mut evidence = self.evidence;
         let permit = match &self.goal_control {
@@ -681,18 +715,12 @@ pub struct BackendRuntime {
 
 impl BackendRuntime {
     /// Publishes resolved provider identity independently of turn content and completion.
-    pub fn resolved_event(&self) -> BackendEvent {
-        BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: None,
-            turn_boundary: None,
-            kind: "runtime_resolved".into(),
-            text: None,
-            data: serde_json::json!(self),
-            activity: None,
-            summary: None,
-            checklist_update: None,
+    pub fn resolved_event(&self, scope: InvocationScope) -> BackendEvent {
+        BackendEvent::Runtime {
+            scope,
+            update: RuntimeUpdate::Resolved {
+                runtime: self.clone(),
+            },
         }
     }
 }
@@ -808,26 +836,39 @@ pub trait Backend: Send + Sync {
     }
 
     /// Collects the ordered stream while the provider executes, including its final drain.
-    async fn prompt(&self, request: BackendRequest) -> Result<BackendOutput> {
-        let (sink, mut stream) = events::channel();
-        let execution = self.prompt_stream(request, sink);
+    async fn prompt(&self, request: BackendRequest) -> Result<BackendOutput, BackendError> {
+        let scope = InvocationScope::new(request.owner()?, uuid::Uuid::new_v4().to_string());
+        let (sink, mut stream) = events::channel(scope);
+        let execution = self.prompt_stream(request, sink.clone());
         tokio::pin!(execution);
         let mut events = Vec::new();
         let mut open = true;
-        let mut output = loop {
+        let mut delivery_failure = None;
+        let result = loop {
             tokio::select! {
-                event = stream.recv(), if open => match event? {
-                    Some(event) => events.push(event),
-                    None => open = false,
+                event = stream.recv(), if open => match event {
+                    Ok(Some(event)) => events.push(event),
+                    Ok(None) => open = false,
+                    Err(error) => {
+                        delivery_failure = Some(error);
+                        open = false;
+                    }
                 },
-                output = &mut execution => break output?.into_output(),
+                output = &mut execution => break output,
             }
         };
+        if let Some(error) = delivery_failure {
+            return Err(error.into());
+        }
         while let Some(event) = stream.try_next()? {
             events.push(event);
         }
-        output.event = events;
-        Ok(output)
+        let completion = result?;
+        drop(sink);
+        Ok(BackendOutput {
+            event: events,
+            completion,
+        })
     }
 
     /// Publishes normalized updates in order and returns completion metadata after delivery settles.
@@ -836,7 +877,7 @@ pub trait Backend: Send + Sync {
         &self,
         request: BackendRequest,
         event_sink: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion>;
+    ) -> Result<crate::backend::BackendCompletion, BackendError>;
 
     /// Fork a provider session only when the provider advertises native support.
     async fn fork(&self, _request: BackendForkRequest) -> Result<BackendForkResult> {
@@ -943,7 +984,7 @@ pub trait Backend: Send + Sync {
     /// Subscribe once to session compaction that can outlive an active provider turn.
     async fn compaction_stream(
         &self,
-        _session_id: &str,
+        _owner: ExecutionOwner,
     ) -> Result<Option<events::BackendEventStream>> {
         Ok(None)
     }
@@ -1004,6 +1045,10 @@ pub fn build(
             acp::AcpBackend::new(kind, launch.command, permission_coordinator, settings_root)?,
         )),
         BackendKind::Mock => Ok(Box::new(MockBackend {
+            provider_stream: launch
+                .command
+                .first()
+                .is_some_and(|value| value == "provider-stream"),
             response_control: Default::default(),
             lsp_probe: launch
                 .command
@@ -1046,6 +1091,7 @@ pub fn build(
 }
 
 struct MockBackend {
+    provider_stream: bool,
     response_control: super::mock_response::MockResponseControl,
     lsp_probe: bool,
     retained_control: Option<
@@ -1187,8 +1233,37 @@ impl Backend for MockBackend {
         &self,
         request: BackendRequest,
         event_sink: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion> {
-        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+    ) -> Result<crate::backend::BackendCompletion, BackendError> {
+        if self.provider_stream {
+            let steering = self.steering_lane(&request.runtime_key()?);
+            let mut active_steering = steering.activate(Some(event_sink.clone()))?;
+            let mut steering_text = Vec::new();
+            let response_hold = self.response_control.arrive(&request);
+            if let Some(hold) = response_hold.as_ref() {
+                self.wait_for_response(Some(hold), &mut active_steering, &mut steering_text)
+                    .await?;
+            }
+            return super::copilot::mock_stream::replay(&request, &event_sink).await;
+        }
+        let scope = event_sink.invocation_scope()?.clone();
+        let turn_address = TurnAddress {
+            scope,
+            thread_id: request
+                .backend_session_id
+                .clone()
+                .unwrap_or_else(|| "mock-session".into()),
+            turn_id: uuid::Uuid::new_v4().to_string().into(),
+        };
+        event_sink
+            .send_wait(BackendEvent::Turn {
+                address: turn_address.clone(),
+                update: TurnUpdate::Started {
+                    started_at_ms: crate::backend::retry::now_ms(),
+                },
+            })
+            .await?;
+        let completion_sink = event_sink.clone();
+        let output: anyhow::Result<crate::backend::BackendCompletion> = async {
         let event_sink = Some(event_sink);
         let steering = self.steering_lane(&request.runtime_key()?);
         let mut active_steering = steering.activate(event_sink.clone())?;
@@ -1231,27 +1306,17 @@ impl Backend for MockBackend {
                 .unwrap_or(false);
             let tool_id = uuid::Uuid::new_v4().to_string();
             if control_probe && let Some(sink) = &event_sink {
-                sink.send_wait(BackendEvent {
-                    message: None,
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "tool".into(),
-                    text: None,
-                    data: Value::Null,
-                    activity: Some(ToolActivity {
-                        id: tool_id.clone(),
+                let address = ToolAddress { turn: turn_address.clone(), tool_id: tool_id.clone().into() };
+                sink.send_wait(BackendEvent::Tool {
+                    address: address.clone(),
+                    update: ToolUpdate::Requested { invocation: ToolInvocation {
                         kind: ToolActivityKind::ToolCall,
+                        name: name.clone(),
                         title: name.clone(),
-                        output: None,
-                        status: Some(crate::backend::ToolStatus::Running),
-                        change: Default::default(),
-                        output_delta: false,
-                    }),
-                    summary: None,
-                    checklist_update: None,
-                })
-                .await?;
+                        arguments: arguments.clone(),
+                    } },
+                }).await?;
+                sink.send_wait(BackendEvent::Tool { address, update: ToolUpdate::Started }).await?;
             }
             let text = if control_probe && name == "__catalog" {
                 serde_json::to_string(
@@ -1308,59 +1373,34 @@ impl Backend for MockBackend {
                 }
             };
             if control_probe && let Some(sink) = &event_sink {
-                sink.send_wait(BackendEvent {
-                    message: None,
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "tool".into(),
-                    text: None,
-                    data: Value::Null,
-                    activity: Some(ToolActivity {
-                        id: tool_id,
-                        kind: ToolActivityKind::ToolCall,
-                        title: name,
-                        output: Some(text.clone()),
-                        status: Some(crate::backend::ToolStatus::Succeeded),
-                        change: Default::default(),
-                        output_delta: false,
-                    }),
-                    summary: None,
-                    checklist_update: None,
-                })
-                .await?;
+                let address = ToolAddress { turn: turn_address.clone(), tool_id: tool_id.into() };
+                sink.send_wait(BackendEvent::Tool {
+                    address: address.clone(),
+                    update: ToolUpdate::Output { update: TextUpdate::Replace(text.clone()) },
+                }).await?;
+                sink.send_wait(BackendEvent::Tool {
+                    address,
+                    update: ToolUpdate::Finished { outcome: ToolOutcome::Succeeded },
+                }).await?;
             }
-            let event = BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "assistant_message".into(),
-                text: Some(if control_probe {
+            let text = if control_probe {
                     format!("```json\n{text}\n```")
                 } else {
                     text
-                }),
-                data: if control_probe {
-                    json!({"phase":"final_answer"})
-                } else {
-                    Value::Null
-                },
-                activity: None,
-                summary: None,
-                checklist_update: None,
+                };
+            let address = MessageAddress {
+                turn: turn_address.clone(),
+                message_id: MessageId::Native(uuid::Uuid::new_v4().to_string()),
             };
-            let event = event.clone().with_message(ProviderMessage {
-                id: MessageId(uuid::Uuid::new_v4().to_string()),
-                role: Some(MessageRole::Response),
-                update: MessageUpdate::Completed {
-                    text: event.text.clone().unwrap_or_default(),
-                },
-            });
             if let Some(sink) = event_sink {
-                sink.send_wait(event.clone()).await?;
+                sink.send_wait(BackendEvent::Message { address: address.clone(),
+                    update: MessageUpdate::Started { classification: MessageClassification::Known(MessageRole::Response), text: text.clone() }
+                }).await?;
+                sink.send_wait(BackendEvent::Message { address,
+                    update: MessageUpdate::Completed { text }
+                }).await?;
             }
-            return Ok(BackendOutput { event: vec![event], completion: crate::backend::BackendCompletion { capability: mock_capability(), ..Default::default() } });
+            return Ok(BackendCompletion { capability: mock_capability(), ..Default::default() });
         }
         if let Some(context) = request.control_context.as_ref()
             && context
@@ -1429,11 +1469,7 @@ impl Backend for MockBackend {
                             shell: None,
                         }],
                     },
-                    Some(ProviderAddress {
-                        owner: Some(request.owner()?),
-                        thread_id: request.harness_session_id.clone(),
-                        turn_id: "mock-turn".into(),
-                    }),
+                    Some(turn_address.clone()),
                     event_sink.as_ref(),
                 )
                 .await?;
@@ -1458,13 +1494,7 @@ impl Backend for MockBackend {
                 | approval::ApprovalResolution::DenyBroad => Some("Rejected by the user."),
             };
         }
-        let event = BackendEvent {
-            message: None,
-            received_at_ms: None,
-            address: None,
-            turn_boundary: None,
-            kind: "assistant_message".into(),
-            text: Some(if let Some(reason) = approval_denial {
+        let response_text = if let Some(reason) = approval_denial {
                 format!(
                     "Mock response: {reason} The requested operation was not executed. Continuing with permitted work."
                 )
@@ -1472,23 +1502,22 @@ impl Backend for MockBackend {
                 "This declaration defines the proposed interface and separates its responsibility from the surrounding code. Implementation details remain outside the declaration plan.".into()
             } else {
                 format!("Mock response: {}", request.input.text())
-            }),
-            data: Value::Null,
-            activity: None,
-            summary: None,
-            checklist_update: None,
+            };
+        let message_address = MessageAddress {
+            turn: turn_address.clone(),
+            message_id: MessageId::Native(uuid::Uuid::new_v4().to_string()),
         };
-        let event = event.clone().with_message(ProviderMessage {
-            id: MessageId(uuid::Uuid::new_v4().to_string()),
-            role: Some(MessageRole::Response),
-            update: MessageUpdate::Completed {
-                text: event.text.clone().unwrap_or_default(),
+        let event = BackendEvent::Message {
+            address: message_address.clone(),
+            update: MessageUpdate::Started {
+                classification: MessageClassification::Known(MessageRole::Response),
+                text: response_text.clone(),
             },
-        });
+        };
         if self.emit_before_delay
             && let Some(event_sink) = event_sink.as_ref()
         {
-            let _ = event_sink.send_wait(event.clone()).await;
+            event_sink.send_wait(event.clone()).await?;
         }
         if self.write_before_delay {
             std::fs::write(
@@ -1501,35 +1530,31 @@ impl Backend for MockBackend {
                 .await?;
         }
         if approval_denial.is_some() {
-            let denial = BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "tool".into(),
-                text: None,
-                data: Value::Null,
-                activity: Some(ToolActivity {
-                    id: "mock-denied".into(),
-                    kind: ToolActivityKind::ToolCall,
-                    title: "mock-probe".into(),
-                    output: approval_denial.map(str::to_owned),
-                    status: Some(crate::backend::ToolStatus::Denied),
-                    change: Default::default(),
-                    output_delta: false,
-                }),
-                summary: None,
-                checklist_update: None,
-            };
+            let address = ToolAddress { turn: turn_address.clone(), tool_id: "mock-denied".into() };
             if let Some(sink) = &event_sink {
-                sink.send_wait(denial.clone()).await?;
-                sink.send_wait(event.clone()).await?;
+                sink.send_wait(BackendEvent::Tool {
+                    address: address.clone(),
+                    update: ToolUpdate::Requested { invocation: ToolInvocation {
+                    kind: ToolActivityKind::ToolCall,
+                    name: "mock-probe".into(),
+                    title: "mock-probe".into(),
+                    arguments: Value::Null,
+                } } }).await?;
+                sink.send_wait(BackendEvent::Tool { address,
+                    update: ToolUpdate::Finished { outcome: ToolOutcome::Denied {
+                        reason: approval_denial.unwrap_or_default().into(),
+                    } }
+                }).await?;
+                if !self.emit_before_delay { sink.send_wait(event.clone()).await?; }
+                sink.send_wait(BackendEvent::Message { address: message_address,
+                    update: MessageUpdate::Completed { text: response_text }
+                }).await?;
             }
             self.permission
                 .as_ref()
                 .expect("mock approval owner")
                 .take_timeout_feedback(&request.owner()?)?;
-            return Ok(BackendOutput { event: vec![denial, event], completion: crate::backend::BackendCompletion { capability: mock_capability(), ..Default::default() } });
+            return Ok(BackendCompletion { capability: mock_capability(), ..Default::default() });
         }
         if request.mode == PromptMode::Plan
             && let Some(document) = request
@@ -1659,10 +1684,10 @@ impl Backend for MockBackend {
             };
             let proposed =
                 document.patch_design(std::path::Path::new(&request.workspace), change.clone())?;
-            return Ok(BackendOutput { event: Vec::new(), completion: crate::backend::BackendCompletion { backend_session_id: request.backend_session_id.or(Some("mock-session".into())), design_patch: vec![change], plan_submit: Some(PlanSubmitRequest {
+            return Ok(BackendCompletion { backend_session_id: request.backend_session_id.or(Some("mock-session".into())), design_patch: vec![change], plan_submit: Some(PlanSubmitRequest {
                     plan_id: document.plan_id.clone(),
                     expected_version: proposed.version,
-                }), structured_plan: true, capability: mock_capability(), ..Default::default() } });
+                }), structured_plan: true, capability: mock_capability(), ..Default::default() });
         }
         let planning_note = (request.mode == PromptMode::Plan).then(|| {
             let steering = steering_text_list
@@ -1886,10 +1911,12 @@ branches: Vec::new()
                 .and_then(|document| document.tasks().last())
                 .is_some_and(|task| task.id == report.task_id)
         });
-        if !self.emit_before_delay
-            && let Some(event_sink) = event_sink
-        {
-            let _ = event_sink.send_wait(event.clone()).await;
+        if let Some(event_sink) = event_sink {
+            if !self.emit_before_delay { event_sink.send_wait(event).await?; }
+            event_sink.send_wait(BackendEvent::Message {
+                address: message_address,
+                update: MessageUpdate::Completed { text: response_text },
+            }).await?;
         }
         let plan_question: Option<PlanQuestionSet> =
             if request.input.text() == "Ask a fixture question." {
@@ -1899,7 +1926,7 @@ branches: Vec::new()
             } else {
                 None
             };
-        Ok(BackendOutput { event: vec![event], completion: crate::backend::BackendCompletion { backend_session_id: request
+        Ok(BackendCompletion { backend_session_id: request
                 .backend_session_id
                 .or_else(|| Some("mock-session".into())), provider_checkpoint_id: Some("mock-checkpoint".into()), plan_edit, design_patch: Vec::new(), plan_submit, plan_read: None, plan_deviation: Vec::new(), plan_task_report: plan_task_report.into_iter().collect(), plan_question, question_answer: None, question_withdrawal: None, control_error: None, goal_control: None, dispatched_task_permit: None, dispatched_execution_id: None, dispatched_entry_id: None, evidence: TurnEvidence {
                 tool_called: request.access.write_access != crate::session::WriteScope::Off,
@@ -1908,10 +1935,26 @@ branches: Vec::new()
             }, capability: mock_capability(), runtime: BackendRuntime {
                 provider: "Mock backend".into(),
                 model: Some(request.model),
-            }, structured_plan: request.mode == PromptMode::Plan, metrics: TurnMetrics::default() } })
+            }, structured_plan: request.mode == PromptMode::Plan, metrics: TurnMetrics::default() })
 
         }.await;
-        Ok(output?.into_completion())
+        let outcome = match &output {
+            Ok(_) => crate::turn::TurnOutcome::Completed,
+            Err(error) if error.is::<crate::broker::TurnCancelled>() => {
+                crate::turn::TurnOutcome::Cancelled
+            }
+            Err(_) => crate::turn::TurnOutcome::Failed,
+        };
+        completion_sink
+            .send_wait(BackendEvent::Turn {
+                address: turn_address,
+                update: TurnUpdate::Finished {
+                    outcome,
+                    completed_at_ms: crate::backend::retry::now_ms(),
+                },
+            })
+            .await?;
+        output.map_err(BackendError::from)
     }
 
     async fn fork(&self, request: BackendForkRequest) -> Result<BackendForkResult> {
@@ -1936,6 +1979,10 @@ branches: Vec::new()
     }
 
     async fn compact(&self, request: BackendCompactionRequest) -> Result<BackendOutput> {
+        let scope = EventScope::SessionOperation {
+            owner: request.request.owner()?,
+            operation_id: request.id.clone(),
+        };
         let compaction = Compaction {
             id: request.id,
             thread_id: request
@@ -1959,7 +2006,10 @@ branches: Vec::new()
         };
         let request = request.request;
         Ok(BackendOutput {
-            event: vec![BackendEvent::from_compaction(compaction, None)],
+            event: vec![BackendEvent::Compaction {
+                scope,
+                update: Box::new(compaction),
+            }],
             completion: crate::backend::BackendCompletion {
                 backend_session_id: request.backend_session_id,
                 capability: mock_capability(),
@@ -2113,6 +2163,7 @@ mod test {
         };
         let backend = Arc::new(MockBackend {
             response_control: Default::default(),
+            provider_stream: false,
             lsp_probe: false,
             retained_control: None,
             permission: None,
@@ -2191,7 +2242,7 @@ mod test {
             submission.record().unwrap().delivery,
             crate::backend::submission::SubmissionState::Accepted { .. }
         ));
-        let text = output.plan_edit[0]
+        let text = output.completion.plan_edit[0]
             .mutation
             .plan
             .as_ref()

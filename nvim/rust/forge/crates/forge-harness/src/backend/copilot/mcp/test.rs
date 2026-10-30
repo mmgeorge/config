@@ -162,11 +162,13 @@ impl Fixture {
                                 "data":{"totalResponseSizeBytes":index}}}})).await;
                     }
                     for (event_type, data) in [
+                        ("assistant.turn_start", json!({"turnId":"turn"})),
                         (
                             "assistant.message",
                             json!({"messageId":"answer","phase":"final_answer","content":"Repository answer"}),
                         ),
-                        ("assistant.idle", json!({})),
+                        ("assistant.turn_end", json!({"turnId":"turn"})),
+                        ("session.idle", json!({})),
                     ] {
                         write_message(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event",
                             "params":{"sessionId":provider_session,"event":{"id":event_type,
@@ -236,14 +238,17 @@ async fn mcp_failures_keep_prompt_and_catalog_available() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let fixture = Fixture::new(&["broken", "disabled", "healthy"]).await;
         let output = fixture.backend.prompt(fixture.prompt()).await.unwrap();
+        assert!(output.event.iter().any(
+            |event| matches!(event, crate::backend::BackendEvent::Message {
+                    update: crate::backend::MessageUpdate::Completed { text }, ..
+                } if text == "Repository answer")
+        ));
         assert!(
-            output
+            !output
                 .event
                 .iter()
-                .any(|event| event.kind == "assistant_message"
-                    && event.text.as_deref() == Some("Repository answer"))
+                .any(|event| matches!(event, crate::backend::BackendEvent::Diagnostic { .. }))
         );
-        assert!(!output.event.iter().any(|event| event.kind == "error"));
         let catalog = fixture.backend.mcp_list(fixture.catalog()).await.unwrap();
         assert_eq!(
             catalog
@@ -373,12 +378,11 @@ async fn mcp_timeout_preserves_healthy_servers_and_session() {
                 .any(|method| method == "session.destroy")
         );
         let output = fixture.backend.prompt(fixture.prompt()).await.unwrap();
-        assert!(
-            output
-                .event
-                .iter()
-                .any(|event| event.text.as_deref() == Some("Repository answer"))
-        );
+        assert!(output.event.iter().any(
+            |event| matches!(event, crate::backend::BackendEvent::Message {
+                    update: crate::backend::MessageUpdate::Completed { text }, ..
+                } if text == "Repository answer")
+        ));
         let trace =
             std::fs::read_to_string(fixture.backend.trace.session_status("mcp-timeout").path)
                 .unwrap();

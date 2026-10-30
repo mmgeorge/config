@@ -2070,18 +2070,10 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
         )],
     );
     let runner = make_runner(workspace.path(), data.path());
-    let (sink, mut stream) = crate::backend::events::channel();
-    let filler = crate::backend::BackendEvent {
-        message: None,
-        received_at_ms: None,
-        address: None,
-        turn_boundary: None,
-        kind: "assistant_message".into(),
-        text: Some("x".repeat(16_384)),
-        data: serde_json::Value::Null,
-        activity: None,
-        summary: None,
-        checklist_update: None,
+    let (sink, mut stream) = crate::broker::publication::channel();
+    let filler = crate::broker::publication::SessionUpdate::CheckFailure {
+        run_id: "backpressure-filler".into(),
+        error: "x".repeat(16_384),
     };
     while let Ok(result) =
         tokio::time::timeout(Duration::from_millis(20), sink.send_wait(filler.clone())).await
@@ -2134,7 +2126,14 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let event = stream.recv().await.unwrap().unwrap();
-            if event.kind == "document_changed" && event.data["checks_running"] == false {
+            if matches!(event, crate::broker::publication::SessionUpdate::DocumentChanged { patch }
+            if patch.operation.iter().any(|operation| matches!(operation,
+                crate::timeline::stream::TimelineOperation::Insert {
+                    entry: crate::timeline::TimelineEntry::Status { checks: None, .. }, ..
+                } | crate::timeline::stream::TimelineOperation::Replace {
+                    entry: crate::timeline::TimelineEntry::Status { checks: None, .. }, ..
+                }
+            ))) {
                 break;
             }
         }

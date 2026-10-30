@@ -3,11 +3,13 @@ use super::approval::ApprovalContext;
 use super::approval::permission_from_provider;
 use super::request_execution::{ExecutedRequest, RequestExecutor};
 use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
+#[cfg(test)]
+use crate::backend::BackendEvent;
 use crate::backend::approval::PermissionCoordinator;
 use crate::backend::{
-    BackendEvent, BackendEventSink, BackendOutput, ChecklistStatus, ProviderChangeKind,
-    ProviderChangeSet, ProviderChecklistEntry, ProviderChecklistUpdate, ProviderFileChange,
-    ToolActivity, ToolActivityKind,
+    BackendEventSink, BackendOutput, ChecklistStatus, ProviderChangeKind, ProviderChangeSet,
+    ProviderChecklistEntry, ProviderChecklistUpdate, ProviderFileChange, ToolActivityKind,
+    ToolInvocation,
 };
 use crate::control_tools::{
     ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext,
@@ -27,6 +29,79 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 const DYNAMIC_TOOL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(super) struct CodexToolSnapshot {
+    pub(super) id: String,
+    pub(super) kind: ToolActivityKind,
+    pub(super) name: String,
+    pub(super) arguments: Value,
+    pub(super) title: String,
+    pub(super) output: Option<String>,
+    pub(super) status: Option<crate::backend::ToolStatus>,
+    pub(super) change: ProviderChangeSet,
+    pub(super) output_delta: bool,
+}
+
+#[cfg(test)]
+fn fixture_scope() -> crate::backend::InvocationScope {
+    crate::backend::InvocationScope {
+        owner: crate::backend::ExecutionOwner::root("session"),
+        exchange_id: "exchange".into(),
+        invocation_id: "fixture-invocation".into(),
+    }
+}
+
+#[cfg(test)]
+fn fixture_normalization() -> super::normalization::CodexNormalization {
+    let mut normalization = super::normalization::CodexNormalization::default();
+    normalization.bind(Some(fixture_scope()));
+    normalization
+}
+
+#[cfg(test)]
+async fn normalize_event(
+    normalization: &mut super::normalization::CodexNormalization,
+    message: &Value,
+    output: &mut BackendOutput,
+    sink: Option<&BackendEventSink>,
+) {
+    normalize_event_in_workspace(normalization, message, output, sink, "", true).await;
+}
+
+#[cfg(test)]
+async fn normalize_event_in_workspace(
+    normalization: &mut super::normalization::CodexNormalization,
+    message: &Value,
+    output: &mut BackendOutput,
+    sink: Option<&BackendEventSink>,
+    workspace: &str,
+    apply_control: bool,
+) {
+    let mut message = message.clone();
+    let method = message["method"].as_str().unwrap_or_default();
+    if method.starts_with("item/") || method.starts_with("turn/plan") {
+        let params = &mut message["params"];
+        if params.get("threadId").is_none() {
+            params["threadId"] = json!("thread");
+        }
+        if params.get("turnId").is_none() {
+            params["turnId"] = json!("turn");
+        }
+    }
+    if message["method"] == "item/agentMessage/delta" && message["params"]["itemId"].is_null() {
+        message["params"]["itemId"] = json!("fixture-message");
+    }
+    let previous = output.event.len();
+    normalization
+        .normalize(&message, output, None, workspace, apply_control)
+        .await
+        .unwrap();
+    if let Some(sink) = sink {
+        for event in &output.event[previous..] {
+            sink.send_wait(event.clone()).await.unwrap();
+        }
+    }
+}
 
 #[derive(Default)]
 struct McpContext {
@@ -274,6 +349,7 @@ pub struct CodexJsonRpc {
     trace: Arc<TraceStore>,
     session_id: String,
     execution_owner: Option<crate::backend::ExecutionOwner>,
+    pub(super) normalization: super::normalization::CodexNormalization,
 }
 
 impl CodexJsonRpc {
@@ -287,9 +363,11 @@ impl CodexJsonRpc {
         trace: Arc<TraceStore>,
         session_id: String,
     ) -> Result<Self> {
-        let (socket, _) = connect_async(endpoint)
-            .await
-            .with_context(|| format!("connect to shared Codex app-server at {endpoint}"))?;
+        let (socket, _) = connect_async(endpoint).await.map_err(|error| {
+            crate::backend::BackendError::Transport {
+                message: format!("connect to shared Codex app-server at {endpoint}: {error}"),
+            }
+        })?;
         Ok(Self {
             socket,
             next_id: 1,
@@ -312,12 +390,22 @@ impl CodexJsonRpc {
             mcp: McpContext::default(),
             approval: ApprovalContext::default(),
             permission_coordinator,
-            event_sink,
+            event_sink: event_sink.clone(),
             activity_publication: true,
             requests_cancelled: false,
             trace,
             session_id,
             execution_owner: None,
+            normalization: {
+                let mut normalization = super::normalization::CodexNormalization::default();
+                normalization.bind(
+                    event_sink
+                        .as_ref()
+                        .map(|sink| sink.invocation_scope().cloned())
+                        .transpose()?,
+                );
+                normalization
+            },
         })
     }
 
@@ -339,9 +427,15 @@ impl CodexJsonRpc {
         workspace: &str,
         approval_mode: ApprovalMode,
         event_sink: Option<BackendEventSink>,
-    ) {
+    ) -> Result<()> {
         self.workspace = workspace.to_owned();
         self.approval_mode = approval_mode;
+        self.normalization.bind(
+            event_sink
+                .as_ref()
+                .map(|sink| sink.invocation_scope().cloned())
+                .transpose()?,
+        );
         self.event_sink = event_sink;
         self.requests_cancelled = false;
         self.control_executor = None;
@@ -353,6 +447,7 @@ impl CodexJsonRpc {
             approval_mode,
             self.event_sink.clone(),
         );
+        Ok(())
     }
 
     /// Isolate preparation traffic until the current provider turn is admitted.
@@ -444,14 +539,15 @@ impl CodexJsonRpc {
                         &message,
                     )
                 {
-                    normalize_event_in_workspace(
-                        &message,
-                        output,
-                        self.event_sink.as_ref(),
-                        &self.workspace,
-                        false,
-                    )
-                    .await;
+                    self.normalization
+                        .normalize(
+                            &message,
+                            output,
+                            self.event_sink.as_ref(),
+                            &self.workspace,
+                            false,
+                        )
+                        .await?;
                 }
                 Ok(message)
             }
@@ -579,14 +675,15 @@ impl CodexJsonRpc {
             return Ok(message);
         }
         if self.activity_publication && !rejects_question_resolution {
-            normalize_event_in_workspace(
-                &message,
-                output,
-                self.event_sink.as_ref(),
-                &self.workspace,
-                false,
-            )
-            .await;
+            self.normalization
+                .normalize(
+                    &message,
+                    output,
+                    self.event_sink.as_ref(),
+                    &self.workspace,
+                    false,
+                )
+                .await?;
         }
         Ok(message)
     }
@@ -598,7 +695,11 @@ impl CodexJsonRpc {
             return None;
         }
         if let Some(error) = message.get("error") {
-            return Some(Err(anyhow::anyhow!("backend {method} failed: {error}")));
+            return Some(Err(crate::backend::BackendError::Provider {
+                code: error.get("code").map(Value::to_string),
+                message: format!("backend {method} failed: {error}"),
+            }
+            .into()));
         }
         Some(Ok(message.get("result").cloned().unwrap_or(Value::Null)))
     }
@@ -628,7 +729,12 @@ impl CodexJsonRpc {
         self.socket
             .send(Message::Text(encoded.into()))
             .await
-            .context("write shared Codex app-server JSON-RPC request")
+            .map_err(|error| {
+                crate::backend::BackendError::Transport {
+                    message: format!("write shared Codex app-server JSON-RPC request: {error}"),
+                }
+                .into()
+            })
     }
 
     async fn complete_provider_request(
@@ -767,12 +873,13 @@ impl CodexJsonRpc {
         {
             if has_runtime {
                 if let Some(invocation) = invocation {
-                    apply_invocation(&invocation, output)?;
+                    apply_invocation(&invocation, &mut output.completion)?;
                 }
             } else {
                 apply_control_request_result(&message, output, response_success)?;
             }
-            if let (Some(digests), Some(request)) = (source_digests, output.design_patch.last_mut())
+            if let (Some(digests), Some(request)) =
+                (source_digests, output.completion.design_patch.last_mut())
             {
                 request.source_digests = digests;
             }
@@ -814,19 +921,36 @@ async fn receive_provider_message(
         let frame = socket
             .next()
             .await
-            .context("shared Codex app-server closed before completing the request")??;
+            .ok_or_else(|| crate::backend::BackendError::Transport {
+                message: "shared Codex app-server closed before completing the request".into(),
+            })?
+            .map_err(|error| crate::backend::BackendError::Transport {
+                message: format!("read Codex response: {error}"),
+            })?;
         match frame {
             Message::Text(text) => break text.to_string(),
             Message::Binary(bytes) => {
-                break String::from_utf8(bytes.to_vec())
-                    .context("decode shared Codex app-server binary frame")?;
+                break String::from_utf8(bytes.to_vec()).map_err(|error| {
+                    crate::backend::BackendError::Protocol {
+                        message: format!("decode shared Codex app-server binary frame: {error}"),
+                    }
+                })?;
             }
             Message::Ping(payload) => {
-                socket.send(Message::Pong(payload)).await?;
+                socket.send(Message::Pong(payload)).await.map_err(|error| {
+                    crate::backend::BackendError::Transport {
+                        message: format!("answer Codex ping: {error}"),
+                    }
+                })?;
             }
             Message::Pong(_) => {}
             Message::Close(close) => {
-                anyhow::bail!("shared Codex app-server closed the session channel: {close:?}")
+                return Err(crate::backend::BackendError::Transport {
+                    message: format!(
+                        "shared Codex app-server closed the session channel: {close:?}"
+                    ),
+                }
+                .into());
             }
             Message::Frame(_) => {}
         }
@@ -837,7 +961,9 @@ async fn receive_provider_message(
         json!({ "bytes": encoded.len() }),
     );
     let message: Value =
-        serde_json::from_str(&encoded).context("decode backend JSON-RPC message")?;
+        serde_json::from_str(&encoded).map_err(|error| crate::backend::BackendError::Protocol {
+            message: format!("decode backend JSON-RPC message: {error}"),
+        })?;
     trace.record_ref(session_id, "model.received", &message);
     Ok(message)
 }
@@ -858,7 +984,7 @@ fn apply_control_request_result(
     let Some(invocation) = control_invocation(method, params)? else {
         return Ok(());
     };
-    apply_invocation(&invocation, output)
+    apply_invocation(&invocation, &mut output.completion)
 }
 
 fn should_apply_control_request_semantics(
@@ -935,461 +1061,6 @@ pub(super) fn native_goal_state(
     }
 }
 
-#[cfg(test)]
-async fn normalize_event(
-    message: &Value,
-    output: &mut BackendOutput,
-    event_sink: Option<&BackendEventSink>,
-) {
-    normalize_event_in_workspace(message, output, event_sink, "", true).await;
-}
-
-async fn normalize_event_in_workspace(
-    message: &Value,
-    output: &mut BackendOutput,
-    event_sink: Option<&BackendEventSink>,
-    workspace: &str,
-    apply_control_invocation: bool,
-) {
-    let method = message
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
-    let address = pointer_string(
-        &params,
-        &[
-            "/threadId",
-            "/thread_id",
-            "/turn/threadId",
-            "/turn/thread_id",
-        ],
-    )
-    .zip(pointer_string(
-        &params,
-        &["/turnId", "/turn_id", "/turn/id"],
-    ))
-    .map(|(thread_id, turn_id)| crate::backend::ProviderAddress {
-        owner: None,
-        thread_id,
-        turn_id,
-    });
-    let text = first_text(&params);
-    let method_lower = method.to_ascii_lowercase();
-    let encoded = params.to_string().to_ascii_lowercase();
-    if method_lower == "turn/moderationmetadata" {
-        return;
-    }
-    if matches!(method_lower.as_str(), "item/started" | "item/completed")
-        && params.pointer("/item/type").and_then(Value::as_str) == Some("contextCompaction")
-    {
-        let Some(id) = params.pointer("/item/id").and_then(Value::as_str) else {
-            return;
-        };
-        let Some(thread_id) = pointer_string(&params, &["/threadId", "/thread_id"]) else {
-            return;
-        };
-        let event = BackendEvent::from_compaction(
-            crate::backend::Compaction {
-                id: id.to_owned(),
-                thread_id,
-                state: if method_lower == "item/started" {
-                    crate::backend::CompactionState::Running
-                } else {
-                    crate::backend::CompactionState::Completed
-                },
-                manual: false,
-                started_at_ms: None,
-                completed_at_ms: None,
-                result: crate::backend::CompactionResult::default(),
-            },
-            address,
-        );
-        if let Some(event_sink) = event_sink {
-            let _ = event_sink.send_wait(event.clone()).await;
-        }
-        append_output_event(output, event);
-        return;
-    }
-    if let Some(events) = normalize_reasoning(method, &params, address.clone()) {
-        for event in events {
-            if let Some(event_sink) = event_sink {
-                let _ = event_sink.send_wait(event.clone()).await;
-            }
-            append_output_event(output, event);
-        }
-        return;
-    }
-    if let Some(event) = normalize_message(method, &params, address.clone(), output) {
-        if let Some(event_sink) = event_sink {
-            let _ = event_sink.send_wait(event.clone()).await;
-        }
-        append_output_event(output, event);
-        return;
-    }
-    if matches!(method_lower.as_str(), "turn/started" | "turn/completed")
-        && pointer_string(
-            &params,
-            &[
-                "/threadId",
-                "/thread_id",
-                "/turn/threadId",
-                "/turn/thread_id",
-            ],
-        )
-        .is_some()
-    {
-        let event = BackendEvent {
-            message: None,
-            address,
-            received_at_ms: None,
-            turn_boundary: Some(if method_lower == "turn/started" {
-                crate::backend::TurnBoundary::Started
-            } else {
-                crate::backend::TurnBoundary::Finished {
-                    outcome: match params.pointer("/turn/status").and_then(Value::as_str) {
-                        Some("failed") => crate::turn::TurnOutcome::Failed,
-                        Some("interrupted") => crate::turn::TurnOutcome::Interrupted,
-                        _ => crate::turn::TurnOutcome::Completed,
-                    },
-                }
-            }),
-            kind: method_lower.replace('/', "_"),
-            text: None,
-            data: json!({ "method": method, "params": params }),
-            activity: None,
-            summary: None,
-            checklist_update: None,
-        };
-        if let Some(event_sink) = event_sink {
-            let _ = event_sink.send_wait(event.clone()).await;
-        }
-        append_output_event(output, event);
-        return;
-    }
-    let agent_lifecycle_list = normalize_agent_lifecycle(method, &params);
-    if !agent_lifecycle_list.is_empty() {
-        for lifecycle in agent_lifecycle_list {
-            let event = BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "agent_lifecycle".into(),
-                text: None,
-                data: serde_json::to_value(lifecycle).unwrap_or(Value::Null),
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            };
-            if let Some(event_sink) = event_sink {
-                let _ = event_sink.send_wait(event.clone()).await;
-            }
-            append_output_event(output, event);
-        }
-        return;
-    }
-    let usage_event = method_lower.contains("tokenusage");
-    if let Some(native_compact) = available_compact_update(&params) {
-        output.metrics.native_compact_update = Some(native_compact);
-    }
-    if usage_event {
-        if address.is_some()
-            && let Some(update) = usage_update(&params)
-        {
-            let event = BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: address.clone(),
-                turn_boundary: None,
-                kind: "usage".into(),
-                text: None,
-                data: serde_json::to_value(update).expect("usage update is JSON serializable"),
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            };
-            if let Some(event_sink) = event_sink {
-                let _ = event_sink.send_wait(event.clone()).await;
-            }
-            append_output_event(output, event);
-        }
-        if let Some(context_usage) = context_usage(&params) {
-            output.metrics.context_usage = Some(context_usage.clone());
-            let event = BackendEvent {
-                message: None,
-                received_at_ms: None,
-                address: address.clone(),
-                turn_boundary: None,
-                kind: "context_usage".into(),
-                text: None,
-                data: serde_json::to_value(context_usage).unwrap_or(Value::Null),
-                activity: None,
-                summary: None,
-                checklist_update: None,
-            };
-            if let Some(event_sink) = event_sink {
-                let _ = event_sink.send_wait(event.clone()).await;
-            }
-            append_output_event(output, event);
-        }
-        return;
-    }
-    let control_tool = control_tool_name(method, &params);
-    let tool_event = is_tool_lifecycle_event(&method_lower, &params);
-    let plan_event = method_lower.contains("plan");
-    let reasoning_event = method_lower.contains("reason") || encoded.contains("\"thought\"");
-    let assistant_event = method_lower.contains("agentmessage");
-    let error_event = method_lower.contains("error") || encoded.contains("\"type\":\"error\"");
-    if method_lower == "error"
-        && params
-            .get("error")
-            .and_then(super::retry::transient_code)
-            .is_some()
-        && crate::backend::retry::replay_safe(output)
-    {
-        return;
-    }
-    let kind = if tool_event {
-        output.evidence.tool_called = true;
-        "tool"
-    } else if error_event {
-        "error"
-    } else if plan_event {
-        "plan"
-    } else if reasoning_event {
-        "reasoning"
-    } else {
-        "assistant_message"
-    };
-
-    if apply_control_invocation
-        && tool_event
-        && let Ok(Some(invocation)) = control_invocation(method, &params)
-    {
-        let _ = apply_invocation(&invocation, output);
-    }
-    if let Some(state) = output
-        .backend_session_id
-        .as_deref()
-        .and_then(|thread_id| native_goal_state(message, thread_id))
-    {
-        output.evidence.native_state = Some(state);
-    }
-    let user_message_item = params
-        .pointer("/item/type")
-        .and_then(Value::as_str)
-        .is_some_and(|item_type| item_type.eq_ignore_ascii_case("userMessage"));
-    if !user_message_item
-        && (tool_event || plan_event || reasoning_event || assistant_event || error_event)
-    {
-        let activity = if tool_event {
-            match normalize_tool_activity(method, &params, workspace) {
-                Ok(activity) => activity,
-                Err(error) => {
-                    let event = BackendEvent {
-                        message: None,
-                        address,
-                        received_at_ms: None,
-                        turn_boundary: None,
-                        kind: "error".into(),
-                        text: Some(format!("{error:#}")),
-                        data: json!({"method":method}),
-                        activity: None,
-                        summary: None,
-                        checklist_update: None,
-                    };
-                    if let Some(sink) = event_sink {
-                        let _ = sink.send_wait(event.clone()).await;
-                    }
-                    append_output_event(output, event);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        if control_tool.is_some() && activity.is_none() {
-            return;
-        }
-        if activity.as_ref().is_some_and(successful_file_change) {
-            output.evidence.workspace_changed = true;
-        }
-        let checklist_update = plan_event
-            .then(|| normalize_checklist_update(method, &params))
-            .flatten();
-        let data = json!({ "method": method, "params": params });
-        let event = BackendEvent {
-            message: None,
-            address,
-            received_at_ms: None,
-            turn_boundary: None,
-            kind: kind.into(),
-            text: activity.is_none().then_some(text).flatten(),
-            data,
-            activity,
-            summary: None,
-            checklist_update,
-        };
-        if let Some(event_sink) = event_sink {
-            let _ = event_sink.send_wait(event.clone()).await;
-        }
-        append_output_event(output, event);
-    }
-}
-
-fn normalize_reasoning(
-    method: &str,
-    params: &Value,
-    address: Option<crate::backend::ProviderAddress>,
-) -> Option<Vec<BackendEvent>> {
-    let delta = method.eq_ignore_ascii_case("item/reasoning/summaryTextDelta");
-    let boundary = method.eq_ignore_ascii_case("item/reasoning/summaryPartAdded");
-    let lifecycle = matches!(method, "item/started" | "item/completed")
-        && params.pointer("/item/type").and_then(Value::as_str) == Some("reasoning");
-    if !delta && !boundary && !lifecycle {
-        return None;
-    }
-    if boundary {
-        return Some(Vec::new());
-    }
-    let item_id = pointer_string(params, &["/itemId", "/item_id", "/item/id"])?;
-    let sections = if delta {
-        vec![(
-            params
-                .get("summaryIndex")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            params.get("delta").and_then(Value::as_str)?.to_owned(),
-        )]
-    } else {
-        params
-            .pointer("/item/summary")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .filter_map(|(index, text)| text.as_str().map(|text| (index as u64, text.to_owned())))
-            .collect()
-    };
-    Some(
-        sections
-            .into_iter()
-            .map(|(index, text)| {
-                let mut data = json!({"method":method,"params":params,
-            "provider_message_id":format!("{item_id}:summary:{index}")});
-                if lifecycle {
-                    data["message_update"] = json!("snapshot");
-                }
-                BackendEvent {
-                    message: Some(crate::backend::ProviderMessage {
-                        id: crate::backend::MessageId(format!("{item_id}:summary:{index}")),
-                        role: Some(crate::backend::MessageRole::ThoughtSummary),
-                        update: if lifecycle {
-                            crate::backend::MessageUpdate::Completed { text: text.clone() }
-                        } else {
-                            crate::backend::MessageUpdate::Delta { text: text.clone() }
-                        },
-                    }),
-                    address: address.clone(),
-                    received_at_ms: None,
-                    turn_boundary: None,
-                    kind: "reasoning_summary".into(),
-                    text: Some(text),
-                    data,
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                }
-            })
-            .collect(),
-    )
-}
-
-/// Preserve message identity and phase across Codex item snapshots and text deltas.
-fn normalize_message(
-    method: &str,
-    params: &Value,
-    address: Option<crate::backend::ProviderAddress>,
-    output: &BackendOutput,
-) -> Option<BackendEvent> {
-    let delta = method.eq_ignore_ascii_case("item/agentMessage/delta");
-    let completed = method.eq_ignore_ascii_case("item/completed");
-    let lifecycle = (completed || method.eq_ignore_ascii_case("item/started"))
-        && params
-            .pointer("/item/type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("agentMessage"));
-    if !delta && !lifecycle {
-        return None;
-    }
-    let id = pointer_string(params, &["/itemId", "/item_id", "/item/id"])?;
-    let role = match pointer_string(params, &["/item/phase", "/phase"]) {
-        Some(phase) => match crate::backend::MessageRole::from_phase(&phase) {
-            Ok(role) => Some(role),
-            Err(error) => {
-                return Some(BackendEvent {
-                    message: None,
-                    address,
-                    received_at_ms: None,
-                    turn_boundary: None,
-                    kind: "error".into(),
-                    text: Some(error.to_string()),
-                    data: json!({"method":method}),
-                    activity: None,
-                    summary: None,
-                    checklist_update: None,
-                });
-            }
-        },
-        None => output.event.iter().rev().find_map(|previous| {
-            (previous.address == address && previous.message_id() == Some(id.as_str()))
-                .then(|| previous.message.as_ref().and_then(|message| message.role))
-                .flatten()
-        }),
-    };
-    let text = if delta {
-        params
-            .get("delta")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    } else if completed {
-        params
-            .pointer("/item/text")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    } else {
-        None
-    };
-    let event = BackendEvent {
-        message: Some(crate::backend::ProviderMessage {
-            id: crate::backend::MessageId(id),
-            role,
-            update: if delta {
-                crate::backend::MessageUpdate::Delta {
-                    text: text.clone().unwrap_or_default(),
-                }
-            } else if completed {
-                crate::backend::MessageUpdate::Completed {
-                    text: text.clone().unwrap_or_default(),
-                }
-            } else {
-                crate::backend::MessageUpdate::Started
-            },
-        }),
-        address,
-        received_at_ms: None,
-        turn_boundary: None,
-        kind: "assistant_message".into(),
-        text,
-        data: json!({ "method": method, "params": params }),
-        activity: None,
-        summary: None,
-        checklist_update: None,
-    };
-    Some(event)
-}
-
 fn normalize_agent_status(status: &str) -> Option<AgentExecutionState> {
     match status.to_ascii_lowercase().as_str() {
         "pendinginit" => Some(AgentExecutionState::Starting),
@@ -1403,7 +1074,7 @@ fn normalize_agent_status(status: &str) -> Option<AgentExecutionState> {
     }
 }
 
-fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifecycleEvent> {
+pub(super) fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifecycleEvent> {
     let encoded = params.to_string().to_ascii_lowercase();
     let method_lower = method.to_ascii_lowercase();
     if !method_lower.contains("subagent")
@@ -1547,10 +1218,15 @@ pub(crate) fn agent_lifecycle_list(message: &Value) -> Vec<AgentLifecycleEvent> 
     normalize_agent_lifecycle(method, params)
 }
 
-fn pointer_string(value: &Value, pointer_list: &[&str]) -> Option<String> {
+pub(super) fn pointer_string(value: &Value, pointer_list: &[&str]) -> Option<String> {
     pointer_list
         .iter()
-        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .find_map(|pointer| {
+            value
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
         .map(str::to_owned)
 }
 
@@ -1561,7 +1237,7 @@ fn first_string(value: &Value, field_list: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn context_usage(params: &Value) -> Option<ContextUsage> {
+pub(super) fn context_usage(params: &Value) -> Option<ContextUsage> {
     if let Some(token_usage) = params
         .get("tokenUsage")
         .or_else(|| params.get("token_usage"))
@@ -1582,7 +1258,7 @@ fn context_usage(params: &Value) -> Option<ContextUsage> {
     ContextUsage::reported(used, size)
 }
 
-fn available_compact_update(params: &Value) -> Option<bool> {
+pub(super) fn available_compact_update(params: &Value) -> Option<bool> {
     let update = params.get("update").unwrap_or(params);
     let command_list = update
         .get("availableCommands")
@@ -1596,7 +1272,7 @@ fn available_compact_update(params: &Value) -> Option<bool> {
     }))
 }
 
-fn usage_update(params: &Value) -> Option<crate::backend::usage::UsageUpdate> {
+pub(super) fn usage_update(params: &Value) -> Option<crate::backend::usage::UsageUpdate> {
     use crate::backend::usage::{TokenUsage, UsageUpdate};
     fn pointer_u64(value: &Value, paths: &[&str]) -> Option<u64> {
         paths
@@ -1634,7 +1310,15 @@ fn usage_update(params: &Value) -> Option<crate::backend::usage::UsageUpdate> {
     })
 }
 
-fn is_tool_lifecycle_event(method_lower: &str, params: &Value) -> bool {
+pub(super) fn is_tool_lifecycle_event(method_lower: &str, params: &Value) -> bool {
+    if matches!(
+        method_lower,
+        "item/commandexecution/requestapproval"
+            | "item/filechange/requestapproval"
+            | "item/permissions/requestapproval"
+    ) {
+        return false;
+    }
     let envelope = params.get("update").unwrap_or(params);
     let item = envelope.get("item").unwrap_or(envelope);
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
@@ -1731,132 +1415,10 @@ pub(super) fn control_invocation(
     }))
 }
 
-fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
-    if let Some(compaction) = event.compaction().ok().flatten()
-        && let Some(previous) = output.event.iter_mut().find(|previous| {
-            previous
-                .compaction()
-                .ok()
-                .flatten()
-                .is_some_and(|existing| {
-                    existing.id == compaction.id && existing.thread_id == compaction.thread_id
-                })
-        })
-    {
-        if previous
-            .compaction()
-            .ok()
-            .flatten()
-            .is_some_and(|existing| existing.state == crate::backend::CompactionState::Running)
-        {
-            *previous = event;
-        }
-        return;
-    }
-    if matches!(
-        event.kind.as_str(),
-        "assistant_message" | "reasoning_summary"
-    ) && let Some(id) = event.message_id()
-        && let Some(previous) = output.event.iter_mut().rev().find(|previous| {
-            previous.kind == event.kind
-                && previous.address == event.address
-                && previous.message_id() == Some(id)
-        })
-    {
-        if let Some(text) = event.text.as_deref() {
-            if event.message_snapshot() {
-                previous.text = Some(text.to_owned());
-            } else {
-                previous.text.get_or_insert_default().push_str(text);
-            }
-        }
-        if let Some(message) = &mut previous.message {
-            message.role = event
-                .message
-                .as_ref()
-                .and_then(|message| message.role)
-                .or(message.role);
-            message.update = if event.message_snapshot() {
-                crate::backend::MessageUpdate::Completed {
-                    text: previous.text.clone().unwrap_or_default(),
-                }
-            } else if event.text.is_some() {
-                crate::backend::MessageUpdate::Delta {
-                    text: previous.text.clone().unwrap_or_default(),
-                }
-            } else {
-                event
-                    .message
-                    .as_ref()
-                    .expect("message event")
-                    .update
-                    .clone()
-            };
-        }
-        previous.data = event.data;
-        return;
-    }
-    if let Some(update) = event.checklist_update.as_ref()
-        && let Some(index) = output.event.iter().rposition(|previous| {
-            previous
-                .checklist_update
-                .as_ref()
-                .is_some_and(|previous_update| previous_update.scope_id == update.scope_id)
-        })
-    {
-        let mut previous = output.event.remove(index);
-        merge_checklist_update(&mut previous, event);
-        output.event.push(previous);
-        return;
-    }
-    if let Some(activity) = event.activity.as_ref() {
-        let exact_index = output.event.iter().rposition(|previous| {
-            previous.activity.as_ref().is_some_and(|previous_activity| {
-                previous_activity.id == activity.id && previous.address == event.address
-            })
-        });
-        if let Some(index) = exact_index {
-            merge_tool_activity(&mut output.event[index], event);
-            return;
-        }
-    }
-    let mergeable = matches!(event.kind.as_str(), "assistant_message" | "reasoning");
-    if mergeable
-        && let Some(text) = event.text.as_deref()
-        && let Some(previous) = output.event.last_mut()
-        && previous.kind == event.kind
-        && previous.address == event.address
-        && previous.message_id() == event.message_id()
-        && previous.message_phase() == event.message_phase()
-        && !event.message_snapshot()
-        && let Some(previous_text) = previous.text.as_mut()
-    {
-        previous_text.push_str(text);
-        previous.data = event.data;
-        return;
-    }
-    output.event.push(event);
-}
-
-fn merge_checklist_update(previous: &mut BackendEvent, incoming: BackendEvent) {
-    let Some(incoming_update) = incoming.checklist_update else {
-        return;
-    };
-    let Some(previous_update) = previous.checklist_update.as_mut() else {
-        return;
-    };
-    if incoming_update.name.is_some() {
-        previous_update.name = incoming_update.name;
-    }
-    if incoming_update.replace_entries {
-        previous_update.entry_list = incoming_update.entry_list;
-    }
-    previous_update.replace_entries = incoming_update.replace_entries;
-    previous_update.complete = incoming_update.complete;
-    previous.data = incoming.data;
-}
-
-fn normalize_checklist_update(method: &str, params: &Value) -> Option<ProviderChecklistUpdate> {
+pub(super) fn normalize_checklist_update(
+    method: &str,
+    params: &Value,
+) -> Option<ProviderChecklistUpdate> {
     let envelope = params.get("update").unwrap_or(params);
     let entry_list = envelope
         .get("plan")
@@ -1934,22 +1496,25 @@ fn normalize_checklist_update(method: &str, params: &Value) -> Option<ProviderCh
     })
 }
 
-fn normalize_tool_activity(
+pub(super) fn normalize_tool_activity(
     method: &str,
     params: &Value,
     workspace: &str,
-) -> Result<Option<ToolActivity>> {
+) -> Result<Option<CodexToolSnapshot>> {
     let envelope = params.get("update").unwrap_or(params);
     let item = envelope.get("item").unwrap_or(envelope);
-    let Some(id) = item
-        .get("id")
-        .or_else(|| envelope.get("itemId"))
-        .or_else(|| envelope.get("item_id"))
-        .or_else(|| envelope.get("toolCallId"))
-        .or_else(|| envelope.get("tool_call_id"))
-        .or_else(|| envelope.get("callId"))
-        .and_then(Value::as_str)
-    else {
+    let Some(id) = [
+        item.get("id"),
+        envelope.get("itemId"),
+        envelope.get("item_id"),
+        envelope.get("toolCallId"),
+        envelope.get("tool_call_id"),
+        envelope.get("callId"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .find(|id| !id.is_empty()) else {
         return Ok(None);
     };
     let id = id.to_owned();
@@ -2070,7 +1635,26 @@ fn normalize_tool_activity(
         .as_deref()
         .map(crate::backend::ToolStatus::parse)
         .transpose()?;
-    Ok(Some(ToolActivity {
+    Ok(Some(CodexToolSnapshot {
+        name: item
+            .get("tool")
+            .or_else(|| item.get("name"))
+            .or_else(|| item.get("toolName"))
+            .or_else(|| item.get("tool_name"))
+            .or_else(|| item.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool")
+            .into(),
+        arguments: item.get("arguments").cloned().unwrap_or_else(|| {
+            if kind == ToolActivityKind::Command {
+                json!({
+                    "command": item.get("command").or_else(|| envelope.get("command")),
+                    "cwd": item.get("cwd").or_else(|| envelope.get("cwd")),
+                })
+            } else {
+                Value::Null
+            }
+        }),
         id,
         kind,
         title,
@@ -2158,7 +1742,7 @@ fn provider_change_path(path: &str, workspace: &str) -> String {
         .into_owned()
 }
 
-fn successful_file_change(activity: &ToolActivity) -> bool {
+pub(super) fn successful_file_change(activity: &CodexToolSnapshot) -> bool {
     activity.kind == ToolActivityKind::FileChange
         && !activity.change.is_empty()
         && activity.status.as_deref().is_some_and(|status| {
@@ -2223,12 +1807,12 @@ fn callable_tool_title(item: &Value) -> Option<String> {
             |namespace| format!("{namespace}.{tool}"),
         );
     let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    ToolActivity::call_title(&title, &arguments)
+    ToolInvocation::call_title(&title, &arguments)
 }
 
 fn generic_tool_title(item: &Value) -> Option<String> {
     let title = item.get("type").and_then(Value::as_str)?;
-    ToolActivity::call_title(title, item)
+    ToolInvocation::call_title(title, item)
 }
 
 fn builtin_tool_title(item: &Value) -> Option<String> {
@@ -2358,42 +1942,7 @@ fn compact_tool_title(title: &str) -> Option<String> {
     (!compact.is_empty()).then_some(compact)
 }
 
-fn merge_tool_activity(previous: &mut BackendEvent, incoming: BackendEvent) {
-    let Some(incoming_activity) = incoming.activity else {
-        return;
-    };
-    let Some(previous_activity) = previous.activity.as_mut() else {
-        return;
-    };
-    if !incoming_activity.title.is_empty()
-        && !matches!(
-            incoming_activity.title.as_str(),
-            "command" | "file changes" | "tool"
-        )
-    {
-        previous_activity.title = incoming_activity.title;
-    }
-    if let Some(output) = incoming_activity.output {
-        if incoming_activity.output_delta {
-            previous_activity
-                .output
-                .get_or_insert_default()
-                .push_str(&output);
-        } else {
-            previous_activity.output = Some(output);
-        }
-    }
-    if incoming_activity.status.is_some() {
-        previous_activity.status = incoming_activity.status;
-    }
-    if !incoming_activity.change.is_empty() {
-        previous_activity.change = incoming_activity.change;
-    }
-    previous_activity.output_delta = false;
-    previous.data = incoming.data;
-}
-
-fn first_text(value: &Value) -> Option<String> {
+pub(super) fn first_text(value: &Value) -> Option<String> {
     for pointer in [
         "/delta",
         "/text",
@@ -2415,6 +1964,197 @@ fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    use crate::backend::{
+        MessageAddress, MessageClassification, MessageRole, MessageUpdate, TextUpdate, ToolAddress,
+        ToolOutcome, ToolStatus, ToolUpdate,
+    };
+
+    struct MessageRecord {
+        address: MessageAddress,
+        role: Option<MessageRole>,
+        text: String,
+        completed: bool,
+    }
+
+    fn message_records(events: &[BackendEvent]) -> Vec<MessageRecord> {
+        let mut records: Vec<MessageRecord> = Vec::new();
+        for event in events {
+            let BackendEvent::Message { address, update } = event else {
+                continue;
+            };
+            let index = records
+                .iter()
+                .position(|record| record.address == *address)
+                .unwrap_or_else(|| {
+                    records.push(MessageRecord {
+                        address: address.clone(),
+                        role: None,
+                        text: String::new(),
+                        completed: false,
+                    });
+                    records.len() - 1
+                });
+            let record = &mut records[index];
+            match update {
+                MessageUpdate::Started {
+                    classification,
+                    text,
+                } => {
+                    record.role = match classification {
+                        MessageClassification::Known(role) => Some(*role),
+                        MessageClassification::Unclassified => None,
+                    };
+                    record.text = text.clone();
+                }
+                MessageUpdate::Delta { text } => record.text.push_str(text),
+                MessageUpdate::Completed { text } => {
+                    record.text = text.clone();
+                    record.completed = true;
+                }
+                MessageUpdate::Classified { role } => record.role = Some(*role),
+                MessageUpdate::Interrupted => record.completed = true,
+            }
+        }
+        records
+    }
+
+    fn message_text(events: &[BackendEvent], index: usize) -> Option<String> {
+        message_records(events)
+            .get(index)
+            .map(|record| record.text.clone())
+    }
+
+    fn message_id(events: &[BackendEvent], index: usize) -> Option<String> {
+        message_records(events)
+            .get(index)
+            .map(|record| record.address.message_id.as_str().into())
+    }
+
+    fn message_role(events: &[BackendEvent], index: usize) -> Option<MessageRole> {
+        message_records(events)
+            .get(index)
+            .and_then(|record| record.role)
+    }
+
+    fn tool_records(events: &[BackendEvent]) -> Vec<CodexToolSnapshot> {
+        let mut records: Vec<(ToolAddress, CodexToolSnapshot)> = Vec::new();
+        for event in events {
+            let BackendEvent::Tool { address, update } = event else {
+                continue;
+            };
+            let index = records
+                .iter()
+                .position(|(existing, _)| existing == address)
+                .unwrap_or_else(|| {
+                    records.push((
+                        address.clone(),
+                        CodexToolSnapshot {
+                            id: address.tool_id.to_string(),
+                            kind: ToolActivityKind::ToolCall,
+                            name: String::new(),
+                            arguments: Value::Null,
+                            title: String::new(),
+                            output: None,
+                            status: None,
+                            change: ProviderChangeSet::default(),
+                            output_delta: false,
+                        },
+                    ));
+                    records.len() - 1
+                });
+            let record = &mut records[index].1;
+            match update {
+                ToolUpdate::Requested { invocation } => {
+                    record.kind = invocation.kind;
+                    record.name = invocation.name.clone();
+                    record.arguments = invocation.arguments.clone();
+                    record.title = invocation.title.clone();
+                }
+                ToolUpdate::Started if record.status.is_none() => {
+                    record.status = Some(ToolStatus::Running)
+                }
+                ToolUpdate::Output {
+                    update: TextUpdate::Append(text),
+                } => record.output.get_or_insert_default().push_str(text),
+                ToolUpdate::Output {
+                    update: TextUpdate::Replace(text),
+                } => record.output = Some(text.clone()),
+                ToolUpdate::Changes { changes } => record.change = changes.clone(),
+                ToolUpdate::Finished { outcome } => {
+                    record.status = Some(match outcome {
+                        ToolOutcome::Succeeded => ToolStatus::Succeeded,
+                        ToolOutcome::Failed { .. } => ToolStatus::Failed,
+                        ToolOutcome::Denied { .. } => ToolStatus::Denied,
+                        ToolOutcome::Cancelled => ToolStatus::Cancelled,
+                        ToolOutcome::Interrupted => ToolStatus::Interrupted,
+                    })
+                }
+                _ => {}
+            }
+        }
+        records.into_iter().map(|(_, record)| record).collect()
+    }
+
+    fn record_count(events: &[BackendEvent]) -> usize {
+        let mut identities = HashSet::new();
+        for event in events {
+            let identity = match event {
+                BackendEvent::Message { address, .. } => format!("message:{address:?}"),
+                BackendEvent::Tool { address, .. } => format!("tool:{address:?}"),
+                BackendEvent::Compaction { scope, update } => {
+                    format!("compaction:{scope:?}:{}:{}", update.thread_id, update.id)
+                }
+                BackendEvent::Checklist { address, update } => {
+                    format!("checklist:{address:?}:{}", update.scope_id)
+                }
+                _ => format!("event:{event:?}"),
+            };
+            identities.insert(identity);
+        }
+        identities.len()
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_preserves_operation_scope_without_message_admission() -> Result<()> {
+        let scope = crate::backend::EventScope::SessionOperation {
+            owner: crate::backend::ExecutionOwner::root("session"),
+            operation_id: "compact".into(),
+        };
+        let mut normalization = super::super::normalization::CodexNormalization::default();
+        normalization.bind(Some(scope.clone()));
+        let mut output = BackendOutput::default();
+        for (method, item) in [
+            (
+                "item/started",
+                json!({"type":"contextCompaction","id":"compact"}),
+            ),
+            (
+                "item/completed",
+                json!({"type":"agentMessage","id":"ignored","phase":"final_answer","text":"Not a response"}),
+            ),
+            (
+                "item/completed",
+                json!({"type":"contextCompaction","id":"compact"}),
+            ),
+        ] {
+            normalization
+                .normalize(
+                    &json!({"method":method,"params":{"threadId":"native","item":item}}),
+                    &mut output,
+                    None,
+                    "",
+                    false,
+                )
+                .await?;
+        }
+        assert_eq!(output.event.len(), 2);
+        assert!(output.event.iter().all(
+            |event| matches!(event, BackendEvent::Compaction { update, .. } if update.manual)
+                && event.scope() == scope
+        ));
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn selected_checks_replay_before_later_design_edits() -> anyhow::Result<()> {
         use super::*;
@@ -2448,6 +2188,7 @@ mod test {
             "session".into(),
         )
         .await?;
+        process.normalization.bind(Some(fixture_scope()));
         let mut document = crate::plan::test_fixture("plan", "Initial");
         document.version = 4;
         document.design = Some(crate::plan::DeclarationDesign::default());
@@ -2480,7 +2221,7 @@ mod test {
             }}), &mut output).await?;
         }
         process.finish_requests(&mut output).await?;
-        assert_eq!(output.design_patch.len(), 2);
+        assert_eq!(output.completion.design_patch.len(), 2);
         for patch in output.completion.design_patch {
             document = document.patch_design(fixture.path(), patch)?;
         }
@@ -2536,7 +2277,7 @@ mod test {
             assert_eq!(corrected["result"]["decision"], "accept");
         });
         let coordinator = PermissionCoordinator::transient(&workspace)?;
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) = crate::backend::events::channel(fixture_scope());
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
@@ -2547,6 +2288,7 @@ mod test {
             "session".into(),
         )
         .await?;
+        process.normalization.bind(Some(fixture_scope()));
         for (id, command, accepted) in [
             (1, "pwsh -c 'unfinished".to_owned(), false),
             (
@@ -2570,15 +2312,10 @@ mod test {
             let event = stream.try_recv();
             if id == 2 {
                 let event = event?;
-                assert_eq!(event.kind, "error");
+                assert_eq!(event.scope(), fixture_scope().into());
                 assert!(
-                    event
-                        .text
-                        .as_deref()
-                        .unwrap()
-                        .contains("shell_command_parse_error")
+                    matches!(event, BackendEvent::Diagnostic { diagnostic, .. } if diagnostic.message.contains("shell_command_parse_error"))
                 );
-                assert_eq!(event.address.unwrap().turn_id, "turn");
                 assert!(stream.try_recv().is_err());
             } else {
                 assert!(event.is_err(), "{event:?}");
@@ -2643,6 +2380,7 @@ mod test {
 
     #[tokio::test]
     async fn compaction_lifecycle_is_neither_assistant_text_nor_a_tool() {
+        let mut normalization = fixture_normalization();
         let mut output = super::BackendOutput::default();
         for method in [
             "item/started",
@@ -2651,6 +2389,7 @@ mod test {
             "item/completed",
         ] {
             super::normalize_event(
+                &mut normalization,
                 &serde_json::json!({
                     "method":method, "params":{"threadId":"thread", "turnId":"turn",
                         "item":{"type":"contextCompaction","id":"compact"}}
@@ -2660,12 +2399,17 @@ mod test {
             )
             .await;
         }
-        assert_eq!(output.event.len(), 1);
-        let compaction = output.event[0].compaction().unwrap().unwrap();
+        assert_eq!(record_count(&output.event), 1);
+        let BackendEvent::Compaction {
+            update: compaction, ..
+        } = output.event.last().unwrap()
+        else {
+            panic!("expected compaction")
+        };
         assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
         assert_eq!(compaction.result.summary_content, None);
-        assert!(output.event[0].activity.is_none());
-        assert!(output.event[0].text.is_none());
+        assert!(!matches!(output.event[0], BackendEvent::Tool { .. }));
+        assert!(!matches!(output.event[0], BackendEvent::Message { .. }));
     }
 
     #[tokio::test]
@@ -2716,6 +2460,7 @@ mod test {
             "session".into(),
         )
         .await?;
+        process.normalization.bind(Some(fixture_scope()));
         process.set_activity_publication(false);
         let mut output = BackendOutput::default();
         process
@@ -2750,6 +2495,7 @@ mod test {
 
     #[tokio::test]
     async fn native_goal_state_ignores_child_and_unknown_notifications() {
+        let mut normalization = fixture_normalization();
         use crate::goal::GoalState;
         let mut output = crate::backend::BackendOutput {
             event: Vec::new(),
@@ -2767,6 +2513,7 @@ mod test {
             ("parent", "budgetLimited", Some(GoalState::BudgetLimited)),
         ] {
             super::normalize_event(
+                &mut normalization,
                 &serde_json::json!({
                     "method":"thread/goal/updated", "params":{"threadId":thread,"status":status}
                 }),
@@ -2774,7 +2521,7 @@ mod test {
                 None,
             )
             .await;
-            assert_eq!(output.evidence.native_state, expected);
+            assert_eq!(output.completion.evidence.native_state, expected);
         }
     }
 
@@ -2782,6 +2529,7 @@ mod test {
 
     #[tokio::test]
     async fn reasoning_snapshots_reconcile_sections_without_losing_or_duplicating_text() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         for message in [
             json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn",
@@ -2794,32 +2542,39 @@ mod test {
                 "item":{"id":"reasoning","type":"reasoning","summary":["Corrected first section","Snapshot only section"],
                     "content":["raw reasoning must not become a summary"]}}}),
         ] {
-            normalize_event(&message, &mut output, None).await;
+            normalize_event(&mut normalization, &message, &mut output, None).await;
         }
-        assert_eq!(output.event.len(), 2);
+        assert_eq!(record_count(&output.event), 3);
         assert_eq!(
-            output.event[0].text.as_deref(),
+            message_text(&output.event, 0).as_deref(),
             Some("Corrected first section")
         );
         assert_eq!(
-            output.event[1].text.as_deref(),
+            message_text(&output.event, 1).as_deref(),
             Some("Snapshot only section")
         );
-        assert_eq!(output.event[0].message_id(), Some("reasoning:summary:0"));
-        assert_eq!(output.event[1].message_id(), Some("reasoning:summary:1"));
-        assert!(
-            output
-                .event
-                .iter()
-                .all(|event| event.kind == "reasoning_summary" && event.message_snapshot())
+        assert_eq!(
+            message_id(&output.event, 0).as_deref(),
+            Some("reasoning:summary:0")
         );
+        assert_eq!(
+            message_id(&output.event, 1).as_deref(),
+            Some("reasoning:summary:1")
+        );
+        assert!(
+            message_records(&output.event)
+                .iter()
+                .all(|message| message.completed)
+        );
+        assert_eq!(message_role(&output.event, 2), Some(MessageRole::Thought));
     }
 
     #[tokio::test]
     async fn dynamic_calls_retain_arguments_all_output_and_failure_status() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         for method in ["item/started", "item/completed"] {
-            normalize_event(&json!({"method":method,"params":{"threadId":"thread","turnId":"turn",
+            normalize_event(&mut normalization, &json!({"method":method,"params":{"threadId":"thread","turnId":"turn",
                 "item":{"id":"dynamic","type":"dynamicToolCall","tool":"fixture_read",
                     "namespace":"fixture","arguments":"{\"path\":\"README.md\",\"api_key\":\"secret\"}",
                     "status":if method == "item/started" { "inProgress" } else { "completed" },
@@ -2827,8 +2582,8 @@ mod test {
                     "contentItems":[{"type":"inputText","text":"first block"},{"type":"inputText","text":"second block"}]}}}),
                 &mut output, None).await;
         }
-        assert_eq!(output.event.len(), 1);
-        let activity = output.event[0].activity.as_ref().unwrap();
+        assert_eq!(record_count(&output.event), 1);
+        let activity = &tool_records(&output.event)[0];
         assert_eq!(
             activity.title,
             "fixture.fixture_read({\"api_key\":\"[REDACTED]\",\"path\":\"README.md\"})"
@@ -2842,6 +2597,7 @@ mod test {
 
     #[tokio::test]
     async fn separates_readable_reasoning_summaries_from_raw_reasoning() {
+        let mut normalization = fixture_normalization();
         let event = |method: &str, summary_index: u64, delta: &str| {
             json!({
                 "method": method,
@@ -2857,6 +2613,7 @@ mod test {
         let mut output = BackendOutput::default();
 
         normalize_event_in_workspace(
+            &mut normalization,
             &event("item/reasoning/summaryTextDelta", 0, "Inspecting "),
             &mut output,
             None,
@@ -2865,6 +2622,7 @@ mod test {
         )
         .await;
         normalize_event_in_workspace(
+            &mut normalization,
             &event("item/reasoning/summaryTextDelta", 0, "ownership"),
             &mut output,
             None,
@@ -2873,6 +2631,7 @@ mod test {
         )
         .await;
         normalize_event_in_workspace(
+            &mut normalization,
             &event("item/reasoning/textDelta", 0, "private chain of thought"),
             &mut output,
             None,
@@ -2881,22 +2640,29 @@ mod test {
         )
         .await;
 
-        assert_eq!(output.event.len(), 2);
-        assert_eq!(output.event[0].kind, "reasoning_summary");
+        assert_eq!(record_count(&output.event), 2);
         assert_eq!(
-            output.event[0].text.as_deref(),
+            message_role(&output.event, 0),
+            Some(MessageRole::ThoughtSummary)
+        );
+        assert_eq!(
+            message_text(&output.event, 0).as_deref(),
             Some("Inspecting ownership")
         );
-        assert_eq!(output.event[0].message_id(), Some("reasoning-1:summary:0"));
-        assert_eq!(output.event[1].kind, "reasoning");
         assert_eq!(
-            output.event[1].text.as_deref(),
+            message_id(&output.event, 0).as_deref(),
+            Some("reasoning-1:summary:0")
+        );
+        assert_eq!(message_role(&output.event, 1), Some(MessageRole::Thought));
+        assert_eq!(
+            message_text(&output.event, 1).as_deref(),
             Some("private chain of thought")
         );
     }
 
     #[tokio::test]
     async fn lifecycle_events_cannot_poison_a_corrected_control_request() {
+        let mut normalization = fixture_normalization();
         let invocation = |method: &str, overview: &str| {
             json!({
                 "method": method,
@@ -2923,6 +2689,7 @@ mod test {
         let mut output = BackendOutput::default();
 
         normalize_event_in_workspace(
+            &mut normalization,
             &invocation("item/started", "rejected"),
             &mut output,
             None,
@@ -2931,6 +2698,7 @@ mod test {
         )
         .await;
         normalize_event_in_workspace(
+            &mut normalization,
             &invocation("item/completed", "rejected"),
             &mut output,
             None,
@@ -2938,9 +2706,10 @@ mod test {
             false,
         )
         .await;
-        assert!(output.design_patch.is_empty());
+        assert!(output.completion.design_patch.is_empty());
 
         normalize_event_in_workspace(
+            &mut normalization,
             &invocation("item/started", "corrected"),
             &mut output,
             None,
@@ -2949,9 +2718,10 @@ mod test {
         )
         .await;
         apply_control_request_result(&request("rejected"), &mut output, false).unwrap();
-        assert!(output.design_patch.is_empty());
+        assert!(output.completion.design_patch.is_empty());
         apply_control_request_result(&request("corrected"), &mut output, true).unwrap();
         normalize_event_in_workspace(
+            &mut normalization,
             &invocation("item/completed", "corrected"),
             &mut output,
             None,
@@ -2960,12 +2730,13 @@ mod test {
         )
         .await;
 
-        assert_eq!(output.design_patch.len(), 1);
-        assert_eq!(output.design_patch[0].patch, "corrected");
+        assert_eq!(output.completion.design_patch.len(), 1);
+        assert_eq!(output.completion.design_patch[0].patch, "corrected");
     }
 
     #[tokio::test]
     async fn accepted_submit_remains_authoritative_across_lifecycle_replays() {
+        let mut normalization = fixture_normalization();
         let lifecycle = |method: &str| {
             json!({
                 "method": method,
@@ -2996,13 +2767,27 @@ mod test {
         });
         let mut output = BackendOutput::default();
 
-        normalize_event_in_workspace(&lifecycle("item/started"), &mut output, None, "", false)
-            .await;
-        assert!(output.plan_submit.is_none());
+        normalize_event_in_workspace(
+            &mut normalization,
+            &lifecycle("item/started"),
+            &mut output,
+            None,
+            "",
+            false,
+        )
+        .await;
+        assert!(output.completion.plan_submit.is_none());
 
         apply_control_request_result(&request, &mut output, true).unwrap();
-        normalize_event_in_workspace(&lifecycle("item/completed"), &mut output, None, "", false)
-            .await;
+        normalize_event_in_workspace(
+            &mut normalization,
+            &lifecycle("item/completed"),
+            &mut output,
+            None,
+            "",
+            false,
+        )
+        .await;
 
         let submit = output
             .completion
@@ -3056,7 +2841,7 @@ mod test {
     #[tokio::test]
     async fn extracts_structured_questions_from_dynamic_tool_arguments() {
         let mut output = BackendOutput::default();
-        normalize_event(
+        apply_control_request_result(
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -3078,8 +2863,8 @@ mod test {
                 }
             }),
             &mut output,
-            None,
-        ).await;
+            true,
+        ).unwrap();
         let question = output
             .completion
             .plan_question
@@ -3092,7 +2877,7 @@ mod test {
     #[tokio::test]
     async fn extracts_answer_and_withdrawal_without_rendering_control_tools() {
         let mut answer_output = BackendOutput::default();
-        normalize_event(
+        apply_control_request_result(
             &json!({
                 "method": "item/completed",
                 "params": { "item": {
@@ -3105,9 +2890,9 @@ mod test {
                 } }
             }),
             &mut answer_output,
-            None,
+            true,
         )
-        .await;
+        .unwrap();
         let answer = answer_output
             .completion
             .question_answer
@@ -3116,7 +2901,7 @@ mod test {
         assert!(answer_output.event.is_empty());
 
         let mut withdrawal_output = BackendOutput::default();
-        normalize_event(
+        apply_control_request_result(
             &json!({
                 "method": "item/completed",
                 "params": { "item": {
@@ -3126,9 +2911,9 @@ mod test {
                 } }
             }),
             &mut withdrawal_output,
-            None,
+            true,
         )
-        .await;
+        .unwrap();
         assert_eq!(
             withdrawal_output
                 .completion
@@ -3142,8 +2927,10 @@ mod test {
 
     #[tokio::test]
     async fn replaces_task_state_across_lifecycle_events_without_creating_an_artifact() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "turn/plan/updated",
                 "params": { "plan": [{ "step": "Inspect the change" }] }
@@ -3153,6 +2940,7 @@ mod test {
         )
         .await;
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "turn/plan/completed",
                 "params": { "status": "completed" }
@@ -3161,9 +2949,11 @@ mod test {
             None,
         )
         .await;
-        assert!(output.plan_edit.is_empty());
-        assert_eq!(output.event.len(), 1);
-        let update = output.event[0].checklist_update.as_ref().unwrap();
+        assert!(output.completion.plan_edit.is_empty());
+        assert_eq!(record_count(&output.event), 1);
+        let BackendEvent::Checklist { update, .. } = output.event.last().unwrap() else {
+            panic!("expected checklist")
+        };
         assert!(update.complete);
         assert_eq!(update.entry_list.len(), 1);
         assert_eq!(update.entry_list[0].content, "Inspect the change");
@@ -3171,28 +2961,32 @@ mod test {
 
     #[tokio::test]
     async fn ignores_control_tool_names_inside_command_output() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
-        normalize_event(
+        normalize_event(&mut normalization,
             &json!({
                 "method": "item/commandExecution/completed",
-                "params": { "output": "printed goal_complete as documentation" }
+                "params": { "itemId":"command-doc", "output": "printed goal_complete as documentation" }
             }),
             &mut output,
             None,
         )
         .await;
-        assert!(output.evidence.tool_called);
-        assert!(!output.evidence.structured_complete);
+        assert!(output.completion.evidence.tool_called);
+        assert!(!output.completion.evidence.structured_complete);
     }
 
     #[tokio::test]
     async fn recognizes_exact_control_tool_calls() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(fixture_scope());
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/tool/call",
                 "params": {
+                    "callId":"complete-goal",
                     "name": "goal_complete",
                     "arguments": { "summary": "Complete" }
                 }
@@ -3201,9 +2995,12 @@ mod test {
             Some(&event_sink),
         )
         .await;
-        assert!(output.evidence.structured_complete);
-        assert!(output.event.is_empty());
-        assert!(event_stream.try_recv().is_err());
+        assert!(output.completion.evidence.structured_complete);
+        assert_eq!(tool_records(&output.event).len(), 1);
+        assert_eq!(tool_records(&output.event)[0].name, "goal_complete");
+        assert!(
+            matches!(event_stream.try_recv().unwrap(), BackendEvent::Tool { update: ToolUpdate::Requested { invocation }, .. } if invocation.title.starts_with("goal_complete("))
+        );
     }
 
     #[test]
@@ -3274,7 +3071,7 @@ mod test {
             let (stream, _) = listener.accept().await.unwrap();
             tokio_tungstenite::accept_async(stream).await.unwrap()
         });
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) = crate::backend::events::channel(fixture_scope());
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
@@ -3285,12 +3082,13 @@ mod test {
             "session".into(),
         )
         .await?;
+        process.normalization.bind(Some(fixture_scope()));
         let _server_socket = server.await?;
         let mut output = BackendOutput::default();
         let mut turn = crate::turn::test_support::TestTurn::new(
             "turn".into(),
-            crate::backend::ProviderAddress {
-                owner: None,
+            crate::backend::TurnAddress {
+                scope: fixture_scope(),
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
             },
@@ -3323,14 +3121,17 @@ mod test {
                     &mut output,
                 )
                 .await?;
-            let event = stream.try_recv()?;
-            let activity = event.activity.expect("published tool lifecycle");
-            assert_eq!(activity.id, call_id);
+            while let Some(event) = stream.try_next()? {
+                let BackendEvent::Tool { address, update } = event else {
+                    panic!("expected tool lifecycle")
+                };
+                assert_eq!(address.tool_id, call_id);
+                turn.record_tool(address.tool_id.as_str(), update, now_ms)?;
+            }
             assert_eq!(
-                activity.status,
-                Some(crate::backend::ToolStatus::parse(status).unwrap())
+                turn.tools().find(|tool| tool.id == call_id).unwrap().status,
+                crate::backend::ToolStatus::parse(status).unwrap().as_str()
             );
-            turn.record_tool(&activity, now_ms)?;
         }
         let tool = turn.tools().collect::<Vec<_>>();
         assert_eq!(tool.len(), 2);
@@ -3340,12 +3141,13 @@ mod test {
             assert_eq!(tool.completed_at_ms, Some(completed));
             assert_eq!(tool.elapsed_ms(9000), Some((completed - started) as u64));
         }
-        assert_eq!(output.event.len(), 2);
+        assert!(output.event.is_empty());
         Ok(())
     }
 
     #[tokio::test]
     async fn renders_completed_control_calls_without_reapplying_their_semantic_effect() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         let completed = json!({
             "method": "item/completed",
@@ -3364,13 +3166,11 @@ mod test {
             } }
         });
 
-        normalize_event_in_workspace(&completed, &mut output, None, "", false).await;
+        normalize_event_in_workspace(&mut normalization, &completed, &mut output, None, "", false)
+            .await;
 
-        assert!(output.plan_edit.is_empty());
-        let activity = output.event[0]
-            .activity
-            .as_ref()
-            .expect("control tool activity");
+        assert!(output.completion.plan_edit.is_empty());
+        let activity = &tool_records(&output.event)[0];
         assert_eq!(activity.id, "plan-edit-1");
         assert_eq!(
             activity.title,
@@ -3482,8 +3282,9 @@ mod test {
 
     #[tokio::test]
     async fn message_lifecycle_preserves_phase_identity_and_authoritative_text() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
-        let (sink, mut stream) = crate::backend::events::channel();
+        let (sink, mut stream) = crate::backend::events::channel(fixture_scope());
         for (method, item) in [
             (
                 "item/started",
@@ -3518,34 +3319,54 @@ mod test {
             params["threadId"] = json!("parent");
             params["turnId"] = json!("turn");
             normalize_event(
+                &mut normalization,
                 &json!({"method":method,"params":params}),
                 &mut output,
                 Some(&sink),
             )
             .await;
         }
-        assert_eq!(output.event.len(), 2);
-        assert_eq!(output.event[0].text.as_deref(), Some("Checking files."));
-        assert_eq!(output.event[0].message_phase(), Some("commentary"));
-        assert_eq!(output.event[1].text.as_deref(), Some("Done."));
-        assert_eq!(output.event[1].message_id(), Some("two"));
-        assert!(output.event.iter().all(BackendEvent::message_snapshot));
+        assert_eq!(record_count(&output.event), 2);
+        assert_eq!(
+            message_text(&output.event, 0).as_deref(),
+            Some("Checking files.")
+        );
+        assert_eq!(
+            message_role(&output.event, 0),
+            Some(crate::backend::MessageRole::Commentary)
+        );
+        assert_eq!(message_text(&output.event, 1).as_deref(), Some("Done."));
+        assert_eq!(message_id(&output.event, 1).as_deref(), Some("two"));
+        assert!(
+            message_records(&output.event)
+                .iter()
+                .all(|message| message.completed)
+        );
+        assert!(output.event.iter().all(|event| !matches!(event, BackendEvent::Message { update: MessageUpdate::Started { text, .. }, .. } if text.is_empty())));
         let mut delta = Vec::new();
         while let Ok(event) = stream.try_recv() {
-            if !event.message_snapshot()
-                && let Some(text) = event.text
-            {
-                delta.push((
-                    text,
-                    event.message.as_ref().and_then(|message| message.role),
-                ));
+            if let BackendEvent::Message { update, .. } = event {
+                match update {
+                    MessageUpdate::Started {
+                        text,
+                        classification: MessageClassification::Known(role),
+                    } => delta.push((text, Some(role))),
+                    MessageUpdate::Delta { text } => {
+                        delta.push((text, Some(MessageRole::Commentary)))
+                    }
+                    _ => {}
+                }
             }
         }
         assert_eq!(
             delta,
             vec![
                 (
-                    "Checking files".into(),
+                    "Checking ".into(),
+                    Some(crate::backend::MessageRole::Commentary)
+                ),
+                (
+                    "files".into(),
                     Some(crate::backend::MessageRole::Commentary)
                 ),
                 ("Done".into(), Some(crate::backend::MessageRole::Response)),
@@ -3553,6 +3374,7 @@ mod test {
         );
         // The same provider item ID in another agent must not inherit the parent's phase.
         normalize_event(
+            &mut normalization,
             &json!({"method":"item/agentMessage/delta", "params":{
                 "threadId":"child","turnId":"turn","itemId":"one","delta":"Child"
             }}),
@@ -3560,15 +3382,33 @@ mod test {
             None,
         )
         .await;
-        assert_eq!(output.event.len(), 3);
-        assert_eq!(output.event[2].message_phase(), None);
+        assert_eq!(record_count(&output.event), 3);
+        assert_eq!(message_role(&output.event, 2), None);
+        let mut next_scope = fixture_scope();
+        next_scope.invocation_id = "next-invocation".into();
+        normalization.bind(Some(next_scope.clone()));
+        normalize_event(
+            &mut normalization,
+            &json!({"method":"item/agentMessage/delta", "params":{
+                "threadId":"parent","turnId":"turn","itemId":"one","delta":"Next invocation"
+            }}),
+            &mut output,
+            None,
+        )
+        .await;
+        assert_eq!(
+            message_records(&output.event)[3].address.turn.scope,
+            next_scope
+        );
+        assert_eq!(message_role(&output.event, 3), None);
     }
 
     #[tokio::test]
     async fn usage_retains_native_categories_and_streams_addressed_snapshots() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
-        let (sink, mut stream) = crate::backend::events::channel();
-        normalize_event(&json!({"method":"thread/tokenUsage/updated", "params":{
+        let (sink, mut stream) = crate::backend::events::channel(fixture_scope());
+        normalize_event(&mut normalization, &json!({"method":"thread/tokenUsage/updated", "params":{
             "threadId":"parent", "turnId":"turn", "tokenUsage":{
                 "last":{"inputTokens":76000,"cachedInputTokens":68400,"outputTokens":4200,"reasoningOutputTokens":3000,"totalTokens":80200},
                 "total":{"inputTokens":176000,"cachedInputTokens":148400,"outputTokens":14200,"reasoningOutputTokens":9000,"totalTokens":190200},
@@ -3578,27 +3418,38 @@ mod test {
         let event = output
             .event
             .iter()
-            .find(|event| event.kind == "usage")
+            .find(|event| matches!(event, BackendEvent::Usage { .. }))
             .unwrap();
-        assert_eq!(event.address.as_ref().unwrap().turn_id, "turn");
-        let native: crate::backend::usage::UsageUpdate =
-            serde_json::from_value(event.data.clone()).unwrap();
+        let BackendEvent::Usage {
+            address,
+            update: native,
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!(address.turn_id, "turn");
         assert_eq!(native.usage.cached_percent(), Some(90));
         assert_eq!(native.usage.non_reasoning_output(), Some(1200));
-        assert_eq!(native.cumulative.unwrap().input, Some(176000));
-        assert_eq!(stream.try_recv().unwrap().kind, "usage");
-        assert!(
-            output
-                .event
-                .iter()
-                .any(|event| event.kind == "context_usage")
-        );
+        assert_eq!(native.cumulative.as_ref().unwrap().input, Some(176000));
+        assert!(matches!(
+            stream.try_recv().unwrap(),
+            BackendEvent::Usage { .. }
+        ));
+        assert!(output.event.iter().any(|event| matches!(
+            event,
+            BackendEvent::Runtime {
+                update: crate::backend::RuntimeUpdate::ContextUsage { .. },
+                ..
+            }
+        )));
     }
 
     #[tokio::test]
     async fn coalesces_message_deltas_without_treating_prose_as_control_tools() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/agentMessage/delta",
                 "params": { "delta": "I will call goal_complete " }
@@ -3608,6 +3459,7 @@ mod test {
         )
         .await;
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/agentMessage/delta",
                 "params": { "delta": "after the plan finishes." }
@@ -3616,19 +3468,21 @@ mod test {
             None,
         )
         .await;
-        assert_eq!(output.event.len(), 1);
+        assert_eq!(record_count(&output.event), 1);
         assert_eq!(
-            output.event[0].text.as_deref(),
+            message_text(&output.event, 0).as_deref(),
             Some("I will call goal_complete after the plan finishes.")
         );
-        assert!(!output.evidence.structured_complete);
-        assert_eq!(output.event[0].kind, "assistant_message");
+        assert!(!output.completion.evidence.structured_complete);
+        assert!(matches!(output.event[0], BackendEvent::Message { .. }));
     }
 
     #[tokio::test]
     async fn ignores_codex_user_message_lifecycle_events() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/started",
                 "params": {
@@ -3647,9 +3501,11 @@ mod test {
 
     #[tokio::test]
     async fn keeps_different_command_call_ids_separate() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(fixture_scope());
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/started",
                 "params": {
@@ -3666,6 +3522,7 @@ mod test {
         )
         .await;
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/commandExecution/outputDelta",
                 "params": { "itemId": "command-1", "delta": "# Harness\nline two\n" }
@@ -3675,6 +3532,7 @@ mod test {
         )
         .await;
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -3694,20 +3552,20 @@ mod test {
 
         assert_eq!(
             std::iter::from_fn(|| event_stream.try_recv().ok()).count(),
-            3,
+            7,
             "each lifecycle update must stream live"
         );
         assert_eq!(
-            output.event.len(),
+            record_count(&output.event),
             2,
             "different call IDs must remain separate even with identical commands"
         );
-        let activity = output.event[0].activity.as_ref().unwrap();
+        let activity = &tool_records(&output.event)[0];
         assert_eq!(activity.id, "command-1");
         assert_eq!(activity.title, "Get-Content README.md");
         assert_eq!(activity.output.as_deref(), Some("# Harness\nline two\n"));
         assert_eq!(activity.status, Some(crate::backend::ToolStatus::Running));
-        let completed = output.event[1].activity.as_ref().unwrap();
+        let completed = &tool_records(&output.event)[1];
         assert_eq!(completed.id, "command-completed-with-different-provider-id");
         assert_eq!(completed.status.as_deref(), Some("completed"));
         assert!(!activity.output_delta);
@@ -3715,15 +3573,16 @@ mod test {
 
     #[tokio::test]
     async fn codex_builtin_activity_preserves_web_results_in_child_turns() -> Result<()> {
-        let address = crate::backend::ProviderAddress {
-            owner: None,
+        let mut normalization = fixture_normalization();
+        let address = crate::backend::TurnAddress {
+            scope: fixture_scope(),
             thread_id: "child-thread".into(),
             turn_id: "child-turn".into(),
         };
         let mut turn =
             crate::turn::test_support::TestTurn::new("child-turn".into(), address.clone(), 0);
         let mut output = BackendOutput::default();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(fixture_scope());
         for (id, action, expected_title) in [
             (
                 "search-1",
@@ -3762,6 +3621,7 @@ mod test {
                 ("item/completed", result.clone(), 2000),
             ] {
                 normalize_event(
+                    &mut normalization,
                     &json!({ "method": method, "params": {
                         "threadId": "child-thread", "turnId": "child-turn", "item": item,
                         "startedAtMs": 1000,
@@ -3771,10 +3631,17 @@ mod test {
                     Some(&event_sink),
                 )
                 .await;
-                let event = event_stream.try_recv()?;
-                assert_eq!(event.kind, "tool");
-                assert_eq!(event.address.as_ref(), Some(&address));
-                turn.record_tool_event(event.tool_event().unwrap(), now_ms)?;
+                while let Some(event) = event_stream.try_next()? {
+                    let BackendEvent::Tool {
+                        address: tool_address,
+                        update,
+                    } = event
+                    else {
+                        panic!("expected tool lifecycle")
+                    };
+                    assert_eq!(&tool_address.turn, &address);
+                    turn.record_tool(tool_address.tool_id.as_str(), update, now_ms)?;
+                }
                 let tool = turn.tools().find(|tool| tool.id == id).unwrap();
                 if method == "item/started" {
                     assert_eq!(tool.title, "Web Search");
@@ -3792,9 +3659,9 @@ mod test {
             assert_eq!(tool.completed_at_ms, Some(2000));
             assert_eq!(serde_json::from_str::<Value>(&tool.output)?, result);
         }
-        assert_eq!(output.event.len(), 4);
+        assert_eq!(record_count(&output.event), 4);
         assert_eq!(turn.tools().count(), 4);
-        assert!(output.evidence.tool_called);
+        assert!(output.completion.evidence.tool_called);
         let restored: crate::turn::test_support::TestTurn =
             serde_json::from_value(serde_json::to_value(&turn)?)?;
         assert_eq!(restored.tools().count(), 4);
@@ -3809,6 +3676,7 @@ mod test {
 
     #[tokio::test]
     async fn builtin_titles_handle_sleep_and_web_fallbacks_without_aliasing_mcp() {
+        let mut normalization = fixture_normalization();
         for (item, expected) in [
             (
                 json!({"type":"sleep", "durationMs":20000}),
@@ -3860,8 +3728,8 @@ mod test {
             "type":"webSearch", "id":"unknown-web", "action":{"type":"other"}, "results":[{"title":"Retained result"}]
         }}});
         let mut output = BackendOutput::default();
-        normalize_event(&event, &mut output, None).await;
-        let activity = output.event[0].activity.as_ref().unwrap();
+        normalize_event(&mut normalization, &event, &mut output, None).await;
+        let activity = &tool_records(&output.event)[0];
         assert!(activity.title.starts_with("webSearch("));
         assert!(activity.title.contains("Retained result"));
         assert!(
@@ -3875,6 +3743,7 @@ mod test {
 
     #[tokio::test]
     async fn codex_builtin_activity_preserves_unknown_types_and_terminal_status() {
+        let mut normalization = fixture_normalization();
         for status in ["completed", "failed", "cancelled"] {
             let mut output = BackendOutput::default();
             let item = json!({ "type": "futureBuiltin", "id": "future-1", "status": status,
@@ -3883,6 +3752,7 @@ mod test {
                     "credentials": [{ "access_token": "nested-private-value" }] }
             });
             normalize_event(
+                &mut normalization,
                 &json!({ "method": "item/completed", "params": {
                     "item": item
                 }}),
@@ -3890,9 +3760,9 @@ mod test {
                 None,
             )
             .await;
-            assert_eq!(output.event.len(), 1);
-            assert_eq!(output.event[0].kind, "tool");
-            let activity = output.event[0].activity.as_ref().unwrap();
+            assert_eq!(record_count(&output.event), 1);
+            assert!(matches!(output.event[0], BackendEvent::Tool { .. }));
+            let activity = &tool_records(&output.event)[0];
             let title_payload = activity
                 .title
                 .strip_prefix("futureBuiltin(")
@@ -3911,12 +3781,13 @@ mod test {
                 serde_json::from_str::<Value>(activity.output.as_deref().unwrap()).unwrap(),
                 item
             );
-            assert!(output.evidence.tool_called);
+            assert!(output.completion.evidence.tool_called);
         }
     }
 
     #[tokio::test]
     async fn codex_builtin_activity_excludes_non_tools_and_nested_payload_types() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         for item_type in [
             "userMessage",
@@ -3929,6 +3800,7 @@ mod test {
             "subAgentActivity",
         ] {
             normalize_event(
+                &mut normalization,
                 &json!({ "method": "item/completed", "params": {
                     "item": { "type": item_type, "id": "non-tool", "text": "Tool documentation",
                         "payload": { "type": "mcpToolCall", "tool": "nested" } }
@@ -3944,21 +3816,29 @@ mod test {
             json!({ "item": { "id": "untyped", "payload": { "type": "mcpToolCall" } } }),
         ] {
             normalize_event(
+                &mut normalization,
                 &json!({ "method": "item/completed", "params": params }),
                 &mut output,
                 None,
             )
             .await;
         }
-        assert!(!output.evidence.tool_called);
-        assert!(output.event.iter().all(|event| event.activity.is_none()));
+        assert!(!output.completion.evidence.tool_called);
+        assert!(
+            output
+                .event
+                .iter()
+                .all(|event| !matches!(event, BackendEvent::Tool { .. }))
+        );
     }
 
     #[tokio::test]
     async fn correlates_codex_mcp_lifecycle_into_one_activity() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(fixture_scope());
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/started",
                 "params": {
@@ -3981,6 +3861,7 @@ mod test {
         )
         .await;
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/mcpToolCall/progress",
                 "params": {
@@ -3993,6 +3874,7 @@ mod test {
         )
         .await;
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4023,15 +3905,15 @@ mod test {
 
         assert_eq!(
             std::iter::from_fn(|| event_stream.try_recv().ok()).count(),
-            3,
+            5,
             "each MCP lifecycle update must stream live"
         );
         assert_eq!(
-            output.event.len(),
+            record_count(&output.event),
             1,
             "one MCP call must persist as one activity"
         );
-        let activity = output.event[0].activity.as_ref().expect("MCP activity");
+        let activity = &tool_records(&output.event)[0];
         assert_eq!(activity.id, "mcp-1");
         assert_eq!(activity.kind, ToolActivityKind::ToolCall);
         assert_eq!(
@@ -4045,13 +3927,15 @@ mod test {
             Some("crate metadata\nrelease metadata")
         );
         assert_eq!(activity.status.as_deref(), Some("completed"));
-        assert!(output.evidence.tool_called);
+        assert!(output.completion.evidence.tool_called);
     }
 
     #[tokio::test]
     async fn normalizes_codex_mcp_failure_output() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4070,10 +3954,7 @@ mod test {
         )
         .await;
 
-        let activity = output.event[0]
-            .activity
-            .as_ref()
-            .expect("failed MCP activity");
+        let activity = &tool_records(&output.event)[0];
         assert_eq!(activity.output.as_deref(), Some("server unavailable"));
         assert_eq!(activity.status.as_deref(), Some("failed"));
     }
@@ -4097,8 +3978,10 @@ mod test {
 
     #[tokio::test]
     async fn does_not_classify_mcp_names_as_harness_control_tools() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4117,11 +4000,8 @@ mod test {
         )
         .await;
 
-        assert!(!output.evidence.structured_complete);
-        let activity = output.event[0]
-            .activity
-            .as_ref()
-            .expect("external MCP activity");
+        assert!(!output.completion.evidence.structured_complete);
+        let activity = &tool_records(&output.event)[0];
         assert_eq!(activity.title, "external-mcp.goal_complete({})");
     }
 
@@ -4155,8 +4035,10 @@ mod test {
 
     #[tokio::test]
     async fn replaces_codex_patch_revisions_with_the_completed_change_set() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/fileChange/patchUpdated",
                 "params": {
@@ -4173,6 +4055,7 @@ mod test {
         )
         .await;
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4193,16 +4076,17 @@ mod test {
         )
         .await;
 
-        assert_eq!(output.event.len(), 1);
-        let activity = output.event[0].activity.as_ref().expect("file change");
+        assert_eq!(record_count(&output.event), 1);
+        let activity = &tool_records(&output.event)[0];
         assert_eq!(activity.change.file.len(), 1);
         assert!(activity.change.file[0].diff.contains("+final"));
         assert!(!activity.change.file[0].diff.contains("+draft"));
-        assert!(output.evidence.workspace_changed);
+        assert!(output.completion.evidence.workspace_changed);
     }
 
     #[tokio::test]
     async fn normalizes_codex_absolute_paths_and_structured_change_kinds() {
+        let mut normalization = fixture_normalization();
         for (path, workspace, expected) in [
             (
                 "C:\\workspace\\src\\main.rs",
@@ -4219,6 +4103,7 @@ mod test {
         ] {
             let mut output = BackendOutput::default();
             normalize_event_in_workspace(
+                &mut normalization,
                 &json!({
                     "method": "item/completed",
                     "params": {
@@ -4241,7 +4126,7 @@ mod test {
             )
             .await;
 
-            let change = &output.event[0].activity.as_ref().unwrap().change.file[0];
+            let change = &&tool_records(&output.event)[0].change.file[0];
             assert_eq!(change.path, expected);
             assert_eq!(change.kind, ProviderChangeKind::Add);
         }
@@ -4249,8 +4134,10 @@ mod test {
 
     #[tokio::test]
     async fn declined_file_changes_do_not_count_as_workspace_progress() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4271,17 +4158,16 @@ mod test {
         )
         .await;
 
-        assert!(!output.evidence.workspace_changed);
-        assert_eq!(
-            output.event[0].activity.as_ref().unwrap().change.file.len(),
-            1
-        );
+        assert!(!output.completion.evidence.workspace_changed);
+        assert_eq!(tool_records(&output.event)[0].change.file.len(), 1);
     }
 
     #[tokio::test]
     async fn derives_codex_command_status_from_lifecycle_method() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/started",
                 "params": {
@@ -4297,6 +4183,7 @@ mod test {
         )
         .await;
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4313,7 +4200,7 @@ mod test {
         )
         .await;
 
-        let activity = output.event[0].activity.as_ref().unwrap();
+        let activity = &tool_records(&output.event)[0];
         assert_eq!(activity.status.as_deref(), Some("completed"));
         assert_eq!(
             activity.output.as_deref(),
@@ -4323,8 +4210,10 @@ mod test {
 
     #[tokio::test]
     async fn strips_terminal_controls_from_command_output() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4341,15 +4230,17 @@ mod test {
         )
         .await;
 
-        let activity = output.event[0].activity.as_ref().unwrap();
+        let activity = &tool_records(&output.event)[0];
         assert_eq!(activity.output.as_deref(), Some("Mode  Name"));
     }
 
     #[tokio::test]
     async fn ignores_codex_moderation_metadata_with_tool_named_fields() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel(fixture_scope());
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "turn/moderationMetadata",
                 "params": {
@@ -4396,8 +4287,10 @@ mod test {
 
     #[tokio::test]
     async fn records_token_usage_without_emitting_interaction_noise() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "thread/tokenUsage/updated",
                 "params": {
@@ -4412,33 +4305,54 @@ mod test {
             None,
         )
         .await;
-        normalize_event(
-            &json!({
-                "method": "turn/started",
-                "params": { "turn": { "id": "turn-1", "status": "inProgress" } }
-            }),
-            &mut output,
-            None,
-        )
-        .await;
+        let error = normalization
+            .normalize(
+                &json!({
+                    "method": "turn/started",
+                    "params": { "turn": { "id": "turn-1", "status": "inProgress" } }
+                }),
+                &mut output,
+                None,
+                "",
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            crate::backend::BackendError::from(error),
+            crate::backend::BackendError::Protocol { .. }
+        ));
 
-        assert!(!output.event.iter().any(|event| event.kind == "usage"));
+        assert!(
+            !output
+                .event
+                .iter()
+                .any(|event| matches!(event, BackendEvent::Usage { .. }))
+        );
         assert_eq!(
-            output.metrics.context_usage,
+            output.completion.metrics.context_usage,
             Some(ContextUsage {
                 used: 2700,
                 size: 353000,
                 remaining_percent: 100,
             })
         );
-        assert_eq!(output.event.len(), 1);
-        assert_eq!(output.event[0].kind, "context_usage");
+        assert_eq!(record_count(&output.event), 1);
+        assert!(matches!(
+            output.event[0],
+            BackendEvent::Runtime {
+                update: crate::backend::RuntimeUpdate::ContextUsage { .. },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
     async fn normalizes_codex_spawn_activity_without_rendering_it_as_a_tool() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4461,23 +4375,29 @@ mod test {
         )
         .await;
 
-        assert_eq!(output.event.len(), 1);
-        assert_eq!(output.event[0].kind, "agent_lifecycle");
-        let lifecycle: AgentLifecycleEvent =
-            serde_json::from_value(output.event[0].data.clone()).unwrap();
+        assert_eq!(record_count(&output.event), 1);
+        let BackendEvent::Agent {
+            update: crate::backend::AgentUpdate::Lifecycle { event: lifecycle },
+            ..
+        } = &output.event[0]
+        else {
+            panic!("expected lifecycle")
+        };
         assert_eq!(
             lifecycle.provider_thread_id.as_deref(),
             Some("child-thread")
         );
         assert_eq!(lifecycle.definition.as_deref(), Some("explorer"));
         assert_eq!(lifecycle.status, AgentExecutionState::Running);
-        assert!(output.event[0].activity.is_none());
+        assert!(!matches!(output.event[0], BackendEvent::Tool { .. }));
     }
 
     #[tokio::test]
     async fn normalizes_each_codex_child_state_instead_of_the_wait_tool_state() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4501,11 +4421,17 @@ mod test {
         )
         .await;
 
-        assert_eq!(output.event.len(), 2);
+        assert_eq!(record_count(&output.event), 2);
         let lifecycle_list = output
             .event
             .iter()
-            .map(|event| serde_json::from_value::<AgentLifecycleEvent>(event.data.clone()).unwrap())
+            .map(|event| match event {
+                BackendEvent::Agent {
+                    update: crate::backend::AgentUpdate::Lifecycle { event },
+                    ..
+                } => event,
+                _ => panic!("expected lifecycle"),
+            })
             .collect::<Vec<_>>();
         assert_eq!(lifecycle_list[0].status, AgentExecutionState::Completed);
         assert_eq!(lifecycle_list[1].status, AgentExecutionState::Running);
@@ -4517,8 +4443,10 @@ mod test {
 
     #[tokio::test]
     async fn ignores_a_codex_wait_without_child_state() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/completed",
                 "params": {
@@ -4542,8 +4470,10 @@ mod test {
 
     #[tokio::test]
     async fn normalizes_codex_subagent_activity_with_its_child_identity() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/updated",
                 "params": {
@@ -4561,8 +4491,13 @@ mod test {
         )
         .await;
 
-        let lifecycle: AgentLifecycleEvent =
-            serde_json::from_value(output.event[0].data.clone()).unwrap();
+        let BackendEvent::Agent {
+            update: crate::backend::AgentUpdate::Lifecycle { event: lifecycle },
+            ..
+        } = &output.event[0]
+        else {
+            panic!("expected lifecycle")
+        };
         assert_eq!(
             lifecycle.provider_thread_id.as_deref(),
             Some("child-thread")
@@ -4572,8 +4507,10 @@ mod test {
 
     #[tokio::test]
     async fn ignores_codex_subagent_interaction_directed_at_the_parent() {
+        let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
+            &mut normalization,
             &json!({
                 "method": "item/updated",
                 "params": {
@@ -4718,6 +4655,7 @@ mod approval_tests {
                 "session".into(),
             )
             .await?;
+            process.normalization.bind(Some(fixture_scope()));
             process.set_execution_owner(request.owner()?).await;
             let mut socket = server.await??;
             let mut output = BackendOutput::default();

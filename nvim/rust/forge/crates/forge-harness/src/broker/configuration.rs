@@ -45,7 +45,8 @@ impl HarnessBroker {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if command == ConfigurationCommand::Configure {
-            self.configuration_progress("applying").await?;
+            self.configuration_progress(ConfigurationProgressState::Applying)
+                .await?;
         }
         match command {
             ConfigurationCommand::Configure => {
@@ -75,7 +76,8 @@ impl HarnessBroker {
                 .and_then(Value::as_u64)
             && self.active_operation_id.is_some()
         {
-            self.configuration_progress("verifying").await?;
+            self.configuration_progress(ConfigurationProgressState::Verifying)
+                .await?;
             let operation = self
                 .active_operation_id
                 .as_deref()
@@ -106,18 +108,12 @@ impl HarnessBroker {
             self.notify_unavailable_mcp(&request, &mut Vec::new())
                 .await?;
         }
-        self.emit_backend_event(
-            BackendEvent { message: None,
-                received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "configuration_applied".into(),
-                text: None,
-                data: json!({"session":self.session_view()?,"access_abbreviation":self.session.access.abbreviation(),"operation_id":self.active_operation_id,
-                "catalog":self.backend_catalog_request()}),
-                activity: None,
-                summary: None,
-                checklist_update: None,
+        self.emit_session_update(
+            SessionUpdate::Configuration {
+                session: Box::new(self.session_view()?),
+                access_abbreviation: self.session.access.abbreviation().into(),
+                operation_id: self.active_operation_id.clone(),
+                catalog: Box::new(self.backend_catalog_request()),
             },
             &mut Vec::new(),
         )
@@ -129,7 +125,8 @@ impl HarnessBroker {
             previous_access, self.session.access.abbreviation(), previous_permission.label(), permission.label()
         ));
         if resume {
-            self.configuration_progress("resuming").await?;
+            self.configuration_progress(ConfigurationProgressState::Resuming)
+                .await?;
             let previous = self
                 .store
                 .latest_exchange(&self.session.id)?

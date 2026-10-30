@@ -226,6 +226,11 @@ the caret or message body to show or hide the complete text.
 Submitting another prompt preserves Markdown formatting in earlier responses while the new
 exchange starts.
 
+Copilot can finish processing after commentary without a separately labeled final
+answer. In that case, Forge also displays the last commentary as a final response,
+with the same text in both places. The original commentary keeps its tools.
+An explicitly empty final answer does not produce a replacement response.
+
 `Running` tool groups show only the latest call and its four-row output preview.
 When a group changes to `Ran`, it folds automatically. Expanding that completed group
 shows every call in the group, with individual output available on expansion.
@@ -303,6 +308,10 @@ italics, aligned with the phase label and wrapped to the available width. The op
 defaults to Off, persists across sessions, and applies without interrupting an
 active response. Thoughts never appear as commentary in the timeline. Only the latest
 readable reasoning summary appears in status when this option is On.
+Reasoning completion updates the existing summary without restarting Thinking,
+even when its snapshot arrives after response text. Received-byte progress and
+tool-argument streaming do not count as reasoning text. Copilot remains active
+until its session becomes idle, including native background work.
 Timeline updates preserve the current cursor and reading position, including when the thought
 preview changes. Active selections retain both endpoints and their selection type.
 If selected text disappears, each endpoint moves to the nearest surviving position.

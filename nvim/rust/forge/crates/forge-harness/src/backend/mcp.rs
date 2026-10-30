@@ -153,10 +153,8 @@ mod test {
             &self,
             _: BackendRequest,
             _: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion> {
-            let output: anyhow::Result<crate::backend::BackendOutput> =
-                async { anyhow::bail!("catalog discovery must not prompt") }.await;
-            Ok(output?.into_completion())
+        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            Err(anyhow::anyhow!("catalog discovery must not prompt").into())
         }
 
         async fn mcp_configuration(&self, _: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {

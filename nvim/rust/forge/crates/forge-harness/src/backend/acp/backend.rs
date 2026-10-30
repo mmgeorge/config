@@ -741,8 +741,13 @@ impl Backend for AcpBackend {
         &self,
         request: BackendRequest,
         sink: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion> {
-        let output: anyhow::Result<crate::backend::BackendOutput> = async {
+    ) -> std::result::Result<crate::backend::BackendCompletion, BackendError> {
+        if request.owner().map_err(BackendError::from)? != sink.invocation_scope()?.owner {
+            return Err(BackendError::Rejected {
+                message: "ACP invocation scope does not match the requested owner".into(),
+            });
+        }
+        let output: anyhow::Result<crate::backend::BackendCompletion> = async {
             let sink = Some(sink);
             let cancelled = request
                 .control_context
@@ -802,8 +807,23 @@ impl Backend for AcpBackend {
                     .await?;
             session
                 .state
-                .begin(&request, request.owner()?, &session.id, sink)
-                .await;
+                .begin(
+                    &request,
+                    &session.id,
+                    sink.context("ACP execution requires an event sink")?,
+                )
+                .await?;
+            if let Some(address) = session.state.address(&session.id).await {
+                session
+                    .state
+                    .emit(BackendEvent::Turn {
+                        address,
+                        update: TurnUpdate::Started {
+                            started_at_ms: super::children::timestamp(),
+                        },
+                    })
+                    .await?;
+            }
             self.conversation
                 .lock()
                 .await
@@ -829,11 +849,12 @@ impl Backend for AcpBackend {
                 crate::turn::TurnOutcome::Failed
             };
             let cleanup = session.state.finish(outcome).await;
-            response.context("ACP prompt failed")?;
-            cleanup?;
             if outcome == crate::turn::TurnOutcome::Cancelled {
+                cleanup?;
                 return Err(crate::broker::TurnCancelled.into());
             }
+            response.context("ACP prompt failed")?;
+            cleanup?;
             let mut output = std::mem::take(&mut *session.state.output.lock().await);
             output.backend_session_id = Some(session.id.clone());
             output.capability = self.runtime_capability(&session).await;
@@ -850,11 +871,10 @@ impl Backend for AcpBackend {
                             .map(str::to_owned)
                     }),
             };
-            skills.output(&mut output)?;
             Ok(output)
         }
         .await;
-        Ok(output?.into_completion())
+        output.map_err(BackendError::from)
     }
 
     async fn model_list(&self, request: BackendRequest) -> Result<Vec<BackendModel>> {
@@ -945,15 +965,92 @@ impl Backend for AcpBackend {
             self.kind == BackendKind::Claude,
             "Antigravity has no manual compaction operation"
         );
-        let mut prompt = request.request;
-        prompt.input = BackendInput::from_text("/compact");
-        self.prompt(prompt).await
+        let scope = EventScope::SessionOperation {
+            owner: request.request.owner()?,
+            operation_id: request.id,
+        };
+        let request = request.request;
+        let session = self.session(catalog_request(&request), None, None).await?;
+        let _turn = session
+            .turn
+            .try_lock()
+            .context("ACP session already owns active work")?;
+        self.configure(&session, &request).await?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.cancellation
+            .lock()
+            .await
+            .insert(request.runtime_key()?, cancelled.clone());
+        let (sink, mut stream) = events::channel(scope);
+        session.state.begin_compaction(&session.id, sink).await?;
+        self.conversation
+            .lock()
+            .await
+            .insert(request.runtime_key()?, session.id.clone());
+        let mut event = Vec::new();
+        let execution = session.transport.request(
+            "session/prompt",
+            json!({"sessionId":session.id,"prompt":[{"type":"text","text":"/compact"}]}),
+        );
+        tokio::pin!(execution);
+        let mut stream_open = true;
+        let result = loop {
+            tokio::select! {
+                update = stream.recv(), if stream_open => match update {
+                    Ok(Some(update)) => event.push(update),
+                    Ok(None) => stream_open = false,
+                    Err(error) => {
+                        let cleanup = session.transport.shutdown().await;
+                        let error: anyhow::Error = error.into();
+                        break Err(match cleanup {
+                            Ok(()) => error,
+                            Err(cleanup) => error.context(format!("ACP compaction cleanup also failed: {cleanup:#}")),
+                        });
+                    }
+                },
+                result = &mut execution => break result,
+            }
+        };
+        session.state.finish_compaction().await;
+        while let Some(update) = stream.try_next()? {
+            event.push(update);
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Err(crate::broker::TurnCancelled.into());
+        }
+        let response = result?;
+        serde_json::from_value::<agent_client_protocol::schema::v1::PromptResponse>(
+            response.clone(),
+        )
+        .map_err(|error| BackendError::Protocol {
+            message: format!("ACP compaction response does not confirm a completed turn: {error}"),
+        })?;
+        if response["stopReason"] == "cancelled" {
+            return Err(crate::broker::TurnCancelled.into());
+        }
+        let mut completion = std::mem::take(&mut *session.state.output.lock().await);
+        completion.backend_session_id = Some(session.id.clone());
+        completion.capability = self.runtime_capability(&session).await;
+        let catalog = session.state.catalog.read().await;
+        completion.runtime = BackendRuntime {
+            provider: self.descriptor().label,
+            model: catalog
+                .pointer("/models/currentModelId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    find_option(&catalog, "model")
+                        .and_then(|option| option["currentValue"].as_str())
+                        .map(str::to_owned)
+                }),
+        };
+        Ok(BackendOutput { event, completion })
     }
 
     async fn has_active_turn(&self, id: &str) -> bool {
         let session = self.session.lock().await.get(id).cloned();
         match session {
-            Some(session) => session.state.active.read().await.is_some(),
+            Some(session) => session.state.has_active_work().await,
             None => false,
         }
     }
@@ -995,14 +1092,19 @@ impl Backend for AcpBackend {
             )
             .await?;
         if let Some(start) = input.task_start() {
-            let mut event = BackendEvent::task_started(start.clone(), input.text().to_owned());
-            event.data["input_message_id"] = serde_json::json!(
-                submission
-                    .as_ref()
-                    .map(|submission| submission.record())
-                    .transpose()?
-                    .and_then(|record| record.input_message_id)
-            );
+            let input_id = submission
+                .as_ref()
+                .map(|submission| submission.record())
+                .transpose()?
+                .and_then(|record| record.input_message_id);
+            let event = BackendEvent::InputAccepted {
+                scope: session.state.scope().await?,
+                acknowledgement: InputAcknowledgement::TaskStarted {
+                    input_id,
+                    start: start.clone(),
+                    prompt: input.text().to_owned(),
+                },
+            };
             session.state.emit(event).await?;
         }
         Ok(())
@@ -1015,9 +1117,12 @@ impl Backend for AcpBackend {
         let session = self.session.lock().await.remove(id);
         if let Some(session) = session {
             session.state.cancel_control().await;
-            *session.state.active.write().await = None;
             let result = session.transport.shutdown().await;
-            session.state.close_control().await;
+            let finalized = session
+                .state
+                .finish(crate::turn::TurnOutcome::Cancelled)
+                .await;
+            finalized?;
             result?;
         }
         Ok(())

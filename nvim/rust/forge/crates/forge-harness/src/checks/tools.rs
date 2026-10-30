@@ -57,7 +57,7 @@ pub(crate) struct CheckToolScope {
     mode: PromptMode,
     permission: ApprovalMode,
     permissions: Arc<crate::backend::approval::PermissionCoordinator>,
-    address: crate::backend::ProviderAddress,
+    scope: crate::backend::InvocationScope,
     editing: Arc<AtomicBool>,
     setup: bool,
     can_run: bool,
@@ -69,7 +69,7 @@ pub(crate) struct CheckToolScope {
 #[derive(Clone)]
 struct CheckDelivery {
     authorization: BackendEventSink,
-    lifecycle: Option<BackendEventSink>,
+    lifecycle: Option<crate::broker::publication::SessionUpdateSink>,
 }
 
 /// Binds check operations to the live root turn and its setup/write authority.
@@ -81,14 +81,14 @@ pub(crate) struct CheckAuthority {
     pub mode: PromptMode,
     pub permission: ApprovalMode,
     pub permissions: Arc<crate::backend::approval::PermissionCoordinator>,
-    pub address: crate::backend::ProviderAddress,
+    pub scope: crate::backend::InvocationScope,
     pub authorization_sink: BackendEventSink,
     pub editing: Arc<AtomicBool>,
     pub setup: bool,
     pub can_run: bool,
     pub agent: Arc<crate::agent::AgentCoordinator>,
     pub cancelled: Arc<AtomicBool>,
-    pub sink: Option<BackendEventSink>,
+    pub sink: Option<crate::broker::publication::SessionUpdateSink>,
 }
 
 pub(crate) struct CheckToolLease(Arc<CheckToolScope>);
@@ -125,7 +125,7 @@ impl CheckToolScope {
             mode,
             permission,
             permissions,
-            address,
+            scope,
             authorization_sink,
             editing,
             setup,
@@ -143,7 +143,7 @@ impl CheckToolScope {
             mode,
             permission,
             permissions,
-            address,
+            scope,
             editing,
             setup,
             can_run,
@@ -176,7 +176,7 @@ impl CheckToolScope {
                 let settings = crate::settings::SettingsStore::open(&self.data_root)?
                     .get(
                         &self.runner.workspace.to_string_lossy(),
-                        &self.address.thread_id,
+                        self.scope.owner.session_id.as_str(),
                         &self.backend,
                     )?
                     .desired;
@@ -265,7 +265,7 @@ impl CheckToolScope {
                         .review(
                             "Update project checks".into(),
                             review,
-                            self.address.clone(),
+                            self.scope.clone(),
                             &delivery.authorization,
                         )
                         .await?;
@@ -290,7 +290,8 @@ impl CheckToolScope {
                 let published = self
                     .runner
                     .configure(
-                        self.runner.exchange_owner(&self.address.turn_id)?,
+                        self.runner
+                            .exchange_owner(self.scope.exchange_id.as_str())?,
                         request,
                         delivery.lifecycle.as_ref(),
                         Some(&self.editing),
@@ -318,7 +319,8 @@ impl CheckToolScope {
                     super::CheckRunRequest,
                 >(arguments)?)?;
                 let run = self.runner.prepare_request(
-                    self.runner.exchange_owner(&self.address.turn_id)?,
+                    self.runner
+                        .exchange_owner(self.scope.exchange_id.as_str())?,
                     request,
                     self.task_id.clone(),
                     self.shell,
@@ -373,7 +375,7 @@ impl CheckToolScope {
                     reason: Some("Configured project checks".into()),
                     target_list,
                 },
-                Some(self.address.clone()),
+                None,
                 Some(authorization),
             )
             .await?;
@@ -669,7 +671,7 @@ impl CheckSupervisor {
         &self,
         owner: crate::timeline::TimelineOwner,
         request: ConfigureChecks,
-        sink: Option<&BackendEventSink>,
+        sink: Option<&crate::broker::publication::SessionUpdateSink>,
         editing: Option<&AtomicBool>,
     ) -> Result<Value> {
         ensure!(
