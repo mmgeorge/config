@@ -135,6 +135,7 @@ pub enum CorrectionReason {
     Spelling,
     ContextualChoice,
     StandaloneI,
+    FirstPersonContraction,
     SentenceStart,
 }
 

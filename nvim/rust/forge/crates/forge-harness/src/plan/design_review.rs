@@ -825,6 +825,11 @@ fn rows(
                 BlockId("plan:section:checks".into()),
                 "Checks",
             )?);
+            overview.push(BufferBlock {
+                id: BlockId("plan:section:checks:spacing".into()),
+                text: BufferText::from_rows([""])?,
+                metadata: BlockMetadata::default(),
+            });
             let lines = review_checks(Some(design), None)?;
             let check_ids = design
                 .check_preview
@@ -859,12 +864,17 @@ fn rows(
                 BlockId("plan:section:changes".into()),
                 "Changes",
             )?);
+            overview.push(BufferBlock {
+                id: BlockId("plan:section:changes:spacing".into()),
+                text: BufferText::from_rows([""])?,
+                metadata: BlockMetadata::default(),
+            });
             let offset = overview.len() as u32;
             for anchor in &mut navigation.anchor {
                 anchor.line += offset;
             }
             section_anchor.push(PlanNavigationAnchor {
-                line: offset,
+                line: changes_start as u32 + 1,
                 target: PlanReviewTarget::Section {
                     section: super::PlanSection::Files,
                 },
@@ -897,6 +907,11 @@ fn rows(
         let fold_id = format!("plan:section:{name}");
         let title = metadata.title;
         overview.push(section_header(BlockId(fold_id.clone()), title)?);
+        overview.push(BufferBlock {
+            id: BlockId(format!("{fold_id}:spacing")),
+            text: BufferText::from_rows([""])?,
+            metadata: BlockMetadata::default(),
+        });
         let text = if metadata.text.trim().is_empty() {
             "None specified."
         } else {
@@ -1204,6 +1219,11 @@ pub(super) fn test_inventory(
         path: None,
         label: "Tests".into(),
     }];
+    block.push(BufferBlock {
+        id: BlockId("plan:section:tests:spacing".into()),
+        text: BufferText::from_rows([""])?,
+        metadata: BlockMetadata::default(),
+    });
     for (file_index, file) in files.iter().enumerate() {
         let original_path = design
             .moved
@@ -1845,6 +1865,46 @@ fn pointer(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keep section spacing in canonical text and both projected review views.
+    #[test]
+    fn section_headings_have_a_blank_row_before_content() {
+        let mut document = crate::plan::document::test_fixture("spacing", "Spacing");
+        document.design = Some(super::super::DeclarationDesign::default());
+        let rendered = render(&document).unwrap();
+        for public_only in [false, true] {
+            let (blocks, _) = project(
+                &document,
+                &WidthProfile::default(),
+                ReviewAnnotationView {
+                    annotation: &[],
+                    revision: &HashMap::new(),
+                    focused: None,
+                },
+                &HashMap::new(),
+                public_only,
+                None,
+                &HashSet::new(),
+            )
+            .unwrap();
+            for (index, block) in blocks.iter().enumerate() {
+                if block.id.0.starts_with("plan:section:") && !block.metadata.fold.is_empty() {
+                    assert_eq!(
+                        blocks[index + 1].text.row(0),
+                        Some(""),
+                        "missing spacing after {}",
+                        block.id.0
+                    );
+                    assert!(
+                        rendered
+                            .markdown
+                            .contains(&format!("{}\n\n", block.text.row(0).unwrap())),
+                        "canonical heading has no blank row"
+                    );
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn algorithm_syntax_preserves_native_rows_and_behavior_anchors() {

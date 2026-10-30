@@ -594,6 +594,7 @@ impl EditablePlanReview<'_> {
         )
     }
 
+    /// Bind each question to exact numbered text from the captured review snapshot.
     fn questions(self, input: DocumentInput) -> Result<Vec<PlanReviewQuestion>> {
         let document = self.0;
         // Independent answer forks read the same snapshot without consuming each other's input sequence.
@@ -627,9 +628,21 @@ impl EditablePlanReview<'_> {
                 vec![annotation.source.clone()],
             )?;
             let excerpt = super::render_review_feedback(&document.source.document, &resolved)?;
+            let selection = super::review_feedback::selected_lines(
+                &document.source.rendered,
+                &annotation.source,
+            )?;
             let thread = document.annotation.thread_context(annotation)?;
             let prompt = format!(
-                "Saved declaration design:\n{context}\n\nPlan review question and source context:\n{excerpt}\n\nConversation thread:\n{thread}Answer this question:\n{}",
+                "Reviewed plan: {}\nReviewed plan version: {}\nSaved source digest: {}\n\
+                 \nSaved declaration design:\n{context}\n\
+                 \nExact selection from the reviewed plan (numbers identify canonical plan lines, not workspace file lines):\n{selection}\n\
+                 Semantic source context (declaration excerpts use their own file line numbers):\n{excerpt}\n\
+                 Conversation thread:\n{thread}Answer this question:\n{}\n\
+                 \nAnswer specifically about the selected text. Context before, context after, and the saved design are supporting context, not the question's target.",
+                document.source.document.plan_id,
+                document.source.document.version,
+                document.source.saved_digest,
                 annotation.source.body
             );
             question.push(PlanReviewQuestion {
@@ -3163,6 +3176,7 @@ mod tests {
         );
     }
 
+    /// Keep code and same-section prose questions bound to their own saved selections.
     #[test]
     fn questions_preserve_design_and_persist_answers_bound_to_current_text() {
         let temporary = tempfile::tempdir().unwrap();
@@ -3173,7 +3187,9 @@ mod tests {
         design.document.objective = "Expose shared state.".into();
         design.document.background = "The fixture contains the declarations under review.".into();
         design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
-        design.document.design = "Use a focused state owner.".into();
+        design.document.design =
+            "Use a focused state owner.\nPreserve independent readers.\nKeep writes explicit.\nReport failures."
+                .into();
         design.proposed.insert(
             "state.rs".into(),
             "/// Owns shared state.\npub struct State;\n".into(),
@@ -3213,6 +3229,14 @@ mod tests {
             })
             .unwrap();
         let line = anchor.line;
+        let prose_start = document
+            .source
+            .rendered
+            .markdown
+            .lines()
+            .position(|row| row == "Use a focused state owner.")
+            .unwrap();
+        let prose_line = u32::try_from(prose_start + 1).unwrap();
         let snapshot = document.snapshot();
         let target = snapshot.block[0].metadata.target[0].clone();
         let mut input = DocumentInput {
@@ -3244,6 +3268,58 @@ mod tests {
         comment.id = "comment".into();
         comment.kind = ReviewAnnotationKind::Comment;
         comment.source.body = "Keep this interface.".into();
+        let prose_questions = [
+            (prose_line, prose_line),
+            (prose_line + 1, prose_line + 1),
+            (prose_line + 2, prose_line + 3),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start_line, end_line))| {
+            let mut annotation = question.clone();
+            annotation.id = format!("prose-{index}");
+            annotation.source = crate::plan::PlanAnnotationInput {
+                start_line,
+                end_line,
+                body: "why?".into(),
+            };
+            annotation
+        })
+        .collect();
+        store
+            .save_annotations(&id, &digest, prose_questions)
+            .unwrap();
+        let captured = store.questions(input.clone()).unwrap();
+        assert_eq!(captured.len(), 3);
+        for (question, expected) in captured.iter().zip([
+            format!("{prose_line}: Use a focused state owner.\n"),
+            format!("{}: Preserve independent readers.\n", prose_line + 1),
+            format!(
+                "{}: Keep writes explicit.\n{}: Report failures.\n",
+                prose_line + 2,
+                prose_line + 3
+            ),
+        ]) {
+            let selected = question
+                .prompt
+                .split_once("\nSelected text:\n")
+                .unwrap()
+                .1
+                .split_once("\nContext after:\n")
+                .unwrap()
+                .0;
+            assert_eq!(selected, expected);
+            assert!(
+                question
+                    .prompt
+                    .contains("Reviewed plan: plan\nReviewed plan version: 1\n")
+            );
+            assert!(
+                question
+                    .prompt
+                    .contains(&format!("Saved source digest: {digest}"))
+            );
+        }
         store
             .save_annotations(&id, &digest, vec![question.clone(), comment.clone()])
             .unwrap();
@@ -3253,6 +3329,12 @@ mod tests {
             questions[0].prompt.contains("pub struct State;")
                 && questions[0].prompt.contains("Why use this owner?")
         );
+        assert!(
+            questions[0]
+                .prompt
+                .contains(&format!("Selected plan lines: {line}-{line}"))
+        );
+        assert!(questions[0].prompt.contains("Semantic source context"));
         let captured = store
             .answer(&id, &questions[0], "It isolates ownership.".into(), 3210)
             .unwrap();

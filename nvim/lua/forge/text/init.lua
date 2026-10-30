@@ -40,8 +40,9 @@ function M.setup()
     end})
     vim.api.nvim_create_autocmd("BufWritePre",{group=group,callback=function(event) M.invalidate(event.buf) end})
     vim.api.nvim_create_autocmd("BufWritePost",{group=group,callback=function(event)
-      if require("forge.text.wordlist").invalidate(event.file) and package.loaded["forge.text.input"] then
-        require("forge.text.input").invalidate_all()
+      if require("forge.text.wordlist").invalidate(event.file) then
+        if package.loaded["forge.text.input"] then require("forge.text.input").invalidate_all() end
+        require("forge.text.harper").refresh_dictionaries()
       end
     end})
   end

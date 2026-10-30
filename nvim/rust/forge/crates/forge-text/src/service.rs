@@ -114,6 +114,7 @@ impl TextCorrectionService {
             let mut ordered: Vec<_> = terminology.iter().collect();
             ordered.sort();
             let mut digest = Sha256::new();
+            digest.update(crate::model::MODEL_REVISION);
             digest.update(model.revision());
             for term in ordered {
                 digest.update(term.as_bytes());
@@ -123,7 +124,7 @@ impl TextCorrectionService {
             let ready = ProfileReady {
                 profile: request.profile.clone(),
                 profile_revision: revision.clone(),
-                model_revision: "en-US-bigram-1".into(),
+                model_revision: crate::model::MODEL_REVISION.into(),
                 dictionary_revision: model.revision().into(),
             };
             if owner.closed.load(Ordering::Acquire) {

@@ -1,7 +1,9 @@
 vim.opt.runtimepath:prepend(vim.fn.getcwd()..'/nvim')
 local published={}
 local captured_config
-package.loaded['forge.infra.config']={options={harper={enabled=true,cmd={vim.v.progpath},settings={}}}}
+package.loaded['forge.infra.config']={options={harper={enabled=true,cmd={vim.v.progpath},settings={}},
+  text_correction={wordlist=false,terminology={},project_terms={}}}}
+package.loaded['forge.text.wordlist']={harper_dictionary=function(_,callback) callback('/fixture/dictionary.txt') end}
 vim.lsp.start=function(config) captured_config=config; return 12345 end
 vim.lsp.buf_detach_client=function() return true end
 vim.lsp.diagnostic.on_publish_diagnostics=function(_,result) published[#published+1]=result end

@@ -195,7 +195,7 @@ M.defaults = {
     dialect = 'American', diagnosticSeverity = 'hint',
     -- Largest exact JSON integer avoids Harper's small default document cutoff.
     maxFileLength = 9007199254740991,
-    linters = { SpellCheck = false, SentenceCapitalization = false, SpelledNumbers = false },
+    linters = { SpellCheck = true, SentenceCapitalization = false, SpelledNumbers = false, OkToOkay = false },
   } },
   text_correction = { enabled = true, language = "en-US", terminology = {}, project_terms = {},
     wordlist = require("forge.text.wordlist").default_path },

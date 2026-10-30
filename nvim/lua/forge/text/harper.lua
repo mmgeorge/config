@@ -3,6 +3,7 @@ local context=require('forge.text.context')
 local state_by_buffer={}
 local action_by_id={}
 local action_sequence=0
+local dictionary_revision=0
 local watching_install=false
 local source_language={c='c',cpp='cpp',cs='csharp',clojure='clojure',cmake='cmake',dart='dart',elixir='elixir',
   go='go',groovy='groovy',haskell='haskell',html='html',java='java',javascript='javascript',
@@ -62,6 +63,13 @@ local function apply(command)
   local client=vim.lsp.get_client_by_id(state.client_id)
   if not client then return end
   require('forge.text').invalidate(state.buffer)
+  if record.word then
+    require('forge.text.wordlist').add(require('forge.infra.config').options.text_correction.wordlist,record.word,function(failure)
+      if failure then require('forge.infra.notifications').error(failure,'Global dictionary') return end
+      M.refresh_dictionaries()
+    end)
+    return
+  end
   if record.action.edit then vim.lsp.util.apply_workspace_edit(record.action.edit,'utf-16') end
   local server_command=record.action.command
   if type(server_command)=='table' then client:exec_cmd(server_command,{bufnr=state.buffer})
@@ -142,13 +150,27 @@ local function transport(command,directory)
         if error then callback(error) return end
         actions=translate(actions,uri_by_alias)
         local filtered={}
+        local added_word={}
         if valid(state,generation,tick) then
           for _,action in ipairs(actions or {}) do
-            if edit_allowed(state,action.edit) then
+            local server_command=type(action.command)=='table' and action.command or action
+            local dictionary_command=server_command.command
+            local dictionary_action=dictionary_command=='HarperAddToUserDict'
+              or dictionary_command=='HarperAddToWSDict' or dictionary_command=='HarperAddToFileDict'
+            local word=dictionary_action and server_command.arguments and server_command.arguments[1]
+            local include=not dictionary_action or (type(word)=='string' and not added_word[word]
+              and require('forge.infra.config').options.text_correction.wordlist~=false)
+            if include and edit_allowed(state,action.edit) then
+              local title=action.title
+              if dictionary_action then
+                added_word[word]=true
+                title='Add "'..word..'" to the global dictionary'
+              end
               action_sequence=action_sequence+1
-              action_by_id[action_sequence]={state=state,generation=generation,tick=tick,action=action}
-              filtered[#filtered+1]={title=action.title,kind=action.kind,diagnostics=action.diagnostics,
-                isPreferred=action.isPreferred,command={title=action.title,command=command_name,arguments={action_sequence}}}
+              action_by_id[action_sequence]={state=state,generation=generation,tick=tick,action=action,
+                word=dictionary_action and word or nil}
+              filtered[#filtered+1]={title=title,kind=action.kind,diagnostics=action.diagnostics,
+                isPreferred=action.isPreferred,command={title=title,command=command_name,arguments={action_sequence}}}
             end
           end
         end
@@ -197,20 +219,63 @@ function M.attach(buffer,owner)
   end
   local command=executable()
   if not command then return end
-  local directory=vim.fs.joinpath(vim.fn.stdpath('cache'),'forge','harper')
-  vim.fn.mkdir(directory,'p')
-  state.client_id=vim.lsp.start({name='harper_ls',cmd=transport(command,directory),root_dir=owner.root,
+  if state.starting then return end
+  state.starting=true
+  require('forge.text.wordlist').harper_dictionary(owner,function(path,failure)
+    state.starting=false
+    if not state.active or state_by_buffer[buffer]~=state then return end
+    if failure then require('forge.infra.notifications').error(failure,'Harper dictionary') return end
+    local settings=vim.deepcopy(configuration().settings)
+    settings.userDictPath=path
+    local directory=vim.fs.dirname(path)
+    state.client_id=vim.lsp.start({name='harper_ls',cmd=transport(command,directory),root_dir=owner.root,
     get_language_id=function(target,filetype)
       local target_state=state_by_buffer[target]
       if target_state and target_state.owner.kind=='source' then return source_language[filetype] or 'plaintext' end
       return target_state and target_state.owner.kind=='prose' and 'plaintext' or 'markdown'
     end,
     capabilities={general={positionEncodings={'utf-16'}}},
-    settings={['harper-ls']=configuration().settings},
+    settings={['harper-ls']=settings},
     flags={debounce_text_changes=150},
     handlers={['textDocument/publishDiagnostics']=diagnostics},
     commands={[command_name]=apply},
-  },{bufnr=buffer})
+    },{bufnr=buffer})
+  end)
+end
+
+--- Refresh each live Harper client after the shared vocabulary changes.
+function M.refresh_dictionaries()
+  dictionary_revision=dictionary_revision+1
+  local revision=dictionary_revision
+  local refreshed={}
+  for _,state in pairs(state_by_buffer) do
+    local client=state.client_id and vim.lsp.get_client_by_id(state.client_id)
+    if client and not refreshed[client.id] then
+      refreshed[client.id]=true
+      require('forge.text.wordlist').harper_dictionary(state.owner,function(path,failure)
+        if revision~=dictionary_revision then return end
+        if failure then require('forge.infra.notifications').error(failure,'Harper dictionary') return end
+        if client:is_stopped() then return end
+        local settings=vim.deepcopy(configuration().settings)
+        settings.userDictPath=path
+        client.settings={['harper-ls']=settings}
+        if not client:notify('workspace/didChangeConfiguration',{settings=client.settings}) then
+          require('forge.infra.notifications').error('Cannot refresh Harper dictionary','Harper')
+        end
+        -- Harper reloads from disk on configuration changes, so restore unsaved and virtual text.
+        for buffer,attached in pairs(state_by_buffer) do
+          if attached.client_id==client.id and vim.api.nvim_buf_is_loaded(buffer) then
+            if not client:notify('textDocument/didChange',{
+              textDocument={uri=vim.uri_from_bufnr(buffer),version=vim.lsp.util.buf_versions[buffer]},
+              contentChanges={{text=table.concat(vim.api.nvim_buf_get_lines(buffer,0,-1,false),'\n')}},
+            }) then
+              require('forge.infra.notifications').error('Cannot recheck current text with Harper','Harper')
+            end
+          end
+        end
+      end)
+    end
+  end
 end
 
 ---@param buffer integer
@@ -243,12 +308,7 @@ function M.setup()
         end) end
       end)
     end
-    for _,client in ipairs(vim.lsp.get_clients({name='harper_ls'})) do
-      if client.commands[command_name] then
-        client.settings={['harper-ls']=vim.deepcopy(configuration().settings)}
-        client:notify('workspace/didChangeConfiguration',{settings=client.settings})
-      end
-    end
+    M.refresh_dictionaries()
     return
   end
   local buffers={}

@@ -19,11 +19,11 @@ Set `text_correction.enabled = false` to disable automatic correction. Disabling
 
 ## Allowed words
 
-Edit [`nvim/spell/forge.en-US.txt`](../../spell/forge.en-US.txt) to allow words such as `repo`. Put one word on each line; blank lines and lines beginning with `#` are ignored. Saving the file in Neovim reloads it for subsequent corrections without a rebuild or restart.
+Harper and automatic correction share [`nvim/spell/forge.en-US.txt`](../../spell/forge.en-US.txt), a global vocabulary file stored in this configuration repository. Use the **Add "word" to the global dictionary** code action or edit the file directly. Additions apply across projects and become ordinary version-controlled changes, not automatic Git commits. Put one word on each line. Blank lines and lines beginning with `#` are ignored. Saving the file in Neovim refreshes both services without a rebuild or restart.
 
-The file also includes 3,250 programming words from CSpell's coding, software-concept, and computing-acronym lists. [Import details and licensing](../../spell/programming-terms.md) record the pinned source revision and the exclusions that keep contextual spelling checks working. Add personal entries in the small section at the top of the file.
+The separate [`nvim/spell/programming.en-US.txt`](../../spell/programming.en-US.txt) supplies 3,250 programming words from CSpell's coding, software-concept, and computing-acronym lists. Both services merge it with the personal file at load time. [Import details and licensing](../../spell/programming-terms.md) record the pinned source revision and the exclusions that keep contextual spelling checks working. The global add-word action writes only to the personal file.
 
-The file combines with `terminology` and `project_terms`. Allowed words are protected from spelling replacements, case-insensitively, while the standalone `i` and sentence-start capitalization rules still apply. Set `text_correction.wordlist` to another file path, or to `false` to use only the configured terminology lists. A missing or invalid configured file reports an error and preserves the text being typed.
+The files combine with `terminology` and `project_terms` for both services. Allowed words are protected from automatic spelling replacements, case-insensitively, while the standalone `i` and sentence-start capitalization rules still apply. Set `text_correction.wordlist` to another personal file path, or to `false` to omit personal vocabulary and hide dictionary-add actions. Programming vocabulary remains enabled. A missing or invalid configured file reports an error and preserves the text being typed. Save unsaved dictionary edits before using the add-word action.
 
 The language model evaluates dictionary words as well as unknown spellings. It may keep a word unchanged. Its contextual evidence comes from adjacent words, and forward typing provides no words to the right that you have not typed yet. The initial held-out regression sample includes a missed `loose`/`lose` correction. This feature is not a general grammar checker.
 
@@ -33,7 +33,9 @@ Space, punctuation, Tab, and an inserted newline can complete a word. Pressing B
 
 Continuing to type, moving the cursor, leaving Insert mode, switching buffers, or submitting text invalidates a pending result. Paste, generated text, completion edits, macros, undo, and redo do not independently trigger correction. A later ordinary typed delimiter can evaluate the word you are currently completing.
 
-Only standalone `i` and alphabetic sentence starts receive automatic capitalization. Opening quotes, digits, and punctuation prevent sentence-start capitalization. Forge does not add proper-name, acronym, brand, or title capitalization.
+Standalone `im` becomes `I'm` and `cant` becomes `can't` in eligible prose, including mid-sentence. The `cant` rule intentionally takes precedence over that word's uncommon standalone meanings and dictionary exemptions. Dictionary-recognized contractions keep their spelling and straight or curly apostrophe, so `can't` and `can’t` cannot become `cant` or `can`. First-person contractions such as `I'm`, `I'll`, `I've`, and `I'd` capitalize `I` anywhere in a sentence. These rules do not expand ambiguous words such as `ill`, `well`, or `were` into contractions.
+
+Standalone `i` and alphabetic sentence starts also receive automatic capitalization. Opening quotes, digits, and punctuation prevent sentence-start capitalization. Forge does not add proper-name, acronym, brand, or title capitalization. Protected code and technical tokens remain excluded, and Backspace can still reject an individual correction.
 
 Typing `.`, `,`, `;`, `:`, `!`, or `?` after spaces following an eligible word removes those spaces: `This is a sentence .` becomes `This is a sentence.`. Immediate Backspace removes the punctuation and restores the original spacing, together with any spelling change in that transaction. Retyping the rejected punctuation keeps the original spacing for that occurrence. This rule uses the same prose and editable-region protection as spelling.
 
@@ -49,7 +51,7 @@ The [verification report](../../contributing/forge/text-verification.md) records
 
 Harper runs locally alongside automatic correction and supplies grammar diagnostics and standard Neovim LSP code actions. It covers Markdown, plain text, source comments, commit messages, Harness composers, and native PR title/body/comment regions. Diagnostics and fixes use the same prose and editable-region checks; code and generated read-only sections are excluded. Source languages without a native Harper parser use plain-text checking behind those same comment guards.
 
-Mason installs `harper-ls` automatically. Set `harper.enabled = false` in the Forge configuration to disable it, or set `harper.cmd` to an explicit executable command. `harper.settings` contains Harper's server settings. The default disables Harper's `SpellCheck` and `SentenceCapitalization` rules because Forge's automatic correction owns those behaviors; the other grammar rules remain available.
+Mason installs `harper-ls` automatically. Set `harper.enabled = false` in the Forge configuration to disable it, or set `harper.cmd` to an explicit executable command. `harper.settings` contains Harper's server settings. `SpellCheck` is enabled by default to underline misspellings alongside automatic correction. `SentenceCapitalization`, `SpelledNumbers`, and `OkToOkay` remain disabled, allowing `ok` without a style warning. Dictionary additions do not suppress other grammar or style rules.
 
 ```lua
 require('forge').setup({
@@ -64,3 +66,5 @@ require('forge').setup({
 ```
 
 Harper suggestions apply only after choosing a code action. Every edit is checked again against the current buffer and its editable regions; typing or submitting invalidates an older suggestion. The server runs from Forge's cache directory to avoid holding a working-directory lock inside a project or build directory.
+
+Forge replaces Harper's user, workspace, and file dictionary actions with one global action per word. Forge appends to the configured source wordlist, invalidates automatic correction's cached vocabulary, and refreshes running Harper clients. Harper reads a plain-word copy in Forge's cache, including configured terminology, rather than rewriting the commented source file. Forge owns `harper.settings.userDictPath` for this integration.

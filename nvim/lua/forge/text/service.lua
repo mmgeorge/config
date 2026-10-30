@@ -37,7 +37,7 @@ end
 ---@param callback fun(profile?: table, failure?: string)
 function M.initialize(owner,callback)
   local config = require("forge.infra.config").options.text_correction
-  require("forge.text.wordlist").load(config.wordlist,function(terms,failure)
+  require("forge.text.wordlist").vocabulary(config.wordlist,function(terms,failure)
     if failure then callback(nil,failure) return end
     initialize_profile(owner,config,terms,callback)
   end)

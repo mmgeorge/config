@@ -11,6 +11,36 @@ struct FeedbackFile {
     comment: BTreeMap<usize, BTreeSet<(bool, u32)>>,
 }
 
+/// Extract complete selected plan lines and up to three context lines on each side.
+pub(crate) fn selected_lines(
+    rendered: &super::RenderedPlan,
+    selection: &super::PlanAnnotationInput,
+) -> Result<String> {
+    let rows = rendered.markdown.lines().collect::<Vec<_>>();
+    let start = usize::try_from(selection.start_line)?;
+    let end = usize::try_from(selection.end_line)?;
+    ensure!(
+        start > 0 && start <= end && end <= rows.len(),
+        "question selection is outside the reviewed plan"
+    );
+    let start = start - 1;
+    let mut output = format!(
+        "Selected plan lines: {}-{}\n",
+        selection.start_line, selection.end_line
+    );
+    for (heading, range) in [
+        ("Context before", start.saturating_sub(3)..start),
+        ("Selected text", start..end),
+        ("Context after", end..end.saturating_add(3).min(rows.len())),
+    ] {
+        output.push_str(&format!("\n{heading}:\n"));
+        for index in range {
+            output.push_str(&format!("{}: {}\n", index + 1, rows[index]));
+        }
+    }
+    Ok(output)
+}
+
 /// Present resolved comments beside numbered declaration diffs without exposing anchor bookkeeping.
 pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> Result<String> {
     let design = document
@@ -269,6 +299,37 @@ mod test {
     use crate::plan::{
         DeclarationDesign, DeclarationFile, PlanAnnotationSubject, document::test_fixture,
     };
+
+    /// Preserve multiline selections without confusing surrounding rows with the target.
+    #[test]
+    fn selected_lines_preserve_exact_ranges_and_context_at_document_edges() {
+        let rendered = crate::plan::RenderedPlan {
+            markdown: (1..=12).map(|line| format!("row {line}\n")).collect(),
+            navigation: crate::plan::PlanNavigationIndex {
+                plan_id: "plan".into(),
+                plan_version: 3,
+                anchor: Vec::new(),
+            },
+        };
+        let selection = |start_line, end_line| crate::plan::PlanAnnotationInput {
+            start_line,
+            end_line,
+            body: "why?".into(),
+        };
+        let output = selected_lines(&rendered, &selection(5, 9)).unwrap();
+        assert_eq!(
+            output,
+            "Selected plan lines: 5-9\n\nContext before:\n2: row 2\n3: row 3\n4: row 4\n\
+             \nSelected text:\n5: row 5\n6: row 6\n7: row 7\n8: row 8\n9: row 9\n\
+             \nContext after:\n10: row 10\n11: row 11\n12: row 12\n"
+        );
+        let output = selected_lines(&rendered, &selection(1, 12)).unwrap();
+        assert!(output.contains("Selected text:\n1: row 1\n"));
+        assert!(output.contains("12: row 12\n\nContext after:\n"));
+        for invalid in [selection(0, 1), selection(2, 1), selection(1, 13)] {
+            assert!(selected_lines(&rendered, &invalid).is_err());
+        }
+    }
 
     fn document(before: &str, after: &str) -> PlanDocument {
         let mut document = test_fixture("plan", "Review declarations.");

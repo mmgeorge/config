@@ -15,7 +15,7 @@ const UNIGRAM: &[u8] = include_bytes!("../assets/frequency_dictionary_en_82_765.
 const BIGRAM: &[u8] = include_bytes!("../assets/frequency_bigramdictionary_en_243_342.txt");
 const UNIGRAM_CHECKSUM: &str = "5eb7d9ca29ba3aee23d11b8b3d3aa048d7e94538b468eeffd9e07f76de7d5125";
 const BIGRAM_CHECKSUM: &str = "c7775c2d4d25930146ae07de85c228330f9b8b6a81c3cc8f6fa52e10246e3de8";
-const MODEL_REVISION: &str = "en-US-bigram-1";
+pub(crate) const MODEL_REVISION: &str = "en-US-bigram-2";
 
 /// Own the validated immutable lexical and contextual base shared by terminology profiles.
 pub(crate) struct Model {
@@ -150,6 +150,9 @@ impl Model {
             token::target(&request.context, &request.target, &request.protected)?;
         let original = words[position].text;
         let normalized = original.to_lowercase();
+        let canonical = normalized.replace('\u{2019}', "'");
+        let protected_contraction =
+            canonical.contains('\'') && self.unigram.contains_key(&canonical);
         let mut candidates = self.candidates.get(&normalized).unwrap_or_else(|| {
             let candidates =
                 self.dictionary
@@ -177,6 +180,23 @@ impl Model {
                 distance: 0,
                 count: 0,
             });
+        }
+        let contraction = match normalized.as_str() {
+            "im" => Some("i'm"),
+            "cant" => Some("can't"),
+            _ => None,
+        };
+        if let Some(contraction) = contraction {
+            candidates.retain(|candidate| candidate.term == contraction);
+            if candidates.is_empty() {
+                candidates.push(symspell_rs::Suggestion {
+                    term: contraction.into(),
+                    distance: 1,
+                    count: 0,
+                });
+            }
+        } else if protected_contraction {
+            candidates.retain(|candidate| candidate.term == normalized);
         }
         let start = token::sentence_start(&request.context, request.target.start);
         let left = position
@@ -233,6 +253,14 @@ impl Model {
         if original == "i" {
             replacement = "I".into();
             reasons.push(CorrectionReason::StandaloneI);
+        }
+        if matches!(
+            replacement.to_lowercase().replace('\u{2019}', "'").as_str(),
+            "i'm" | "i'll" | "i've" | "i'd" | "i'd've" | "i'll've"
+        ) && replacement.starts_with('i')
+        {
+            replacement.replace_range(..1, "I");
+            reasons.push(CorrectionReason::FirstPersonContraction);
         }
         if request.target.start == start
             && let Some(first) = replacement.chars().next()
@@ -408,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn capitalization_has_only_two_rules() {
+    fn capitalization_preserves_sentence_and_pronoun_rules() {
         assert_eq!(decide("  hello there.", "hello"), "Hello");
         assert_eq!(decide("Say i can help.", "i"), "I");
         assert_eq!(decide("\"hello there.\"", "hello"), "hello");
@@ -424,6 +452,46 @@ mod tests {
             "I"
         );
         assert_eq!(decide("ß", "ß"), "SS");
+    }
+
+    /// Keep recognized contractions intact independently of misleading corpus frequencies.
+    #[test]
+    fn contractions_preserve_spelling_and_capitalize_first_person() {
+        for word in model().unigram.keys().filter(|word| word.contains('\'')) {
+            for original in [word.clone(), word.replace('\'', "\u{2019}")] {
+                let expected = if matches!(
+                    word.as_str(),
+                    "i'm" | "i'll" | "i've" | "i'd" | "i'd've" | "i'll've"
+                ) {
+                    format!("I{}", &original[1..])
+                } else {
+                    original.clone()
+                };
+                assert_eq!(decide(&format!("Say {original} now."), &original), expected);
+            }
+        }
+        for (context, target, expected) in [
+            ("im ", "im", "I'm"),
+            ("Say im ready.", "im", "I'm"),
+            ("Say Im ready.", "Im", "I'm"),
+            ("I cant ", "cant", "can't"),
+            ("cant ", "cant", "Can't"),
+            ("I CANT ", "CANT", "CAN'T"),
+            ("I can't ", "can't", "can't"),
+            ("I can\u{2019}t ", "can\u{2019}t", "can\u{2019}t"),
+            ("Say i'm ready.", "i'm", "I'm"),
+            ("Say i\u{2019}m ready.", "i\u{2019}m", "I\u{2019}m"),
+            ("I CAN'T ", "CAN'T", "CAN'T"),
+        ] {
+            assert_eq!(decide(context, target), expected, "{context}");
+        }
+        for (context, target) in [
+            ("They are ill.", "ill"),
+            ("They were ready.", "were"),
+            ("They work well.", "well"),
+        ] {
+            assert!(!decide(context, target).contains('\''), "{context}");
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ The plan keeps an ordered `manual_changes` history, which acceptance, revision f
 
 Annotations attach to a source line, and `Ctrl-S` saves feedback and submits unanswered questions. Revision requests carry structured comment anchors. Feedback formatting finishes before the broker changes plan state, so an invalid anchor cannot drop comments from a revision.
 
-`session.plan.question.answer` forks the source session once per question. Each fork keeps conversation history, receives the saved design and selected excerpt, and answers without writing files or changing the plan. Answers persist in the annotation store. Editing a question invalidates its answer, so a late response cannot attach to different text. `/config` exposes a provider-local Ask model, thinking level, and speed.
+`session.plan.question.answer` forks the source session once per question. Each fork keeps conversation history and receives the saved design, plan ID, version, source digest, and exact selected text with canonical plan line numbers. Up to three lines before and after the complete selection are labeled separately as context. Semantic declaration excerpts retain their own file line numbers, distinct from plan line numbers. All excerpts come from the captured review snapshot, not current workspace files. The fork answers about the selected text without writing files or changing the plan. Answers persist in the annotation store. Editing a question invalidates its answer, so a late response cannot attach to different text. `/config` exposes a provider-local Ask model, thinking level, and speed.
 
 ## Decisions
 
