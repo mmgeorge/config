@@ -252,7 +252,11 @@ impl BrokerObserver {
                     &document.model_json()?,
                 )
             }
-            TaskWorkflow::Execute { execution } => self.execution_continuation_prompt(execution)?,
+            TaskWorkflow::Execute { execution } => {
+                let mut resumed = execution.clone();
+                crate::task::SessionTaskController::resume_execution(&mut resumed);
+                self.execution_continuation_prompt(&resumed)?
+            }
         };
         for text in request.message.iter().chain(request.continuation.iter()) {
             instruction.push_str("\n\n");
@@ -470,6 +474,118 @@ impl BrokerObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Queue active phase guidance from the same workflow state that resume commits.
+    #[tokio::test]
+    async fn resumed_execution_entry_uses_committed_phase_instead_of_stopped_state() -> Result<()> {
+        for stopped in [PlanExecutionState::Stalled, PlanExecutionState::Paused] {
+            let workspace = super::super::test::repository();
+            let data = tempfile::tempdir()?;
+            let mut broker =
+                super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+            let mut document = crate::plan::test_fixture("resume-plan", "Resume fixture");
+            let mut design = crate::plan::DeclarationDesign::default();
+            design.document.objective = "Resume existing work".into();
+            design.document.background = "A blocked execution".into();
+            design.document.design = "Keep the accepted implementation".into();
+            document.design = Some(design);
+            let mut plan = broker
+                .plan_file
+                .prepare_entry(
+                    &broker.session.id,
+                    "Resume fixture".into(),
+                    Some(document),
+                    1,
+                )?
+                .record;
+            broker
+                .plan_file
+                .submit_document_revision(&broker.session.id, "resume-plan", 1, 1)?;
+            plan.state = PlanState::Accepted;
+            plan.model_revision = 1;
+            plan.accepted_revision = Some(1);
+            plan.submitted_version = Some(plan.document_version);
+            broker.store.save_plan(&plan)?;
+            let record: PlanExecutionRecord = serde_json::from_value(json!({
+                "id":"resume-execution", "session_id":broker.session.id,
+                "plan_id":"resume-plan", "state":stopped, "phase":"resolve",
+                "original_revision":1, "revision":1, "generation":7,
+                "findings":["Operator gate failed"], "created_at_ms":1,
+                "lifecycle":[], "progress":crate::plan::execution::SemanticProgress::default(),
+                "verification":[], "revision_history":[], "review_paused":false,
+                "observed_source":{}, "observed_generation":7, "observed_check":[],
+            }))?;
+            let mut task = ActiveTask::execute(
+                "Resume fixture".into(),
+                record,
+                crate::session::continuation::ContinuationBudget::new(20, 2),
+                false,
+                1,
+            );
+            let TaskWorkflow::Execute { execution } = &mut task.workflow else {
+                unreachable!()
+            };
+            execution.continuation.observe(false);
+            let before = execution.clone();
+            let mut projected = execution.clone();
+            crate::task::SessionTaskController::resume_execution(&mut projected);
+            assert_eq!(execution.record.state, stopped);
+            assert_eq!(projected.record.state, PlanExecutionState::Active);
+            assert_eq!(projected.record.id, before.record.id);
+            assert_eq!(projected.record.generation, before.record.generation);
+            assert_eq!(projected.record.created_at_ms, before.record.created_at_ms);
+            assert_eq!(projected.continuation.turn_count, 0);
+            let installed = broker
+                .task_controller
+                .change(
+                    &mut broker.store,
+                    None,
+                    TaskChange::Install(Box::new(task)),
+                    1,
+                )?
+                .unwrap();
+            let prepared = broker.observer.prepare_task_change(
+                &SessionAction::Resume {
+                    request: ResumeRequest::default(),
+                },
+                Some(&installed),
+                20,
+                2,
+            )?;
+            let resumed = broker
+                .task_controller
+                .change(
+                    &mut broker.store,
+                    Some(&installed.revision),
+                    prepared.change,
+                    2,
+                )?
+                .unwrap();
+            assert_ne!(resumed.revision, installed.revision);
+            let entry = resumed.entry.as_ref().context("resume entry missing")?;
+            assert!(
+                entry
+                    .instruction
+                    .contains("Resolve the collected verification findings")
+            );
+            assert!(entry.instruction.contains("plan_phase_done"));
+            assert!(
+                !entry
+                    .instruction
+                    .contains("End this turn, and do not continue automatically")
+            );
+            assert!(!entry.instruction.contains("Execution is Stalled"));
+            assert!(!entry.instruction.contains("Execution is Paused"));
+            let TaskWorkflow::Execute { execution } = &resumed.workflow else {
+                unreachable!()
+            };
+            assert_eq!(execution.record.state, projected.record.state);
+            assert_eq!(execution.record.generation, 7);
+            assert_eq!(execution.record.findings, before.record.findings);
+            assert_eq!(execution.continuation, projected.continuation);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn pause_without_active_task_preserves_chat_state() -> Result<()> {

@@ -167,6 +167,93 @@ async fn repeated_native_turn_numbers_keep_distinct_interaction_addresses() -> a
     Ok(())
 }
 
+/// Admit an autonomous wakeup by its event identity while retaining late tool ownership.
+#[tokio::test]
+async fn background_wakeup_reuses_native_pair_without_restarting_completed_turn()
+-> anyhow::Result<()> {
+    let first = start();
+    let wakeup = start();
+    let delivered = replay(
+        vec![
+            first.clone(),
+            event("tool.execution_start", json!({"toolCallId":"shell","toolName":"powershell"})),
+            event("tool.execution_complete", json!({"toolCallId":"shell","success":true,"result":{"content":"shell 0 started"}})),
+            event("assistant.message", json!({"messageId":"launched","phase":"final_answer","content":"Started shell 0"})),
+            event("assistant.turn_end", json!({"turnId":"0"})),
+            event("assistant.idle", json!({})),
+            wakeup.clone(),
+            first.clone(),
+            wakeup.clone(),
+            event("tool.execution_partial_result", json!({"toolCallId":"shell","partialOutput":"old shell finished"})),
+            event("assistant.message", json!({"messageId":"completed","phase":"final_answer","content":"Shell 0 completed"})),
+            event("assistant.turn_end", json!({"turnId":"0"})),
+            event("session.idle", json!({})),
+        ],
+        true,
+    ).await?;
+    let starts: Vec<_> = delivered
+        .iter()
+        .filter_map(|event| match event {
+            BackendEvent::Turn {
+                address,
+                update: crate::backend::TurnUpdate::Started { .. },
+            } => Some(address),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[0].turn_id.as_str(), first.id);
+    assert_eq!(starts[1].turn_id.as_str(), wakeup.id);
+    assert_ne!(starts[0], starts[1]);
+    let finishes: Vec<_> = delivered
+        .iter()
+        .filter_map(|event| match event {
+            BackendEvent::Turn {
+                address,
+                update: crate::backend::TurnUpdate::Finished { .. },
+            } => Some(address),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finishes, starts);
+    let tools: Vec<_> = delivered
+        .iter()
+        .filter_map(|event| match event {
+            BackendEvent::Tool { address, update } => Some((address, update)),
+            _ => None,
+        })
+        .collect();
+    assert!(tools.iter().all(|(address, _)| &address.turn == starts[0]));
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|(_, update)| matches!(update, ToolUpdate::Started))
+            .count(),
+        1
+    );
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|(_, update)| matches!(update, ToolUpdate::Finished { .. }))
+            .count(),
+        1
+    );
+    assert!(tools.iter().any(|(_, update)| matches!(update,
+        ToolUpdate::Output { update: crate::backend::TextUpdate::Replace(text) } if text == "old shell finished")));
+
+    let owner = scope().owner.clone();
+    let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+        "id":"exchange", "session_id":owner.session_id, "agent_id":owner.agent_id,
+        "ordinal":1, "prompt":"Launch background shell", "state":"running", "created_at_ms":0,
+        "attributed_matches_checkpoint":false, "node_list":[]
+    }))?;
+    for (sequence, update) in delivered.iter().enumerate() {
+        exchange.observe_turn(update, i64::try_from(sequence)?)?;
+    }
+    assert_eq!(exchange.tools().count(), 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn missing_and_unknown_phases_preserve_unclassified_text() -> anyhow::Result<()> {
     for phase in [None, Some("future_phase")] {

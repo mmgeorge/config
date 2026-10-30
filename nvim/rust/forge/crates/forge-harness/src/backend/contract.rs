@@ -875,6 +875,8 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
     /// Collect provider process ownership after admitted session work has drained.
+    /// Publish final observations for known background tools before closing every
+    /// session event stream. Callers drain those streams before releasing session leases.
     async fn shutdown(&self) -> Result<()>;
 
     /// Return stable provider identity and capability without starting a provider process.
@@ -1036,8 +1038,10 @@ pub trait Backend: Send + Sync {
         Err(UnsupportedCapability("native_compact").into())
     }
 
-    /// Subscribe once to session compaction that can outlive an active provider turn.
-    async fn compaction_stream(
+    /// Subscribe once to owned session observations that can outlive an active provider turn.
+    /// Shutdown publishes final known-background outcomes, then closes the stream so
+    /// callers can await durable delivery of all preceding observations.
+    async fn session_event_stream(
         &self,
         _owner: ExecutionOwner,
     ) -> Result<Option<events::BackendEventStream>> {

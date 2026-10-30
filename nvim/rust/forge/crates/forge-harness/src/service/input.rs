@@ -120,11 +120,10 @@ impl SessionController {
                             )?;
                             let record = submission.reconcile(self.backend.as_ref()).await?;
                             if matches!(record.delivery, SubmissionState::Accepted { .. }) {
-                                let mut update = self
+                                let update = self
                                     .coordinator
                                     .submissions
-                                    .delivery(id, None, None, None)?;
-                                update.operation_id = Some(operation.id.clone());
+                                    .acknowledge_retry(operation.clone())?;
                                 self.publish_input(update.clone(), sink).await?;
                                 sink.send_response(Response::success(request.id, update)?)
                                     .await?;

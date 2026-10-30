@@ -7,6 +7,8 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod journal;
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputIntent {
@@ -146,21 +148,125 @@ pub struct InputSnapshot {
     pub control_operation_id: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct InputState {
     snapshot: InputSnapshot,
     submitted: std::collections::HashSet<String>,
     operation: HashMap<String, (String, InputUpdate)>,
 }
 
-/// One session's volatile queue. No lock is retained across provider or storage work.
+/// Own one session's accepted input and commit mutations before publishing them.
 #[derive(Default)]
 pub(crate) struct SessionInputQueue {
     state: Mutex<InputState>,
+    journal: Option<Mutex<journal::InputJournal>>,
     pub changed: Arc<tokio::sync::Notify>,
 }
 
 impl SessionInputQueue {
+    /// Restore accepted input suspended, retaining delivery evidence without replaying it.
+    pub(crate) fn open(
+        root: &std::path::Path,
+        session_id: &str,
+        submissions: &Arc<crate::backend::submission::SubmissionStore>,
+    ) -> Result<Self> {
+        // Load active input independently of completed interaction history.
+        let mut journal = journal::InputJournal::open(root, session_id)?;
+        let (mut state, restored) = journal.load()?;
+        if restored {
+            let previous = state.clone();
+            state.snapshot.control_revision = state
+                .snapshot
+                .control_revision
+                .checked_add(1)
+                .context("input control revision exhausted")?;
+            state.snapshot.revision = state
+                .snapshot
+                .revision
+                .checked_add(1)
+                .context("input revision exhausted")?;
+            // Preserve uncertainty; only proven acceptance removes an input.
+            for message in &mut state.snapshot.messages {
+                if message.reservation.take().is_some() {
+                    message.revision = message
+                        .revision
+                        .checked_add(1)
+                        .context("input message revision exhausted")?;
+                }
+                if let Some(id) = &message.submission_id {
+                    let record = submissions.submission(id)?.record()?;
+                    ensure!(
+                        record.request.harness_session_id == session_id,
+                        "input submission belongs to another session"
+                    );
+                    match record.delivery {
+                        crate::backend::submission::SubmissionState::Accepted { .. } => {
+                            message.delivery = InputDelivery::Accepted;
+                        }
+                        crate::backend::submission::SubmissionState::Sending { .. } => {
+                            message.delivery = InputDelivery::Unknown;
+                            message.error =
+                                Some("Delivery requires reconciliation before retry".into());
+                        }
+                        crate::backend::submission::SubmissionState::Prepared => {
+                            message.delivery = InputDelivery::Failed;
+                            message.error = Some(
+                                "Interrupted before provider dispatch; retry explicitly".into(),
+                            );
+                        }
+                        crate::backend::submission::SubmissionState::Cancelled => {
+                            message.delivery = InputDelivery::Failed;
+                            message.error =
+                                Some("Previous submission was cancelled; retry explicitly".into());
+                        }
+                    }
+                    message.revision = message
+                        .revision
+                        .checked_add(1)
+                        .context("input message revision exhausted")?;
+                } else if message.delivery == InputDelivery::Delivering {
+                    message.delivery = InputDelivery::Queued;
+                    message.route = None;
+                    message.revision = message
+                        .revision
+                        .checked_add(1)
+                        .context("input message revision exhausted")?;
+                }
+            }
+            state
+                .snapshot
+                .messages
+                .retain(|message| message.delivery != InputDelivery::Accepted);
+            if !state.snapshot.messages.is_empty() {
+                state.snapshot.suspended = true;
+            }
+            // Publish recovered revisions only after the suspended state is durable.
+            journal.save(&previous, &state)?;
+        }
+        Ok(Self {
+            state: Mutex::new(state),
+            journal: Some(Mutex::new(journal)),
+            changed: Arc::default(),
+        })
+    }
+
+    /// Remove queue state and duplicate receipts only when the session is explicitly deleted.
+    pub(crate) fn delete_persisted(root: &std::path::Path, session_id: &str) -> Result<()> {
+        journal::InputJournal::open(root, session_id)?.delete()
+    }
+
+    /// Commit a candidate atomically before exposing any changed queue state.
+    fn commit(&self, retained: &mut InputState, candidate: InputState) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal
+                .lock()
+                .map_err(|_| anyhow::anyhow!("input journal lock poisoned"))?
+                .save(retained, &candidate)?;
+        }
+        *retained = candidate;
+        Ok(())
+    }
+
     pub(crate) fn has_pending(&self) -> Result<(u64, bool)> {
         let state = self
             .state
@@ -194,6 +300,8 @@ impl SessionInputQueue {
             let mut outcome = outcome.clone();
             outcome.revision = state.snapshot.revision;
             outcome.snapshot = Some(state.snapshot.clone());
+            outcome.suspended = state.snapshot.suspended;
+            outcome.control_revision = state.snapshot.control_revision;
             outcome
         }))
     }
@@ -204,15 +312,18 @@ impl SessionInputQueue {
             "input operation identity is required"
         );
         let request = serde_json::to_string(&operation)?;
-        let mut state = self
+        let mut retained = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        let mut state = retained.clone();
         if let Some((original, outcome)) = state.operation.get(&operation.id) {
             ensure!(*original == request, "input operation identity was reused");
             let mut outcome = outcome.clone();
             outcome.revision = state.snapshot.revision;
             outcome.snapshot = Some(state.snapshot.clone());
+            outcome.suspended = state.snapshot.suspended;
+            outcome.control_revision = state.snapshot.control_revision;
             return Ok(outcome);
         }
         let mut update = InputUpdate {
@@ -246,7 +357,8 @@ impl SessionInputQueue {
         let mut receipt = update.clone();
         receipt.snapshot = None;
         state.operation.insert(operation.id, (request, receipt));
-        drop(state);
+        self.commit(&mut retained, state)?;
+        drop(retained);
         self.changed.notify_one();
         Ok(update)
     }
@@ -426,16 +538,18 @@ impl SessionInputQueue {
     }
 
     pub fn suspend(&self, suspended: bool, operation_id: Option<&str>) -> Result<InputUpdate> {
-        let mut state = self
+        let mut retained = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        let mut state = retained.clone();
         state.snapshot.suspended = suspended;
         state.snapshot.control_revision += 1;
         state.snapshot.control_operation_id = operation_id.map(str::to_owned);
         let mut update = InputUpdate::default();
         Self::advance(&mut state.snapshot, &mut update);
-        drop(state);
+        self.commit(&mut retained, state)?;
+        drop(retained);
         self.changed.notify_one();
         Ok(update)
     }
@@ -446,10 +560,11 @@ impl SessionInputQueue {
         revision: u64,
         route: InputRoute,
     ) -> Result<Option<InputMessage>> {
-        let mut state = self
+        let mut retained = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        let mut state = retained.clone();
         let snapshot = &mut state.snapshot;
         let Some(index) = snapshot
             .messages
@@ -503,7 +618,9 @@ impl SessionInputQueue {
         message.delivery = InputDelivery::Delivering;
         message.route = Some(route);
         message.revision += 1;
-        Ok(Some(message.clone()))
+        let claimed = message.clone();
+        self.commit(&mut retained, state)?;
+        Ok(Some(claimed))
     }
 
     pub fn delivery(
@@ -513,10 +630,11 @@ impl SessionInputQueue {
         submission_id: Option<String>,
         error: Option<String>,
     ) -> Result<InputUpdate> {
-        let mut state = self
+        let mut retained = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        let mut state = retained.clone();
         let Some(index) = state
             .snapshot
             .messages
@@ -550,7 +668,59 @@ impl SessionInputQueue {
             update.removed.push(id.into());
         }
         Self::advance(&mut state.snapshot, &mut update);
-        drop(state);
+        self.commit(&mut retained, state)?;
+        drop(retained);
+        self.changed.notify_one();
+        Ok(update)
+    }
+
+    /// Acknowledge an already accepted provider retry and its removal in one transaction.
+    pub(crate) fn acknowledge_retry(&self, operation: InputOperation) -> Result<InputUpdate> {
+        ensure!(
+            !operation.id.is_empty(),
+            "input operation identity is required"
+        );
+        let InputAction::Retry { id, revision } = &operation.action else {
+            anyhow::bail!("accepted delivery requires a retry operation");
+        };
+        let request = serde_json::to_string(&operation)?;
+        let mut retained = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        if let Some((original, outcome)) = retained.operation.get(&operation.id) {
+            ensure!(original == &request, "input operation identity was reused");
+            let mut outcome = outcome.clone();
+            outcome.snapshot = Some(retained.snapshot.clone());
+            outcome.revision = retained.snapshot.revision;
+            outcome.suspended = retained.snapshot.suspended;
+            outcome.control_revision = retained.snapshot.control_revision;
+            return Ok(outcome);
+        }
+        let mut state = retained.clone();
+        if let Some(message) = state
+            .snapshot
+            .messages
+            .iter()
+            .find(|message| &message.id == id)
+        {
+            ensure!(
+                message.revision == *revision,
+                "message changed before retry acknowledgment"
+            );
+        }
+        state.snapshot.messages.retain(|message| &message.id != id);
+        let mut update = InputUpdate {
+            operation_id: Some(operation.id.clone()),
+            removed: vec![id.clone()],
+            ..Default::default()
+        };
+        Self::advance(&mut state.snapshot, &mut update);
+        let mut receipt = update.clone();
+        receipt.snapshot = None;
+        state.operation.insert(operation.id, (request, receipt));
+        self.commit(&mut retained, state)?;
+        drop(retained);
         self.changed.notify_one();
         Ok(update)
     }
@@ -591,3 +761,7 @@ impl SessionInputQueue {
 #[cfg(test)]
 #[path = "input/test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "input/durability_test.rs"]
+mod durability_test;

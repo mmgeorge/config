@@ -20,10 +20,10 @@ pub enum ConfigurationFormat {
 }
 
 impl ConfigurationFormat {
-    /// Decode TypeScript configuration without discarding comments manually.
+    /// Decode JSONC values, ignoring one leading encoding marker without changing source text.
     pub fn json_value(text: &str) -> Result<serde_json::Value, SyntaxError> {
         jsonc_parser::parse_to_serde_value::<serde_json::Value>(
-            text,
+            json_source(text),
             &jsonc_parser::ParseOptions::default(),
         )
         .map_err(|error| SyntaxError::Query(error.to_string()))
@@ -84,10 +84,11 @@ impl ConfigurationFormat {
                 }
             }
             Self::Json => {
-                serde_json::from_str::<serde_json::Value>(text)
+                serde_json::from_str::<serde_json::Value>(json_source(text))
                     .map_err(|error| invalid(error.to_string()))?;
             }
             Self::Jsonc => {
+                let text = json_source(text);
                 let options = jsonc_parser::ParseOptions {
                     allow_comments: true,
                     allow_trailing_commas: true,
@@ -136,9 +137,75 @@ impl ConfigurationFormat {
     }
 }
 
+/// Borrow JSON after one leading encoding marker without rewriting the caller's document.
+fn json_source(text: &str) -> &str {
+    // RFC 8259 section 8.1 permits parsers to ignore a BOM instead of rejecting the document.
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::ConfigurationFormat;
     use crate::syntax::{DeclarationOverview, DeclarationVisibility};
+
+    /// Preserve BOM-bearing documents and navigation while decoding their actual values.
+    #[test]
+    fn json_bom_preserves_configuration_source_and_navigation() {
+        for (path, text) in [
+            (
+                "settings.json",
+                "\u{feff}{\r\n  \"name\": \"work\u{feff}flow\",\r\n  \"enabled\": true\r\n}\r\n",
+            ),
+            (
+                "tsconfig.json",
+                "\u{feff}{\n  // Keep this comment\n  \"name\": \"work\u{feff}flow\",\n  \"enabled\": true,\n}\n",
+            ),
+        ] {
+            assert_eq!(DeclarationOverview::extract(path, text).unwrap(), text);
+            assert_eq!(DeclarationOverview::parse(path, text).unwrap(), text);
+            assert_eq!(
+                DeclarationOverview::format_with_width(path, text, 40).unwrap(),
+                text
+            );
+            let presentation = DeclarationOverview::present(path, text).unwrap();
+            assert_eq!(presentation.text.as_bytes(), text.as_bytes());
+            assert_eq!(presentation.source.len(), text.lines().count());
+            for (row, position) in presentation.source.iter().enumerate() {
+                let position = position.unwrap();
+                assert_eq!(usize::try_from(position.line).unwrap(), row + 1);
+                assert_eq!(position.column, 0);
+            }
+            let value = ConfigurationFormat::json_value(text).unwrap();
+            assert_eq!(value["name"], "work\u{feff}flow");
+            assert_eq!(value["enabled"], true);
+        }
+    }
+
+    /// Keep malformed JSON and misplaced encoding markers outside the admitted grammar.
+    #[test]
+    fn json_bom_does_not_relax_configuration_syntax() {
+        for path in ["settings.json", "settings.jsonc"] {
+            assert!(DeclarationOverview::parse(path, "\u{feff}").is_err());
+            for text in [
+                "\u{feff}\u{feff}{}",
+                " \u{feff}{}",
+                "\u{feff}{\"enabled\":\u{feff}true}",
+                "\u{feff}{\"enabled\": true",
+            ] {
+                assert!(
+                    DeclarationOverview::parse(path, text).is_err(),
+                    "{path}: {text}"
+                );
+                assert!(
+                    ConfigurationFormat::json_value(text).is_err(),
+                    "{path}: {text}"
+                );
+            }
+        }
+        for text in ["\u{feff}{\"enabled\":true,}", "\u{feff}// Comment\n{}"] {
+            assert!(DeclarationOverview::parse("settings.json", text).is_err());
+        }
+    }
 
     #[test]
     fn configuration_preserves_values_layout_visibility_and_navigation() {

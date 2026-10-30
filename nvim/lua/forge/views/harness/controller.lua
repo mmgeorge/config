@@ -1530,13 +1530,25 @@ local function finish_queue_edit(state, text, unqueue)
   if state.presentation then state.presentation.follow_tail() end
 end
 
+---Keep unowned startup drafts out of session history and the input pipeline.
+---@param state ForgeHarnessPresentationState
+---@return boolean
+local function admit_composer_input(state)
+  if state.host_error then notifications.error(state.execution_notice, "ForgeHarness") return false end
+  if not state.session or type(state.session.id) ~= "string" or state.session.id == "" then
+    notifications.warn("Harness is still initializing", "ForgeHarness")
+    return false
+  end
+  if state.switching_backend then return false end
+  return true
+end
+
 function M.submit()
-  require("forge.text").invalidate(harness_state().composer_buf)
-  if not attachments_ready(harness_state().composer_buf) then return end
-  if harness_state().host_error then notifications.error(harness_state().execution_notice, "ForgeHarness") return end
-  harness_state().execution_notice = nil
   local state = harness_state()
-  if state.switching_backend then return end
+  if not admit_composer_input(state) then return end
+  require("forge.text").invalidate(state.composer_buf)
+  if not attachments_ready(state.composer_buf) then return end
+  state.execution_notice = nil
   local text = composer_text(state.composer_buf)
   if state.queue_edit then finish_queue_edit(state, text) return end
   if text == "/task refresh" then
@@ -1856,6 +1868,7 @@ end
 ---Send the composer into the active provider turn without creating a new interaction.
 function M.steer_submit()
   local state = harness_state()
+  if not admit_composer_input(state) then return end
   if not attachments_ready(state.composer_buf) then return end
   if state.queue_edit then M.submit() return end
   local text = composer_text(state.composer_buf)
@@ -1871,12 +1884,11 @@ end
 
 ---Queue a follow-up independently of active waits and the selected child timeline.
 function M.queue_submit()
-  if not attachments_ready(harness_state().composer_buf) then return end
-  if harness_state().host_error then notifications.error(harness_state().execution_notice, "ForgeHarness") return end
-  harness_state().execution_notice = nil
   local state = harness_state()
+  if not admit_composer_input(state) then return end
+  if not attachments_ready(state.composer_buf) then return end
+  state.execution_notice = nil
   if state.queue_edit then finish_queue_edit(state, composer_text(state.composer_buf), true) return end
-  if state.switching_backend then return end
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   local accepted, admission_failure = require("forge.views.harness.completion.command_source").accepts_prompt(text)

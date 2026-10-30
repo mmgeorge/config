@@ -15,6 +15,14 @@ pub(crate) fn words(context: &str) -> Vec<Word<'_>> {
         .collect()
 }
 
+/// Restrict the English candidate model to its supported alphabet without transliteration.
+pub(crate) fn supports_english_correction(word: &str) -> bool {
+    word.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic() || byte == b'\'')
+}
+
 /// Validate the target as one complete lexical word outside protected spans.
 pub(crate) fn target<'text>(
     context: &'text str,

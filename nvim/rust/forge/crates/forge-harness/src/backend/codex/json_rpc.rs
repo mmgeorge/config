@@ -344,6 +344,7 @@ pub struct CodexJsonRpc {
     approval: ApprovalContext,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
+    background_sink: Option<BackendEventSink>,
     activity_publication: bool,
     requests_cancelled: bool,
     trace: Arc<TraceStore>,
@@ -391,6 +392,7 @@ impl CodexJsonRpc {
             approval: ApprovalContext::default(),
             permission_coordinator,
             event_sink: event_sink.clone(),
+            background_sink: None,
             activity_publication: true,
             requests_cancelled: false,
             trace,
@@ -407,6 +409,162 @@ impl CodexJsonRpc {
                 normalization
             },
         })
+    }
+
+    /// Bind the same-owner observer that survives foreground invocation completion.
+    pub(super) fn set_background_sink(&mut self, sink: Option<BackendEventSink>) {
+        self.background_sink = sink;
+    }
+
+    /// Deliver only exact retained tool evidence while the primary connection is idle.
+    pub(super) async fn publish_idle_received(&mut self, received: ReceivedMessage) -> Result<()> {
+        let mut output = BackendOutput::default();
+        match received {
+            ReceivedMessage::Provider(message) => {
+                if self.publish_background(&message, &mut output).await? {
+                    return Ok(());
+                }
+                if message.get("id").is_some() && message.get("method").is_some() {
+                    self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
+                        "error":{"code":-32001,"message":"No active provider invocation"}}))
+                        .await?;
+                }
+            }
+            ReceivedMessage::Request(request) => {
+                self.complete_provider_request(*request, &mut output)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Route a retained native identity without borrowing the current invocation's sink.
+    async fn publish_background(
+        &mut self,
+        message: &Value,
+        output: &mut BackendOutput,
+    ) -> Result<bool> {
+        let Some(events) = self
+            .normalization
+            .normalize_background(message, &self.workspace)
+            .await?
+        else {
+            return Ok(false);
+        };
+        self.publish_background_events(events, output).await?;
+        Ok(true)
+    }
+
+    /// Deliver retained updates through their original invocation-scoped observer.
+    async fn publish_background_events(
+        &self,
+        events: Vec<crate::backend::BackendEvent>,
+        output: &mut BackendOutput,
+    ) -> Result<()> {
+        for event in events {
+            if let Some(base) = &self.background_sink {
+                let scope = event.scope();
+                let invocation = scope
+                    .invocation()
+                    .context("background tool omitted invocation ownership")?;
+                base.invocation_sink(invocation)?.send_wait(event).await?;
+            } else {
+                output.event.push(event);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop only admitted native background commands and publish their verified settlement.
+    pub(super) async fn shutdown_background(&mut self) -> Result<()> {
+        let addresses = self.normalization.pending_background_addresses();
+        let threads: std::collections::BTreeSet<_> = addresses
+            .iter()
+            .map(|address| address.turn.thread_id.clone())
+            .collect();
+        let mut output = BackendOutput::default();
+        for thread_id in threads {
+            // Preserve completion frames encountered while collecting exact owned processes.
+            let terminals = self.background_inventory(&thread_id, &mut output).await?;
+            for (item_id, process_id) in terminals {
+                if !addresses.iter().any(|address| {
+                    address.turn.thread_id == thread_id && address.tool_id == item_id
+                }) {
+                    continue;
+                }
+                let result = self
+                    .request(
+                        "thread/backgroundTerminals/terminate",
+                        json!({"threadId":thread_id,"processId":process_id}),
+                        &mut output,
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    result.get("terminated").and_then(Value::as_bool).is_some(),
+                    "native terminal termination omitted its outcome"
+                );
+            }
+            // A second inventory proves absence even when natural completion won the first scan.
+            let remaining = self.background_inventory(&thread_id, &mut output).await?;
+            anyhow::ensure!(
+                !remaining
+                    .iter()
+                    .any(|(item_id, _)| addresses.iter().any(|address| {
+                        address.turn.thread_id == thread_id && &address.tool_id == item_id
+                    })),
+                "native background command remains running after shutdown cleanup"
+            );
+            let events = addresses
+                .iter()
+                .filter(|address| address.turn.thread_id == thread_id)
+                .filter_map(|address| self.normalization.interrupt_background(address))
+                .collect();
+            self.publish_background_events(events, &mut output).await?;
+        }
+        Ok(())
+    }
+
+    /// Collect the complete native inventory without granting ownership to unrecognized items.
+    async fn background_inventory(
+        &mut self,
+        thread_id: &str,
+        output: &mut BackendOutput,
+    ) -> Result<Vec<(crate::backend::ToolId, String)>> {
+        let mut terminals = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let result = self
+                .request(
+                    "thread/backgroundTerminals/list",
+                    json!({"threadId":thread_id,"cursor":cursor}),
+                    output,
+                )
+                .await?;
+            for terminal in result
+                .get("data")
+                .and_then(Value::as_array)
+                .context("native terminal inventory is missing")?
+            {
+                let item = terminal
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .context("native terminal item identity is missing")?;
+                let process = terminal
+                    .get("processId")
+                    .and_then(Value::as_str)
+                    .context("native terminal process identity is missing")?;
+                terminals.push((item.into(), process.to_owned()));
+            }
+            let Some(next) = result.get("nextCursor").and_then(Value::as_str) else {
+                return Ok(terminals);
+            };
+            anyhow::ensure!(
+                seen.insert(next.to_owned()),
+                "native terminal inventory repeated a pagination cursor"
+            );
+            cursor = Some(next.to_owned());
+        }
     }
 
     /// Bind provider permission callbacks before starting or resuming a conversation.
@@ -604,6 +762,9 @@ impl CodexJsonRpc {
         output: &mut BackendOutput,
     ) -> Result<Value> {
         self.mcp.normalize(&mut message);
+        if self.publish_background(&message, output).await? {
+            return Ok(message);
+        }
         self.approval.observe(&message);
         let method = message
             .get("method")

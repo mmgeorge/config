@@ -129,7 +129,8 @@ impl SqliteStore {
         for session_id in pending {
             let root = self.data_root.clone();
             let result = self.delete_session_with(&session_id, || {
-                crate::plan::PlanFileStore::new(&root, "").delete_session(&session_id)
+                crate::plan::PlanFileStore::new(&root, "").delete_session(&session_id)?;
+                crate::input::SessionInputQueue::delete_persisted(&root, &session_id)
             });
             if let Err(error) = result
                 && !error.is::<crate::session::SessionLeaseConflict>()

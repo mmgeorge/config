@@ -82,6 +82,21 @@ local function register(state, session_id)
   layout.rename_session_buffers(state.transcript_buf, state.composer_buf, session_id)
 end
 
+---Release window-bound presentation resources while retaining the session's buffers.
+---@param state ForgeHarnessPresentationState
+---@return boolean
+local function release_presentation(state)
+  local owner = state.presentation
+  if not owner then return true end
+  local ok, closed = pcall(owner.close, { preserve_buffer = true })
+  if not ok or not closed then
+    notifications.error("Cannot transfer Harness panes: " .. (ok and "presentation cleanup did not complete" or tostring(closed)), "ForgeHarness")
+    return false
+  end
+  if state.presentation == owner then state.presentation = nil end
+  return true
+end
+
 ---@class ForgeHarnessSessionActivation
 ---@field state? ForgeHarnessPresentationState
 ---@field open_mode? "current"|"tab"
@@ -104,6 +119,7 @@ function M.activate(result, options)
   if existing and existing ~= state and (valid_view(existing)
     or (reusable_buffer and state and options.open_mode == "current" and valid_view(state))) then
     if state and options.open_mode == "current" and valid_view(state) then
+      if not release_presentation(existing) or not release_presentation(state) then return end
       local previous_tab = existing.timeline_tab
       require("forge.views.harness.workspace").release(existing)
       require("forge.views.harness.workspace").release(state)
@@ -112,6 +128,8 @@ function M.activate(result, options)
       existing.transcript_win, existing.composer_win, existing.timeline_tab =
         state.transcript_win, state.composer_win, state.timeline_tab
       state.transcript_win, state.composer_win, state.timeline_tab = nil, nil, nil
+      layout.attach_auto_height(existing.composer_buf, existing.composer_win)
+      layout.attach_scroll_boundary(existing.transcript_buf, existing.transcript_win)
       vim.api.nvim_set_current_tabpage(existing.timeline_tab)
       if previous_tab and previous_tab ~= existing.timeline_tab and vim.api.nvim_tabpage_is_valid(previous_tab) then
         vim.cmd("tabclose " .. vim.api.nvim_tabpage_get_number(previous_tab))
@@ -137,6 +155,7 @@ function M.activate(result, options)
     and source_state.timeline_tab
     and vim.api.nvim_tabpage_is_valid(source_state.timeline_tab)
   then
+    if not release_presentation(source_state) then return end
     require("forge.views.harness.workspace").release(source_state)
     vim.cmd("tabclose " .. vim.api.nvim_tabpage_get_number(source_state.timeline_tab))
   end

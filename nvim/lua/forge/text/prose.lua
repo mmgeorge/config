@@ -8,6 +8,38 @@ function M.word_character(character)
   return class==2 or class>=256
 end
 
+---The English dictionary accepts ASCII spelling candidates without transliteration.
+---@param word string
+---@return boolean
+function M.supports_english_correction(word)
+  return word:find("[A-Za-z]")~=nil and word:find("[^A-Za-z']")==nil
+end
+
+---@param text string
+---@return boolean
+local function dotted_word(text)
+  local previous, before_dot
+  for character in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+    if before_dot and M.word_character(character) then return true end
+    before_dot=character=="." and previous and M.word_character(previous)
+    previous=character
+  end
+  return false
+end
+
+---@param text string
+---@return boolean
+local function quoted_path(text)
+  if text:match("^[A-Za-z]:[/\\]") or text:match("^[/\\]")
+    or text:match("^%.%.?[/\\]") or text:match("^~[/\\]") then return true end
+  local suffix=text:match("%.([^%.%s/\\]+)$")
+  if not suffix then return false end
+  for character in suffix:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+    if not M.word_character(character) then return false end
+  end
+  return dotted_word(text)
+end
+
 ---@param buffer integer
 ---@param row integer
 ---@param column integer
@@ -68,6 +100,9 @@ end
 function M.protected(context)
   local ranges = {}
   local function add(first, last) ranges[#ranges + 1] = { start = first - 1, ["end"] = last } end
+  for first, quote, content, last in context:gmatch("()(['\"])(.-)%2()") do
+    if quoted_path(content) then add(first,last-1) end
+  end
   local position=1
   while position<=#context do
     local first,last=context:find("`+",position)
@@ -87,7 +122,7 @@ function M.protected(context)
   for first, content, last in context:gmatch("()%]%((.-)%)()") do add(first,last - 1) end
   for first, word, last in context:gmatch("()(%S+)()") do
     local inner = word:gsub("[.,;:!?%)%]%}]+$", "")
-    if inner:find("[/\\_@`]") or inner:find("::",1,true) or inner:match("%w%.%w") then add(first,last - 1) end
+    if inner:find("[/\\_@`]") or inner:find("::",1,true) or dotted_word(inner) then add(first,last - 1) end
   end
   return ranges
 end

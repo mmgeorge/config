@@ -515,6 +515,12 @@ impl Exchange {
             BackendEvent::Message { .. }
             | BackendEvent::Tool { .. }
             | BackendEvent::Checklist { .. } => {
+                let late_update = match event {
+                    BackendEvent::Tool { address, update } => {
+                        self.accepts_settled_tool_update(address, update)
+                    }
+                    _ => false,
+                };
                 let existing_tool = match event {
                     BackendEvent::Tool {
                         address: tool_address,
@@ -533,8 +539,6 @@ impl Exchange {
                 else {
                     return Ok(false);
                 };
-                let late_update = existing_tool
-                    && matches!(event, BackendEvent::Tool { update, .. } if update.can_update_settled());
                 if turn.state() != TurnState::Running && !late_update {
                     return Ok(false);
                 }

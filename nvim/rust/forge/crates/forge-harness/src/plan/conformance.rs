@@ -129,6 +129,27 @@ pub(crate) fn declaration_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compare configuration values independently of one leading encoding marker.
+    #[test]
+    fn json_bom_conformance_preserves_values_and_mismatch_source() {
+        let workspace = tempfile::tempdir().unwrap();
+        for path in ["settings.json", "settings.jsonc"] {
+            let expected = "{\"name\":\"work\u{feff}flow\",\"enabled\":true}";
+            let source = format!("\u{feff}{expected}\n");
+            assert!(compare(path, expected, &source).unwrap().is_empty());
+            assert!(compare(path, &source, expected).unwrap().is_empty());
+
+            let changed = "\u{feff}{\"name\":\"work\u{feff}flow\",\"enabled\":false}\n";
+            let (findings, changes) =
+                inspect_in_workspace(workspace.path(), path, expected, changed).unwrap();
+            assert_eq!(findings, ["configuration differs from the accepted values"]);
+            assert_eq!(changes.len(), 1);
+            assert!(changes[0].diff.contains(changed.trim_end()));
+            assert!(compare(path, expected, "\u{feff}{\"enabled\":true").is_err());
+        }
+    }
+
     #[test]
     fn declaration_changes_keep_source_signatures_without_implementation_bodies() {
         let workspace = tempfile::tempdir().unwrap();

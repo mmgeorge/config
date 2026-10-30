@@ -220,12 +220,11 @@ impl CopilotEventDecoder {
                     .await?;
                 let native_id = super::string_field(&event.data, &["turnId"])
                     .ok_or_else(|| Self::protocol("Copilot turn start omitted turnId"))?;
-                let interaction = super::string_field(&event.data, &["interactionId"])
-                    .unwrap_or_else(|| event.id.clone());
+                // Background wakeups reuse interactionId and turnId; only the durable event identifies this execution.
                 let address = TurnAddress {
                     scope: self.scope.clone(),
                     thread_id: thread.clone(),
-                    turn_id: format!("{interaction}:{native_id}").into(),
+                    turn_id: event.id.clone().into(),
                 };
                 sink.send_wait(BackendEvent::Turn {
                     address: address.clone(),

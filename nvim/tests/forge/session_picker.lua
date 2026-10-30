@@ -122,6 +122,8 @@ local ok, failure = pcall(function()
       end
       callback(vim.deepcopy(result))
     elseif method == "session.preview" then
+      assert_equals(request_specification.session_id, "active",
+        "preview transport must use the captured picker owner, not the candidate or current view")
       local entry = vim.iter(entry_list):find(function(candidate) return candidate.id == params.session_id end)
       if defer_preview then
         preview_callback_by_session[params.session_id] = function()
@@ -200,14 +202,20 @@ local ok, failure = pcall(function()
   preview_text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(state.transcript_win), 0, -1, false), "\n")
   assert_true(preview_text:find("Preview Gamma migration", 1, true) ~= nil,
     "fuzzy filtering should preview the selected matching session")
+  assert_equals(last_request("session.preview").params.session_id, "gamma",
+    "same-provider preview must keep the candidate identity in params")
+  assert_equals(state.session.id, "active", "preview must not resume its candidate")
   vim.api.nvim_exec_autocmds("InsertLeave", { buffer = active_picker.search_buf })
   vim.wait(20, function() return false end, 5)
   assert_true(active_picker.search_win ~= nil and active_picker.frame.search_start ~= nil,
     "leaving a nonempty search should preserve the filter and input")
 
   defer_preview = true
+  local preview_owner = state.session
+  state.session = vim.tbl_extend("force", preview_owner, { id = "another-active-view" })
   vim.api.nvim_buf_set_lines(active_picker.search_buf, 0, -1, false, { "beta" })
   vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active_picker.search_buf })
+  state.session = preview_owner
   vim.api.nvim_buf_set_lines(active_picker.search_buf, 0, -1, false, { "gamma" })
   vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active_picker.search_buf })
   preview_callback_by_session.gamma()

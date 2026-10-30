@@ -1,6 +1,8 @@
 mod acceptance;
 mod admission;
 #[cfg(test)]
+mod cancellation_test;
+#[cfg(test)]
 mod change_results_test;
 mod checks;
 mod configuration;
@@ -14,6 +16,7 @@ mod observation;
 pub(crate) mod plan_entry;
 mod project_checks;
 mod review_question;
+pub(crate) mod session_events;
 pub(crate) use observation::BrokerObserver;
 
 pub use fork::{ForkPreparation, prepare_provider_fork};
@@ -892,6 +895,7 @@ impl HarnessBroker {
                 shared.desired.check_editing.unwrap_or(false),
             )),
             completion_queue: Default::default(),
+            session_events: Default::default(),
             data_root: data_root.clone(),
             session_id: session.id.clone(),
             runtime_epoch: Uuid::new_v4().to_string(),
@@ -3004,9 +3008,14 @@ impl HarnessBroker {
             .agent_coordinator
             .cancellation(&owner.agent_id, &task_id)
             .is_ok_and(|cancel| *cancel.borrow());
-        task.state = if interrupted {
+        let provider_cancelled = output
+            .as_ref()
+            .is_err_and(|error| error.is::<TurnCancelled>());
+        task.state = if cleanup_error.is_some() {
+            ExchangeState::Failed
+        } else if interrupted || provider_cancelled {
             ExchangeState::Cancelled
-        } else if output.is_err() || cleanup_error.is_some() {
+        } else if output.is_err() {
             ExchangeState::Failed
         } else {
             ExchangeState::Complete
@@ -5459,11 +5468,13 @@ impl HarnessBroker {
             }
         });
         // Event-loop state must not remain inline in the provider lifecycle future.
+        let session_events = Arc::clone(&self.observer.session_events);
         let outcome = Box::pin(async {
             loop {
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => break Err(anyhow::Error::new(TurnCancelled)),
+
                     result = async {
                         match runtime.checkpoint.as_mut() {
                             Some(task) => (&mut task.0).await.context("checkpoint worker failed").and_then(|result|result),
@@ -5637,6 +5648,23 @@ impl HarnessBroker {
                             break Err(error);
                         }
                         self.start_agent_result_delivery(attached_result,&mut attempted_result,&mut result_delivery)?;
+                    }
+                    // Admit queued background lifetime markers before their session-stream completion.
+                    ready = session_events.notified() => {
+                        ready?;
+                        for observation in session_events.drain_after(&mut backend_event_stream)? {
+                            if observation.scope().invocation().is_some_and(|scope| scope.exchange_id == interaction.id) {
+                                self.process_backend_event(&mut runtime, interaction, observation, event).await?;
+                            } else if matches!(observation, BackendEvent::Tool { .. }) {
+                                anyhow::ensure!(
+                                    observation.scope().owner() == &crate::backend::ExecutionOwner::root(&self.session.id),
+                                    "session tool event crosses execution ownership"
+                                );
+                                self.route_settled_parent_event(interaction, &observation, event).await?;
+                            } else {
+                                event.extend(self.observe_session_event(observation)?);
+                            }
+                        }
                     }
                     error = publication::failed(delivery_sink.as_ref()) => break Err(error.into()),
                     result = provider_task.join_next() => {
@@ -6549,10 +6577,15 @@ impl HarnessBroker {
             return Ok(false);
         };
         if matches!(backend_event, BackendEvent::Usage { .. })
-            || matches!(backend_event, BackendEvent::Tool { update, .. } if update.can_update_settled())
+            || matches!(backend_event, BackendEvent::Tool { address, update }
+                if owner.accepts_settled_tool_update(address, update))
         {
             owner.observe_turn(backend_event, self.clock.now_ms())?;
-            self.store.save_exchange(&owner)?;
+            if backend_event.tool_output_delta().is_some() {
+                self.store.save_tool_output_delta(&owner, backend_event)?;
+            } else {
+                self.store.save_exchange(&owner)?;
+            }
             let status = self.live_interaction_status(Some(current))?;
             let patch = self
                 .presentation
@@ -8408,12 +8441,50 @@ impl HarnessBroker {
         Ok(())
     }
 
+    /// Deliver queued session observations in provider order under broker ownership.
+    pub(crate) fn drain_session_events(&mut self) -> Result<Vec<SessionEvent>> {
+        let mut updates = Vec::new();
+        for observation in self.observer.session_events.drain()? {
+            updates.extend(self.observe_session_event(observation)?);
+        }
+        Ok(updates)
+    }
+
     /// Retain session notifications after provider execution has released the broker.
-    pub(crate) fn observe_external_compaction(
+    pub(crate) fn observe_session_event(
         &mut self,
         event: BackendEvent,
     ) -> Result<Vec<SessionEvent>> {
         let now_ms = event.observed_at_ms(self.clock.now_ms());
+        if let BackendEvent::Tool { address, update } = &event {
+            anyhow::ensure!(
+                address.turn.scope.owner == crate::backend::ExecutionOwner::root(&self.session.id),
+                "session tool event crosses execution ownership"
+            );
+            let Some(mut owner) = self
+                .store
+                .load_provider_exchange(&self.session.id, &address.turn)?
+            else {
+                return Ok(Vec::new());
+            };
+            if !owner.accepts_settled_tool_update(address, update) {
+                return Ok(Vec::new());
+            }
+            if !owner.observe_turn(&event, now_ms)? {
+                return Ok(Vec::new());
+            }
+            if event.tool_output_delta().is_some() {
+                self.store.save_tool_output_delta(&owner, &event)?;
+            } else {
+                self.store.save_exchange(&owner)?;
+            }
+            let patch = self.reconcile_timeline()?;
+            return Ok(if patch.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.event("document_changed", patch.notification())?]
+            });
+        }
         let BackendEvent::Compaction {
             scope,
             update: compaction,
@@ -9767,6 +9838,8 @@ mod test {
     use crate::agent::AgentExecutionState;
     use crate::session::state_machine::SessionPhase;
     include!("agent_test.rs");
+    include!("child_cancellation_test.rs");
+    include!("child_background_test.rs");
     include!("input_test.rs");
     include!("admission_test.rs");
     async fn settle_managed_children(broker: &mut HarnessBroker) -> Result<Vec<SessionEvent>> {
@@ -15575,6 +15648,108 @@ let sink = Some(sink);
         assert!(run_list[0].provider_thread_id.is_none());
     }
 
+    /// Persist late background output and completion only on the admitted historical owner.
+    #[tokio::test]
+    async fn background_tool_completes_on_settled_owner_without_touching_current_turn() -> Result<()>
+    {
+        use crate::backend::{
+            TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
+        };
+
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let mut settled = completed_interaction("background-owner", &broker.session.id, Vec::new());
+        let provider = crate::turn::test_support::address(&settled, "background-provider-turn");
+        let mut turn =
+            crate::turn::test_support::TestTurn::new("background-turn".into(), provider.clone(), 1);
+        for update in [
+            ToolUpdate::Requested {
+                invocation: ToolInvocation {
+                    kind: ToolActivityKind::Command,
+                    name: "exec".into(),
+                    title: "Background command".into(),
+                    arguments: Value::Null,
+                },
+            },
+            ToolUpdate::Started,
+            ToolUpdate::Output {
+                update: TextUpdate::Append("START\n".into()),
+            },
+            ToolUpdate::Backgrounded,
+        ] {
+            turn.record_tool("background", update, 2)?;
+        }
+        turn.finish(crate::turn::TurnOutcome::Completed, 3)?;
+        let recorded = turn.into_exchange();
+        settled.turn = recorded.turn;
+        settled.node_list = recorded.node_list;
+        settled.entry = recorded.entry;
+        settled.rebuild_tool_counter();
+        broker.store.save_exchange(&settled)?;
+
+        let mut current = completed_interaction("foreground-owner", &broker.session.id, Vec::new());
+        current.ordinal = 2;
+        broker.store.save_exchange(&current)?;
+        let current_before = serde_json::to_value(&current)?;
+        let address = crate::backend::ToolAddress {
+            turn: provider,
+            tool_id: "background".into(),
+        };
+        let mut event = Vec::new();
+        for update in [
+            ToolUpdate::Output {
+                update: TextUpdate::Append("END\n".into()),
+            },
+            ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            },
+        ] {
+            assert!(
+                broker
+                    .route_settled_parent_event(
+                        &current,
+                        &BackendEvent::Tool {
+                            address: address.clone(),
+                            update
+                        },
+                        &mut event,
+                    )
+                    .await?
+            );
+        }
+        let saved = broker.store.load_exchange(&settled.id)?.unwrap();
+        let tool = saved.tools().next().unwrap().1;
+        assert_eq!(tool.state(), crate::turn::ToolState::Completed);
+        assert_eq!(tool.output, "START\nEND\n");
+        assert_eq!(saved.state(), ExchangeState::Complete);
+        assert_eq!(
+            serde_json::to_value(broker.store.load_exchange(&current.id)?.unwrap())?,
+            current_before
+        );
+        assert!(!event.is_empty());
+        let mut unknown = address.clone();
+        unknown.tool_id = "unknown".into();
+        assert!(!saved.accepts_settled_tool_update(
+            &unknown,
+            &ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            }
+        ));
+        assert!(!saved.accepts_settled_tool_update(
+            &address,
+            &ToolUpdate::Finished {
+                outcome: ToolOutcome::Failed {
+                    diagnostic: crate::backend::ToolDiagnostic {
+                        code: None,
+                        message: "late contradiction".into(),
+                    }
+                },
+            }
+        ));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn late_tool_title_updates_the_settled_owner_without_touching_current_turn() -> Result<()>
     {
@@ -16821,16 +16996,11 @@ let sink = Some(sink);
         broker.event_sink = None;
         assert!(
             broker
-                .observe_external_compaction(update.clone())
+                .observe_session_event(update.clone())
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            broker
-                .observe_external_compaction(update)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(broker.observe_session_event(update).unwrap().is_empty());
         let restored = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(restored.len(), interaction_count + 1);
         let ExchangeNode::Compaction { compaction, .. } = &restored[0].node_list[position] else {

@@ -120,6 +120,26 @@ impl BackendEventSink {
             })
     }
 
+    /// Bind a session observer to one original invocation without widening prompt delivery.
+    pub(crate) fn invocation_sink(
+        &self,
+        invocation: &InvocationScope,
+    ) -> Result<Self, EventDeliveryError> {
+        let received = EventScope::from(invocation.clone());
+        if !matches!(self.scope, EventScope::SessionOperation { .. })
+            || self.scope.owner() != &invocation.owner
+        {
+            return Err(EventDeliveryError::OwnershipMismatch {
+                expected: Box::new(self.scope.clone()),
+                received: Box::new(received),
+            });
+        }
+        Ok(Self {
+            scope: received,
+            ..self.clone()
+        })
+    }
+
     pub(crate) fn skills(
         &self,
         observer: std::sync::Arc<std::sync::Mutex<crate::skill::SkillObserver>>,
@@ -474,6 +494,41 @@ mod tests {
             },
             update,
         }
+    }
+
+    /// Keep retained delivery inside its session and preserve exact invocation validation.
+    #[tokio::test]
+    async fn session_observer_rebinds_only_its_owned_invocations() -> anyhow::Result<()> {
+        let original = scope();
+        let (session_sink, mut stream) = channel(EventScope::SessionOperation {
+            owner: original.owner.clone(),
+            operation_id: "session-observer".into(),
+        });
+        let retained_sink = session_sink.invocation_sink(&original)?;
+        let update = message(
+            "retained",
+            MessageUpdate::Delta {
+                text: "original invocation".into(),
+            },
+        );
+        retained_sink.send_wait(update).await?;
+        let received = stream.recv().await?.expect("retained event was sent");
+        assert_eq!(received.scope(), EventScope::from(original.clone()));
+
+        let mut later = original.clone();
+        later.invocation_id = "later-invocation".into();
+        later.exchange_id = "later-exchange".into();
+        assert!(retained_sink.invocation_sink(&later).is_err());
+        let later_sink = session_sink.invocation_sink(&later)?;
+        assert!(later_sink.validate(&received).is_err());
+
+        let mut sibling = original.clone();
+        sibling.owner.agent_id = "another-agent".into();
+        assert!(session_sink.invocation_sink(&sibling).is_err());
+        let mut foreign = original;
+        foreign.owner = ExecutionOwner::root("foreign-session");
+        assert!(session_sink.invocation_sink(&foreign).is_err());
+        Ok(())
     }
 
     #[tokio::test]

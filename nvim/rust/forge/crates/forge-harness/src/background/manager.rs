@@ -166,9 +166,9 @@ impl BackgroundManager {
                 }
             }
         });
-        let mut compaction_stream = match runtime
+        let mut session_event_stream = match runtime
             .backend_handle()
-            .compaction_stream(crate::backend::ExecutionOwner::root(&session_id))
+            .session_event_stream(crate::backend::ExecutionOwner::root(&session_id))
             .await
         {
             Ok(stream) => stream,
@@ -176,7 +176,7 @@ impl BackgroundManager {
                 report(
                     &request.delivery,
                     &session_id,
-                    format!("Background compaction subscription failed: {error:#}"),
+                    format!("Background session observation failed: {error:#}"),
                 )
                 .await;
                 None
@@ -255,7 +255,7 @@ impl BackgroundManager {
             session_id: session_id.clone(),
         }));
         let mut native_compaction_observed = false;
-        if let Some(stream) = &mut compaction_stream {
+        if let Some(stream) = &mut session_event_stream {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
             let mut pending: Option<crate::backend::Compaction> = None;
             loop {
@@ -278,11 +278,11 @@ impl BackgroundManager {
                                     None
                                 };
                         }
-                        if let Err(error) = broker.observe_external_compaction(event) {
+                        if let Err(error) = broker.observe_session_event(event) {
                             report(
                                 &request.delivery,
                                 &session_id,
-                                format!("Background compaction event failed: {error:#}"),
+                                format!("Background session observation failed: {error:#}"),
                             )
                             .await;
                         }
@@ -292,7 +292,7 @@ impl BackgroundManager {
                             compaction.state = crate::backend::CompactionState::Unconfirmed;
                             compaction.result.error =
                                 Some("Provider compaction completion was not confirmed".into());
-                            let _ = broker.observe_external_compaction(
+                            let _ = broker.observe_session_event(
                                 crate::backend::BackendEvent::Compaction {
                                     scope: crate::backend::EventScope::SessionOperation {
                                         owner: crate::backend::ExecutionOwner::root(&session_id),

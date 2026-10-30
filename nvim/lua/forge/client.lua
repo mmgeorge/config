@@ -13,6 +13,10 @@ local perf = require("forge.infra.perf")
 
 local launcher_for_test = nil
 local shutdown_autocmd = false
+local exiting = false
+local host_drain_timeout_ms = 3000
+local host_unix_collection_timeout_ms = 1000
+local host_windows_collection_timeout_ms = 2000
 local send_request
 
 ---@alias ForgeCallback fun(result?: any, error?: string, error_detail?: table)
@@ -132,6 +136,7 @@ end
 ---@return integer?
 local function host_admit_request(method, callback)
   local client = host_state()
+  if exiting then callback(nil, "Forge host is exiting", { code = "not_admitted" }) return nil end
   if client.draining then callback(nil, "Forge host is draining", { code = "not_admitted" }) return nil end
   local count, ordinary = 0, 0
   for _, pending in pairs(client.pending) do
@@ -221,13 +226,26 @@ local function session_fail_initialization(client, failure)
   end
 end
 
+---Keep the event loop alive until normal shutdown collects the host, without admitting replacement work.
+local function host_stop_for_exit()
+  exiting = true
+  local stopped = false
+  M.host_stop(nil, function() stopped = true end)
+  if stopped then return end
+  local collection_timeout_ms = vim.fn.has("win32") == 1
+    and host_windows_collection_timeout_ms or host_unix_collection_timeout_ms
+  if not vim.wait(host_drain_timeout_ms + collection_timeout_ms, function() return stopped end) then
+    notifications.error("Forge exit exceeded its drain and process collection deadlines; shutdown completion is unknown", "Forge")
+  end
+end
+
 local function host_ensure_shutdown_autocmd()
   if shutdown_autocmd then return end
   shutdown_autocmd = true
   local group = vim.api.nvim_create_augroup("ForgeClient", { clear = true })
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = group,
-    callback = function() M.host_stop() end,
+    callback = host_stop_for_exit,
   })
 end
 
@@ -320,7 +338,7 @@ local function host_collect_process(client, process, still_running, finished)
         return
       end
       finished(result)
-    end, 1000)
+    end, host_unix_collection_timeout_ms)
     return
   end
   local pid = process.pid
@@ -333,7 +351,7 @@ local function host_collect_process(client, process, still_running, finished)
     text = true,
     stdout = true,
     stderr = true,
-    timeout = 2000,
+    timeout = host_windows_collection_timeout_ms,
   }, function(result)
     vim.schedule(function()
       if client.taskkill_process == taskkill_process then client.taskkill_process = nil end
@@ -725,7 +743,6 @@ local function host_spawn(binary, callback, launch_token, lease)
   client.process = process
   require("forge.startup_log").write("host.spawned", { pid = process.pid, generation = generation,
     elapsed_ms = math.floor((vim.uv.hrtime() - spawn_started) / 1e6) })
-  host_ensure_shutdown_autocmd()
   host_send_initialize(callback)
 end
 
@@ -784,6 +801,8 @@ end
 function M.host_start(callback)
   callback = protect_consumer(callback or function() end, "startup")
   local client = host_state()
+  if exiting then callback(nil, "Forge host is exiting", { code = "not_admitted" }) return end
+  host_ensure_shutdown_autocmd()
   if client.draining then callback(nil, "Forge host is draining") return end
   if client.ready and client.process then
     local generation = client.generation
@@ -1088,7 +1107,7 @@ function M.host_stop(reason, on_stopped)
     local shutdown_timer = assert(vim.uv.new_timer(), "Unable to create Forge shutdown timer")
     client.shutdown_timer = shutdown_timer
     client.shutdown_timer_token = launch_token
-    shutdown_timer:start(3000, 0, vim.schedule_wrap(function()
+    shutdown_timer:start(host_drain_timeout_ms, 0, vim.schedule_wrap(function()
       if client.shutdown_timer == shutdown_timer then
         client.shutdown_timer = nil
         client.shutdown_timer_token = nil
@@ -1151,6 +1170,7 @@ function M._host_reset_for_test()
   M._client = nil
   launcher_for_test = nil
   shutdown_autocmd = false
+  exiting = false
 end
 
 return M

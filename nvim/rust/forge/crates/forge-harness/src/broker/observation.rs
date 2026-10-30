@@ -17,6 +17,7 @@ pub(crate) struct BrokerObserver {
     pub(crate) status_thoughts: AtomicBool,
     pub(crate) check_editing: Arc<AtomicBool>,
     pub(crate) completion_queue: crate::checks::CompletionQueue,
+    pub(crate) session_events: Arc<super::session_events::SessionEventInbox>,
     pub(super) data_root: PathBuf,
     pub(super) session_id: String,
     pub(super) session_metadata: crate::storage::lifecycle::SessionMetadataWriter,

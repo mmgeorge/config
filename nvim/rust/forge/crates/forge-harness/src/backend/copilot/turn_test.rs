@@ -4,6 +4,218 @@ use crate::backend::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
+/// Preserve the repair caution in the native prompt without emitting a UI diagnostic.
+#[tokio::test]
+async fn copilot_repaired_resume_cautions_native_prompt_without_diagnostic() -> Result<()> {
+    let (_fixture, backend, mut request) = fixture()?;
+    request.backend_session_id = Some("repaired-native".into());
+    request.input = crate::backend::BackendInput::Text {
+        text: "Read the workspace before repeating any action.".into(),
+        attachments: Vec::new(),
+    };
+    let original_input = request.input.clone();
+    let (client_read, mut server_write) = tokio::io::duplex(65536);
+    let (client_write, mut server_read) = tokio::io::duplex(65536);
+    *backend.client.lock().await = Some(Client::from_streams(
+        client_read,
+        client_write,
+        PathBuf::from(&request.workspace),
+    )?);
+    let (sink, mut events) = event_channel(&request)?;
+    let server = async {
+        let resume = read_request(&mut server_read).await?;
+        assert_eq!(resume["method"], "session.resume");
+        respond(
+            &mut server_write,
+            &resume,
+            json!({"result":{"sessionId":"repaired-native","workspacePath":"."}}),
+        )
+        .await?;
+        let reload = read_request(&mut server_read).await?;
+        assert_eq!(reload["method"], "session.skills.reload");
+        respond(&mut server_write, &reload, json!({"result":{}})).await?;
+        let history = read_request(&mut server_read).await?;
+        assert_eq!(history["method"], "session.eventLog.read");
+        respond(&mut server_write, &history, json!({"result":{"cursor":"unsafe","cursorStatus":"ok","hasMore":false,"events":[{"id":"unsafe-assistant","type":"assistant.message","timestamp":"2026-10-30T00:00:00Z","data":{"messageId":"request","content":"","toolRequests":[{"name":"shell","toolCallId":"orphan"}]}}]}})).await?;
+        let truncate = read_request(&mut server_read).await?;
+        assert_eq!(truncate["method"], "session.history.truncate");
+        assert_eq!(truncate["params"]["eventId"], "unsafe-assistant");
+        respond(
+            &mut server_write,
+            &truncate,
+            json!({"result":{"eventsRemoved":1}}),
+        )
+        .await?;
+        let verify = read_request(&mut server_read).await?;
+        assert_eq!(verify["method"], "session.eventLog.read");
+        respond(
+            &mut server_write,
+            &verify,
+            json!({"result":{"cursor":"repaired","cursorStatus":"ok","hasMore":false,"events":[]}}),
+        )
+        .await?;
+        let tasks = read_request(&mut server_read).await?;
+        assert_eq!(tasks["method"], "session.plan.readSqlTodosWithDependencies");
+        respond(
+            &mut server_write,
+            &tasks,
+            json!({"result":{"rows":[],"dependencies":[]}}),
+        )
+        .await?;
+        let tail = read_request(&mut server_read).await?;
+        assert_eq!(tail["method"], "session.eventLog.tail");
+        respond(
+            &mut server_write,
+            &tail,
+            json!({"result":{"cursor":"before-send"}}),
+        )
+        .await?;
+        let send = read_request(&mut server_read).await?;
+        assert_eq!(send["method"], "session.send");
+        assert_eq!(send["params"]["sessionId"], "repaired-native");
+        let prompt = send["params"]["prompt"]
+            .as_str()
+            .context("native prompt missing")?;
+        assert!(prompt.contains("Recovery notice: an interrupted native tool-call suffix was removed from provider history. Its actions may already have completed or partially changed the workspace. Inspect the workspace before repeating writes; do not replay the interrupted request automatically."));
+        assert!(prompt.ends_with("Read the workspace before repeating any action."));
+        respond(
+            &mut server_write,
+            &send,
+            json!({"result":{"messageId":"accepted-user"}}),
+        )
+        .await?;
+        for (kind, data) in [
+            ("assistant.turn_start", json!({"turnId":"recovered-turn"})),
+            (
+                "assistant.message",
+                json!({"messageId":"answer","phase":"final_answer","content":"Recovered safely"}),
+            ),
+            ("session.idle", json!({})),
+        ] {
+            write_frame(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"repaired-native","event":{"id":kind,"type":kind,"timestamp":"2026-10-30T00:00:00Z","data":data}}})).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let (completion, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::try_join!(
+            async { Ok::<_, anyhow::Error>(backend.prompt_stream(request.clone(), sink).await?) },
+            server
+        )
+    })
+    .await??;
+    assert_eq!(
+        completion.backend_session_id.as_deref(),
+        Some("repaired-native")
+    );
+    assert_eq!(request.input, original_input);
+    let mut finished = false;
+    while let Some(event) = events.try_next()? {
+        assert!(
+            !matches!(event, BackendEvent::Diagnostic { .. }),
+            "successful recovery emitted a UI diagnostic: {event:?}"
+        );
+        if let BackendEvent::Turn {
+            update: TurnUpdate::Finished { outcome, .. },
+            ..
+        } = event
+        {
+            assert_eq!(outcome, crate::turn::TurnOutcome::Completed);
+            finished = true;
+        }
+    }
+    assert!(finished, "native completion was not published");
+    Ok(())
+}
+
+/// Fresh native resume validates every page and refuses unverifiable repairs.
+#[tokio::test]
+async fn copilot_resume_repairs_only_verified_incomplete_history() -> Result<()> {
+    for scenario in [
+        "valid",
+        "repair",
+        "expired",
+        "stalled",
+        "truncate-failed",
+        "still-incomplete",
+        "prefix-lost",
+    ] {
+        let (_fixture, backend, mut request) = fixture()?;
+        request.backend_session_id = Some("resume-history".into());
+        let (client_read, mut server_write) = tokio::io::duplex(65536);
+        let (client_write, mut server_read) = tokio::io::duplex(65536);
+        *backend.client.lock().await = Some(Client::from_streams(
+            client_read,
+            client_write,
+            PathBuf::from(&request.workspace),
+        )?);
+        let server = async {
+            let resume = read_request(&mut server_read).await?;
+            assert_eq!(resume["method"], "session.resume");
+            respond(
+                &mut server_write,
+                &resume,
+                json!({"result":{"sessionId":"resume-history","workspacePath":"."}}),
+            )
+            .await?;
+            let reload = read_request(&mut server_read).await?;
+            assert_eq!(reload["method"], "session.skills.reload");
+            respond(&mut server_write, &reload, json!({"result":{}})).await?;
+            let read = read_request(&mut server_read).await?;
+            assert_eq!(read["method"], "session.eventLog.read");
+            assert!(read["params"].get("cursor").is_none_or(Value::is_null));
+            let dangling = json!({"id":"unsafe-assistant","type":"assistant.message","timestamp":"2026-10-30T00:00:00Z","data":{"messageId":"request","content":"","toolRequests":[{"name":"shell","toolCallId":"orphan"}]}});
+            let prefix = json!({"id":"completed-prefix","type":"assistant.message","timestamp":"2026-10-30T00:00:00Z","data":{"messageId":"completed","content":"Earlier completed work"}});
+            respond(&mut server_write, &read, json!({"result":{"cursor":"page-one","cursorStatus":if scenario == "expired" {"expired"} else {"ok"},"hasMore":scenario != "valid" && scenario != "expired","events":[prefix.clone()]}})).await?;
+            if scenario != "valid" && scenario != "expired" {
+                let page = read_request(&mut server_read).await?;
+                assert_eq!(page["params"]["cursor"], "page-one");
+                respond(&mut server_write, &page, json!({"result":{"cursor":if scenario == "stalled" {"page-one"} else {"page-two"},"cursorStatus":"ok","hasMore":scenario == "stalled","events":[dangling.clone()]}})).await?;
+                if scenario != "stalled" {
+                    let truncate = read_request(&mut server_read).await?;
+                    assert_eq!(truncate["method"], "session.history.truncate");
+                    assert_eq!(truncate["params"]["eventId"], "unsafe-assistant");
+                    respond(&mut server_write, &truncate, json!({"result":{"eventsRemoved":if scenario == "truncate-failed" {0} else {1}}})).await?;
+                    if scenario != "truncate-failed" {
+                        let verify = read_request(&mut server_read).await?;
+                        assert_eq!(verify["method"], "session.eventLog.read");
+                        let rewind = json!({"id":"rewind","type":"session.snapshot_rewind","timestamp":"2026-10-30T00:00:00Z","ephemeral":true,"data":{"upToEventId":"unsafe-assistant","eventsRemoved":1}});
+                        let retained = match scenario {
+                            "still-incomplete" => vec![prefix, dangling],
+                            "prefix-lost" => vec![],
+                            _ => vec![prefix, rewind],
+                        };
+                        respond(&mut server_write, &verify, json!({"result":{"cursor":"repaired","cursorStatus":"ok","hasMore":false,"events":retained}})).await?;
+                    }
+                }
+            }
+            if scenario != "valid" && scenario != "repair" {
+                let disconnect = read_request(&mut server_read).await?;
+                assert_eq!(disconnect["method"], "session.destroy");
+                respond(&mut server_write, &disconnect, json!({"result":{}})).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let (result, served) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                backend.session(&request, CopilotSessionReuse::Compatible),
+                server
+            )
+        })
+        .await?;
+        served?;
+        assert_eq!(
+            result.is_ok(),
+            scenario == "valid" || scenario == "repair",
+            "{scenario}"
+        );
+        if scenario == "repair" {
+            let slot = backend.session_slot(&request.runtime_key()?).await;
+            assert!(slot.lock().await.as_ref().unwrap().repair.is_some());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum NativeUserDelivery {
     Streaming,
@@ -457,6 +669,9 @@ async fn copilot_disables_tool_search_and_binds_session_files_on_create_and_resu
                 let reload = read_request(&mut server_read).await?;
                 assert_eq!(reload["method"], "session.skills.reload");
                 respond(&mut server_write, &reload, json!({"result":{}})).await?;
+                let history = read_request(&mut server_read).await?;
+                assert_eq!(history["method"], "session.eventLog.read");
+                respond(&mut server_write, &history, json!({"result":{"cursor":"validated","cursorStatus":"ok","hasMore":false,"events":[]}})).await?;
             }
             Ok::<_, anyhow::Error>(())
         };
@@ -969,6 +1184,181 @@ async fn native_rewind(first_failure: Option<Value>, delivery: NativeUserDeliver
     Ok(())
 }
 
+/// Keep a background wakeup inside its admitted invocation until actual session idle.
+#[tokio::test]
+async fn copilot_background_wakeup_settles_before_next_prompt() -> Result<()> {
+    let (_root, backend, mut request) = fixture()?;
+    let (client_read, mut server_write) = tokio::io::duplex(65536);
+    let (client_write, mut server_read) = tokio::io::duplex(65536);
+    *backend.client.lock().await = Some(Client::from_streams(
+        client_read,
+        client_write,
+        PathBuf::from(&request.workspace),
+    )?);
+    let server = async {
+        let create = read_request(&mut server_read).await?;
+        assert_eq!(create["method"], "session.create");
+        let session_id = create["params"]["sessionId"].clone();
+        respond(
+            &mut server_write,
+            &create,
+            json!({"result":{"sessionId":session_id,"workspacePath":"."}}),
+        )
+        .await?;
+        for attempt in 0..2 {
+            for (method, result) in [
+                (
+                    "session.plan.readSqlTodosWithDependencies",
+                    json!({"rows":[],"dependencies":[]}),
+                ),
+                (
+                    "session.eventLog.tail",
+                    json!({"cursor":format!("before-{attempt}")}),
+                ),
+                (
+                    "session.send",
+                    json!({"messageId":format!("prompt-{attempt}")}),
+                ),
+            ] {
+                let message = read_request(&mut server_read).await?;
+                assert_eq!(message["method"], method);
+                if method == "session.send" {
+                    assert_eq!(message["params"]["sessionId"], session_id);
+                    assert!(
+                        message["params"]["prompt"]
+                            .as_str()
+                            .unwrap()
+                            .contains(&format!("request-{attempt}"))
+                    );
+                }
+                respond(&mut server_write, &message, json!({"result":result})).await?;
+            }
+            let native = if attempt == 0 {
+                vec![
+                    (
+                        "original-start",
+                        "assistant.turn_start",
+                        json!({"turnId":"0","interactionId":"background"}),
+                    ),
+                    (
+                        "shell-start",
+                        "tool.execution_start",
+                        json!({"toolCallId":"shell","toolName":"powershell","arguments":{"mode":"async"}}),
+                    ),
+                    (
+                        "shell-launch",
+                        "tool.execution_complete",
+                        json!({"toolCallId":"shell","success":true,"result":{"content":"shell 0 started"}}),
+                    ),
+                    (
+                        "launch-answer",
+                        "assistant.message",
+                        json!({"messageId":"launch","phase":"final_answer","content":"Started shell 0"}),
+                    ),
+                    ("original-end", "assistant.turn_end", json!({"turnId":"0"})),
+                    ("foreground-idle", "assistant.idle", json!({})),
+                    (
+                        "late-output",
+                        "tool.execution_partial_result",
+                        json!({"toolCallId":"shell","partialOutput":"background completed"}),
+                    ),
+                    (
+                        "wakeup-start",
+                        "assistant.turn_start",
+                        json!({"turnId":"0","interactionId":"background"}),
+                    ),
+                    (
+                        "wakeup-start",
+                        "assistant.turn_start",
+                        json!({"turnId":"0","interactionId":"background"}),
+                    ),
+                    (
+                        "wakeup-answer",
+                        "assistant.message",
+                        json!({"messageId":"wakeup","phase":"final_answer","content":"Background completed"}),
+                    ),
+                    ("wakeup-end", "assistant.turn_end", json!({"turnId":"0"})),
+                    ("session-idle", "session.idle", json!({})),
+                ]
+            } else {
+                vec![
+                    (
+                        "next-start",
+                        "assistant.turn_start",
+                        json!({"turnId":"0","interactionId":"next"}),
+                    ),
+                    (
+                        "next-answer",
+                        "assistant.message",
+                        json!({"messageId":"next","phase":"final_answer","content":"Next prompt completed"}),
+                    ),
+                    ("next-end", "assistant.turn_end", json!({"turnId":"0"})),
+                    ("next-idle", "session.idle", json!({})),
+                ]
+            };
+            for (id, kind, payload) in native {
+                write_frame(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event","params":{
+                    "sessionId":session_id,"event":{"id":id,"type":kind,"timestamp":"2026-10-30T16:32:00Z","data":payload}
+                }})).await?;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let workflow = async {
+        let mut native_session = None;
+        for attempt in 0..2 {
+            request.backend_session_id = native_session.clone();
+            request.input = crate::backend::BackendInput::Text {
+                text: format!("request-{attempt}"),
+                attachments: Vec::new(),
+            };
+            let (sink, mut events) = event_channel(&request)?;
+            let completed = backend.prompt_stream(request.clone(), sink).await?;
+            if let Some(previous) = &native_session {
+                assert_eq!(completed.backend_session_id.as_ref(), Some(previous));
+            }
+            native_session = completed.backend_session_id;
+            let owner = request.owner()?;
+            let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+                "id":"exchange","session_id":owner.session_id,"agent_id":owner.agent_id,
+                "ordinal":1,"prompt":"Background lifecycle","state":"running","created_at_ms":0,
+                "attributed_matches_checkpoint":false,"node_list":[]
+            }))?;
+            let mut started = Vec::new();
+            let mut finished = Vec::new();
+            let mut foreground_idle = 0;
+            while let Some(event) = events.try_next()? {
+                match &event {
+                    BackendEvent::Turn {
+                        address,
+                        update: TurnUpdate::Started { .. },
+                    } => started.push(address.clone()),
+                    BackendEvent::Turn {
+                        address,
+                        update: TurnUpdate::Finished { .. },
+                    } => finished.push(address.clone()),
+                    BackendEvent::Runtime {
+                        update: crate::backend::RuntimeUpdate::ForegroundIdle,
+                        ..
+                    } => foreground_idle += 1,
+                    _ => {}
+                }
+                exchange.observe_turn(&event, 0)?;
+            }
+            assert_eq!(started.len(), if attempt == 0 { 2 } else { 1 });
+            assert_eq!(finished, started);
+            assert_eq!(foreground_idle, if attempt == 0 { 1 } else { 0 });
+            assert_eq!(exchange.tools().count(), if attempt == 0 { 1 } else { 0 });
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::try_join!(server, workflow)
+    })
+    .await??;
+    Ok(())
+}
+
 fn fixture() -> Result<(tempfile::TempDir, CopilotBackend, BackendRequest)> {
     let fixture = tempfile::tempdir()?;
     let backend = CopilotBackend::new_with_permission_coordinator(
@@ -1369,6 +1759,14 @@ async fn copilot_submission_reconciliation_excludes_known_messages_and_ambiguous
             let reload = read_request(&mut server_read).await?;
             assert_eq!(reload["method"], "session.skills.reload");
             respond(&mut server_write, &reload, json!({"result":{}})).await?;
+            let validation = read_request(&mut server_read).await?;
+            assert_eq!(validation["method"], "session.eventLog.read");
+            assert!(
+                validation["params"]
+                    .get("cursor")
+                    .is_none_or(Value::is_null)
+            );
+            respond(&mut server_write, &validation, json!({"result":{"cursor":"validated","cursorStatus":"ok","hasMore":false,"events":[]}})).await?;
             for page in 0..2 {
                 let read = read_request(&mut server_read).await?;
                 assert_eq!(read["method"], "session.eventLog.read");

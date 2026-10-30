@@ -27,10 +27,16 @@ use crate::task::command as session_command;
 #[path = "service/input.rs"]
 mod input_delivery;
 #[cfg(test)]
+#[path = "service/input_durability_test.rs"]
+mod input_durability_test;
+#[cfg(test)]
 #[path = "service/provider_startup_test.rs"]
 mod provider_startup_test;
 #[path = "service/review_questions.rs"]
 mod review_questions;
+#[cfg(test)]
+#[path = "service/session_observation_test.rs"]
+mod session_observation_test;
 #[path = "service/shared.rs"]
 mod shared;
 #[path = "service/task_state.rs"]
@@ -1076,11 +1082,8 @@ impl HarnessService {
                     if let Some(task) = controller.input_task.lock().await.take() {
                         task.await.context("input worker shutdown failed")?;
                     }
-                    for subscription in [
-                        &controller.timeout_task,
-                        &controller.agent_task,
-                        &controller.compaction_task,
-                    ] {
+                    controller.finish_session_events().await?;
+                    for subscription in [&controller.timeout_task, &controller.agent_task] {
                         if let Some(task) = subscription.lock().await.take() {
                             task.abort();
                             if let Err(error) = task.await
@@ -1227,6 +1230,12 @@ impl HarnessService {
     }
 }
 
+/// Preserve an intake failure until every preceding observation has been delivered.
+enum SessionObservationIntake {
+    Receiving,
+    Closed(std::result::Result<(), crate::backend::events::EventDeliveryError>),
+}
+
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
     provider_startup: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1246,7 +1255,7 @@ struct SessionController {
     checks: Arc<crate::checks::CheckSupervisor>,
     agent_backend_factory: crate::agent::AgentBackendFactory,
     parent_input: crate::backend::SteeringLane,
-    compaction_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    session_event_task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     revision_review: Arc<crate::plan::revision_review::RevisionReview>,
     broker: Mutex<HarnessBroker>,
@@ -1447,7 +1456,11 @@ impl SessionController {
     fn new(mut broker: HarnessBroker) -> Result<Arc<Self>> {
         let catalog_request = broker.backend_catalog_request();
         let observer = broker.observer();
-        let input = Arc::new(crate::input::SessionInputQueue::default());
+        let input = Arc::new(crate::input::SessionInputQueue::open(
+            &broker.data_root,
+            &catalog_request.harness_session_id,
+            &broker.submission_store,
+        )?);
         broker.input_wakeup = Some(input.changed.clone());
         Ok(Arc::new(Self {
             provider_startup: Mutex::new(None),
@@ -1467,7 +1480,7 @@ impl SessionController {
             checks: broker.checks(),
             agent_backend_factory: broker.agent_backend_factory.clone(),
             parent_input: broker.parent_input.clone(),
-            compaction_task: Mutex::new(None),
+            session_event_task: Mutex::new(None),
             plan_review: Arc::clone(&broker.plan_review),
             revision_review: Arc::clone(&broker.revision_review),
             presentation: broker.presentation(),
@@ -1481,48 +1494,83 @@ impl SessionController {
         }))
     }
 
-    async fn attach_compaction(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
+    /// Deliver provider observations without blocking intake behind a foreground broker owner.
+    async fn attach_session_events(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
         self.attach_timeout(message_sink).await?;
         self.attach_agents(message_sink).await?;
-        let mut task = self.compaction_task.lock().await;
+        let mut task = self.session_event_task.lock().await;
         if task.is_some() {
             return Ok(());
         }
         let session_id = self.catalog_request.read().await.harness_session_id.clone();
         let Some(mut stream) = self
             .backend
-            .compaction_stream(crate::backend::ExecutionOwner::root(&session_id))
+            .session_event_stream(crate::backend::ExecutionOwner::root(&session_id))
             .await?
         else {
             return Ok(());
         };
         let controller = Arc::downgrade(self);
+        let session_events = Arc::clone(&self.observer.session_events);
         let message_sink = message_sink.clone();
         *task = Some(tokio::spawn(async move {
             let result: Result<()> = async {
-                while let Some(event) = stream.recv().await? {
-                    let Some(controller) = controller.upgrade() else {
-                        return Ok(());
+                let mut intake = SessionObservationIntake::Receiving;
+                loop {
+                    if !session_events.has_pending()?
+                        && let SessionObservationIntake::Closed(result) = &intake
+                    {
+                        return result.clone().map_err(Into::into);
+                    }
+                    let deliver = async {
+                        let Some(controller) = controller.upgrade() else {
+                            return Ok::<_, anyhow::Error>(None);
+                        };
+                        let events = controller.broker.lock().await.drain_session_events()?;
+                        Ok(Some(events))
                     };
-                    let events = controller
-                        .broker
-                        .lock()
-                        .await
-                        .observe_external_compaction(event)?;
-                    for event in events {
-                        message_sink.send_event(event).await?;
+                    // Keep intake draining while a foreground request owns the broker.
+                    tokio::select! {
+                        observation = stream.recv(), if matches!(intake, SessionObservationIntake::Receiving) => {
+                            match observation {
+                                Ok(Some(observation)) => session_events.push(observation)?,
+                                Ok(None) => intake = SessionObservationIntake::Closed(Ok(())),
+                                Err(error) => intake = SessionObservationIntake::Closed(Err(error)),
+                            }
+                        }
+                        events = deliver, if session_events.has_pending()? => {
+                            let Some(events) = events? else { return Ok(()); };
+                            for event in events {
+                                message_sink.send_event(event).await?;
+                            }
+                        }
+                        // The active broker can empty the inbox between the two inspections.
+                        else => continue,
                     }
                 }
-                Ok(())
             }
             .await;
-            if let Err(error) = result {
+            if let Err(error) = &result {
                 let _ = message_sink.send_event(SessionEvent {
                     session_id, event: "backend_event".into(),
-                    payload: json!({"kind":"error", "text":format!("Compaction subscription failed: {error:#}")}),
+                    payload: json!({"kind":"error", "text":format!("Session observation failed: {error:#}")}),
                 }).await;
             }
+            result
         }));
+        Ok(())
+    }
+
+    /// Persist every final provider observation before releasing the session lease.
+    /// The backend closes its stream after shutdown publication; the caller's deadline
+    /// bounds this join while retaining the task if shutdown is cancelled for retry.
+    async fn finish_session_events(&self) -> Result<()> {
+        let mut task = self.session_event_task.lock().await;
+        if let Some(pending) = task.as_mut() {
+            let result = pending.await;
+            task.take();
+            result.context("session observation task failed during shutdown")??;
+        }
         Ok(())
     }
 
@@ -1722,7 +1770,7 @@ impl Drop for SessionController {
         if let Some(task) = self.agent_task.get_mut().take() {
             task.abort();
         }
-        if let Some(task) = self.compaction_task.get_mut().take() {
+        if let Some(task) = self.session_event_task.get_mut().take() {
             task.abort();
         }
     }
@@ -2130,7 +2178,7 @@ async fn route_request(
         !controller.input_stopping.load(Ordering::Acquire),
         "Harness session is closing"
     );
-    controller.attach_compaction(message_sink).await?;
+    controller.attach_session_events(message_sink).await?;
     controller.attach_input(message_sink).await?;
     if matches!(
         method,
@@ -3609,11 +3657,14 @@ async fn delete_session(
             controller.input_task.lock().await.take(),
             controller.timeout_task.lock().await.take(),
             controller.agent_task.lock().await.take(),
-            controller.compaction_task.lock().await.take(),
         ]
         .into_iter()
         .flatten()
         {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = controller.session_event_task.lock().await.take() {
             task.abort();
             let _ = task.await;
         }
@@ -3626,7 +3677,13 @@ async fn delete_session(
         std::path::Path::new(&registry.initialize.data_root),
         &session.workspace,
     );
-    store.delete_session_with(&target, || plans.delete_session(&target))?;
+    store.delete_session_with(&target, || {
+        plans.delete_session(&target)?;
+        crate::input::SessionInputQueue::delete_persisted(
+            std::path::Path::new(&registry.initialize.data_root),
+            &target,
+        )
+    })?;
     message_sink
         .send_response(Response::success(
             request.id,
@@ -8061,10 +8118,14 @@ mod tests {
         let initialize = initialize(&fixture, "fork-blocking");
         let opened = service.open_session(1, initialize.clone()).await.unwrap();
         assert!(opened.error().is_none(), "{opened:?}");
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let (sink, mut output) = forge_protocol::outbound::channel();
         service
             .dispatch(
-                None,
+                Some(session_id.clone()),
                 Request {
                     id: 2,
                     method: "session.fork".into(),
@@ -8084,12 +8145,12 @@ mod tests {
 
         assert!(service.shutdown(Duration::from_millis(10)).await.is_err());
         assert!(service.registry.lock().await.is_some());
-        assert!(
-            service
-                .prepare(None, RuntimeMethod::SessionPromptSubmit)
-                .await
-                .is_err()
-        );
+        let admission_error = service
+            .prepare(Some(&session_id), RuntimeMethod::SessionPromptSubmit)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(admission_error.to_string(), "Harness service is closed");
         let contender_diff = DiffEngine::new(CacheLimits::default(), 1);
         let contender_syntax = SyntaxEngine::new(contender_diff.analysis_pool());
         let contender = HarnessService::new(

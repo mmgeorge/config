@@ -4,6 +4,7 @@ mod compaction;
 mod event_decoder;
 mod event_stream;
 mod file_change;
+mod history_repair;
 mod mcp;
 pub(crate) mod mock_stream;
 mod rejection;
@@ -92,6 +93,7 @@ enum CopilotSessionReuse {
 struct CopilotSessionBinding {
     session: SharedCopilotSession,
     history: CopilotSessionHistory,
+    repair: Option<history_repair::HistoryRepair>,
     tool_schema: Vec<Value>,
     compaction: Option<compaction::CompactionMonitor>,
     mcp_failure: HashMap<String, String>,
@@ -342,6 +344,10 @@ impl CopilotBackend {
         let session_slot = self.session_slot(&request.runtime_key()?).await;
         let turn_event = self.turn_event(&request.runtime_key()?).await;
         let mut active_session = session_slot.lock().await;
+        let fresh_resume = active_session.is_none() && request.backend_session_id.is_some();
+        let previous_repair = active_session
+            .as_ref()
+            .and_then(|binding| binding.repair.clone());
         let tool_schema = ControlToolRegistry
             .definition_list_for_context(
                 request.control_context.as_ref(),
@@ -563,6 +569,17 @@ impl CopilotBackend {
         };
         let session_directory = SessionDirectory::new(&session)?;
         let session = Arc::new(session);
+        let repair = if fresh_resume {
+            match history_repair::repair(&session).await {
+                Ok(repair) => repair,
+                Err(error) => {
+                    let _ = session.disconnect().await;
+                    return Err(error);
+                }
+            }
+        } else {
+            previous_repair
+        };
         if let Some(resources) = &resources {
             let mut stage = "inspect Copilot skill selection".to_owned();
             let verified = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -674,6 +691,7 @@ impl CopilotBackend {
         *active_session = Some(CopilotSessionBinding {
             session: Arc::clone(&session),
             history,
+            repair,
             tool_schema,
             compaction,
             mcp_failure,
@@ -1186,7 +1204,13 @@ let event_sink = Some(event_sink);
             recovered.push(Self::input_text(&session, input).await?);
         }
         let provider_text = request.recovered_text(&provider_text, &recovered);
-        let prompt = format!("{}\n\n{}", request.interaction_contract(), provider_text);
+        let repair = self.session_slot(&request.runtime_key()?).await.lock().await.as_ref().and_then(|binding| binding.repair.clone());
+        let prompt = match repair {
+            Some(repair) => {
+                format!("{}\n\n{}\n\n{}", request.interaction_contract(), repair.caution(), provider_text)
+            },
+            None => format!("{}\n\n{}", request.interaction_contract(), provider_text),
+        };
         let history = session
             .rpc()
             .event_log()
@@ -1490,7 +1514,8 @@ let event_sink = Some(event_sink);
         })
     }
 
-    async fn compaction_stream(
+    /// Subscribe to owner-scoped session observations independently of foreground turns.
+    async fn session_event_stream(
         &self,
         owner: super::ExecutionOwner,
     ) -> Result<Option<super::events::BackendEventStream>> {

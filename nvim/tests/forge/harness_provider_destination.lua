@@ -11,7 +11,11 @@ state.session = { id = 'source', backend = 'codex', workspace = 'workspace' }
 state.busy = false
 state.queue, state.pending_steer = {}, {}
 local spec, selected, list_failure, empty_list, previewed, notifications
+local preview_request_list = {}
+local deferred_preview_list = {}
+local defer_preview = false
 require('forge.infra.notifications').error = function(message) notifications = message end
+require('forge.infra.notifications').warn = function(message) notifications = message end
 preview.open = function() end
 preview.close = function() end
 preview.render = function(result) previewed = result end
@@ -26,7 +30,17 @@ client.request = function(request_specification, callback)
   local method = request_specification.method
   local params = request_specification.params or {}
 
-  if method == 'session.preview' then callback({ preview = params.session_id }) return end
+  if method == 'session.preview' then
+    assert(request_specification.session_id == 'source',
+      'preview must use the captured calling provider session, not the candidate')
+    preview_request_list[#preview_request_list + 1] = vim.deepcopy(request_specification)
+    if defer_preview then
+      deferred_preview_list[#deferred_preview_list + 1] = function() callback({ preview = params.session_id }) end
+    else
+      callback({ preview = params.session_id })
+    end
+    return
+  end
   assert(method == 'session.list' and params.scope == 'repo')
   if list_failure then callback(nil, 'list failed') return end
   callback(empty_list and {} or {
@@ -59,9 +73,26 @@ choose_destination('resume')
 assert(#spec.page_list[1].option_list == 1 and #spec.action_list == 0)
 local option = spec.page_list[1].option_list[1]
 assert(option.id == 'chosen')
+local source_session = state.session
+state.session = { id = 'later-view', backend = 'codex', workspace = 'workspace' }
 spec.on_change({ option = option })
+state.session = source_session
 assert(previewed.preview == 'chosen')
+assert(preview_request_list[#preview_request_list].params.session_id == 'chosen',
+  'the cross-provider candidate belongs in preview params')
+assert(selected == nil and state.session.id == 'source', 'preview must not switch sessions')
+defer_preview = true
+spec.on_change({ option = option })
+spec.on_change({ option = nil })
+previewed = nil
+deferred_preview_list[#deferred_preview_list]()
+assert(previewed == nil, 'clearing selection must invalidate an outstanding preview')
+spec.on_change({ option = option })
+local closed_preview = deferred_preview_list[#deferred_preview_list]
+defer_preview = false
 spec.on_confirm({ option = option })
+closed_preview()
+assert(previewed == nil, 'a closed destination picker must reject late preview callbacks')
 assert(selected.backend == 'copilot' and selected.destination.session_id == 'chosen')
 assert(state.session.id == 'source', 'selection changed the source before startup')
 selected = nil
@@ -81,6 +112,18 @@ choose_destination('resume')
 vim.wait(100, function() return spec.page_list[1].title == 'Select Chat' end)
 assert(notifications == 'list failed' and selected == nil)
 assert(session_picker._state_for_test() == nil)
+list_failure, empty_list = false, false
+state.session = nil
+session_picker.open({})
+local preview_request_count = #preview_request_list
+previewed, notifications = nil, nil
+spec.on_change({ option = spec.page_list[1].option_list[1] })
+assert(#preview_request_list == preview_request_count,
+  'an uninitialized caller must not route preview through the candidate')
+assert(previewed == nil and notifications ==
+  'Wait for the calling session to initialize before previewing saved sessions.')
+session_picker.close()
+state.session = source_session
 state.pending_steer = { { prompt = 'pending' } }
 assert(not harness.backend_switch_available())
 print('harness_provider_destination: passed')

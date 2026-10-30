@@ -59,6 +59,8 @@ for queue display and editing. Rust applies the configuration only when that ent
 is eligible for delivery and consumes an empty prompt without starting a turn.
 Ctrl-S settings-only model commands use the immediate configuration coordinator.
 
+The queue commits accepted state and idempotency receipts to its SQLite journal before acknowledging a mutation. Recovery releases abandoned edit reservations and restores retained input suspended. It reconciles linked submission evidence: accepted input leaves the queue, uncertain sends stay blocked, and proven unsent work requires explicit resumption or retry. An empty recovered queue preserves readiness instead of creating a pause.
+
 Provider acceptance and queue acknowledgement are separate facts. `SubmissionStore` persists a `Prepared → Sending → Accepted` journal, and restart recovery never treats `Sending` as permission to replay. A turn that ends before dispatch keeps the message for the next eligible interaction. A failed message stays visible and blocks later follow-ups until the user retries or removes it. `SessionAdmission` keeps a compact task, operation, question, and exchange projection in memory, republished after every committed mutation, so submission never reopens SQLite.
 
 Lua owns the unsent draft, and typing sends nothing to Rust. Ctrl-S captures the draft and sends one `session.prompt.submit` with its text, typed attachments, and a monotonically increasing token. Acceptance clears only the captured draft if it is unchanged, rejection keeps it, and newer typing always survives. Rust publishes a durable running exchange before provider preparation. Editing a queued prompt reserves its entry, so the queue drains only up to that entry.
@@ -67,9 +69,17 @@ Pasted file paths import through `session.attachment.import` into the object sto
 
 ## Exchanges and cancellation
 
-`ExchangeNode` preserves the order of turn content, delegations, clarifications, steering, plan resolution, and artifact changes. Provider execution runs as a task in the broker's `JoinSet`, and every exit aborts and joins it before transport cleanup, so cancellation never leaves detached work running.
+`ExchangeNode` preserves the order of turn content, delegations, clarifications, steering, plan resolution, and artifact changes. The foreground provider invocation runs as a task in the broker's `JoinSet`, and every exit aborts and joins that task before transport cleanup. A native command can have a longer lifetime than the foreground invocation that started it.
+
+The adapter marks a known running command with `ToolUpdate::Backgrounded` before reporting normal foreground completion. `ToolStore` persists that lifetime on the original invocation and keeps the command running until its native completion arrives. Unmarked unfinished tools still settle as interrupted when the foreground turn ends. A turn ending in cancellation, interruption, or failure settles its running tools even when they were marked as background work, and a later completion cannot reopen a terminal result.
+
+`Backend::session_event_stream` carries observations that outlive a foreground turn, including background-command output and provider-initiated compaction. Its sinks retain the original execution owner and invocation address. The session collector queues events without waiting for the broker lock, so foreground work cannot block intake; the active broker drains invocation events before session events so lifetime admission precedes late completion. Delivery resolves the original stored tool and permits completion only while that exact background execution is still running. Output chunks commit before publication, historical updates preserve the current foreground view, and a failed subscription is reported rather than treated as an empty stream.
+
+Managed children consume that same session-event contract alongside their invocation stream. `AgentRuntime` continues forwarding observations during provider identity lookup and shutdown, then drains the final events before reporting child completion. Every forwarded invocation must belong to the current child and task; a foreign observation fails the task without bypassing cleanup. This ordering prevents a stopped child command from remaining marked as running after its child has completed.
 
 `session.turn.cancel` bypasses the serialized request queue so Ctrl-C can interrupt an active turn. A newly submitted prompt stays retractable until the provider produces a message, tool activity, task update, or workspace change. Retraction uses Codex `thread/rollback` or Copilot `session.history.truncate`, then the broker deletes the provisional interaction and Lua restores the exact prompt. After visible activity, cancellation persists the partial exchange as cancelled.
+
+Typed provider cancellation enters the same settlement path for root and managed-child requests. It stops retries and cancels unsent child submissions while retaining evidence for uncertain or accepted sends. Provider error text does not determine cancellation, and a child cleanup failure remains a failure that requires collection.
 
 Changing mode interrupts the provider and pauses the exchange, which keeps its request, plan, goal, and initial checkpoint. A cleanup or checkpoint failure leaves the exchange finalizing and blocks new admission, and Ctrl-C, new prompts, and goal resume retry finalization first. The terminal checkpoint and the exchange outcome commit together. When the host exits, Lua shows a reconnect error over the retained transcript, and only reopening Harness reconnects.
 
@@ -81,6 +91,8 @@ Workflow changes never enable writing or widen filesystem scope. When a permissi
 
 Restart recovery keeps committed phases and completion evidence, suspends unfinished attempts, marks unsettled operations outcome-unknown, and never starts a provider automatically. Pause operations recover as cancelled. Failure, disconnect, and unknown outcomes stop automatic queue draining, so queued work cannot run on top of a state nobody has confirmed.
 
+After exclusive runtime ownership is acquired, recovery also settles detached background tools inside already-completed exchanges. It preserves the foreground outcome, output, and last observed duration. On a fresh Copilot binding, native history is checked for unmatched tool calls; only a verified incomplete suffix can be truncated, and the retained prefix is checked again before new input is sent. The repaired session's provider prompt cautions that prior actions may have completed and must be inspected before repeating writes. Successful recovery does not emit an editor warning; ambiguous history blocks admission rather than discarding completed work.
+
 ## Plan generation
 
 The broker owns plan generation as one bounded continuation loop for every backend. Each turn applies plan edits to the canonical document, and only three outcomes move forward: a submitted plan, a new unresolved question, or another bounded turn. `ContinuationBudget` provides the budget for both goals and planning, and `PlanGeneration` stops after a turn limit or after consecutive turns without document progress. `/plan retry` resets only that budget.
@@ -91,7 +103,7 @@ The broker owns plan generation as one bounded continuation loop for every backe
 
 Provider usage normalizes into durable `ContextUsage`. `AutoCompaction` is a per-session policy with an enabled flag and a token threshold. It is off for ordinary sessions, and Background sessions enable it at 128,000 tokens. It runs after completed provider work and never estimates tokens from bytes.
 
-`Compaction` is a separate lifecycle with an operation identity, observed start and completion, and an outcome. Its after-compaction token count is accepted only once the provider confirms completion, and a turn that ends first records an unconfirmed outcome. `native_compact` gates manual `/compact`, which uses Codex `thread/compact/start` or Copilot `session.history.compact` and creates no user exchange. Copilot keeps a `Backend::compaction_stream` subscription across turns, because it can start compaction on its own.
+`Compaction` is a separate lifecycle with an operation identity, observed start and completion, and an outcome. Its after-compaction token count is accepted only once the provider confirms completion, and a turn that ends first records an unconfirmed outcome. `native_compact` gates manual `/compact`, which uses Codex `thread/compact/start` or Copilot `session.history.compact` and creates no user exchange. Copilot keeps a `Backend::session_event_stream` subscription across turns because it can start compaction on its own.
 
 ## Rollback
 

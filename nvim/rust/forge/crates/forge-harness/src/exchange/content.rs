@@ -120,6 +120,22 @@ impl Exchange {
         self.rebuild_tool_counter();
     }
 
+    /// Recover orphaned background tools without changing settled foreground execution.
+    pub(crate) fn interrupt_detached_background_tools(&mut self, observed_at: i64) -> Result<bool> {
+        let mut changed = false;
+        for entry in &mut self.entry {
+            if let ExchangeEntry::Commentary { commentary } = entry {
+                for tools in &mut commentary.tool {
+                    changed |= tools.store.interrupt_detached_background(observed_at)?;
+                }
+            }
+        }
+        if changed {
+            self.rebuild_tool_counter();
+        }
+        Ok(changed)
+    }
+
     /// Integrates new timeline identities without changing existing tool ownership.
     pub(crate) fn reconcile_entries(&mut self) -> Result<()> {
         let legacy_checks: Vec<_> = self
@@ -488,6 +504,30 @@ impl Exchange {
         Ok(&mut commentary.tool[index].store)
     }
 
+    /// Check late updates against the exact persisted tool owner without reopening execution.
+    pub(crate) fn accepts_settled_tool_update(
+        &self,
+        address: &crate::backend::ToolAddress,
+        update: &crate::backend::ToolUpdate,
+    ) -> bool {
+        self.entry.iter().any(|entry| {
+            let ExchangeEntry::Commentary { commentary } = entry else {
+                return false;
+            };
+            commentary.tool.iter().any(|tools| {
+                tools
+                    .store
+                    .execution(address.tool_id.as_str())
+                    .is_some_and(|execution| {
+                        execution.address == *address
+                            && (update.can_update_settled()
+                                || matches!(update, crate::backend::ToolUpdate::Finished { .. })
+                                    && tools.store.accepts_background_completion(address))
+                    })
+            })
+        })
+    }
+
     pub(crate) fn record_tool_event(
         &mut self,
         turn_id: &str,
@@ -498,7 +538,7 @@ impl Exchange {
         let existing = self
             .tools_for_turn(turn_id)
             .any(|tool| tool.id == address.tool_id.as_str());
-        let late = existing && update.can_update_settled();
+        let late = self.accepts_settled_tool_update(address, update);
         ensure!(
             self.turn.iter().any(|turn| turn.id() == turn_id
                 && turn.provider() == &address.turn

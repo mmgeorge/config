@@ -648,6 +648,13 @@ impl SessionTaskController {
         self.current()
     }
 
+    /// Resume execution work without changing admission identity or timestamps.
+    /// Callers still validate the enclosing task's resume eligibility before committing it.
+    pub(crate) fn resume_execution(execution: &mut super::ExecutionTask) {
+        execution.record.state = PlanExecutionState::Active;
+        execution.continuation.reset();
+    }
+
     fn apply_change(
         active: &mut Option<ActiveTask>,
         change: TaskChange,
@@ -738,8 +745,7 @@ impl SessionTaskController {
                         plan.paused = false;
                     }
                     TaskWorkflow::Execute { execution } => {
-                        execution.record.state = PlanExecutionState::Active;
-                        execution.continuation.reset();
+                        Self::resume_execution(execution);
                     }
                 }
                 task.renew(now_ms);

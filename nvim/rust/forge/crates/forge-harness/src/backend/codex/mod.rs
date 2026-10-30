@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, Notify};
 
+mod background;
 mod json_rpc;
 mod normalization;
 mod process;
@@ -65,6 +66,7 @@ struct TerminalConnection {
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
 pub struct CodexBackend {
     runtime: CodexRuntime,
+    background: background::BackgroundDelivery,
     command: Vec<String>,
     settings_root: Option<std::path::PathBuf>,
     resource_by_session: Mutex<HashMap<String, Arc<CodexResources>>>,
@@ -154,6 +156,7 @@ impl CodexBackend {
         );
         Ok(Self {
             runtime: CodexRuntime::new(command.clone()),
+            background: background::BackgroundDelivery::default(),
             command,
             settings_root,
             resource_by_session: Mutex::new(HashMap::new()),
@@ -401,6 +404,9 @@ impl CodexBackend {
         output: &mut BackendOutput,
         event_sink: Option<BackendEventSink>,
     ) -> Result<Arc<Mutex<CodexConnection>>> {
+        let runtime_key = request.runtime_key()?;
+        self.background.stop(&runtime_key).await?;
+        let background_sink = self.background.sink(&runtime_key).await;
         if let Some(connection) = self
             .connection_by_session
             .lock()
@@ -414,9 +420,16 @@ impl CodexBackend {
                 .process
                 .set_request_context(&request.workspace, request.approval_mode, event_sink)
                 .await?;
+            connection
+                .lock()
+                .await
+                .process
+                .set_background_sink(background_sink);
             return Ok(connection);
         }
-        let connection = Arc::new(Mutex::new(self.connect(request, output, event_sink).await?));
+        let mut connected = self.connect(request, output, event_sink).await?;
+        connected.process.set_background_sink(background_sink);
+        let connection = Arc::new(Mutex::new(connected));
         self.connection_by_session
             .lock()
             .await
@@ -1222,38 +1235,44 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
+    /// Initialize or reuse a native thread without suspending its retained background delivery.
     async fn initialize_session(&self, mut request: BackendRequest) -> Result<Option<String>> {
-        let _startup = self.startup_guard(request.runtime_key()?).await;
+        let runtime_key = request.runtime_key()?;
+        let _startup = self.startup_guard(runtime_key.clone()).await;
         let mut output = BackendOutput::default();
         let connection = self
             .persistent_connection(&request, &mut output, None)
             .await?;
-        let mut connection = connection.lock().await;
-        if let Some(thread) = &connection.thread {
-            return Ok(Some(thread.id().to_owned()));
-        }
-        request.model = self
-            .resolve_model(&request, &mut connection.process, &mut output)
-            .await?;
-        let tools = ControlToolRegistry
-            .definition_list_for_owner(&request.owner()?, true, true)
-            .into_iter()
-            .map(|definition| {
-                json!({
-                    "type":"function", "name":definition.name, "description":definition.description,
-                    "inputSchema":definition.input_schema,
+        let result = async {
+            let mut connection = connection.lock().await;
+            if let Some(thread) = &connection.thread {
+                return Ok(Some(thread.id().to_owned()));
+            }
+            request.model = self
+                .resolve_model(&request, &mut connection.process, &mut output)
+                .await?;
+            let tools = ControlToolRegistry
+                .definition_list_for_owner(&request.owner()?, true, true)
+                .into_iter()
+                .map(|definition| {
+                    json!({
+                        "type":"function", "name":definition.name, "description":definition.description,
+                        "inputSchema":definition.input_schema,
+                    })
                 })
-            })
-            .collect();
-        let thread = self
-            .load_thread(&mut connection.process, &mut output, &request, false, tools)
-            .await?;
-        connection.thread = Some(if request.backend_session_id.is_some() {
-            CodexThread::Submitted(thread.clone())
-        } else {
-            CodexThread::Prepared(thread.clone())
-        });
-        Ok(Some(thread))
+                .collect();
+            let thread = self
+                .load_thread(&mut connection.process, &mut output, &request, false, tools)
+                .await?;
+            connection.thread = Some(if request.backend_session_id.is_some() {
+                CodexThread::Submitted(thread.clone())
+            } else {
+                CodexThread::Prepared(thread.clone())
+            });
+            Ok(Some(thread))
+        }.await;
+        self.background.start(runtime_key, connection).await?;
+        result
     }
 
     fn supports_task_steering(&self, _kind: crate::task::TaskKind) -> bool {
@@ -1337,6 +1356,7 @@ impl Backend for CodexBackend {
             .clone();
         let mut terminal = terminal_slot.lock().await;
         *terminal = None;
+        self.background.stop(&request.runtime_key()?).await?;
         self.connection_by_session
             .lock()
             .await
@@ -1499,17 +1519,38 @@ impl Backend for CodexBackend {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        for (_, resources) in self.resource_by_session.lock().await.drain() {
-            resources.runtime.shutdown().await?;
+        let mut failure = self.background.stop_readers().await.err();
+        let connections: Vec<_> = self
+            .connection_by_session
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        for connection in connections {
+            if let Err(error) = connection.lock().await.process.shutdown_background().await {
+                failure.get_or_insert(error);
+            }
         }
-        self.runtime.shutdown().await?;
+        for (_, resources) in self.resource_by_session.lock().await.drain() {
+            if let Err(error) = resources.runtime.shutdown().await {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.runtime.shutdown().await {
+            failure.get_or_insert(error);
+        }
         self.connection_by_session.lock().await.clear();
         self.startup_by_session.lock().await.clear();
         self.terminal_connection_by_session.lock().await.clear();
         self.steering_by_session.lock().await.clear();
         self.active_turn_by_session.lock().await.clear();
         self.completed_turn_by_session.lock().await.clear();
-        Ok(())
+        self.background.close().await;
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn descriptor(&self) -> BackendDescriptor {
@@ -1518,6 +1559,14 @@ impl Backend for CodexBackend {
             label: "Codex CLI".into(),
             capability: capability(),
         }
+    }
+
+    /// Subscribe to original-owner background updates independently of foreground requests.
+    async fn session_event_stream(
+        &self,
+        owner: super::ExecutionOwner,
+    ) -> Result<Option<super::events::BackendEventStream>> {
+        Ok(Some(self.background.subscribe(owner).await))
     }
 
     async fn prompt_stream(
@@ -1532,6 +1581,7 @@ impl Backend for CodexBackend {
                 message: "Codex invocation scope does not match the requested owner".into(),
             });
         }
+        let runtime_key = request.runtime_key().map_err(super::BackendError::from)?;
         let output: anyhow::Result<crate::backend::BackendOutput> = async {
             let event_sink = Some(event_sink);
             let skills = self.permission_coordinator.skills(
@@ -1863,6 +1913,18 @@ impl Backend for CodexBackend {
             Ok(output)
         }
         .await;
+        let connection = self
+            .connection_by_session
+            .lock()
+            .await
+            .get(&runtime_key)
+            .cloned();
+        if let Some(connection) = connection {
+            self.background
+                .start(runtime_key, connection)
+                .await
+                .map_err(super::BackendError::from)?;
+        }
         output
             .map(BackendOutput::into_completion)
             .map_err(super::BackendError::from)
@@ -1943,6 +2005,7 @@ impl Backend for CodexBackend {
     }
 
     async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
+        self.background.stop(session_id).await?;
         self.steering_lane(session_id)
             .await
             .cleanup_execution()
@@ -1950,6 +2013,7 @@ impl Backend for CodexBackend {
     }
 
     async fn cancel_session(&self, session_id: &str) -> Result<()> {
+        self.background.stop(session_id).await?;
         self.steering_lane(session_id)
             .await
             .cleanup_execution()
@@ -2059,6 +2123,7 @@ impl Backend for CodexBackend {
                 "disabled"
             }
         );
+        self.background.stop(&request.runtime_key()?).await?;
         self.connection_by_session
             .lock()
             .await
@@ -2207,6 +2272,7 @@ impl Backend for CodexBackend {
                 }
             );
         }
+        self.background.stop(&request.runtime_key()?).await?;
         self.connection_by_session
             .lock()
             .await

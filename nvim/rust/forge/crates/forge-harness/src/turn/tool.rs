@@ -65,12 +65,27 @@ pub struct ToolStore {
     execution: HashMap<String, ToolExecution>,
 }
 
+/// Lifetime proven by the provider, independently of foreground turn completion.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolExecutionLifetime {
+    /// Settle an unfinished call when its foreground turn finishes.
+    #[default]
+    Foreground,
+    /// Await a native terminal event even after normal foreground completion.
+    Background,
+}
+
+/// Retain an admitted invocation and its provider-confirmed execution lifetime.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolExecution {
     pub address: ToolAddress,
     pub invocation: ToolInvocation,
     pub input: String,
     pub outcome: Option<ToolOutcome>,
+    /// Provider-confirmed lifetime; old saved calls remain foreground-owned.
+    #[serde(default)]
+    lifetime: ToolExecutionLifetime,
 }
 
 impl ToolStore {
@@ -93,6 +108,13 @@ impl ToolStore {
             super::TurnOutcome::Completed | super::TurnOutcome::Interrupted => "interrupted",
         };
         for tool in self.item.values_mut() {
+            if outcome == super::TurnOutcome::Completed
+                && self.execution.get(&tool.id).is_some_and(|execution| {
+                    execution.lifetime == ToolExecutionLifetime::Background
+                })
+            {
+                continue;
+            }
             if tool.state() == ToolState::Running {
                 tool.completed_at_ms = Some(now_ms.max(tool.started_at_ms.unwrap_or(now_ms)));
                 tool.status = status.into();
@@ -113,6 +135,35 @@ impl ToolStore {
                 }
             }
         }
+    }
+
+    /// Settle only proven background calls after exclusive recovery finds no runtime owner.
+    pub(crate) fn interrupt_detached_background(
+        &mut self,
+        observed_at: i64,
+    ) -> Result<bool, crate::backend::BackendError> {
+        let address: Vec<_> = self
+            .execution
+            .values()
+            .filter(|execution| {
+                execution.lifetime == ToolExecutionLifetime::Background
+                    && self
+                        .item
+                        .get(execution.address.tool_id.as_str())
+                        .is_some_and(|tool| tool.state() == ToolState::Running)
+            })
+            .map(|execution| execution.address.clone())
+            .collect();
+        for address in &address {
+            self.merge(
+                address,
+                &ToolUpdate::Finished {
+                    outcome: ToolOutcome::Interrupted,
+                },
+                observed_at,
+            )?;
+        }
+        Ok(!address.is_empty())
     }
 
     /// Assign a call to its first observed task without changing historical attribution.
@@ -149,6 +200,7 @@ impl ToolStore {
                     invocation: invocation.clone(),
                     input: String::new(),
                     outcome: None,
+                    lifetime: ToolExecutionLifetime::Foreground,
                 },
             );
         }
@@ -185,6 +237,19 @@ impl ToolStore {
             },
             ToolUpdate::Started if tool.state() == ToolState::Running => {
                 tool.started_at_ms.get_or_insert(now_ms);
+            }
+            ToolUpdate::Backgrounded if tool.state() == ToolState::Running => {
+                if execution.invocation.kind != crate::backend::ToolActivityKind::Command {
+                    return Err(protocol(
+                        "only command tools can outlive their foreground turn",
+                    ));
+                }
+                execution.lifetime = ToolExecutionLifetime::Background;
+            }
+            ToolUpdate::Backgrounded => {
+                return Err(protocol(
+                    "settled tool rejects a background lifetime change",
+                ));
             }
             ToolUpdate::Output { update } => match update {
                 TextUpdate::Append(text) => tool.output.push_str(text),
@@ -226,6 +291,20 @@ impl ToolStore {
     pub fn execution(&self, id: &str) -> Option<&ToolExecution> {
         self.execution.get(id)
     }
+
+    /// Admit late completion only for the exact still-running background execution.
+    pub(crate) fn accepts_background_completion(&self, address: &ToolAddress) -> bool {
+        self.execution
+            .get(address.tool_id.as_str())
+            .is_some_and(|execution| {
+                execution.address == *address
+                    && execution.lifetime == ToolExecutionLifetime::Background
+                    && self
+                        .item
+                        .get(address.tool_id.as_str())
+                        .is_some_and(|tool| tool.state() == ToolState::Running)
+            })
+    }
 }
 
 fn tool_kind(kind: crate::backend::ToolActivityKind) -> String {
@@ -244,6 +323,91 @@ fn tool_failed(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Preserve proven background work only across normal foreground completion.
+    #[test]
+    fn background_tools_outlive_completed_turns_but_not_cancellation()
+    -> Result<(), crate::backend::BackendError> {
+        let address = ToolAddress {
+            turn: crate::backend::TurnAddress {
+                scope: crate::backend::InvocationScope::new(
+                    crate::backend::ExecutionOwner::root("session"),
+                    "exchange",
+                ),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+            },
+            tool_id: "command".into(),
+        };
+        for outcome in [
+            super::super::TurnOutcome::Completed,
+            super::super::TurnOutcome::Cancelled,
+            super::super::TurnOutcome::Interrupted,
+            super::super::TurnOutcome::Failed,
+        ] {
+            let mut store = ToolStore::default();
+            store.merge(
+                &address,
+                &ToolUpdate::Requested {
+                    invocation: ToolInvocation {
+                        kind: crate::backend::ToolActivityKind::Command,
+                        name: "exec".into(),
+                        title: "Background command".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+                1,
+            )?;
+            store.merge(&address, &ToolUpdate::Started, 2)?;
+            store.merge(&address, &ToolUpdate::Backgrounded, 3)?;
+            store.finish(outcome, 4);
+            let mut restored: ToolStore =
+                serde_json::from_value(serde_json::to_value(&store).unwrap()).unwrap();
+            if outcome == super::super::TurnOutcome::Completed {
+                assert!(restored.accepts_background_completion(&address));
+                assert_eq!(restored.get("command").unwrap().completed_at_ms, None);
+                let mut stranger = address.clone();
+                stranger.turn.turn_id = "different-turn".into();
+                assert!(!restored.accepts_background_completion(&stranger));
+                restored.merge(
+                    &address,
+                    &ToolUpdate::Output {
+                        update: TextUpdate::Append("END".into()),
+                    },
+                    5,
+                )?;
+                restored.merge(
+                    &address,
+                    &ToolUpdate::Finished {
+                        outcome: ToolOutcome::Succeeded,
+                    },
+                    6,
+                )?;
+                assert_eq!(restored.get("command").unwrap().output, "END");
+                assert_eq!(restored.get("command").unwrap().completed_at_ms, Some(6));
+                assert!(!restored.accepts_background_completion(&address));
+            } else {
+                assert!(!restored.accepts_background_completion(&address));
+                assert!(
+                    restored
+                        .merge(
+                            &address,
+                            &ToolUpdate::Finished {
+                                outcome: ToolOutcome::Succeeded,
+                            },
+                            6
+                        )
+                        .is_err()
+                );
+            }
+            assert!(
+                restored
+                    .merge(&address, &ToolUpdate::Backgrounded, 7)
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
 
     /// Keep invocation identity immutable while display metadata evolves and survives reload.
     #[test]

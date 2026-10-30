@@ -40,7 +40,11 @@ local function request_preview(instance, entry)
   instance.preview_generation = instance.preview_generation + 1
   local generation = instance.preview_generation
   if not entry then return end
-  client.request({ session_id = entry.id, method = "session.preview", params = { session_id = entry.id } }, function(result, request_error)
+  if not instance.owner_session_id then
+    notifications.warn("Wait for the calling session to initialize before previewing saved sessions.", "ForgeSessions")
+    return
+  end
+  client.request({ session_id = instance.owner_session_id, method = "session.preview", params = { session_id = entry.id } }, function(result, request_error)
     if active ~= instance or generation ~= instance.preview_generation then return end
     if request_error then
       notifications.error(request_error, "Session preview")

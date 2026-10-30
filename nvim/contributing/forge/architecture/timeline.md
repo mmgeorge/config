@@ -48,6 +48,8 @@ The outer duration covers tools and delegated waits during active execution, and
 
 The Harness controller binds a native transcript document, a native status document, and a Lua-owned composer buffer, all owned by `OpenPresentation`. The status document has its own revision, so status-only updates leave transcript rows unchanged. `HarnessStatusView` owns the split above the composer and a separate display buffer, so local notices never modify the native replica. Lua fills unused transcript space with virtual rows, so the live tail ends at the bottom without changing native text.
 
+Switching a saved session into the current tab releases both window-bound presentations before transferring the panes. Their buffers, drafts, and queued input remain session-owned. The receiving session then binds fresh presentation, composer-height, and scroll observers to its new windows; closing only the old tab does not release those subscriptions.
+
 Composer height follows wrapped rows within the configured bounds, and `smoothscroll` lets tall drafts scroll within one physical line. If the whole draft fits, the viewport starts at the first line, which stops Insert-mode scrolling from hiding the top of a short draft.
 
 The status split has a fixed viewport at row one. Its owner resets vertical and horizontal scroll offsets after layout and scroll events without moving focus or the transcript. Status sizing remains content-driven, bounded by available window space, and the separate status-details view retains normal scrolling for overflow.

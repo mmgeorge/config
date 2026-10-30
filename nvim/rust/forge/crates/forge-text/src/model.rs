@@ -149,6 +149,19 @@ impl Model {
         let (words, position) =
             token::target(&request.context, &request.target, &request.protected)?;
         let original = words[position].text;
+        let identity = CorrectionIdentity {
+            profile: request.profile,
+            profile_revision: request.profile_revision,
+            occurrence: request.occurrence,
+            model_revision: MODEL_REVISION.into(),
+            dictionary_revision: self.revision.clone(),
+        };
+        if closed.load(Ordering::Acquire) {
+            return Err(TextError::Closed);
+        }
+        if !token::supports_english_correction(original) {
+            return Ok(CorrectionDecision::Unchanged { identity });
+        }
         let normalized = original.to_lowercase();
         let canonical = normalized.replace('\u{2019}', "'");
         let protected_contraction =
@@ -291,13 +304,6 @@ impl Model {
                 replacement = capitalized;
             }
         }
-        let identity = CorrectionIdentity {
-            profile: request.profile,
-            profile_revision: request.profile_revision,
-            occurrence: request.occurrence,
-            model_revision: MODEL_REVISION.into(),
-            dictionary_revision: self.revision.clone(),
-        };
         if replacement == original {
             return Ok(CorrectionDecision::Unchanged { identity });
         }
@@ -503,7 +509,63 @@ mod tests {
             ),
             "I"
         );
-        assert_eq!(decide("ß", "ß"), "SS");
+        assert_eq!(decide("ß", "ß"), "ß");
+    }
+
+    /// Preserve unsupported tokens even when English neighbors make a replacement more probable.
+    #[test]
+    fn unsupported_alphabets_preserve_original_text() {
+        for (context, target) in [
+            ("東京 café Ω", "Ω"),
+            ("東京 café Ω", "東"),
+            ("東京 café Ω", "京"),
+            ("Please café here.", "café"),
+            ("Please cafe\u{301} here.", "cafe\u{301}"),
+            ("Please cаfe here.", "cаfe"),
+            ("Please naïve here.", "naïve"),
+            ("Please don’t here.", "don’t"),
+            ("Ω", "Ω"),
+        ] {
+            assert_eq!(decide(context, target), target, "{context}");
+        }
+        assert_eq!(
+            decide("東京 café Ω Please recieve the package.", "recieve"),
+            "receive"
+        );
+        assert_eq!(
+            decide("Please RECIEVE the package near Ω.", "RECIEVE"),
+            "RECEIVE"
+        );
+    }
+
+    /// Alphabet eligibility cannot bypass malformed, partial, or protected target validation.
+    #[test]
+    fn unsupported_alphabets_still_validate_target_ranges() {
+        use crate::contract::{ByteRange, OccurrenceId, ProfileId};
+        for (context, target, protected) in [
+            ("Ω", ByteRange { start: 1, end: 2 }, Vec::new()),
+            (
+                "Ω",
+                ByteRange { start: 0, end: 2 },
+                vec![ByteRange { start: 0, end: 2 }],
+            ),
+            ("Ωmega", ByteRange { start: 0, end: 3 }, Vec::new()),
+            ("Ω café", ByteRange { start: 0, end: 8 }, Vec::new()),
+            ("東京", ByteRange { start: 0, end: 6 }, Vec::new()),
+        ] {
+            let request = CorrectRequest {
+                profile: ProfileId::new("test".into()).unwrap(),
+                profile_revision: "test".into(),
+                occurrence: OccurrenceId::try_from("unicode-range".to_owned()).unwrap(),
+                context: context.into(),
+                target,
+                protected,
+            };
+            assert!(matches!(
+                model().correct(request, &HashSet::new(), None, &AtomicBool::new(false)),
+                Err(TextError::InvalidInput(_))
+            ));
+        }
     }
 
     /// Keep recognized contractions intact independently of misleading corpus frequencies.

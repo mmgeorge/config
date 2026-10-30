@@ -64,6 +64,13 @@ pub struct SubmissionRecord {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum PreparationIdentity {
+    Unidentified,
+    Task,
+    EditableInput,
+}
+
 /// SQLite delivery journal. Commits complete before any corresponding provider write.
 pub(crate) struct SubmissionStore {
     connection: Mutex<Connection>,
@@ -187,7 +194,12 @@ impl SubmissionStore {
         provider: super::BackendKind,
         input_message_id: Option<String>,
     ) -> Result<Arc<Submission>> {
-        self.prepare_record(request, provider, input_message_id, false)
+        self.prepare_record(
+            request,
+            provider,
+            input_message_id,
+            PreparationIdentity::Unidentified,
+        )
     }
 
     fn prepare_record(
@@ -195,7 +207,7 @@ impl SubmissionStore {
         request: &BackendRequest,
         provider: super::BackendKind,
         input_message_id: Option<String>,
-        deduplicate: bool,
+        identity: PreparationIdentity,
     ) -> Result<Arc<Submission>> {
         let provider = serde_json::to_string(&provider)?;
         let record = SubmissionRecord {
@@ -212,7 +224,10 @@ impl SubmissionStore {
             .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if deduplicate && let Some(input_id) = &record.input_message_id {
+        let mut superseded = None;
+        if !matches!(identity, PreparationIdentity::Unidentified)
+            && let Some(input_id) = &record.input_message_id
+        {
             let existing: Option<(String, String, String)> = transaction.query_row(
                 "SELECT id,provider,payload FROM submission WHERE runtime=?1 AND json_extract(payload,'$.input_message_id')=?2 ORDER BY rowid DESC LIMIT 1",
                 params![request.runtime_key()?, input_id],
@@ -221,25 +236,42 @@ impl SubmissionStore {
             if let Some((id, existing_provider, payload)) = existing {
                 let mut existing: SubmissionRecord = serde_json::from_str(&payload)?;
                 ensure!(
-                    existing_provider == provider
-                        && serde_json::to_value(&existing.request.input)?
-                            == serde_json::to_value(&request.input)?,
-                    "input identity was reused for different provider content"
+                    existing_provider == provider,
+                    "input identity changed provider"
                 );
-                if existing.delivery == SubmissionState::Cancelled {
-                    existing.delivery = SubmissionState::Prepared;
-                    existing.error = None;
+                let same_input = serde_json::to_value(&existing.request.input)?
+                    == serde_json::to_value(&request.input)?;
+                if !same_input {
+                    ensure!(
+                        matches!(identity, PreparationIdentity::EditableInput)
+                            && matches!(
+                                existing.delivery,
+                                SubmissionState::Prepared | SubmissionState::Cancelled
+                            ),
+                        "input identity was reused for different provider content"
+                    );
+                    existing.delivery = SubmissionState::Cancelled;
                     transaction.execute(
                         "UPDATE submission SET payload=?2 WHERE id=?1",
                         params![id, serde_json::to_string(&existing)?],
                     )?;
-                    transaction.commit()?;
-                    self.publish(&existing)?;
+                    superseded = Some(existing);
                 } else {
-                    drop(transaction);
+                    if existing.delivery == SubmissionState::Cancelled {
+                        existing.delivery = SubmissionState::Prepared;
+                        existing.error = None;
+                        transaction.execute(
+                            "UPDATE submission SET payload=?2 WHERE id=?1",
+                            params![id, serde_json::to_string(&existing)?],
+                        )?;
+                        transaction.commit()?;
+                        self.publish(&existing)?;
+                    } else {
+                        drop(transaction);
+                    }
+                    drop(connection);
+                    return self.submission(&id);
                 }
-                drop(connection);
-                return self.submission(&id);
             }
         }
         transaction.execute(
@@ -252,6 +284,9 @@ impl SubmissionStore {
             ],
         )?;
         transaction.commit()?;
+        if let Some(superseded) = superseded {
+            self.publish(&superseded)?;
+        }
         self.log(&record);
         let submission = Arc::new(Submission {
             store: self.clone(),
@@ -314,10 +349,11 @@ impl SubmissionStore {
         provider: super::BackendKind,
         input_message_id: Option<String>,
     ) -> Result<Arc<Submission>> {
-        self.prepare_identified(
+        self.prepare_record(
             &Self::input_request(catalog, input),
             provider,
             input_message_id,
+            PreparationIdentity::EditableInput,
         )
     }
 
@@ -332,7 +368,7 @@ impl SubmissionStore {
             &Self::input_request(catalog, input),
             provider,
             Some(id.as_str().into()),
-            true,
+            PreparationIdentity::Task,
         )
     }
 
@@ -1003,7 +1039,7 @@ mod tests {
             &request("entry"),
             super::super::BackendKind::Codex,
             Some("entry-id".into()),
-            true,
+            PreparationIdentity::Task,
         )?;
         let id = first.id().to_owned();
         let accepted = first.acceptance();
@@ -1022,7 +1058,7 @@ mod tests {
             &request("entry"),
             super::super::BackendKind::Codex,
             Some("entry-id".into()),
-            true,
+            PreparationIdentity::Task,
         )?;
         assert_eq!(duplicate.id(), id);
         assert!(
@@ -1031,7 +1067,7 @@ mod tests {
                     &request("changed"),
                     super::super::BackendKind::Codex,
                     Some("entry-id".into()),
-                    true,
+                    PreparationIdentity::Task,
                 )
                 .is_err()
         );
@@ -1044,7 +1080,7 @@ mod tests {
             &request("entry"),
             super::super::BackendKind::Codex,
             Some("entry-id".into()),
-            true,
+            PreparationIdentity::Task,
         )?;
         assert_eq!(recovered.id(), id);
         assert!(matches!(

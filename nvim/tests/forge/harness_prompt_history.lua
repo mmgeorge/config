@@ -1,5 +1,6 @@
 vim.loader.enable(false)
 local state = require("forge.session").harness
+state.session = { id = "history-session", backend = "mock" }
 local history = require("forge.views.harness.prompt_history")
 local attachment = require("forge.views.harness.attachment")
 local snapshot = require("forge.views.harness.snapshot")
@@ -83,7 +84,7 @@ expect("first line\nsecond line")
 write("draft across refresh")
 vim.api.nvim_win_set_cursor(state.composer_win, { 1, 0 })
 press("<Up>")
-snapshot.apply(state, { prompt_history = { draft("newest"), draft("older\nsecond line") } })
+snapshot.apply(state, { session = state.session, prompt_history = { draft("newest"), draft("older\nsecond line") } })
 press("<Up>")
 expect("older\nsecond line")
 history.replace({ draft("added elsewhere"), draft("newest"), draft("older\nsecond line") })
@@ -102,6 +103,7 @@ client.request = function(request_specification, callback)
   local method = request_specification.method
 
   assert(method == "session.prompt.history.record")
+  assert(request_specification.session_id == "history-session", "history lost its owning session")
   response = callback
 end
 history.record("submitted")

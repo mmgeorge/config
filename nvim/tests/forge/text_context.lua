@@ -32,12 +32,34 @@ capture.capture(index,{row=0,column=#"Say 'don't'",after={row=0,column=#"Say 'do
   {kind='markdown'},function()return true end,function(value)result=value;done=true end)
 assert(vim.wait(1000,function()return done end,5))
 assert(result and result.original=="don't",vim.inspect(result))
+vim.api.nvim_buf_set_lines(buffer,0,-1,false,{"Say 'recieve' "})
+result,done=nil,false
+capture.capture(index,{row=0,column=#"Say 'recieve'",after={row=0,column=#"Say 'recieve' "}},
+  {kind='markdown'},function()return true end,function(value)result=value;done=true end)
+assert(vim.wait(1000,function()return done end,5))
+assert(result and result.original=='recieve' and result.before_boundary=="'",vim.inspect(result))
+assert(result.text:sub(result.target.start+1,result.target['end'])=='recieve','closing quote entered spelling target')
 for _,text in ipairs({'Use `code with recieve ', 'Use ``code with ` and recieve`` '}) do
   local protected=require('forge.text.prose').protected(text)
   local target=assert(text:find('recieve',1,true))-1
   local covered=false
   for _,range in ipairs(protected) do covered=covered or range.start<=target and range['end']>=target+7 end
   assert(covered,'inline code was not protected: '..text)
+end
+local prose=require('forge.text.prose')
+for _,text in ipairs({'"D:/my files/資料 Ω.txt"', '"../my files/資料 Ω.txt"', 'Ω.txt', '資料.文書'}) do
+  local covered=false
+  for _,range in ipairs(prose.protected(text)) do covered=covered or range.start==0 and range['end']==#text end
+  assert(covered,'technical path was not fully protected: '..text)
+end
+local quoted_prose='Say "recieve, please."'
+local target=assert(quoted_prose:find('recieve',1,true))-1
+for _,range in ipairs(prose.protected(quoted_prose)) do
+  assert(not (range.start<=target and range['end']>=target+7),'ordinary quoted prose was protected')
+end
+for _,word in ipairs({"recieve", "don't", "UPPER"}) do assert(prose.supports_english_correction(word),word) end
+for _,word in ipairs({'Ω','日本語','café','café','don’t','recіeve',"''"}) do
+  assert(not prose.supports_english_correction(word),'unsupported English candidate: '..word)
 end
 local lines={}
 for row=1,4096 do lines[row]='Continuous prose continues here.' end

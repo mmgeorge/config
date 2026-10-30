@@ -45,6 +45,8 @@ pub enum ToolUpdate {
         update: TextUpdate,
     },
     Started,
+    /// Retain a proven running command after its foreground turn completes.
+    Backgrounded,
     Output {
         update: TextUpdate,
     },
@@ -67,9 +69,11 @@ impl ToolUpdate {
             | Self::Output { .. }
             | Self::Changes { .. }
             | Self::SkillRead { .. } => true,
-            Self::Requested { .. } | Self::Input { .. } | Self::Started | Self::Finished { .. } => {
-                false
-            }
+            Self::Requested { .. }
+            | Self::Input { .. }
+            | Self::Started
+            | Self::Backgrounded
+            | Self::Finished { .. } => false,
         }
     }
 }

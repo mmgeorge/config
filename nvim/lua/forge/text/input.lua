@@ -79,7 +79,7 @@ local function changed(state)
     transaction.anchor(state,occurrence)
     transaction.replace_question_slash(state,occurrence)
     transaction.remove_punctuation_space(state,occurrence)
-    if already_evaluated then return end
+    if already_evaluated or not require("forge.text.prose").supports_english_correction(captured.original) then return end
     service.correct(state.owner,occurrence,function() return transaction.current(state,occurrence) end,function(result,failure)
       if failure then
         require("forge.infra.notifications").error(failure,"Text correction")

@@ -64,6 +64,7 @@ pub(crate) fn replay_safe(output: &super::BackendCompletion) -> bool {
 }
 
 /// Runs one request with bounded retries only after an adapter proves safe terminal failure.
+/// Preserve broker cancellation identity when a provider terminates the request intentionally.
 /// Dropping this future cancels its delay. Native execution cleanup remains with the caller.
 pub(crate) async fn prompt(
     backend: &dyn Backend,
@@ -109,6 +110,9 @@ pub(crate) async fn prompt(
                 publish(&event_sink, address.clone(), None).await?;
             }
             progress.pending = false;
+            if matches!(error, super::BackendError::Cancelled) {
+                return Err(crate::broker::TurnCancelled.into());
+            }
             return Err(error.into());
         };
         progress.record(
@@ -266,7 +270,7 @@ mod tests {
 
     struct FailureBackend {
         failure_count: usize,
-        permanent: bool,
+        terminal_error: Option<fn() -> BackendError>,
         request: Mutex<Vec<(BackendRequest, tokio::time::Instant)>>,
     }
 
@@ -299,9 +303,6 @@ mod tests {
             let output: anyhow::Result<BackendCompletion> = async {
                 let mut requests = self.request.lock().unwrap();
                 requests.push((request, tokio::time::Instant::now()));
-                if self.permanent {
-                    anyhow::bail!("unauthorized");
-                }
                 if requests.len() <= self.failure_count {
                     return Err(RetryableFailure {
                         address: TurnAddress {
@@ -314,6 +315,9 @@ mod tests {
                         message: format!("capacity failure {}", requests.len()),
                     }
                     .into());
+                }
+                if let Some(error) = self.terminal_error {
+                    return Err(error().into());
                 }
                 Ok(BackendCompletion::default())
             }
@@ -353,7 +357,7 @@ mod tests {
     fn backend(failure_count: usize) -> FailureBackend {
         FailureBackend {
             failure_count,
-            permanent: false,
+            terminal_error: None,
             request: Mutex::new(Vec::new()),
         }
     }
@@ -455,7 +459,10 @@ mod tests {
             BackendEvent::Retry { update: None, .. }
         ));
         let backend = FailureBackend {
-            permanent: true,
+            terminal_error: Some(|| BackendError::Provider {
+                code: None,
+                message: "unauthorized".into(),
+            }),
             ..backend(0)
         };
         assert_eq!(
@@ -465,6 +472,67 @@ mod tests {
                 .to_string(),
             "unauthorized"
         );
+        assert_eq!(backend.request.lock().unwrap().len(), 1);
+        Ok(())
+    }
+
+    /// Preserve cancellation identity on the first attempt and after transient recovery.
+    #[tokio::test(start_paused = true)]
+    async fn provider_cancellation_reaches_broker_without_another_retry() -> Result<()> {
+        for failure_count in [0, 1] {
+            let directory = tempfile::tempdir()?;
+            let trace = std::sync::Arc::new(TraceStore::open(directory.path())?);
+            let submission_store =
+                super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
+            let backend = FailureBackend {
+                terminal_error: Some(|| BackendError::Cancelled),
+                ..backend(failure_count)
+            };
+            let (sink, mut stream) = crate::backend::events::channel(scope());
+            let error = prompt(&backend, request(), Some(sink), &trace, &submission_store)
+                .await
+                .unwrap_err();
+            assert!(error.is::<crate::broker::TurnCancelled>(), "{error:#}");
+            assert_eq!(backend.request.lock().unwrap().len(), failure_count + 1);
+            let mut retry_updates = Vec::new();
+            while let Some(event) = stream.try_next()? {
+                if let BackendEvent::Retry { update, .. } = event {
+                    retry_updates.push(update);
+                }
+            }
+            if failure_count == 0 {
+                assert!(retry_updates.is_empty());
+            } else {
+                assert_eq!(retry_updates.len(), 3);
+                assert!(retry_updates[0].as_ref().unwrap().retry_at_ms.is_some());
+                assert!(retry_updates[1].as_ref().unwrap().retry_at_ms.is_none());
+                assert!(retry_updates[2].is_none());
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep provider failures distinct even when their rendered message describes cancellation.
+    #[tokio::test]
+    async fn provider_failure_text_does_not_become_broker_cancellation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = std::sync::Arc::new(TraceStore::open(directory.path())?);
+        let submission_store =
+            super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
+        let backend = FailureBackend {
+            terminal_error: Some(|| BackendError::Provider {
+                code: Some("provider_failure".into()),
+                message: "provider execution cancelled".into(),
+            }),
+            ..backend(0)
+        };
+        let error = prompt(&backend, request(), None, &trace, &submission_store)
+            .await
+            .unwrap_err();
+        assert!(!error.is::<crate::broker::TurnCancelled>());
+        assert!(matches!(error.downcast_ref::<BackendError>(),
+            Some(BackendError::Provider { code: Some(code), message })
+                if code == "provider_failure" && message == "provider execution cancelled"));
         assert_eq!(backend.request.lock().unwrap().len(), 1);
         Ok(())
     }

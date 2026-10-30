@@ -22,9 +22,16 @@ struct NativeMessage {
     completed: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NativeToolLifetime {
+    Foreground,
+    Background,
+}
+
 struct NativeTool {
     title: String,
     terminal: bool,
+    lifetime: NativeToolLifetime,
     kind: ToolActivityKind,
     has_changes: bool,
     request: NativeToolRequest,
@@ -100,10 +107,89 @@ impl NativeToolRequest {
 
 impl CodexNormalization {
     pub(super) fn bind(&mut self, scope: Option<impl Into<EventScope>>) {
-        *self = Self {
-            scope: scope.map(Into::into),
-            ..Default::default()
+        self.scope = scope.map(Into::into);
+        self.message.clear();
+        self.checklist.clear();
+        self.tool.retain(|address, tool| {
+            tool.lifetime == NativeToolLifetime::Background
+                && !tool.terminal
+                && self
+                    .scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.owner() == &address.turn.scope.owner)
+        });
+        self.replay_sensitive = false;
+    }
+
+    /// Identify retained commands whose native updates can outlive foreground completion.
+    pub(super) fn has_pending_background_tools(&self) -> bool {
+        self.tool
+            .values()
+            .any(|tool| tool.lifetime == NativeToolLifetime::Background && !tool.terminal)
+    }
+
+    /// Get exact admitted command owners that still require native shutdown evidence.
+    pub(super) fn pending_background_addresses(&self) -> Vec<ToolAddress> {
+        self.tool
+            .iter()
+            .filter(|(_, tool)| tool.lifetime == NativeToolLifetime::Background && !tool.terminal)
+            .map(|(address, _)| address.clone())
+            .collect()
+    }
+
+    /// Settle only a still-pending command after native inventory proves its absence.
+    pub(super) fn interrupt_background(&mut self, address: &ToolAddress) -> Option<BackendEvent> {
+        let tool = self.tool.get_mut(address)?;
+        if tool.lifetime != NativeToolLifetime::Background || tool.terminal {
+            return None;
+        }
+        tool.terminal = true;
+        Some(BackendEvent::Tool {
+            address: address.clone(),
+            update: ToolUpdate::Finished {
+                outcome: ToolOutcome::Interrupted,
+            },
+        })
+    }
+
+    /// Normalize only a previously admitted background tool under its original invocation.
+    pub(super) async fn normalize_background(
+        &mut self,
+        message: &Value,
+        workspace: &str,
+    ) -> Result<Option<Vec<BackendEvent>>> {
+        let method = message["method"].as_str().unwrap_or_default();
+        let params = message.get("params").unwrap_or(&Value::Null);
+        if !is_tool_lifecycle_event(&method.to_ascii_lowercase(), params) {
+            return Ok(None);
+        }
+        let Some(thread_id) = pointer_string(params, &["/threadId", "/thread_id"]) else {
+            return Ok(None);
         };
+        let Some(turn_id) = pointer_string(params, &["/turnId", "/turn_id", "/turn/id"]) else {
+            return Ok(None);
+        };
+        let Some(item_id) = pointer_string(params, &["/itemId", "/item_id", "/item/id"]) else {
+            return Ok(None);
+        };
+        let owner = self.tool.iter().find_map(|(address, tool)| {
+            (tool.lifetime == NativeToolLifetime::Background
+                && address.turn.thread_id == thread_id
+                && address.turn.turn_id.as_str() == turn_id
+                && address.tool_id.as_str() == item_id)
+                .then(|| address.turn.scope.clone())
+        });
+        let Some(owner) = owner else { return Ok(None) };
+        let previous = self.scope.replace(owner.into());
+        let replay_sensitive = self.replay_sensitive;
+        let mut output = BackendOutput::default();
+        let result = self
+            .normalize(message, &mut output, None, workspace, false)
+            .await;
+        self.scope = previous;
+        self.replay_sensitive = replay_sensitive;
+        result?;
+        Ok(Some(output.event))
     }
 
     fn address(&self, params: &Value) -> Option<TurnAddress> {
@@ -435,6 +521,21 @@ impl CodexNormalization {
                         Some("interrupted") => crate::turn::TurnOutcome::Interrupted,
                         _ => crate::turn::TurnOutcome::Completed,
                     };
+                    if outcome == crate::turn::TurnOutcome::Completed {
+                        for (tool_address, tool) in &mut self.tool {
+                            if tool_address.turn == address
+                                && tool.kind == ToolActivityKind::Command
+                                && !tool.terminal
+                                && tool.lifetime == NativeToolLifetime::Foreground
+                            {
+                                tool.lifetime = NativeToolLifetime::Background;
+                                events.push(BackendEvent::Tool {
+                                    address: tool_address.clone(),
+                                    update: ToolUpdate::Backgrounded,
+                                });
+                            }
+                        }
+                    }
                     let pending = self
                         .message
                         .iter()
@@ -503,6 +604,7 @@ impl CodexNormalization {
                         .or_insert_with(|| NativeTool {
                             title: String::new(),
                             terminal: false,
+                            lifetime: NativeToolLifetime::Foreground,
                             kind: snapshot.kind,
                             has_changes: false,
                             request: NativeToolRequest::default(),
@@ -679,6 +781,145 @@ mod test {
             },
             message_id: MessageId::Native("message".into()),
         }
+    }
+
+    /// Keep native background evidence on its original invocation across subsequent bindings.
+    #[tokio::test]
+    async fn background_tool_updates_preserve_original_owner_across_bind() -> Result<()> {
+        let owner = scope();
+        let mut normalization = CodexNormalization::default();
+        normalization.bind(Some(owner.clone()));
+        let mut output = BackendOutput::default();
+        normalization
+            .normalize(
+                &json!({"method":"item/started","params":{
+            "threadId":"thread","turnId":"old","item":{"type":"commandExecution","id":"command",
+            "command":"slow command","status":"inProgress"}}}),
+                &mut output,
+                None,
+                "",
+                false,
+            )
+            .await?;
+        normalization
+            .normalize(
+                &json!({"method":"turn/completed","params":{
+            "threadId":"thread","turn":{"id":"old","status":"completed"}}}),
+                &mut output,
+                None,
+                "",
+                false,
+            )
+            .await?;
+        assert!(output.event.iter().any(|event| matches!(
+            event,
+            BackendEvent::Tool {
+                update: ToolUpdate::Backgrounded,
+                ..
+            }
+        )));
+        let before = normalization
+            .normalize_background(
+                &json!({"method":"item/commandExecution/outputDelta",
+            "params":{"threadId":"thread","turnId":"old","itemId":"command","delta":"first"}}),
+                "",
+            )
+            .await?
+            .unwrap();
+        assert!(
+            before
+                .iter()
+                .all(|event| event.scope().invocation() == Some(&owner))
+        );
+        normalization.bind(Some(InvocationScope::new(owner.owner.clone(), "next")));
+        for (thread, turn, item) in [
+            ("foreign", "old", "command"),
+            ("thread", "foreign", "command"),
+            ("thread", "old", "foreign"),
+        ] {
+            assert!(
+                normalization
+                    .normalize_background(
+                        &json!({"method":"item/commandExecution/outputDelta",
+                "params":{"threadId":thread,"turnId":turn,"itemId":item,"delta":"foreign"}}),
+                        ""
+                    )
+                    .await?
+                    .is_none()
+            );
+        }
+        let completed = normalization.normalize_background(&json!({"method":"item/completed","params":{
+            "threadId":"thread","turnId":"old","item":{"type":"commandExecution","id":"command",
+            "command":"slow command","status":"completed","aggregatedOutput":"first end","exitCode":0}}}), "").await?.unwrap();
+        assert!(
+            completed
+                .iter()
+                .all(|event| event.scope().invocation() == Some(&owner))
+        );
+        assert!(completed.iter().any(|event| matches!(
+            event,
+            BackendEvent::Tool {
+                update: ToolUpdate::Finished {
+                    outcome: ToolOutcome::Succeeded
+                },
+                ..
+            }
+        )));
+        assert!(!completed.iter().any(|event| matches!(
+            event,
+            BackendEvent::Tool {
+                update: ToolUpdate::Requested { .. } | ToolUpdate::Started,
+                ..
+            }
+        )));
+        let repeated = normalization.normalize_background(&json!({"method":"item/completed","params":{
+            "threadId":"thread","turnId":"old","item":{"type":"commandExecution","id":"command",
+            "command":"slow command","status":"completed","aggregatedOutput":"first end","exitCode":0}}}), "").await?.unwrap();
+        assert!(!repeated.iter().any(|event| matches!(
+            event,
+            BackendEvent::Tool {
+                update: ToolUpdate::Finished { .. },
+                ..
+            }
+        )));
+        normalization.bind(Some(InvocationScope::new(
+            ExecutionOwner::root("foreign"),
+            "next",
+        )));
+        assert!(!normalization.has_pending_background_tools());
+        Ok(())
+    }
+
+    /// Explicit failed or interrupted turns never grant background lifetime.
+    #[tokio::test]
+    async fn interrupted_native_turn_does_not_retain_command_lifetime() -> Result<()> {
+        for status in ["failed", "interrupted"] {
+            let mut normalization = CodexNormalization::default();
+            normalization.bind(Some(scope()));
+            let mut output = BackendOutput::default();
+            normalization.normalize(&json!({"method":"item/started","params":{
+                "threadId":"thread","turnId":"turn","item":{"type":"commandExecution","id":"command",
+                "command":"slow command","status":"inProgress"}}}), &mut output, None, "", false).await?;
+            normalization
+                .normalize(
+                    &json!({"method":"turn/completed","params":{
+                "threadId":"thread","turn":{"id":"turn","status":status}}}),
+                    &mut output,
+                    None,
+                    "",
+                    false,
+                )
+                .await?;
+            assert!(!normalization.has_pending_background_tools());
+            assert!(!output.event.iter().any(|event| matches!(
+                event,
+                BackendEvent::Tool {
+                    update: ToolUpdate::Backgrounded,
+                    ..
+                }
+            )));
+        }
+        Ok(())
     }
 
     #[test]
