@@ -10,13 +10,6 @@
       "command": "docs-mcp",
       "default_tools_approval_mode": "approve"
     },
-    "sem": {
-      "command": "sem",
-      "args": [
-        "mcp"
-      ],
-      "default_tools_approval_mode": "approve"
-    },
     "google-dev-knowledge": {
       "targets": ["claudecode", "codexcli", "antigravity-cli", "copilotcli"],
       "type": "http",
