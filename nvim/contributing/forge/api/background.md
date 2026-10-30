@@ -1,6 +1,6 @@
 # Background methods
 
-The background service owns persisted generation conversations independently of the selected interactive session. These calls never accept an envelope `session_id` or start a provider. Their callers appear in the [usage ledger](../../../../md/rename-usage-ledger.json).
+The background service owns persisted generation conversations independently of the selected interactive session. These calls never accept an envelope `session_id` or start a provider.
 
 All calls inherit the [request lifecycle and failure contract](lua-client.md#requestspec-callback-progress). Method failures do not select another session or close an otherwise valid connection.
 
@@ -15,8 +15,6 @@ Read or operate on a persisted background conversation.
 - **Inspected source:** [`BackgroundManager::timeline`](../../../rust/forge/crates/forge-harness/src/background/manager.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `none`.
-
-**Current caller:** [nvim/lua/forge/views/background.lua:12](../../../../nvim/lua/forge/views/background.lua).
 
 | Parameter | Type and default | Contract |
 | --- | --- | --- |
@@ -54,8 +52,6 @@ Read or update persisted background-generation preferences.
 - **Inspected source:** [`commit_message/settings.rs`](../../../rust/forge/src/commit_message/settings.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `none`.
-
-**Current caller:** [nvim/lua/forge/integrations/background_settings.lua:37](../../../../nvim/lua/forge/integrations/background_settings.lua).
 
 | Parameter | Type and default | Contract |
 | --- | --- | --- |

@@ -10,9 +10,7 @@ The [repository result schemas](repository-schemas.md) define status inventory, 
 
 The [GitHub request and result schemas](github-schemas.md) define remote reads, captured writes, durable outcomes, and explicit recovery resolutions. The [native review schemas](review-schemas.md) define review, issue, and notification document results, including custom serialization rules.
 
-## Reference coverage
-
-The index covers every retained method, including explicitly identified live integration-control APIs. The [usage ledger](../../../../md/rename-usage-ledger.json) records its production or test-control caller. The [completed implementation plan](../../../../rename.md), [API audit](../../../../md/rename-api-audit.json), and [verification record](../../../../md/rename-verification.md) record reviewed contracts and verified examples for all 147 methods.
+## Method index
 
 | Method | Reference | Session context |
 | --- | --- | --- |

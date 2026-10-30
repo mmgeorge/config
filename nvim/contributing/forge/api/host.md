@@ -1,6 +1,6 @@
 # Host methods
 
-The native connection owns these methods. None invokes a model, performs a remote mutation, or selects an active session. The [usage ledger](../../../../md/rename-usage-ledger.json) records their callers, and the shared contract supplies their transport policy.
+The native connection owns these methods. None invokes a model, performs a remote mutation, or selects an active session. The shared contract supplies their transport policy.
 
 All calls inherit the [request lifecycle and failure contract](lua-client.md#requestspec-callback-progress). Method failures do not select another session or close an otherwise valid connection.
 
@@ -17,8 +17,6 @@ Negotiate the client/host protocol and initialize host-owned storage paths.
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `control`. Recovery: `none`.
 
 **Parameter schema:** [HostInitialize](native-schemas.md#hostinitialize).
-
-**Current caller:** [nvim/lua/forge/client.lua:570](../../../../nvim/lua/forge/client.lua).
 
 The first frame on a new connection must be this request. The decoder rejects unknown parameter fields.
 
@@ -53,8 +51,6 @@ Stop accepting work and drain the shared host.
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `control`. Recovery: `none`.
 
-**Current caller:** [nvim/lua/forge/client.lua:1060](../../../../nvim/lua/forge/client.lua).
-
 There are no parameter fields or nested operations. The host stops admission, collects outstanding work and producers, and sends the terminal `shutdown: true` response before the connection exits. It may still require receive-credit frames while draining buffered output. Sending ordinary work after shutdown starts is invalid. A broken pipe or collection failure can prevent the acknowledgement, so the caller must also observe process exit and retain unresolved mutation receipts. The request emits no progress and does not delete session storage. It is a connection lifecycle operation, not a replayable service mutation.
 
 [The same handshake fixture](../../../../nvim/tests/forge/host_initialize.lua) sends shutdown and verifies process collection:
@@ -78,8 +74,6 @@ Set whether tracing is enabled.
 - **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service.rs`](../../../rust/forge/crates/forge-harness/src/service.rs).
 
 **Transport:** Optional explicit session ID. Readiness: `runtime`. Admission: `control`. Recovery: `none`.
-
-**Current caller:** [nvim/lua/forge/client.lua:527](../../../../nvim/lua/forge/client.lua).
 
 Without session context, `path` identifies `harness-trace.jsonl`. With explicit context, it identifies that session's log. Configuration still changes the shared tracing setting. An explicit unknown session fails validation rather than selecting another log.
 
@@ -114,8 +108,6 @@ Read tracing status and the selected log information.
 
 **Transport:** Optional explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `none`.
 
-**Current caller:** [nvim/lua/forge/views/harness/settings.lua:163](../../../../nvim/lua/forge/views/harness/settings.lua).
-
 Without session context, `path` identifies `harness-trace.jsonl`. With explicit context, it identifies that session's log. An explicit unknown session fails validation rather than selecting another log.
 
 There are no parameter fields or nested operations. The result has the same three fields as `host.trace.configure`. This read does not write preferences, invoke a provider, or emit progress. The local preference can change immediately after the response, so it is an observation rather than a lock. Retrying a failed read is safe. Keep the captured UI owner when displaying the path.
@@ -143,8 +135,6 @@ Return receive credit for data already processed by Lua.
 - **Inspected source:** [`nvim/rust/forge/src/host.rs`](../../../rust/forge/src/host.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `none`.
-
-**Current caller:** [nvim/lua/forge/client.lua:685](../../../../nvim/lua/forge/client.lua).
 
 | Field | Type | Meaning |
 | --- | --- | --- |
