@@ -141,6 +141,41 @@ local function run()
   assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "explicit wins")
   vim.api.nvim_buf_delete(buffer, { force = true })
 
+  for _, comparison in ipairs({ "status", "staged", "latest_commit" }) do
+    local workspace = "D:/manual-" .. comparison
+    buffer = vim.api.nvim_create_buf(false, true)
+    local subject = comparison == "status" and "" or "existing subject"
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { subject, "", "existing body", "# Git comment" })
+    local finish, request
+    if comparison == "status" then
+      ai_commit.ensure(workspace, { ref = "HEAD" })
+      finish, request = take("generate", comparison)
+      ai_commit.populate_commit_buffer_when_ready(buffer, workspace)
+    else
+      ai_commit.populate_commit_buffer_when_ready(buffer, workspace, true,
+        comparison == "latest_commit" and "latest_commit" or nil)
+      finish, request = take("generate", comparison)
+    end
+    assert_progress(buffer)
+    local unrelated = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_exec_autocmds("InsertEnter", { buffer = unrelated })
+    assert(not request.cancelled, "editing another buffer cancelled commit generation")
+    vim.api.nvim_buf_delete(unrelated, { force = true })
+    vim.api.nvim_set_current_buf(buffer)
+    assert_equal(vim.fn.maparg("i", "n"), "", "fixture requires the native Insert-mode command")
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("i<Esc>", true, false, true), "xt", false)
+    assert(request.cancelled, "InsertEnter did not cancel " .. comparison .. " generation")
+    assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], subject, "InsertEnter retained the spinner")
+    assert_equal(vim.api.nvim_buf_get_lines(buffer, 2, 3, false)[1], "existing body")
+    local manual = { "manual subject", "", "manual body", "# Git comment" }
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, manual)
+    local notice_count = #notices
+    finish({ state = "ready", message = "obsolete generated text" })
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), manual), "late result replaced manual input")
+    assert_equal(#notices, notice_count, "manual cancellation reported a generation failure")
+    vim.api.nvim_buf_delete(buffer, { force = true })
+  end
+
   local settings = package.loaded["forge.integrations.background_settings"]
   local original_request, resolution = settings.request, {}
   settings.request = function(_, _, callback) resolution[#resolution + 1] = callback end

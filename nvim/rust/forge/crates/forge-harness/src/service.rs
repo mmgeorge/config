@@ -26,6 +26,9 @@ use crate::task::command as session_command;
 
 #[path = "service/input.rs"]
 mod input_delivery;
+#[cfg(test)]
+#[path = "service/provider_startup_test.rs"]
+mod provider_startup_test;
 #[path = "service/review_questions.rs"]
 mod review_questions;
 #[path = "service/shared.rs"]
@@ -474,6 +477,18 @@ impl HarnessService {
             Ok(snapshot) => Ok(Response::success(request_id, snapshot)?),
             Err(error) => Ok(initialize_failure(request_id, &error)),
         }
+    }
+
+    /// Start the opened conversation's provider without waiting for network initialization.
+    pub async fn start_provider_session(
+        &self,
+        session_id: &str,
+        sink: &MessageSender,
+    ) -> Result<()> {
+        let registry = self.registry().await?;
+        let controller = registry.resolve(session_id).await?;
+        controller.start_provider(sink).await;
+        Ok(())
     }
 
     /// Initialize shared runtime services without creating or selecting a session.
@@ -1007,6 +1022,10 @@ impl HarnessService {
                     .collect();
                 for controller in controller_list {
                     controller.input_stopping.store(true, Ordering::Release);
+                    if let Some(task) = controller.provider_startup.lock().await.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
                     controller.coordinator.submissions.changed.notify_one();
                     if let Some(task) = controller.timeout_task.lock().await.take() {
                         task.abort();
@@ -1210,6 +1229,8 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    provider_startup: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    provider_startup_error: std::sync::Mutex<Option<String>>,
     goal_max_turns: u32,
     task_controller: Arc<crate::task::SessionTaskController>,
     coordinator: Arc<SessionCoordinator>,
@@ -1253,6 +1274,79 @@ impl Drop for PromptAdmission {
 }
 
 impl SessionController {
+    async fn start_provider(self: &Arc<Self>, sink: &MessageSender) {
+        let mut startup = self.provider_startup.lock().await;
+        if let Some(task) = startup.as_ref() {
+            if !task.is_finished()
+                || self
+                    .provider_startup_error
+                    .lock()
+                    .expect("provider startup state poisoned")
+                    .is_none()
+            {
+                return;
+            }
+            startup.take();
+        }
+        *self
+            .provider_startup_error
+            .lock()
+            .expect("provider startup state poisoned") = None;
+        let request = self.broker.lock().await.initialization_request();
+        let Some(request) = request else {
+            return;
+        };
+        let revision = self.mcp_revision.load(Ordering::Acquire);
+        let backend = Arc::clone(&self.backend);
+        let owner = Arc::downgrade(self);
+        let sink = sink.clone();
+        *startup = Some(tokio::spawn(async move {
+            let initialized = backend.initialize_session(request.clone()).await;
+            let Some(owner) = owner.upgrade() else {
+                return;
+            };
+            if owner.input_stopping.load(Ordering::Acquire)
+                || owner.mcp_revision.load(Ordering::Acquire) != revision
+            {
+                return;
+            }
+            let result: Result<()> = async {
+                let Some(provider_id) = initialized? else {
+                    return Ok(());
+                };
+                let mut broker = owner.broker.lock().await;
+                if owner.mcp_revision.load(Ordering::Acquire) != revision {
+                    return Ok(());
+                }
+                if let Some(snapshot) = broker.retain_initialized_session(&request, provider_id)? {
+                    *owner.catalog_request.write().await = broker.backend_catalog_request();
+                    sink.send_event(SessionEvent {
+                        session_id: request.harness_session_id.clone(),
+                        event: "session_configured".into(),
+                        payload: serde_json::to_value(snapshot)?,
+                    })
+                    .await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                let message = format!("Provider initialization failed: {error:#}");
+                *owner
+                    .provider_startup_error
+                    .lock()
+                    .expect("provider startup state poisoned") = Some(message.clone());
+                let _ = sink
+                    .send_event(SessionEvent {
+                        session_id: request.harness_session_id,
+                        event: "backend_event".into(),
+                        payload: json!({"kind":"error", "text":message}),
+                    })
+                    .await;
+            }
+        }));
+    }
+
     async fn background_terminals(&self) -> Result<crate::backend::terminal::TerminalSnapshot> {
         let request = self.catalog_request.read().await.clone();
         let revision = self.mcp_revision.load(Ordering::Acquire);
@@ -1323,6 +1417,8 @@ impl SessionController {
         let input = Arc::new(crate::input::SessionInputQueue::default());
         broker.input_wakeup = Some(input.changed.clone());
         Ok(Arc::new(Self {
+            provider_startup: Mutex::new(None),
+            provider_startup_error: std::sync::Mutex::new(None),
             task_controller: broker.task_controller.clone(),
             goal_max_turns: broker.goal_max_turns,
             coordinator: SessionCoordinator::new(input),
@@ -1582,6 +1678,9 @@ impl SessionController {
 
 impl Drop for SessionController {
     fn drop(&mut self) {
+        if let Some(task) = self.provider_startup.get_mut().take() {
+            task.abort();
+        }
         self.input_stopping.store(true, Ordering::Release);
         self.coordinator.submissions.changed.notify_one();
         if let Some(task) = self.timeout_task.get_mut().take() {
@@ -2304,14 +2403,9 @@ async fn route_request(
         None
     };
     if method == RuntimeMethod::SessionProviderSetup {
-        let install = request
-            .params
-            .get("install")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let result = controller
             .backend
-            .setup(controller.catalog_request.read().await.clone(), install)
+            .setup(controller.catalog_request.read().await.clone())
             .await?;
         controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
         message_sink
@@ -2629,6 +2723,12 @@ async fn route_request(
     }
     let catalog_request = broker.backend_catalog_request();
     drop(broker);
+    if catalog_request.backend_session_id.is_some() {
+        *controller
+            .provider_startup_error
+            .lock()
+            .expect("provider startup state poisoned") = None;
+    }
     *controller.catalog_request.write().await = catalog_request;
 
     if let Some(child_session_id) = result
@@ -3315,6 +3415,7 @@ async fn route_new_session(
         event: "session_created".into(),
         payload: serde_json::to_value(child)?,
     }))?;
+    child_controller.start_provider(message_sink).await;
     Ok(())
 }
 
@@ -3471,6 +3572,7 @@ async fn delete_session(
         controller.coordinator.execution.close();
         controller.coordinator.control.close();
         for task in [
+            controller.provider_startup.lock().await.take(),
             controller.input_task.lock().await.take(),
             controller.timeout_task.lock().await.take(),
             controller.agent_task.lock().await.take(),
@@ -3516,6 +3618,7 @@ async fn resume_session(
     message_sink
         .send_response(Response::success(request.id, snapshot)?)
         .await?;
+    controller.start_provider(message_sink).await;
     Ok(())
 }
 
@@ -3941,6 +4044,14 @@ async fn route_control_request(
             .context("skill discovery exceeded 30 seconds")??,
         )?),
         RuntimeMethod::SessionProviderMcpList => {
+            if let Some(error) = controller
+                .provider_startup_error
+                .lock()
+                .expect("provider startup state poisoned")
+                .clone()
+            {
+                anyhow::bail!(error);
+            }
             let revision = controller.mcp_revision.load(Ordering::Acquire);
             let mut discovery = controller.mcp_discovery.lock().await;
             if discovery.0 != revision {

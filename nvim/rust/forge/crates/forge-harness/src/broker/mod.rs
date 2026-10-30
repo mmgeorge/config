@@ -1014,6 +1014,37 @@ impl HarnessBroker {
         }
     }
 
+    /// Capture interactive startup settings without creating an exchange or task.
+    pub(crate) fn initialization_request(&self) -> Option<BackendRequest> {
+        (self.session.background.is_none()
+            && self.session.purpose == crate::session::SessionPurpose::Conversation
+            && self.provider_fork_state() == crate::session::ProviderForkState::Ready)
+            .then(|| self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+    }
+
+    /// Retain provider history only while the captured session settings remain current.
+    pub(crate) fn retain_initialized_session(
+        &mut self,
+        request: &BackendRequest,
+        provider_id: String,
+    ) -> Result<Option<BrokerSnapshot>> {
+        if self.session.backend_session_id.as_deref() == Some(&provider_id) {
+            return Ok(None);
+        }
+        if self.session.id != request.harness_session_id
+            || self.session.backend_session_id != request.backend_session_id
+            || self.session.model != request.model
+            || self.session.effort != request.effort
+            || self.session.access != request.access
+            || self.session.approval_mode != request.approval_mode
+        {
+            return Ok(None);
+        }
+        self.session.backend_session_id = Some(provider_id);
+        self.save_session()?;
+        Ok(Some(self.snapshot()?))
+    }
+
     fn control_turn_context(
         &self,
         mode: PromptMode,

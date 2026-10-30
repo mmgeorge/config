@@ -1257,7 +1257,24 @@ impl HostRouter {
                         .open_session(request.id, initialize)
                         .await?
                 };
+                let opened_session = response
+                    .result()
+                    .and_then(|result| result.pointer("/session/id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 sink.send_response(response).await?;
+                if let Some(session_id) = opened_session
+                    && let Err(error) = self
+                        .host
+                        .harness
+                        .start_provider_session(&session_id, sink)
+                        .await
+                {
+                    sink.send_event(forge_protocol::message::SessionEvent {
+                            session_id, event: "backend_event".into(),
+                            payload: json!({"kind":"error","text":format!("Provider initialization failed: {error:#}")}),
+                        }).await?;
+                }
             }
             RoutedMethod::RepositoryRevisionList => {
                 let params: RevisionRequest = serde_json::from_value(request.params)?;

@@ -430,43 +430,42 @@ function M.open(state, host)
       ---@param kind 'choice'|'toggle'|'input'|'action'
       ---@param value string|boolean
       ---@param label string?
-      ---@param description string
       ---@param disabled string?
       ---@param muted boolean?
       ---@return ForgePickerField
-      local function field(id, kind, value, label, description, disabled, muted)
-        return { id = id, kind = kind, value = value, label = label, description = description,
+      local function field(id, kind, value, label, disabled, muted)
+        return { id = id, kind = kind, value = value, label = label,
           disabled_reason = disabled, muted = muted }
       end
       local catalog_disabled = not (commit and commit.model_list) and (commit and commit.failure or "Loading models") or nil
       local main = {
-        field("main-model", "choice", active.model or "Default", nil, "Model for the main conversation and task execution.",
+        field("main-model", "choice", active.model or "Default", nil,
           not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled),
-        field("main-thinking", "choice", active.effort or "Default", "Thinking", "Reasoning effort for the selected main model.",
+        field("main-thinking", "choice", active.effort or "Default", "Thinking",
           not capability.effort_selection and "Reasoning effort selection is unavailable for this provider" or catalog_disabled),
       }
       if #require("forge.views.harness.model_options").speeds(model_descriptor(), capability) > 1
         or active.service_tier and active.service_tier ~= "default" then
-        main[#main + 1] = field("main-speed", "choice", active.service_tier or "default", "Speed", "Provider service tier for the main conversation.")
+        main[#main + 1] = field("main-speed", "choice", active.service_tier or "default", "Speed")
       end
       local compaction = active.auto_compaction or { enabled = false, threshold_tokens = 128000 }
       local sandbox = {
-        field("sandbox", "toggle", policy.sandbox, "Enabled", "OS isolation, independent of approval mode.",
+        field("sandbox", "toggle", policy.sandbox, "Enabled",
           not supported and "OS sandbox configuration is unavailable for this provider" or nil),
       }
       if vim.fn.has("win32") == 1 then
-        sandbox[#sandbox + 1] = field("windows-sandbox", "choice", policy.windows_sandbox, "Windows mode", "Windows sandbox implementation. MXC requires host support.",
+        sandbox[#sandbox + 1] = field("windows-sandbox", "choice", policy.windows_sandbox, "Windows mode",
           not supported and "OS sandbox configuration is unavailable for this provider" or nil)
       end
       local approval, answer = duration.value(active.approval_timeout), duration.value(active.answer_timeout)
-      local approval_unit = field("approval_timeout:unit", "choice", approval.unit, nil, "Approval timeout unit: seconds, minutes, or hours.")
-      local answer_unit = field("answer_timeout:unit", "choice", answer.unit, nil, "Answer timeout unit: seconds, minutes, or hours.")
+      local approval_unit = field("approval_timeout:unit", "choice", approval.unit, nil)
+      local answer_unit = field("answer_timeout:unit", "choice", answer.unit, nil)
       approval_unit.join_previous, answer_unit.join_previous = true, true
       local provider_configuration = {
-        field("native-import", "action", "Import…", nil, "Preview and select native skills or MCP definitions to import into Forge settings."),
+        field("native-import", "action", "Import…", nil),
       }
       if active.backend == "claude" or active.backend == "antigravity" then
-        provider_configuration[#provider_configuration + 1] = field("provider-setup", "action", "Install / sign in…", nil, "Manage the ACP runtime and OAuth login.")
+        provider_configuration[#provider_configuration + 1] = field("provider-setup", "action", "Provider setup / sign in…", nil)
       end
       ---@param id string
       ---@param section string
@@ -485,74 +484,74 @@ function M.open(state, host)
           option_list = {
             row("main-model", "Models", "Main", main),
             row("ask-model", "Models", "Ask", {
-              field("ask-model", "choice", ask.model or "Same as planning", nil, "Model for forked Plan Review answers.",
+              field("ask-model", "choice", ask.model or "Same as planning", nil,
                 not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled),
-              field("ask-thinking", "choice", ask.effort or "Default", "Thinking", "Reasoning effort for the Ask model.",
+              field("ask-thinking", "choice", ask.effort or "Default", "Thinking",
                 not ask.model and "Uses the planning model settings" or catalog_disabled),
-              field("ask-speed", "choice", ask.service_tier or "default", "Speed", "Provider service tier for the Ask model.",
+              field("ask-speed", "choice", ask.service_tier or "default", "Speed",
                 not ask.model and "Uses the planning model settings" or catalog_disabled),
-              field("ask-inherit", "action", "Use planning", nil, "Clear the Ask override and inherit the planning model.",
+              field("ask-inherit", "action", "Use planning", nil,
                 not ask.model and "Already uses the planning model" or nil),
             }),
             row("background-model", "Models", "Background", background_fields),
             row("main-compaction", "Compaction", "Main", {
-              field("auto-compact", "toggle", compaction.enabled, "Automatic", "Compact the main conversation after completed turns.",
+              field("auto-compact", "toggle", compaction.enabled, "Automatic",
                 not capability.native_compact and "Compaction is unavailable for this provider" or nil),
-              field("compact-threshold", "input", tostring(compaction.threshold_tokens), "Threshold", "Main compaction threshold in provider-reported context tokens.", nil, not compaction.enabled),
+              field("compact-threshold", "input", tostring(compaction.threshold_tokens), "Threshold", nil, not compaction.enabled),
             }),
             row("background-compaction", "Compaction", "Background", { background.compact, background.threshold }),
             row("check-execution", "Checks", "Execution", {
-              field("shell", "choice", active.shell == "nushell" and "Nushell" or "System", "Shell", "Shell used for saved checks. Nushell is available when installed."),
+              field("shell", "choice", active.shell == "nushell" and "Nushell" or "System", "Shell"),
             }),
             row("automatic-checks", "Checks", "Automatic", {
-              field("automatic-checks", "toggle", active.automatic_checks == true, "Enabled", "Run applicable checks when work completes. Explicit runs and plan Checking remain available when disabled."),
-              field("check-timing", "choice", active.check_timing == "between_work" and "Between queued work" or "After queue", "Timing", "Run checks after each work item or once the queue finishes."),
+              field("automatic-checks", "toggle", active.automatic_checks == true, "Enabled"),
+              field("check-timing", "choice", active.check_timing == "between_work" and "Between queued work" or "After queue", "Timing"),
             }),
             row("check-editing", "Checks", "Setup", {
-              field("check-editing", "toggle", state.check_editing == true, "Enabled", "Allow the agent to edit project checks. Changes permission without sending a prompt."),
+              field("check-editing", "toggle", state.check_editing == true, "Enabled"),
             }),
             row("plan-approval", "Planning", "Approval", {
-              field("plan-approval", "choice", ({ ask = "ask", deny = "deny", allow = "allow" })[active.plan_approval] or "Keep current", nil, "Approval mode applied when starting a planning task."),
+              field("plan-approval", "choice", ({ ask = "ask", deny = "deny", allow = "allow" })[active.plan_approval] or "Keep current", nil),
             }),
             row("plan-revisions", "Planning", "Auto-approve", {
-              field("plan-revisions", "toggle", active.plan_auto_approve_revisions ~= false, "Auto-approve", "Automatically accept validated execution plan revisions."),
+              field("plan-revisions", "toggle", active.plan_auto_approve_revisions ~= false, "Auto-approve"),
             }, true),
             row("execute-approval", "Execute", "Approval", {
-              field("default-approval", "choice", active.default_approval or "ask", nil, "Approval mode applied to new goals and accepted plan execution. Choose ask, deny, or allow without changing filesystem access."),
+              field("default-approval", "choice", active.default_approval or "ask", nil),
             }),
             row("read-access", "Permissions", "Read", {
-              field("read-access", "choice", policy.read_access, nil, "Filesystem scope for reported file reads. This does not configure OS read confinement."),
-              field("readable-directories", "action", tostring(#policy.readable_directory) .. "…", "Extra directories", "Add, edit, or remove additional readable directories."),
+              field("read-access", "choice", policy.read_access, nil),
+              field("readable-directories", "action", tostring(#policy.readable_directory) .. "…", "Extra directories"),
             }),
             row("write-access", "Permissions", "Write", {
-              field("write-access", "choice", policy.write_access, nil, "Filesystem scope for reported file writes. Off rejects writes in every approval mode."),
-              field("writable-directories", "action", tostring(#policy.writable_directory) .. "…", "Extra directories", "Add, edit, or remove additional writable directories."),
+              field("write-access", "choice", policy.write_access, nil),
+              field("writable-directories", "action", tostring(#policy.writable_directory) .. "…", "Extra directories"),
             }),
             row("sandbox", "Permissions", "Sandbox", sandbox),
             row("timeouts", "Tools", "Timeouts", {
-              field("approval_timeout:amount", "input", tostring(approval.amount), "Approval", "Automatically reject unanswered approvals after this duration. Set 0 to disable."),
+              field("approval_timeout:amount", "input", tostring(approval.amount), "Approval"),
               approval_unit,
-              field("answer_timeout:amount", "input", tostring(answer.amount), "Answer", "Automatically answer questions with recommended defaults after this duration. Set 0 to disable."),
+              field("answer_timeout:amount", "input", tostring(answer.amount), "Answer"),
               answer_unit,
             }),
             row("subagent-tools", "Tools", "Subagents", {
-              field("subagent-tools", "toggle", (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true, "Subagents", "Allow root model delegation. Manual spawning remains available."),
+              field("subagent-tools", "toggle", (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true, "Subagents"),
             }, true),
             row("lsp-tools", "Tools", "LSP", {
-              field("lsp-tools", "toggle", (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true, "LSP", "Read-only agent queries through editor language servers."),
+              field("lsp-tools", "toggle", (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true, "LSP"),
             }, true),
             row("session-tools", "Tools", "Session history", {
-              field("session-tools", "toggle", active.session_tools ~= false and (active.session_tools ~= nil or state.session_tools ~= false), "Sessions", "Read-only Harness history tools. Configuration inspection and the Harness skill remain available when off."),
+              field("session-tools", "toggle", active.session_tools ~= false and (active.session_tools ~= nil or state.session_tools ~= false), "Sessions"),
             }, true),
             row("status-thoughts", "Display", "Thoughts", {
-              field("status-thoughts", "toggle", active.status_thoughts == true, "Thoughts", "Show the latest thought under live status without changing timeline messages."),
+              field("status-thoughts", "toggle", active.status_thoughts == true, "Thoughts"),
             }, true),
             row("provider", "Provider", "Connection", {
-              field("provider", "action", cli or "Unknown", nil, "Choose a new chat or resume a session with another provider."),
+              field("provider", "action", cli or "Unknown", nil),
             }),
             row("provider-configuration", "Provider", "Configuration", provider_configuration),
             row("logging", "Debug", "Logging", {
-              field("logging", "toggle", status.enabled == true, "Logging", "Save the session log."),
+              field("logging", "toggle", status.enabled == true, "Logging"),
             }, true),
           },
           footer = "↑↓ row  Tab/S-Tab field  ←→ value  Space toggle  Enter edit/open  q close",

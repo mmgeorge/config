@@ -7,6 +7,13 @@ argument parsing and completion. Contributor documentation starts at
 
 ## Harness inspection
 
+Opening, creating, or resuming a Harness conversation starts its Codex or Copilot
+provider session in the background. The editor remains usable while the provider
+and MCP servers initialize. This sends no prompt and starts no model turn.
+`/mcp` reports connection progress without requiring a first message. The first
+prompt reuses the initialized provider thread. Startup failures appear as session
+errors and remain available through `/mcp`.
+
 Harness agents can inspect configuration with `harness_config` and recall previous
 work through `harness_session_list`, `harness_session_search`,
 `harness_session_exchange_list`, `harness_session_exchange`, `harness_session_tool`,
@@ -87,6 +94,9 @@ line show an animated `Generating with <model>` status, including thinking and s
 Failures and cancellation restore the previous subject. `Ctrl-A` cancels the previous
 generation request before regenerating from staged changes, or from the latest commit
 when amending. Late results from the cancelled request cannot replace the new draft.
+Entering Insert mode while generation is pending cancels that request and removes
+the spinner, preserving the current draft for manual editing. `Ctrl-A` can start
+generation again explicitly.
 
 Git LFS files are excluded from both the changed-file inventory and compact diff before
 Forge reads their content. This applies to automatic drafts, staged regeneration, amend

@@ -53,7 +53,7 @@ local success, failure = xpcall(function()
   })) == "table")
   assert(request("session.check.complete").session.id == session_id)
   assert(request("session.exchange.recovery") == nil)
-  request("session.provider.setup", { install = false }, "unsupported provider capability")
+  request("session.provider.setup", {}, "unsupported provider capability")
   request("session.provider.authenticate", { method = "fixture" }, "unsupported provider capability")
   local attachment = directory .. "/example.txt"
   vim.fn.writefile({ "Example attachment" }, attachment)

@@ -1,26 +1,23 @@
 use crate::backend::BackendKind;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use std::fs::File;
-use std::io::Write;
-use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-const CLAUDE_VERSION: &str = "0.89.1";
-const ANTIGRAVITY_VERSION: &str = "1.3.0";
+const LEGACY_CLAUDE_VERSION: &str = "0.89.1";
+const LEGACY_ANTIGRAVITY_VERSION: &str = "1.3.0";
 
 #[derive(Serialize)]
 /// Reports installation independently of authentication and provider session state.
 pub(super) struct RuntimeStatus {
     pub(super) available: bool,
     pub(super) managed: bool,
-    pub(super) version: Option<String>,
-    pub(super) supported_version: &'static str,
+    pub(super) adapter_version: Option<String>,
     pub(super) command: Vec<String>,
-    pub(super) installable: bool,
+    pub(super) environment: BTreeMap<String, String>,
 }
 
-/// Owns pinned ACP installations without changing global provider installations.
+/// Resolves installed ACP adapters and retains compatibility with existing managed copies.
 pub(super) struct AcpRuntime {
     kind: BackendKind,
     command: Vec<String>,
@@ -28,7 +25,7 @@ pub(super) struct AcpRuntime {
 }
 
 impl AcpRuntime {
-    /// Scope managed runtime files to the Harness data directory.
+    /// Locate existing managed copies beneath the Harness data directory.
     pub(super) fn new(kind: BackendKind, command: Vec<String>, root: &Path) -> Self {
         let name = if kind == BackendKind::Claude {
             "claude"
@@ -42,15 +39,15 @@ impl AcpRuntime {
         }
     }
 
-    fn version(&self) -> &'static str {
+    fn legacy_version(&self) -> &'static str {
         if self.kind == BackendKind::Claude {
-            CLAUDE_VERSION
+            LEGACY_CLAUDE_VERSION
         } else {
-            ANTIGRAVITY_VERSION
+            LEGACY_ANTIGRAVITY_VERSION
         }
     }
 
-    fn installable(&self) -> bool {
+    fn default_command(&self) -> bool {
         self.command.len() == 1
             && self.command[0]
                 == if self.kind == BackendKind::Claude {
@@ -87,20 +84,8 @@ impl AcpRuntime {
         }
     }
 
-    /// Prefer the managed pinned runtime for default commands and honor explicit overrides.
+    /// Resolve the configured adapter before falling back to an existing managed copy.
     pub(super) fn status(&self) -> RuntimeStatus {
-        let installable = self.installable();
-        if installable && let Some(command) = self.managed_command(&self.root.join(self.version()))
-        {
-            return RuntimeStatus {
-                available: true,
-                managed: true,
-                version: Some(self.version().into()),
-                supported_version: self.version(),
-                command,
-                installable,
-            };
-        }
         let mut command = self.command.clone();
         let program = command
             .first()
@@ -108,192 +93,82 @@ impl AcpRuntime {
         if let Some(program) = &program {
             command[0] = program.to_string_lossy().into_owned();
         }
+        let mut environment = BTreeMap::new();
+        if self.kind == BackendKind::Claude {
+            let executable = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
+                .filter(|executable| !executable.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| crate::process::executable("claude"));
+            if let Some(executable) = executable {
+                environment.insert(
+                    "CLAUDE_CODE_EXECUTABLE".into(),
+                    executable.to_string_lossy().into_owned(),
+                );
+            }
+        }
+        if program.is_none()
+            && self.default_command()
+            && let Some(command) = self.managed_command(&self.root.join(self.legacy_version()))
+        {
+            return RuntimeStatus {
+                available: true,
+                managed: true,
+                adapter_version: Some(self.legacy_version().into()),
+                command,
+                environment,
+            };
+        }
         RuntimeStatus {
             available: program.is_some(),
             managed: false,
-            version: None,
-            supported_version: self.version(),
+            adapter_version: None,
             command,
-            installable,
+            environment,
         }
     }
 
     /// Resolve a launch command without implicitly downloading software.
-    pub(super) fn resolve(&self) -> Result<Vec<String>> {
+    pub(super) fn resolve(&self) -> Result<RuntimeStatus> {
         let status = self.status();
         ensure!(
             status.available,
-            "ACP runtime is not installed. Open /config → Provider setup to install it, or configure an explicit backend command"
+            "ACP runtime is not installed. Configure an installed ACP adapter in harness.backends"
         );
-        Ok(status.command)
-    }
-
-    /// Publish a complete pinned installation after download and extraction succeed.
-    pub(super) async fn install(&self) -> Result<RuntimeStatus> {
-        ensure!(
-            self.installable(),
-            "Explicit backend commands must be installed by their owner"
-        );
-        std::fs::create_dir_all(&self.root)?;
-        let lock = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.root.join("install.lock"))?;
-        lock.try_lock()
-            .context("Another ACP installation is in progress")?;
-        let destination = self.root.join(self.version());
-        if self.managed_command(&destination).is_some() {
-            return Ok(self.status());
-        }
-        ensure!(
-            !destination.exists(),
-            "Incomplete ACP installation at {} must be removed before retrying",
-            destination.display()
-        );
-        let staging = tempfile::Builder::new()
-            .prefix("install-")
-            .tempdir_in(&self.root)?;
-        if self.kind == BackendKind::Claude {
-            let node = crate::process::executable("node")
-                .context("Node.js 22 or newer is required to install Claude ACP")?;
-            let output = tool_output(
-                node.to_string_lossy().as_ref(),
-                &["--version".into()],
-                staging.path(),
-            )
-            .await?;
-            let version = semver::Version::parse(
-                String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .trim_start_matches('v'),
-            )?;
-            ensure!(
-                version.major >= 22,
-                "Claude ACP requires Node.js 22 or newer, found {version}"
-            );
-            let npm = crate::process::executable("npm")
-                .context("npm is required to install Claude ACP")?;
-            tool_output(
-                npm.to_string_lossy().as_ref(),
-                &[
-                    "install".into(),
-                    "--prefix".into(),
-                    staging.path().to_string_lossy().into_owned(),
-                    "--no-audit".into(),
-                    "--no-fund".into(),
-                    "--save-exact".into(),
-                    format!("@agentclientprotocol/claude-agent-acp@{CLAUDE_VERSION}"),
-                ],
-                staging.path(),
-            )
-            .await?;
-        } else {
-            let (platform, architecture) = match (std::env::consts::OS, std::env::consts::ARCH) {
-                ("windows", "x86_64") => ("windows", "windows-x86_64"),
-                ("windows", "aarch64") => ("windows", "windows-arm64"),
-                ("macos", "x86_64") => ("macos", "darwin-x86_64"),
-                ("macos", "aarch64") => ("macos", "darwin-arm64"),
-                ("linux", "x86_64") => ("linux", "linux-x86_64"),
-                ("linux", "aarch64") => ("linux", "linux-arm64"),
-                _ => bail!("No supported Antigravity ACP archive for this platform"),
-            };
-            let url = format!(
-                "https://dl.google.com/agy-extensions/releases/{platform}/agy-acp-server-{ANTIGRAVITY_VERSION}-{architecture}.zip"
-            );
-            let mut response = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(120))
-                .build()?
-                .get(url)
-                .send()
-                .await?
-                .error_for_status()?;
-            let mut archive = tempfile::tempfile()?;
-            while let Some(chunk) = response.chunk().await? {
-                archive.write_all(&chunk)?;
-            }
-            let root = staging.path().to_owned();
-            tokio::task::spawn_blocking(move || extract(archive, &root)).await??;
-        }
-        ensure!(
-            self.managed_command(staging.path()).is_some(),
-            "ACP installation omitted its executable"
-        );
-        std::fs::write(staging.path().join("version"), self.version())?;
-        std::fs::rename(staging.path(), &destination).context("publish ACP installation")?;
-        Ok(self.status())
+        Ok(status)
     }
 }
 
-async fn tool_output(
-    program: &str,
-    argument: &[String],
-    root: &Path,
-) -> Result<std::process::Output> {
-    let mut command = crate::process::command(program, argument);
-    command
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let child = crate::process::spawn_owned(command)?;
-    let output = tokio::time::timeout(
-        Duration::from_secs(120),
-        Box::into_pin(child.wait_with_output()),
-    )
-    .await
-    .context("ACP installation command exceeded 120 seconds")??;
-    ensure!(
-        output.status.success(),
-        "ACP installation command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(output)
+impl RuntimeStatus {
+    /// Report the native executable selected for ACP and terminal authentication.
+    pub(super) async fn provider_version(&self) -> Result<Option<String>> {
+        let Some(program) = self.environment.get("CLAUDE_CODE_EXECUTABLE") else {
+            return Ok(None);
+        };
+        let mut command = crate::process::command(program, &["--version".into()]);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child =
+            crate::process::spawn_owned(command).context("launch Claude Code version check")?;
+        let output = Box::into_pin(child.wait_with_output()).await?;
+        ensure!(
+            output.status.success(),
+            "Claude Code version check failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        parse_claude_version(&output.stdout).map(Some)
+    }
 }
 
-fn extract(archive: File, root: &Path) -> Result<()> {
-    let mut archive = zip::ZipArchive::new(archive)?;
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        let relative = entry
-            .enclosed_name()
-            .context("ACP archive path escapes its installation directory")?;
-        ensure!(
-            relative
-                .components()
-                .all(|component| matches!(component, Component::Normal(_))),
-            "ACP archive path is not relative"
-        );
-        ensure!(
-            entry
-                .unix_mode()
-                .is_none_or(|mode| mode & 0o170000 != 0o120000),
-            "ACP archive contains a symbolic link"
-        );
-        let destination = root.join(relative);
-        if entry.is_dir() {
-            std::fs::create_dir_all(destination)?;
-            continue;
-        }
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut output = File::create(&destination)?;
-        let expected_size = entry.size();
-        let copied = std::io::copy(&mut entry, &mut output)?;
-        ensure!(
-            copied == expected_size,
-            "ACP archive entry differs from its declared size"
-        );
-        #[cfg(unix)]
-        if let Some(mode) = entry.unix_mode() {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(destination, std::fs::Permissions::from_mode(mode & 0o777))?;
-        }
-    }
-    Ok(())
+fn parse_claude_version(output: &[u8]) -> Result<String> {
+    let output = std::str::from_utf8(output).context("Claude Code version is not UTF-8")?;
+    let version = output
+        .split_whitespace()
+        .next()
+        .context("Claude Code version is empty")?;
+    semver::Version::parse(version).context("Claude Code returned an invalid version")?;
+    Ok(version.to_owned())
 }
 
 #[cfg(test)]
@@ -301,22 +176,101 @@ mod test {
     use super::*;
 
     #[test]
-    fn extraction_rejects_traversal_and_preserves_existing_runtime() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let installation = root.path().join("installation");
-        std::fs::create_dir(&installation)?;
-        std::fs::write(installation.join("existing"), "retained")?;
-        let archive = tempfile::tempfile()?;
-        let mut writer = zip::ZipWriter::new(archive);
-        writer.start_file("../escape", zip::write::SimpleFileOptions::default())?;
-        writer.write_all(b"escaped")?;
-        let archive = writer.finish()?;
-        assert!(extract(archive, &installation).is_err());
+    fn claude_version_is_independent_of_adapter_version() -> Result<()> {
         assert_eq!(
-            std::fs::read_to_string(installation.join("existing"))?,
-            "retained"
+            parse_claude_version(b"2.1.302 (Claude Code)\r\n")?,
+            "2.1.302"
         );
-        assert!(!root.path().join("escape").exists());
+        assert_eq!(
+            parse_claude_version(b"2.2.0-beta.1 (Claude Code)\n")?,
+            "2.2.0-beta.1"
+        );
+        assert!(parse_claude_version(b"").is_err());
+        assert!(parse_claude_version(b"unexpected version output").is_err());
+        assert!(parse_claude_version(&[0xff]).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn launch_preserves_selected_claude_executable() -> Result<()> {
+        use super::super::session::AcpSessionState;
+        use super::super::transport::AcpTransport;
+        use crate::backend::approval::PermissionCoordinator;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let directory = tempfile::tempdir()?;
+        let peer = directory.path().join("peer.cjs");
+        std::fs::write(
+            &peer,
+            r#"
+const readline = require('node:readline');
+readline.createInterface({input: process.stdin}).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  process.stdout.write(JSON.stringify({jsonrpc: '2.0', id: request.id, result: {
+    protocolVersion: 1, executable: process.env.CLAUDE_CODE_EXECUTABLE,
+    agentInfo: {version: 'adapter-fixture'}
+  }}) + '\n');
+});
+"#,
+        )?;
+        let executable = directory
+            .path()
+            .join("selected native CLI.exe")
+            .to_string_lossy()
+            .into_owned();
+        let runtime = RuntimeStatus {
+            available: true,
+            managed: false,
+            adapter_version: None,
+            command: vec!["node".into(), peer.to_string_lossy().into_owned()],
+            environment: BTreeMap::from([("CLAUDE_CODE_EXECUTABLE".into(), executable.clone())]),
+        };
+        let handler = Arc::new(AcpSessionState::new(
+            BackendKind::Claude,
+            PermissionCoordinator::transient(directory.path())?,
+        ));
+        let transport =
+            AcpTransport::launch(&runtime, &directory.path().to_string_lossy(), handler, None)
+                .await?;
+        let initialized = transport
+            .request("initialize", json!({"protocolVersion": 1}))
+            .await?;
+        transport.shutdown().await?;
+        assert_eq!(initialized["executable"], executable);
+        assert_eq!(initialized["agentInfo"]["version"], "adapter-fixture");
+        assert!(
+            runtime.provider_version().await.is_err(),
+            "missing native executable must report a version failure"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_runtime_does_not_create_installation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let runtime = AcpRuntime::new(
+            BackendKind::Claude,
+            vec![
+                root.path()
+                    .join("missing-adapter")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            root.path(),
+        );
+        assert!(!runtime.status().available);
+        let error = runtime
+            .resolve()
+            .err()
+            .context("missing adapter resolved")?;
+        assert!(
+            error
+                .to_string()
+                .contains("Configure an installed ACP adapter")
+        );
+        assert!(!root.path().join("provider-runtime").exists());
         Ok(())
     }
 }

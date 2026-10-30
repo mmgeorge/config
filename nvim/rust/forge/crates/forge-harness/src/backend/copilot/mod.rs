@@ -1592,6 +1592,11 @@ let event_sink = Some(event_sink);
         })
     }
 
+    async fn initialize_session(&self, request: BackendRequest) -> Result<Option<String>> {
+        let session = self.session(&request).await?;
+        Ok(Some(session.id().to_string()))
+    }
+
     async fn mcp_configuration(
         &self,
         request: BackendCatalogRequest,

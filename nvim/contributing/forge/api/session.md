@@ -7674,12 +7674,12 @@ Wire frames captured from [semantic_execution_host.lua](../../../../nvim/tests/f
 
 ## `session.provider.setup`
 
-Inspect or install the selected provider integration.
+Inspect the installed provider integration.
 
 - **Context:** Explicit existing session/provider.
-- **Input:** install boolean and session/provider context.
+- **Input:** The explicit session/provider context.
 - **Result and effects:** Returns setup outcome.
-- **Boundary:** Installation and provider I/O are effects of this explicit operation.
+- **Boundary:** Provider inspection performs a handshake without installing software or creating a conversation.
 - **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service.rs`](../../../rust/forge/crates/forge-harness/src/service.rs).
 
 **Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `none`.
@@ -7689,21 +7689,19 @@ Inspect or install the selected provider integration.
 <!-- detailed-contract -->
 ### Contract
 
-Accepts optional `install` (boolean, default false). Calls the selected provider's setup operation and returns its provider-specific result object. `install: false` inspects setup; `true` authorizes the configured provider's installation/setup path. The operation requires idle source execution and no pending cleanup, and invalidates MCP discovery after success. Unsupported providers, unavailable installer/runtime, active work, and setup failures are errors. It does not send a chat prompt.
+Calls the selected provider's inspection operation and returns runtime availability, separate native CLI and ACP adapter versions, and authentication methods. It never installs software. The operation requires idle source execution and no pending cleanup, and invalidates MCP discovery after success. Unsupported providers, active work, and handshake failures are errors. A missing adapter returns unavailable status. It does not send a chat prompt.
 
 <!-- /detailed-contract -->
 
 <!-- captured-example -->
-### Verified example
+### Example
 
-Wire frames captured from [session_api_examples.lua](../../../../nvim/tests/forge/session_api_examples.lua) against the rebuilt host, before Lua null normalization. Temporary paths use `/fixture`; session, resource, and document identities refer to the fixture's preceding setup.
+The request in [session_api_examples.lua](../../../../nvim/tests/forge/session_api_examples.lua) exercises the unsupported-provider response. The request has no installation option.
 
 ```json
 {
   "method": "session.provider.setup",
-  "params": {
-    "install": false
-  },
+  "params": {},
   "id": 16,
   "session_id": "b14c3cec-edd9-49ca-a61f-467677607b72"
 }

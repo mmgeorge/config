@@ -11,19 +11,19 @@ local M = {}
 ---@field description? string
 ---@field terminal boolean
 ---@field command? string[]
+---@field environment? table<string, string>
 
 ---@class ForgeProviderRuntime
 ---@field available boolean
 ---@field managed boolean
----@field version? string
----@field supported_version string
+---@field adapter_version? string
 ---@field provider_version? string
----@field installable boolean
+---@field version_error? string
 ---@field auth_methods ForgeProviderAuthentication[]
 
----@param command string[]
+---@param method ForgeProviderAuthentication
 ---@param callback fun(success: boolean)
-local function terminal_login(command, callback)
+local function terminal_login(method, callback)
   local buffer = vim.api.nvim_create_buf(false, true)
   local window = vim.api.nvim_open_win(buffer, true, {
     relative = "editor", border = "rounded", title = " Provider sign-in ",
@@ -48,7 +48,7 @@ local function terminal_login(command, callback)
   vim.api.nvim_create_autocmd("BufWipeout", { buffer = buffer, once = true,
     callback = function() finish(false) end })
   local launched, result = pcall(vim.api.nvim_buf_call, buffer, function()
-    return vim.fn.jobstart(command, { term = true,
+    return vim.fn.jobstart(method.command, { term = true, env = method.environment,
       on_exit = function(_, code)
         vim.schedule(function()
           finish(code == 0, code ~= 0 and ("Sign-in exited with status " .. code .. ". See the terminal output.") or nil)
@@ -87,10 +87,6 @@ function M.open(options)
   local function spec()
     local rows = {}
     if not busy then
-      if not runtime or (runtime.installable and not runtime.managed) then
-        rows[#rows + 1] = { id = "install", label = "Install supported runtime",
-          detail = runtime and ("Version " .. runtime.supported_version .. " · stored by Forge") or "Stored by Forge" }
-      end
       if runtime and runtime.available then
         for _, method in ipairs(runtime.auth_methods or {}) do
           rows[#rows + 1] = { id = method.id, label = method.label, detail = method.description, value = method }
@@ -100,8 +96,11 @@ function M.open(options)
     end
     local status = phase
     if not busy and runtime then
-      status = runtime.available and ("Runtime ready · " .. (runtime.provider_version or runtime.version or "external installation"))
-        or "ACP runtime is not installed"
+      local details = { runtime.available and "ACP adapter ready" or "ACP adapter is not installed" }
+      if runtime.provider_version then details[#details + 1] = "Claude Code " .. runtime.provider_version end
+      if runtime.adapter_version then details[#details + 1] = "Adapter " .. runtime.adapter_version end
+      if runtime.version_error then details[#details + 1] = runtime.version_error end
+      status = table.concat(details, " · ")
     end
     return { owner = owner, host = options.host,
       page_list = { { id = "setup", title = "Provider Setup", subtitle = failure or status,
@@ -110,8 +109,7 @@ function M.open(options)
       on_confirm = function(result)
         if busy or not current() then return false end
         local option = result.option
-        if option.id == "refresh" then refresh(false) return false end
-        if option.id == "install" then refresh(true) return false end
+        if option.id == "refresh" then refresh() return false end
         local method = option.value
         if not method then return false end
         busy, failure, phase = true, nil, "Complete sign-in in the browser or terminal..."
@@ -124,12 +122,12 @@ function M.open(options)
           busy = false
           if success then
             notifications.info("Provider sign-in completed", "Provider setup")
-            refresh(false)
+            refresh()
           elseif picker.is_open(owner) then picker.update(spec()) end
         end
         if method.terminal then
           picker.close()
-          terminal_login(method.command, finished)
+          terminal_login(method, finished)
         else
           picker.update(spec())
           client.request({ session_id = options.session_id, method = "session.provider.authenticate", params = { method = method.id } }, function(_, error)
@@ -142,15 +140,15 @@ function M.open(options)
       end,
     }
   end
-  refresh = function(install)
+  refresh = function()
     if not current() then return end
     generation = generation + 1
     local requested = generation
-    busy, failure, phase = true, nil, install and "Installing supported runtime..." or "Loading provider setup..."
+    busy, failure, phase = true, nil, "Loading provider setup..."
     session.harness.configuring = true
     require("forge.views.harness.controller").render()
     if picker.is_open(owner) then picker.update(spec()) else picker.open(spec()) end
-    client.request({ session_id = options.session_id, method = "session.provider.setup", params = { install = install } }, function(result, error)
+    client.request({ session_id = options.session_id, method = "session.provider.setup", params = {} }, function(result, error)
       if requested ~= generation or not current() then return end
       busy, failure = false, error
       session.harness.configuring = false
@@ -159,7 +157,7 @@ function M.open(options)
       if picker.is_open(owner) then picker.update(spec()) end
     end)
   end
-  refresh(false)
+  refresh()
 end
 
 return M

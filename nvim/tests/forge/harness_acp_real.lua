@@ -154,15 +154,15 @@ local succeeded, failure = xpcall(function()
       ready = require("forge.session").harness.ready, host_error = require("forge.session").harness.host_error }))
   assert(state.session,table.concat(notifications,"\n"))
   if vim.g.forge_acp_test_setup then
-    local installed = request("session.provider.setup", { install = true })
-    assert(installed.available and installed.managed, "managed ACP installation did not become available")
+    local installed = request("session.provider.setup", {})
+    assert(installed.available, "configured ACP adapter is unavailable")
     assert(#installed.auth_methods > 0, "provider omitted sign-in methods")
     local oauth = false
     for _, method in ipairs(installed.auth_methods) do
       if method.id == "claude-ai-login" or method.id == "oauth-personal" then oauth = true end
     end
     assert(oauth, "provider omitted the expected OAuth sign-in method")
-    print("ACP managed runtime and OAuth discovery passed: " .. backend .. " " .. installed.supported_version)
+    print("ACP runtime and OAuth discovery passed: " .. backend .. " " .. (installed.adapter_version or "unknown"))
   end
   if vim.g.forge_acp_test_trace then
     print("ACP trace: " .. vim.json.encode(request("host.trace.configure", { enabled = true })))
@@ -327,7 +327,7 @@ local succeeded, failure = xpcall(function()
     print("ACP completed shell output persistence passed: " .. backend)
   end
   if vim.g.forge_acp_test_setup then
-    local refreshed = request("session.provider.setup", { install = false })
+    local refreshed = request("session.provider.setup", {})
     assert(refreshed.available and refreshed.managed, "setup refresh lost the managed runtime")
     request("session.prompt.submit", { text = "Reply with exactly AFTER_SETUP_REFRESH. Do not call tools." })
     local resumed = request("session.state.get")

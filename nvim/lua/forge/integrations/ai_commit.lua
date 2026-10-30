@@ -329,7 +329,10 @@ function M.populate_commit_buffer_when_ready(buf, cwd, regenerate, comparison)
   local ref = comparison or (regenerate and "staged" or "HEAD")
   if not regenerate and not get_state(cwd, ref) then return end
   M._buffer_generation[buf] = cancel
-  autocmd = vim.api.nvim_create_autocmd({ "BufWritePre", "BufWipeout" }, { buffer = buf, once = true, callback = cancel })
+  autocmd = vim.api.nvim_create_autocmd({ "InsertEnter", "BufWritePre", "BufWipeout" }, {
+    buffer = buf, once = true,
+    callback = function(event) cancel(event.event == "InsertEnter") end,
+  })
   M.ensure(cwd, { ref = ref, force = regenerate == true, on_start = function(state)
     stop_progress = require("forge.render.generation_progress").watch(state, function()
       if current() then return true end

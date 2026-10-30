@@ -778,6 +778,12 @@ pub struct BackendModel {
 /// Requires session lifecycle ownership and provides explicit failures for optional operations.
 #[async_trait]
 pub trait Backend: Send + Sync {
+    /// Create or resume provider history and connections without admitting a model turn.
+    /// The returned identity belongs to the requested Harness session.
+    async fn initialize_session(&self, _request: BackendRequest) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Expose explicit response barriers only for the in-process mock provider.
     fn mock_response_control(&self) -> Option<&super::mock_response::MockResponseControl> {
         None
@@ -788,8 +794,8 @@ pub trait Backend: Send + Sync {
         false
     }
 
-    /// Inspect or explicitly install the selected provider runtime without creating a conversation.
-    async fn setup(&self, _request: BackendCatalogRequest, _install: bool) -> Result<Value> {
+    /// Inspect the installed provider runtime without creating a conversation.
+    async fn setup(&self, _request: BackendCatalogRequest) -> Result<Value> {
         Err(UnsupportedCapability("runtime_setup").into())
     }
 

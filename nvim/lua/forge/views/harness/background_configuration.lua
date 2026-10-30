@@ -89,13 +89,13 @@ function BackgroundConfiguration:fields()
   local policy = self.snapshot and self.snapshot.settings.auto_compaction
   local fields = {
     model = { id = "background-model", kind = "choice", value = selected and selected.model or "Loading…",
-      disabled_reason = catalog_disabled, description = "Model for Background requests, independent of the main conversation." },
+      disabled_reason = catalog_disabled },
     thinking = { id = "background-thinking", kind = "choice", label = "Thinking", value = selected and selected.thinking or "Default",
-      disabled_reason = catalog_disabled, description = "Reasoning effort for Background requests." },
+      disabled_reason = catalog_disabled },
     compact = { id = "background-compact", kind = "toggle", label = "Automatic", value = policy and policy.enabled == true,
-      disabled_reason = disabled, description = "Automatically compact Background sessions after completed turns." },
+      disabled_reason = disabled },
     threshold = { id = "background-threshold", kind = "input", label = "Threshold", value = tostring(policy and policy.threshold_tokens or 128000),
-      disabled_reason = disabled, muted = not (policy and policy.enabled), description = "Background compaction threshold in provider-reported context tokens." },
+      disabled_reason = disabled, muted = not (policy and policy.enabled) },
   }
   local capability = self.options.capability()
   if #self:speed_values() > 1 or (capability.fast_mode or capability.ultrafast_mode)
@@ -103,8 +103,7 @@ function BackgroundConfiguration:fields()
     local tier = selected and selected.service_tier or "default"
     local value = vim.tbl_contains(self:speed_values(), tier) and tier or (tier .. " (unsupported)")
     fields.speed = { id = "background-speed", kind = "choice", label = "Speed",
-      value = value, disabled_reason = disabled,
-      description = "Provider service tier for Background requests, independent of the main conversation." }
+      value = value, disabled_reason = disabled }
   end
   return fields
 end

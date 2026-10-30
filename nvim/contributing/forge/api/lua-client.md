@@ -129,6 +129,8 @@ Ensure the runtime and requested initial-session workflow. `callback` is optiona
 
 `services_only = true` returns `{ initialized = true }` without a session. Otherwise the callback receives a session snapshot. An explicit `session_id` resumes that ID, including when another session is already initialized. An explicit new-session choice creates a new session. Concurrent callers retain their own choices. No explicit-target failure selects another session.
 
+An interactive session snapshot can arrive before provider startup completes. Codex and Copilot initialization runs asynchronously without submitting model input, and a later `session_configured` event carries the retained provider thread identity. Startup failures arrive as session `backend_event` errors and are also returned by MCP inspection. Service-only initialization does not start a provider conversation.
+
 The first interactive initialization with no options uses the configured initial-session workflow. This convenience belongs to opening the Harness UI. General requests use service-only initialization and cannot invoke it as a side effect.
 
 ### `session_create(options, callback)`

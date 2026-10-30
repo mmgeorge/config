@@ -381,18 +381,18 @@ impl AcpBackend {
 
 #[async_trait]
 impl Backend for AcpBackend {
-    async fn setup(&self, request: BackendCatalogRequest, install: bool) -> Result<Value> {
+    async fn setup(&self, request: BackendCatalogRequest) -> Result<Value> {
         ensure!(
             !self.has_active_turn(&request.runtime_key()?).await,
             "Finish active provider work before setup"
         );
-        let status = if install {
-            self.runtime.install().await?
-        } else {
-            self.runtime.status()
-        };
+        let status = self.runtime.status();
         let mut result = serde_json::to_value(&status)?;
         result["auth_methods"] = json!([]);
+        match status.provider_version().await {
+            Ok(version) => result["provider_version"] = json!(version),
+            Err(error) => result["version_error"] = json!(format!("{error:#}")),
+        }
         if !status.available {
             return Ok(result);
         }
@@ -408,7 +408,7 @@ impl Backend for AcpBackend {
             None
         };
         let transport = AcpTransport::launch(
-            &status.command,
+            &status,
             &request.workspace,
             state,
             profile.as_ref().map(ResourceProfile::path),
@@ -428,7 +428,7 @@ impl Backend for AcpBackend {
             initialized["protocolVersion"] == 1,
             "ACP agent did not negotiate protocol v1"
         );
-        result["provider_version"] = initialized
+        result["adapter_version"] = initialized
             .pointer("/agentInfo/version")
             .cloned()
             .unwrap_or(Value::Null);
@@ -439,7 +439,8 @@ impl Backend for AcpBackend {
                 if terminal { command.extend(method.get("args").and_then(Value::as_array).into_iter().flatten()
                     .filter_map(Value::as_str).map(str::to_owned)); }
                 json!({"id":method["id"],"label":method["name"],"description":method["description"],
-                    "terminal":terminal,"command":if terminal { json!(command) } else { Value::Null }})
+                    "terminal":terminal,"command":if terminal { json!(command) } else { Value::Null },
+                    "environment":status.environment})
             }).collect::<Vec<_>>());
         Ok(result)
     }
@@ -521,11 +522,13 @@ impl Backend for AcpBackend {
             let native_fork = descriptor.capability.native_fork;
             let native_steer = descriptor.capability.native_steer;
             manifest = CapabilityManifest::from_descriptor(descriptor);
-            manifest.provider_version = session
-                .initialized
-                .pointer("/agentInfo/version")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            if self.kind != BackendKind::Claude {
+                manifest.provider_version = session
+                    .initialized
+                    .pointer("/agentInfo/version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
             let catalog = session.state.catalog.read().await;
             manifest.notice = catalog["mcpResources"]
                 .as_array()
@@ -565,10 +568,17 @@ impl Backend for AcpBackend {
             manifest.availability_reason =
                 Some("Agent startup and authentication have not completed".into());
         }
-        if !self.runtime.status().available {
+        let status = self.runtime.status();
+        if self.kind == BackendKind::Claude {
+            match status.provider_version().await {
+                Ok(version) => manifest.provider_version = version,
+                Err(error) => manifest.notice.push(format!("{error:#}")),
+            }
+        }
+        if !status.available {
             manifest.availability = "blocked";
             manifest.availability_reason =
-                Some("ACP runtime is not installed. Open /config → Provider setup".into());
+                Some("ACP runtime is not installed. Configure an installed ACP adapter in harness.backends".into());
         }
         Ok(manifest)
     }

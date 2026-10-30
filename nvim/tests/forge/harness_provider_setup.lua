@@ -3,9 +3,10 @@ local state = require("forge.session").harness
 state.session = { id = "setup-test", backend = "claude" }
 local notices = {}
 vim.notify = function(message, level) notices[#notices + 1] = { message = message, level = level } end
-local installation = false
+local available = false
+local version_error
 local refreshes = 0
-local auth_command = { "node", "-e", "process.exit(0)" }
+local auth_command = { "node", "-e", "process.exit(process.env.FORGE_AUTH_FIXTURE === 'installed-cli' ? 0 : 8)" }
 local calls = {}
 package.loaded["forge.views.harness.controller"] = { render = function() end }
 package.loaded["forge.client"] = { request = function(request_specification, callback)
@@ -18,10 +19,12 @@ package.loaded["forge.client"] = { request = function(request_specification, cal
   vim.schedule(function()
     if method == "session.provider.setup" then
       refreshes = refreshes + 1
-      installation = installation or params.install
-      callback({ available = installation, managed = installation, installable = true,
-        supported_version = "fixture", version = installation and "fixture" or nil,
-        auth_methods = installation and { { id = "oauth", label = "OAuth", terminal = true, command = auth_command } } or {},
+      assert(params.install == nil, "setup must never request installation")
+      callback({ available = available, managed = false,
+        adapter_version = available and "0.89.1" or nil, provider_version = not version_error and "2.1.302" or nil,
+        version_error = version_error,
+        auth_methods = available and { { id = "oauth", label = "OAuth", terminal = true, command = auth_command,
+          environment = { FORGE_AUTH_FIXTURE = "installed-cli" } } } or {},
       })
     else callback({ authenticated = true }) end
   end)
@@ -40,10 +43,14 @@ local function wait_for(id)
 end
 local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
 setup.open({ host = host, session_id = "setup-test" })
-local spec, option = wait_for("install")
+local spec, option = wait_for("refresh")
+assert(not selected("install"), "missing runtime exposed an installer")
+assert(spec.page_list[1].subtitle:find("Claude Code 2.1.302", 1, true), "installed CLI version is hidden without an adapter")
+available = true
 spec.on_confirm({ option = option })
 spec, option = wait_for("oauth")
-assert(calls[#calls].params.install == true)
+assert(not selected("install"), "available runtime exposed an installer")
+assert(spec.page_list[1].subtitle:find("Claude Code 2.1.302 · Adapter 0.89.1", 1, true), "CLI and adapter versions were conflated")
 spec.on_confirm({ option = option })
 assert(vim.wait(5000, function() return not state.configuring and refreshes == 3 end, 10), "successful terminal login did not refresh setup")
 wait_for("oauth")
@@ -72,5 +79,11 @@ assert(vim.wait(5000, function()
   return not state.configuring and vim.fn.jobwait({ login_job }, 0)[1] ~= -1
 end, 10), "cancelled login retained its process or configuration lock")
 assert(refreshes == before, "cancelled login was reported as successful")
+version_error = "Claude Code version check failed: fixture error"
+setup.open({ host = host, session_id = "setup-test" })
+spec, option = wait_for("oauth")
+assert(spec.page_list[1].subtitle:find(version_error, 1, true), "version failure was hidden")
+assert(option.value.terminal, "version failure removed authentication actions")
+picker.close()
 print("harness_provider_setup: passed")
 vim.cmd("qa!")

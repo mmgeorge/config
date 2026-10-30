@@ -28,13 +28,17 @@ pub(super) struct AcpTransport {
 impl AcpTransport {
     /// Launch a provider with hidden, collected descendants and stable ACP v1 framing.
     pub(super) async fn launch(
-        command: &[String],
+        runtime: &super::runtime::RuntimeStatus,
         workspace: &str,
         handler: Arc<dyn AcpHandler>,
         profile: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let program = command.first().context("ACP provider command is empty")?;
-        let mut launch = crate::process::command(program, &command[1..]);
+        let program = runtime
+            .command
+            .first()
+            .context("ACP provider command is empty")?;
+        let mut launch = crate::process::command(program, &runtime.command[1..]);
+        launch.envs(&runtime.environment);
         if let Some(profile) = profile {
             launch.env("GEMINI_HOME", profile);
         }

@@ -4,6 +4,20 @@ Provider adapters normalize transport-specific identities, capabilities, activit
 
 Harness lifecycle and permission ownership remain in [Harness](harness.md). Transport admission and framing are described in [Host and protocol](host-and-protocol.md).
 
+Interactive Codex and Copilot conversations initialize their provider session asynchronously
+on open, creation, and resume. Initialization captures the session settings without creating
+an exchange or submitting model input. The controller releases its broker lock during
+network work, retains the native thread identity on success, and rejects stale results after
+configuration changes. Failures reach the owning session and its MCP inspection request.
+Shutdown cancels outstanding initialization before collecting provider processes.
+
+Codex serializes initialization with first-turn setup and retains the thread on the shared
+connection. Startup registers the root tool schemas before the first prompt. Execution-time
+control contexts still determine which calls are authorized. A later prompt resumes that
+thread with its current model, policy, and instructions. Copilot reuses its initialized SDK
+session and can refresh its registered tool set while retaining the same conversation.
+Background generation and internal plan-answer forks retain their separate admission paths.
+
 Model requests run through Harness provider adapters. Commit messages and PR descriptions
 share the same persistent, branch-aware Background session, provider thread, and
 Background model and thinking settings. Each exchange repeats its own task and output
@@ -214,13 +228,15 @@ unclosed children become interrupted, with nested children finalized before thei
 `/capabilities` reports child observation as limited because this boundary observes active
 prompts and does not expose independent child control or background observation.
 
-`AcpRuntime` resolves explicit commands and pinned Forge-managed installations. `/config` exposes
-Provider setup for Claude and Antigravity. Installation writes into a temporary directory under
-`provider-runtime`, validates the expected executable, then publishes the version directory atomically.
-An OS file lock excludes concurrent installers. Failed installation preserves existing versions.
-Claude uses its pinned npm package and requires Node.js 22 or newer. Antigravity uses Google's
-platform-specific archive with complete download and extraction, rejecting escaping paths and symlinks.
-Neither installer changes global CLI installations or shell configuration.
+`AcpRuntime` resolves configured ACP adapters and falls back to an existing Forge-managed copy
+for default commands. `/config` exposes inspection and authentication for Claude and Antigravity.
+Forge does not install or download provider runtimes. Missing adapters require an externally
+installed command configured in `harness.backends`.
+Claude uses the installed `claude` executable when available, preserving an explicit
+`CLAUDE_CODE_EXECUTABLE` override. ACP launches and terminal authentication receive the same
+executable selection. Setup reports the native CLI version separately from the adapter's
+`agentInfo.version`, including when the adapter is unavailable. Version-query failures remain
+visible without discarding the available authentication actions.
 Setup and authentication hold session execution and cleanup admission, so they reject active work.
 The setup handshake advertises terminal authentication support. Claude OAuth runs the advertised
 CLI in a Neovim terminal, while Antigravity OAuth uses its ACP authentication request. Terminal

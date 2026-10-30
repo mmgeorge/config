@@ -38,6 +38,7 @@ use security::CodexSecurity;
 struct CodexConnection {
     process: CodexJsonRpc,
     timing: Vec<BackendTimingRecord>,
+    thread_id: Option<String>,
 }
 
 struct TerminalConnection {
@@ -57,6 +58,7 @@ pub struct CodexBackend {
     active_turn_by_session: Mutex<HashMap<String, CodexTurnState>>,
     turn_started: Notify,
     connection_by_session: Mutex<HashMap<String, Arc<Mutex<CodexConnection>>>>,
+    startup_by_session: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     terminal_connection_by_session: Mutex<HashMap<String, Arc<Mutex<Option<TerminalConnection>>>>>,
     completed_turn_by_session: Mutex<HashMap<String, String>>,
     permission_coordinator: Arc<PermissionCoordinator>,
@@ -145,6 +147,7 @@ impl CodexBackend {
             active_turn_by_session: Mutex::new(HashMap::new()),
             turn_started: Notify::new(),
             connection_by_session: Mutex::new(HashMap::new()),
+            startup_by_session: Mutex::new(HashMap::new()),
             terminal_connection_by_session: Mutex::new(HashMap::new()),
             completed_turn_by_session: Mutex::new(HashMap::new()),
             permission_coordinator,
@@ -203,6 +206,7 @@ impl CodexBackend {
         process.notify("initialized", Value::Null).await?;
         Ok(CodexConnection {
             process,
+            thread_id: None,
             timing: vec![
                 BackendTimingRecord {
                     phase: "codex.process_start".into(),
@@ -403,6 +407,17 @@ impl CodexBackend {
             .await
             .insert(request.runtime_key()?, Arc::clone(&connection));
         Ok(connection)
+    }
+
+    async fn startup_guard(&self, session_id: String) -> tokio::sync::OwnedMutexGuard<()> {
+        self.startup_by_session
+            .lock()
+            .await
+            .entry(session_id)
+            .or_default()
+            .clone()
+            .lock_owned()
+            .await
     }
 
     async fn steering_lane(&self, session_id: &str) -> SteeringLane {
@@ -1192,6 +1207,36 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
+    async fn initialize_session(&self, mut request: BackendRequest) -> Result<Option<String>> {
+        let _startup = self.startup_guard(request.runtime_key()?).await;
+        let mut output = BackendOutput::default();
+        let connection = self
+            .persistent_connection(&request, &mut output, None)
+            .await?;
+        let mut connection = connection.lock().await;
+        if let Some(thread) = &connection.thread_id {
+            return Ok(Some(thread.clone()));
+        }
+        request.model = self
+            .resolve_model(&request, &mut connection.process, &mut output)
+            .await?;
+        let tools = ControlToolRegistry
+            .definition_list_for_owner(&request.owner()?, true, true)
+            .into_iter()
+            .map(|definition| {
+                json!({
+                    "type":"function", "name":definition.name, "description":definition.description,
+                    "inputSchema":definition.input_schema,
+                })
+            })
+            .collect();
+        let thread = self
+            .load_thread(&mut connection.process, &mut output, &request, false, tools)
+            .await?;
+        connection.thread_id = Some(thread.clone());
+        Ok(Some(thread))
+    }
+
     fn supports_task_steering(&self, _kind: crate::task::TaskKind) -> bool {
         false
     }
@@ -1441,6 +1486,7 @@ impl Backend for CodexBackend {
         }
         self.runtime.shutdown().await?;
         self.connection_by_session.lock().await.clear();
+        self.startup_by_session.lock().await.clear();
         self.terminal_connection_by_session.lock().await.clear();
         self.steering_by_session.lock().await.clear();
         self.active_turn_by_session.lock().await.clear();
@@ -1490,11 +1536,19 @@ impl Backend for CodexBackend {
                 },
             };
             let coordinator_event_sink = event_sink.clone();
+            let startup = self.startup_guard(request.runtime_key()?).await;
             let connection = self
                 .persistent_connection(&request, &mut output, event_sink)
                 .await?;
             let mut connection = connection.lock().await;
-            let process = &mut connection.process;
+            if request.backend_session_id.is_none() {
+                request.backend_session_id.clone_from(&connection.thread_id);
+            }
+            let CodexConnection {
+                process,
+                thread_id: retained_thread,
+                ..
+            } = &mut *connection;
             process.set_activity_publication(false);
             let request_text = request.input.text();
             let mut control_context = request.control_context.clone().unwrap_or_else(|| {
@@ -1536,6 +1590,8 @@ impl Backend for CodexBackend {
             let thread_id = self
                 .load_thread(process, &mut output, &request, false, dynamic_tool_list)
                 .await?;
+            *retained_thread = Some(thread_id.clone());
+            drop(startup);
             if request.backend_session_id.is_some()
                 && let Some(gate) = request
                     .control_context
@@ -1831,6 +1887,7 @@ impl Backend for CodexBackend {
             resources.retain_thread(&backend_session_id).await;
         }
         let timing = connection.timing.clone();
+        connection.thread_id = Some(backend_session_id.clone());
         self.connection_by_session.lock().await.insert(
             request.target_harness_session_id,
             Arc::new(Mutex::new(connection)),
@@ -2219,6 +2276,120 @@ impl Backend for CodexBackend {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[tokio::test]
+    async fn eager_initialization_reuses_thread_without_starting_a_turn() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(fixture.path())?);
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for method in ["thread/start", "thread/resume", "turn/start"] {
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(request["method"], method);
+                if method == "thread/start" {
+                    assert_eq!(request["params"]["ephemeral"], false);
+                    assert!(
+                        !request["params"]["dynamicTools"]
+                            .as_array()
+                            .unwrap()
+                            .is_empty()
+                    );
+                } else {
+                    assert_eq!(request["params"]["threadId"], "prepared-thread");
+                }
+                let response = if method == "turn/start" {
+                    json!({"turn":{"id":"first-turn"}})
+                } else {
+                    json!({"thread":{"id":"prepared-thread"}})
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":response})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if method == "turn/start" {
+                    for message in [
+                        json!({"method":"item/completed","params":{"threadId":"prepared-thread","turnId":"first-turn","item":{"id":"answer","type":"agentMessage","phase":"final_answer","text":"ready"}}}),
+                        json!({"method":"turn/completed","params":{"threadId":"prepared-thread","turn":{"id":"first-turn","status":"completed"}}}),
+                    ] {
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                message.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        });
+        let process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            ApprovalMode::Ask,
+            permission,
+            None,
+            trace,
+            "eager".into(),
+        )
+        .await?;
+        backend.connection_by_session.lock().await.insert(
+            "eager".into(),
+            Arc::new(Mutex::new(CodexConnection {
+                process,
+                timing: Vec::new(),
+                thread_id: None,
+            })),
+        );
+        let mut request = CodexBackend::catalog_backend_request(&BackendCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "eager".into(),
+            workspace,
+            access: Default::default(),
+            approval_mode: ApprovalMode::Ask,
+            backend_session_id: None,
+        });
+        request.model = "fixture-model".into();
+        assert_eq!(
+            backend.initialize_session(request.clone()).await?,
+            Some("prepared-thread".into())
+        );
+        assert!(backend.active_turn_by_session.lock().await.is_empty());
+        assert_eq!(
+            backend.initialize_session(request.clone()).await?,
+            Some("prepared-thread".into())
+        );
+        request.input = BackendInput::from_text("first prompt");
+        let output = backend.prompt(request.clone()).await?;
+        assert_eq!(
+            output.completion.backend_session_id.as_deref(),
+            Some("prepared-thread")
+        );
+        assert!(serde_json::to_string(&output.event)?.contains("ready"));
+        assert_eq!(
+            backend.initialize_session(request).await?,
+            Some("prepared-thread".into())
+        );
+        server.await?;
+        backend.shutdown().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn checkpoint_hook_preserves_user_hooks_and_disappears_when_ready() -> Result<()> {
@@ -2733,6 +2904,7 @@ mod test {
             "speed-test".into(),
             Arc::new(Mutex::new(CodexConnection {
                 process,
+                thread_id: None,
                 timing: Vec::new(),
             })),
         );
@@ -3035,6 +3207,7 @@ mod test {
                 "session".into(),
                 Arc::new(Mutex::new(CodexConnection {
                     process,
+                    thread_id: None,
                     timing: Vec::new(),
                 })),
             );
@@ -3323,6 +3496,7 @@ mod test {
                 "session".into(),
                 Arc::new(Mutex::new(CodexConnection {
                     process,
+                    thread_id: None,
                     timing: Vec::new(),
                 })),
             );
