@@ -1301,7 +1301,7 @@ impl SessionController {
         let owner = Arc::downgrade(self);
         let sink = sink.clone();
         *startup = Some(tokio::spawn(async move {
-            let initialized = backend.initialize_session(request.clone()).await;
+            let mut initialized = backend.initialize_session(request.clone()).await;
             let Some(owner) = owner.upgrade() else {
                 return;
             };
@@ -1309,6 +1309,18 @@ impl SessionController {
                 || owner.mcp_revision.load(Ordering::Acquire) != revision
             {
                 return;
+            }
+            if initialized.as_ref().is_err_and(|error| {
+                matches!(
+                    error.downcast_ref::<crate::backend::BackendError>(),
+                    Some(crate::backend::BackendError::SessionMissing { .. })
+                )
+            }) {
+                initialized = initialized.map_err(|error| {
+                    error.context(
+                    "Saved provider history is unavailable; retained conversation was preserved"
+                )
+                });
             }
             let result: Result<()> = async {
                 let Some(provider_id) = initialized? else {
@@ -1347,25 +1359,46 @@ impl SessionController {
         }));
     }
 
+    /// Gate dependent provider requests on completed, successful initialization.
+    async fn provider_ready(&self) -> bool {
+        self.provider_startup
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+            && self
+                .provider_startup_error
+                .lock()
+                .expect("provider startup state poisoned")
+                .is_none()
+    }
+
     async fn background_terminals(&self) -> Result<crate::backend::terminal::TerminalSnapshot> {
-        let request = self.catalog_request.read().await.clone();
-        let revision = self.mcp_revision.load(Ordering::Acquire);
         let configuring = || -> Result<bool> { Ok(self.observer.admission.runtime()?.configuring) };
         let pending = || crate::backend::terminal::TerminalSnapshot {
             supported: true,
-            starting: true,
+            starting: self
+                .provider_startup_error
+                .lock()
+                .expect("provider startup state poisoned")
+                .is_none(),
             terminal: Vec::new(),
         };
-        if configuring()? {
+        if configuring()? || !self.provider_ready().await {
             return Ok(pending());
         }
+        let request = self.catalog_request.read().await.clone();
+        let revision = self.mcp_revision.load(Ordering::Acquire);
         let result = tokio::time::timeout(
             Duration::from_secs(8),
             self.backend.background_terminals(request.clone()),
         )
         .await
         .context("background terminal query timed out");
-        if revision != self.mcp_revision.load(Ordering::Acquire) || configuring()? {
+        if revision != self.mcp_revision.load(Ordering::Acquire)
+            || configuring()?
+            || !self.provider_ready().await
+        {
             return Ok(pending());
         }
         result?

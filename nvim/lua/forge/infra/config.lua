@@ -1,4 +1,6 @@
 ---@class ForgeConfig
+---@field text_correction ForgeTextCorrectionConfig
+---@field harper ForgeHarperConfig
 ---@field status_buffer_name string
 ---@field status_open_target "tab"|"buffer" Destination for files opened from ForgeStatus.
 ---@field pr_buffer_name string
@@ -174,8 +176,29 @@
 ---@field setup fun(opts?: ForgeConfig): ForgeConfig
 local M = {}
 
+---@class ForgeTextCorrectionConfig
+---@field enabled boolean
+---@field language string
+---@field terminology string[]
+---@field project_terms table<string, string[]>
+---@field wordlist string|false
+---@field assets? {unigram: string, bigram: string}
+
+---@class ForgeHarperConfig
+---@field enabled boolean
+---@field cmd string[]
+---@field settings table
+
 ---@type ForgeConfig
 M.defaults = {
+  harper = { enabled = true, cmd = { 'harper-ls', '--stdio' }, settings = {
+    dialect = 'American', diagnosticSeverity = 'hint',
+    -- Largest exact JSON integer avoids Harper's small default document cutoff.
+    maxFileLength = 9007199254740991,
+    linters = { SpellCheck = false, SentenceCapitalization = false, SpelledNumbers = false },
+  } },
+  text_correction = { enabled = true, language = "en-US", terminology = {}, project_terms = {},
+    wordlist = require("forge.text.wordlist").default_path },
   status_buffer_name = "ForgeStatus",
   status_open_target = "tab",
   pr_buffer_name = "ForgePR",
@@ -382,6 +405,42 @@ function M.setup(opts)
     return result
   end
   local options = (opts == nil or vim.tbl_isempty(opts)) and vim.deepcopy(M.defaults) or merge(M.defaults, opts)
+  local correction = options.text_correction
+  if type(options.harper)~='table' or type(options.harper.enabled)~='boolean'
+    or type(options.harper.cmd)~='table' or not vim.islist(options.harper.cmd) or #options.harper.cmd==0
+    or type(options.harper.settings)~='table' then error('harper requires enabled, cmd, and settings') end
+  for _,argument in ipairs(options.harper.cmd) do
+    if type(argument)~='string' or argument=='' then error('harper cmd must contain nonempty strings') end
+  end
+  if type(correction) ~= "table" or type(correction.enabled) ~= "boolean" or correction.language ~= "en-US" then
+    error("text_correction requires enabled boolean and language en-US")
+  end
+  local function validate_terms(terms)
+    if type(terms) ~= "table" or not vim.islist(terms) then error("text_correction terminology must be a list") end
+    for _, term in ipairs(terms) do
+      if type(term) ~= "string" or term == "" or term:find("%s") then error("text_correction terms must be individual nonempty words") end
+    end
+  end
+  validate_terms(correction.terminology)
+  if correction.wordlist~=false and (type(correction.wordlist)~="string" or correction.wordlist=="") then
+    error("text_correction wordlist must be a nonempty path or false")
+  end
+  if type(correction.project_terms) ~= "table" then error("text_correction project_terms must be a map") end
+  for root, terms in pairs(correction.project_terms) do
+    if type(root) ~= "string" or root == "" then error("text_correction project keys must be paths") end
+    validate_terms(terms)
+  end
+  if correction.assets ~= nil then
+    if type(correction.assets) ~= "table" then error("text_correction assets must contain unigram and bigram paths") end
+    for _, name in ipairs({ "unigram", "bigram" }) do
+      if type(correction.assets[name]) ~= "string" or correction.assets[name] == "" then
+        error("text_correction assets require a nonempty " .. name .. " path")
+      end
+    end
+    for name in pairs(correction.assets) do
+      if name ~= "unigram" and name ~= "bigram" then error("unknown text_correction asset: " .. tostring(name)) end
+    end
+  end
   if options.status_open_target ~= "tab" and options.status_open_target ~= "buffer" then
     error('status_open_target must be "tab" or "buffer"')
   end

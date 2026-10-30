@@ -1,0 +1,74 @@
+{
+  "replace": {
+    "request": {
+      "method": "text.correct",
+      "params": {
+        "protected": [],
+        "occurrence": "wire-example",
+        "profile": "D:\\config:5890e7f71377abf4c422f3604917a8adda3ad63be2a013a52eb35a74372ee9b7",
+        "context": "The value is greater then zero.",
+        "target": {
+          "end": 25,
+          "start": 21
+        },
+        "profile_revision": "db2180d85ba3a52fd5612c79b953216a12baf1dc2539138477129b6477d81181"
+      }
+    },
+    "result": {
+      "replacement": "than",
+      "original": "then",
+      "dictionary_revision": "b6f7175aa47332cb45d7760d19f9f7562091683dc9d2ff1743d18915a15ea639",
+      "reasons": [
+        "contextual_choice"
+      ],
+      "decision": "replace",
+      "occurrence": "wire-example",
+      "profile": "D:\\config:5890e7f71377abf4c422f3604917a8adda3ad63be2a013a52eb35a74372ee9b7",
+      "model_revision": "en-US-bigram-1",
+      "profile_revision": "db2180d85ba3a52fd5612c79b953216a12baf1dc2539138477129b6477d81181"
+    }
+  },
+  "unchanged": {
+    "request": {
+      "method": "text.correct",
+      "params": {
+        "protected": [],
+        "occurrence": "unchanged-example",
+        "profile": "D:\\config:5890e7f71377abf4c422f3604917a8adda3ad63be2a013a52eb35a74372ee9b7",
+        "context": "Please receive",
+        "target": {
+          "end": 14,
+          "start": 7
+        },
+        "profile_revision": "db2180d85ba3a52fd5612c79b953216a12baf1dc2539138477129b6477d81181"
+      }
+    },
+    "result": {
+      "decision": "unchanged",
+      "occurrence": "unchanged-example",
+      "profile": "D:\\config:5890e7f71377abf4c422f3604917a8adda3ad63be2a013a52eb35a74372ee9b7",
+      "model_revision": "en-US-bigram-1",
+      "dictionary_revision": "b6f7175aa47332cb45d7760d19f9f7562091683dc9d2ff1743d18915a15ea639",
+      "profile_revision": "db2180d85ba3a52fd5612c79b953216a12baf1dc2539138477129b6477d81181"
+    }
+  },
+  "initialize": {
+    "request": {
+      "method": "text.initialize",
+      "params": {
+        "terminology": [
+          "Neovim",
+          "serde",
+          "tokio"
+        ],
+        "profile": "D:/config:5890e7f71377abf4c422f3604917a8adda3ad63be2a013a52eb35a74372ee9b7"
+      }
+    },
+    "result": {
+      "profile": "D:/config:5890e7f71377abf4c422f3604917a8adda3ad63be2a013a52eb35a74372ee9b7",
+      "model_revision": "en-US-bigram-1",
+      "dictionary_revision": "b6f7175aa47332cb45d7760d19f9f7562091683dc9d2ff1743d18915a15ea639",
+      "profile_revision": "db2180d85ba3a52fd5612c79b953216a12baf1dc2539138477129b6477d81181"
+    }
+  }
+}

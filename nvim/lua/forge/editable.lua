@@ -156,6 +156,7 @@ end
 ---@param selected? table<string, boolean>
 ---@return table[]
 function M.capture_draft(state, selected)
+  if state.native then require("forge.text").invalidate(state.native.buffer) end
   assert(not state.fault, state.fault)
   local captured = {}
   for region, entry in pairs(state.region) do
@@ -262,6 +263,7 @@ function M.detach(state)
   if not native then
     return
   end
+  require("forge.text").detach(native.buffer)
   native.active = false
   native.generation = native.generation + 1
   state.native = nil
@@ -331,6 +333,10 @@ function M.attach(state, buffer, region_ranges, options)
     modified = vim.bo[buffer].modified,
   }
   state.native = native
+  require("forge.text").attach(buffer, { kind = "native", guard = function(start, finish)
+    local region = M.guard_region(state, start, finish)
+    return region == "title" or region == "body" or region and region:match("/body$") ~= nil
+  end })
   local attached = vim.api.nvim_buf_attach(buffer, false, {
     ---@return boolean? detach
     on_changedtick = function()

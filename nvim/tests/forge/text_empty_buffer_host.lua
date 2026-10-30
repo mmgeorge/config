@@ -1,0 +1,40 @@
+local fixture = dofile('nvim/tests/forge/support/text_fixture.lua').open()
+local ok, failure = xpcall(function()
+  fixture.exec([[
+    require('forge.text').detach(vim.api.nvim_get_current_buf())
+    vim.bo.filetype = 'ForgeHarnessInput'
+    require('forge.text').attach(vim.api.nvim_get_current_buf(), { kind = 'prompt' })
+  ]])
+  fixture.type('iPlease recieve ')
+  fixture.wait('Please receive ')
+  local requests = fixture.exec('return #text_requests')
+  fixture.type('<Esc>ggVGd')
+  fixture.wait('')
+  fixture.type('i ')
+  fixture.wait(' ')
+  assert(fixture.exec('return #text_errors') == 0, vim.inspect(fixture.exec('return text_errors')))
+  assert(fixture.exec('return #text_requests') == requests, 'empty prompt submitted a correction')
+  fixture.type('Please recieve ')
+  fixture.wait(' Please receive ')
+
+  fixture.exec('text_hold = true')
+  fixture.type('teh ')
+  assert(vim.wait(1000, function() return fixture.exec('return #text_requests') > requests + 1 end, 5))
+  fixture.type('<Esc>ggdG')
+  fixture.wait('')
+  fixture.exec([[
+    local request = text_requests[#text_requests]
+    request.callback({ decision = 'replace', occurrence = request.occurrence.id,
+      original = 'teh', replacement = 'the', profile = 'fixture', profile_revision = 'revision' })
+    text_hold = false
+  ]])
+  fixture.wait('')
+  fixture.type('iPlease recieve ')
+  fixture.wait('Please receive ')
+  fixture.type('<Esc>u')
+  assert(fixture.exec('return #text_errors') == 0, vim.inspect(fixture.exec('return text_errors')))
+end, debug.traceback)
+fixture.close()
+assert(ok, failure)
+print('text empty prompt: delete-all, empty delimiter, stale response, undo, and retyping passed')
+vim.cmd('qa!')

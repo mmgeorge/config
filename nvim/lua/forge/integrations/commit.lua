@@ -192,6 +192,7 @@ function M.editor(target, client_addr)
   local finished = false
   local leave_autocmd
   local function finish(abort)
+    require("forge.text").invalidate(buf)
     if finished then return end
     finished = true
     record(st.trace, "editor.submit", {

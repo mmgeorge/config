@@ -5,6 +5,10 @@ describes the current local plugin configuration. The source registration define
 argument parsing and completion. Contributor documentation starts at
 [Contributing to Forge](../../contributing/forge/README.md).
 
+[Local text correction](text-correction.md) documents the optional local spelling service,
+its eligible prose regions, and immediate Backspace rejection. It does not add a slash
+command or a provider request.
+
 ## Harness inspection
 
 Opening, creating, or resuming a Harness conversation starts its Codex or Copilot

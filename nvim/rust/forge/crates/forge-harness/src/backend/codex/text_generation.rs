@@ -88,7 +88,7 @@ pub(super) async fn generate(
             .request(
                 "thread/start",
                 json!({"model": (model != "default").then_some(model),
-            "cwd":workspace,"approvalPolicy":"never","sandbox":"read-only","ephemeral":true,
+            "cwd":workspace,"approvalPolicy":"never","sandbox":"read-only","ephemeral":true,"historyMode":"paginated",
             "dynamicTools":[],"config":config,"baseInstructions":purpose.instructions()}),
                 output,
             )

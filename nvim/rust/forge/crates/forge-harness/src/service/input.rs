@@ -325,7 +325,7 @@ impl SessionController {
         &self,
         applied: &mut Option<NativeGoalSelection>,
     ) -> Result<()> {
-        if !self.observer.native_goal_supported()? {
+        if !self.observer.native_goal_supported()? || !self.provider_ready().await {
             return Ok(());
         }
         let session = SqliteStore::read_only(&self.data_root)?

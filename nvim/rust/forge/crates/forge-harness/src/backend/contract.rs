@@ -321,6 +321,10 @@ pub enum BackendError {
         code: Option<String>,
         message: String,
     },
+    /// The provider cannot find the conversation requested for resumption.
+    SessionMissing {
+        message: String,
+    },
     Rejected {
         message: String,
     },
@@ -335,6 +339,7 @@ impl std::fmt::Display for BackendError {
             Self::Transport { message }
             | Self::Protocol { message }
             | Self::Provider { message, .. }
+            | Self::SessionMissing { message }
             | Self::Rejected { message } => formatter.write_str(message),
             Self::Retryable(error) => std::fmt::Display::fmt(error, formatter),
             Self::Delivery(error) => std::fmt::Display::fmt(error, formatter),
@@ -779,7 +784,8 @@ pub struct BackendModel {
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Create or resume provider history and connections without admitting a model turn.
-    /// The returned identity belongs to the requested Harness session.
+    /// The returned identity belongs to the requested Harness session in this runtime.
+    /// The broker decides whether to resume or replace it when reopening local history.
     async fn initialize_session(&self, _request: BackendRequest) -> Result<Option<String>> {
         Ok(None)
     }

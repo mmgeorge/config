@@ -19,6 +19,7 @@ pub(crate) mod repository_write;
 pub struct ForgeRuntime {
     pub(crate) writes: repository_write::RepositoryWriteGateway,
     pub(crate) generation: commit_message::GenerationService,
+    pub(crate) text: forge_text::TextCorrectionService,
     pub(crate) syntax: Arc<forge_diff::syntax::SyntaxEngine>,
     pub(crate) status: forge_status::StatusService,
     pub(crate) sources: forge_status::source_document::SourceDocumentService,
@@ -77,6 +78,7 @@ impl ForgeRuntime {
         Ok(Self {
             writes,
             generation,
+            text: forge_text::TextCorrectionService::new(),
             syntax,
             status,
             sources,
@@ -97,6 +99,7 @@ impl ForgeRuntime {
     pub async fn shutdown(&self) -> Result<()> {
         self.writes.close();
         self.generation.close();
+        self.text.close();
         self.status.close_all();
         self.sources.close_all();
         self.walkthrough.close_all();
@@ -109,7 +112,7 @@ impl ForgeRuntime {
         let harness = self.harness.shutdown(SHUTDOWN_DEADLINE).await;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         self.diff.close();
-        let (report, unfinished_analysis, storage, remote, review, issues, generation) = tokio::join!(
+        let (report, unfinished_analysis, storage, remote, review, issues, generation, text) = tokio::join!(
             self.repositories.shutdown(remaining),
             self.diff.shutdown(remaining),
             self.github.shutdown(remaining),
@@ -117,6 +120,7 @@ impl ForgeRuntime {
             self.review.shutdown(remaining),
             self.issues.shutdown(remaining),
             self.generation.shutdown(remaining),
+            self.text.shutdown(remaining),
         );
         let unfinished_mutations = self.repositories.writes.close();
         self.repositories.evict_idle();
@@ -133,8 +137,9 @@ impl ForgeRuntime {
                 && issues.unfinished_jobs == 0
                 && issues.failed_jobs == 0
                 && remote.is_ok()
-                && generation.is_ok(),
-            "Forge shutdown left Harness state: {:?}, repository read jobs: {:?}, mutations: {:?}, analyses: {:?}, issue storage: {:?}, GitHub native reads: {:?}, review jobs: {:?}, issue jobs: {:?}, generation: {:?}",
+                && generation.is_ok()
+                && text.is_ok(),
+            "Forge shutdown left Harness state: {:?}, repository read jobs: {:?}, mutations: {:?}, analyses: {:?}, issue storage: {:?}, GitHub native reads: {:?}, review jobs: {:?}, issue jobs: {:?}, generation: {:?}, text: {:?}",
             harness.err(),
             report.unfinished,
             unfinished_mutations,
@@ -143,7 +148,8 @@ impl ForgeRuntime {
             remote.err(),
             review,
             issues,
-            generation.err()
+            generation.err(),
+            text.err()
         );
         Ok(())
     }

@@ -13,6 +13,7 @@ return {
     config = function()
       require("mason-lspconfig").setup({
         automatic_installation = true,
+        automatic_enable = { exclude = { 'harper_ls' } },
         ensure_installed = {
           "jsonls",
           "lua_ls",
@@ -23,7 +24,7 @@ return {
           "cssls",
           "html",
           "tailwindcss",
-          -- "harper_ls",
+          "harper_ls",
           -- "ltex_plus",
           "texlab",
           "tsgo",
@@ -70,31 +71,9 @@ return {
 
       local capabilities = require('blink.cmp').get_lsp_capabilities()
 
-      vim.lsp.config("harper_ls", {
-        capabilities = capabilities,
-        settings = {
-          ["harper-ls"] = {
-            linters = {
-              SpellCheck = true,
-              SpelledNumbers = false,
-              AnA = true,
-              SentenceCapitalization = true,
-              UnclosedQuotes = true,
-              WrongQuotes = false,
-              LongSentences = true,
-              RepeatedWords = true,
-              Spaces = true,
-              Matcher = true,
-              CorrectNumberSuffix = true
-            },
-            -- diagnosticSeverity = "warning",
-            dialect = "American",
-          }
-        }
-      })
-
-      -- This appears to hold a file lock on rust incremental compilation directory
+      -- Forge owns attachment so native drafts and comments share its prose guards.
       vim.lsp.enable('harper_ls', false)
+      require('forge.text').setup()
 
       vim.lsp.enable('nushell')
 

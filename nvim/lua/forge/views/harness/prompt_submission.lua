@@ -12,6 +12,7 @@ local input_state = require("forge.views.harness.input_state")
 ---@param completed fun(result?: table, failure?: string)
 function M.start(state, prompt, completed)
   local context = prompt.context
+  if context then require("forge.text").invalidate(context.buffer) end
   local source = context and (prompt.source or vim.api.nvim_buf_get_lines(context.buffer, 0, -1, false)) or nil
   local text = source and table.concat(source, "\n") or prompt.text
   if not text:find("%S") then completed(nil, "Prompt requires nonempty text") return end

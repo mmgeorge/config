@@ -358,6 +358,8 @@ enum StatusContextRequest {
 }
 
 pub(crate) enum RoutedMethod {
+    TextInitialize,
+    TextCorrect,
     Github(github_routes::GithubRoute),
     SessionInitialize,
     SessionDocument,
@@ -406,6 +408,8 @@ pub(crate) enum RoutedMethod {
 
 fn decode_method(method: &str) -> Result<RoutedMethod> {
     match method {
+        "text.initialize" => Ok(RoutedMethod::TextInitialize),
+        "text.correct" => Ok(RoutedMethod::TextCorrect),
         "github.actor.get" => Ok(RoutedMethod::Github(github_routes::GithubRoute::ActorGet)),
         "github.notification.list" => Ok(RoutedMethod::Github(
             github_routes::GithubRoute::NotificationList,
@@ -605,6 +609,18 @@ impl HostRouter {
         let harness_admission = envelope.harness_admission;
         let request = envelope.request;
         match method {
+            RoutedMethod::TextInitialize => {
+                let params: forge_text::contract::InitializeRequest =
+                    serde_json::from_value(request.params)?;
+                let result = self.host.text.initialize(params).await?;
+                send_completed_result(sink, request.id, result).await?;
+            }
+            RoutedMethod::TextCorrect => {
+                let params: forge_text::contract::CorrectRequest =
+                    serde_json::from_value(request.params)?;
+                let result = self.host.text.correct(params).await?;
+                send_completed_result(sink, request.id, result).await?;
+            }
             RoutedMethod::RepositoryStatusNavigate => {
                 let params: StatusNavigationParams = serde_json::from_value(request.params)?;
                 let result = self

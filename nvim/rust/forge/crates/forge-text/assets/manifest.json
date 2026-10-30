@@ -1,0 +1,32 @@
+{
+  "revision": "en-US-bigram-1",
+  "upstream_revision": "62131c2ca5bfd7fe8432e28b17b24dd98d959ee0",
+  "assets": [
+    {
+      "path": "frequency_dictionary_en_82_765.txt",
+      "sha256": "5eb7d9ca29ba3aee23d11b8b3d3aa048d7e94538b468eeffd9e07f76de7d5125",
+      "source": "https://github.com/wolfgarbe/symspell_rs/blob/62131c2ca5bfd7fe8432e28b17b24dd98d959ee0/data/frequency_dictionary_en_82_765.txt"
+    },
+    {
+      "path": "frequency_bigramdictionary_en_243_342.txt",
+      "sha256": "c7775c2d4d25930146ae07de85c228330f9b8b6a81c3cc8f6fa52e10246e3de8",
+      "source": "https://github.com/wolfgarbe/symspell_rs/blob/62131c2ca5bfd7fe8432e28b17b24dd98d959ee0/data/frequency_bigramdictionary_en_243_342.txt"
+    }
+  ],
+  "model": {
+    "interpolation": 0.5,
+    "known_edit_penalty": 2.5,
+    "transposition": 0.5,
+    "length_edit": 2.0,
+    "vowel_substitution": 1.2,
+    "other_substitution": 6.8,
+    "additional_distance": 5.0
+  },
+  "provenance": {
+    "frequency": "Google Books Ngrams, CC-BY-3.0",
+    "vocabulary": "SCOWL, permissive notices in SCOWL-Copyright.txt",
+    "distribution": "SymSpell, MIT"
+  },
+  "tokenization": "Unicode UAX #29 words, protected source spans, immediate word bigrams within sentence",
+  "smoothing": "Equal interpolation between observed conditional bigrams and add-one unigram probabilities"
+}

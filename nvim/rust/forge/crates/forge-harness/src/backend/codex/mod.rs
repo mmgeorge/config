@@ -38,7 +38,22 @@ use security::CodexSecurity;
 struct CodexConnection {
     process: CodexJsonRpc,
     timing: Vec<BackendTimingRecord>,
-    thread_id: Option<String>,
+    thread: Option<CodexThread>,
+}
+
+/// Distinguish an in-memory conversation from one used for provider submission.
+enum CodexThread {
+    Prepared(String),
+    Submitted(String),
+}
+
+impl CodexThread {
+    /// Get the identity owned by either lifecycle state.
+    fn id(&self) -> &str {
+        match self {
+            Self::Prepared(id) | Self::Submitted(id) => id,
+        }
+    }
 }
 
 struct TerminalConnection {
@@ -206,7 +221,7 @@ impl CodexBackend {
         process.notify("initialized", Value::Null).await?;
         Ok(CodexConnection {
             process,
-            thread_id: None,
+            thread: None,
             timing: vec![
                 BackendTimingRecord {
                     phase: "codex.process_start".into(),
@@ -347,14 +362,14 @@ impl CodexBackend {
         let (method, parameter) = match &request.backend_session_id {
             Some(thread) => (
                 "thread/resume",
-                json!({"threadId":thread,"cwd":request.workspace,
+                json!({"threadId":thread,"cwd":request.workspace,"excludeTurns":true,
                 "config":{"model_reasoning_effort":request.effort},
                 "developerInstructions":request.system_message(),"serviceTier":request.service_tier}),
             ),
             None => (
                 "thread/start",
                 json!({"cwd":request.workspace,"ephemeral":ephemeral,
-                "experimentalRawEvents":false,"historyMode":"legacy",
+                "experimentalRawEvents":false,"historyMode":"paginated",
                 "developerInstructions":request.system_message(),"dynamicTools":dynamic_tool,
                 "serviceTier":request.service_tier}),
             ),
@@ -505,8 +520,8 @@ impl CodexBackend {
         Ok((process, output))
     }
 
-    /// Open an independent connection and load the thread that owns terminal state.
-    async fn terminal_connection(
+    /// Load a thread before sending an observer request on an independent connection.
+    async fn thread_connection(
         &self,
         mut request: BackendCatalogRequest,
     ) -> Result<Option<(CodexJsonRpc, BackendOutput, String)>> {
@@ -546,7 +561,7 @@ impl CodexBackend {
         {
             return Ok(());
         }
-        let mut parameter = json!({"threadId":thread_id});
+        let mut parameter = json!({"threadId":thread_id,"excludeTurns":true});
         if let Some(resources) = resources {
             parameter["config"] = resources
                 .configure(process, output, &request.workspace)
@@ -1214,8 +1229,8 @@ impl Backend for CodexBackend {
             .persistent_connection(&request, &mut output, None)
             .await?;
         let mut connection = connection.lock().await;
-        if let Some(thread) = &connection.thread_id {
-            return Ok(Some(thread.clone()));
+        if let Some(thread) = &connection.thread {
+            return Ok(Some(thread.id().to_owned()));
         }
         request.model = self
             .resolve_model(&request, &mut connection.process, &mut output)
@@ -1233,7 +1248,11 @@ impl Backend for CodexBackend {
         let thread = self
             .load_thread(&mut connection.process, &mut output, &request, false, tools)
             .await?;
-        connection.thread_id = Some(thread.clone());
+        connection.thread = Some(if request.backend_session_id.is_some() {
+            CodexThread::Submitted(thread.clone())
+        } else {
+            CodexThread::Prepared(thread.clone())
+        });
         Ok(Some(thread))
     }
 
@@ -1378,7 +1397,7 @@ impl Backend for CodexBackend {
     }
     async fn terminate_terminal(&self, request: BackendCatalogRequest, id: &str) -> Result<()> {
         let (mut process, mut output, thread_id) = self
-            .terminal_connection(request)
+            .thread_connection(request)
             .await?
             .context("Codex session has no active thread")?;
         let result = process
@@ -1424,8 +1443,7 @@ impl Backend for CodexBackend {
             .is_none_or(|connection| connection.thread_id != thread_id)
         {
             *connection = None;
-            let Some((process, output, thread_id)) = self.terminal_connection(request).await?
-            else {
+            let Some((process, output, thread_id)) = self.thread_connection(request).await? else {
                 anyhow::bail!("Codex thread disappeared while opening terminal inventory");
             };
             *connection = Some(TerminalConnection {
@@ -1541,12 +1559,16 @@ impl Backend for CodexBackend {
                 .persistent_connection(&request, &mut output, event_sink)
                 .await?;
             let mut connection = connection.lock().await;
+            let prepared = connection.thread.as_ref().is_some_and(|thread| {
+                matches!(thread, CodexThread::Prepared(_))
+                    && request.backend_session_id.as_deref().is_none_or(|id| id == thread.id())
+            });
             if request.backend_session_id.is_none() {
-                request.backend_session_id.clone_from(&connection.thread_id);
+                request.backend_session_id = connection.thread.as_ref().map(|thread| thread.id().to_owned());
             }
             let CodexConnection {
                 process,
-                thread_id: retained_thread,
+                thread: retained_thread,
                 ..
             } = &mut *connection;
             process.set_activity_publication(false);
@@ -1587,12 +1609,19 @@ impl Backend for CodexBackend {
                     })
                 })
                 .collect::<Vec<_>>();
-            let thread_id = self
-                .load_thread(process, &mut output, &request, false, dynamic_tool_list)
-                .await?;
-            *retained_thread = Some(thread_id.clone());
+            let thread_id = if prepared {
+                request.backend_session_id.clone().context("prepared Codex thread is missing")?
+            } else {
+                self.load_thread(process, &mut output, &request, false, dynamic_tool_list).await?
+            };
             drop(startup);
-            if request.backend_session_id.is_some()
+            if prepared {
+                // The initial thread has no per-turn checkpoint hook. Admit its first turn
+                // only after the checkpoint completes, before native tools can execute.
+                if let Some(gate) = request.control_context.as_ref().and_then(|context| context.checkpoint.as_ref()) {
+                    gate.wait().await?;
+                }
+            } else if request.backend_session_id.is_some()
                 && let Some(gate) = request
                     .control_context
                     .as_ref()
@@ -1689,6 +1718,7 @@ impl Backend for CodexBackend {
                         .map(|(_, text)| text.to_owned())
                 })
                 .flatten();
+            *retained_thread = Some(CodexThread::Submitted(thread_id.clone()));
             let admission = if native_resume {
                 if let Some(submission) = &request.submission {
                     submission.sending(super::submission::SubmissionTarget::Untracked)?;
@@ -1715,7 +1745,13 @@ impl Backend for CodexBackend {
                                     "input": input,
                                     "cwd": request.workspace,
                                     "effort": request.effort,
-                                    "serviceTier": request.service_tier
+                                    "serviceTier": request.service_tier,
+                                    "collaborationMode": prepared.then(|| json!({
+                                        "mode":"default", "settings":{
+                                            "model":request.model, "reasoning_effort":request.effort,
+                                            "developer_instructions":request.system_message()
+                                        }
+                                    }))
                                 }),
                                 &request,
                             ),
@@ -1850,7 +1886,7 @@ impl Backend for CodexBackend {
                 "thread/start",
                 Self::with_model(
                     Self::secure_thread(
-                        json!({"cwd":source_request.workspace,"historyMode":"legacy"}),
+                        json!({"cwd":source_request.workspace,"historyMode":"paginated"}),
                         &source_request,
                     ),
                     &source_request.model,
@@ -1887,7 +1923,11 @@ impl Backend for CodexBackend {
             resources.retain_thread(&backend_session_id).await;
         }
         let timing = connection.timing.clone();
-        connection.thread_id = Some(backend_session_id.clone());
+        connection.thread = Some(if request.checkpoint_id.is_some() {
+            CodexThread::Submitted(backend_session_id.clone())
+        } else {
+            CodexThread::Prepared(backend_session_id.clone())
+        });
         self.connection_by_session.lock().await.insert(
             request.target_harness_session_id,
             Arc::new(Mutex::new(connection)),
@@ -2216,12 +2256,10 @@ impl Backend for CodexBackend {
         objective: Option<String>,
         status: &str,
     ) -> Result<()> {
-        let thread_id = request
-            .backend_session_id
-            .clone()
+        let (mut process, mut output, thread_id) = self
+            .thread_connection(Self::catalog_from_request(&request))
+            .await?
             .context("Codex thread has not started")?;
-        let mut output = BackendOutput::default();
-        let mut process = self.connect(&request, &mut output, None).await?.process;
         if status == "cleared" {
             process
                 .request(
@@ -2278,7 +2316,8 @@ mod test {
     use super::*;
 
     #[tokio::test]
-    async fn eager_initialization_reuses_thread_without_starting_a_turn() -> Result<()> {
+    async fn eager_initialization_reuses_live_thread_without_persisting_or_resuming() -> Result<()>
+    {
         use futures_util::{SinkExt, StreamExt};
         let fixture = tempfile::tempdir()?;
         let workspace = fixture.path().to_string_lossy().into_owned();
@@ -2295,13 +2334,19 @@ mod test {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            for method in ["thread/start", "thread/resume", "turn/start"] {
+            let mut initial_instructions = Value::Null;
+            for (method, thread) in [
+                ("thread/start", "prepared-thread"),
+                ("turn/start", "prepared-thread"),
+            ] {
                 let request: Value =
                     serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
                         .unwrap();
                 assert_eq!(request["method"], method);
                 if method == "thread/start" {
+                    initial_instructions = request["params"]["developerInstructions"].clone();
                     assert_eq!(request["params"]["ephemeral"], false);
+                    assert_eq!(request["params"]["historyMode"], "paginated");
                     assert!(
                         !request["params"]["dynamicTools"]
                             .as_array()
@@ -2309,12 +2354,24 @@ mod test {
                             .is_empty()
                     );
                 } else {
-                    assert_eq!(request["params"]["threadId"], "prepared-thread");
+                    assert_eq!(request["params"]["threadId"], thread);
+                }
+                if method == "turn/start" {
+                    assert_eq!(request["params"]["collaborationMode"]["mode"], "default");
+                    assert_eq!(
+                        request["params"]["collaborationMode"]["settings"]["model"],
+                        "fixture-model"
+                    );
+                    assert!(request["params"]["collaborationMode"]["settings"]["developer_instructions"].is_string());
+                    assert_ne!(
+                        request["params"]["collaborationMode"]["settings"]["developer_instructions"],
+                        initial_instructions
+                    );
                 }
                 let response = if method == "turn/start" {
                     json!({"turn":{"id":"first-turn"}})
                 } else {
-                    json!({"thread":{"id":"prepared-thread"}})
+                    json!({"thread":{"id":thread}})
                 };
                 socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -2326,8 +2383,8 @@ mod test {
                     .unwrap();
                 if method == "turn/start" {
                     for message in [
-                        json!({"method":"item/completed","params":{"threadId":"prepared-thread","turnId":"first-turn","item":{"id":"answer","type":"agentMessage","phase":"final_answer","text":"ready"}}}),
-                        json!({"method":"turn/completed","params":{"threadId":"prepared-thread","turn":{"id":"first-turn","status":"completed"}}}),
+                        json!({"method":"item/completed","params":{"threadId":thread,"turnId":"first-turn","item":{"id":"answer","type":"agentMessage","phase":"final_answer","text":"ready"}}}),
+                        json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":"first-turn","status":"completed"}}}),
                     ] {
                         socket
                             .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -2354,7 +2411,7 @@ mod test {
             Arc::new(Mutex::new(CodexConnection {
                 process,
                 timing: Vec::new(),
-                thread_id: None,
+                thread: None,
             })),
         );
         let mut request = CodexBackend::catalog_backend_request(&BackendCatalogRequest {
@@ -2376,6 +2433,26 @@ mod test {
             Some("prepared-thread".into())
         );
         request.input = BackendInput::from_text("first prompt");
+        let gate = crate::checkpoint::ToolGate::new()?;
+        gate.complete(Err("fixture checkpoint failed".into()))?;
+        let mut blocked_request = request.clone();
+        let mut blocked_context =
+            crate::control_tools::ControlTurnContext::inactive(PromptMode::Chat);
+        blocked_context.checkpoint = Some(gate);
+        blocked_request.control_context = Some(blocked_context);
+        let failure = backend.prompt(blocked_request).await.unwrap_err();
+        assert!(failure.to_string().contains("fixture checkpoint failed"));
+        assert!(matches!(
+            backend.connection_by_session.lock().await["eager"]
+                .lock()
+                .await
+                .thread,
+            Some(CodexThread::Prepared(_))
+        ));
+        request.mode = PromptMode::Plan;
+        request.control_context = Some(crate::control_tools::ControlTurnContext::inactive(
+            PromptMode::Plan,
+        ));
         let output = backend.prompt(request.clone()).await?;
         assert_eq!(
             output.completion.backend_session_id.as_deref(),
@@ -2560,7 +2637,10 @@ mod test {
                     serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
                         .unwrap();
                 assert_eq!(request["method"], "thread/resume");
-                assert_eq!(request["params"], json!({"threadId":"provider-thread"}));
+                assert_eq!(
+                    request["params"],
+                    json!({"threadId":"provider-thread","excludeTurns":true})
+                );
                 response["id"] = request["id"].clone();
                 socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -2904,7 +2984,7 @@ mod test {
             "speed-test".into(),
             Arc::new(Mutex::new(CodexConnection {
                 process,
-                thread_id: None,
+                thread: None,
                 timing: Vec::new(),
             })),
         );
@@ -3207,7 +3287,7 @@ mod test {
                 "session".into(),
                 Arc::new(Mutex::new(CodexConnection {
                     process,
-                    thread_id: None,
+                    thread: None,
                     timing: Vec::new(),
                 })),
             );
@@ -3496,7 +3576,7 @@ mod test {
                 "session".into(),
                 Arc::new(Mutex::new(CodexConnection {
                     process,
-                    thread_id: None,
+                    thread: None,
                     timing: Vec::new(),
                 })),
             );

@@ -62,7 +62,7 @@ local section_label = { unstaged = "Unstaged changes", staged = "Staged changes"
 ---@field retain_removed_position boolean
 ---@field fold table
 ---@field changedtick integer
----@field generation integer
+---@field publication_revision integer Advances after every committed projection, including body-only updates.
 ---@field namespace integer
 ---@field marks table<string, integer[]>
 ---@field sentinel? integer
@@ -234,6 +234,7 @@ local function context_entries(session, context)
 end
 
 local function prepare(session, snapshot, checkpoint)
+  local publication_revision = session.publication_revision
   assert(snapshot.document == session.document, "status document differs")
   counter(snapshot.revision)
   assert(not session.revision or snapshot.revision >= session.revision, "stale status snapshot")
@@ -343,10 +344,16 @@ local function prepare(session, snapshot, checkpoint)
   local built = vim.uv.hrtime()
   local root = Sequence.from(entries, checkpoint)
   return { root = root, entries = entries, file = file, block = block, body_owner = body_owner,
-    fold = { record = record, changed = changed }, inventory = snapshot, index_us = elapsed(built) }
+    fold = { record = record, changed = changed }, inventory = snapshot, index_us = elapsed(built),
+    publication_revision = publication_revision }
 end
 
 local function adopt(session, prepared)
+  if session.status == "Closed" then return { kind = "Closed" } end
+  if prepared.publication_revision ~= session.publication_revision
+    or session.inventory and prepared.inventory.revision < session.inventory.revision then
+    return { kind = "Superseded" }
+  end
   local source = { document = session.document, revision = prepared.inventory.revision, block = {} }
   local starts, source_entry, rows = {}, {}, 0
   local previous = session.source_block_cache or {}
@@ -433,9 +440,10 @@ local function adopt(session, prepared)
   session.context_width = session.width
   local result = buffer.apply_snapshot(session, source)
   assert(result.kind == "Applied", result.diagnostic or result.kind)
+  session.publication_revision = session.publication_revision + 1
   session.source_block_cache = cache
   if session.issues_editor then session.issues_editor.sync() end
-  return elapsed(started), {}
+  return { kind = "Applied", revision = session.revision, buffer_us = elapsed(started), edits = {} }
 end
 
 ---@param document string
@@ -446,7 +454,8 @@ function M.open(document, options)
     preserve_view = true, retain_removed_position = true,
   }))
   session.file, session.body_owner, session.root, session.commit = {}, {}, Sequence.new(), {}
-  session.presentation, session.width, session.generation = { pr = { state = "fetching" }, about = { state = "none" } }, 80, 0
+  session.presentation, session.width = { pr = { state = "fetching" }, about = { state = "none" } }, 80
+  session.publication_revision = 0
   session.locate = function(row, column) return M.locate(session, row, column) end
   session.capture = function(view, action) return M.capture(session, view, action) end
 
@@ -458,37 +467,55 @@ end
 ---@param callback? fun(result: table)
 ---@return table?
 function M.apply_snapshot(session, snapshot, callback)
-  session.generation = session.generation + 1
-  local generation, started = session.generation, vim.uv.hrtime()
+  local started = vim.uv.hrtime()
   local budget = started
   local timing = { files = #snapshot.file, callback_count = 0, longest_callback_us = 0, work_us = 0 }
-  local thread = coroutine.create(function()
+  local function prepare_snapshot()
     local prepared = prepare(session, snapshot, callback and function()
       if elapsed(budget) >= 4000 then coroutine.yield() budget = vim.uv.hrtime() end
     end)
-    if session.status == "Closed" or session.generation ~= generation then return { kind = "Closed" } end
     local formatting_us = elapsed(started) - prepared.index_us
-    local buffer_us = adopt(session, prepared)
-    timing.rows, timing.formatting_us = session.row_count, formatting_us
-    timing.index_us, timing.buffer_us = prepared.index_us, buffer_us
-    return { kind = "Applied", revision = session.revision }
-  end)
-  local function resume()
-    if session.status == "Closed" or session.generation ~= generation then return { kind = "Closed" } end
+    local result = adopt(session, prepared)
+    if result.kind == "Applied" then
+      timing.rows, timing.formatting_us = session.row_count, formatting_us
+      timing.index_us, timing.buffer_us = prepared.index_us, result.buffer_us
+    end
+    return result
+  end
+  local thread = coroutine.create(prepare_snapshot)
+  local completed = false
+  local function finish(result)
+    if completed then return result end
+    completed = true
+    if result.kind == "Applied" then
+      timing.elapsed_us = elapsed(started)
+      trace(session, "status.semantic.applied", timing)
+    end
+    if callback then callback(result) end
+    return result
+  end
+  local resume
+  resume = function()
+    if session.status == "Closed" then return finish({ kind = "Closed" }) end
+    if session.inventory and snapshot.revision < session.inventory.revision then
+      return finish({ kind = "Superseded" })
+    end
     local callback_started = vim.uv.hrtime()
     local ok, result = coroutine.resume(thread)
     local callback_us = elapsed(callback_started)
     timing.callback_count = timing.callback_count + 1
     timing.longest_callback_us = math.max(timing.longest_callback_us, callback_us)
     timing.work_us = timing.work_us + callback_us
-    if not ok then result = buffer.fail_apply(session, result) end
-    if ok and coroutine.status(thread) ~= "dead" then vim.schedule(resume) return end
-    if ok and result.kind == "Applied" then
-      timing.elapsed_us = elapsed(started)
-      trace(session, "status.semantic.applied", timing)
+    if not ok then return finish(buffer.fail_apply(session, result)) end
+    if coroutine.status(thread) ~= "dead" then vim.schedule(resume) return end
+    if result.kind == "Superseded"
+      and (not session.inventory or snapshot.revision > session.inventory.revision) then
+      thread = coroutine.create(prepare_snapshot)
+      budget = vim.uv.hrtime()
+      vim.schedule(resume)
+      return
     end
-    if callback then callback(result) end
-    return result
+    return finish(result)
   end
   return resume()
 end
@@ -527,8 +554,7 @@ end
 function M.apply_patch(session, delta)
   local ok, result = pcall(function()
     local snapshot = delta_snapshot(session.inventory, delta)
-    adopt(session, prepare(session, snapshot))
-    return { kind = "Applied", revision = session.revision }
+    return adopt(session, prepare(session, snapshot))
   end)
   if not ok then return buffer.fail_apply(session, result) end
   return result
@@ -595,9 +621,11 @@ function M.apply_updates(session, updates)
     session.file = file
     local prepared = prepare(session, inventory)
     session.file = previous_file
-    local buffer_us, edits = adopt(session, prepared)
-    trace(session, "status.optimistic.applied", { updates = adopted, edits = #edits, buffer_us = buffer_us })
-    return { kind = "Applied", revision = session.revision }
+    local result = adopt(session, prepared)
+    if result.kind == "Applied" then
+      trace(session, "status.optimistic.applied", { updates = adopted, edits = #result.edits, buffer_us = result.buffer_us })
+    end
+    return result
   end)
   if not ok then
     for owner, snapshot in pairs(previous_snapshot) do owner.snapshot = snapshot end
@@ -642,8 +670,7 @@ function M.apply_body(session, delivery)
     else return { kind = "Applied" } end
     model.body = body
     model.header = file_header(model.record, body, delivery.file, model.display_path)
-    adopt(session, prepare(session, session.inventory))
-    return { kind = "Applied" }
+    return adopt(session, prepare(session, session.inventory))
   end)
   if not ok then
     session.status = "Desynchronized"
@@ -773,7 +800,7 @@ function M.present_context(session, presentation)
       if not changed and count == #leading then return end
       session.root:splice(0, count, leading)
       adopt(session, { root = session.root, file = session.file, body_owner = session.body_owner,
-        inventory = session.inventory, fold = session.source_fold })
+        inventory = session.inventory, fold = session.source_fold, publication_revision = session.publication_revision })
     end)
     if not ok then buffer.fail_apply(session, failure) end
   end

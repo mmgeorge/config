@@ -7,7 +7,7 @@ and repository code, not another branch in the host.
 
 Read [Project checks](../../docs/forge/checks.md) for the input schema, argv
 substitution, JSON callback request, receipts, and optional result reports.
-[Planning](architecture/planning.md#project-checks-and-the-harness-checking-gate)
+[Planning](architecture/planning.md#project-checks)
 describes admission, persistence, and completion gates.
 
 ## Prerequisites

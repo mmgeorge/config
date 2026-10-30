@@ -1528,6 +1528,7 @@ local function finish_queue_edit(state, text, unqueue)
 end
 
 function M.submit()
+  require("forge.text").invalidate(harness_state().composer_buf)
   if not attachments_ready(harness_state().composer_buf) then return end
   if harness_state().host_error then notifications.error(harness_state().execution_notice, "ForgeHarness") return end
   harness_state().execution_notice = nil

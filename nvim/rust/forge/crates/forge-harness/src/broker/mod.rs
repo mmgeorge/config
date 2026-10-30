@@ -809,6 +809,15 @@ impl HarnessBroker {
             startup_started.elapsed().as_secs_f64() * 1000.0,
         );
         store.lock_session(&session.id)?;
+        // Provider-only preparation is disposable across runtimes. Keep all local metadata,
+        // including names and settings, while replacing only an unused provider identity.
+        if session.background.is_none()
+            && session.provider_fork_state == ProviderForkState::Ready
+            && session.provider_checkpoint_id.is_none()
+            && !store.has_conversation_history(&session.id)?
+        {
+            session.backend_session_id = None;
+        }
         store.save_session(&session)?;
         if store
             .list_agent_run(&session.id)?
@@ -1022,15 +1031,12 @@ impl HarnessBroker {
             .then(|| self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
     }
 
-    /// Retain provider history only while the captured session settings remain current.
+    /// Persist an initialized provider conversation only while its captured settings remain current.
     pub(crate) fn retain_initialized_session(
         &mut self,
         request: &BackendRequest,
         provider_id: String,
     ) -> Result<Option<BrokerSnapshot>> {
-        if self.session.backend_session_id.as_deref() == Some(&provider_id) {
-            return Ok(None);
-        }
         if self.session.id != request.harness_session_id
             || self.session.backend_session_id != request.backend_session_id
             || self.session.model != request.model
@@ -1040,8 +1046,10 @@ impl HarnessBroker {
         {
             return Ok(None);
         }
-        self.session.backend_session_id = Some(provider_id);
-        self.save_session()?;
+        if self.session.backend_session_id.as_ref() != Some(&provider_id) {
+            self.session.backend_session_id = Some(provider_id);
+            self.save_session()?;
+        }
         Ok(Some(self.snapshot()?))
     }
 

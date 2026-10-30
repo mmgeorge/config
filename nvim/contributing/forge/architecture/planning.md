@@ -1,807 +1,99 @@
 # Planning, review, and implementation
 
-A saved plan describes a proposed interface and its review evidence. Harness validates captured internal references and retains proposal-only navigation. Existing project language servers resolve source-backed definition requests on demand.
-
-Tree-sitter extraction and LSP setup are separate capabilities. See [Languages](languages.md) and [Adding a language](../adding-language.md).
-
-## Complete plan artifacts
-
-Plan readers retain complete documents, source snapshots, Markdown, navigation indexes, and
-annotations. A large navigation index follows the same integrity and regular-file checks as a
-small one, without inheriting a source-file byte ceiling. Current and historical review capture
-validate the saved artifacts before constructing the view.
-
-Rendering and editor delivery preserve every logical row. Pagination and transport chunks control
-individual deliveries rather than total plan size, and an oversized first record still makes
-progress. Patch confirmations retain the complete applied diff. Cache eviction controls retained
-reuse without rejecting explicit reads, declaration analysis, edits, or reviews.
-
-Harness owns declaration spacing, indentation style, table layout, and wrapping.
-Agents supply complete content and syntactic nesting rather than preformatted
-display rows. `declaration_line_width` is a preferred formatting width, not a
-validation constraint. Zero requests one column, and indivisible syntax, literals,
-and code examples remain complete even when wider than the preference. Source
-syntax and document integrity checks remain independent of presentation choices.
-Flow labels accept padding, line breaks, tabs, and backticks. The renderer joins
-label whitespace for diagram rows without rewriting the saved fields. Validation
-requires meaningful labels and distinct display titles, not agent-authored layout.
-
-Baseline validation reparses combined declarations and reference metadata, whose
-native parser recovery tree can be deeper than the original source tree.
-Protected-region scanning must retain all literal and comment regions rather
-than rejecting that recovery depth. Plan flow and ownership diagrams use work
-lists without a nesting cutoff and preserve navigation anchors for every row.
-
-PlanReview opens with one compact block snapshot. Modified files contribute changed
-chunks and enclosing declaration boundaries with shared compact diff presentation.
-Subsequent revisions send disjoint block patches and sparse source-anchor edits.
-Unchanged declaration text and syntax metadata remain in the Lua source fragment.
-Anchor edits carry only row identity, canonical line, and test or check selection.
-They never duplicate block text or syntax metadata. Rust compares stable block
-identities in linear time before publishing the changed ranges, so distant edits
-do not resend the intervening declarations. Explicit reference navigation adds a
-bounded excerpt around the selected reference, including its enclosing syntax.
-Complete captured declarations remain backend inputs for validation and resolution.
-
-## Local annotations and recovery
-
-`forge.draft_comments` owns local compact and full-width comment presentation. PlanReview
-uses it for creation, focus, collapse, raw body editing, and full-collection captures without
-editing requests to Rust. Source extmarks retain semantic identities independently from
-physical comment rows. Providers may supply sparse source identities. Read-only comments
-reject focus promotion and deletion, while an owner callback admits editable source fields.
-The renderer forces status-column layout before measuring rule width so line-number growth
-cannot wrap the heading label. `forge.review_comments` uses the same renderer for inline PR
-draft creation, focus, collapse, and local deletion. Native field extmarks retain other unsaved
-text through those transitions. `forge.draft_source` caches source identities once per buffer
-change or local render generation and maps navigation, syntax, and fold boundaries independently
-from inserted comment rows. Materialization supplies immutable diff anchors for local creation.
-Conversation and reply drafts use the same local creation path. Reply drafts retain the remote
-parent identity and source anchor, reuse one unsent body per parent, and remain unavailable in
-batched mode. Compact read-only comments expose their identity for reply selection without
-admitting body edits. Existing conversation entries retain their explicit-open lifecycle.
-
-Plan document recovery retains current local annotations and the latest queued explicit
-operation independently. After replacement admission validates the source digest, the queued
-operation keeps its original annotation capture. A queued submission receives the replacement
-document, revision, view, and sequence identities before dispatch. Completion closes the current
-review only when its physical buffer and plan identity match the originating submission.
-An operation already dispatched to the obsolete host is not replayed by this recovery path.
-Explicit PR comment saves capture only the selected body,
-and batched review submission captures the summary and comments without accepting PR fields.
-Generated patches defer while a local PR projection owns inserted comment rows. The adapter
-coalesces those updates, detaches the clean local projection, and adopts a full host snapshot
-before rebuilding source mappings. Pending native text prevents that replacement.
-Review capture admission accepts client-owned comment region identities, immutable source
-anchors, and optional reply parents with their bodies. `CommentStore` stages numeric identities
-and validates reply ownership before `EditStore` reserves every field body. Both stores commit
-only after the complete capture passes. New bodies retain an empty saved baseline. Repeated
-captures preserve accepted identities and revisions. Comment save can resolve a captured region
-to its numeric identity, and restoration retains that region when reopening saved draft state.
-Materialization returns comment body snapshots and anchors for local presentation ownership.
-
-Plan Review Ask requests publish request-correlated progress after the answer fork
-resolves its model and thinking settings. The question's reply block displays
-`Generating response · <model> · Thinking: <effort>` until the saved answer arrives.
-Lua binds each update to its pending request and annotation identity, preserving
-that status across compact and focused rendering without moving the reader's
-cursor. Progress from a retired request cannot replace another question or a
-completed answer. The source session's planning model and thinking remain unchanged.
-Answer and annotation-save completions settle their operation ownership even when
-the physical review buffer has been wiped. Saved answers remain in native plan
-state, so reopening reconstructs the completed thread rather than retaining a
-permanently saving view. Retiring an invalid view never reads its buffer options.
-
-## Captured declarations and saved-plan resolution
-
-Declaration design records use the schema version declared by the current plan implementation. Older plan records are excluded from storage reads,
-and older document schemas fail validation. Planning no longer authors entities, stages,
-or implementation tasks.
-
-Harness captures nonignored Git working-tree Rust, TypeScript, TSX, Lua, JSON/JSONC, TOML, YAML, and XML files. Tree-sitter
-language adapters extract immutable declaration baselines, complete signatures, fields, visibility,
-generics, imports, and documentation. They omit executable bodies and value initializers. Private
-members remain visible when changed. Lua function headers omit the closing `end`. TypeScript arrow
-bindings stop at `=>`. These overview files describe interfaces and do not claim compilation validity.
-Configuration retains complete values. Unsupported extensions remain outside this design representation.
-
-`declaration` resolves Rust and TypeScript names within the saved plan for submission validation
-and proposal navigation. The shared Tree-sitter `DeclarationIndex` extracts scopes, symbols,
-imports, exports, generics, and signature references without examining implementation bodies.
-Proposed declarations replace their baseline files. Deleted lines use a separate baseline graph.
-Uncaptured and removed files cannot enter this resolver through filesystem discovery.
-
-Rust module loading uses a work list and the indexed-file map to terminate cycles,
-not a module-depth limit. Conditional modules mark their loaded descendants only
-after traversal, and missing or unreadable sources retain incomplete evidence.
-
-Callable behavior is stored as a tagged `FunctionBehavior`, either `Algorithm` or `Change`.
-New functions and methods require a nonempty `Algorithm` at submission. Existing callables use
-`Change` for behavioral deltas, preferably one short sentence stating the concrete problem or
-purpose and the behavior that addresses it. A second sentence is reserved for essential detail.
-The reason must follow from the task or inspected baseline, without inventing a defect or
-restating unchanged behavior.
-The immutable baseline, including file moves, determines which
-category applies. Drafts can remain incomplete, while duplicate or mixed behavior blocks fail
-parsing. Academic pseudocode retains nested indentation through editing, serialization, and review.
-Planning prompts require the globally distributed `academic-pseudocode` skill, whose `SKILL.md`
-contains the writing rules without an external guide dependency.
-Algorithm blocks use the repository-owned `algorithm` Tree-sitter grammar. Submission validates
-statement syntax, balanced expression delimiters, space indentation, nonempty control bodies,
-matching `otherwise` branches, and loop ownership of `break` and `continue`. Errors identify the
-callable and algorithm line and column. Draft patches still retain incomplete text for repair.
-Invocation nodes retain qualified targets, named arguments, and nested calls. Every target in
-the callable's `Constructs` section requires an explicit matching invocation in its Algorithm.
-Constructor arguments use `field = value`, with `Type()` for argument-free construction.
-Missing construction sites and positional constructor arguments fail submission. Comments and
-string contents cannot satisfy this requirement. Ordinary helper calls permit positional arguments.
-Qualified and signature-resolved field references require matching Accesses entries, which use
-the declaration validator's member resolution. The validator does not type-check expression
-values or prove algorithmic correctness.
-Review parses Algorithm rows separately from native declarations and applies its keyword,
-operator, literal, constructor, named-field, and identifier captures at their original displayed byte columns. Change
-blocks retain prose styling. Algorithm-only revisions invalidate the affected syntax cache.
-Algorithm expressions default to comment-gray prose. Assignment targets, standalone operands,
-operator operands, call arguments, and qualified or underscored references receive variable
-styling. Type qualifiers such as `Projectile` in `Projectile.previous_position` use the type
-highlight. Variables and named fields render white. Algorithm and Change headings share the
-reference section heading style used by Calls, Constructs, and Accesses.
-Soft-wrapped plan rows retain their own source indentation and gutter width. The review buffer
-reserves leading display whitespace per row, with gutters overlaid on that space. Source-column
-mapping excludes this padding from navigation and copying. Stored source text stays unchanged.
-Each window wraps independently at its own width. Shared background decorations repeat across
-the continuation margin, including the whitespace before wrapped test descriptions. Wrapped
-diff rows repeat the change marker without repeating declaration line numbers. Full-row
-backgrounds stop at their owning row, leaving file headings and section spacers uncolored.
-Behavior rows carry category-aware review anchors. Collapsed signatures never append `[changed]`.
-Algorithm definition navigation uses parsed reference segments and the enclosing callable's
-signature. Selecting a parameter name, including a receiver or call argument, jumps to its exact
-signature token. Member lookup first uses the receiver's declared type, including matching
-reference targets inside generic wrappers. Calls and Constructs disambiguate shortened call
-names, while Accesses disambiguates fields and values. Multiple remaining targets report an
-ambiguity without moving the cursor. Literals, comments, and unmatched prose have no target.
-Algorithm references reuse the plan declaration resolver and reveal transaction. Their synthetic
-positions never enter the source-backed LSP request path.
-Rename uses the same parsed segments and resolved identities for Algorithm call targets, type
-qualifiers, fields, and constructor field labels. Preview and committed edits preserve comments,
-strings, unrelated receivers, and same-named signature bindings.
-
-Function-body references use three editable sections: `Calls` for invocations and callbacks,
-`Constructs` for directly instantiated types, and `Accesses` for fields and named values.
-Rust struct literals and TypeScript `new` expressions retain construction evidence separately
-from initialized fields. Resolved Rust tuple and unit constructors use the same category.
-Factory calls returning an owned named type also use `Constructs`, retaining the callable name.
-Captured return types determine classification, including `Self`. Borrowed, scalar, and unit
-returns remain calls. Signature and generic type mentions do not imply construction.
-Construction targets retain their source positions, type color, and definition navigation.
-Known targets that are neither types nor factories fail `Constructs` validation. Unavailable external types remain unchecked.
-Omitted sections retain unknown evidence, while empty sections explicitly record no uses.
-
-## Source-backed LSP navigation
-
-Narrative inline-code identifiers resolve against the complete proposed declaration index,
-including declarations hidden by the Public filter. Exact names and qualified names share
-one target identity for syntax coloring and definition navigation. Unique matches receive
-their declaration-kind color. Ambiguous names retain Markdown styling and open a chooser.
-Inline expressions, ordinary prose, and fenced code do not acquire narrative symbol targets.
-The same captured declaration index supplies type highlights for named value references
-under `Accesses`. The owning file takes precedence over other captured files. Ambiguous
-cross-file names retain their value highlight, and classification does not change plan data.
-
-An unmatched narrative name can query `workspace/symbol` on existing project clients when
-the reviewer requests its definition. The request filters exact names and excludes files
-captured by the plan, so deleted declarations cannot reappear through workspace fallback.
-It admits at most four clients and 256 results per client, with a five-second deadline.
-Cursor movement, revision changes, and closing the review cancel pending navigation. Missing
-clients and zero matches produce informational messages. Failed or incomplete lookups report
-their error instead of selecting from partial results. A successful workspace lookup colors
-the selected inline reference using the returned symbol kind. This transient decoration is
-cleared when the review projection changes. Unresolved references retain Markdown styling.
-
-Source-backed definition jumps use the existing project LSP on demand. Rust projects the real
-source path, captured digest, identifier position, and filetype through `workspace_definition`.
-Lua loads that real file into a hidden buffer without triggering server autostart, selects an
-already-running client for its language and project root, and requests `textDocument/definition`.
-The request targets the referenced member token, including members of optional chains. Lua
-normalizes `Location` and `LocationLink` responses into byte positions and returns the selected
-target through the typed `plan_definition` presentation request. Rust validates the original
-document, revision, view, input sequence, target, and source digest before mapping the definition
-to a plan declaration or returning its source location. Modified target buffers open as source.
-
-No generated source, stub project, private language server, or dependency download participates
-in this path. Definition requests have a five-second deadline and discard superseded results.
-Multiple destinations use a chooser. Missing clients and empty results remain distinct from
-request failures. Lua releases only temporary buffers created by the request and never stops the
-shared client. Neither Rust nor Lua caches jump results. Each jump issues a fresh request, while
-the language server retains ownership of its own analysis state.
-
-Definition destinations in captured plan files reveal the exact declaration inside PlanReview.
-The shared reveal transaction restores omitted context, opens enclosing folds, and preserves the
-Public filter and canonical plan bytes. Definition jumps never fall back to a declaration popup.
-Targets outside the captured plan open in normal source buffers. Lua applies any reveal patch
-before moving the cursor and records the originating position for jump-back. Unsaved annotations
-must be saved before a definition jump can change the source projection.
-
-Tree-sitter still owns extraction, formatting, syntax presentation, and source-token mapping.
-Captured references retain the exact source expression independently of their inferred name and
-position. Unchanged captured expressions round-trip even when their receiver cannot be resolved.
-Newly authored qualified targets retain structural validation. Proposed references without real
-source evidence use the plan resolver and never query generated source.
-
-External APIs, dependency versions, standard libraries, and uncaptured modules remain unchecked
-during planning. Existing dependencies can be navigation targets when the running project server
-resolves them. Plan capture, saving, and submission issue no LSP or dependency-acquisition requests.
-Known invalid references within captured modules still fail validation. Internal incoming-use
-requirements still apply to new internal declarations. These checks do not constitute compilation
-or full typechecking of the proposed program.
-
-## Validation, persistence, flows, and review questions
-
-The submit tool runs reference validation before accepting a version, so the provider can repair a
-rejected design in the same turn. The broker repeats validation on the formatted snapshot before
-freezing it. `DeclarationDesign.validation` stores generated location-bearing diagnostics and its
-snapshot fingerprint. Patches invalidate that evidence. Review displays a collapsible Validation
-section. Proven invalid or ambiguous references reject submission. Unverified references warn.
-
-`.` and `open` resolve the selected token through saved Tree-sitter token coordinates. They jump to
-the plan declaration, revealing hidden context and opening containing folds, or open the exact
-existing project/dependency/standard-library source buffer when the target is outside the plan.
-Opening a file heading selects its actual source buffer. Declaration navigation has no popup path.
-Re-export navigation follows the defining declaration. Filtering remains unchanged. Native input
-revision, view, and cursor guards discard stale responses. Lua owns key binding and presentation,
-while Rust owns resolution and source coordinates.
-
-`DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves
-inside Harness-owned `plans/<session>/<plan>/working.json`. New plans read `.forge.json` settings
-and start with no captured source files. They perform no repository file discovery or extraction.
-The provider receives the plan identity,
-version, request, and path inventory. `plan_read` reads one virtual file or its baseline as
-numbered plain text. Optional 1-based inclusive line bounds require a file path. The response retains
-the active version, selected side, actual range, and total line count. An uncaptured-path read extracts
-only that workspace file and returns its full-source digest without changing the saved design or version.
-Inventory reads remain structured and list captured and proposed paths rather than workspace files.
-`design_patch` applies familiar Add File, Update File, Delete File, Move to, and
-context chunks atomically. The first Update, Delete, or Move captures that path's baseline and source
-digest in the patch candidate. Add and Move reject occupied workspace destinations. Captured removals
-and moves never reload their original source. The control runtime retains inspected digests within a
-turn, and optional `source_digests` preserves read identities across turns. Provider transports retain
-first-capture digests for broker replay, so a source change after acknowledgement also rejects the patch.
-Invalid syntax, paths, bodies, stale versions, source identities, or unmatched context change nothing.
-Every patch that changes the design increments the version. Patch confirmation includes
-the complete applied declaration and overview deltas with three context lines.
-The agent can confirm focused edits without a second read. The baseline remains immutable.
-Successful submission retains inconclusive reference warnings in the saved validation evidence and
-returns only acceptance and version to the provider. Proven-invalid references still return actionable errors.
-Reference validation reads relevant ancestor manifests, lockfiles, and untouched modules on demand
-without adding those source files to the proposal. Lockfile evidence remains separate from editable files.
-Files first captured in a later submitted revision compare against their captured source baseline,
-and removed-row navigation opens that baseline in the current revision rather than a missing prior proposal.
-`plan/prompts/system.md` defines stable model-facing Harness conventions. It separates permission
-presets from Plan, Execute, and Goal tasks, preserves task identity across interruption, and explains
-control transitions, questions, evidence, and failures. `backend/prompt.rs` composes current effective
-permission and interaction purpose from the admitted request. Recorded-answer guidance comes from
-control context rather than a phrase found in user text. Codex receives the shared instructions and
-current context through `developerInstructions` on both thread start and resume, including native goal
-resumption. Copilot appends shared instructions when creating or resuming a session and sends current
-interaction context with every message, including messages to an already-live session.
-
-Plan metadata stores execution flows separately from Design prose. `design_flows.rs` owns
-the typed `trigger` and ordered `steps` schema. Steps contain actions, terminal effects,
-and conditional branches with their own steps. Effects contain only `target` and `change` and
-cannot nest execution. The validator requires triggers, nonempty step lists, branch conditions,
-and plain labels. Later independent events require separate flows even when they share state.
-Rendering and validation traverse nested branches iteratively without flow-count, step-count,
-or depth caps. The renderer uses `→` for the first action, `↓` for subsequent steps, and `┄▶`
-for effects. Branch rails retain their conditions and nesting. Text exports
-retain fences while PlanReview renders the same diagram rows as native buffer text.
-Section reads, review, and revision diffs use the same canonical projection. Plan schema 15
-stores named trigger/action check snapshots and excludes older persisted plan formats.
-Retired step input lists are discarded when loading saved flows and are absent from the schema,
-serialized steps, and diagrams. Other unknown step fields remain errors.
-Native diagram rows keep literal punctuation and receive neutral prose styling, with exact
-identifier tokens colored through the proposed declaration index. Those tokens reuse narrative
-symbol targets, including definition reveal, ambiguity choices, removed-symbol checks, and
-workspace fallback for code-shaped names. Byte ranges remain relative to the canonical row,
-so hidden fences do not shift definition targets or saved annotation coordinates.
-
-Plan review places Tests after proposed declaration changes, followed by Checks and Verification. Each section
-retains its own fold boundary and navigation targets in both full and public-only views.
-Check command cells reuse the shell syntax highlighter used by permission previews. They parse
-the complete displayed invocation before table wrapping, then project token byte ranges into
-each wrapped cell. Quoted arguments retain their capture across row boundaries, while headers,
-padding, separators, and other columns remain outside command syntax. The parser uses the
-PowerShell-compatible quoting produced by direct check invocation display on every platform.
-The blank row before Tests stays outside the Changes fold in both views.
-Rust inspection masks test attributes and test-only `cfg` gates in both Public and All views.
-The mask includes attached documentation, nested helpers, and synthetic behavior/reference rows
-through their owning declaration. It leaves saved declarations, validation, test inventory, and
-other languages unchanged. Production-capable conditional declarations remain visible.
-Test file headings use `DiffPresenter::file`, while case names and descriptions use its
-semantic summary rows with shared change gutters and full-row backgrounds. Modified cases
-use the same orange groups as replacement rows. File folds start expanded and retain stable
-path identities through edits. Every case row carries the same file-and-name deletion target.
-Rust test labels show the leaf function name while retaining the complete qualified identity.
-Test gutters use matching old and proposed declaration line numbers. Missing or ambiguous
-declarations leave the number blank, and description rows retain the same gutter width.
-The Tests heading reserves the section background for its label. Adjacent inventory counts use
-green, orange, and red foregrounds for new, modified, and removed tests, with reused counts in
-neutral gray. Optimistic deletions update these text spans before the revised projection arrives.
-Each file heading shows `+N -N` for added and removed test cases, excluding modified and reused
-cases from both totals. Source deliveries include each case's change kind, the file heading's
-path, and complete section and per-file inventory counts. Optimistic deletion uses those fields without parsing rendered labels or
-markers, preserving counts for cases inside collapsed files. Removing the last case removes
-only its inventory group. Incremental and full projections retain identical targets and folds.
-Public filtering preserves that unhighlighted section spacer even after an empty diff row.
-Declaration comparisons match unique Tree-sitter callable owners before aligning lines.
-The longest ordered chain supplies start and end boundaries, including attached comments
-and attributes. The existing histogram matcher compares each intervening range without
-matching repeated call lines against unrelated functions. Ambiguous owners and reordered
-regions retain ordinary line comparison. Source order, byte ranges, and both line-number
-columns remain authoritative. Changed callable signatures and revised lines inside matched
-callables use the shared orange `~` presentation. New callables retain green `+` rows.
-
-This follows the ordered-anchor approach described in Git's
-[patience implementation](https://github.com/git/git/blob/c51408889c3b372814bc20b9431c3b74d0d268eb/xdiff/xpatience.c),
-with callable identities replacing unique text lines and histogram comparison handling the gaps.
-[Difftastic's syntax matching](https://difftastic.wilfred.me.uk/diffing.html) motivates retaining
-syntax ownership before display alignment. Forge uses declaration boundaries here rather than
-implementing Difftastic's complete syntax-tree graph search.
-
-`plan/prompts/planning.md` owns the virtual file procedure, metadata roles, declaration syntax,
-validation contracts, and patch examples. `PlanPrompt` embeds it in draft, feedback, revision, and
-editable discussion requests. Execution prompts retain execution ID, plan ID, accepted revision,
-phase, findings, and the accepted document. Start, continuation, and interruption resume have distinct
-guidance. Resume requires checking current files, tool results, and background processes before
-repeating work. Successful phase completion ends the model turn so Harness owns the next phase
-transition. Execution revision submission retains the provider turn while the broker commits the
-revision and returns the decision. Ordinary pending-question follow-ups do not claim to be Plan tasks.
-
-`question_ask` pauses either backend on one to three structured decisions while
-`plan_submit` alone creates a review artifact. `ControlToolRegistry` owns every Harness
-tool schema once, then Codex projects it into app-server dynamic tools while Copilot projects it
-into SDK `Tool` handlers. Ordinary prose remains an ordinary planning response until the agent
-invokes a structured control tool.
-`ControlToolRuntime` owns the provider-visible state machine for one bounded turn. The broker
-captures the active plan state, canonical document, resolved question digests, elicitation,
-execution, and goal state, then both adapters feed every control invocation through that Rust
-runtime before forwarding it. Versioned patches atomically mutate virtual files and plan metadata,
-so all providers share the same authoring and validation boundary. Submission leaves the runtime
-open for reads, edits, and resubmission in the same turn. A later accepted patch or question clears
-the pending submission, and only the last successfully submitted current version reaches review.
-The runtime terminalizes question asks and execution phase completion, rejects controls outside
-their state, and treats an already-consumed question digest
-as an idempotent success rather than creating another picker. The broker still replays accepted
-operations against durable state with optimistic version checks, which keeps the session-scoped
-broker document authoritative. Adapters export a control invocation into aggregate
-`BackendOutput` only after its provider request returns success. Rejected invocations remain
-visible as failed timeline activities but never enter durable replay, preventing a corrected plan
-from being poisoned by an earlier validation failure. Started and completed lifecycle
-notifications update the rendered tool activity only. They never authorize a control mutation,
-because those notifications can precede validation or replay a rejected call after its response.
-Copilot uses its native tool events for Harness control-call activity, preserving the native tool
-and turn identities. The accepted-control channel carries replay data only and never adds a
-second, addressless completion. Concurrent SDK handlers share one asynchronously locked control
-runtime, so one call cannot make that runtime appear absent to another. Queued calls verify their
-turn ownership after acquiring the runtime before invoking it.
-A separate accepted-request identity set keeps successful provider request replays idempotent
-without allowing rejected requests to reserve that identity.
-The question tool also works during ordinary chat, goal, and execution turns. Those questions
-persist on their owning `Exchange`, while planning questions remain on `PlanRecord`.
-After submission, a normal prompt associated with the selected waiting Plan task creates a plan discussion exchange.
-`PromptMode::PlanDiscussion` supplies the canonical document and instructions to answer questions
-without editing or resubmitting. Discussion questions remain on that exchange, and clarification
-and answer continuations retain its planning context. Reading leaves `AwaitingReview` unchanged.
-A successful version-checked edit applies `ChangesRequested`, changes the exchange to
-`PlanRevision`, and clears pending acceptance. The planning loop then requires submission or a
-new question before completion. A rejected edit does not start a revision. Tool authorization
-allows discussion reads, edits, and revalidation through resubmission, but rejects editing
-while a question remains unresolved. These transitions retain the selected execution authorization.
-`BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
-answer, skip, Ask, and continue reuse the shared bottom picker without creating a plan artifact.
-Submitting the review page consumes that question set before the provider continuation starts.
-The continuation prompt and control-tool descriptions therefore forbid `question_answer`
-and `question_withdraw` for the embedded planning feedback. The Codex request responder
-enforces the same boundary by returning an unsuccessful tool result and omitting the rejected call
-from normalized control output. If Codex edits the plan but ends without submitting or asking a new
-question, the backend starts one bounded corrective provider turn inside the same Harness
-interaction and requires a current submission or new question. Codex app-server can expose one
-dynamic control invocation through both lifecycle and request messages. The JSON-RPC transport
-normalizes that invocation once across the full Harness request, including its corrective turn.
-This keeps one reviewed answer set attached to one planning interaction instead of reopening the
-same questions or applying one plan edit twice.
-Ordinary prose never counts as a submitted question set. Copilot `session.todos_changed` and Codex
-`turn/plan/updated` events feed the generic task tracker without submitting a plan. Names printed
-in prose or command output never count as control calls. Codex uses its app-server protocol
-directly, including `model/list`, dynamic Harness control tools, `thread/goal/set`, and
-`thread/fork`, but it does not set `collaborationMode` for Harness planning. Copilot uses the SDK
-model catalog, native permission callbacks, immediate steering, cancellation, and streamed
-subagent observation. Native fork enters the command set only after the backend advertises it.
-No transcript-copy fallback exists.
-
-## Check setup and plan elicitation
-
-`/plan` validates project checks before admitting plan generation. Missing or invalid configuration
-retains the original request in a `ConfiguringChecks` plan and a `checks_setup` task phase. A separate
-setup exchange receives the request as tooling context and owns its questions. Configuration
-publication requires an explicit user answer. Closing the picker preserves the pending setup,
-while cancelling the plan cancels its setup exchange. Recovery retains the request and resumes
-setup rather than generating a design. A matching persisted configuration-save record plus a valid
-current snapshot permits the broker to transition to `Generating` and start one planning exchange
-with the original request. An intentionally empty configuration bypasses setup. Submission still
-validates the saved configuration in case it changed during planning.
-
-`/plan` uses `Planning` and `Planned` summaries, while plan revision uses `Revising plan` during work. A
-question-only turn saves `PlanElicitation` under the active `AwaitingInput` plan, renders its
-choices in the timeline, and opens the shared picker across the bottom of the complete Harness
-transcript-and-composer surface. The border shows the question title and `N/M` progress. The
-picker maps provider choices and Other through configurable `picker.choice_keys`, reserves `a`
-for Ask, and reserves `o` for Other. Provider choices
-default to `n`, `e`, `i`, `l`, `u`, and `y`. Arrow keys plus `s`/`t` change the light-blue selected
-row without submitting it. The compact footer exposes only question navigation and Tab feedback.
-Enter records an ordinary choice or opens the
-attached editor for Other and Ask. Tab opens that same editor for optional choice feedback.
-Ctrl-s belongs only to the attached input window, where it records the selected answer plus text
-and advances to the next unanswered question. The input renders as an independent borderless child
-inside rows reserved by the parent picker and uses the shared window-local prompt gutter, so buffer
-columns contain only submitted text. Reserving those rows keeps the parent top edge stable while
-the input opens. Opening the picker focuses its read-only navigation buffer with the cursor hidden.
-Opening an attached input restores the configured cursor and enters Insert mode. Tab returns to
-the cursorless picker without closing the child, so its text
-follows whichever option the user selects next. Tab or `go` can focus that existing child again,
-while Ctrl-c clears its draft, closes it, shrinks the picker, and restores option focus.
-
-After the final answer, the float becomes an explicit review page that lists every question,
-selected answer, and additional input in question order. `y` closes the elicitation and resumes
-the provider. `n` returns to the first question while preserving the broker-backed answer set,
-including feedback and Other text, so each answer can be inspected or replaced before submission.
-The main question float never maps Ctrl-s and cannot bypass this review boundary.
-
-Answer and skip requests update only the durable elicitation record. Ask and subsequent ordinary
-Harness prompts run read-only follow-up interactions against a mutable decision set. The provider
-must preserve the set without a control call when it remains valid, may replace the complete set
-through `question_ask`, may record only an explicit user answer through
-`question_answer`, and may remove the boundary through `question_withdraw` only
-when user direction or repository evidence proves that no material decision remains. A model
-recommendation never qualifies as an answer.
-Closing the float leaves a Timeline Status reading `Waiting for input (press oe)`. Clarification
-chat can continue without reopening that unchanged question set, while `oe` or `/questions`
-restores it explicitly. A provider replacement increments the elicitation revision, preserves only
-answers that remain valid against the new schema, and presents the revised questions once. A
-conversational answer also increments the elicitation revision so the next unresolved decision
-reopens. Withdrawing an ordinary question clears its status after the response. Withdrawing a
-planning question records `Question withdrawn: <reason>` in plan history and starts a new planning
-turn automatically. Failed planning continuation restores the original elicitation and removes the
-provisional withdrawal lifecycle, preserving the review boundary. The
-status takes precedence over a concurrent subagent wait because user input blocks provider
-continuation. The broker serializes missing answers as intentional best-judgment decisions only
-when the user explicitly continues. A provisional `QuestionAnswered` lifecycle record is removed if that
-continuation turn fails, so the timeline never claims feedback was consumed while the elicitation
-has been restored.
-Elicitation revisions prevent a restored session from repeatedly presenting the same picker, while
-the transient Timeline Status exposes the pending decision after dismissal or restart.
-Plan edit calls persist the structurally valid JSON draft without rendering its intermediate
-cross-section state. `plan_submit` validates ownership coverage and renderability against
-the complete staged document. A rejected submission returns those violations to the provider and
-leaves the draft editable, while a successful submission atomically refreshes `working.md`, its
-navigation index, and the immutable submitted revision.
-Successful submission appends one collapsed artifact delta to the planning interaction that
-produced it and increments the artifact count in the winbar. The delta uses the shared changed-file
-tree while labeling the canonical plan as an artifact, so revision history stays attached to its
-causal turn instead of creating a sibling `Plan revision created` event or dumping the complete plan
-into the timeline. Harness never opens PlanReview automatically. `op` selects a session artifact
-through the floating no-preview picker and opens its physical working copy through `session.plan.get`.
-The picker selects the current task's plan first. Browsing another plan or revision never selects
-a task. Each review document captures its session, plan, and revision digest independently.
-`C` creates an inline annotation at the current source line. Cursor focus expands its editable body,
-while leaving the annotation collapses it into a compact rendered box. Request changes records
-line/body input, then Rust resolves every line to its exact semantic target before starting another
-read-only revision turn. That revision interaction names the overall comment when present and otherwise stays
-`Request plan changes`. The durable `ChangesRequested` record remains state-machine history but
-does not create a duplicate timeline node. PlanReview admits only one acceptance or revision request
-at a time. Both `oY` and `oN` open an optional-comment popup. `Enter` or `Ctrl-S` submits in normal
-or insert mode, while `Esc` or `Ctrl-C` cancels without sending a decision. Submission checks that
-the plan and review buffer still match the captured revision, then hides the review and restores
-the originating Harness window while the broker request continues. Failed revision requests preserve
-the Lua annotation cache so `op` can rebuild the review
-surface. Acceptance creates durable `PlanAcceptance` input in Rust and reuses the Harness multi-page
-question picker for provider-context reuse and execution authorization. Dismissing that picker
-cancels pending acceptance and restores plan-review status. Rust attaches one collapsed
-`Resolved N comments` node before the revision artifact delta only after the model submits the
-replacement plan. Acceptance prevents an accepted write plan from inheriting Read authorization and
-blocking its first file change. It then emits
-`Plan accepted` inside the admitted execution exchange and creates the guarded
-`Complete accepted plan: <title>` goal. Phase transitions, revision decisions, and suspension events
-retain an `ExchangeAnchor` containing the owning exchange ID and a boundary in its append-only
-source node sequence. `TimelineProjector` inserts their content as `ExchangeNode::PlanEvent`
-inside that exchange. The timeline has no separate plan lifecycle, execution, or resolution
-container. Live provider replacement preserves these derived nodes at their captured positions.
-An optional acceptance comment is stored on `PlanAcceptance` until all acceptance questions resolve,
-then copied to the accepted lifecycle record and execution history without changing the plan digest
-or design. Initial and revised execution prompts and live revision responses include these notes as
-reviewer context. Revised execution state and its acceptance lifecycle record commit in one storage
-transaction, so retry cannot observe one without the other.
-Question answers and withdrawals retain the matching question identity and place its resolved
-details at the response boundary.
-The collapsed clarification row retains the question, options, and response, without duplicating
-the user input row. Review feedback retains annotations before revision execution, including
-failed revisions. Direct review renames remain visible as exchange-owned revision events.
-Records saved before anchors existed use a compatibility path scoped to the matching plan or
-execution. That path uses clarification input boundaries when available, but old provider content
-without item timestamps cannot recover every historical intra-turn position exactly. Cancellation
-pauses execution without changing its phase. `/goal resume` uses the effective canonical design,
-retained findings, and phase instructions while preserving completed workspace work.
-
-## Harness representation and evidence boundaries
-
-Submitted Codex turns own their request through a box, and plan-execution timeline interactions
-own their interaction record through a box. Inactive enum variants no longer reserve storage for
-the largest payload. Serialization continues to emit the underlying request and interaction data
-without an additional wire object.
-
-Plan mutation uses a `ResourceSchema` descriptor for collection identity, semantic keys, renaming,
-and preparation. The descriptor keeps each resource's naming and identity rules together while
-the mutation algorithm still validates and applies the same ordered edits. Semantic execution
-accepts phase completion through its broker-owned control channel. Completion requires a fresh
-semantic comparison and a verification assessment with retained tool evidence.
-
-Wrapped plan lines accept their first-line and continuation prefixes as a pair. Entity rendering
-derives the entity from its document index instead of accepting a second independently supplied
-entity reference. Cargo source resolution names its package/version lock map without changing
-lock ownership or retention.
-
-## Plan implementation and conformance
-
-Implementation cannot be interrupted by declaration reconciliation. Implement writes the accepted
-behavior and tests, permits justified source deviations, and defers builds and checks to Harness Checking.
-The tool catalog omits plan mutation controls in Implement and Verify. The control runtime and
-broker independently reject those mutations, including calls from stale provider sessions.
-
-Checking compares body-free declaration structure and configuration values against the current
-accepted revision. Required declarations, signatures, ownership, and exposed API remain binding.
-Additional internal helpers are permitted. Calls, Constructs, and Accesses record implementation evidence.
-Planning uses their resolved internal relationships to enforce incoming-use requirements, while
-implementation conformance does not treat every captured body reference as a completion gate. Checking collects declaration findings and executes accepted commands. Resolve fixes the
-workspace or submits a consolidated contract revision, then returns to Checking. Plan revisions
-retain the existing review-wait protocol and never replace the original accepted baseline.
-
-Unique Rust callables within the caller's conditional scope can supply navigation and incoming-use
-evidence without asserting that the current build enables their condition. This includes private
-helpers called by tests inside `#[cfg(test)]` modules. An uncalled helper still fails validation,
-and references to conditionally available types remain unverified.
-Check tables preserve multiline command and diagnostic cells as physical rows before measuring
-their display width, so a package-discovery error remains visible without preventing plan review.
-
-At completion or a blocked result, the broker records an implementation-differences report against
-the original accepted revision. Failure, cancellation, and continuation exhaustion retain an
-incomplete report. Reports compare accepted paths and checkpoint changes, including removed files.
-They distinguish unspecified reference categories from explicitly empty Calls, Constructs, or Accesses and show
-internal additions, contract differences, approved revisions, and unavailable evidence.
-
-The report is an immutable content-addressed object. The execution record and timeline node retain
-its identity and counts, not its full text. The timeline shares cached report data and exposes its
-file details through the existing collapsed-section loader. Reopening a session preserves the same
-report. A missing report object shows unavailable content rather than silently dropping the summary.
-Report publication checks source identities before committing a successful phase result. A changed
-workspace rejects that result for a fresh verification attempt, rather than pairing stale evidence
-with a newer report.
-
-## Project checks and the Harness checking gate
-
-Project check definitions live in the `checks` section of `.forge.json`. The LLM configures
-them through `check_definition_edit` with check-editing permission, using the
-`harness-checks` skill and preserving other repository settings. The categories are
-`format`, `lint`, `check`, `test`, and `build`. Unit, integration, and screenshot suites are
-named `test` definitions. No language detector generates commands. An absent checks section
-blocks plan submission. An explicitly empty checks object is valid. Each named check contains
-its automatic `trigger` and executable `action`.
-
-Check history version 5 stores named checks with their declared and resolved inputs. The supervisor checks the
-record envelope version before decoding its run. Older records remain on disk but are excluded
-from reopening, previews, and forks. Invalid current records report their file path and decoding
-error. Plan schema 15 applies the corresponding boundary to saved plan check snapshots.
-
-Each definition owns its identity, trigger, explicit category, directory, opaque command,
-typed named inputs, and prerequisites. Callbacks receive resolved inputs and generic change
-context as JSON on stdin. Successful callbacks write a matching selection receipt, and can
-publish a generic result report separately from stdout. Missing or malformed receipts fail.
-Managed helper files live under `.forge/checks/`. Setup validates paths and captured identities,
-not language syntax, and never starts helper-specific validation commands.
-
-Direct operations retain an executable and argument vector. `checks::invocation::resolve` substitutes
-declared values into complete argv elements without executing anything. It has no package
-manager or test-runner branches. A definition produces one command. Repository callbacks own
-any package lookup, test filtering, batching, or runner-specific output interpretation.
-Prerequisites must pass before dependent definitions run.
-
-`enabled` permits execution and `auto` controls trigger-driven selection. Omitted
-`auto` defaults to true. The plan's `checks` list explicitly selects enabled
-checks, and `disabled_checks` suppresses checks for that plan even when their
-automatic triggers match. The plan-specific `oc` picker and visual deletion
-submit `session.plan.check.update` through the same versioned review-edit path as test
-deletion. Rust expands prerequisite and dependent choices, recomputes the preview,
-retains annotations, and persists the new review digest. The repository check
-configuration remains unchanged. Check rows carry semantic check identities so
-visual selection remains valid across wrapping and repeated package invocations.
-
-The `checks` list explicitly selects enabled
-definitions without changing their repository defaults. The versioned
-`plan_checks_add` tool adds these references through the normal design
-patch lifecycle. Both previews and execution include required prerequisites.
-
-`CheckEvidence` retains the source checkpoint and execution contract certified by
-an attempt. Automatic gates reuse current evidence within the owning task,
-including evidence from explicit tool runs. Reuse requires identical context and resolved
-inputs, the same execution contract and helper content, and an unchanged workspace.
-No package ownership is inferred for evidence. Explicit runs always execute.
-
-Ordinary completion and successful goal completion enter the Rust-owned automatic
-gate. Intermediate goal turns, waiting questions, approvals, cancellation, and
-active children do not. The gate runs applicable automatic checks and delivers
-saved failures to a repair exchange retaining the original check owner.
-`AutomaticChecks` persists pending validation and failure delivery. Repeated
-failures without changed inputs stop repair with unresolved diagnostics.
-
-`CheckPreview` resolves the same typed inputs as execution without running subprocesses.
-A missing required value remains an unresolved preview. Runner-specific coverage guarantees,
-including rejecting zero matching tests, belong in configured callbacks. Plain commands use
-their exit status. Argument values never pass through shell interpolation.
-
-Changed-case defaults consume an accepted plan's added/modified case inventory. `new_cases`
-consumes only new entries. Case executable identities are opaque data for callbacks,
-not instructions for Harness to construct a runner command. An explicitly
-empty inventory can select no cases. Standalone runs have no such inventory and report a
-configuration error when an applicable case-scoped check cannot resolve coverage. Explicit
-empty file or case selections also fail configuration. File mappings and explicit nonempty
-case selections remain available outside plan execution.
-
-Triggers select checks independently from execution scope. An `any_change` trigger requires at
-least one task-relative changed path. A `paths` or `files_changed` trigger selects changes
-matching an include and no exclude pattern. Patterns support `*` and `?` within components
-and `**` across components.
-A `manual` trigger requires an explicit request or a dependency from a selected check. Areas
-are descriptive groups and may overlap through trigger paths. A full-workspace check therefore
-does not run on changes outside its trigger. Required prerequisites enter the selected set even
-when their own triggers do not match.
-
-The runner compares the current checkpoint with the first checkpoint of the owning task,
-preserving the baseline across continuations and host recovery. Existing dirty files do not
-trigger checks unless that task changes them. Additions, deletions, and both rename paths remain
-part of the change set. Before a task baseline exists, automatic applicability remains unknown
-and standalone runs select no commands. An accepted plan without a checkpoint has unknown
-changes rather than an empty change set. Its automatic triggers require verification, with
-full-scope checks running normally and unresolved file or case scopes blocking completion.
-The runner never infers a complete change set from declaration files alone or silently broadens
-scoped coverage. Explicit IDs or the separate run-all action bypass triggers.
-Repository callback implementations follow
-[Extending project checks](../extending-project-checks.md), with targeted verification in
-[Building and testing](../building-and-testing.md#verify-project-checks).
-Nushell receives `--stdin` before `-c` when scoped selectors are piped into a check. Shell
-construction owns both argument order and stdin configuration.
-
-Setup first discovers commands and then asks the user about areas, automatic suites, coverage,
-and cost through the shared question flow. Setup retains its decision state across question
-continuations, interrupted exchanges, and subsequent chat follow-ups in the same task context.
-Follow-ups inherit discovery or reviewed state from the latest persisted exchange. A recorded
-configuration publication ends that inheritance, as do cancellation, rollback, and a change of
-task context. The configuration tool rejects publication before a user answer.
-Missing-configuration bootstrap during planning uses the same question requirement before
-publishing checks. Explicit setup never runs configured checks or modifies active-plan questions.
-Setup rejected before exchange admission returns `not_admitted` and preserves the existing task's
-status and pending questions. An error after admission follows normal task failure handling.
-
-The check-tool lease owns authorization and lifecycle event senders. When a provider turn ends,
-the lease revokes tool access and releases those senders even if a persistent provider connection
-retains its control context. Request completion can then drain the event stream and publish pending
-questions to the UI. A retained context cannot keep the broker locked after the turn returns.
-
-`/checks` shows ordered definitions with enabled circles, categories, scope, automatic selection,
-and areas. Space toggles the selected definition. Tab selects Scope or Auto, and arrow keys
-change that field. Enter runs the selected check. The picker omits setup, batch-run, reset,
-and save-defaults action rows, along with result and duration columns and selection subtitles.
-Shared inline picker fields change task overrides without editing project defaults. Overrides
-persist by task identity across resume and revisions. Ad hoc conversations use a separate
-conversation identity. Project setup writes `.forge.json` explicitly. Details expose commands,
-requested and resolved coverage, error reasons, and saved output. History retains completed
-and interrupted runs. Read, status, cancel, and override requests remain responsive outside
-the active provider or automatic-gate broker lock.
-
-Checks use arrow keys for value editing on the definitions page and bracket keys for page
-navigation. Refresh retains the selected page unless the owner supplies an explicit initial page.
-History replaces definition actions with its own page mappings. Action rows use the available
-width independently of table columns.
-Expanded details wrap long output paths without discarding characters or crossing picker borders.
-Missing configuration stays unconfigured. Invalid configuration and failed catalog requests retain
-a visible repair row and disable execution until the catalog loads successfully.
-
-Plans retain test inventory and manual `verification` actions, while configured checks are a
-read-only projection. Submission captures the saved configuration. Acceptance rejects stale
-configuration, refreshes the projection, and requires reopening the review. Implement and
-Resolve write source without executing validation. Their completion persists Checking before
-process admission. Manual Verify begins only after the declaration scan and enabled checks pass.
-
-The completion gate defaults to `after_queue`. `/config` can select `between_work`
-instead, and the settings store persists that choice globally. Rust derives pending
-work from its revisioned input queue. Input operations remain available independently
-of the active broker lock.
-`CompletionQueue` retains deferred validation and the original change owner across
-queued interactions. The final interaction therefore checks changes from the entire
-batch. If queue editing removes the remaining work, the host input worker invokes
-`session.check.complete` under normal execution admission. Failed, paused, or waiting work retains its existing
-admission boundaries. Plan Checking and explicitly requested runs remain independent.
-
-One Rust-owned runner serves the automatic gate and `check_run`. Its provider-neutral
-tools list configuration, save authorized setup captures, start runs, read status, and cancel
-owned runs. Model-triggered runs execute enabled saved definitions without command approval,
-just like automatic checks. Requests select check IDs and coverage, never replacement commands.
-Check configuration writes still follow the existing permission coordinator. The narrow
-setup action writes only checks settings and managed helpers while retaining the active plan.
-Disabled checks cannot be selected by the model. Source-writing phases and active children
-exclude on-demand runs. Models normally finish work and leave checking to the gate.
-Manual runs are generally unnecessary, but models may optionally call `check_run`
-for earlier feedback where on-demand runs are available.
-Automatic checking does not admit a model exchange or report tokens.
-
-Checks execute serially through `/config Shell`. `CheckConfig::order_selected` promotes selected
-preparation and its transitive prerequisites before unrelated verification, then prioritizes
-runnable checks by check, test, read-only format, lint, and build. Compiler and TypeScript
-type-check commands belong to category `check`. Configured order breaks ties within a category.
-Explicit dependencies take precedence, including tests that consume
-a built host. Catalog ordering uses the same policy with every definition selected. Previews and
-execution use their actual selected set so unselected preparation cannot promote verification.
-Independent checks continue after failures. Dependents of failed prerequisites are skipped with a reason.
-An enabled check with a disabled prerequisite is a configuration error. Categories do not
-imply dependencies. Formatting and lint errors therefore do not suppress independent tests.
-Run snapshots retain configuration, helper hashes, overrides, selections, matched paths, selection
-reasons, shell, source identity,
-and environment digest. Environment values do not appear in the transcript. Each command owns
-exit status, timestamps, stdout, stderr, combined output, and requested/resolved selections.
-
-Each run owns stable structured events for start, individual check start and completion,
-skips, configuration errors, interruption, resumption, and completion. Setup records a
-configuration-saved event. Active checks appear below the primary workflow status,
-not in timeline history. `CheckActivity` retains command labels, completion counts,
-execution intervals, and the latest nonempty output line for each running command.
-It removes terminal escape sequences from that line and updates the status through
-the supervisor's 250 ms publication interval. Complete output remains in the check store.
-Check activity never replaces Working, a user-decision wait, or another primary phase.
-An otherwise idle primary status shows Checking while the check timer advances.
-
-Completion clears that run's side activity and inserts one expandable result group at
-its completion timestamp in the same revision. Repeated updates retain the same group
-identity, and a late result cannot clear a different active run. Result details retain
-commands, selections, failure diagnostics, and lazy access to complete saved output.
-Intermediate lifecycle events remain in the check record rather than producing timeline
-rows. Reopening reconstructs the same final results and current independent activity.
-`CheckSupervisor` owns publication for both plan gates and on-demand runs. The broker does
-not publish a second check projection or replace the primary phase from a check update.
-Agent `check_status` returns only a compact summary and latest output line.
-Its optional `wait_ms` waits for completion under one fixed deadline, defaulting
-to immediate observation and allowing at most 60 seconds. `check_list` applies
-the same summary to currently running IDs without serializing completed history.
-Both paths read current in-memory records without resolving previews or opening logs.
-`check_detail` reads completed logs in UTF-8-safe pages and exposes exact invocation
-metadata. Running detail requests direct the caller to `check_status`.
-`check_definition_list` reads saved definitions and live policy without history,
-while `check_definition_details` provides a full definition on demand.
-The editor's internal service routes retain their catalog and run contracts.
-
-Recorded declaration or command failures enter Resolve. Configuration errors block completion
-and notify the user to fix the definitions. Disabled checks and empty task selections remain
-Not run, never Passed. Source changes during the gate invalidate its result. Interruption
-terminates owned processes and preserves outputs. Recovery marks detached work interrupted.
-Interrupted runs retain their input checkpoint. Automatic completion compares the
-same task, command contract, selection, and relevant inputs before scheduling a
-retry. Unchanged cancelled work becomes Blocked and does not start another process
-or automatic repair. An explicit check run or changed relevant inputs permits a new
-attempt. A later completed explicit attempt supersedes the cancellation for that
-coverage without granting coverage to other checks.
-
-Direct prompt submission interrupts active checks and waits for process collection and
-execution release before admitting the new prompt. Snapshots and check document updates
-publish the active run identity so the composer keeps this action separate from explicit
-queueing. Queued prompts wait for check completion without cancelling the run.
-Resume reuses completed results only when configuration, scope, environment, and workspace
-identities still match. Passing gates enter manual Verify when actions exist, otherwise
-complete the plan. Manual defects return to Resolve and manual blockers preserve Verify.
-Checking updates the owning task phase before publishing the transition, so the header and
-the next Resolve or Verify exchange show the same phase.
+A plan that a provider can change after review, or that names declarations no one can find, gives the reviewer nothing to hold the implementation to. Harness therefore owns the plan document, validates its references against captured source, freezes each submitted revision, and checks the finished work against the accepted revision.
+
+Tree-sitter extraction and LSP setup are separate capabilities. See [Languages](languages.md) and [Adding a language](../adding-language.md). Editable-region and draft-comment mechanics are described in [Buffers and rendering](buffers-and-rendering.md).
+
+## Plan documents and authoring
+
+`DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves in Harness-owned `plans/<session>/<plan>/working.json`. A new plan reads `.forge.json` settings and starts with no captured files. The provider receives the plan identity, version, request, and path inventory, and edits the plan only through control tools:
+
+- **`plan_read`** returns one virtual file or its baseline as numbered text, optionally within 1-based inclusive line bounds. Reading an uncaptured path extracts only that file and returns its digest without changing the design.
+- **`design_patch`** applies Add File, Update File, Delete File, Move to, and context chunks atomically. The first Update, Delete, or Move captures that path's baseline and digest, and optional `source_digests` carry read identities across turns, so a source change after the read rejects the patch. Invalid syntax, paths, stale versions, or unmatched context change nothing. Every effective patch increments the version, and its confirmation includes the applied deltas with three context lines.
+- **`plan_submit`** validates the complete staged document and freezes an immutable revision, refreshing `working.md` and its navigation index.
+
+Harness captures nonignored Rust, TypeScript, TSX, Lua, JSON/JSONC, TOML, YAML, and XML files. Language adapters extract declaration baselines with complete signatures, fields, visibility, generics, imports, and documentation, but omit executable bodies and initializers. Configuration keeps complete values. Harness owns spacing, indentation, tables, and wrapping, so agents supply content and nesting rather than display rows. `declaration_line_width` is a preference, never a validation limit.
+
+Callable behavior is a tagged `FunctionBehavior`. New callables require a nonempty `Algorithm`, and existing callables use `Change`: preferably one sentence naming the concrete problem and the behavior that addresses it, without invented defects. Planning prompts require the global `academic-pseudocode` skill. Algorithm blocks use the repository's `algorithm` Tree-sitter grammar, and submission validates statement syntax, balanced delimiters, indentation, control bodies, `otherwise` branches, and loop ownership of `break` and `continue`, reporting the callable, line, and column.
+
+Function-body references use three sections. `Calls` lists invocations and callbacks, `Constructs` lists directly instantiated types and owned-type factories, and `Accesses` lists fields and named values. Every `Constructs` target needs a matching invocation in the Algorithm with `field = value` arguments, and qualified field references need matching `Accesses` entries. An omitted section records unknown evidence, while an empty section records no uses. Validation resolves references and members but never type-checks expressions or proves correctness.
+
+`plan/prompts/planning.md` owns the authoring procedure, metadata roles, declaration syntax, and patch examples. `plan/prompts/system.md` defines the stable Harness conventions, and `backend/prompt.rs` adds the current permission and interaction purpose from the admitted request.
+
+## Control tools
+
+`ControlToolRegistry` defines every Harness tool schema once. Codex projects it into app-server dynamic tools and Copilot into SDK `Tool` handlers. `ControlToolRuntime` owns the provider-visible state machine for one turn: the broker captures plan, question, execution, and goal state, and both adapters route every control call through that runtime before forwarding it. Submission keeps the runtime open for further reads, edits, and resubmission in the same turn, and only the last current submitted version reaches review.
+
+Adapters export a control call into durable replay only after its provider request succeeds, so a rejected call stays visible as a failed activity without poisoning a later corrected plan. Lifecycle notifications only update the rendered activity and never authorize a mutation, because they can precede validation. Copilot's concurrent SDK handlers share one asynchronously locked runtime and verify turn ownership after acquiring it. Names printed in prose or command output never count as control calls, and Codex does not set `collaborationMode` for Harness planning. Native fork appears only when the backend advertises it, with no transcript-copy fallback.
+
+`question_ask` pauses on one to three structured decisions. It also works in chat, goal, and execution turns, where questions persist on the owning `Exchange` instead of `PlanRecord`. After submission, a prompt for the selected waiting Plan task becomes a plan discussion. A successful edit there applies `ChangesRequested` and requires a new submission or question before completion. If Codex edits a plan but ends without submitting or asking, the backend runs one bounded corrective turn inside the same interaction.
+
+## Reference validation and navigation
+
+The submit tool validates references before accepting a version, so the provider can repair a rejected design in the same turn, and the broker repeats validation on the formatted snapshot. `DeclarationDesign.validation` stores diagnostics and the snapshot fingerprint, and any patch invalidates them. Proven invalid or ambiguous references reject submission, and unverifiable references warn. The shared Tree-sitter `DeclarationIndex` resolves Rust and TypeScript names within the saved plan, with proposed declarations replacing their baseline files and deleted lines using a separate baseline graph. Rust module loading uses a work list without a depth limit. External APIs, dependency versions, and uncaptured modules stay unchecked, and capture, saving, and submission never issue LSP or dependency requests.
+
+`.` and `open` resolve the selected token through saved Tree-sitter coordinates. A target inside the plan is revealed in PlanReview, opening folds and restoring omitted context without changing the Public filter. A target outside the plan opens its real source buffer. Source-backed definitions use an already-running project LSP on demand: Rust supplies the real path, digest, position, and filetype, Lua loads the file into a hidden buffer without autostarting a server and requests `textDocument/definition`, and Rust validates document, revision, view, and digest before mapping the result. Requests have a five-second deadline, discard superseded results, and are never cached. No generated source, stub project, or dependency download participates.
+
+Narrative inline-code identifiers resolve against the complete proposed declaration index. Unique matches receive their declaration-kind color, and ambiguous names open a chooser. An unmatched name may query `workspace/symbol` on at most four existing clients, with at most 256 results each and a five-second deadline. That query excludes captured files, so deleted declarations cannot reappear. Algorithm references reuse the plan resolver, and parameter names jump to their exact signature token.
+
+## Flows
+
+Plan metadata stores execution flows separately from prose, typed by `design_flows.rs` as a `trigger` and ordered `steps`. Steps hold actions, terminal effects with only a `target` and `change`, and conditional branches with their own steps. Later independent events need separate flows. Rendering and validation traverse branches iteratively without count or depth caps, using `→` for the first action, `↓` for later steps, and `┄▶` for effects. Diagram identifiers reuse narrative symbol targets for coloring and navigation.
+
+## PlanReview
+
+PlanReview opens with one compact block snapshot. Modified files contribute changed chunks and enclosing declaration boundaries through the shared diff presentation, and later revisions send disjoint block patches and sparse anchor edits, compared by stable block identity in linear time. Explicit reference navigation adds a bounded excerpt around a declaration outside the changed regions. Sections appear in order: proposed declaration changes, Tests, Checks, and Verification, each with its own fold. Rust test attributes and test-only `cfg` gates are masked in both views.
+
+Declaration comparisons first match unique Tree-sitter callable owners, then run the histogram matcher on the gaps between them, which follows Git's [patience](https://github.com/git/git/blob/c51408889c3b372814bc20b9431c3b74d0d268eb/xdiff/xpatience.c) approach with callable identities as anchors. Changed signatures and revised lines in matched callables use the orange `~` presentation, and new callables use green `+` rows. Submitted revisions keep a file delta between consecutive proposals with three context lines. Removed-row navigation opens the previous proposal, or the source baseline on the first submission, and never the current worktree.
+
+The Tests section lists cases by file with `+N -N` counts for added and removed cases. Every case row carries a file-and-name deletion target, and Rust labels show the leaf name while keeping the qualified identity. Check command cells use the shell highlighter, parsed before table wrapping. Soft-wrapped rows keep their source indentation and gutter, and each window wraps independently.
+
+## Review edits
+
+Reviewers can rename declarations and delete tests in place. Renames preview every affected span. Visual `j` on test rows collects distinct cases into one confirmation, and `session.plan.test.delete` removes only those inventory entries. `session.plan.check.update`, opened through `oc`, changes the plan's check selection through the same versioned path. Each edit validates the captured view and source version and returns an updated projection to the open document, so the review never reloads. Confirmed deletions project optimistically and restore on failure.
+
+The plan keeps an ordered `manual_changes` history of renames and removed tests, which acceptance, revision feedback, and resumed execution expose to the agent. Each edit saves `working.json`, `working.md`, and its navigation index and advances the review digest, while submitted snapshots stay unchanged. Accepting or requesting changes freezes one snapshot of the edited draft and records one revision.
+
+## Annotations and questions
+
+`C` creates an inline annotation at the current source line. Cursor focus expands its editable body, and leaving it collapses the annotation into a compact box. `A` creates a `Plan question` through the same editor, and `C` or `A` on an existing message adds a follow-up to its conversation. `Ctrl-S` saves feedback and submits unanswered questions.
+
+`session.plan.question.answer` forks the source session once per question through the same-provider fork coordinator. Each fork keeps conversation history, receives the saved design and selected excerpt, and answers in one or two sentences without writing files or changing the plan. While a fork runs, its reply block shows `Generating response · <model> · Thinking: <effort>`. Answers persist in the annotation store with their duration, shown as `Thought for N seconds`. Editing a question invalidates its answer, and a late response cannot attach to different text. `/config` exposes a provider-local Ask model, thinking, and speed override.
+
+Revision requests carry structured comment anchors. The planning prompt shows each comment beside a baseline-and-proposal excerpt with three rows of context, one line number per row, `-` for removals, and `+` for additions, followed by `8: body` or `8–12: body`. Feedback formatting finishes before the broker changes plan state, so an invalid anchor cannot drop comments from a revision.
+
+## Decisions and acceptance
+
+`oY` and `oN` each open an optional-comment popup, and only one decision can be pending at a time. Submission checks that the plan and buffer still match the captured revision, hides the review, and returns focus to Harness while the broker continues. A failed request reopens the review without losing unsaved feedback, and `op` can rebuild it. Harness never opens PlanReview automatically. `op` picks a session artifact, preferring the current task's plan.
+
+Acceptance creates a durable `PlanAcceptance` and reuses the question picker for provider-context reuse and execution authorization, so an accepted write plan never inherits Read authorization. Dismissing the picker cancels acceptance. Once every question resolves, Harness emits `Plan accepted` inside the execution exchange and creates the guarded `Complete accepted plan: <title>` goal. An acceptance comment is copied to the accepted lifecycle record and execution prompts as reviewer context. Phase transitions and revision decisions carry an `ExchangeAnchor`, so `TimelineProjector` places them inside their owning exchange, with no separate plan lifecycle container.
+
+## Question picker
+
+A question-only turn saves `PlanElicitation` under an `AwaitingInput` plan and opens the shared picker across the bottom of the Harness surface, titled with the question and `N/M` progress. Provider choices default to the keys `n`, `e`, `i`, `l`, `u`, and `y` through `picker.choice_keys`, with `a` reserved for Ask and `o` for Other. Arrow keys and `s`/`t` move the selection, and Enter records a choice or opens the attached editor for Other and Ask. Tab opens that editor for optional feedback, and Ctrl-s inside it records the answer and advances. After the final answer, a review page lists every answer. `y` resumes the provider, and `n` returns to the first question with answers preserved.
+
+Answer and skip requests update only the durable elicitation. Ask and later prompts run read-only follow-ups, where the provider may keep the set, replace it through `question_ask`, record an explicit user answer through `question_answer`, or remove it through `question_withdraw` only when no material decision remains. A model recommendation never counts as an answer. Closing the picker leaves `Waiting for input (press oe)`, and `oe` or `/questions` reopens it. Revisions keep only answers that remain valid, and missing answers become best-judgment decisions only when the user explicitly continues.
+
+## Check setup
+
+`/plan` validates project checks before generating a plan. Missing or invalid configuration keeps the request in a `ConfiguringChecks` plan with a `checks_setup` phase, run as a separate setup exchange that requires an explicit user answer before publishing configuration. A matching saved configuration then starts one planning exchange with the original request. An intentionally empty configuration skips setup, and submission still validates the saved configuration.
+
+## Implementation and conformance
+
+Accepted execution runs Implement, Checking, Resolve, and optional Verify. Implement writes the accepted behavior and tests, may deviate from source with justification, and defers builds and checks to Checking. Plan mutation tools are absent in Implement and Verify, and both the runtime and broker reject them. Successful phase completion ends the model turn so Harness owns the next transition. Resume prompts require checking current files, tool results, and background processes before repeating work.
+
+Checking compares body-free declaration structure and configuration values with the accepted revision. Required declarations, signatures, ownership, and exposed API are binding, and additional internal helpers are allowed. It then runs the accepted checks. Recorded failures enter Resolve, which fixes the workspace or submits a consolidated contract revision through the normal review wait and returns to Checking. A passing gate enters manual Verify when verification actions exist and otherwise completes the plan.
+
+At completion or a blocked result, the broker records an implementation-differences report against the original accepted revision, covering internal additions, contract differences, approved revisions, and unavailable evidence. The report is an immutable content-addressed object referenced by identity from the execution record and timeline. Publication checks source identities first, so a changed workspace forces a fresh verification instead of pairing stale evidence with a new report.
+
+## Project checks
+
+Project checks live in the `checks` section of `.forge.json` and are edited through `check_definition_edit` with the `harness-checks` skill. Each definition has an identity, an automatic `trigger`, a category (`format`, `lint`, `check`, `test`, or `build`), a directory, an opaque command, typed named inputs, and prerequisites. No language detector generates commands. An absent section blocks plan submission, while an explicitly empty one is valid. Callbacks under `.forge/checks/` receive resolved inputs and change context as JSON on stdin and must write a matching selection receipt. `checks::invocation::resolve` substitutes declared values into complete argv elements, never through shell interpolation, and Harness never constructs runner commands. Repository callbacks own test filtering and coverage guarantees, following [Extending project checks](../extending-project-checks.md).
+
+Triggers select checks independently of execution scope: `any_change` needs a task-relative change, `paths` or `files_changed` match include and exclude globs, and `manual` needs an explicit request or a dependent. Required prerequisites always join the selection. The change set compares the current checkpoint with the owning task's first checkpoint, so pre-existing dirty files never trigger checks. Without a baseline, applicability is unknown and scoped coverage blocks completion rather than being inferred. `enabled` permits execution and `auto` controls trigger selection. The plan's `checks` list adds checks, and `disabled_checks` suppresses them for that plan without changing repository defaults.
+
+One Rust runner serves the automatic gate and `check_run`. Ordinary completion and successful goal completion enter the gate, while intermediate goal turns, questions, approvals, cancellation, and active children do not. The gate defaults to `after_queue` and checks the entire queued batch. `/config` can select `between_work`. Checks run serially through `/config Shell`. `CheckConfig::order_selected` runs selected preparation and its prerequisites first, then orders check, test, read-only format, lint, and build. Explicit dependencies take precedence, independent checks continue after failures, and dependents of failed prerequisites are skipped with a reason. `CheckEvidence` lets the gate reuse a result only when context, resolved inputs, execution contract, helper content, and workspace are unchanged. Explicit runs always execute.
+
+Failures go to a repair exchange owned by the original task. Repeated failures with unchanged inputs stop repair, and cancelled work with unchanged inputs becomes Blocked instead of retrying. Configuration errors block completion. Disabled or unselected checks report Not run, never Passed, and source changes during the gate invalidate it. A direct prompt interrupts active checks and waits for process collection, while queued prompts wait for completion.
+
+`CheckSupervisor` owns publication. Active checks appear below the primary workflow status, showing command labels, counts, intervals, and the latest output line every 250 ms. Completion inserts one expandable result group at its timestamp. Agents use compact `check_status` (with `wait_ms` up to 60 seconds), `check_list`, paged `check_detail`, `check_definition_list`, and `check_definition_details`. `/checks` lists definitions with enabled circles, categories, scope, and automatic selection. Space toggles a definition, Tab selects the Scope or Auto field, arrows change it, and Enter runs it. Overrides persist per task without editing project defaults. Check history version 5 and plan schema 15 exclude older records.

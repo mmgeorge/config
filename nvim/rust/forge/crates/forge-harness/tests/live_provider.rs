@@ -29,6 +29,8 @@ mod codex_cli;
 mod codex_real;
 #[path = "live_provider/copilot_real.rs"]
 mod copilot_real;
+#[path = "live_provider/session_resume.rs"]
+mod session_resume;
 #[path = "live_provider/text_generation.rs"]
 mod text_generation;
 

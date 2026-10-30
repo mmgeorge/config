@@ -695,6 +695,21 @@ impl CodexJsonRpc {
             return None;
         }
         if let Some(error) = message.get("error") {
+            let missing_session = method == "thread/resume"
+                && error.get("code").and_then(Value::as_i64) == Some(-32600)
+                && error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| {
+                        message.starts_with("no rollout found for thread id ")
+                            || message.starts_with("thread not found: ")
+                    });
+            if missing_session {
+                return Some(Err(crate::backend::BackendError::SessionMissing {
+                    message: format!("backend {method} failed: {error}"),
+                }
+                .into()));
+            }
             return Some(Err(crate::backend::BackendError::Provider {
                 code: error.get("code").map(Value::to_string),
                 message: format!("backend {method} failed: {error}"),
@@ -1964,6 +1979,46 @@ pub(super) fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    /// Distinguish missing history from permission, transient, and unrelated RPC failures.
+    #[test]
+    fn classifies_only_missing_resume_history() {
+        for (method, code, message, missing) in [
+            (
+                "thread/resume",
+                -32600,
+                "no rollout found for thread id missing",
+                true,
+            ),
+            ("thread/resume", -32600, "thread not found: missing", true),
+            ("thread/resume", -32600, "permission denied", false),
+            (
+                "thread/resume",
+                -32603,
+                "failed to read thread: file is empty",
+                false,
+            ),
+            (
+                "thread/goal/clear",
+                -32600,
+                "thread not found: missing",
+                false,
+            ),
+        ] {
+            let response = serde_json::json!({"id":17,"error":{"code":code,"message":message}});
+            let error = super::CodexJsonRpc::request_result(&response, 17, method)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                matches!(
+                    error.downcast_ref::<crate::backend::BackendError>(),
+                    Some(crate::backend::BackendError::SessionMissing { .. })
+                ),
+                missing
+            );
+            assert!(super::CodexJsonRpc::request_result(&response, 18, method).is_none());
+        }
+    }
+
     use crate::backend::{
         MessageAddress, MessageClassification, MessageRole, MessageUpdate, TextUpdate, ToolAddress,
         ToolOutcome, ToolStatus, ToolUpdate,
@@ -2070,6 +2125,7 @@ mod test {
                     record.arguments = invocation.arguments.clone();
                     record.title = invocation.title.clone();
                 }
+                ToolUpdate::TitleChanged { title } => record.title.clone_from(title),
                 ToolUpdate::Started if record.status.is_none() => {
                     record.status = Some(ToolStatus::Running)
                 }

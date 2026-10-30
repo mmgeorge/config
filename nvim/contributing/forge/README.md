@@ -13,7 +13,7 @@ documents for the work at hand. Do not read every subsystem chapter for a local 
 | Task | Procedure | Architecture |
 | --- | --- | --- |
 | Add language support | [Adding a language](adding-language.md) | [Languages](architecture/languages.md), [Planning](architecture/planning.md) |
-| Configure check inputs or repository callbacks | [Extending project checks](extending-project-checks.md) | [Planning](architecture/planning.md#project-checks-and-the-harness-checking-gate), [Languages](architecture/languages.md) |
+| Configure check inputs or repository callbacks | [Extending project checks](extending-project-checks.md) | [Planning](architecture/planning.md#project-checks), [Languages](architecture/languages.md) |
 | Update a parser or query | [Updating Tree-sitter](updating-tree-sitter.md) | [Languages](architecture/languages.md), [Buffers and rendering](architecture/buffers-and-rendering.md) |
 | Build or verify a change | [Building and testing](building-and-testing.md) | [Host and protocol](architecture/host-and-protocol.md) |
 | Call the native host from Lua | [Lua client API](api/lua-client.md) | [Host and protocol](architecture/host-and-protocol.md) |

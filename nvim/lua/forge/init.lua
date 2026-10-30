@@ -230,6 +230,7 @@ function M.setup(opts)
   M.config = config.setup(opts)
   perf.configure_from_forge_options(M.config)
   highlights.setup()
+  require("forge.text").setup()
 end
 
 --- Asynchronously collects Git status items for external consumer integrations.

@@ -161,3 +161,5 @@ The [GitHub request and result schemas](github-schemas.md) define remote reads, 
 | `settings.mcp.set_enabled` | [shared](shared.md#settingsmcpset_enabled) | Optional explicit session ID |
 | `settings.skill.set_enabled` | [shared](shared.md#settingsskillset_enabled) | Optional explicit session ID |
 | `settings.update` | [shared](shared.md#settingsupdate) | Optional explicit session ID |
+| `text.correct` | [text](text.md#textcorrect) | Session ID forbidden |
+| `text.initialize` | [text](text.md#textinitialize) | Session ID forbidden |

@@ -1,5 +1,5 @@
 {
-  "version": 29,
+  "version": 30,
   "node": {
     "kind": [
       "exchange",
@@ -373,6 +373,18 @@
     }
   },
   "methods": {
+    "text.initialize": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "text.correct": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
     "agent.profile.get": {
       "session_context": "optional",
       "readiness": "runtime",

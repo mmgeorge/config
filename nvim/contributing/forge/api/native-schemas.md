@@ -6,6 +6,11 @@ These declarations specify the field names and types accepted by the native deco
 
 Opaque ID types serialize as strings, revision and sequence types as integers, collections as JSON arrays or objects, and `PathBuf` as a path string. Paths are interpreted by the owning local service. Resource identity, freshness, and authorization checks follow decoding and remain part of the method contract.
 
+The [local text-service contract](text.md) defines `text.initialize` and `text.correct`.
+Their authoritative Serde definitions are in [forge-text/contract.rs](../../../rust/forge/crates/forge-text/src/contract.rs).
+Text ranges use UTF-8 bytes, and correction results use the `decision` tag with
+`unchanged` and `replace` variants.
+
 ## Document input lifecycle
 
 The client captures a document ID, revision, view ID, sequence, block, and position before dispatch. The host validates that the view and revision still own the target before applying an action. A stale action cannot be retargeted to a different active buffer. `action` must be nonempty and contain no control characters. An optional target narrows the action to the supplied native target identity.

@@ -1,0 +1,50 @@
+{
+  "applied": {
+    "p99_ms": 1.4816,
+    "p95_ms": 1.3441
+  },
+  "platform": {
+    "release": "10.0.26300",
+    "version": "Windows 11 Pro",
+    "sysname": "Windows_NT",
+    "machine": "x86_64"
+  },
+  "words": 120,
+  "words_per_second": 20,
+  "cold_ms": 1721.6361,
+  "applied_count": 120,
+  "redraw_count": 120,
+  "redraw": {
+    "p99_ms": 2.228,
+    "p95_ms": 1.892
+  },
+  "status": {
+    "applied": 120
+  },
+  "long_context": [
+    {
+      "words": 10,
+      "status": "applied",
+      "redraw_ms": 1.388,
+      "applied_ms": 1.0625
+    },
+    {
+      "words": 100,
+      "status": "applied",
+      "redraw_ms": 1.271,
+      "applied_ms": 0.9346
+    },
+    {
+      "words": 1000,
+      "status": "applied",
+      "redraw_ms": 3.978,
+      "applied_ms": 3.1786
+    },
+    {
+      "words": 10000,
+      "status": "applied",
+      "redraw_ms": 22.312,
+      "applied_ms": 18.428
+    }
+  ]
+}

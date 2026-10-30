@@ -452,13 +452,7 @@ impl CodexNormalization {
                     {
                         output.completion.evidence.workspace_changed = true;
                     }
-                    if first
-                        || (native.title != snapshot.title
-                            && !matches!(
-                                snapshot.title.as_str(),
-                                "tool" | "command" | "file changes"
-                            ))
-                    {
+                    if first {
                         native.title = snapshot.title.clone();
                         events.push(BackendEvent::Tool {
                             address: address.clone(),
@@ -466,9 +460,19 @@ impl CodexNormalization {
                                 invocation: ToolInvocation {
                                     kind: snapshot.kind,
                                     name: snapshot.name,
-                                    title: snapshot.title,
+                                    title: snapshot.title.clone(),
                                     arguments: snapshot.arguments,
                                 },
+                            },
+                        });
+                    } else if native.title != snapshot.title
+                        && !matches!(snapshot.title.as_str(), "tool" | "command" | "file changes")
+                    {
+                        native.title = snapshot.title.clone();
+                        events.push(BackendEvent::Tool {
+                            address: address.clone(),
+                            update: ToolUpdate::TitleChanged {
+                                title: snapshot.title.clone(),
                             },
                         });
                     }

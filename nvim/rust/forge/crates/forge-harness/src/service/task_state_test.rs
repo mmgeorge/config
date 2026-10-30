@@ -1817,6 +1817,11 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
     let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
     controller.observer.set_native_goal_for_test(true)?;
+    let (startup_sink, _startup_output) = forge_protocol::outbound::channel();
+    controller.start_provider(&startup_sink).await;
+    while !controller.provider_ready().await {
+        tokio::task::yield_now().await;
+    }
     let mut store = SqliteStore::open(&controller.data_root)?;
     let mut session = store.load_session(&session_id)?.unwrap();
     session.backend_session_id = Some("native-thread".into());

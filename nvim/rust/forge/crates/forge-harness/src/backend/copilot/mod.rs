@@ -445,6 +445,7 @@ impl CopilotBackend {
             .or(request.backend_session_id.as_deref())
         {
             let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
+            config.suppress_resume_event = Some(true);
             config.excluded_tools = Some(native_agent_exclusions());
             config.model = (request.model != "default").then(|| request.model.clone());
             config.reasoning_effort = reasoning_effort.clone();
@@ -484,6 +485,14 @@ impl CopilotBackend {
                         .with_hooks(checkpoint_hooks),
                 )
                 .await
+                .map_err(|error| match error.kind() {
+                    github_copilot_sdk::ErrorKind::Session(
+                        github_copilot_sdk::SessionErrorKind::NotFound(_),
+                    ) => anyhow::Error::new(BackendError::SessionMissing {
+                        message: error.to_string(),
+                    }),
+                    _ => error.into(),
+                })
                 .context("resume Copilot session")?
         } else {
             let mut config = SessionConfig::default();

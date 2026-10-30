@@ -1,10 +1,10 @@
 # Languages, syntax, and source mapping
 
-Tree-sitter supplies syntax analysis, declaration projection, token coordinates, and highlighting. Plan navigation may ask an existing project LSP for a definition in real source, but the LSP does not parse or validate the virtual plan.
+A language feature can work in one consumer and silently fail in another, because Forge's language support is several independent capabilities rather than one switch. Tree-sitter supplies syntax analysis, declaration projection, token coordinates, and highlighting. Plan navigation and agent queries may ask an existing project LSP about real source, but no LSP parses or validates the virtual plan.
 
 Read [Adding a language](../adding-language.md), [Updating Tree-sitter](../updating-tree-sitter.md), and [Planning](planning.md) before changing these boundaries.
 
-## Independent language capabilities
+## Independent capabilities
 
 | Capability | Source of truth | Result |
 | --- | --- | --- |
@@ -12,300 +12,37 @@ Read [Adding a language](../adding-language.md), [Updating Tree-sitter](../updat
 | Declaration planning | `DeclarationOverview::language` and the declaration adapters | Body-free interfaces, imports, fields, documentation, and formatting |
 | Structural references | `declaration_index.rs`, `declaration_calls.rs`, and Harness plan modules | Scopes, callable owners, reference expressions, and source coordinates |
 | Commit-message excerpts | `SyntaxHandle::outline` and `src/commit_message/excerpt.rs` | Signatures and bounded changed-body excerpts, with ordinary diff fallback |
-| Workspace definitions | Shared Lua LSP adapter plus the running project server | Definition locations for captured real-source occurrences |
-| Package ownership | Repository-configured callbacks | Repository-dependent mapping from changed files to packages |
+| Workspace definitions and agent queries | The shared Lua LSP adapter and the running project server | Definitions, references, calls, symbols, and diagnostics for real source |
 | Check invocation | Harness typed inputs and literal argv substitution | One configured opaque command with recorded input identity |
 
-The native syntax registry supports more languages than the declaration-planning
-registry. Extensions and aliases must be added to the correct registry for each
-promised capability. Rust, TypeScript, TSX, and Lua have plan-specific adapters.
-Configuration formats retain their values rather than using executable-language
-body projection.
+The native syntax registry supports more languages than declaration planning, so each extension and alias must be added to the registry for every promised capability. Rust, TypeScript, TSX, and Lua have plan adapters, and configuration formats keep their values. Python (`.py`, `.pyi`, `.pyw`), CUE, C, and C++ have native syntax and commit excerpts but no plan adapters. `.c` and `.h` select C. `.cpp`, `.cc`, `.cxx`, `.C`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++`, `.ipp`, and `.tpp` select C++. `.scm` selects the Tree-sitter query grammar, not Scheme. None of these require editor parsers or language servers.
 
-Native syntax includes Python (`.py`, `.pyi`, `.pyw`) and CUE (`.cue`) without
-installing editor parsers or language servers. Python uses a pinned upstream
-grammar crate and the local query assets. Its context queries
-recognize decorated functions and classes once, preserving their outer scope.
-Python and CUE do not have declaration-planning adapters.
-
-Native C and C++ syntax uses upstream grammar crates and the existing query assets.
-`.c` and `.h` select C. `.cpp`, `.cc`, `.cxx`, `.C`, `.c++`, `.hpp`, `.hh`,
-`.hxx`, `.h++`, `.ipp`, and `.tpp` select C++. The `c++` language alias selects
-the `cpp` parser. `.scm` and the `scm` alias select the Tree-sitter query grammar,
-not Scheme. These languages require no editor parser installation and do not
-add declaration-planning or agent structural-query adapters.
-
-TypeScript and TSX import highlighting retains token-level keyword, identifier,
-string, and punctuation captures. The Neovim and embedded repository overrides
-do not apply a statement-wide capture that overrides those token colors.
-
-Commit excerpts select syntax automatically from the file path. They require no
-user configuration or language server. A language's signature and import support
-must be verified separately from highlighting. The current regression matrix
-covers Rust, TypeScript, JavaScript, Lua, Python, C, and C++ signatures,
-JSON/TOML/YAML/CUE/query diffs, unknown-language fallback, and complete
-Markdown/plain-text changes. C and C++ extraction follows function declarators,
-retains template headers, recognizes bound lambdas, and excludes `#include` rows.
-Parse errors disable only the affected declarations or imports. Recovered valid
-subtrees remain eligible for excerpts, so conditional C/C++ linkage blocks do
-not force an entire shared header into ordinary diff fallback.
-Contributor acceptance requirements are in
-[Commit-message excerpt coverage](../adding-language.md#commit-message-excerpt-coverage).
-
-## Agent LSP queries
-
-Nine focused `lsp_*` tools expose source overview, symbol discovery, navigation,
-context, references, calls, call paths, diagnostics, and status independently of plan navigation.
-The enabled-only model guidance and explorer profiles recommend overview/symbol
-lookup followed by shared name-or-position selectors. The [tool reference](../../../docs/forge/lsp-tools.md)
-defines arguments, formatting, and limits.
-
-`SourceDeclaration` extraction operates on the native `SyntaxHandle` for Rust,
-TypeScript/TSX, JavaScript/JSX, and Lua. It retains source ranges, exact identifier
-positions, signatures, nesting, and declared visibility. It does not alter the
-plan-specific declaration projection. Native parsing uses the shared syntax
-workers. Extracted declaration lists and query results remain request-scoped.
-The existing exact-source syntax cache is unchanged.
-
-Lua captures authorized live snapshots and calls the correlated `session.lsp.analyze`
-route. Rust validates the active request scope before native analysis, then checks
-it throughout the await. This route bypasses the busy broker lock, like
-`session.lsp.authorize` and `session.lsp.respond`. Rust validates returned paths and renders one
-shared location gutter with budgeted source excerpts, or aligned call trees. Snapshot guards cover every
-contributing buffer and disk source, including semantic destinations.
-
-The shared Lua LSP source adapter owns client selection, hidden source buffers,
-and reference-counted buffer leases. Agent queries use live editor contents.
-Plan navigation retains its captured digest and rejects changed or unsaved source
-that differs from that capture. `forge.lsp.startup` starts servers only for an
-explicit tool request. File requests resolve matching configurations without
-scanning the workspace. Workspace requests discover applicable project roots.
-Neovim clients already serving the same root are reused, preserving the editor's
-server ownership. The adapter
-dispatches root-resolution callbacks onto Neovim's main loop before client
-startup or buffer cleanup, because server configurations can resolve roots from
-libuv process callbacks. Queued callbacks recheck workspace closure before acting.
-It releases hidden buffer leases after initialization and never stops shared
-servers when Harness closes. Agent queries also prepare explicit project files
-and await initialization and reported work-done progress before selecting a client. No generated project or
-source is required.
-
-Startup discovers JavaScript and TypeScript projects from `package.json` and Rust
-projects from `Cargo.toml`. Loose source files do not start these servers during
-discovery. Manifest buffers retain their actual filetype and are not attached as
-language source documents. Other configurations use one matching source per directory.
-Discovery visits nested directories in scheduled batches, excluding dependency and
-build directories without limiting the total entries, directories, or nesting depth.
-It resolves candidates using the original server root callback and retains each
-distinct root rather than choosing one nested fallback for the entire checkout.
-Discovery and a concurrent first query share pending startup work. Explicit
-queries into separate workspaces retain separate editor-owned clients.
-Root callbacks may decline startup by not selecting a directory. Those attempts
-settle without an initialization error after the discovery wait, and are not retried
-as nested fallbacks. Initialization timeouts apply to clients that actually started.
-
-Rust owns one interaction scope per root or child turn, the read policy, and the
-setting generation. It admits at most four requests per host, each with a
-60-second startup wait and a separate ten-second operation deadline. Path searches
-allow 30 seconds after startup. The Rust transport watchdog allows 75 seconds for
-ordinary queries and 105 seconds for path searches, including startup and delivery. Correlated
-`lsp.request` events reach an editor adapter
-independently of the selected view. The `session.lsp.authorize` and `session.lsp.respond` routes
-bypass the busy broker lock. Target authorization precedes editor reads, and Rust
-checks returned paths again before publishing bounded text. Cancellation drops
-the pending identity and sends `lsp.cancel`. Late replies cannot revive it.
-
-The adapter reuses current diagnostic reports, pulls when invalidated, and otherwise reads
-Neovim's push diagnostic store. Unknown freshness remains explicit. Diagnostic reuse is scoped
-to the client, provider, source version, and invalidation generation. Other semantic queries
-retain no cross-query result cache. Harness creates no dependency projects.
-
-The check executor has no package-manager or test-runner adapters. Repository
-callbacks own any manifest lookup, exact-test selection, and coverage validation.
-Harness passes typed inputs and generic change context without inspecting command
-names. Adding syntax support does not imply a source-to-test mapping. See
-[Extending project checks](../extending-project-checks.md) for the integration
-boundary and [Planning](planning.md#project-checks-and-the-harness-checking-gate)
-for selection, preview, and execution ownership.
+Commit excerpts select syntax from the file path, and signature and import support must be verified separately from highlighting. Parse errors disable only the affected declarations, so a recovered C or C++ header still produces excerpts. Coverage requirements are in [Commit-message excerpt coverage](../adding-language.md#commit-message-excerpt-coverage). The check executor has no package-manager or test-runner adapters, so adding syntax support never implies a source-to-test mapping. See [Extending project checks](../extending-project-checks.md) and [Planning](planning.md#project-checks).
 
 ## Parser and query ownership
 
-`forge-diff/Cargo.toml` selects upstream grammar crates and exact Git revisions.
-`Cargo.lock` pins their resolved packages. Each grammar dependency compiles its
-own generated parser and scanner, and `SyntaxLanguage::grammar` consumes its Rust
-language entry point. Prefer this path when adding a language.
+`forge-diff/Cargo.toml` selects upstream grammar crates at exact Git revisions, `Cargo.lock` pins them, and `SyntaxLanguage::grammar` consumes each crate's language entry point. Prefer this path for a new language. WGSL, CUE, and LaTeX keep local parser sources, recorded with file hashes in `forge-diff/grammar/manifest.json` and compiled by `forge-diff/build.rs`, because their upstream Rust bindings require older Tree-sitter runtimes. The patched PowerShell grammar is a Cargo path patch under `forge/vendor/`. Harness consumes Bash, Zsh, and Nushell grammars for shell approval analysis, and its classifier must keep rejecting unresolved execution and environment changes after parser updates.
 
-WGSL, CUE, and LaTeX retain local parser sources because their selected upstream
-Rust bindings require older Tree-sitter runtimes. `forge-diff/grammar/manifest.json`
-records local grammar sources and their exact file hashes. `forge-diff/build.rs`
-compiles their parsers and scanners. The separate patched PowerShell grammar
-remains a Cargo path patch under `forge/vendor/`. Bash and Zsh already use upstream
-Cargo grammar dependencies in `forge-harness` for shell approval analysis.
-Harness also consumes the shared Nushell grammar. Its approval classifier must
-continue rejecting unresolved execution and environment changes after parser updates.
+The repository-owned `algorithm` grammar, also compiled by `forge-diff/build.rs`, parses academic pseudocode for plan Algorithm blocks. It is registered under the `algorithm` and `pseudocode` aliases and highlighted by `query/local/algorithm/highlights.scm`.
 
-The repository-owned `algorithm` grammar is also compiled by `forge-diff/build.rs`.
-It parses academic pseudocode statements independently of a declaration's native language.
-The native syntax registry exposes `algorithm` and `pseudocode` aliases, and Algorithm review
-rows use the shared syntax worker pool and `query/local/algorithm/highlights.scm`. The grammar
-manifest records its source and generated asset hashes and its Tree-sitter CLI/ABI command.
-The submission validator adds indentation and control-flow nesting checks to the parsed statements.
+`forge-diff/query/manifest.json` records native query provenance, and `QUERY_ASSET` embeds the query text. Neovim runtime overrides in `nvim/queries/` and the plugin's bundled `nvim/lua/forge/queries/` are separate consumers, so updating one never updates another. Query node names, fields, predicates, capture ordering, and injection languages must match the selected grammar. The bundled `diff_context.scm` queries capture the named scope enclosing a changed line as `@scope` and `@scope.name` for Rust, TypeScript, TSX, JavaScript, Python, and Slang. `query_runtime.lua` appends the plugin root to the runtimepath from every entry module before any consumer calls `vim.treesitter.query.get(lang, "diff_context")`.
 
-The pinned `tree-sitter` and `tree-sitter-language` dependencies define the runtime
-and grammar binding boundary. A compatible generated-parser ABI does not remove
-an upstream Rust crate's dependency constraints.
+## Declarations and coordinates
 
-`forge-diff/query/manifest.json` records native query provenance. `QUERY_ASSET`
-embeds and orders query text for the native service. Neovim runtime overrides in
-`nvim/queries/` are a separate consumer. Updating one consumer does not update the
-other. Query node names, fields, predicates, capture ordering, and injection
-languages must match the selected grammar.
+`DeclarationOverview` compiles each declaration query once per grammar, with separate slots for TypeScript and TSX. Parsers, trees, cursors, and capture maps stay local to each operation. Extraction preserves interfaces and source identity without claiming that an overview compiles. Formatting can move rows, so source-token maps stay distinct from displayed coordinates. Comment scans, literal scans, callable extraction, and structural indexing use work lists instead of recursion and traverse complete trees without a depth limit.
 
-## Declarations and source coordinates
+The Rust navigation boundary uses one-based lines and zero-based UTF-8 byte columns. The Lua adapter converts columns to each client's position encoding before a request and back afterward, and source digests guard both halves. An LSP result describes current project source and cannot prove that a changed virtual signature typechecks.
 
-`DeclarationOverview` compiles each immutable declaration query once per grammar.
-Rust, TypeScript, TSX, and Lua retain separate query slots, including separate slots
-for TypeScript and TSX despite their shared query text. Parsers, syntax trees,
-query cursors, and capture maps remain local to each source operation.
+## Syntax analysis
 
-Declaration extraction preserves interfaces and source identity without pretending
-that an overview file is a compilable implementation. Formatting and presentation
-can move rows, so source-token maps remain distinct from displayed coordinates.
-Callable references retain their exact source expression even when inferred
-receiver resolution is unavailable.
+Native rendering and structural queries analyze complete sources without byte, line, capture, injection, or decoration limits. The shared worker pool bounds concurrent jobs and propagates cancellation and deadlines, and the syntax cache keeps up to 256 results, evicting old entries without invalidating live handles. `AnalysisCache` keeps raw comparisons within 512 entries, 128 MiB of sources, and 64 MiB of results. A reservation stays charged until the last consumer handle drops, including a `DisplayCursor`, which holds an `AnalysisHandle` for its lifetime. Explicit work still returns an uncached handle when those budgets are full.
 
-Declaration comment scans, protected literal scans, callable extraction, and
-structural indexing traverse complete syntax trees without a nesting ceiling.
-Work lists replace recursive descent, including receiver-type inference, while
-preserving lexical occurrence order and restoring bindings after each scope.
-Rust public-macro recovery also visits every subtree without a depth cutoff.
+## Agent LSP queries
 
-The Rust navigation boundary uses one-based lines and zero-based UTF-8 byte
-columns. The Lua adapter converts byte columns to the selected client's position
-encoding before a request, then converts returned locations back to byte columns.
-Source digests and captured document identities guard both halves of the request.
-The detailed request and proposal-mapping contract is owned by
-[Planning](planning.md#source-backed-lsp-navigation).
+Nine `lsp_*` tools expose source overview, symbol discovery, navigation, context, references, calls, call paths, diagnostics, and status. The [tool reference](../../../docs/forge/lsp-tools.md) defines arguments, formatting, and limits. `SourceDeclaration` extraction for Rust, TypeScript/TSX, JavaScript/JSX, and Lua supplies source ranges, identifier positions, signatures, nesting, and visibility, separately from plan projection.
 
-An LSP result describes the current project source. It cannot establish that a
-changed virtual signature or a new dependency in a plan typechecks. Saving and
-submission retain their independent structural and internal-reference checks.
+Rust owns one interaction scope per root or child turn, along with the read policy and setting generation. It admits at most four requests per host, each with a 60-second startup wait and a ten-second operation deadline (30 seconds for path searches). A transport watchdog allows 75 seconds for ordinary queries and 105 for path searches. Correlated `lsp.request` events reach the editor regardless of the selected view, and `session.lsp.authorize`, `session.lsp.respond`, and `session.lsp.analyze` bypass the busy broker lock. Target authorization precedes every editor read, and Rust checks returned paths again before publishing text. Cancellation sends `lsp.cancel`, and late replies cannot revive the request. `session.lsp.analyze` accepts ordered UTF-8 source chunks, so large files fit within the transport frame limit.
 
-## Native syntax analysis and cache retention
+The shared Lua adapter owns client selection, hidden source buffers, and reference-counted leases. Agent queries read live editor contents, while plan navigation rejects source that differs from its captured digest. `forge.lsp.startup` starts servers only for an explicit request. Discovery finds JavaScript and TypeScript projects by `package.json` and Rust projects by `Cargo.toml`, visits nested directories in batches without total limits, and keeps every distinct root. Clients already serving a root are reused, and Harness never stops shared servers. Root-resolution callbacks are dispatched onto the main loop before client startup. Unused owned hidden buffers expire 60 seconds after their last request.
 
-Native rendering and explicit structural queries analyze complete source versions without
-byte, line-count, capture-count, injection-count, or decoration-count admission ceilings.
-The shared worker pool bounds concurrent jobs and propagates cancellation and deadlines.
-Syntax sources remain retained by their existing owners. The cache retains up to 256 results and
-evicts old entries without invalidating document handles or rejecting new analysis.
-
-## Bundled tree-sitter queries (`queries/`)
-
-The plugin ships its own queries instead of relying on the shared `nvim/queries/` tree, so
-they travel with the plugin. `query_runtime.lua` registers them by computing the plugin
-root from `debug.getinfo` and appending it to the runtimepath — once, and from every entry
-path (`init.lua`, `git_data.lua`) so the queries resolve no matter which
-module loads first.
-
-- **`diff_context.scm`** captures the named scope (function, struct, class, trait,
-  interface, impl, module, ...) enclosing a changed line. The capture is labeled `@scope`
-  with a `@scope.name` child. `git_data` + `syntax_engine` use it to label hunk boundaries
-  ("in `fn foo`") and to merge change regions by scope. Languages: rust, typescript, tsx,
-  javascript, python, slang.
-
-`vim.treesitter.query.get(lang, "diff_context")` resolves these through the runtimepath —
-which is why `query_runtime` must run before any consumer.
-
----
-
-## Analysis cache ownership and reservations
-
-`AnalysisCache` tracks source capacity, result capacity, and one entry for each live analysis.
-Cache retention budgets default to 128 MiB of sources, 64 MiB of results, and 512 entries.
-Reservations cover pending work and remain attached to published consumer handles. Explicit work
-evicts least-recently-used cache references as needed and still returns an uncached handle when
-live allocations exceed those budgets. Eviction does not release a charge until the last consumer
-handle drops. Optional speculative retention can decline a cache reservation without disabling
-explicit analysis or losing its source content.
-
-Publication rejects reservations from another cache, mismatched source identities, and retained
-capacities above the reservation. Raw result accounting includes the result structure and hunk
-vector capacity. Source accounting uses vector capacity and charges a shared old/new allocation
-once within a result. Separate results conservatively charge shared source storage again.
-Reservation excess remains charged until release.
-
-This cache currently covers immutable raw comparisons. It does not account for temporary algorithm
-allocations, allocator overhead, syntax trees, captures, patches created after publication, or
-source/result clones made outside charged handles. The engine must preserve handle ownership across
-consumers and reserve worker memory separately. Cache integration with engine jobs and display
-cursors, source-level deduplication, and separate tree/capture accounting remain incomplete.
-
-## Display cursors retain charged analysis handles
-
-`DisplayCursor` now requires an `AnalysisHandle` instead of an uncharged `Arc<RawDiff>`. The handle
-provides immutable access to the raw result while retaining its reservation for the full cursor
-lifetime. Finishing delivery does not release the result while the cursor remains open. Dropping
-the last cursor releases its charge only when no cache or other consumer still owns the handle.
-
-Display and body-policy fixtures now publish their analysis through the cache before opening a
-cursor. A lifecycle regression opens two cursors, evicts their shared cache entry, and verifies
-that both can render while new admission remains saturated until the last cursor drops.
-
-This closes the cursor's direct-reference accounting bypass. Generated row ownership, per-cursor
-group and emphasis storage, independent source/result clones, worker memory, and live feature
-integration still require their own accounting and lifecycle work.
-
-
-### Agent target resolution and path search
-
-`forge.lsp.diagnostics` shares completed pull reports with the editor's diagnostic handler.
-Queries for the same client, document, and provider coalesce while a pull is pending. Repeated
-queries reuse a report only while its buffer tick and client invalidation generation still match.
-Source notifications, saves, watched-file changes, configuration changes, and server diagnostic
-refreshes invalidate reuse. New pulls supply the previous result ID and retain the prior items
-when the server answers `unchanged`. Cancelling one consumer preserves a pull needed by another.
-Push-only servers continue to expose their editor diagnostic namespace with unknown freshness.
-
-Workspace diagnostics query each supporting client through `workspace/diagnostic`.
-They retain per-server root and coverage state. Unsupported and failed clients do
-not erase successful reports, and partial coverage never becomes a clean-workspace
-claim. Workspace symbols use the same discovery, reuse, and coverage contract.
-
-`forge.lsp.source` retains unused, owned hidden buffers for 60 seconds after the last request.
-Reuse refreshes hidden source from disk without rewriting unchanged text or replacing visible or
-modified editor buffers. Expiry and language-service shutdown release unused owned buffers.
-This bounds idle retention without limiting source size or the number of requested documents.
-
-`forge.lsp.target` resolves declaration names and exact source occurrences for
-all position-based tools. File lookup uses the captured structural snapshot.
-Workspace lookup asks existing language servers for bounded candidates and
-validates exact qualified names against authorized snapshots. Ambiguous and
-incomplete searches fail before the requested semantic operation begins.
-Explicit file and directory symbol searches filter structural declarations before
-pagination. Unscoped symbol searches use workspace symbols, with rust-analyzer's
-all-symbol query mode and optional dependency scope. Server search limits cannot
-truncate a file-scoped inventory.
-
-`forge.lsp.paths` traverses outgoing call hierarchy edges after preparing both
-endpoints. The query owns its request budget, cycle checks, route queue, and
-captured source identities. It retains no cross-query results. All native sends,
-including retries, consume the shared request budget. Every visited source file
-is captured so a changed buffer or disk snapshot invalidates the whole result.
-Rust renders only complete paths within the response budget.
-
-Explicit agent structural queries use `SyntaxEngine::analyze_full` without a
-source-byte or line cutoff. Rendering continues to use `analyze` with its existing
-line cutoff. Cache keys separate cutoff results from full parsing for large sources.
-The `session.lsp.analyze` route accepts ordered UTF-8 source chunks, validates the active
-request and read authority for every chunk, and assembles one source under the
-pending request. Cancellation releases unfinished transfer state. Chunking preserves
-the transport frame limit without rejecting large source files.
-
-List arguments accept any positive result limit. Lua bounds transport batches,
-and Rust applies the response budget with continuation positions. Structured
-visibility omissions carry names, positions, and total count through authorization
-and rendering. Optional structural or semantic enrichment failures retain valid
-primary results. Source changes, revoked authority, and cancelled requests remain
-fatal. Empty results, incomplete coverage, unsupported capabilities, startup
-failure, and disconnected servers have distinct output messages without retry
-instructions.
+`forge.lsp.target` resolves declaration names and exact occurrences for position-based tools, failing on ambiguity or incomplete search before the semantic operation starts. `forge.lsp.paths` walks outgoing call hierarchy edges under one request budget with cycle checks, and captures every visited file so any change invalidates the result. `forge.lsp.diagnostics` reuses a pull report only while its buffer tick and client invalidation generation match, coalesces concurrent pulls, and reports push-only diagnostics with unknown freshness. Workspace diagnostics and symbols keep per-server coverage, so partial coverage never becomes a clean-workspace claim. Empty results, incomplete coverage, unsupported capabilities, startup failure, and disconnected servers produce distinct messages.

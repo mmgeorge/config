@@ -880,6 +880,16 @@ impl SqliteStore {
         )
     }
 
+    /// Check for local or inherited conversation history without decoding its payloads.
+    pub(crate) fn has_conversation_history(&self, session_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM exchange_record WHERE session_id=?1)
+                OR EXISTS(SELECT 1 FROM fork_history_record, json_tree(fork_history_record.payload) AS entry
+                    WHERE session_id=?1 AND entry.key='kind' AND entry.value='exchange')",
+            [session_id], |row| row.get(0),
+        )?)
+    }
+
     /// Prepend the immutable fork snapshot without exposing it to child execution queries.
     pub(crate) fn with_fork_history(
         &self,
@@ -1348,6 +1358,72 @@ fn decode_current_session(value: &str) -> Result<Option<HarnessSession>> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Count conversation content while excluding local and inherited rename metadata.
+    #[test]
+    fn conversation_history_distinguishes_metadata_local_and_inherited_exchanges() -> Result<()> {
+        use crate::timeline::{SessionEventKind, SessionEventRecord, TimelineEntry, TimelineOwner};
+        let directory = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(directory.path())?;
+        let source = session("source", "D:/work");
+        store.save_session(&source)?;
+        let renamed = SessionEventRecord {
+            id: "renamed".into(),
+            session_id: source.id.clone(),
+            owner: TimelineOwner::session(&source.id),
+            created_at_ms: 1,
+            detail: SessionEventKind::Renamed {
+                name: "Only a local name".into(),
+            },
+        };
+        store.save_session_event(&renamed)?;
+        assert!(!store.has_conversation_history(&source.id)?);
+        let metadata_child = session("metadata-child", "D:/work");
+        let metadata = TimelineEntry::Inherited {
+            captured_at_ms: 2,
+            entry: Box::new(TimelineEntry::SessionEvent {
+                id: renamed.id.clone(),
+                created_at_ms: 1,
+                event: renamed,
+            }),
+        };
+        let lineage = |child: &HarnessSession| SessionEventRecord {
+            id: format!("{}-forked", child.id),
+            session_id: child.id.clone(),
+            owner: TimelineOwner::session(&child.id),
+            created_at_ms: 2,
+            detail: SessionEventKind::Forked {
+                source_session_id: source.id.clone(),
+                source_session_name: source.name.clone(),
+            },
+        };
+        store.save_fork_history(&metadata_child, &[metadata], &lineage(&metadata_child))?;
+        assert!(!store.has_conversation_history(&metadata_child.id)?);
+        let exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id":"prior-exchange","session_id":source.id,"agent_id":source.primary_agent_id,
+            "ordinal":1,"prompt":"Retain this request","kind":"chat","state":"failed",
+            "disposition":"current","turn":[],"node_list":[],"created_at_ms":1,
+            "awaiting_input":false,"duration_ms":0,"metrics":{},"comment":[],
+            "attributed_matches_checkpoint":false
+        }))?;
+        store.save_exchange(&exchange)?;
+        assert!(store.has_conversation_history(&source.id)?);
+        let history_child = session("history-child", "D:/work");
+        let history = TimelineEntry::Inherited {
+            captured_at_ms: 2,
+            entry: Box::new(TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 1,
+                exchange: Box::new(exchange),
+                agent_by_id: Default::default(),
+            }),
+        };
+        store.save_fork_history(&history_child, &[history], &lineage(&history_child))?;
+        assert!(store.list_exchange(&history_child.id)?.is_empty());
+        assert!(store.has_conversation_history(&history_child.id)?);
+        assert!(!store.has_conversation_history("unrelated")?);
+        Ok(())
+    }
 
     #[test]
     fn default_model_cache_is_scoped_and_ignores_explicit_or_incompatible_sessions() -> Result<()> {

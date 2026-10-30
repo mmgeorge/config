@@ -150,6 +150,7 @@ local function recover_commit(state, owner)
     owner.recovering = nil
     if failure or not snapshot then notice(failure or "Missing commit snapshot") return end
     if state.replica.commit[owner.oid] ~= owner then return end
+    if owner.snapshot and owner.snapshot.revision > snapshot.revision then return end
     owner.snapshot = snapshot
     buffer.apply_snapshot(state.replica, state.replica.inventory)
     state.done = {}
@@ -162,9 +163,11 @@ local function recover(state)
   state.recovering = true
   request(state, { operation = "snapshot", document = state.document }, function(result, failure)
     if failure or not result then notice(failure or "Missing status snapshot") return end
-    if buffer.apply_snapshot(state.replica, result).kind ~= "Applied" then return end
+    local applied = buffer.apply_snapshot(state.replica, result)
+    if applied.kind ~= "Applied" and applied.kind ~= "Superseded" then return end
     state.recovering = nil
-    state.done = {}
+    if applied.kind == "Superseded" and state.replica.status ~= "Applied" then recover(state) return end
+    if applied.kind == "Applied" then state.done = {} end
     M.demand(state)
   end)
 end
@@ -556,9 +559,20 @@ function M.refresh(state, callback)
       if snapshot then
         buffer.apply_snapshot(state.replica, result, function(applied)
           record("snapshot.applied", { ms = perf.elapsed_ms(apply_started), status = applied.kind })
-          if applied.kind ~= "Applied" then complete("Status snapshot could not be applied") return end
+          if applied.kind == "Superseded" then
+            local inventory = state.replica.inventory
+            if state.replica.status ~= "Applied" or not inventory or inventory.revision < result.revision then
+              state.refresh_recover = true
+              run()
+              return
+            end
+          elseif applied.kind ~= "Applied" then
+            complete("Status snapshot could not be applied")
+            return
+          end
           state.refresh_recover = false
-          state.done = {}
+          if applied.kind == "Applied" then state.done = {} end
+          if epoch ~= state.refresh_epoch then record("superseded") run() return end
           complete()
         end)
         return
@@ -982,7 +996,9 @@ function M.open(options)
     local snapshot_apply_started = vim.uv.hrtime()
     require("forge.startup_log").write("status.snapshot.apply", { document = document, files = #result.file })
     buffer.apply_snapshot(state.replica, result, function(applied)
-    if not state.active or applied.kind ~= "Applied" then return end
+    if not state.active or (applied.kind ~= "Applied" and applied.kind ~= "Superseded")
+      or state.replica.status ~= "Applied" then return end
+    result = state.replica.inventory
     require("forge.startup_log").write("status.snapshot.applied", { document = document, status = state.replica.status,
       files = #result.file, rows = state.replica.row_count,
       elapsed_ms = math.floor((vim.uv.hrtime() - snapshot_apply_started) / 1e6) })
