@@ -1,7 +1,6 @@
 # Portal Items and Resources
 
-*When to read this:* before searching, resolving, inspecting, sharing, deleting,
-or modifying generic Portal items and their resources.
+*When to read this:* before searching, resolving, inspecting, sharing, deleting, or modifying generic Portal items and their resources.
 
 ## Search
 
@@ -11,12 +10,9 @@ portal item any list --portal <alias> --name parcels
 portal item any list --portal <alias> --public --tags county,boundaries
 ```
 
-List filters include `--name`, `--content`, `--owner`, `--tags`,
-`--categories`, `--page`, `--me`, and `--public`. `--me` and `--owner` are
-mutually exclusive.
+List filters include `--name`, `--content`, `--owner`, `--tags`, `--categories`, `--page`, `--me`, and `--public`. `--me` and `--owner` are mutually exclusive.
 
-With no filters, generic item listing authenticates and defaults to the
-signed-in owner. Results paginate in groups of 100.
+With no filters, generic item listing authenticates and defaults to the signed-in owner. Results paginate in groups of 100.
 
 ## Resolve identifiers
 
@@ -39,8 +35,7 @@ portal item any resource list <item-id> --portal <alias> --full
 portal item any open <item-id> --portal <alias>
 ```
 
-`meta` prints item metadata. `data` prints the `/data` JSON. `about` prints the
-description. `open` opens the Portal item page.
+`meta` prints item metadata. `data` prints the `/data` JSON. `about` prints the description. `open` opens the Portal item page.
 
 ## Manage resources
 
@@ -62,8 +57,7 @@ portal item any resource delete <item-id> path/file.json --portal <alias>
 - Downloads can overwrite local paths without prompting.
 - Resource replacement and deletion do not prompt.
 
-List resources before and after mutation. Confirm the exact resource path
-before overwrite or deletion.
+List resources before and after mutation. Confirm the exact resource path before overwrite or deletion.
 
 ## Share and delete
 
@@ -74,10 +68,7 @@ portal item any share <item-id> --portal <alias> --level public
 portal item any delete <item-id> --portal <alias>
 ```
 
-Sharing defaults to `public` when `--level` is omitted. Always specify the
-level.
+Sharing defaults to `public` when `--level` is omitted. Always specify the level.
 
-Deletion is permanent and does not prompt. The command can print `[Failed]`
-while still producing success-shaped completion output. Verify deletion with an
-explicit metadata lookup or list search.
+Deletion is permanent and does not prompt. The command can print `[Failed]` while still producing success-shaped completion output. Verify deletion with an explicit metadata lookup or list search.
 

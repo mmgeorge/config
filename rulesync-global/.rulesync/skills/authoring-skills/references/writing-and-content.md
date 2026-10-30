@@ -27,9 +27,7 @@ with pdfplumber.open("file.pdf") as pdf:
 ```
 
 <!-- Non-functional: generic background and tutorial prose -->
-## Extract PDF text
-PDF (Portable Document Format) files are a common format that contains text... there are
-many libraries... pdfplumber is recommended because... first install it with pip...
+## Extract PDF text PDF (Portable Document Format) files are a common format that contains text... there are many libraries... pdfplumber is recommended because... first install it with pip...
 ```
 
 ## Instructional Tone and Phrasing

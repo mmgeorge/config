@@ -314,7 +314,7 @@ pub async fn collect(
     };
     let prompt = if let Some(background) = &background {
         background.verify(store).await?;
-        prompt.map(|diff| format!("Current authoritative comparison at HEAD {} on {}. Earlier requests and generated drafts are historical, not current changes. Prior drafts do not prove a commit occurred.\n\nLast 10 reachable commits (style and terminology examples only):\n{}\nCurrent authoritative changes:\n{}",
+        prompt.map(|diff| format!("Current comparison at HEAD {} on {}. Earlier requests and generated drafts are history, not current changes, and a prior draft does not mean a commit happened.\n\nLast 10 reachable commits (examples of style and terminology only):\n{}\nCurrent changes:\n{}",
             background.head.as_deref().unwrap_or("unborn"), background.branch.as_deref().unwrap_or("detached HEAD"), background.history, diff))
     } else {
         prompt

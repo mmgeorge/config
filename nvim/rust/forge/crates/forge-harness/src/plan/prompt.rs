@@ -16,7 +16,7 @@ pub enum PlanExecutionPromptKind {
 impl PlanPrompt {
     pub(crate) fn checks_setup(request: &str) -> String {
         format!(
-            "The user requested a plan. Project checks are missing or invalid, so use the harness-checks skill to configure them before beginning that plan. Do not design or implement the requested feature yet. Use the original request only to identify the intended tooling. Harness will resume the original planning request after successful configuration publication.\n\nOriginal planning request:\n{request}"
+            "The user asked for a plan, but the project's checks are missing or invalid. Configure them with the harness-checks skill before planning. Do not design or implement the requested feature yet, and use the original request only to identify the tooling it needs. Harness resumes the original planning request after the configuration is saved.\n\nOriginal planning request:\n{request}"
         )
     }
 
@@ -26,7 +26,7 @@ impl PlanPrompt {
             return prompt;
         }
         format!(
-            "{prompt}\n\nManual plan edits recorded during review:\n{}\nThe current canonical plan determines which edits remain after the review decision. When acknowledging the review decision, state these manual changes.",
+            "{prompt}\n\nManual plan edits made during review:\n{}\nThe current plan shows which of these edits remain after the review decision. List them when you acknowledge the decision.",
             changes
                 .iter()
                 .map(|change| format!("- {change}"))
@@ -38,7 +38,7 @@ impl PlanPrompt {
     /// Build a decision-complete planning request for one user objective.
     pub fn draft(request: &str) -> String {
         format!(
-            r#"You are planning a software change in the Harness Plan task. The effective permission for this turn governs repository access. Planning may inspect source but must not modify project files.
+            r#"You are planning a software change as a Harness Plan task. The permission for this turn controls repository access. You may read source but must not change project files.
 
 {PLANNING_CONTRACT}
 
@@ -50,7 +50,7 @@ User request:
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing Harness Plan task. The Harness already recorded and consumed the user's answers below. Do not call question_answer or question_withdraw for them. Incorporate the answers through design_patch edits. Resolve any remaining material decision under the user's question preferences, then call plan_submit with the exact canonical plan ID and version.
+            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not call question_answer or question_withdraw for them. Apply the answers with design_patch edits, settle any remaining decision according to the user's question preferences, then call plan_submit with the exact plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -81,7 +81,7 @@ Original request:
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("None");
         format!(
-            r#"Revise the saved canonical plan in the Harness Plan task. Address every annotation and overall comment. Apply requested design changes with design_patch. Explain when a comment needs no edit or conflicts with another requirement. Do not invent an edit merely to close a comment. Then call plan_submit with the exact resulting plan ID and version.
+            r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment, making the requested design changes with design_patch. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the resulting plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -111,13 +111,13 @@ Review comments:
     ) -> String {
         let continuation = match kind {
             PlanExecutionPromptKind::Start => {
-                "Start the Execute task for this accepted plan. Inspect the current workspace before implementation."
+                "Start the Execute task for this accepted plan. Check the current workspace before implementing."
             }
             PlanExecutionPromptKind::Continue => {
-                "Continue the same Execute task at the persisted phase below. Reuse confirmed work and check whether existing evidence still applies."
+                "Continue the same Execute task at the saved phase below. Reuse confirmed work, and check whether existing evidence still applies."
             }
             PlanExecutionPromptKind::ResumeAfterInterruption => {
-                "Resume the same Execute task after interruption. Preserve its plan, accepted revision, and phase. Inspect current files, completed tool results, and any background commands before retrying unfinished work. Do not assume interruption rolled back changes or stopped a command."
+                "Resume the same Execute task after an interruption, keeping its plan, accepted revision, and phase. Check current files, completed tool results, and any background commands before retrying unfinished work. An interruption does not undo changes or stop a running command."
             }
         };
         format!(
@@ -134,12 +134,7 @@ Review comments:
     /// Keep review discussion read-only until the user requests a canonical plan revision.
     pub fn discussion(prompt: &str) -> String {
         format!(
-            "Continue discussing the active canonical plan in the Harness Plan task. \
-Answer questions without editing or resubmitting the plan. When the user requests changes, \
-revise the existing plan through design_patch, then submit the resulting plan ID and version \
-through plan_submit. A successful edit starts a revision of the same plan. \
-Resolve material uncertainty under the user's question preferences. Resolve pending questions before editing. \
-Do not implement the plan or modify project files. The authoring procedure below applies only when the user requests a revision. For discussion alone, answer without editing or submitting.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
+            "Continue discussing the active plan in the Harness Plan task. Answer questions without editing or resubmitting the plan. When the user asks for changes, revise the existing plan with design_patch and submit the resulting plan ID and version with plan_submit. A successful edit starts a new revision of the same plan. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The planning contract below applies only when the user asks for a revision.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
         )
     }
 }
@@ -150,7 +145,7 @@ fn mutable_elicitation_prompt(
     question: &str,
 ) -> String {
     let workflow_boundary = if planning_request.is_some() {
-        "Remain in the Harness Plan task. Do not continue or submit the plan during this turn."
+        "Stay in the Harness Plan task, and do not continue or submit the plan during this turn."
     } else {
         "Do not continue the original request during this turn."
     };
@@ -158,25 +153,18 @@ fn mutable_elicitation_prompt(
         .map(|request| format!("\nOriginal planning request:\n{request}\n"))
         .unwrap_or_default();
     format!(
-        r#"The user is responding while a Harness question set remains pending. Treat the pending elicitation as mutable decision state, not as a modal lock.
+        r#"The user is replying while Harness questions are still pending. The pending questions are open decisions that can change, not a lock on the conversation.
 
-The effective permission for this turn governs repository access. Answer the user's follow-up directly, using repository evidence when relevant. {workflow_boundary}
+The permission for this turn controls repository access. Answer the user's reply directly, using the repository when it helps. {workflow_boundary}
 
 After answering, choose exactly one outcome:
 
-1. Preserve
-   Make no control-tool call when the existing questions and options remain material and valid.
+1. Keep: make no tool call when the current questions and options still matter and are still valid.
+2. Answer: call question_answer only when the user clearly answers a pending question. Discussion, tentative wording, or your own preference is not an answer.
+3. Replace: call question_ask with the complete revised question set when the user asks for changes or the reply changes which questions or options matter. Keep a question's ID only when its meaning is unchanged. End the turn after replacing.
+4. Withdraw: call question_withdraw when no decision remains for the user, with a short reason based on an explicit instruction, a delegated choice, repository evidence, or a settled requirement. End the turn after withdrawing.
 
-2. Answer
-   Call question_answer only when the user explicitly and unambiguously answers a pending question. Do not convert tentative language, discussion, or model preference into an answer.
-
-3. Replace
-   Call question_ask with the complete revised question set when the user requests changes or when clarification changes which questions or options remain material. Preserve question IDs only when their meaning remains unchanged. End the turn after replacement.
-
-4. Withdraw
-   Call question_withdraw when no material user decision remains. Provide a concise reason grounded in an explicit user instruction, delegated judgment, repository evidence, or a resolved requirement. End the turn after withdrawal.
-
-Never select an option merely because you recommend it. Never retain a question that no longer affects the implementation. Never withdraw a question merely to avoid asking for input. "Choose for me" explicitly delegates the decision and may resolve the question. Tentative language such as "I'm leaning toward" does not resolve the question. If only part of the question set changes, replace the complete set while retaining unchanged questions and stable IDs. If a new material decision emerges, include it in the complete replacement set. After any control-tool call, let the Harness present or resume the resulting workflow.
+Never pick an option because you recommend it, keep a question that no longer affects the implementation, or withdraw a question to avoid asking. "Choose for me" delegates the decision and can settle the question. Tentative language such as "I'm leaning toward" does not. When only part of the set changes, replace the whole set, keeping unchanged questions and their IDs, and include any new decision that has come up. After any tool call, let Harness present or resume the next step.
 {planning_context}
 Pending elicitation:
 {elicitation_json}
@@ -278,7 +266,7 @@ mod test {
     #[test]
     fn clarification_preserves_the_pending_decision_boundary() {
         let prompt = PlanPrompt::clarification("Refactor", "{\"question\":\"Migration?\"}", "Why?");
-        assert!(prompt.contains("mutable decision state"));
+        assert!(prompt.contains("open decisions that can change"));
         assert!(prompt.contains("question_answer"));
         assert!(prompt.contains("question_ask"));
         assert!(prompt.contains("question_withdraw"));

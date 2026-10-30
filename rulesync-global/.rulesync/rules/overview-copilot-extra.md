@@ -1,6 +1,0 @@
----
-targets:
-  - copilotcli
-globs:
-  - '**/*'
----

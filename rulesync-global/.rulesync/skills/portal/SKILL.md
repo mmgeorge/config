@@ -14,45 +14,26 @@ targets:
 ---
 # Portal CLI
 
-Use `portal` as the default interface for ArcGIS Portal item inspection and
-management. Make the Portal alias, item ID, item type, and mutation explicit
-before changing remote state because the CLI persists active aliases and
-per-type selections.
+Use `portal` as the default interface for ArcGIS Portal item inspection and management. Make the Portal alias, item ID, item type, and mutation explicit before changing remote state because the CLI persists active aliases and per-type selections.
 
 ## Workflow
 
-- [ ] 1. Confirm the command surface with `portal --help` and the relevant
-      namespace help.
-- [ ] 2. Inspect `portal config show`. Choose an explicit `--portal <alias>` for
-      item commands when more than one Portal exists.
-- [ ] 3. Discover the target with `list`, then resolve it to a 32-character item
-      ID. Avoid title-based mutations.
-- [ ] 4. Inspect `meta`, `data`, `layers`, `inspect`, resources, or job state
-      before changing anything.
-- [ ] 5. Show the exact Portal alias, item ID, operation, sharing level, and
-      affected resource path before a mutation.
-- [ ] 6. Run the narrowest command and verify remote state afterward. Inspect
-      output text as well as the process exit code.
+- [ ] 1. Confirm the command surface with `portal --help` and the relevant namespace help.
+- [ ] 2. Inspect `portal config show`. Choose an explicit `--portal <alias>` for item commands when more than one Portal exists.
+- [ ] 3. Discover the target with `list`, then resolve it to a 32-character item ID. Avoid title-based mutations.
+- [ ] 4. Inspect `meta`, `data`, `layers`, `inspect`, resources, or job state before changing anything.
+- [ ] 5. Show the exact Portal alias, item ID, operation, sharing level, and affected resource path before a mutation.
+- [ ] 6. Run the narrowest command and verify remote state afterward. Inspect output text as well as the process exit code.
 
 ## Always-apply rules
 
-- **Use IDs and explicit aliases for mutations.** Exact titles are
-  case-sensitive and can be ambiguous. Persisted selections can point at a
-  different item than the current task expects.
+- **Use IDs and explicit aliases for mutations.** Exact titles are case-sensitive and can be ambiguous. Persisted selections can point at a different item than the current task expects.
 - **Never omit `--level` when sharing.** Share defaults to `public`.
-- **Confirm destructive operations.** Item deletion, resource replacement or
-  deletion, `config clean`, cache changes, and multiscale changes do not prompt.
-- **Do not trust every zero exit code.** Item deletion can print `[Failed]` and
-  still complete with success-shaped output. Export refresh can persist an
-  error as job state without failing the command.
-- **Treat ArcGIS Play as external disclosure.** `app` posts a document to an
-  Esri-hosted Play service. Web Map `--mini` modes upload embedded map JSON.
-- **Do not call `app` a Portal Application item.** It creates and opens an
-  ArcGIS Play document.
-- **Route Parquet data work to the `parquet` skill.** This includes
-  `portal tools parquet`, `portal item parquet`, `_spatial.json`, and Azure
-  Parquet delivery. Route hand-authored `ParquetLayer` app code to the
-  `maps-sdk` skill.
+- **Confirm destructive operations.** Item deletion, resource replacement or deletion, `config clean`, cache changes, and multiscale changes do not prompt.
+- **Do not trust every zero exit code.** Item deletion can print `[Failed]` and still complete with success-shaped output. Export refresh can persist an error as job state without failing the command.
+- **Treat ArcGIS Play as external disclosure.** `app` posts a document to an Esri-hosted Play service. Web Map `--mini` modes upload embedded map JSON.
+- **Do not call `app` a Portal Application item.** It creates and opens an ArcGIS Play document.
+- **Route Parquet data work to the `parquet` skill.** This includes `portal tools parquet`, `portal item parquet`, `_spatial.json`, and Azure Parquet delivery. Route hand-authored `ParquetLayer` app code to the `maps-sdk` skill.
 
 ## Quick start
 
@@ -64,12 +45,9 @@ portal item any data <item-id> --portal <alias>
 portal item any resource list <item-id> --portal <alias>
 ```
 
-Read [`references/configuration.md`](references/configuration.md) before adding
-or removing Portals, authenticating, switching aliases, using selections, or
-cleaning state.
+Read [`references/configuration.md`](references/configuration.md) before adding or removing Portals, authenticating, switching aliases, using selections, or cleaning state.
 
-Read [`references/items-and-resources.md`](references/items-and-resources.md)
-before searching, sharing, deleting, or modifying generic item resources.
+Read [`references/items-and-resources.md`](references/items-and-resources.md) before searching, sharing, deleting, or modifying generic item resources.
 
 ## Feature Layers
 
@@ -81,10 +59,7 @@ portal item feature export start <item-id> --portal <alias> \
 portal job list
 ```
 
-Read
-[`references/feature-services-and-jobs.md`](references/feature-services-and-jobs.md)
-before copying, cloning, exporting, changing cache or multiscale settings, or
-working with tracked jobs.
+Read [`references/feature-services-and-jobs.md`](references/feature-services-and-jobs.md) before copying, cloning, exporting, changing cache or multiscale settings, or working with tracked jobs.
 
 ## Web Maps
 
@@ -93,20 +68,14 @@ portal item webmap inspect <item-id> --portal <alias>
 portal item webmap view <item-id> --portal <alias>
 ```
 
-Read [`references/webmaps-and-play.md`](references/webmaps-and-play.md) before
-opening Map Viewer or posting ArcGIS Play documents.
+Read [`references/webmaps-and-play.md`](references/webmaps-and-play.md) before opening Map Viewer or posting ArcGIS Play documents.
 
 ## Error handling
 
-- Preserve the underlying HTTP, ArcGIS REST, authentication, JSON, or file
-  error. Never substitute an empty result or a different item.
-- Public reads may run anonymously. Use authenticated `--me` searches when
-  private current-user content must be included.
-- A private Feature Service can pass item lookup and still fail service
-  inspection because some service requests do not carry the cached token.
-- Feature Layer `app` can embed the active Portal URL in its component shell
-  even when item resolution uses `--portal`. Switch to the target alias before
-  creating that Play document.
+- Preserve the underlying HTTP, ArcGIS REST, authentication, JSON, or file error. Never substitute an empty result or a different item.
+- Public reads may run anonymously. Use authenticated `--me` searches when private current-user content must be included.
+- A private Feature Service can pass item lookup and still fail service inspection because some service requests do not carry the cached token.
+- Feature Layer `app` can embed the active Portal URL in its component shell even when item resolution uses `--portal`. Switch to the target alias before creating that Play document.
 
 ## Reference map
 

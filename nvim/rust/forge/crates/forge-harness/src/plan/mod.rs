@@ -680,7 +680,7 @@ impl PlanElicitation {
             line_list.push(format!("- {}{provenance}: {value}", question.header));
         }
         if self.resolution_source == crate::session::ResolutionSource::Timeout {
-            line_list.insert(0, "The question set timed out. The user may be unavailable. Harness preserved confirmed answers and automatically selected defaults or skipped questions without options. Automatic responses are not user answers. Continue conservatively using available context and existing permissions.".into());
+            line_list.insert(0, "The questions timed out, and the user may be unavailable. Harness kept the answers the user confirmed, selected defaults for the rest, and skipped questions without options. Automatic selections are not user answers. Continue cautiously with the available context and existing permissions.".into());
         }
         line_list.join("\n")
     }

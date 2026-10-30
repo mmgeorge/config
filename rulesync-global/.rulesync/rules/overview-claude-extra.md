@@ -1,6 +1,0 @@
----
-targets:
-  - claudecode
-globs:
-  - '**/*'
----

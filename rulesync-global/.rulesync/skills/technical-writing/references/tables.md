@@ -1,55 +1,46 @@
-# Technical Tables Guide
+# Tables
 
-*Read when designing, reviewing, or structuring comparison tables, configuration matrices, parameter lists, and reference schemas.*
+*Read before adding or reviewing a comparison table, configuration table, parameter list, or schema table.*
 
-## Purpose and Selection Criteria
+## When to use a table
 
-Use a table when readers must compare multiple entities across two or more shared dimensions, look up values by a primary key, or evaluate a matrix of constraints.
+Use a table when the reader compares several items across the same attributes, or looks up a value by name.
 
-- **Use a table when:** Items share three or more attributes (such as Name, Type, Default, Description, Required).
-- **Use a bulleted list when:** Comparing only a single attribute or presenting sequential steps.
-- **Use prose when:** Explaining nuanced causality, edge-case rationale, or conditional behaviors that cannot be summarized in tabular cells.
+- Use a table when items share three or more attributes, such as name, type, default, and description.
+- Use a list when items share only one attribute, or when the items are steps in order.
+- Use prose when the content explains causes, exceptions, or conditions that do not fit in a cell.
 
-## Focus on One Comparison Dimension
+## One kind of row per table
 
-Design each table around a single primary entity type and lifecycle scope. Do not mix unrelated entities (such as user accounts and database migration records) in the same table.
+Give each table one kind of item. Do not mix unrelated items, such as user accounts and database migrations, in one table.
 
-### The Five Column Quality Checks
+Keep a column only when:
 
-Audit every column against these five criteria:
+- It answers a question the reader has, such as "What happens on failure?"
+- Most of its cells hold real values, not blanks or "N/A."
+- Its values differ from row to row, so it helps the reader tell rows apart.
+- It stays at the same level of detail as the rest of the table.
+- Its header is clear without a footnote.
 
-1. **Contribution:** Answers a distinct reader question (such as *"What is the fallback behavior?"*).
-2. **Coverage:** Contains populated, meaningful data across rows rather than empty cells or `N/A` placeholders.
-3. **Differentiation:** Provides distinct values that help readers distinguish one row from another.
-4. **Scope:** Remains strictly within the entity abstraction level and lifecycle phase of the table.
-5. **Header Clarity:** Uses a concise, self-explanatory domain label without requiring footnotes.
+Remove a column that repeats another, has the same value in every row, or is mostly empty. Split the table when some columns apply to only one phase, such as build time or runtime. Move a cell that needs several sentences into the text around the table.
 
-### Column Pruning and Table Splitting
+## Headers
 
-- **Remove redundant columns:** Drop columns that repeat another column's information, remain constant across all rows, or are mostly empty.
-- **Split disparate lifecycles:** When subsets of columns apply to different lifecycle phases (such as Build Time vs Runtime configuration), split them into separate tables.
-- **Extract complex edge cases:** When a single cell requires multiple sentences of qualification, move that explanation to adjacent prose and link or cross-reference it.
+Treat each header as a prefix shared by every cell in its column, and drop words from cells that only repeat it. Keep the cells in one column grammatically alike: all nouns, all verbs, or all yes-or-no values. A shortened name in a cell does not replace the full name in the surrounding text.
 
-## Headers as Shared Context
+## Formatting
 
-Treat column headers as the shared category prefix for all cells in that column:
+- Left-align text and code. Right-align numbers. Center short status values.
+- Put units in the header, such as `Timeout (ms)`, instead of in every cell.
+- Never leave a cell blank. Write `None` or `-`, and say what it means when that is not obvious.
+- Put literal values, field names, environment variables, and types in backticks.
 
-- Combine the header with each cell, then remove words in the cells that merely repeat the header label.
-- Keep sibling cells grammatically parallel (all noun phrases, all imperative verbs, or all boolean values).
-- Contextual shortening within a table does not alter canonical terminology. Use the full canonical identifier in surrounding prose.
+## Example
 
-## Formatting Standards
+The text before the table states its point: only `retry_delay` takes effect without a restart.
 
-- **Alignment:** Left-align text, descriptions, and code identifiers. Right-align numeric quantities and memory/time metrics. Center short status tags or booleans.
-- **Units in Headers:** Place units of measurement directly in the header (such as `Timeout (ms)`, `Memory (MiB)`) instead of repeating units in every cell.
-- **Empty States:** Never leave a table cell blank. Use an explicit indicator: `None`, `N/A`, or `-`, and define the meaning if ambiguous.
-- **Code Formatting:** Wrap literal values, field names, environment variables, and types in backticks.
-
-## Table Review Checklist
-
-1. Does the table track exactly one entity type or comparison dimension?
-2. Does every column pass the five quality checks (Contribution, Coverage, Differentiation, Scope, Header Clarity)?
-3. Are numeric units declared in column headers rather than repeated in cells?
-4. Are all cells populated with explicit values or defined empty-state indicators?
-5. Are cell entries parallel in grammar and abstraction level?
-6. Does the preceding text state the takeaway or primary pattern shown in the table?
+| Setting | Default (ms) | Applies without restart |
+| --- | ---: | :---: |
+| `retry_delay` | 500 | Yes |
+| `max_retry_delay` | 30000 | No |
+| `request_timeout` | 10000 | No |

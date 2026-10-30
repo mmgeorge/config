@@ -439,31 +439,31 @@ impl PlanExecutionRecord {
     pub fn instructions(&self) -> String {
         if self.state != PlanExecutionState::Active {
             return format!(
-                "Execution is {:?}. End this turn. Do not continue automatically.",
+                "Execution is {:?}. End this turn, and do not continue automatically.",
                 self.state
             );
         }
         let work = match self.phase {
             PlanPhase::Implement => {
-                "Implement the accepted design and tests. The accepted plan is frozen during Implement. Make justified implementation deviations when needed, including internal helpers, and explain them in your completion summary. Do not edit or submit the plan, reconcile declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Harness runs validation and conformance assessment in Checking. When writing is finished, call plan_phase_done. Declarations and call/access differences do not gate Implement completion."
+                "Implement the accepted design and its tests. The accepted plan is frozen during Implement. Make justified deviations when needed, such as internal helpers, and explain them in your completion summary. Do not edit or submit the plan, update declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Harness runs validation and conformance checks in the Checking phase. When the code is written, call plan_phase_done. Differences in declarations, calls, or accesses do not block finishing Implement."
             }
             PlanPhase::Resolve => {
-                "Resolve the collected verification findings. Correct code defects in the workspace. If an intentional change affects the accepted contract, propose one consolidated plan revision with a concrete reason. Internal helpers and Calls/Constructs/Accesses differences do not require revisions. After acceptance, continue with the returned revision. Finish with plan_phase_done so Harness can run declarations and automated checks again. Do not run those checks yourself."
+                "Resolve the collected verification findings by fixing the code in the workspace. If an intentional change affects the accepted contract, propose one combined plan revision with a concrete reason, and continue with the returned revision once it is accepted. Internal helpers and differences in Calls, Constructs, or Accesses do not need a revision. Finish with plan_phase_done so Harness runs the declaration and automated checks again. Do not run those checks yourself."
             }
             PlanPhase::Checking => {
-                "Harness runs declarations and accepted checks locally. No model turn is admitted for this phase."
+                "Harness runs the declaration and accepted checks locally. No model turn runs in this phase."
             }
             PlanPhase::Verify => {
-                "Perform only the accepted plan's manual verification actions, in order. Harness has already passed declarations and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked with observations and tool evidence. Report blockers honestly. Send observed defects to Resolve. Retrieve exact evidence IDs with plan_read before submitting results."
+                "Perform only the accepted plan's manual verification actions, in order. Harness has already passed the declaration and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked, with observations and tool evidence, and report blockers honestly. Observed defects go to Resolve. Get the exact evidence IDs with plan_read before submitting results."
             }
         };
         let reporting = if self.phase == PlanPhase::Verify {
-            " Report verification.checks with one entry per accepted manual verification action, in plan order. Each entry contains category (manual), the exact command or manual check label, outcome (passed, failed, or blocked), a concise result summary, and evidence tool IDs. Include checks that could not run as blocked with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI renders the structured report. Keep the final response brief instead of repeating the inventory."
+            " Report verification.checks with one entry per accepted manual action, in plan order. Each entry has category (manual), the exact command or manual check label, outcome (passed, failed, or blocked), a short result summary, and evidence tool IDs. List checks that could not run as blocked, with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI shows the structured report, so keep the final response brief."
         } else {
             ""
         };
         format!(
-            "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the target with plan_read. Call plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Do not call goal_complete for this execution.",
+            "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the plan with plan_read. Call plan_phase_done with this phase and revision when the phase's work is finished, then end the turn after it succeeds. Harness records the transition and supplies the next phase. Ending a turn does not end the phase. Do not call goal_complete for this execution.",
             self.phase, self.revision
         )
     }
@@ -652,7 +652,7 @@ mod tests {
                 ),
                 (
                     PlanExecutionPromptKind::ResumeAfterInterruption,
-                    "Resume the same Execute task after interruption",
+                    "Resume the same Execute task after an interruption",
                 ),
             ] {
                 let prompt = PlanPrompt::execution(&record, kind, "accepted document");
@@ -663,9 +663,11 @@ mod tests {
                 assert!(prompt.contains("Reviewer approval comments (context only, not plan edits):\nPreserve the public API name"));
                 assert!(prompt.ends_with("accepted document"));
                 if phase == PlanPhase::Implement {
-                    assert!(prompt.contains("Do not edit or submit the plan, reconcile declaration metadata, or run builds"));
                     assert!(prompt.contains(
-                        "Harness runs validation and conformance assessment in Checking"
+                        "Do not edit or submit the plan, update declaration metadata, or run builds"
+                    ));
+                    assert!(prompt.contains(
+                        "Harness runs validation and conformance checks in the Checking phase"
                     ));
                 } else if phase == PlanPhase::Verify {
                     assert!(
@@ -677,7 +679,7 @@ mod tests {
                 }
                 if kind == PlanExecutionPromptKind::ResumeAfterInterruption {
                     assert!(prompt.contains(
-                        "Do not assume interruption rolled back changes or stopped a command"
+                        "An interruption does not undo changes or stop a running command"
                     ));
                 }
             }

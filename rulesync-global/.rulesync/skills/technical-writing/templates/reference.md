@@ -1,40 +1,53 @@
 # Reference Profile
 
-*Read when authoring or revising comprehensive lookup documentation for APIs, schemas, CLI commands, configuration surfaces, protocols, or error catalogs.*
+*Read when writing complete lookup documentation for an API, a schema, CLI commands, configuration, a protocol, or error codes.*
 
 ## Controlling Claim
 
-Establish that the document describes its declared interface completely, accurately, and in a predictable hierarchy that practitioners can rapidly navigate during implementation and debugging.
+The reference describes every item in its scope accurately, in an order the reader can scan quickly while coding or debugging.
 
-## Structural Obligations
+## Sections
 
-Reference documentation must follow the structural organization of the underlying interface:
+Organize the reference the way the interface itself is organized.
 
-### 1. Scope, Version, and Authoritative Source
-- State the exact software version, package, schema version, or RFC standard covered.
-- State the authoritative source of truth (such as a source crate, OpenAPI spec, or protobuf definition).
+### 1. Scope and source
 
-### 2. Namespace and Module Hierarchy
-- Mirror the module structure, namespaces, or command groups directly in heading levels.
-- Provide a summary table or index at the top of each major category for rapid lookup.
+- State the exact version covered.
+- Name the source the reference is generated from or checked against, such as an OpenAPI file or a protobuf definition.
 
-### 3. Exhaustive Member Specification
-For every declared member (function, field, configuration key, flag, or error code):
-- **Canonical Identifier:** Full symbol path or command syntax.
-- **Type and Constraints:** Data type, accepted value range, string encoding, or regex pattern.
-- **Optionality and Defaults:** Explicitly mark as `Required`, `Optional (Default: <value>)`, or `Deprecated (Use: <alternative>)`.
-- **Behavior Contract:** Concrete description of runtime effects, side effects, and state mutations.
-- **Errors and Exit Codes:** Exhaustive enumeration of possible error returns, exceptions, or failure codes.
+### 2. Structure
 
-### 4. Verified Minimal Examples
-- Provide a minimal, syntax-accurate example for each member or configuration block.
-- Verify examples against the same authoritative compiler, schema, or test suite that produces the reference.
+- Mirror the interface's modules, namespaces, or command groups in the headings.
+- Start each large group with a summary table or index.
 
-## Exclude by Default
+### 3. Entries
 
-- Do not include narrative tutorials, design history, or persuasive arguments. Link the relevant how-to guide, explanation, or RFC.
-- Do not omit obscure or advanced members. Reference documentation must provide exhaustive coverage within its declared scope.
+For every function, field, setting, flag, or error code, give:
 
-## Completion Check
+- Its full name or command syntax.
+- Its type and allowed values.
+- Whether it is required, its default value, and what replaces it if it is deprecated.
+- What it does, including side effects.
+- Every error or exit code it can produce.
 
-A practitioner should be able to locate any declared member immediately, identify its accepted inputs, return guarantees, default values, and failure modes, and distinguish documented contract facts from optional examples.
+### 4. Examples
+
+- Give a short, working example for each entry, checked with the same compiler, schema, or tests that produce the reference.
+
+## Leave out
+
+- Do not include tutorials, design history, or arguments. Link the how-to guide, explanation, or RFC.
+- Do not skip rarely used items. A reference covers everything in its stated scope.
+
+## Example
+
+One entry from a configuration reference:
+
+> `sync.retry_delay`
+>
+> The time the sync worker waits before retrying a failed save, in milliseconds. It is optional and defaults to 500. Each retry doubles the delay, up to `sync.max_retry_delay`. A value below 100 fails validation at startup with `config error: sync.retry_delay must be at least 100`.
+>
+> ```toml
+> [sync]
+> retry_delay = 1000
+> ```

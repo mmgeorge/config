@@ -1,48 +1,50 @@
 # Tutorial Profile
 
-*Read when authoring guided tutorials where a learner builds a runnable project to master a specific technology or capability.*
+*Read when writing a guided tutorial in which the reader builds a working project to learn a technology.*
 
 ## Controlling Claim
 
-Establish that building one runnable, end-to-end project from scratch teaches the learner how central concepts interact and gives them a reusable engineering capability.
+Building one working project from start to finish teaches the reader how the main concepts fit together and leaves them with a pattern they can reuse.
 
-## Structural Obligations
+## Sections
 
-A tutorial must progress through the following milestones:
+Write these sections in order.
 
-### 1. Target Project and Acquired Capability
-- State the concrete functional artifact the learner will build (such as `Build an event-driven task queue worker with Redis and Rust.`).
-- Define the reusable engineering capability acquired upon completion.
+### 1. What you will build
 
-### 2. Pinned Prerequisites and Environment
-- Specify exact software versions, required compilers, CLIs, Docker images, and access credentials.
-- State assumed background knowledge without using subjective labels (such as `Assumes familiarity with async Rust syntax and basic Redis commands.`).
+- Name the project, such as "a task queue worker in Rust that reads jobs from Redis."
+- Say what the reader will be able to do afterward.
 
-### 3. Progressive Milestones
-Structure the tutorial into small, verifiable milestones:
+### 2. Before you start
 
-- **Milestone 1: Minimal Runnable Scaffold:** Initialize the repository, dependencies, and configuration. Provide an immediate verification command that proves the basic environment runs.
-- **Milestones 2 through N: Feature Construction:**
-  - Introduce core concepts strictly at the milestone where the learner implements them.
-  - Provide complete, copyable code files or diffs with semantic identifiers.
-  - End each milestone with a deterministic verification checkpoint (such as running a test or sending a curl request).
+- Give the exact versions of the tools, compilers, and images the reader needs, and any credentials.
+- State the background the reader needs, such as "This tutorial assumes familiarity with async Rust and basic Redis commands."
 
-### 4. End-to-End System Verification
-- Provide the final command that exercises the complete application from start to finish.
-- Display the exact expected terminal output, log traces, or UI result that confirms success.
+### 3. Milestones
 
-### 5. Capability Mapping and Next Steps
-- Explain how the patterns implemented in the tutorial translate to production systems.
-- Link relevant architecture overviews, explanations, and reference documents for advanced configuration.
+- Start with the smallest project that runs, and a command that proves it runs.
+- Add one feature per milestone, and introduce each concept in the milestone that uses it.
+- Give complete code the reader can copy, and end each milestone with a check, such as a test or a `curl` request.
 
-### 6. Author Verification Requirement
-- Execute the entire tutorial from a clean directory in an isolated environment before publishing to verify that every command and code snippet succeeds.
+### 4. Final check
 
-## Exclude by Default
+- Give one command that runs the whole project, and show its exact expected output.
 
-- Do not provide multiple alternative implementation paths or configuration forks. Provide the single simplest working path to the target artifact.
-- Do not interrupt the build flow with exhaustive API listings or deep theoretical proofs.
+### 5. Next steps
 
-## Completion Check
+- Explain how the pattern applies to a production system, and link the overviews, explanations, and references that go further.
 
-A learner following the tutorial should successfully build the functional artifact, understand the purpose of each introduced concept, and possess a working template they can adapt to production projects.
+## Leave out
+
+- Do not offer alternative paths or configurations. Give the single simplest path that works.
+- Do not interrupt the build with full API listings or long theory.
+
+## Example
+
+The opening of a tutorial:
+
+> In this tutorial you build a worker that takes jobs from a Redis list and runs them, and you finish with a pattern you can reuse for any background job. It assumes familiarity with async Rust and basic Redis commands, and it uses Rust 1.80 and Redis 7.
+>
+> Start with a worker that only connects. Create the project with `cargo new job-worker`, add the `redis` and `tokio` crates, and open a connection to Redis in `main`. When you run `cargo run`, the worker prints `connected to redis://localhost:6379` and waits.
+>
+> Next, the worker reads a job. A job is a JSON string pushed onto the `jobs` list, and the worker takes one at a time with `BRPOP`, which waits until a job arrives.

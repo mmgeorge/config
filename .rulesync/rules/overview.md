@@ -79,6 +79,10 @@ The `rulesync-global/` directory defines baseline dotfile defaults across projec
 - Add global commands under `rulesync-global/.rulesync/commands/` only for targets that support commands.
 - Keep provider-specific generated outputs untracked and ignored.
 
+Global sources generate into the user's home directories (`~/.claude`, `~/.agents`, `~/.copilot`, and `~/.gemini/antigravity-cli`) and load in every repository. Evaluate their content by usefulness across repositories, never by whether this checkout uses a pattern, document type, or template. Repository evidence may illustrate a general rule but must not decide that a general rule is unnecessary. Keep this checkout's paths, project names, and conventions, such as Forge or `nvim/` paths, out of general global skills, rules, and examples. Only a source that exists to drive a cross-repository tool, such as the Harness and walkthrough skills, names that tool.
+
+Global rules load in every session, so a global skill must not restate them. The global configuration sets `delete: false`, so removing a global source file leaves its generated copies in place. Delete those copies from each home directory after generation.
+
 When adding stdio **MCP servers** that require inherited credentials, declare the environment variable names with `envVars` in `rulesync-global/.rulesync/mcp.json`. Codex generates those as `env_vars` in `~/.codex/config.toml`. The GitHub MCP server must preserve `envVars: ["GITHUB_PERSONAL_ACCESS_TOKEN"]`, or Codex can start `github-mcp-server` without credentials and close the MCP handshake during initialization.
 
 Use this dry run before applying global changes:

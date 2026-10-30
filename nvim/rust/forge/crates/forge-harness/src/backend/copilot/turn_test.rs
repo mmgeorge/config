@@ -843,7 +843,7 @@ async fn copilot_rejection_feedback_preserves_denial_origin_and_cancellation() -
                     "policy" | "policy-autonomous" => {
                         "Harness permission or filesystem access policy"
                     }
-                    "mode" => "Reject-all approval mode is active",
+                    "mode" => "Tool approval is set to reject all",
                     "user" => "Rejected by the user",
                     "timeout" => "timeout expired",
                     "invalid" => "permission evaluation failed",
@@ -859,9 +859,9 @@ async fn copilot_rejection_feedback_preserves_denial_origin_and_cancellation() -
                     scenario != "user"
                 );
                 if mode == ApprovalMode::Deny {
-                    assert!(feedback.contains("operating autonomously"));
-                    assert!(feedback.contains("whitelisted commands"));
-                    assert!(feedback.contains("Do not wait for user approval"));
+                    assert!(feedback.contains("no user is reviewing requests"));
+                    assert!(feedback.contains("allowed tools and commands"));
+                    assert!(feedback.contains("Do not wait for approval"));
                 }
             }
         }

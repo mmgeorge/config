@@ -725,32 +725,13 @@ credentials/
 
 ### Where ignore patterns are written per tool
 
-Most tools get a dedicated ignore file (for example `.cursorignore`,
-`.geminiignore`, `.clineignore`). Antigravity CLI is built on the same engine
-as Gemini CLI, so it reads the project-root `.geminiignore` file. Claude Code is the exception: it does not
-read a separate ignore file, so Rulesync writes the deny list into Claude
-Code's settings file as `permissions.deny` entries (`Read(<pattern>)`).
+Most tools get a dedicated ignore file (for example `.cursorignore`, `.geminiignore`, `.clineignore`). Antigravity CLI is built on the same engine as Gemini CLI, so it reads the project-root `.geminiignore` file. Claude Code is the exception: it does not read a separate ignore file, so Rulesync writes the deny list into Claude Code's settings file as `permissions.deny` entries (`Read(<pattern>)`).
 
-For Cursor, Rulesync emits only `.cursorignore` — the file that **blocks access
-entirely** (semantic search, Tab, Agent, Inline Edit, and `@`-mentions). Cursor
-also supports a second file, `.cursorindexingignore`, which excludes files from
-**indexing only** while keeping them accessible to the AI on demand. These two
-files mean _different_ things, and Rulesync's `ignore` feature models a single
-canonical ignore list per tool with no per-pattern distinction between
-"block access" and "exclude from indexing only". Emitting the same patterns to
-both files would be incorrect, so `.cursorindexingignore` is intentionally **not
-generated** (an intentional non-goal). Author it by hand if you need
-indexing-only excludes.
+For Cursor, Rulesync emits only `.cursorignore` — the file that **blocks access entirely** (semantic search, Tab, Agent, Inline Edit, and `@`-mentions). Cursor also supports a second file, `.cursorindexingignore`, which excludes files from **indexing only** while keeping them accessible to the AI on demand. These two files mean _different_ things, and Rulesync's `ignore` feature models a single canonical ignore list per tool with no per-pattern distinction between "block access" and "exclude from indexing only". Emitting the same patterns to both files would be incorrect, so `.cursorindexingignore` is intentionally **not generated** (an intentional non-goal). Author it by hand if you need indexing-only excludes.
 
-By default, Claude Code's deny list is written to the **shared**
-`.claude/settings.json` so that the policy can be committed and reviewed by
-the team. This is intentional (see issue #1094), but it means that running
-`rulesync gitignore` will not add `.claude/settings.json` to `.gitignore` —
-that file may also contain other shared Claude config you actively want to
-commit.
+By default, Claude Code's deny list is written to the **shared** `.claude/settings.json` so that the policy can be committed and reviewed by the team. This is intentional (see issue #1094), but it means that running `rulesync gitignore` will not add `.claude/settings.json` to `.gitignore` — that file may also contain other shared Claude config you actively want to commit.
 
-If you would rather keep the deny list out of version control, opt into the
-**local** mode using the per-feature options object form:
+If you would rather keep the deny list out of version control, opt into the **local** mode using the per-feature options object form:
 
 ```jsonc
 // rulesync.jsonc

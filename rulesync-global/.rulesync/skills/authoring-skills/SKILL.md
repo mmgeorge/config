@@ -21,23 +21,18 @@ Read the corresponding reference file before performing each workflow step.
 
 Follow these steps in sequential order:
 
-1. **Identify Functional Gaps with Baselines:**
-   Execute 1–3 representative tasks without the skill. Record specific failures, unverified assumptions, or domain context that required manual intervention. These recorded gaps define the scope and evaluation criteria for the skill. If baseline execution succeeds consistently without guidance, do not create the skill.
+1. **Identify Functional Gaps with Baselines:** Execute 1–3 representative tasks without the skill. Record specific failures, unverified assumptions, or domain context that required manual intervention. These recorded gaps define the scope and evaluation criteria for the skill. If baseline execution succeeds consistently without guidance, do not create the skill.
 
-2. **Draft Minimal `SKILL.md`:**
-   Define frontmatter (`name`, `description`) and the minimal instructions necessary to resolve the recorded gaps. State **what** capability the skill provides and **when** to trigger it using third-person declarative prose. Verify that every instruction addresses a specific operational failure mode.
+2. **Draft Minimal `SKILL.md`:** Define frontmatter (`name`, `description`) and the minimal instructions necessary to resolve the recorded gaps. State **what** capability the skill provides and **when** to trigger it using third-person declarative prose. Verify that every instruction addresses a specific operational failure mode.
 
-3. **Apply Progressive Disclosure Based on Conditional Access:**
-   Keep the `SKILL.md` body under 500 lines as a structural overview. Extract content into `references/*.md` only when an agent can execute a distinct subset of tasks without loading the other parts (such as specialized data schemas, alternative format decoders, or rare error codes). If all rules and guidelines form an essential baseline required on every invocation, keep them unified in `SKILL.md` rather than fragmenting them across reference files. Place output templates in `assets/` and deterministic executables in `scripts/`.
+3. **Apply Progressive Disclosure Based on Conditional Access:** Keep the `SKILL.md` body under 500 lines as a structural overview. Extract content into `references/*.md` only when an agent can execute a distinct subset of tasks without loading the other parts (such as specialized data schemas, alternative format decoders, or rare error codes). If all rules and guidelines form an essential baseline required on every invocation, keep them unified in `SKILL.md` rather than fragmenting them across reference files. Place output templates in `assets/` and deterministic executables in `scripts/`.
 
-4. **Validate Skill Execution:**
-   Evaluate the draft in an isolated session across three dimensions:
+4. **Validate Skill Execution:** Evaluate the draft in an isolated session across three dimensions:
    - **Discovery:** Verify the skill triggers on intended requests and remains inactive on related but distinct tasks.
    - **Deterministic Logic:** Trace execution step by step to identify ambiguous branching, missing parameters, or unspecified dependencies.
    - **Edge Cases:** Test boundary conditions, malformed inputs, missing tools, and execution failures.
 
-5. **Iterate on Real Workflows:**
-   Test the skill on production tasks across all targeted models. Monitor navigation behavior, referenced file loading order, and command execution. Promote frequently needed reference rules into `SKILL.md` and prune unused reference files.
+5. **Iterate on Real Workflows:** Test the skill on production tasks across all targeted models. Monitor navigation behavior, referenced file loading order, and command execution. Promote frequently needed reference rules into `SKILL.md` and prune unused reference files.
 
 ---
 
@@ -51,6 +46,8 @@ Follow these steps in sequential order:
 - **Consistent Domain Terminology:** Use one unambiguous term per concept across all files in the skill. Place historical or deprecated patterns in explicit collapsed blocks.
 - **Cross-Platform Paths:** Use forward slashes (`/`) for all file paths, including Windows environments.
 - **Verified Technical Interfaces:** Validate all documented CLI commands, API endpoints, schema structures, and parameters against live implementations.
+- **Provider-Neutral Wording:** Do not hardcode provider brand names (*"when Codex works with..."*) or chat UI slash commands in shared skills. Write third-person functional triggers and reference other skills by name (*"use the gpu-debug skill for shader capture"*).
+- **Contract Framing:** Do not attribute cognitive traits to models (*"the agent is already smart"*), assign roleplay personas (*"act as a ruthless QA tester"*), or use journey metaphors (*"robot on a path with cliffs"*). Frame instructions around operation fragility, context budgets, and input/output contracts.
 
 ---
 

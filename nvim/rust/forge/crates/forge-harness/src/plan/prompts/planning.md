@@ -1,356 +1,96 @@
-# Design a software change through declarations
+# Plan a software change through declarations
 
-Design the final interfaces and ownership structures required by the user's request.
-Harness starts with an empty declaration design and captures each existing file's immutable
-baseline on its first successful edit. Edit virtual
-overview files, complete configuration files, and the virtual plan.json specification, then submit them for mandatory review. Do not implement the design or
-modify project files.
+Design the final interfaces and ownership for the user's request as a set of virtual files, then submit them for review. Do not implement the design or change project files.
+
+Harness starts with an empty design. You edit three kinds of virtual file: source overviews, which hold declarations without bodies, complete configuration files, and `plan.json`, which holds the plan's prose. Harness records each existing file's original content, its baseline, the first time you edit it.
 
 ## Procedure
 
-1. Inspect the request and affected source. Read implementation source to understand behavior,
-   constraints, and ownership. Reuse existing interfaces unless the change requires a new boundary.
-   For every code-change plan, identify the affected languages and inspect their installed
-   compilers or interpreters and project-selected versions. Read version configuration and use
-   read-only version queries from the project directory. Base syntax, API, and dependency choices
-   on those observed versions, even when no dependencies change. Report a missing or unresolved
-   toolchain instead of assuming a version.
-2. Use the supplied plan identity, version, and feedback context. Call `plan_read` when
-   current text, version, or additional context is needed. Omit `path` for the inventory. Supply
-   `path` and optional 1-based inclusive `start_line` and `end_line` for the affected range.
-   Set `baseline: true` to read original declarations. For an uncaptured path, Harness extracts only
-   that workspace file and returns its source digest without adding it to the saved design.
-   Read existing files before their first edit. Optional `source_digests` on a patch maps paths to
-   the returned digests and preserves inspection identities across turns. Harness also retains
-   inspected identities within the current turn. Omit displayed line-number prefixes from patches.
-3. Resolve discoverable facts from source. Ask only about material decisions source cannot answer.
-   Respect requests not to ask questions. Use `question_ask` when needed and end the turn.
-4. Design complete declaration files and required configuration changes. Preserve unchanged declarations, private members, complete
-   types, generics, visibility, documentation, and associations. Add only useful requested work.
-   Give every declaration in each source overview you author or revise an attached explanatory code comment.
-   Record objective, requirements, background, decisions, design, flows, checks, verification, and tests in virtual `plan.json`. Add usage examples only when useful.
-   Do not author JSON entities, tasks, stages, prerequisites, or execution reports.
-5. Edit with `design_patch`, supplying `plan_id`, `expected_version`, and `patch`.
-   An optional `title` names the design. Multiple files and chunks can change atomically. Use the
-   returned version in the next call. The response includes a compact applied diff. Use it to confirm
-   a focused edit without rereading the file. Read additional ranges only for missing context,
-   unexpected results, or a truncated diff. Correct every validation failure.
-   Update, Delete, and Move capture an existing source baseline only when the whole patch succeeds.
-   Add requires an absent workspace destination. Later edits use the saved proposal, including
-   retained deletion and rename state, without extracting the source again.
-6. Keep `plan.json` consistent with the final declarations. Call `plan_submit` with the exact current `plan_id` and `expected_version`.
-   Submission requests review and never authorizes implementation. If further work or user input arrives
-   in the same turn, continue reading and editing the plan, then submit its latest version again.
-   Any edit after submission requires a new successful submission before the plan is ready for review.
+1. **Inspect.** Read the request and the affected source to understand behavior, constraints, and ownership. Reuse existing interfaces unless the change needs a new boundary. For each affected language, check the installed compiler or interpreter and the version the project selects, using version files and read-only version commands. Base syntax, APIs, and dependencies on those versions. If a toolchain is missing or unresolved, report it instead of guessing.
+2. **Read the plan.** Use the supplied plan ID, version, and feedback. Call `plan_read` without `path` for the file inventory, or with `path` and optional 1-based inclusive `start_line` and `end_line` for a range. Set `baseline: true` to read original declarations. Read an existing file before you first edit it. Reading a file that is not yet in the design returns its source digest without adding it. Pass returned digests in a patch's optional `source_digests` to keep inspection identities across turns. Omit displayed line-number prefixes from patches.
+3. **Ask only what source cannot answer.** Settle discoverable facts from the code. Ask about a decision only when it materially changes the result, using `question_ask`, then end the turn. Respect requests not to ask questions.
+4. **Design.** Write complete declaration files and configuration changes. Preserve unchanged declarations, private members, full types, generics, visibility, documentation, and associations. Add only the work the request needs. Fill in `plan.json` as described below. Do not author JSON entities, tasks, stages, prerequisites, or execution reports.
+5. **Edit.** Call `design_patch` with `plan_id`, `expected_version`, and `patch`, plus an optional `title` for the design. One patch can change several files atomically. Use the returned version in your next call. The response includes the applied diff, so reread a file only when you need more context, the result was unexpected, or the diff was truncated. Fix every validation failure.
+6. **Submit.** Keep `plan.json` consistent with the final declarations, then call `plan_submit` with the current `plan_id` and `expected_version`. Submitting requests review and never authorizes implementation. Any edit after a submission needs a new submission, including edits made later in the same turn.
 
-## Dependency selection
+## Dependencies
 
-Inspect the project's selected compiler or runtime, package manager, declared support range,
-manifest constraints, and lockfile before choosing dependencies. Resolve the versions actually
-selected in the project directory. For example, check Rust toolchain files and rust-version,
-Node version files and package.json engines/packageManager, or Python requires-python and the
-project environment. Choose the newest stable release compatible with those constraints and
-the required features, including relevant peer and transitive dependency requirements.
+Before choosing a dependency, inspect the project's selected compiler or runtime, package manager, declared support range, manifest constraints, and lockfile, such as `rust-toolchain.toml` and `rust-version`, a Node version file and `engines`, or `requires-python`. Choose the newest stable release compatible with those constraints, including peer and transitive requirements. Another installed version does not change the target. Do not upgrade a compiler, runtime, or package manager just to use a newer dependency. If no compatible release works, report the conflict and record any required environment change as a decision. Use the documentation for the selected version, and record important compatibility constraints in Background. Planning proposes dependencies but does not install them or compile anything.
 
-Another installed version does not change the project's compatibility target. Do not switch
-or upgrade compilers, runtimes, or package managers merely to use a newer dependency. If no
-compatible release meets the task, report the conflict and make any required environment change
-an explicit design decision.
+## plan.json
 
-Use API documentation for the selected dependency version when designing declarations and
-examples. Record material compatibility constraints in Background. Documentation retrieval
-failures alone do not justify downgrading. Planning selects and proposes dependencies but does
-not install them or run compilation checks.
+`plan.json` holds the plan's prose in the fields `objective`, optional `usage`, `requirements`, `background`, `decisions`, `design`, `flows`, `checks`, `verification`, and `tests`. It is not a project file. Edit it with the same tools as declaration files. Do not move or delete it or add fields. A new draft has empty strings and lists, and no `usage`. `objective`, `background`, and `design` must be nonempty before submission.
 
-## Plan metadata
+Write for an implementer who can read the repository and the proposed declarations but has not seen this conversation. Do not write "as discussed" or rely on earlier messages. Keep every field consistent with the final declarations, and update it when review changes the plan. Use inline code for identifiers, paths, and commands, and encode paragraph breaks as `\n\n` in JSON strings. Apply the technical-writing skill's Architectural Overview profile to the prose.
 
-Harness creates a virtual `plan.json` containing `objective`, optional `usage`, `requirements`,
-`background`, `decisions`, `design`, `flows`, `checks`, `verification`, and `tests`. It is plan metadata, never a project file
-or declaration overview. Read and update it through the same tools as declaration files. Do not
-move it, delete it, or add other fields. Drafts start with empty strings and lists, with `usage` absent.
+Reviewers read the fields in this order: Objective, Usage, Requirements, Background, Decisions, Design, Flows, the declaration changes, Tests, and Verification.
 
-Write for an implementer who can inspect the repository and proposed declarations but has no
-conversation history. Preserve settled user requirements and consequential decisions in this metadata.
-Do not depend on phrases such as "as discussed" or details available only in earlier messages.
-Keep every section consistent with the final declarations and update it when review changes the plan.
+### objective
 
-Consult `technical-writing` and its Architectural Overview profile before drafting or revising plan
-prose. Apply its guidance within the structure and length limits below.
+A short statement of the outcome and scope the user asked for: what they need to do, or which failure needs fixing. For new functionality, state the task without inventing a defect. Do not list files or steps.
 
-The review order is Objective, Usage when present, Requirements, Background, Decisions when nonempty,
-Design, Flows when nonempty, proposed declaration changes, Tests, and Verification. Each section has a distinct role:
+### usage
 
-### Objective
+Optional Markdown showing one representative successful use: the starting conditions, the input or action, and the observable result. Mark illustrative values as illustrative. Omit the field, or leave it empty or null, when an example adds nothing, such as for an internal refactor.
 
-Write `objective` as a short statement of the requested outcome and scope. State what the user
-needs to accomplish or which failure needs correction. For new functionality, state the task
-without inventing a defect. Do not substitute an inventory of files or implementation steps.
+- For a CLI, show the command or input, then the output and exit status.
+- For a UI, show the starting state, the user's action, and the visible result.
+- For an API, show the request, the response, and its side effects.
+- For a library, show the call and its preconditions, then the return value, mutation, or error.
+- For a background process, show the trigger and the eventual result.
+- For a data migration, show sample data before and after.
 
-### Usage
+### requirements
 
-Use the optional Markdown string `usage` for representative successful use. Omit the field when
-examples add no useful information, such as an internal refactor. An empty string or null also
-hides this section. State the relevant starting conditions, input or action, and observable result.
-Distinguish illustrative values from exact required output.
+An array of 2–4 strings, each an observable guarantee the change must deliver. For a bug fix, leave it empty when the objective and design already state the acceptance criteria.
 
-- For a CLI, show the command or stdin followed by stdout, stderr, and exit status.
-- For a UI, show the starting state, user action, and visible result.
-- For an API, show the request, response, and observable side effects.
-- For a library, show the call and preconditions, then its return value, mutation, or error.
-- For a background process, show the trigger and eventual observable result.
-- For a data migration, show representative data before and after the migration.
+Start each entry with a bold sentence that states the guarantee on its own, stored with its `**` markers. Add one plain sentence only for necessary conditions or scope. State behavior directly instead of "Provide", "Support", or "Implement" followed by a feature name. Derive each guarantee from the task. For example:
 
-### Requirements
+- **Cancellation preserves saved data.** Cancelling before publication leaves previously saved records unchanged.
+- **Existing callers remain compatible.** Preserve public signatures and documented error behavior.
 
-Identify the 2–4 key requirements: requested outcomes and essential acceptance constraints.
-Write them as a JSON array of nonempty strings. For bug fixes, this section can be omitted by
-leaving `requirements` empty when the objective and design already capture the acceptance criteria.
+Keep acceptance-critical constraints such as error handling, recovery, compatibility, and scope, and any exact API or mechanism the user required. Put ownership in Design, exact defaults in declarations, choices in Decisions, and test scenarios in Tests. Do not turn every design choice into a requirement, add milestones, or invent numeric limits that the request and source do not support.
 
-Start each entry with a short, bold sentence stating an observable guarantee. Add one plain-text
-sentence only when it supplies necessary conditions or scope. Store the Markdown bold markers
-inside the requirement string. The bold sentence must communicate the guarantee on its own.
-Use direct behavior statements rather than repeating a feature name with "Provide", "Support",
-or "Implement". Do not repeat the objective or explain why a design choice was selected.
+### background
 
-These examples show the format. Derive each guarantee from the current task rather than copying
-an unrelated example:
+Markdown describing the existing system this task touches. Name the inspected components by repository-relative path and symbol, say what each owns, how the affected operation flows between them today, and where the change connects. Include behavior that must be preserved, such as persistence, error propagation, and platform limits, and the current limitation when there is one. Call out unresolved constraints that affect implementation or verification. Leave out how you found things, tool failures, a general repository tour, the conversation, and the proposed solution. For a new project, describe the starting repository and its conventions briefly.
 
-- **Cancellation preserves saved data.** Cancelling before publication leaves previously saved
-  records unchanged.
-- **Failed imports leave stored records unchanged.** Report invalid rows without committing
-  any part of the import.
-- **Existing callers remain compatible.** Preserve public signatures and documented error
-  behavior.
+### decisions
 
-Keep entries at a consistent level of abstraction. Group closely related behaviors without
-combining unrelated requirements merely to reduce the count. Put ownership and lifecycle mechanisms
-in Design, exact defaults and local behavioral contracts in declarations, consequential choices in
-Decisions, and individual test scenarios in Tests. Preserve an exact API, dependency, or mechanism
-here when the user explicitly requires it. Retain acceptance-critical error, recovery, compatibility,
-and scope constraints.
+An array of `{decision, rationale}` objects with nonempty strings, or an empty array. Record choices that settle a question the task left open, where a different answer would change behavior, scope, or an integration contract, including choices the user made in answer to a question. In `decision`, state the choice. In `rationale`, say why it fits the task and what tradeoff the implementer must keep. Do not repeat requirements fixed by the original request, summarize the solution, or record routine conventions. For example:
 
-Requirements describe properties of the delivered change. Preserve task-specific constraints such
-as compatibility, offline operation, or protecting user configuration. Do not promote every design
-choice into a mandatory requirement or create implementation milestones. Keep routine validation
-and implementation safeguards in the relevant Design or declaration unless they are explicitly
-requested or essential to a task-specific acceptance constraint. Do not invent numeric limits or
-additional product requirements. Ground any required limit in the user's request or a verified
-constraint.
+- `decision`: "Reject the entire import if any row is invalid." `rationale`: "Users can fix and retry the file without reconciling a partial import."
+- `decision`: "Resume interrupted jobs from the last completed item." `rationale`: "Restarting retries only unfinished items, which requires durable progress tracking."
 
-When following an existing rule requires concrete work, plan the resulting change instead of
-repeating the rule. Include supported file changes in the proposed files and put exact verification
-commands and observable manual checks in Verification. Mention a generated artifact or unsupported
-file change in Design only when its specific contents are essential to the requested change and are
-not represented elsewhere, using a brief sentence alongside its owning component. A routine README
-contents list does not explain the design and belongs outside this section. Do not invent
-placeholder generated contents or add a separate file inventory.
+### design
 
-When the change introduces generated files, inspect the project's existing ignore rules and
-propose any needed .gitignore addition or update as a normal virtual file change. Preserve existing
-comments, negations, and unrelated rules. Add appropriate generated paths, such as /target/ for a
-root Rust package. Do not propose an empty file merely because .gitignore is absent. Keep source
-and required lockfiles tracked. Generate or update required lockfiles during implementation, not
-in Plan. Routine lockfile handling belongs to implementation and needs no Design prose. The model
-creates or updates the actual file during implementation. Do not modify workspace files in Plan.
-
-### Background
-
-Write `background` as Markdown explaining the existing system directly relevant to this task.
-Identify inspected components using repository-relative paths and symbol names. Explain what each
-owns, how the affected operation currently flows between them, and the integration points for this
-change. Include existing behavior that must be understood or preserved, such as persistence,
-error propagation, and platform limits. Explain the current limitation when applicable.
-
-Describe established starting conditions and explicitly identify material unresolved constraints.
-Omit discovery chronology, tool failures, and evidence-gathering details unless they leave an
-uncertainty that changes implementation or verification. Include only facts needed to understand
-or implement this change. Do not give a repository tour, summarize the conversation, repeat the
-requested behavior, or describe the proposed solution. For a new project, briefly describe the
-starting repository, available infrastructure, and relevant conventions.
-
-### Decisions
-
-Write `decisions` as a JSON array of objects with nonempty `decision` and `rationale` strings.
-
-Record consequential choices that resolve questions left open by the task. The answer may come
-from asking the user or from your own planning. Include choices where a different answer would
-materially change the behavior, scope, or integration contract.
-
-In `decision`, state the selected answer directly. In `rationale`, explain why it fits this task
-and any consequence or tradeoff the implementer must preserve. Record the settled choice, not
-the conversation or deliberation that produced it.
-
-A choice resolved through user clarification belongs here. Requirements already fixed by the
-original request do not need repeating. Omit solution summaries, component inventories, routine
-conventions, and dependency selections without a task-specific tradeoff. An empty list is valid.
-
-These examples show rendered decisions. Store each bold sentence as `decision` without the bold
-markers and its explanation as `rationale`. Derive the actual choices from the current task rather
-than copying these examples:
-
-- **Update matching records and create unmatched records.** Users can import revised CSV files
-  to maintain existing data instead of creating duplicates.
-- **Reject the entire import if any row is invalid.** Report row-specific errors and leave stored
-  data unchanged, so users can correct and retry the file without reconciling a partial import.
-- **Resume interrupted jobs from the last completed item.** Completed work remains recorded, and
-  restarting retries only unfinished items. This requires durable progress tracking.
-- **Pause synchronization when both copies of a file have changed.** Preserve both versions and
-  ask the user to resolve the conflict, preventing automatic synchronization from discarding an edit.
-- **Preserve the public API during the internal refactor.** Existing callers can adopt the change
-  without modifying their code. Public API cleanup remains outside this refactor.
-- **Generate reports as background jobs.** Large reports can finish after the user leaves the page.
-  Users receive a completion notification and download the result when it is ready.
-
-### Design
-
-Write `design` as Markdown explaining how the proposed solution works and satisfies the requirements.
-Use an unheaded opening paragraph followed by `### Ownership`. Store flows separately in `flows`.
-Use this template, replacing the bracketed instructions with task-specific content:
+Markdown explaining how the solution works and meets the requirements. It contains an unheaded opening paragraph followed by `### Ownership`, and nothing else:
 
 ```markdown
-[One paragraph of 2–3 sentences: describe the concrete solution, explain the main structural choice and its reason, then introduce the main objects and their roles.]
+[2–3 sentences: what will be built or changed, the main structural choice and the guarantee it provides, and the main objects by their code names.]
 
 ### Ownership
-[One paragraph of 1–2 sentences per main owner: its responsibility, the meaning of its owned state, and its boundary with other owners. Define supporting code names as they appear.]
+[One paragraph of 1–2 sentences per main owner: what it creates, changes, or keeps, and where its authority ends.]
 ```
 
-**Opening.** Write one paragraph of 2–3 sentences explaining how the design solves the user's task.
-Follow this progression:
+An opening for a CSV import reads: "Implement CSV import as a workflow that previews incoming records, reports validation errors, and saves the import after confirmation. Validation happens before saving, so users can correct invalid records before stored data changes. `ImportSession` holds the pending records and validation results, and `ImportService` validates them and commits the confirmed import."
 
-1. Concrete solution: state what will be implemented or changed and its defining behavior.
-   Describe the proposed solution, not just the objective.
-2. Structural choice and reason: explain the main organizing choice and one concrete capability
-   or guarantee it provides.
-3. Main objects: introduce the principal components by their actual code names and briefly
-   explain their roles.
+In Ownership, describe the owners in the order the opening introduced them, starting with the one that controls the central state. Introduce supporting types with their meaning, such as "`ImportSession`, the pending records and validation results", and write connected prose rather than bullets or file lists. Keep configuration values, defaults, key bindings, styling, and algorithms in the declarations unless changing one would move an ownership boundary.
 
-Combine the structural reason and component introduction when two sentences suffice. Expand
-responsibilities in Ownership and interactions in Flows. Keep configuration values, detailed
-algorithms, and secondary components out of the opening.
+Describe the scope of the change, not the whole system. For a bug fix, state the rule being restored and the mechanism that restores it. A localized change can have one ownership paragraph and one flow, and an existing function can be the owner. Do not invent components to fill the template. Write in the present tense. Do not include executable code, progress, file inventories, housekeeping, explanations of Harness format limits, or claims that work or verification is finished.
 
-The examples below demonstrate structure and level of detail. Derive the solution, reasoning,
-and component names from the current task and design. Do not copy the examples' implementation
-choices. The generated opening is one paragraph without the example labels.
+### flows
 
-**Feature: CSV import**
+An array of `{title, description, trigger, steps}` objects, or an empty array when no runtime flow helps. Harness draws the diagrams, so do not hand-draw arrows in any field.
 
-Solution: Implement CSV import as a workflow that previews incoming records, reports validation
-errors, and saves the import after confirmation.
+Each flow is one execution started by one event. Split events into separate flows even when they share state: collecting a shield stores charges, and a later enemy contact reads them, so they are two flows.
 
-Reason: Separate validation from persistence so users can correct invalid records before
-changing stored data.
+- `trigger` names the starting event. Flow titles must be unique.
+- `steps` is an ordered array. Each step has an `action` naming a function or operation, and optional `effects` and `branches`.
+- Each effect has exactly `target` and `change`, describing an observable change such as create, update, remove, or preserve. Effects are end points and cannot contain steps, branches, or triggers.
+- Each branch has a `condition` checked during the current execution and a nonempty `steps` array. A later event needs its own flow. Write mutually exclusive conditions explicitly when only one branch applies. Branches are not parallel work.
 
-Objects: `ImportSession` holds the pending records and validation results, while `ImportService`
-validates the data and commits the confirmed import.
-
-**Feature: log-search CLI**
-
-Solution: Implement log search as a command that filters files by time range and severity, then
-prints matching records.
-
-Reason: Process files incrementally so memory use does not grow with the total size of the
-input files.
-
-Objects: `SearchCommand` handles arguments, `LogScanner` reads and filters records, and
-`MatchWriter` formats the output.
-
-**Bugfix: cancellation leaves the interface stuck**
-
-Solution: Make cancelling a request stop its active work and return the interface to idle.
-
-Reason: Associate callbacks with a request generation so results arriving after cancellation
-cannot restore stale progress.
-
-Objects: `RequestController` owns the active generation and cancellation handle, while `RunState`
-records the status displayed by the interface.
-
-**Refactor: duplicated authentication**
-
-Solution: Move authentication from individual route handlers into shared middleware while
-preserving existing responses.
-
-Reason: Centralize credential validation so every protected route applies the same expiry and
-revocation checks.
-
-Objects: `AuthMiddleware` gates protected requests, `TokenVerifier` validates credentials, and
-`RequestIdentity` carries the authenticated user to the handler.
-
-**Bugfix: interrupted saves corrupt settings**
-
-Solution: Preserve the last complete settings file when saving is interrupted or fails.
-
-Reason: Write the replacement to a temporary file and publish it atomically so readers never
-observe partially written settings.
-
-Objects: `SettingsStore` owns serialization and loading, while `AtomicFileWriter` manages the
-temporary file and final replacement.
-
-**Ownership.** Expand the owners introduced in the opening, in the same order, using one paragraph
-of 1–2 sentences per owner. State what each owner creates, changes, or retains, and where its authority
-ends. Introduce supporting types with their meaning, such as "`ImportSession`, the pending records
-and validation results", rather than listing names after "owns". Group supporting modules and data under that
-owner. Use connected prose, not bullets, file inventories, or paragraphs for every type.
-Keep thin composition wrappers in the opening unless they own a separate lifecycle. Begin Ownership
-with the component that controls the central state, not its configuration or launcher. Configuration
-fields, numeric defaults, key bindings, visual styling, algorithms, and schedule-by-schedule details
-belong in the relevant declarations. Include a detail here only when changing it changes the
-ownership boundary. Do not add README contents, documentation chores, or repeated setup descriptions.
-
-Describe the scope of the change, not the architecture of the entire system. For bugfixes, explain
-the invariant being restored and the mechanism that restores it. Describe only the existing owners
-and interactions relevant to the fix. A single ownership paragraph and one flow are sufficient
-for a localized change, and an existing function or module can be the owner. Do not invent new
-components to fill the template.
-
-Describe the target design in present tense. Preserve terminology across sections, remove repeated
-claims, and demonstrate guarantees through concrete mechanisms. Keep detailed contracts in
-declarations, detailed tradeoffs in Decisions, and existing behavior in Background. Flows retain the ordering
-and failure rules needed to explain the result, without repeating local algorithms or configuration
-values. Execution instructions remain governed by the active system and repository instructions.
-The complete plan must support implementation without the prior conversation.
-
-Only the opening and Ownership belong in the `design` string. Omit a Files
-and artifacts section, repeated file inventories, routine housekeeping, and explanations of Harness
-format limitations. Do not include executable implementation bodies, mutable execution progress,
-or claims that implementation or verification has finished.
-
-Before submission, review the Design against this template. Confirm that the opening describes the
-solution, explains its structure, and introduces the main objects. Define unexplained code names
-and move configuration or implementation detail out of Ownership. Confirm that every flow arrow
-represents production, transformation, storage, or consumption through the described objects.
-Shorten any ownership paragraph exceeding two sentences instead of joining unrelated clauses.
-Keep acceptance-critical behavior in the plan, placing each detail in its designated section.
-
-### Flows
-
-Write `flows` as an array of `{title, description, trigger, steps}` objects, or [] when no runtime
-flow adds useful information. Harness generates the diagram after Design. Do not put a Flows
-heading or hand-formatted arrows in `design` or flow labels.
-
-Each flow describes one execution started by one explicit event. Use a concise description for
-its purpose and ordering guarantees. Separate events into separate flows even when they share
-state: collecting a shield stores charges, while a later enemy contact reads those charges.
-Do not connect these actions into one execution merely because one uses the other's output.
-
-- `trigger` names the event that starts this execution.
-- `steps` is an ordered array. Each step has a required `action` naming a function or concrete
-  operation, optional `effects`, and optional `branches`.
-- Each effect has exactly `target` and `change`. It is terminal data describing an observable
-  change, such as create, update, remove, or preserve. Effects cannot have steps, actions,
-  children, branches, or triggers. Put subsequent execution in the enclosing `steps` array.
-- Each branch has a required `condition` and a nonempty `steps` array. The condition is evaluated
-  during the current execution. A later event requires a new flow, not a conditional branch.
-  Each applicable branch runs its steps before the next enclosing step. When alternatives are
-  exclusive, write mutually exclusive conditions explicitly. Branches do not mean parallel work.
-
-Use descriptive labels and the exact declaration names where available. Harness normalizes label
-whitespace for display while retaining the original content. Keep resulting
-state in `effects`, rather than treating data as executable steps. Express conditions that govern
-execution in branch conditions or action labels instead of adding separate input inventories.
-Flow titles must be unique. There are no total flow, step-count, or nesting-depth limits.
-Keep diagrams focused for readability without omitting meaningful execution or effects.
-
-For example, collection and contact are independent triggers:
+Use exact declaration names where possible. There are no limits on flow count, step count, or nesting depth.
 
 ```json
 [
@@ -381,23 +121,19 @@ For example, collection and contact are independent triggers:
 ]
 ```
 
-The renderer uses `→` for the first action, `↓` for subsequent execution, and `┄▶` for effects.
-Conditions introduce branch steps. Effects never acquire execution arrows.
+### tests
 
-Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
-Encode paragraph breaks as `\n\n` inside JSON strings.
-The required tests array inventories every test involved in the plan, grouped by project-relative
-file. Each cases entry names the test (module-qualified when needed), its change (new, modified,
-removed, or reused), and a description of the scenario and expected result or removal rationale.
-Include inline test modules and separate test files consistently. List existing coverage being
-reused, omit unrelated repository tests, and use [] when no tests apply. Keep names unique within
-a file and list each file once. Native Cargo case checks require the full runtime test name.
-Use the optional target field (lib, bin:<name>, or test:<name>) when a file belongs to multiple
-Cargo test targets. Tests is rendered
-before Verification and records planned coverage. Verification retains execution commands and manual checks.
-Objective, Background, and Design must be nonempty before submission.
+An array listing every test the plan involves, grouped by project-relative `file`, or an empty array when none apply. List each file once, with `cases` entries of `name` (module-qualified when needed and unique in the file), `change` (`new`, `modified`, `removed`, or `reused`), and `description` (the scenario and expected result, or why the test is removed). Include reused existing coverage and leave out unrelated tests. Treat inline test modules and separate test files the same way. Cargo case checks need the full runtime test name. Set the optional `target` (`lib`, `bin:<name>`, or `test:<name>`) when a file belongs to more than one Cargo test target.
 
-A plan's metadata can use this shape:
+### checks and verification
+
+Automated checks are defined in the project's `.forge.json`, and Harness configures missing or invalid ones before planning starts. Read them with `check_definition_list`. An explicitly empty configuration is valid. Enabled checks with `auto: true` join the plan automatically. Add other enabled checks with `plan_checks_add`, passing the plan ID, version, and check IDs. The `checks` field stores those check references, not commands. If the configuration becomes missing or invalid during planning, report the submission failure and repair it with the harness-checks skill, which needs check-editing permission. Never run validation commands yourself.
+
+`verification` is an array of manual actions, each with the result to expect. Note which actions need a person or hardware that is not available. Harness runs manual verification only after declarations and automated checks pass. The plan records what to check, not results.
+
+### Example
+
+A complete `plan.json`:
 
 ```json
 {
@@ -414,64 +150,20 @@ A plan's metadata can use this shape:
       "rationale": "A single publication point keeps each submitted frame's texture selection consistent."
     }
   ],
-  "design": "Support texture replacement that reports progress and can be cancelled while the current texture remains visible. Separate preparation from publication so pending work leaves the current texture usable. `TextureStreaming`, the preparation service, passes completed replacements to `TextureRegistry`, the owner of the handles used by the renderer.\n\n### Ownership\n`TextureStreaming` creates and prepares each replacement, exposing its progress and cancellation through `TextureRequest`, the caller's handle to pending work. Preparation leaves the published texture unchanged.\n\n`TextureRegistry` controls which texture the renderer can use and retains replaced allocations while submitted frames still reference them. Only the registry publishes or retires a texture.",
+  "design": "Support texture replacement that reports progress and can be cancelled while the current texture remains visible. Preparation is separate from publication, so pending work leaves the current texture usable. `TextureStreaming`, the preparation service, passes completed replacements to `TextureRegistry`, the owner of the handles used by the renderer.\n\n### Ownership\n`TextureStreaming` creates and prepares each replacement, exposing its progress and cancellation through `TextureRequest`, the caller's handle to pending work. Preparation leaves the published texture unchanged.\n\n`TextureRegistry` controls which texture the renderer can use and retains replaced allocations while submitted frames still reference them. Only the registry publishes or retires a texture.",
   "flows": [
-    {
-      "title": "Publish a replacement",
-      "description": "Publication at a frame boundary selects the prepared texture for rendering.",
-      "trigger": "prepared replacement is ready at a frame boundary",
-      "steps": [
-        {
-          "action": "TextureRegistry.publish",
-          "effects": [
-            {
-              "target": "published handle",
-              "change": "replace"
-            }
-          ]
-        },
-        {
-          "action": "Renderer"
-        }
-      ]
-    },
-    {
-      "title": "Retire an old allocation",
-      "description": "The replaced allocation remains alive until its last submitted frame completes.",
-      "trigger": "last submitted frame using the old allocation completes",
-      "steps": [
-        {
-          "action": "TextureRegistry.retire",
-          "effects": [
-            {
-              "target": "replaced allocation",
-              "change": "release"
-            }
-          ]
-        }
-      ]
-    },
     {
       "title": "Cancel preparation",
       "description": "Cancellation releases only the unpublished replacement.",
       "trigger": "cancellation requested",
       "steps": [
-        {
-          "action": "TextureRequest.cancel"
-        },
-        {
-          "action": "TextureStreaming.discard",
-          "effects": [
-            {
-              "target": "unpublished allocation",
-              "change": "release"
-            }
-          ]
-        }
+        {"action": "TextureRequest.cancel"},
+        {"action": "TextureStreaming.discard", "effects": [{"target": "unpublished allocation", "change": "release"}]}
       ]
     }
   ],
-  "verification": ["Cancel a pending replacement and confirm the current texture remains visible.", "Replace a texture with frames in flight and confirm rendering remains valid."],
+  "checks": [],
+  "verification": ["Cancel a pending replacement and confirm the current texture remains visible."],
   "tests": [
     {
       "file": "src/texture.rs",
@@ -480,11 +172,6 @@ A plan's metadata can use this shape:
           "name": "tests::texture_replacement_cancellation_preserves_published_handle",
           "change": "new",
           "description": "Cancel before publication and verify the original texture handle remains published."
-        },
-        {
-          "name": "tests::texture_replacement_retains_in_flight_allocation",
-          "change": "new",
-          "description": "Replace a texture with frames in flight and verify its allocation remains valid until their completion."
         }
       ]
     }
@@ -492,9 +179,7 @@ A plan's metadata can use this shape:
 }
 ```
 
-This example illustrates the schema. Use inspected project facts and actual supported commands
-for the real plan. Read the saved text before patching when it is not already available. Metadata
-and declaration edits can share one atomic patch:
+Use inspected project facts and supported commands in the real plan. Metadata and declaration edits can share one atomic patch:
 
 ```text
 *** Begin Patch
@@ -506,173 +191,29 @@ and declaration edits can share one atomic patch:
 *** End Patch
 ```
 
-### Checks and verification
+## Generated and unsupported files
 
-Automated check definitions belong to the project's saved `.forge.json`. Harness configures missing or invalid checks before starting this planning turn. Read the saved configuration through `check_definition_list`. An explicitly empty configuration is valid. If the configuration becomes missing or invalid during planning, report the submission failure and use the harness-checks skill to repair it with check-editing permission. Test inventory describes intended coverage independently of commands. Applicable enabled checks with `auto:true` are included automatically. Use `plan_checks_add` with the current plan ID, version, and check IDs to add other enabled checks explicitly. The `checks` array in virtual `plan.json` stores those references, not commands. Never run validation directly through shell tools while planning or implementing. During implementation and resolution, finish the phase and let Harness Checking run validation.
+When the change creates generated files, check the project's ignore rules and propose any needed `.gitignore` change as a normal virtual file edit, keeping existing comments, negations, and rules, such as adding `/target/` for a root Rust package. Do not propose an empty `.gitignore`. Keep source and required lockfiles tracked. Lockfiles are generated during implementation, not planning, and need no Design prose.
 
-Harness executes these commands locally, outside the model provider sandbox, after Implement and Resolve. Harness records exit status, duration, and saved stdout/stderr and checks declaration conformance. The model must not execute automated checks during Implement, Resolve, or manual Verify.
+When a required change affects a file format Harness cannot edit, mention it in one sentence next to its owning component in Design, without explaining the format limit or inventing a substitute.
 
-Record manual actions in `verification`, an array of actions and expected observations. Identify actions requiring a person or unavailable hardware. Manual Verify starts only after declarations and automated checks pass. Planning records requirements, not results. Execution state and results remain Harness-owned.
+## Source overviews
 
-## Overview syntax
+Overview paths match project-relative source paths. Supported files are `.rs`, `.ts`, `.tsx`, and `.lua` source, `.toml`, `.json`, `.jsonc`, `.yaml`, and `.yml` files, XML configuration (including `.xml`, `.csproj`, `.fsproj`, `.vbproj`, `.props`, `.targets`, `.resx`, and `.plist`), and `.gitignore`, which is kept verbatim.
 
-Paths match project-relative source paths. Supported extensions are `.rs`, `.ts`, `.tsx`, `.lua`, and
-`.toml`, `.json`, `.jsonc`, `.yaml`, `.yml`, and XML configuration paths (including `.xml`,
-`.csproj`, `.fsproj`, `.vbproj`, `.props`, `.targets`, `.resx`, and `.plist`), plus `.gitignore` files whose contents are preserved verbatim. Source overviews retain native layouts but are not compilable implementation files. Never write
-executable function bodies, empty or placeholder bodies, or executable initializers. Academic
-pseudocode belongs only in an indented `Algorithm` block, never in a native-language body. Preserve
-reference qualifiers, generic arguments, and complete return types. Do not infer missing types.
+Overviews keep their native layout but are not compilable. Never write function bodies, empty or placeholder bodies, or executable initializers. Keep reference qualifiers, generic arguments, and complete return types, and do not guess missing types. Keep nesting, and attach documentation to its declaration. Harness owns formatting, indentation, spacing, and line wrapping, so do not wrap lines or shorten names to fit a width. When patching, match the current text exactly, including indentation. Submission can reformat declarations, so read affected ranges again before another revision unless feedback already shows the formatted text.
 
-Preserve syntactic nesting and attach documentation to its declaration. Harness owns presentation
-formatting, indentation style, blank-line spacing, column widths, and line wrapping. Do not manually
-wrap content or shorten names, comments, commands, or diagrams to satisfy a display width.
-Harness formats each requested workspace overview and captured baseline, then canonicalizes both
-declaration snapshots on submission. The repository line width is a formatting preference, not a
-submission constraint. Literals, code examples, and indivisible types remain intact. Read virtual
-file ranges when their exact current text is unavailable and match that text, including indentation.
-Draft patches retain their layout until submission. Submission can reformat declarations, so read
-affected ranges before another revision unless current formatted text is already supplied in feedback.
-
-## Function algorithms, changes, and references
-
-Categorize callable behavior against the captured source baseline, including after resubmission:
-
-- A new function or method requires one nonempty `Algorithm` block describing its complete behavior
-  in academic pseudocode. A `Change` block does not satisfy this requirement.
-- A modified function or method uses one `Change` block, preferably one short sentence: state
-  the concrete problem or purpose, then the behavioral change that addresses it. Ground the reason
-  in the task or inspected baseline, without inventing a defect. Use a second short sentence only
-  when essential. Omit unchanged behavior and implementation detail that does not explain the delta.
-  Include internal changes even when its signature and reference lists remain identical. Do not
-  restate the complete algorithm or use `Algorithm` for an existing callable. Unmodified callables
-  do not need a `Change` block.
-
-Place the heading at the signature's indentation and its content one level deeper, before `Calls`,
-`Constructs`, and `Accesses`, in that order. Never combine `Algorithm` and `Change` on one callable.
-Partial drafts may omit a new algorithm, but submission rejects that omission. Preserve an authored
-block unless its intended behavior changes. Removing `Change` withdraws that delta. Configuration
-and non-callable declarations do not have behavior blocks. Review folds both categories with their
-callable and never appends `[changed]` to a collapsed signature.
-
-### Academic pseudocode
-
-Read and apply the `academic-pseudocode` skill before authoring `Algorithm` blocks. Its local
-`SKILL.md` contains the complete writing rules. Keep algorithms as high-level and compact as
-possible while preserving the complete behavioral contract.
-
-For this plan, keep domain identifiers searchable and preserve numeric bounds, tie-breaking,
-saturation, ownership, and deferred effects explicitly. Function signatures already declare inputs
-and results, so do not repeat them as boilerplate in each `Algorithm` block.
-
-Algorithm submission validates statement syntax and indentation with Forge's pseudocode parser.
-Use `target ← expression` for assignment, `if condition`, `otherwise if condition`, `otherwise`,
-`for each item in collection`, and `while condition`. Every control statement needs a nonempty
-body indented with spaces. A trailing colon is optional. Keep each statement on its own line,
-align siblings, and dedent to an existing enclosing level. Use `return` with an optional result.
-Use `break` and `continue` only inside loops. Expressions and operation statements may use concise
-natural language, identifiers, numbers, quoted strings, parentheses, and brackets. Use `=` for
-equality and `≠`, `≤`, or `≥` for comparisons. Omit native-language braces and semicolons.
-Incomplete drafts remain editable. Repair the reported callable, line, and column before resubmitting.
-
-Keep explicit field references consistent with `Accesses`: `Projectile.previous_position` in
-an Algorithm requires `Projectile::previous_position` in Rust's `Accesses` section. Use signature
-bindings for instance receivers when available. Qualified fields must name real declared members.
-
-Make construction explicit as `Type(field = value, ...)`, or `Type()` for a zero-field marker.
-Use the exact qualified name from `Constructs`, including factory names such as
-`Store::new(config = config)`. Every target listed in `Constructs` for an Algorithm must have
-a matching invocation with named arguments or no arguments. Construct values before describing
-the operation that queues, spawns, inserts, or publishes them. Reused shared assets are not new
-constructions. Ordinary helper calls may use positional arguments. Do not hide constructed values
-and their initial fields in prose such as "queue a shot with damage".
-
-Source inspection extracts function-body references alongside declarations in Rust, TypeScript,
-TSX, and Lua. Use these sections, with one qualified target per line and no arguments:
-
-- `Calls` records invocations other than construction and callable values, including callback
-  registration. A callable passed as a callback remains here even when it is a factory.
-- `Constructs` records types instantiated directly, such as `Weapon` for `Weapon { ... }` or
-  `new Weapon(...)`, and factory calls whose declared return is an owned named type. List the
-  callable itself, such as `Weapon::new` or `Weapon::default` returning `Self` or `Weapon`.
-  Use the return type, not a method-name convention. Borrowed, scalar, and unit returns stay in
-  `Calls`. Rust tuple and unit constructors belong here when their type is resolved.
-  Do not list a type here merely because it appears in a signature, type annotation, generic
-  argument, cast, or destructuring pattern.
-- `Accesses` records field reads, writes, references, and named value uses. A struct initializer
-  such as `Weapon { cooldown_remaining: 0.0 }` records `Weapon` under `Constructs` and
-  `Weapon::cooldown_remaining` under `Accesses`. Destructured fields also belong in `Accesses`.
-
-Preserve occurrence order and repetitions within each category. Parsing retains captured
-interleaving and semantic kinds in saved data. Unknown or computed receivers remain unresolved
-and must not be matched to a same-named property without type evidence.
-
-Every newly declared internal symbol needs a resolved incoming use before submission. Include each registered system or callback in the registering function's Calls, even when the framework invokes it later. Include new property and value uses in Accesses and new type uses in signatures or Constructs. Imports, declaration names, owner headers, prose, and self references alone do not count. Truly public APIs, recognized executable entry points, tests, and trait contract items need no in-plan caller. Public exposure includes module and member accessibility and public re-exports, so pub(crate) and pub items hidden in private modules remain internal. The rule applies to new symbols relative to the captured source baseline, including resubmission, while partial draft edits remain permitted.
-The virtual file includes `Calls`, `Constructs`, and `Accesses` blocks after each captured callable signature.
-Edit it atomically with declarations through `design_patch`. Include names only, without
-arguments, assignments, control flow, or other statements. Qualify methods with a receiver type only
-when source evidence identifies that type. Keep unresolved receiver names when evidence is absent.
-
-Keep call occurrences in extraction or authored order, including repetitions. Review deduplicates
-targets while retaining parsed order by default. Preserve unchanged Calls blocks when editing
-signatures. Update an owner's list when relationships change and include a block for a newly planned
-callable when its relationships are known. An empty block states that the callable has no calls.
-An absent block states that call information is unavailable. Do not manufacture missing information
-for historical plans or configuration documents.
-
-The structured list follows the signature at the same indentation level. Target names use one
-additional indentation level:
-
-```text
-pub fn dispatch(client: &Client);
-Change
-  Avoid futile retries of rejected credentials by stopping on authentication
-  failure and recording the final attempt.
-Calls
-  validate_policy
-  Client::send
-  record_metrics
-```
-
-A newly introduced callable instead has an algorithm, with reference evidence listed separately:
-
-```text
-pub fn next_attempt(attempt: u32, limit: u32) -> Option<u32>;
-Algorithm
-  if attempt ≥ limit
-    return none
-  return attempt + 1
-```
+- **Rust** keeps structs, fields, enums, traits, aliases, imports, attributes, and `impl` blocks. End every function and method signature with a semicolon.
+- **TypeScript** keeps classes, interfaces, aliases, fields, exports, and complete signatures. An arrow binding keeps its header through `=>` with no body, such as `export const request = <T>(id: T): TextureRequest =>;`. Keep a missing return annotation missing.
+- **Lua** keeps bindings, named function headers, module returns, and annotations. Table members appear as dotted bindings and function headers under their module binding. Do not add a closing `end` to a function header.
 
 ## Declaration comments
 
-Every declaration in a source overview you author or revise must have an attached explanatory
-code comment, including private declarations, types, fields, enum variants, traits or interfaces,
-implementation blocks, functions, methods, aliases, and module-level bindings. Preserve accurate
-existing comments and add missing ones. Imports, attributes, parameters, and configuration entries
-do not need separate declaration comments.
+Every declaration in an overview you write or revise needs an attached comment. This covers types, fields, enum variants, traits, interfaces, `impl` blocks, functions, methods, aliases, and module-level bindings, including private ones, even where general comment guidance would allow leaving one out. Imports, attributes, parameters, and configuration entries do not need one. Keep accurate existing comments. A comment on a container does not cover its members.
 
-Start newly added or edited comments with `Get` instead of `Returns`. Submission rejects comments
-whose first word is `Returns`, ignoring case. The rule applies only to the start of the complete
-comment, not later sentences or continuation lines. Unchanged captured comments remain valid.
+Explain the declaration's role, ownership, or contract. For a field or variant, say what it means. For a function, say what result, change, or failure the signature does not show. Include bounds and ordering or lifetime rules that matter. Describe only behavior the source or the settled design supports, and do not restate the signature, such as "stores a value". Use native comment syntax (Rust `///`, TypeScript JSDoc, Lua `---` and `---@`), directly above the declaration and above its attributes. Follow the active language skill's comment rules and the technical-writing skill's API Documentation profile.
 
-Follow the repository's code-comment instructions and, when available, the technical-writing
-skill's Code Comments and API Documentation profiles. Reuse instructions already loaded in context. This planning requirement makes declaration
-comments mandatory even when general source-comment guidance permits omission.
-
-Explain the declaration's role, ownership boundary, or behavioral contract. For fields and
-variants, explain their domain meaning or represented condition. For callables, explain the
-observable result, mutation, or failure condition the signature cannot convey. Include relevant
-bounds and lifecycle or ordering constraints. Use only contracts supported by the inspected source
-or settled proposal. Do not invent behavior or narrate the signature, such as "stores a value"
-or "gets the current texture." A comment on a container does not replace comments on its members.
-
-Use native comment syntax, such as Rust `///`, TypeScript JSDoc, and Lua `---` or `---@` annotations.
-Keep comments immediately attached to declarations and above their attributes. Before submission,
-read the edited overviews and check that every declaration has a useful comment consistent with
-the final design. Comments describe the design without adding function bodies or pseudocode.
-
-Rust retains structs, fields, enums, traits, aliases, imports, attributes, and `impl` blocks.
-Terminate callable signatures with a semicolon, including methods:
+Submission rejects a new or edited comment whose first word is `Returns`, in any letter case. Use `Get` instead. Unchanged existing comments are accepted.
 
 ```rust
 /// Publishes uploaded replacements while retaining textures still used by submitted frames.
@@ -686,92 +227,84 @@ impl TextureRegistry {
   /// Get the published handle without changing the active texture version.
   pub fn current(&self) -> Option<TextureHandle>;
 
-  /// Installs a completed upload at a frame boundary and retains the previous allocation until its final GPU use.
+  /// Install a completed upload at a frame boundary and retain the previous allocation until its final GPU use.
   pub fn publish(&mut self, replacement: TextureHandle);
 }
 ```
 
-TypeScript retains classes, interfaces, aliases, fields, exports, and complete signatures:
+## Function behavior
 
-```typescript
-/** Provides asynchronous access to texture handles by their stable identifier. */
-export interface TextureStore {
-  /** Resolves a usable handle or rejects when the texture cannot be loaded. */
-  get(id: string): Promise<TextureHandle>;
-}
+Compare each function and method with the captured baseline, including after resubmission:
 
-/** Resolves texture handles through the configured storage provider. */
-export class TextureRegistry {
-  /** Provider used to resolve handles without exposing storage access to callers. */
-  private store: TextureStore;
+- A **new** callable needs one nonempty `Algorithm` block describing its complete behavior in academic pseudocode. Submission rejects a new callable without one.
+- A **modified** callable needs one `Change` block, usually one short sentence that states the problem or purpose and the behavior change that addresses it. Use a second sentence only when essential. Include internal changes even when the signature is unchanged. Do not restate the whole algorithm.
+- An **unmodified** callable needs neither.
 
-  /** Resolves the requested handle and propagates provider failures. */
-  get(id: string): Promise<TextureHandle>;
-}
+Never put both blocks on one callable. Place the block heading at the signature's indentation, with its content one level deeper, before the reference blocks. Configuration and non-callable declarations have no behavior blocks. Removing a `Change` block withdraws that change. Never append `[changed]` to a signature.
+
+```text
+pub fn dispatch(client: &Client);
+Change
+  Avoid futile retries of rejected credentials by stopping on authentication failure and recording the final attempt.
+Calls
+  validate_policy
+  Client::send
+  record_metrics
 ```
 
-Arrow bindings retain their native header through `=>`, with no expression or body:
-
-```typescript
-/** Starts an observable texture request using the caller's identifier. */
-export const request = <T>(id: T): TextureRequest =>;
+```text
+pub fn next_attempt(attempt: u32, limit: u32) -> Option<u32>;
+Algorithm
+  if attempt ≥ limit
+    return none
+  return attempt + 1
 ```
 
-Keep an absent return annotation absent. Lua table members appear as dotted bindings and named
-function headers beneath their module binding.
+### Pseudocode
 
-Lua retains bindings, named function headers, module returns, and declaration annotations.
-Do not add function-closing `end` to signature-only headers:
+Read the `academic-pseudocode` skill before writing `Algorithm` blocks. Keep each algorithm as short and high-level as its complete behavior allows. Keep domain names searchable, and state numeric bounds, tie-breaking, saturation, ownership, and deferred effects. Do not repeat the signature's inputs and results.
 
-```lua
----Exposes access to the currently published texture handles.
-local M
+Submission checks syntax and indentation:
 
----Get the published handle for the requested texture.
----@param id string
----@return TextureHandle
-function M.get(id)
+- Assign with `target ← expression`. Use `if condition`, `otherwise if condition`, `otherwise`, `for each item in collection`, and `while condition`, each with a nonempty body indented with spaces. A trailing colon is optional.
+- Put each statement on its own line, align siblings, and dedent only to an existing level.
+- Use `return` with an optional value, and `break` and `continue` only inside loops.
+- Use `=` for equality and `≠`, `≤`, or `≥` for comparison. Do not use native braces or semicolons.
+- Expressions may use plain language, identifiers, numbers, quoted strings, parentheses, and brackets.
 
-return M
-```
+Write construction as `Type(field = value, ...)`, or `Type()` for a type with no fields, using the exact name from `Constructs`, including factories such as `Store::new(config = config)`. Every `Constructs` entry needs a matching construction in the algorithm, with named arguments or none. Construct a value before the step that queues, spawns, inserts, or publishes it, and do not hide its fields in prose such as "queue a shot with damage". Reused shared assets are not new constructions, and ordinary helper calls may use positional arguments.
 
-## Manifests and configuration
+Field references must match `Accesses`: `Projectile.previous_position` in an algorithm requires `Projectile::previous_position` in Rust's `Accesses`. Qualified fields must name real members. Use signature bindings for receivers when available. Drafts may be incomplete, but fix every reported callable, line, and column before resubmitting.
 
-JSON, JSONC, TOML, YAML, XML, and .gitignore files retain their complete contents, including values, comments
-where allowed, arrays, attributes, and nested structures. These are editable configuration proposals
-rather than abbreviated declarations. Include every affected manifest and configuration file when
-changing dependencies, features, scripts, package settings, workspace members, or build targets.
-This includes `Cargo.toml`, `package.json`, `tsconfig.json`, CI YAML, and XML project files as needed.
-Keep unaffected settings and include affected nested package manifests. Do not omit configuration
-changes because the design focuses on source declarations.
+## Calls, Constructs, and Accesses
 
-Read the existing virtual file and patch it with the same Add File, Update File, Delete File, and
-Move to operations. Use valid syntax and preserve exact string values. Source restrictions on
-initializers do not apply to configuration. Harness validates configuration and preserves its text
-without applying declaration indentation or prose wrapping. Configuration remains visible in
-public-only inspection. Do not write actual project files during planning.
+Each callable signature can be followed by up to three reference blocks, in this order, with one qualified target per line and no arguments:
 
-Use strict JSON for `package.json` and ordinary `.json` files. `.jsonc`, `tsconfig*.json`,
-`jsconfig*.json`, and JSON files beneath `.vscode/` allow comments and trailing commas, but require
-quoted property names and commas between values. YAML retains block scalars and multiple documents.
-XML retains elements, attributes, namespaces, comments, and CDATA. XML admission checks well-formedness,
-not application schemas, and never fetches external DTDs. TOML admission rejects duplicate keys.
-The root virtual `plan.json` remains reserved for plan metadata, even if the checkout contains a
-project file with that name. Other nested `plan.json` paths are ordinary JSON proposals.
+- `Calls` lists invocations other than construction, including callbacks and registered systems, even when a framework invokes them later.
+- `Constructs` lists types created directly, such as `Weapon` for `Weapon { ... }` or `new Weapon(...)`, and factory calls whose declared return type is an owned named type, such as `Weapon::new` returning `Self`. Decide by the return type, not the method name. Borrowed, scalar, and unit returns stay in `Calls`. A type that only appears in a signature, annotation, generic argument, cast, or pattern is not constructed.
+- `Accesses` lists field reads and writes and named value uses, including fields set in an initializer and destructured fields. `Weapon { cooldown_remaining: 0.0 }` adds `Weapon` to `Constructs` and `Weapon::cooldown_remaining` to `Accesses`.
 
-For example, a proposed dependency section retains its complete settings:
+Harness extracts these blocks from Rust, TypeScript, TSX, and Lua source and includes them in each captured file. Keep their order and repetitions, and edit them atomically with the declarations. Qualify a method with its receiver type only when source shows the type, and leave unknown receivers unresolved rather than matching a same-named property. Preserve unchanged blocks when editing a signature, update them when relationships change, and add them to a new callable when its references are known. An empty block means no references. A missing block means the references are unknown, so do not invent blocks for configuration or historical plans.
+
+Every new internal symbol needs a recorded use before submission: a call in `Calls`, a property or value use in `Accesses`, or a type use in a signature or `Constructs`. Imports, declaration names, owner headers, prose, and self references do not count. Public APIs, recognized entry points, tests, and trait contract items need no caller in the plan. `pub(crate)` items and `pub` items inside private modules count as internal.
+
+## Configuration files
+
+JSON, JSONC, TOML, YAML, XML, and `.gitignore` proposals keep their complete contents, including comments where the format allows them. Include every manifest and configuration file the change affects, such as `Cargo.toml`, `package.json`, `tsconfig.json`, CI YAML, and XML project files, keeping unaffected settings and nested package manifests. Read the current virtual file, then patch it with the same operations as source. Write valid syntax and preserve exact string values. The restrictions on source bodies and initializers do not apply to configuration.
+
+- `package.json` and ordinary `.json` files are strict JSON.
+- `.jsonc`, `tsconfig*.json`, `jsconfig*.json`, and JSON files under `.vscode/` allow comments and trailing commas, but still need quoted keys and commas between values.
+- YAML keeps block scalars and multiple documents. XML keeps elements, attributes, namespaces, comments, and CDATA, and is checked only for well-formedness, without fetching external DTDs. TOML rejects duplicate keys.
+- The root `plan.json` is always plan metadata, even when the project has a file with that name. Nested `plan.json` files are ordinary JSON.
 
 ```toml
 [dependencies]
 engine = { version = "1.2", default-features = false, features = ["render"] }
 ```
 
-## Context-based file patches
+## Patch format
 
-Patch paths are virtual proposed files, not paths beneath a real `design/` directory. Add File
-creates an overview, Delete File proposes source removal, and Move to follows Update File to
-propose a rename. `@@` starts a chunk. Context lines start with a space, removals with `-`, and
-additions with `+`:
+Patch paths name virtual files, not paths under a real `design/` directory. `Add File` creates a file and requires that it not already exist in the workspace. `Delete File` proposes removing a file, and `Move to` after `Update File` proposes a rename. Update, Delete, and Move record the baseline only when the whole patch succeeds, and later edits use the saved proposal. `@@` starts a chunk. Context lines start with a space, removals with `-`, and additions with `+`:
 
 ```text
 *** Begin Patch
@@ -786,26 +319,10 @@ additions with `+`:
 *** End Patch
 ```
 
-Invalid patches change no files and do not increment the version. No-op patches retain the current
-version. Changed patches increment it. Correct the reported syntax,
-context, or version and retry. Never bypass validation with ordinary filesystem tools.
+An invalid patch changes nothing and keeps the version. A patch with no changes also keeps the version, and a successful change increments it. Fix the reported syntax, context, or version and retry. Never edit plan files with ordinary filesystem tools.
 
-## Review revisions and boundaries
+## Review feedback
 
-Review feedback shows file excerpts with one line number per row. `-` marks removed baseline text,
-`+` marks proposed additions, and unmarked rows provide context. Removed rows use baseline line
-numbers. Other rows use proposed line numbers. Comments follow each excerpt as `8: comment` or
-`8–12: comment`. Replacements can share a line number. These excerpts are review context, not patch
-input. Resolve each comment against the saved design and preserve its intended context.
-Read current proposed files before revising them. Preserve useful decisions and submit the new version.
+Feedback shows file excerpts with one line number per row. `-` marks removed baseline text and uses baseline line numbers. `+` marks additions, and unmarked rows are context, both using proposed line numbers. Comments follow as `8: comment` or `8–12: comment`. The excerpts are context, not patch input. Read the current files, resolve each comment against the saved design, keep useful decisions, and submit the new version.
 
-Unsupported file formats cannot be edited through declaration controls. Preserve essential changes
-to those files briefly alongside their owning component in Design when not represented elsewhere,
-without explaining the format limitation or inventing a supported-file substitute. Planning never writes
-implementation bodies or performs execution. For a function behavior change, retain the signature
-when it remains valid and add or update its Change summary in the virtual declaration. Explain the
-behavior in Design and include its coverage in Tests. Never manufacture an interface change to make
-a diff appear. Declaration conformance does not prove runtime behavior.
-
-If affected workspace source changed since extraction, report the need for a fresh baseline.
-Do not silently replace the baseline or modify project source.
+For a behavior change that keeps a valid signature, keep the signature, add or update its `Change` block, explain the behavior in Design, and cover it in Tests. Never invent an interface change to make a diff appear. Matching declarations do not prove runtime behavior. If affected workspace source changed since it was captured, report that a fresh baseline is needed instead of replacing the baseline or editing project source.

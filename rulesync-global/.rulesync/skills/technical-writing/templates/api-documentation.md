@@ -1,26 +1,28 @@
 # API Documentation Profile
 
-*Read when authoring or revising API reference docs, docstrings, rustdoc, JSDoc, OpenAPI schemas, or source-level interface documentation.*
+*Read when writing or revising API reference pages, docstrings, rustdoc, JSDoc, OpenAPI descriptions, or other documentation that sits next to an interface.*
 
 ## Controlling Claim
 
-Establish that a caller can predict an interface's runtime behavior, error states, and invariant guarantees without inspecting its underlying source code.
+A caller can predict what the interface does, how it fails, and what stays true, without reading its source code.
 
-## Structural Obligations
+## Sections
 
-### 1. Type and Struct Documentation
-- **Domain Role:** State the single conceptual role and responsibility of the type.
-- **Ownership Boundary:** Define whether instances own, borrow, or share their state.
-- **State Invariants:** Document conditions that remain true throughout the instance lifecycle.
-- **Concurrency Contract:** State thread-safety, synchronization requirements, or `Send`/`Sync` guarantees.
-- **Lifecycle:** Document construction, active state transitions, and disposal/cleanup obligations.
+Document each kind of item as follows.
 
-### 2. Property and Field Documentation
-- Describe a stored property or field with a concise noun phrase that states its value and lifecycle
-  boundary.
-- Omit articles unless they disambiguate the value.
-- Avoid generic action verbs such as `Identifies`, `Reports`, `Contains`, and `Represents` when
-  access performs no action.
+### 1. Types
+
+- State the one job the type does.
+- Say whether it owns its data, borrows it, or shares it.
+- State the rules that always hold for an instance.
+- Say whether it is safe to use from several threads at once.
+- Describe how to create it, how its state changes, and what cleanup it needs.
+
+### 2. Fields and properties
+
+- Describe a field with a short noun phrase that names its value and when that value is valid.
+- Leave out articles unless they remove ambiguity.
+- Do not start with verbs such as "Identifies," "Reports," "Contains," or "Represents," because reading a field does nothing.
 
 Good:
 
@@ -36,34 +38,37 @@ Bad:
 pub(crate) root: RootAssetKey,
 ```
 
-### 3. Callable Documentation (Functions, Methods, RPCs)
-- **Action Line:** Begin with a concise, present-tense description of the caller-visible operation (such as `Executes a batch sync against the remote catalog.`).
-- **Arguments and Inputs:**
-  - Name parameter roles directly when pronouns could be ambiguous.
-  - Specify valid value bounds, required formats, encoding expectations, and default values.
-  - Document ownership transfer, borrowing, or lifetime constraints.
-- **Return Values:** Describe the observable payload, structure, and representation guarantees on success.
-- **Error and Failure Modes:**
-  - Enumerate every error type, exception, panic condition, or HTTP status code.
-  - State the exact condition or invalid input that triggers each failure.
-  - State whether the operation is atomic or leaves partial state on failure.
-- **Side Effects and Idempotency:** Document external mutation, disk I/O, network traffic, background task spawning, and whether repeat calls are idempotent.
+### 3. Functions and methods
 
-### 4. Trait, Interface, and Protocol Documentation
-- Document the capability contract that implementers must fulfill.
-- State required invariants and ordering rules between interface methods.
-- Document default method implementations and whether implementers should override them.
+- Start with one sentence that says what the call does, beginning with an imperative verb such as "Load" or "Validate."
+- For each parameter, give its valid range, format, and default, and say whether ownership moves to the callee.
+- Describe what a successful call returns.
+- List every error, panic, or status code, the input that causes it, and whether a failure leaves partial changes behind.
+- Mention side effects such as file writes, network calls, or background tasks, and say whether calling twice is safe.
 
-### 5. Executable Documentation and Schema Generation
-- Treat documentation consumed by schema generators, OpenAPI compilers, or discovery endpoints as executable contracts.
-- Preserve required annotations, tags, format markers, and parameter descriptions required by tooling.
+### 4. Traits and interfaces
 
-## Exclude by Default
+- State what every implementation must do, and any required order between methods.
+- Describe each default method and when an implementation should override it.
 
-- Do not restate function signatures, parameter names, or type annotations in prose (avoid `s: string - a string`).
-- Do not list member methods inside type documentation.
-- Do not expose private collaborators, internal memory layouts, private locking strategies, or internal branch decisions unless callers directly interact with them.
+### 5. Generated documentation
 
-## Completion Check
+- When tools read the documentation to generate schemas or API listings, keep the annotations, tags, and formats those tools require.
 
-A caller should understand the item's role, valid usage parameters, return guarantees, failure conditions, and concurrency safety without opening the implementation source.
+## Leave out
+
+- Do not repeat the signature in prose, such as "`s: string`: a string."
+- Do not list a type's methods in the type's own documentation.
+- Do not describe private helpers, memory layout, locking, or internal branches unless callers deal with them directly.
+
+## Example
+
+A documented function:
+
+```rust
+/// Load the document at `path`, or share the load already in progress.
+///
+/// The first call reads the file on a background task. Later calls for the same path receive the same handle until the load finishes.
+/// Fails with `LoadError::NotFound` when no file exists at `path`, and leaves the cache unchanged.
+pub fn load(&self, path: &DocumentPath) -> Result<DocumentHandle, LoadError> {
+```

@@ -1,7 +1,6 @@
 # Parquet Inspection
 
-*When to read this:* before inspecting, querying, filtering, or saving Parquet
-data with `portal tools parquet`.
+*When to read this:* before inspecting, querying, filtering, or saving Parquet data with `portal tools parquet`.
 
 ## Contents
 
@@ -15,14 +14,10 @@ data with `portal tools parquet`.
 
 ## Format specification
 
-Use the Apache Parquet sources when implementation details require more than
-the Portal CLI exposes:
+Use the Apache Parquet sources when implementation details require more than the Portal CLI exposes:
 
-- [Apache Parquet format repository](https://github.com/apache/parquet-format/)
-  for the format specification, logical types, metadata, encodings, and
-  compatibility context.
-- [`parquet.thrift`](https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift)
-  for the authoritative serialized metadata structures used in Parquet files.
+- [Apache Parquet format repository](https://github.com/apache/parquet-format/) for the format specification, logical types, metadata, encodings, and compatibility context.
+- [`parquet.thrift`](https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift) for the authoritative serialized metadata structures used in Parquet files.
 
 ## Source resolution
 
@@ -34,10 +29,7 @@ Every inspection command accepts one of these sources:
 - A 32-character Portal item ID.
 - An exact Portal item title.
 
-Omitting the source uses `portal tools parquet select`. Prefer an explicit
-source in automation and whenever another task may have changed the selection.
-Portal item sources can resolve multiple resource files as one sequential
-dataset.
+Omitting the source uses `portal tools parquet select`. Prefer an explicit source in automation and whenever another task may have changed the selection. Portal item sources can resolve multiple resource files as one sequential dataset.
 
 ## Choose the narrowest command
 
@@ -54,8 +46,7 @@ dataset.
 | Records | `portal tools parquet query <source>` |
 | Filtered copy | `portal tools parquet save <source> --output <file>` |
 
-`meta` summarizes primary geometry, CRS, extent, and Esri spatial optimization.
-It does not replace `schema`, `kv`, or `stats`.
+`meta` summarizes primary geometry, CRS, extent, and Esri spatial optimization. It does not replace `schema`, `kv`, or `stats`.
 
 ## Query records
 
@@ -73,11 +64,9 @@ portal tools parquet query ./data/counties.parquet \
 - `--num` defaults to 10.
 - Column terms perform matching rather than requiring full nested paths.
 - GeoParquet WKB renders as GeoJSON.
-- Esri-PBF geodisplay geometry receives its multiscale transform unless
-  `--raw` is passed.
+- Esri-PBF geodisplay geometry receives its multiscale transform unless `--raw` is passed.
 
-Use `--raw` only when the task requires encoded geometry lengths and
-coordinates before transformation.
+Use `--raw` only when the task requires encoded geometry lengths and coordinates before transformation.
 
 ## Inspect statistics
 
@@ -86,16 +75,13 @@ portal tools parquet stats ./data/counties.parquet \
   --column geodisplay,indexkey
 ```
 
-The result follows `_spatial.json`-style structure with file name, record
-count, byte size, key-value metadata, and available column statistics.
-Statistics may omit:
+The result follows `_spatial.json`-style structure with file name, record count, byte size, key-value metadata, and available column statistics. Statistics may omit:
 
 - Columns whose row groups contain no statistics.
 - Distinct counts when a column spans multiple chunks.
 - Min and max values for fields not classified as numeric.
 
-A single `--column` term matches case-insensitive substrings in any path
-component. Comma-separated terms match corresponding nested path components.
+A single `--column` term matches case-insensitive substrings in any path component. Comma-separated terms match corresponding nested path components.
 
 ## Save a subset
 
@@ -107,9 +93,7 @@ portal tools parquet save ./data/counties.parquet \
   --output ./data/counties-large.parquet
 ```
 
-The output preserves the first source file's schema and key-value metadata and
-writes Parquet statistics and indexes. Verify the result with `meta`, `schema`,
-and a bounded `query`.
+The output preserves the first source file's schema and key-value metadata and writes Parquet statistics and indexes. Verify the result with `meta`, `schema`, and a bounded `query`.
 
 ## Output behavior
 
@@ -117,5 +101,4 @@ and a bounded `query`.
 - Safe BigInts print as numbers. Larger BigInts print as strings.
 - Binary metadata prints as `blob(<length>)`.
 - Multi-file Portal items wrap each result with its resource name.
-- Missing files and unknown filter columns return specific errors. Report them
-  directly instead of substituting another source or field.
+- Missing files and unknown filter columns return specific errors. Report them directly instead of substituting another source or field.

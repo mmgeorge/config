@@ -649,7 +649,7 @@ impl HarnessBroker {
         response["result"] = json!("transitioned");
         response["instructions"] = if phase_completion {
             json!(
-                "End this turn now. Do not start the next phase. Forge will start a separate exchange with its instructions."
+                "End this turn now, without starting the next phase. Forge starts the next phase in a separate exchange with its own instructions."
             )
         } else {
             json!(execution.instructions())

@@ -1,50 +1,57 @@
 # How-To Guide Profile
 
-*Read when authoring operational runbooks, incident response procedures, migration instructions, or task-oriented guides.*
+*Read when writing a runbook, an incident procedure, migration steps, or another guide to one task.*
 
 ## Controlling Claim
 
-Establish that following the documented sequence deterministically achieves one specific operational result under defined prerequisites and environmental constraints.
+A reader who meets the stated prerequisites and follows the steps in order reaches one specific result.
 
-## Structural Obligations
+## Sections
 
-Every how-to guide must progress through the following sections:
+Write these sections in order.
 
-### 1. Target Outcome
-- Name the exact resulting state or artifact produced by completing the guide (such as `Rotates the production database credentials and updates the secret manager with zero downtime.`).
+### 1. Result
 
-### 2. Prerequisites and Environment
-- List required tooling, exact version constraints, and required environment variables.
-- List required permissions, IAM roles, or credential scopes.
-- Highlight any destructive operations or irreversible side effects in an explicit warning block before proceeding.
+- Say exactly what the reader has when they finish, such as "The production database uses a new password, with no downtime."
 
-### 3. Execution Sequence
-- **Step Independence:** Sequence steps in strict execution dependency order.
-- **One Observable Action per Step:** Give each numbered step exactly one primary action.
-- **Actionable Formatting:** Begin each step with an active imperative verb (such as `Deploy`, `Export`, `Configure`, `Verify`).
-- **Commands and Code:** Provide exact copyable commands, file paths, and configuration snippets. Place optional parameters and explanations directly beneath the main command.
+### 2. Before you start
 
-### 4. Checkpoints and State Verification
-- Provide expected stdout, HTTP status codes, or file system artifacts after critical actions.
-- Include a specific verification command that proves the step succeeded before the reader advances to the next step.
+- List the tools, versions, and environment variables the reader needs.
+- List the permissions or roles they need.
+- Warn about any step that deletes data or cannot be undone, before the steps begin.
 
-### 5. Conditional Branches
-- Address environment or configuration divergences (such as macOS vs Linux paths) at the exact step where the branch occurs, not in separate disconnected sections.
+### 3. Steps
 
-### 6. Failure Modes and Recovery
-- Provide a troubleshooting table or section covering expected failure states:
-  - **Symptom / Error Text:** The exact searchable error string or status code.
-  - **Root Cause:** The underlying trigger (such as expired token or port collision).
-  - **Remediation Action:** The exact recovery command to restore operational state.
+- Order the steps so each one depends only on the steps before it.
+- Give each step one action, starting with a verb such as "Deploy," "Export," or "Verify."
+- Give exact commands, paths, and settings the reader can copy. Put optional flags and notes under the command.
 
-### 7. Author Verification Requirement
-- Execute the complete guide from the declared starting state in a clean, isolated environment before publishing.
+### 4. Checks
 
-## Exclude by Default
+- After each important step, show the expected output, status code, or file, and a command that confirms it.
 
-- Do not include theoretical deep dives, architectural debates, or historical design rationale in the workflow. Link a dedicated explanation document instead.
-- Do not provide a broad menu of alternative approaches. Document the single standard, verified procedure.
+### 5. Platform differences
 
-## Completion Check
+- Handle differences, such as macOS and Linux paths, inside the step where they occur.
 
-A practitioner with the stated prerequisites should be able to execute the steps without ambiguity, verify intermediate checkpoints, reach the target state, and recover from documented error conditions.
+### 6. Troubleshooting
+
+- For each expected failure, give the exact error text, its cause, and the command that fixes it.
+
+## Leave out
+
+- Do not include design history or theory. Link an explanation instead.
+- Do not offer several ways to do the task. Document the one tested procedure.
+
+## Example
+
+A shortened guide:
+
+> This guide changes the production database password without downtime. You need the `dbadmin` role and version 2.4 or later of `dbctl`. Step 4 revokes the old password and cannot be undone.
+>
+> 1. Create the new password with `dbctl rotate app`.
+> 2. Confirm that the new password works. `dbctl check app` prints `ok: app connected with new credentials`.
+> 3. Restart the app servers one at a time with `deploy restart app --rolling`.
+> 4. Revoke the old password with `dbctl revoke app --old`.
+>
+> If step 3 fails with `password authentication failed`, the servers are still reading the old password. Run `deploy restart app --rolling --refresh-secrets`, then repeat the check in step 2.

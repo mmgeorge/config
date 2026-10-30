@@ -1,56 +1,66 @@
 # Architectural Overview Profile
 
-*Read when authoring or revising a system architecture overview, subsystem design document, or feature architecture specification.*
+*Read when writing or revising an overview of a system's architecture, a subsystem design, or a feature's design.*
 
 ## Controlling Claim
 
-Establish that one complete operating model explains how the system satisfies its requirements, divides subsystem authority, represents domain entities, and moves state through its lifecycle.
+The overview shows how the system meets its requirements: what each part is responsible for, what data it owns, and how that data changes as the system runs.
 
-Describe the target architecture in the present tense as fully operational behavior. Do not qualify the model with aspirational disclaimers (`intended`, `proposed`, `future`) unless describing a temporary migration boundary that directly affects current caller behavior.
+Describe the architecture in the present tense, as it works. Avoid words such as "intended," "proposed," or "future," except for a migration that is still in progress and changes how callers use the system today.
 
-## Structural Obligations
+## Sections
 
-An architectural overview progresses through the following sections:
+Write these sections in order.
 
-### 1. System Scope and Public Boundary
-- State what capability the system provides at its user or caller boundary.
-- Enumerate the participating primary subsystems and external dependencies.
-- Define unfamiliar domain concepts immediately when introduced.
+### 1. Scope
 
-### 2. Domain Model and Entity Ownership
-- Define core domain entities, their persistent identifiers, and state invariants.
-- Explicitly define ownership boundaries: which subsystem creates, mutates, and deletes each entity.
-- Detail data representations, serialization formats, and durability guarantees.
+- Say what the system does for its users or callers.
+- List its main parts and the external services it depends on.
+- Define each unfamiliar term where it first appears.
 
-### 3. Subsystem Architecture and Storage
-- Describe each subsystem by its primary role, public interface, and internal storage.
-- Document storage engines, database schemas, in-memory caches, and isolation mechanisms.
-- Explain the warrants behind core storage and boundary decisions.
+### 2. Data and ownership
 
-### 4. Runtime Lifecycles and Data Pipelines
-- Trace end-to-end dataflow from ingestion or caller request through transformations to persistence and response.
-- Document state machine transitions, event notifications, and background worker queues.
-- Detail synchronization protocols, cache invalidation rules, and consistency guarantees.
+- Describe the main kinds of data, how each one is identified, and the rules that must always hold for it.
+- For each kind of data, say which part creates it, changes it, and deletes it.
+- Describe how the data is stored and sent: its format, where it lives, and whether it survives a restart.
 
-### 5. Failure Modes and Concurrency Boundaries
-- Define the concurrency model (such as isolated message-passing workers, thread pools, async event loops, or mutex hierarchies).
-- Document partial failure handling, network timeouts, retry policies, and automated recovery paths.
-- Define resource limits, queue capacity bounds, and backpressure mechanisms.
+### 3. Components and storage
 
-### 6. End-to-End Workflow Synthesis
-- Show how the individual subsystems and pipelines compose to fulfill the overarching system contract.
+- For each part, describe what it does, how other parts call it, and what it stores.
+- Name the databases, caches, and schemas, and explain how parts are kept from interfering with each other.
+- Explain why the main storage and boundary decisions were made.
 
-## Organizational Patterns
+### 4. How data moves
 
-- **Component-Synthesis:** Open with the complete system boundary, decompose into participating subsystems, and synthesize their interactions.
-- **Bottom-Up:** Define primitive entities, storage models, and protocols before detailing higher-level APIs and workflows.
-- **Pipeline:** Sequence sections to follow the physical or logical dataflow from ingest to output.
+- Follow a request or input from where it enters, through each change, to where it is stored and how the response returns.
+- Describe the states each piece of data passes through, the events that move it between them, and any background jobs.
+- Explain how copies stay in sync: when caches refresh and what consistency callers can rely on.
 
-## Exclude by Default
+### 5. Failures and concurrency
 
-- Do not include proposal history, rejected alternatives, feasibility discussions, implementation roadmaps, rollout checklists, or backlog items. Those belong in an RFC or implementation plan.
-- Do not expose low-level function signatures or variable names unless they define a public architectural boundary.
+- Describe how work runs in parallel, such as separate workers that pass messages, thread pools, or locks.
+- Describe what happens when part of the system fails, including timeouts, retries, and recovery.
+- State the limits: how much work each queue holds and what happens when it is full.
 
-## Completion Check
+### 6. How the parts work together
 
-A reader should understand what the system accomplishes, which subsystem owns each responsibility, how central entities relate, how inputs become durable runtime state, how failures are contained, and why the boundaries satisfy system requirements.
+- Show how the parts combine to deliver what the system promises its callers.
+
+## Leave out
+
+- Do not include proposal history, rejected options, feasibility discussion, roadmaps, rollout checklists, or backlog items. These belong in an RFC or an implementation plan.
+- Do not include function signatures or variable names unless they define a boundary between parts.
+
+## Example
+
+A shortened overview of offline draft sync in a text editor:
+
+> Draft sync keeps a user's unsaved edits when the editor closes or the network drops, and sends them to the document server later. Three parts share this work: the editor, a local draft cache, and a sync worker that talks to the server's save API.
+>
+> Each pending edit is stored as a draft, identified by its document ID and a sequence number. The editor creates drafts, and the sync worker deletes them once the server confirms the save. No other part changes them. Drafts live as JSON files in the user's data directory, so they survive a restart.
+>
+> When the user types, the editor writes the edit to the draft cache before it changes the open document. The sync worker reads the cache in sequence order and sends each draft to the server. Because the cache keeps one file per document, a slow save on one document never delays another.
+>
+> A draft stays pending until the server confirms it. If a save fails, the worker leaves the draft in place and tries again after a longer delay each time. Only the worker sends saves, so two saves for the same document never run at once.
+>
+> Together, these rules mean an edit is never lost on its way to the server: it reaches the cache before the document changes, and it leaves the cache only after the server has it.

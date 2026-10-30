@@ -1,50 +1,61 @@
 # RFC and Proposal Profile
 
-*Read when proposing a major architecture change, technology adoption, API redesign, or cross-cutting engineering strategy.*
+*Read when proposing a major design change, a new technology, an API redesign, or an engineering strategy.*
 
 ## Controlling Claim
 
-Establish that the proposed technical design best satisfies stated goals and constraints when evaluated against viable alternatives, recorded drawbacks, system risks, and prototype evidence.
+The proposal shows that its design meets the stated goals better than the alternatives, and records its costs, its risks, and the evidence still needed.
 
-## Structural Obligations
+## Sections
 
-An RFC must contain the following sections:
+Write these sections in order.
 
-### 1. Motivation and Problem Definition
-- Describe the concrete use cases, system bottlenecks, or user friction prompting the proposal.
-- Document the operational cost and technical limitations of maintaining the status quo.
+### 1. Problem
 
-### 2. Goals, Non-Goals, and Evaluation Criteria
-- **Goals:** Measurable capabilities or invariants the proposal must deliver.
-- **Non-Goals:** Explicitly out-of-scope capabilities to prevent scope creep.
-- **Evaluation Criteria:** Weighted dimensions (such as Latency, Durability, Backward Compatibility, Developer Velocity) used to judge solutions.
+- Describe the use cases, bottlenecks, or user problems behind the proposal.
+- Describe what it costs to keep things as they are.
 
-### 3. Proposed Solution
-- **User-Facing Surface:** Show concrete CLI invocations, API code samples, or configuration examples before describing internal machinery.
-- **Reference-Level Architecture:** Detail component ownership, state machines, data schemas, protocol definitions, and concurrency models.
-- **State Invariants:** Explicitly define invariants preserved across failure and recovery paths.
+### 2. Goals and criteria
 
-### 4. Evaluated Alternatives and Tradeoffs
-- Enumerate viable alternative approaches evaluated against the shared criteria.
-- Provide a side-by-side comparison table showing where each alternative excels and why it failed the primary requirements.
+- List the measurable goals the proposal must meet.
+- List the non-goals, so reviewers know what is out of scope.
+- Name the criteria used to compare options, such as latency, durability, or backward compatibility.
 
-### 5. Drawbacks, Security Risks, and Mitigations
-- Document new failure modes, resource overhead, operational complexities, or security attack surfaces introduced by this design.
-- Define explicit mitigation strategies for every identified risk.
+### 3. Proposal
 
-### 6. Migration and Compatibility Strategy
-- Document backward compatibility guarantees, schema evolution rules, and deprecation schedules.
-- Detail zero-downtime data migration and fallback rollback mechanisms.
+- Show what users will see first, such as commands, API calls, or configuration.
+- Then describe the design: which part owns what, the states data passes through, the data formats, and how work runs in parallel.
+- State what stays true when something fails and the system recovers.
 
-### 7. Unresolved Questions and Validation Plan
-- State explicit open questions that affect reviewer acceptance.
-- Define the proof-of-concept prototype, benchmark, or experiment required to validate uncertain claims before implementation.
+### 4. Alternatives
 
-## Exclude by Default
+- Compare each alternative against the same criteria, in a table when that helps, and say why it falls short.
 
-- Do not include task-level Jira tickets or engineering checklists. Those belong in an implementation plan after RFC acceptance.
-- Do not make unsupported assertions (such as *"This approach is vastly superior"*). Connect every claim to measurable evaluation criteria.
+### 5. Risks
 
-## Completion Check
+- Describe new failure modes, added cost, operational work, and security exposure, and how each one is reduced.
 
-A reviewer should be able to identify the exact decision requested, test the proposal against explicit criteria, understand its mechanics and costs, compare it fairly with alternatives, and identify what evidence remains required before approval.
+### 6. Migration
+
+- Explain what stays compatible, how data formats change, and when old behavior is removed.
+- Describe how data moves without downtime and how to roll back.
+
+### 7. Open questions
+
+- List the questions reviewers must settle before accepting the proposal.
+- Describe the prototype, benchmark, or experiment that will answer any uncertain claim.
+
+## Leave out
+
+- Do not include task tickets or checklists. Those belong in an implementation plan after the proposal is accepted.
+- Do not make claims the criteria cannot check, such as "this approach is far better."
+
+## Example
+
+A shortened proposal:
+
+> Clients learn about document changes by polling the server every 30 seconds, so collaborators see each other's edits up to 30 seconds late, and polling makes up 60% of server requests. This proposal replaces polling with webhooks. The goal is to show changes within one second without adding server load. Moving existing third-party integrations off polling is out of scope.
+>
+> Clients register a callback URL when they open a document, and the server calls it with each change. In a test with 200 clients, changes arrived in 400 ms on average and server requests fell by half. Long polling also met the one-second goal, but it holds one open connection per client and doubled memory use in the same test.
+>
+> Webhooks add a new way to fail: a client behind a firewall cannot receive callbacks. Those clients keep polling until they can register a reachable URL. Before this proposal is accepted, we need to measure how many current clients sit behind such firewalls.

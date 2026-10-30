@@ -24,14 +24,11 @@ Ground code explanations in the controlling problem and consumer contract rather
 Structure the explanation using this exact sequence:
 
 1. **Problem-First Summary (2–3 sentences):**
-   - Sentence 1: Open with the problem, hazard, or controlling contract, naming
-     the specific target function or method name as the active subject (e.g., `publish_loaded`
-     or `SessionStore::reconcile`). Natural opening patterns include:
+   - Sentence 1: Open with the problem, hazard, or controlling contract, naming the specific target function or method name as the active subject (e.g., `publish_loaded` or `SessionStore::reconcile`). Natural opening patterns include:
      - Purpose infinitive: `To prevent / ensure / isolate / preserve [outcome], [fn_name] [action]...`
      - Direct action: `[fn_name] [action] to [outcome]...`
      - Operational condition: `When [condition], [fn_name] [action]...`
-     - Never substitute broad struct or class names alone, and never open with dummy subjects
-       (`"This function..."`, `"This method..."`), process narration, or preambles.
+     - Never substitute broad struct or class names alone, and never open with dummy subjects (`"This function..."`, `"This method..."`), process narration, or preambles.
    - Sentence 2: State the pre-validation or ordering invariant that protects system state.
    - Sentence 3: State the preserved consumer contract (such as handle stability, temporal consistency, or error boundaries).
 2. **Lifecycle Flow (2–3 architectural phases):**

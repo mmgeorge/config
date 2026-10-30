@@ -72,10 +72,7 @@ Example:
 
 ## Per-Target Features
 
-The `targets` option accepts both an array and an object format. Use the
-object format when you want to declare per-target feature configuration in
-a single place — the object keys are the target tools, and each value
-carries the features to generate for that tool:
+The `targets` option accepts both an array and an object format. Use the object format when you want to declare per-target feature configuration in a single place — the object keys are the target tools, and each value carries the features to generate for that tool:
 
 ```jsonc
 // rulesync.jsonc
@@ -98,8 +95,7 @@ In this example:
 > field must be omitted. Declaring both would double-define the target
 > set, so the config loader rejects that combination.
 
-You can also use `*` (wildcard) inside a target's value to enable every
-feature for that tool:
+You can also use `*` (wildcard) inside a target's value to enable every feature for that tool:
 
 ```jsonc
 {
@@ -112,9 +108,7 @@ feature for that tool:
 
 ### Per-feature options
 
-Some features accept additional configuration. To pass options through, use
-the object form for a target's value instead of an array. Each feature key
-maps to either `true`/`false` (enable/disable) or an options object.
+Some features accept additional configuration. To pass options through, use the object form for a target's value instead of an array. Each feature key maps to either `true`/`false` (enable/disable) or an options object.
 
 ```jsonc
 {
@@ -132,13 +126,11 @@ maps to either `true`/`false` (enable/disable) or an options object.
 }
 ```
 
-`gitignoreDestination` controls where `rulesync gitignore` writes path entries.
-You can set it:
+`gitignoreDestination` controls where `rulesync gitignore` writes path entries. You can set it:
 
 - at **root level** (`gitignoreDestination`)
 - at **tool level** (`targets.<tool>.gitignoreDestination`)
-- or at **tool × feature level**
-  (`targets.<tool>.<feature>.gitignoreDestination`)
+- or at **tool × feature level** (`targets.<tool>.<feature>.gitignoreDestination`)
 
 Allowed values:
 
@@ -161,9 +153,7 @@ The current per-feature options are:
 | `claudecode` | `ignore` | `fileMode`             | `"shared"` (settings.json) / `"local"` (settings.local.json)                   | `"shared"`    |
 | any          | any      | `gitignoreDestination` | `"gitignore"` / `"gitattributes"`                                              | `"gitignore"` |
 
-See [`docs/reference/file-formats.md`](../reference/file-formats.md#where-ignore-patterns-are-written-per-tool)
-for the rationale behind the Claude Code default and when to switch to
-`"local"`.
+See [`docs/reference/file-formats.md`](../reference/file-formats.md#where-ignore-patterns-are-written-per-tool) for the rationale behind the Claude Code default and when to switch to `"local"`.
 
 ## Local Configuration
 

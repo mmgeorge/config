@@ -181,7 +181,7 @@ impl RequestExecutor {
                 Ok(json!({
                     "contentItems": [{
                         "type": "inputText",
-                        "text": "Harness already recorded and consumed this planning feedback. Continue with design_patch, question_ask, or plan_submit."
+                        "text": "Harness has already recorded this planning feedback. Continue with design_patch, question_ask, or plan_submit."
                     }],
                     "success": false
                 }))

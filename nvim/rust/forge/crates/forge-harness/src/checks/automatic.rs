@@ -138,7 +138,7 @@ impl AutomaticChecks {
             .any(|command| command.state == CheckState::ConfigurationError)
         {
             self.blocked = Some(format!(
-                "Automatic validation needs corrected check configuration. Use the authorized checks setup workflow.\n{findings}"
+                "Automatic validation needs a corrected check configuration. Fix it through the authorized checks setup workflow.\n{findings}"
             ));
             self.save()?;
             return Ok(None);
@@ -146,7 +146,7 @@ impl AutomaticChecks {
         self.delivered = identities;
         self.blocked = None;
         let prompt = format!(
-            "Automatic checks prevent task completion. Fix the failures below and finish the repair turn so Harness automatically runs checks again. Manual check_run calls are optional for earlier feedback and are generally unnecessary. Do not run validation commands through terminal tools. Preserve the original task scope. A turn ending with the same failed inputs will stop automatic repair.\n\n{findings}"
+            "Automatic checks are blocking task completion. Fix the failures below and finish the repair turn, and Harness runs the checks again. You do not need to call check_run, though you may for earlier feedback. Do not run validation commands through terminal tools, and keep to the original task's scope. If the turn ends with the same failing inputs, automatic repair stops.\n\n{findings}"
         );
         self.repair_prompt = Some(prompt.clone());
         self.repair_exchange = None;

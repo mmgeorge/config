@@ -24,19 +24,15 @@ Deliver a thorough, section-by-section code walkthrough that breaks down an impl
 Structure the walkthrough using this exact sequence:
 
 1. **Problem-First Summary (2–3 sentences):**
-   - Sentence 1: Open with the problem, hazard, or controlling contract, naming
-     the specific target function or method name as the active subject (e.g., `publish_loaded`
-     or `SessionStore::reconcile`). Natural opening patterns include:
+   - Sentence 1: Open with the problem, hazard, or controlling contract, naming the specific target function or method name as the active subject (e.g., `publish_loaded` or `SessionStore::reconcile`). Natural opening patterns include:
      - Purpose infinitive: `To prevent / ensure / isolate / preserve [outcome], [fn_name] [action]...`
      - Direct action: `[fn_name] [action] to [outcome]...`
      - Operational condition: `When [condition], [fn_name] [action]...`
-     - Never substitute broad struct or class names alone, and never open with dummy subjects
-       (`"This function..."`, `"This method..."`), process narration, or preambles.
+     - Never substitute broad struct or class names alone, and never open with dummy subjects (`"This function..."`, `"This method..."`), process narration, or preambles.
    - Sentence 2: State the pre-validation or ordering invariant that protects system state.
    - Sentence 3: State the preserved consumer contract (such as handle stability, temporal consistency, or error boundaries).
 
-2. **Sequential Architectural Sections (`### 1. ...`, `### 2. ...`):**
-   For each numbered phase:
+2. **Sequential Architectural Sections (`### 1. ...`, `### 2. ...`):** For each numbered phase:
    - **Context Sentence:** State the phase invariant, trigger, or safety guarantee *before* presenting any code.
    - **Annotated Code Snippet:** Show the relevant slice of code, adding concise in-line comments (`// ...`) that explain *non-obvious invariants, guarantees, and error paths* rather than restating syntax.
    - **Consequence Sentence:** State what state transition or invariant is established for subsequent phases or external consumers.

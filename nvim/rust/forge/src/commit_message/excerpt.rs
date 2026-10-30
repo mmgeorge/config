@@ -13,11 +13,11 @@ pub(super) const MAX_INPUT_BYTES: usize = 500_000;
 const BODY_CHANGED_LINES: usize = 20;
 const CONTEXT_LINES: usize = 2;
 const INSTRUCTIONS: &str = "The diff is compacted. '+ ' marks added lines, '- ' removed lines, and '  ' unchanged lines. \
-Signatures are retained. Omission markers include added and removed line counts. \
-Added and removed functions include signatures only. \
-Renamed files, license changes, and lockfile changes appear only in the file list. \
-Standalone import changes are excluded from excerpts. Files without excerpts appear only in the file list. \
-Describe visible changes without guessing the contents of omitted lines.\n\nChanged files:\n";
+Signatures are kept, and omission markers give the number of added and removed lines left out. \
+Added and removed functions show only their signatures. \
+Renamed files, license changes, lockfile changes, and files without excerpts appear only in the file list. \
+Standalone import changes are left out of the excerpts. \
+Describe the visible changes without guessing what omitted lines contain.\n\nChanged files:\n";
 
 /// A complete file comparison retained until inventory and excerpt selection finish.
 pub(super) struct ChangedFile {

@@ -465,7 +465,7 @@ impl SessionTaskController {
                     continuation: continuing.then(|| super::TaskContinuation {
                         id: super::TaskInputId::fresh(),
                         instruction: format!(
-                            "Continue the active planning task. The previous provider turn ended without a terminal planning action. Edit the proposed declaration files if needed, then call plan_submit. Ask only a genuinely new unresolved question with question_ask when the user's question preferences allow it. Do not repeat resolved questions. Prose alone does not submit a plan. Report persistent control failures clearly instead of retrying unchanged rejected requests.\n\nPlanning continuation: turn {} of {}.",
+                            "Continue the active planning task. The previous turn ended without submitting the plan or asking a question. Edit the proposed declaration files if needed, then call plan_submit. Prose alone does not submit a plan. Use question_ask only for a new open decision, and only when the user's question preferences allow it. Do not repeat answered questions. If a tool keeps failing, report the failure instead of repeating the same rejected request.\n\nPlanning continuation: turn {} of {}.",
                             artifact.generation.budget.turn_count + 1,
                             artifact.generation.budget.max_turn_count,
                         ),
