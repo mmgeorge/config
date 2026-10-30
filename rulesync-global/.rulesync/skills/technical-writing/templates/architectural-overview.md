@@ -2,11 +2,19 @@
 
 *Read when writing or revising an overview of a system's architecture, a subsystem design, or a feature's design.*
 
-## Controlling Claim
+## Main Claim
 
 The overview shows how the system meets its requirements: what each part is responsible for, what data it owns, and how that data changes as the system runs.
 
 Describe the architecture in the present tense, as it works. Avoid words such as "intended," "proposed," or "future," except for a migration that is still in progress and changes how callers use the system today.
+
+### Example main claims
+
+These examples connect architecture to a system requirement. Use them as alternatives to adapt, not a checklist.
+
+- "Draft sync preserves locally saved edits across application restarts and sends them when the server becomes reachable."
+- "Per-document queues preserve edit order while allowing unrelated documents to sync independently."
+- "Versioned cache keys prevent responses from an earlier deployment from being served after a new version activates."
 
 ## Sections
 

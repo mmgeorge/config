@@ -2,9 +2,17 @@
 
 *Read when writing complete lookup documentation for an API, a schema, CLI commands, configuration, a protocol, or error codes.*
 
-## Controlling Claim
+## Main Claim
 
 The reference describes every item in its scope accurately, in an order the reader can scan quickly while coding or debugging.
+
+### Example main claims
+
+These examples state what a reader can look up within a defined scope. Use them as alternatives to adapt, not a checklist.
+
+- "This reference lists every supported configuration field for version 2, including defaults, allowed values, and validation errors."
+- "This command reference covers every backup subcommand, flag, and exit code in version 2."
+- "This event catalog defines each published event type, its fields, and the versions that support it."
 
 ## Sections
 

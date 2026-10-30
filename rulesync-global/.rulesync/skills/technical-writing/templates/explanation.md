@@ -2,9 +2,17 @@
 
 *Read when writing a deep dive, a concept explanation, or an analysis of how a mechanism works.*
 
-## Controlling Claim
+## Main Claim
 
 The explanation gives the reader a model of why the system behaves as it does, clear enough to predict what happens when inputs, settings, or failures change.
+
+### Example main claims
+
+These examples connect an observed behavior to its cause. Use them as alternatives to adapt, not a checklist.
+
+- "Hourly latency spikes occur because cache entries expire together and trigger concurrent database reads."
+- "When retries lack deduplication, a timeout after commit can cause the same operation to run twice."
+- "Queue latency grows when jobs arrive faster than workers can finish them."
 
 ## Sections
 

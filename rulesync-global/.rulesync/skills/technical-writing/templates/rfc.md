@@ -2,9 +2,17 @@
 
 *Read when proposing a major design change, a new technology, an API redesign, or an engineering strategy.*
 
-## Controlling Claim
+## Main Claim
 
 The proposal shows that its design meets the stated goals better than the alternatives, and records its costs, its risks, and the evidence still needed.
+
+### Example main claims
+
+These examples compare a proposal against an existing design or alternative. Use them as alternatives to adapt, not a checklist.
+
+- "Replacing polling with webhooks meets the one-second update target with fewer requests than polling."
+- "A shared connection pool meets the concurrency target with fewer database connections than per-worker pools."
+- "Supporting both credential formats during migration preserves client compatibility without the coordinated cutover required by an immediate format switch."
 
 ## Sections
 

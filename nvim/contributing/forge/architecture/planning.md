@@ -26,6 +26,8 @@ Harness captures nonignored Rust, TypeScript, TSX, Lua, JSON, JSONC, TOML, YAML,
 
 `FunctionBehavior` is a tagged type. New callables need a nonempty `Algorithm`, and existing callables use `Change`. Algorithm blocks use the repository's `algorithm` Tree-sitter grammar, and submission checks statement syntax, delimiters, indentation, control bodies, `otherwise` branches, and that `break` and `continue` sit inside loops, reporting the callable, line, and column.
 
+Algorithm statements and expressions reject free-form prose. The grammar accepts assignments, calls, structured expressions, and control flow, with explanations confined to `#` comments. Lowercase abstract operations keep algorithms independent of implementation APIs. Unlisted unqualified operation calls have no declaration navigation target, while explicit reference metadata, qualified names, and typed receivers retain concrete navigation.
+
 Function-body references use three sections: `Calls`, `Constructs`, and `Accesses`. Every `Constructs` target needs a matching invocation in the Algorithm with `field = value` arguments, and qualified field references need matching `Accesses` entries. An omitted section means unknown, and an empty section means none. Validation resolves references and members, but it never type-checks expressions or proves correctness.
 
 ## Control tools
@@ -49,6 +51,8 @@ Plan metadata stores execution flows separately from prose, typed by `design_flo
 ## Acceptance
 
 Acceptance creates a durable `PlanAcceptance` and reuses the question picker for provider-context reuse and execution authorization, so an accepted write plan never inherits Read authorization. Dismissing the picker cancels acceptance. Once every question resolves, Harness emits `Plan accepted` inside the execution exchange and creates the guarded `Complete accepted plan: <title>` goal. An acceptance comment becomes reviewer context in execution prompts. Phase transitions and revision decisions carry an `ExchangeAnchor`, so `TimelineProjector` places them inside their owning exchange.
+
+When acceptance includes inline comments, Harness first sends ordinary changes-requested feedback to the planning agent. A one-cycle approval retains the execution choices and accepts the next valid submitted revision before implementation starts. Existing execution revisions use the same one-cycle approval to resume Resolve. This approval is independent of the global revision-approval preference. [Plan review](plan-review.md#decisions) describes its persistence and invalidation boundaries.
 
 ## Implementation and conformance
 

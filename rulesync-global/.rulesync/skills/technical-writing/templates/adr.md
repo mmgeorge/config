@@ -2,9 +2,17 @@
 
 *Read when recording a significant design decision for future maintainers.*
 
-## Controlling Claim
+## Main Claim
 
 The record shows that one decision answers a stated problem under stated constraints, and what the decision costs.
+
+### Example main claims
+
+These examples justify a decision under stated constraints. Use them as alternatives to adapt, not a checklist.
+
+- "We chose a local draft cache to preserve unsent edits across restarts, accepting disk usage and background synchronization."
+- "We chose immutable audit records to retain change history, accepting the storage cost of keeping earlier revisions."
+- "We chose database-backed job scheduling to coordinate workers without another service, accepting additional database load."
 
 ## Sections
 

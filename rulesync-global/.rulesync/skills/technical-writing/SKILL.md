@@ -10,68 +10,82 @@ description: >-
 
 Write for technically proficient readers. When audience context is unstated, address a developer who understands general software engineering but does not know this repository. Ground audience assumptions in the prompt, existing documentation, or repository context, and state unverified assumptions explicitly.
 
-## Objective and claims
+## Claims
 
-Every document makes claims, including documentation that reads as neutral description. A reference page claims its options are complete and correct for a stated version. A how-to guide claims its steps produce the stated result. API documentation claims callers can rely on the described behavior. A document that never states its claims leaves the reader unable to tell what to trust or act on.
+Technical writing asks readers to accept conclusions about a system: how it behaves, why a design satisfies its requirements, or whether a procedure achieves its goal. Treat those conclusions as **claims** that need support.
 
-A **claim** is a statement the reader could doubt, so the document must support it. "The cache uses Redis" is a fact the reader can check directly. "The cache never serves stale data after a deploy" is a claim, because it needs evidence and reasoning.
+A **claim** states what the reader should accept as true; its support explains why. Support can come from a directly verifiable fact, a measurement, or reasoning that connects several pieces of evidence. The broader the assertion, the more conditions the document must account for.
 
-Claims are explicit or implicit. An **explicit claim** appears in the text, such as:
+Claims can be explicit or implied. An **explicit claim** appears in the text, such as:
 
 - "These steps rotate the credentials without downtime."
 - "Retrying a failed upload never creates a duplicate record."
 - "The parser rejects input with an unknown version field."
 - "Webhooks cut sync delay from 30 seconds to under 1 second."
 
-An **implicit claim** is a point the writer wants the reader to conclude without stating it.
+Some claims are better conveyed through evidence than stated outright, especially when an explicit assertion would sound promotional. These **implied claims** express judgments the writer intends readers to reach for themselves.
 
-Leave implicit claims unstated, and show the evidence that supports them instead. Calling an implementation "clean" or "robust" asserts its quality without evidence. The reader should reach the conclusion from what the document shows:
-
-| Implicit claim | Show instead |
+| Implied claim | What to show instead |
 | --- | --- |
-| "This implementation is simpler than the one it replaces." | The change removes two locks and one background thread. |
-| "The new API is a drop-in replacement for the old one." | Each old call maps to a new call with the same arguments, and the existing tests pass unchanged. |
-| "We considered the obvious alternatives." | Each alternative is compared against the same criteria as the chosen design. |
-| "You should use this library because its authors know what they are doing." | Benchmark results, production users, and documented failure handling. |
+| "This change improves performance." | Compare measurements before and after the change, and state the test conditions. |
+| "This change reduces complexity." | Identify the dependencies, coordination steps, or background tasks it removes. |
+| "The system is robust." | Show recovery behavior, its verification, and the conditions it does not cover. |
+| "This design best fits the requirements." | Compare other alternatives, including its costs and limitations. |
 
-An omission can also create an implicit claim that the evidence does not support. A change description that lists only benefits implies the change has no costs. Leaving out a failure path implies the system cannot fail there. State the costs and failure paths the reader needs.
+When supporting an implied claim, account for conclusions the reader may draw beyond the one intended. *Omitting a tradeoff can make a recommendation appear stronger than the evidence supports.* Omitting a failure condition can make a guarantee appear unconditional. Include the conditions, costs, and limitations that keep the implied claim within what the evidence establishes.
 
-The **reader objective** is what the reader came to do. It selects the [document profile](#document-profiles) and decides which claims the document must make.
+The **reader objective** is what the reader needs to do, decide, or understand. Use it to frame the document: choose the [document profile](#document-profiles), identify the claims to establish, and determine what belongs in scope.
 
-**Controlling claims** are what the reader must believe to meet the objective. Each profile template's Controlling Claim section gives the first one. A claim belongs only if the reader cannot meet the objective without accepting it.
+**Main claims** are the conclusions the document must establish to meet the reader's objective. They determine which supporting material belongs.
 
-**Supporting claims** are why the reader should believe a controlling claim. Each one proves one part of it and needs:
+**Supporting claims** establish why a main claim holds. Each needs its own evidence and a clear connection to the main claim.
+
+Both main and supporting claims can be explicit or implied. Support each with:
 
 - **Evidence** the reader can check: facts, runtime behavior, schemas, code examples, or measurements.
 - **A warrant** when the link is not obvious: the reasoning that explains why the evidence proves the claim.
 - **A qualification** when the claim has limits: where it stops holding, attached to that claim instead of a generic disclaimer.
 
-For a reader who must rotate production credentials:
+### Examples
 
-- Objective: rotate the credentials.
-- Controlling claim: "These steps rotate the credentials without downtime."
+For a reader who must rotate production credentials without interrupting service:
+
+- Objective: rotate production credentials without interrupting service.
+- Document profile: [How-to guide](templates/how-to.md), because the reader needs a procedure that produces a specific result.
+- Main claim: "Following these steps with the stated prerequisites rotates production credentials without interrupting service."
 - Supporting claim: "The new credential works before the old one is revoked."
-- Evidence: the step 3 command and its expected output.
+- Evidence: the credential-check command and its expected output.
 - Warrant: the command authenticates with only the new credential, so its success proves the new credential works alone.
 - Qualification: this holds only for clients that reread the secret on each connection.
 
-Include only content that supports a controlling claim. A paragraph on why the team chose its secret manager supports no claim in the credential guide, so it belongs in an ADR.
+For a fix to out-of-order search responses:
+
+- Objective: verify that the fix prevents older search results from replacing newer ones.
+- Document profile: [Technical explanation](templates/explanation.md) in a code-review comment.
+- Main claim: "This fix prevents stale search responses from overwriting the current results."
+- Supporting claim: "The handler rejects responses whose request ID no longer matches the current request."
+- Evidence: a regression test completes requests in reverse order. It fails before the fix and passes afterward.
+- Warrant: the test reproduces the original failure, and the identity check prevents the older response from reaching the state update.
+- Qualification: request IDs must remain unique while requests are outstanding.
 
 ## Workflow
 
-When the user asks for review or advice, report findings and leave files unchanged.
+Use this workflow when providing explanations to the user, or to develop new documents or assess existing ones. *When revising or reviewing documents, identify which claims, evidence, explanations, or structural relationships need attention within the existing document*. Frame your additions in this context, and prefer holistic document changes, where you may need to update prior claims rather than make narrow patches.
 
 1. **Survey existing documentation.** Search for pages that already cover the topic or depend on it. Update every affected page instead of duplicating its content. When no page covers the topic, add one and link it from the nearest index or parent page.
 2. **Select a document profile.** Match the reader's objective to a row in the [document profiles](#document-profiles) table below, and read that profile's template.
-3. **State the controlling claims.** Adapt the selected template's Controlling Claim section, such as the [architectural overview's](templates/architectural-overview.md#controlling-claim), to the subject, and add any claims the objective still needs, as [objective and claims](#objective-and-claims) shows. Write each claim as one sentence.
+3. **Identify the main claims.** Adapt the selected template's Main Claim section and examples, such as the [architectural overview's](templates/architectural-overview.md#main-claim), to the subject and [reader objective](#claims). Include only claims that objective requires. Write each claim as one sentence to identify what the document must establish; not every claim needs to appear explicitly in the published document.
 4. **Verify against sources.** Check behavior against source code, schemas, tests, traces, or runtime output before asserting it. For API documentation, inspect implementations, callers, and tests, and document only the caller contract.
 5. **Outline and draft.** Order the content as the [reading path](#reading-path) describes, and write it under the [composition](#composition) rules.
-6. **Check claims and links.** Confirm that every controlling and supporting claim has evidence, and that the document shows evidence for every implicit claim or drops the wording that implies it. Check terms, identifiers, examples, links, cross-references, and other pages that describe the same behavior. After structural edits, recheck scope statements, transitions, and prerequisite order.
-7. **Proofread.** Reread the document against the global communication rules and the [composition](#composition) and [terminology](#terminology) sections. Repair sentence emphasis, modifier attachment, pronoun reference, tense, and needless words. Preserve the author's tone and the repository's house style.
+6. **Proofread.**
+   - **Claims:** Confirm that every main and supporting claim has evidence, whether stated explicitly or deliberately implied. Check for unsupported implications from wording, examples, or omissions, and revise the document to support, qualify, or remove them.
+   - **Consistency and links:** Check terms, identifiers, examples, links, cross-references, and other pages that describe the same behavior.
+   - **Structure:** After structural edits, recheck scope statements, transitions, and prerequisite order.
+   - **Prose:** Review the prose against the global communication rules and the [composition](#composition) and [terminology](#terminology) sections. Repair sentence emphasis, modifier attachment, pronoun reference, tense, and needless words. Preserve the author's tone and the repository's house style.
 
 ## Document profiles
 
-Each profile template defines its primary controlling claim, the sections to write, and what to leave out.
+Each profile template describes its main claim, gives examples to adapt, and specifies what to include or leave out.
 
 | Reader Objective | Document Profile |
 | --- | --- |
@@ -84,6 +98,7 @@ Each profile template defines its primary controlling claim, the sections to wri
 | Learn a technology by building an end-to-end project | [Tutorial](templates/tutorial.md) |
 | Predict how a public API, docstring, or endpoint behaves | [API documentation](templates/api-documentation.md) |
 
+
 ## Composition
 
 - **Paragraph structure:** Open each expository paragraph with its point, support it in the body, and end on its strongest consequence or required transition. Connect paragraphs with explicit continuation, qualification, contrast, or causal transitions.
@@ -94,6 +109,7 @@ Each profile template defines its primary controlling claim, the sections to wri
 - **Grounded nouns:** Replace `things`, `details`, and importance words such as `important`, `critical`, or `major` with exact domain entities and attributes.
 - **Mapping rules over slogans:** State explicit conditions and consequences instead of aphorisms or circular qualifiers.
 - **Plain wording:** Write literal statements instead of punchy phrasing. Avoid catchphrases such as "show, don't tell", figurative verbs such as "earn" or "unlock", and contrasts written for rhythm rather than meaning.
+- **Buzzwords and promotion:** Replace vague labels and promotional claims with concrete mechanisms, measured results, or explicit guarantees. Keep technical terms when their precise meaning helps explain the subject.
 
 
 | Category | Before | After |
@@ -102,7 +118,9 @@ Each profile template defines its primary controlling claim, the sections to wri
 | **Generic nouns** | *"Show interactions between two important things."* | *"Show interactions between two components or stores."* |
 | **Aphorisms** | *"Fail fast."* | *"Check the config file when the app starts, so a typo fails at launch instead of during a user's request."* |
 | **Circular qualifiers** | *"Retry the requests that can be retried."* | *"Retry requests that fail with a timeout or a 503 status."* |
-| **Punchy phrasing** | *"Keep implicit claims implicit and earn them: show, don't tell."* | *"Leave implicit claims unstated, and show the evidence that supports them."* |
+| **Punchy phrasing** | *"Keep implied claims implied and earn them: show, don't tell."* | *"Support implied claims with evidence rather than promotional descriptions."* |
+| **Buzzwords** | *"Our battle-tested, fault-tolerant architecture delivers rock-solid reliability."* | *"The queue retains unfinished jobs and reassigns them when a worker disconnects."* |
+
 
 ## Terminology
 

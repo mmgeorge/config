@@ -2,9 +2,17 @@
 
 *Read when writing a guided tutorial in which the reader builds a working project to learn a technology.*
 
-## Controlling Claim
+## Main Claim
 
 Building one working project from start to finish teaches the reader how the main concepts fit together and leaves them with a pattern they can reuse.
+
+### Example main claims
+
+These examples connect a working project to a learning outcome. Use them as alternatives to adapt, not a checklist.
+
+- "Building a task worker teaches how queued jobs move through execution, acknowledgment, and retry."
+- "Building an offline notes app teaches how local storage and synchronization preserve edits during network outages."
+- "Building a file watcher teaches how filesystem events trigger cache invalidation and reloads."
 
 ## Sections
 

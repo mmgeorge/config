@@ -2,9 +2,17 @@
 
 *Read when writing or revising API reference pages, docstrings, rustdoc, JSDoc, OpenAPI descriptions, or other documentation that sits next to an interface.*
 
-## Controlling Claim
+## Main Claim
 
 A caller can predict what the interface does, how it fails, and what stays true, without reading its source code.
+
+### Example main claims
+
+These examples state behavior that callers can rely on. Use them as alternatives to adapt, not a checklist.
+
+- "Retrying an upload with the same idempotency key returns the original result without creating another object while the key remains valid."
+- "Closing the client cancels pending requests and releases the connections it owns."
+- "Reloading an invalid configuration returns a validation error and leaves the active configuration unchanged."
 
 ## Sections
 

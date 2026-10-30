@@ -2,9 +2,17 @@
 
 *Read when writing a runbook, an incident procedure, migration steps, or another guide to one task.*
 
-## Controlling Claim
+## Main Claim
 
 A reader who meets the stated prerequisites and follows the steps in order reaches one specific result.
+
+### Example main claims
+
+These examples state the result a procedure must produce. Use them as alternatives to adapt, not a checklist.
+
+- "These steps rotate production credentials without interrupting service."
+- "This procedure restores the database to a selected recovery point."
+- "Following these steps removes the deployment and its resources without affecting other applications."
 
 ## Sections
 

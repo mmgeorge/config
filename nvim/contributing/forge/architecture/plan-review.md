@@ -34,6 +34,10 @@ Annotations attach to a source line, and `Ctrl-S` saves feedback and submits una
 
 Only one decision can be pending at a time. Submitting a decision checks that the plan and buffer still match the captured revision, hides the review, and returns focus to Harness while the broker continues. A failed request reopens the review without losing unsaved feedback. Harness never opens PlanReview automatically.
 
+Accepting nonempty inline comments uses the same revision feedback as requesting changes. Each comment retains its saved source anchors and any associated question-and-answer thread. Question-only threads do not become revision instructions. `PlanAcceptance` retains the captured comments until execution choices are confirmed. Harness then revises the plan instead of entering implementation.
+
+`PlanRecord.revision_approval` retains approval for exactly the next submitted revision, together with the selected execution settings when execution has not started. A valid submission consumes that approval and starts or resumes execution without another plan review. It does not change the global automatic-revision setting. Pauses and interruptions retain the pending approval, while cancellation, a replacement review decision, or manual review edits invalidate it. The input coordinator recovers a submitted revision if execution promotion was interrupted.
+
 After submission, a prompt for the selected waiting Plan task becomes a plan discussion. A successful edit there applies `ChangesRequested` and requires a new submission or question before completion.
 
 ## Question picker
