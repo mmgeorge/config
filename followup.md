@@ -1,16 +1,12 @@
 # Typed provider interface follow-up
 
-The work addressed duplicate transcript block identities and empty commentary entries caused by provider message/tool envelopes. The provider-interface implementation is in place and has passed targeted Rust, real-host, and terminal verification. Final sign-off remains open because the last mechanical timestamp-helper cleanup happened after those passing checks.
+The provider-interface follow-up is complete as of 2026-10-29. The rebuilt runtime passes the targeted Rust checks, fresh-host fixtures, and interactive terminal verification after the timestamp-helper cleanup. The two stash conflicts are resolved and their fixtures pass.
 
 ## Current state
 
-The last edit removed the forwarding-only `CopilotEventDecoder::now_ms` method and changed four call sites to use the existing `super::timestamp_ms` helper directly:
+`nvim/rust/forge/crates/forge-harness/src/backend/copilot/event_decoder/stream.rs` contains four direct `super::timestamp_ms` calls and no forwarding `CopilotEventDecoder::now_ms` method. This cleanup is already present in HEAD and has no remaining working-tree diff. Fresh checks and the development build cover the current source.
 
-`nvim/rust/forge/crates/forge-harness/src/backend/copilot/event_decoder/stream.rs`
-
-No behavior change was intended. **This exact final edit has not been formatted, checked, tested, or rebuilt yet.** The current runtime executable predates it.
-
-The implementation changes remain uncommitted. Preserve the unrelated user edit in `nvim/lua/plugins/lsp.lua`. Do not reset the worktree or stage unrelated files.
+The stash resolutions preserve the upstream question-progress, response identity, late-answer, failure, retry, and wiped-buffer recovery coverage together with the stashed `toggle_visibility` command and recovery changes. Only the two resolved test files were staged by this follow-up. The pre-existing staged and untracked implementation work remains intact. No commit was created, no stash was dropped, and no edit was made to `nvim/lua/plugins/lsp.lua`.
 
 ## What was implemented
 
@@ -36,96 +32,90 @@ Contributor and user documentation was updated in:
 - `nvim/contributing/forge/architecture/host-and-protocol.md`
 - `nvim/docs/forge/commands.md`
 
-## Verification already recorded
+## Completed verification
 
-All results below predate the final timestamp-helper cleanup.
+Fresh evidence is saved under `nvim/rust/forge/target/followup-verification/`. JSON reports contain exact commands, exit statuses, durations, and log paths. All commands below exited 0. No compiled source changed after the successful build.
 
-| Boundary | Recorded result |
-| --- | --- |
-| Integrated production library | `cargo check` passed. |
-| Production lint | Clippy passed with only the two recorded baseline warnings. New enum-size warnings were fixed with typed boxed payloads, not suppressed. |
-| Targeted Rust matrix | 78 tests passed, zero failed. No full workspace suite was run. |
-| Public integration callers | The named `live_provider` integration target compiled. Ignored live tests were not executed. |
-| Runtime executable | The development `forge` binary built successfully. |
-| Real host/editor | The registered message-fold fixture passed at 80x36 and invoked the native-stream support fixture at 100x36. |
-| Native-stream workflow | Three native turns, three tools, an empty parallel tool envelope, reasoning, commentary fallback, a following invocation, expansion, cursor/viewport preservation, and close/explicit resume passed. |
-| Terminal MCP | Dedicated editors passed at 100x36 and 160x48. Both showed distinct commentary/response copies, correctly owned three-tool groups, no empty commentary headings, idle status, and an unchanged reading cursor during expansion. |
-| Cleanup | Both owned terminal editors and hosts were collected, and their terminal sessions were destroyed. |
+Rust commands ran from `nvim/rust/forge` with Rust 1.94.0, the development profile, the lockfile, and one Cargo job. Validation ran in check, test, read-only format, lint, build order.
 
-The native host fixture is:
+| Verification | Result | Duration | Evidence |
+| --- | --- | --- | --- |
+| Production `cargo check` | Passed | 35.59 s | `rust.json`, `rust-0.log` |
+| Exact commentary-fallback regression | 1 passed | 163.38 s | `rust.json`, `rust-1.log` |
+| Related decoder and compaction tests | 28 passed, 0 failed, including the exact regression | 0.65 s | `rust.json`, `rust-2.log` |
+| Read-only rustfmt for `stream.rs` | Passed | 0.04 s | `rust.json`, `rust-3.log` |
+| Working-tree and staged whitespace checks | Passed | 0.03 s and 0.06 s | `rust.json`, `rust-4.log`, `rust-5.log` |
+| Production Clippy | Passed with no warnings | 45.28 s | `rust.json`, `rust-6.log` |
+| Development `forge` executable | Built successfully | 122.20 s | `rust.json`, `rust-7.log` |
+| Public `live_provider` integration target | Compiled, no live tests executed | 34.95 s | `public-callers.json` |
+| Registered message-fold host fixture | Passed at 80×36, including embedded provider-stream fixture at 100×36 | 10.76 s | `host.json`, `host.log` |
+| Real-host PlanReview question fixture | All 18 scenarios passed | 18.10 s | `plan-question-host.json` |
+| Resolved stash fixtures | Syntax check, questions, and recovery passed | Recorded per command | `stash-conflicts.json` |
 
-`nvim/tests/forge/support/provider_stream_host.lua`
+The Rust commands were:
 
-It runs through the existing registered entrypoint:
+```console
+cargo +1.94.0 check --profile dev --locked -p forge-harness --lib --jobs 1
+cargo +1.94.0 test --profile dev --locked -p forge-harness --lib --jobs 1 backend::copilot::event_decoder::tests::idle_synthesizes_latest_commentary_as_a_distinct_response_once -- --exact
+cargo +1.94.0 test --profile dev --locked -p forge-harness --lib --jobs 1 -- backend::copilot::event_decoder:: backend::copilot::compaction::tests::
+rustfmt +1.94.0 --edition 2024 --config skip_children=true --check crates/forge-harness/src/backend/copilot/event_decoder/stream.rs
+git diff --check
+git diff --cached --check
+cargo +1.94.0 clippy --profile dev --locked -p forge-harness --lib --jobs 1 --no-deps --message-format short
+cargo +1.94.0 build --manifest-path Cargo.toml --profile dev --bin forge --locked --jobs 1
+cargo +1.94.0 check --profile dev --locked -p forge-harness --test live_provider --jobs 1
+```
 
-`nvim/tests/forge/harness_message_folds_host.lua`
+The artifact is `nvim/rust/forge/target/debug/forge.exe`. The one build had already started through the terminal wrapper before the user changed the workflow. Future builds run outside Terminal MCP only when source changes require rebuilding. The initial Rust commands had the previously requested 300-second compilation and 30-second formatting deadlines. After the user prohibited command timeouts, subsequent commands ran without them. Existing fixture-internal bounded waits were not changed.
 
-No check registry or new test runner was added. The fixture uses explicit mock launch mode `provider-stream` and the real Copilot decoder, without authenticated provider requests.
+The fresh-host commands ran from the repository root:
 
-## Remaining steps
+```console
+nvim --headless -i NONE -u NONE --cmd "set rtp^=D:/config/nvim" --cmd "lua vim.loader.enable(false)" -l nvim/tests/forge/harness_message_folds_host.lua
+nvim --headless -i NONE -u NONE --cmd "set rtp^=D:/config/nvim" -l nvim/tests/forge/plan_review_question_response_host.lua
+```
 
-Use the existing pinned Rust 1.94.0 toolchain, development profile, feature selection, and default artifact directory. Keep Cargo jobs serial. Allow 300 seconds for compilation/build commands, 30 seconds for formatting/whitespace checks, and 120 seconds for the host runner.
+The registered host fixture invokes `nvim/tests/forge/support/provider_stream_host.lua` through an embedded editor. Its success messages are consumed by RPC, so the report uses the parent success marker and exit status. No check registry or runner was changed.
 
-1. **Check the final cleanup and formatting.** Confirm the only implementation edit after the last passing verification is the timestamp forwarding-method removal. The full refactor also remains uncommitted. From `nvim/rust/forge`, check the affected file:
+Dedicated Terminal MCP editors at 100×36 and 160×48 used that same native provider-stream fixture with the rebuilt executable and explicit mock launch mode `provider-stream`. Both completed two invocations and close/explicit resume, retained distinct commentary and synthetic responses, rejected duplicate block identities and empty commentary headings, and reached idle status. After inspecting the effective Normal-mode `<Tab>` mapping, two Tab presses expanded the commentary and its three-tool group. The cursor stayed on the selected heading. Screenshots and transcript-node records confirm all three tools remain attached to the original commentary group.
 
-   ```console
-   rustfmt +1.94.0 --edition 2024 --config skip_children=true --check crates/forge-harness/src/backend/copilot/event_decoder/stream.rs
-   git diff --check
-   ```
+The 100-column launch initially lacked plugin paths. Adding the existing `D:/.local/share/nvim-data` plugin and parser paths to that isolated editor fixed setup. A 160-column launch initially passed literal single quotes to the Windows command interpreter. Correcting command quoting fixed startup. Neither issue required repository changes. The corrected startup command uses a distinct pipe per editor:
 
-2. **Recheck production lint and types.** From the same Rust workspace, require exit status 0 and no new warnings:
+```console
+nvim -u NONE -i NONE --listen \\.\pipe\forge-provider-followup-160 --cmd "set rtp^=D:/config/nvim" --cmd "set rtp+=D:/.local/share/nvim-data/lazy/render-markdown.nvim,D:/.local/share/nvim-data/lazy/nvim-treesitter,D:/.local/share/nvim-data/site" -c "lua vim.g.forge_provider_stream_grid=true; vim.g.forge_provider_stream_keep_open=true; dofile('nvim/tests/forge/support/provider_stream_host.lua')"
+```
 
-   ```console
-   cargo clippy --profile dev --locked -p forge-harness --lib --no-deps --message-format short
-   ```
+Terminal records are `terminal-100-*.json` and `terminal-160-*.json`, including identities, expanded nodes, screens, and cleanup. Both owned hosts were collected, both owned editors exited, and their dedicated terminal sessions were destroyed. The user's editor was not controlled or closed.
 
-3. **Run the exact fallback regression first.** If compilation fails, correct the compiler error and retry this same test before starting other tests:
+## Execution checkpoint
 
-   ```console
-   cargo test --profile dev --locked -p forge-harness --lib backend::copilot::event_decoder::tests::idle_synthesizes_latest_commentary_as_a_distinct_response_once -- --exact
-   ```
+- [x] Resolve both stash conflicts and verify the resolved fixtures.
+- [x] Verify the timestamp-helper cleanup, production types, focused tests, formatting, and Clippy.
+- [x] Rebuild once and verify fresh hosts against the new executable.
+- [x] `empty-transcript-verify`: complete, including both terminal dimensions, expansion, cursor preservation, and explicit close/resume.
+- [x] `provider-contract-docs`: complete. Existing provider, Harness, host/protocol, and command documentation remains in place. This file records current validation and limits.
+- [x] Preserve the stash and unrelated work. Record the final whitespace and unmerged-index audit in `final-audit.json`.
 
-4. **Verify the affected decoder and timing boundaries.** After the exact regression passes, run the related decoder and compaction cases:
-
-   ```console
-   cargo test --profile dev --locked -p forge-harness --lib -- backend::copilot::event_decoder:: backend::copilot::compaction::tests::
-   ```
-
-   The exact command for the previously passing 78-test matrix is preserved in `typed-contract-final-targeted-2.json`. Reuse passing results for unaffected boundaries. Do not expand to the full workspace merely to reconfirm them.
-
-5. **Rebuild the runtime executable.** From `nvim/rust/forge`, require a recorded passing build:
-
-   ```console
-   cargo build --manifest-path Cargo.toml --profile dev --bin forge --locked
-   ```
-
-   The artifact is `nvim/rust/forge/target/debug/forge`. Existing editors retain their process-owned executable copies, so runtime verification must start a fresh test host.
-
-6. **Repeat the registered host fixture against that build.** From the repository root, use the exact runner command and stdin request recorded in `typed-contract-host-final-2.json`. Select only `nvim/tests/forge/harness_message_folds_host.lua`. The fixture deadline is 90 seconds and the outer command deadline is 120 seconds. Require exit status 0 and `{"passed":1,"failed":0}`.
-
-   The passing close/resume path uses `session_navigation.resume(session_id)` and refreshes the current presentation owner. A no-argument `open_harness()` attempt reused a stale initial snapshot and did not recreate the presentation. That separate path was not changed or claimed as verified.
-
-7. **Finalize the handoff records.** Update the execution checkpoint in the session `plan.md`, which still contains stale in-progress text. Assemble the final validation summary from the existing logs and the new recheck results. Mark `empty-transcript-verify` and `provider-contract-docs` done only after the final checks and fresh-host run pass. No commit was requested.
-
-If any compiled source changes during these steps, repeat affected checks and rebuild before using host-test results as proof.
+The original `~/.copilot/session-state/6b91bc77-dfd4-4ed0-995f-01a76a21b0c3/plan.md` and its evidence directory could not be found. This file serves as the available completion checkpoint. The missing historical plan was not recreated.
 
 ## Existing failures and limits
 
-Do not silently treat these as new regressions or fix them outside the requested scope:
+- The previous handoff reported 78 passing targeted Rust tests. This follow-up reran the affected decoder and compaction boundary, not that entire historical matrix or the full workspace.
+- The previous Clippy warnings at `buffer/projection.rs:1675` and `buffer/transcript.rs:352` did not reproduce in the fresh lint run.
+- The previously recorded `broker::test::native_goal_turns_start_separate_exchanges_and_route_late_usage` failure (`left: 0`, `right: 2`) remains outside this task. It was not rerun or claimed fixed.
+- The standalone SDK observations remain limited to SDK 1.0.7, CLI 1.0.98, and `gpt-6.1-terra`. They do not establish a closed phase vocabulary for every Copilot model.
+- No authenticated live-provider calls or ignored live tests were run. The public integration target was compiled only.
+- Close/resume uses `session_navigation.resume(session_id)`. No-argument `open_harness()` after closing was not changed or claimed verified.
+- StyLua was previously unavailable and no formatter was installed. The resolved Lua fixtures passed syntax checks and execution.
 
-- Clippy retains the existing `too_many_arguments` warning at `buffer/projection.rs:1675` and `nonminimal_bool` warning at `buffer/transcript.rs:352`.
-- `broker::test::native_goal_turns_start_separate_exchanges_and_route_late_usage` still fails with `left: 0`, `right: 2`. The recorded original baseline has the identical assertion failure. It was not included in the passing 78-test matrix.
-- The standalone SDK probe established observations for SDK 1.0.7, CLI 1.0.98, and `gpt-6.1-terra`, not a closed phase vocabulary for every Copilot model. It covered 36 executions, 18 scenarios, 38 prompts, and 44 tool attempts.
-- No authenticated live-provider calls were made during implementation. Do not run ignored live tests without authorization.
-- StyLua was unavailable on PATH and at the checked Mason path. No formatter was installed. The Lua fixtures were syntax-checked and executed through the real host runner.
+## Historical evidence and source locations
 
-## Evidence and source locations
 
-The approved plan is stored at:
+The previous handoff referenced this approved plan:
 
 `~/.copilot/session-state/6b91bc77-dfd4-4ed0-995f-01a76a21b0c3/plan.md`
 
-All evidence filenames below are relative to that session's `files/` directory. Command reports contain exact argument arrays, deadlines, exit statuses, durations, and log paths.
+That session directory is unavailable in this checkout and the checked user profile. Its plan and logs were not recreated or modified. The filenames below preserve the historical references under its `files/` directory. Their previously reported results were not independently reread during this follow-up.
 
 - `typed-contract-final-targeted-2.json` and `.log`: passing 78-test matrix.
 - `typed-contract-wire-regression-2.json` and `.log`: broker event draining plus real editor-wire serialization.
