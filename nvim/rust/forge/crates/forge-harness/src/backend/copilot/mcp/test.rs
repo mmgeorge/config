@@ -331,7 +331,14 @@ async fn mcp_failures_keep_prompt_and_catalog_available() {
 async fn mcp_timeout_preserves_healthy_servers_and_session() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let fixture = Fixture::new(&["healthy"]).await;
-        let session = fixture.backend.session(&fixture.prompt()).await.unwrap();
+        let session = fixture
+            .backend
+            .session(
+                &fixture.prompt(),
+                crate::backend::copilot::CopilotSessionReuse::Compatible,
+            )
+            .await
+            .unwrap();
         let launch = vec![
             (
                 "stalled".into(),
@@ -397,7 +404,14 @@ async fn mcp_timeout_preserves_healthy_servers_and_session() {
 async fn mcp_selection_failure_still_rejects_unselected_tools() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let fixture = Fixture::new(&["rogue"]).await;
-        let session = fixture.backend.session(&fixture.prompt()).await.unwrap();
+        let session = fixture
+            .backend
+            .session(
+                &fixture.prompt(),
+                crate::backend::copilot::CopilotSessionReuse::Compatible,
+            )
+            .await
+            .unwrap();
         let failure = start(
             &session,
             &[],

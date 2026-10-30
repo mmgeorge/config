@@ -1,100 +1,47 @@
 # Updating Tree-sitter
 
-A grammar update must preserve both syntax rendering and the structural data used
-by planning. A parser that builds successfully can still rename nodes, invalidate
-queries, move token positions, or change declaration extraction.
+A parser that builds can still rename nodes, invalidate queries, move token positions, or change declaration extraction, so a successful compile proves little. This guide takes a grammar update through each consumer. It assumes familiarity with [Languages](architecture/languages.md). To add a language, see [Adding language support](adding-language.md).
 
-Read [Languages](architecture/languages.md) and use the release workflow in
-[Building and testing](building-and-testing.md). Add a new language through the
-broader [language integration procedure](adding-language.md).
+Paths are relative to `nvim/rust/forge/crates/forge-diff/` unless stated otherwise.
 
 ## Asset ownership
 
 | Path | Owns |
 | --- | --- |
-| `nvim/rust/forge/crates/forge-diff/Cargo.toml` and `Cargo.lock` | Upstream grammar dependencies and resolved versions or Git revisions |
-| `nvim/rust/forge/crates/forge-diff/grammar/manifest.json` | Remaining local grammar exceptions, revisions, file inventory, and hashes |
-| `nvim/rust/forge/crates/forge-diff/grammar/<language>/` | Exception-only vendored parser, scanner, headers, metadata, and license |
-| `nvim/rust/forge/crates/forge-diff/build.rs` | Compilation of the remaining local parsers/scanners |
-| `nvim/rust/forge/crates/forge-diff/query/manifest.json` | Vendored query provenance and hashes |
-| `nvim/rust/forge/crates/forge-diff/query/` | Queries embedded by the native syntax service |
-| `nvim/rust/forge/crates/forge-diff/src/syntax/assets.rs` | Grammar entry points, language mapping, and embedded query selection |
-| `nvim/queries/` | Neovim runtime query overrides, separate from the Rust query inventory |
+| `Cargo.toml` and the workspace `Cargo.lock` | Upstream grammar dependencies and pinned revisions |
+| `grammar/manifest.json` and `grammar/<language>/` | Local grammar exceptions, file inventory, and hashes |
+| `build.rs` | Compilation of local parsers and scanners |
+| `query/manifest.json` and `query/` | Embedded queries and their provenance |
+| `src/syntax/assets.rs` | Grammar entry points, language mapping, and query selection |
+| `nvim/queries/` (repository root) | Neovim runtime query overrides, separate from the Rust queries |
 
-Prefer an upstream Cargo grammar crate over copying parser sources. Use a pinned
-upstream Git dependency when the required compatible binding is not published.
-Keep local sources only for a necessary patch or incompatible upstream binding.
-WGSL, CUE, and LaTeX currently retain local bindings for runtime compatibility.
-The repository-owned Algorithm grammar has no upstream dependency. Its `grammar.js` and
-generated assets live under `grammar/algorithm/`. Regenerate it with the CLI version and ABI
-recorded in its README and manifest, then refresh its grammar and highlight-query hashes.
-Do not update only Neovim's parser installation and assume the native parser
-changed. For local exceptions, never replace generated `parser.c` without its
-required scanner, headers, node metadata, and provenance.
+Prefer an upstream Cargo grammar crate. Keep local sources only for a required patch or an incompatible binding, as WGSL, CUE, and LaTeX do. Updating Neovim's parser installation does not change the native parser.
 
-Harness's PowerShell grammar uses the Cargo patch under
-`nvim/rust/forge/vendor/tree-sitter-powershell/`. Its `FORGE-PATCH.md` and
-`grammar.patch` record the upstream base and local source changes, and
-`nvim/rust/forge/vendor/grammar-manifest.json` records all vendored bytes.
-Regenerate with the recorded CLI and ABI before refreshing those hashes.
-The remaining shell grammars retain their Cargo or native grammar manifest pins.
+Two grammars have their own process. The repository-owned Algorithm grammar lives under `grammar/algorithm/`, so regenerate it with the CLI version and ABI in its README, then refresh its hashes. The PowerShell grammar is a Cargo patch under `nvim/rust/forge/vendor/tree-sitter-powershell/`, where `FORGE-PATCH.md` records the upstream base, and `vendor/grammar-manifest.json` records its bytes.
 
-## Update sequence
+## Update steps
 
-1. **Record the existing asset selection.** Identify the Cargo package or local
-   manifest entry, exact revision, and every query consumer for the language.
-
-2. **Update the upstream dependency.** Change the grammar crate version or Git
-   revision and refresh its lockfile entry. For a required local exception, copy
-   only the manifest-listed files and license from one pinned revision. If parser
-   generation is necessary, use its supported generator and declared ABI. Do not
-   hand-edit generated parser tables.
-
-3. **Reconcile the build and runtime mapping.** Verify the dependency's Rust language
-   entry point and `SyntaxLanguage` mapping. Check C exports, scanner requirements,
-   and `GRAMMAR` source locations only for local exceptions. Update the Tree-sitter
-   runtime only when required, then verify every configured grammar against it.
-
-4. **Reconcile query and extraction behavior.** Compare `node-types.json` and grammar
-   fields with native queries, Neovim query overrides, and language branches under
-   `src/syntax/`. Review highlighting, injections, captures, function owners,
-   declaration roles, visibility, and member-token coordinates.
-
-5. **Refresh local asset hashes and verify provenance.** Update only entries whose bytes
-   changed. From the repository root, run the existing inventory check:
+1. **Record the current selection.** Note the Cargo package or manifest entry, its revision, and every query consumer.
+2. **Update the dependency.** Change the crate version or Git revision and refresh the lockfile. For a local exception, copy only the manifest-listed files and license from one pinned revision. Never hand-edit generated parser tables.
+3. **Check the runtime mapping.** Verify the Rust language entry point and `SyntaxLanguage` mapping. Update the Tree-sitter runtime only when required, then verify every grammar against it.
+4. **Reconcile queries and extraction.** Compare `node-types.json` and grammar fields with native queries, Neovim overrides, and the language branches under `src/syntax/`.
+5. **Refresh hashes.** Update only entries whose bytes changed, then run the inventory check from the repository root. A digest mismatch names the exact file. A `Source has no owner` diagnostic is an unrelated inventory entry, so resolve it separately.
 
    ```nu
    nu nvim/tools/check_forge_migration.nu
    ```
 
-   A passing result reports verified assets. A digest mismatch identifies the
-   exact vendored file that differs. This check also validates the repository's
-   migration inventory, so investigate that diagnostic separately if an unrelated
-   source-ownership record fails.
-
-6. **Run targeted native regression tests.** Use the development target from the build
-   guide. Exercise syntax, injection/highlight cases, extraction, declaration
-   formatting, and source mapping for the affected language. Add a regression
-   fixture for every intentional query or node-shape change.
-   Nushell also supplies Harness shell parsing, so run its `permissions::` tests
-   and preserve rejection of unresolved commands and environment mutations.
-
-7. **Rebuild Forge and verify editor behavior.** Check rendered highlighting and
-   plan navigation in a fresh Neovim host. Confirm that existing project LSP
-   definitions still receive the correct member-token position.
-
-8. **Update the documentation.** Record changed language capabilities or integration
-   steps in the language architecture and contribution guide. Keep version-specific
-   facts in manifests and lockfiles instead of duplicating a second version list.
+6. **Run targeted tests.** Exercise syntax, injections, extraction, formatting, and source mapping for the language, and add a regression fixture for each intentional change. Nushell, Bash, Zsh, and PowerShell also supply shell approval analysis, so run the `permissions::` tests and confirm unresolved commands stay rejected.
+7. **Verify in the editor.** Rebuild, then check highlighting and plan navigation in a fresh host, and confirm project LSP definitions still get the right member-token position.
+8. **Update documentation.** Keep version facts in manifests and lockfiles, not in prose.
 
 ## Failure recovery
 
 | Failure | Response |
 | --- | --- |
-| Query compilation rejects a node or field | Update the query for the pinned grammar and add a focused regression |
-| Missing parser/scanner symbol at link time | Check `build.rs`, the vendored file inventory, and grammar entry-point mapping |
-| A manifest hash differs | Verify upstream provenance before changing the recorded hash |
-| The migration check reports `Source has no owner` | Resolve the named migration-inventory entry separately from parser/query hash failures |
-| Declarations save but navigation shifts columns | Compare byte positions, multiline syntax, and injected-language offsets |
-| Highlighting changes unexpectedly | Check query ordering, priorities, injections, and Neovim/native asset differences |
-| The editor uses old behavior after a successful build | Start a fresh Forge host or restart Neovim |
+| A query rejects a node or field | Update the query for the pinned grammar, and add a regression. |
+| A parser or scanner symbol is missing at link time | Check `build.rs`, the file inventory, and the entry-point mapping. |
+| A manifest hash differs | Verify upstream provenance before changing the recorded hash. |
+| Navigation columns shift | Compare byte positions, multiline syntax, and injected-language offsets. |
+| Highlighting changes unexpectedly | Check query order, priorities, and injections. |
+| The editor shows old behavior after a build | Start a fresh Forge host. |

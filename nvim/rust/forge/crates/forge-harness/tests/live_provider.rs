@@ -33,6 +33,8 @@ mod copilot_real;
 mod session_resume;
 #[path = "live_provider/text_generation.rs"]
 mod text_generation;
+#[path = "live_provider/workflows.rs"]
+mod workflows;
 
 fn catalog_request(workspace: &Path, session_id: &str) -> BackendCatalogRequest {
     BackendCatalogRequest {

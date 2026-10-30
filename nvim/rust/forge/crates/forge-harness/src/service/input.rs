@@ -4,11 +4,15 @@ use crate::input::{
     InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputRoute, InputUpdate,
 };
 
-#[derive(Clone, PartialEq, Eq)]
+/// Retain the acknowledged native selection together with its canonical task authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct NativeGoalSelection {
+    /// Provider conversation that owns the acknowledged update.
     pub(super) backend_session_id: String,
+    /// Canonical task authority observed when selecting the update.
     pub(super) revision: Option<crate::task::TaskRevision>,
-    pub(super) objective: Option<String>,
+    /// Complete native goal state selected by the canonical task.
+    pub(super) update: crate::backend::NativeGoalUpdate,
 }
 
 impl SessionController {
@@ -321,6 +325,7 @@ impl SessionController {
         Ok(())
     }
 
+    /// Reconcile retained lifecycle state and repair acknowledgments superseded during transport.
     pub(super) async fn reconcile_native_goal(
         &self,
         applied: &mut Option<NativeGoalSelection>,
@@ -328,59 +333,98 @@ impl SessionController {
         if !self.observer.native_goal_supported()? || !self.provider_ready().await {
             return Ok(());
         }
-        let session = SqliteStore::read_only(&self.data_root)?
-            .load_session(self.observer.session_id())?
-            .context("native goal session is missing")?;
-        let Some(backend_session_id) = session.backend_session_id.clone() else {
-            return Ok(());
-        };
-        let active = self.task_controller.current()?.filter(|task| {
-            task.entry_accepted() && task.status() == crate::task::TaskStatus::Running
-        });
-        let objective = active.as_ref().and_then(|task| match &task.workflow {
-            crate::task::TaskWorkflow::Goal { goal } if goal.native => Some(goal.objective.clone()),
-            _ => None,
-        });
-        let desired = NativeGoalSelection {
-            backend_session_id: backend_session_id.clone(),
-            revision: objective
-                .as_ref()
-                .and_then(|_| active.as_ref().map(|task| task.revision.clone())),
-            objective,
-        };
-        if applied.as_ref() == Some(&desired) {
+        loop {
+            // Capture the canonical task and provider identity before transport.
+            let session = SqliteStore::read_only(&self.data_root)?
+                .load_session(self.observer.session_id())?
+                .context("native goal session is missing")?;
+            let Some(backend_session_id) = session.backend_session_id.clone() else {
+                return Ok(());
+            };
+            let desired = self.native_goal_selection(backend_session_id.clone())?;
+            if applied.as_ref() == Some(&desired) {
+                return Ok(());
+            }
+            let request = crate::backend::BackendRequest {
+                execution_owner: None,
+                harness_session_id: session.id,
+                workspace: session.workspace,
+                input: crate::backend::BackendInput::from_text(""),
+                mode: crate::backend::PromptMode::GoalContinuation,
+                model: session.model,
+                effort: session.effort,
+                context_window: session.context_window,
+                service_tier: session.service_tier,
+                access: session.access,
+                approval_mode: session.approval_mode,
+                backend_session_id: Some(backend_session_id),
+                submission: None,
+                recovered_input: Vec::new(),
+                control_context: None,
+            };
+            // Apply only a still-current selection, without holding state guards across I/O.
+            if self.native_goal_selection(desired.backend_session_id.clone())? != desired {
+                continue;
+            }
+            self.backend
+                .goal_status(request, desired.update.clone())
+                .await?;
+            // A stale acknowledgment cannot authorize input or mark its old state applied.
+            let current_session = SqliteStore::read_only(&self.data_root)?
+                .load_session(self.observer.session_id())?
+                .context("native goal session is missing")?;
+            if current_session.backend_session_id.as_deref() != Some(&desired.backend_session_id)
+                || self.native_goal_selection(desired.backend_session_id.clone())? != desired
+            {
+                continue;
+            }
+            *applied = Some(desired);
             return Ok(());
         }
-        let request = crate::backend::BackendRequest {
-            execution_owner: None,
-            harness_session_id: session.id,
-            workspace: session.workspace,
-            input: crate::backend::BackendInput::from_text(""),
-            mode: crate::backend::PromptMode::GoalContinuation,
-            model: session.model,
-            effort: session.effort,
-            context_window: session.context_window,
-            service_tier: session.service_tier,
-            access: session.access,
-            approval_mode: session.approval_mode,
-            backend_session_id: Some(backend_session_id),
-            submission: None,
-            recovered_input: Vec::new(),
-            control_context: None,
+    }
+
+    /// Preserve suspended native tasks instead of treating them as deleted goals.
+    fn native_goal_selection(&self, backend_session_id: String) -> Result<NativeGoalSelection> {
+        use crate::backend::NativeGoalUpdate;
+        use crate::plan::PlanExecutionState;
+        use crate::task::TaskWorkflow;
+        let task = self.task_controller.current()?;
+        let update = match task.as_ref() {
+            Some(task) => match &task.workflow {
+                TaskWorkflow::Goal { goal } if goal.native => {
+                    let state =
+                        if !task.entry_accepted() && goal.state == crate::goal::GoalState::Active {
+                            crate::goal::GoalState::Paused
+                        } else {
+                            goal.state
+                        };
+                    NativeGoalUpdate::from_goal(goal.objective.clone(), state)
+                }
+                TaskWorkflow::Execute { execution } if execution.native => {
+                    let state = match execution.record.state {
+                        PlanExecutionState::Active if task.entry_accepted() => {
+                            crate::goal::GoalState::Active
+                        }
+                        PlanExecutionState::Active
+                        | PlanExecutionState::Paused
+                        | PlanExecutionState::Stalled => crate::goal::GoalState::Paused,
+                        PlanExecutionState::Complete => crate::goal::GoalState::Complete,
+                        PlanExecutionState::Blocked => crate::goal::GoalState::Blocked,
+                        PlanExecutionState::Cancelled => crate::goal::GoalState::Cleared,
+                    };
+                    NativeGoalUpdate::from_goal(execution.title.clone(), state)
+                }
+                TaskWorkflow::Goal { .. }
+                | TaskWorkflow::Execute { .. }
+                | TaskWorkflow::Plan { .. } => NativeGoalUpdate::Absent,
+            },
+            None => NativeGoalUpdate::Absent,
         };
-        self.backend
-            .goal_status(
-                request,
-                desired.objective.clone(),
-                if desired.objective.is_some() {
-                    "active"
-                } else {
-                    "cleared"
-                },
-            )
-            .await?;
-        *applied = Some(desired);
-        Ok(())
+        Ok(NativeGoalSelection {
+            backend_session_id,
+            revision: task.map(|task| task.revision),
+            update,
+        })
     }
 
     async fn admit_input(

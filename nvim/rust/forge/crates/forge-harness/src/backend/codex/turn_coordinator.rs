@@ -8,15 +8,33 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_FINALIZATION_ATTEMPT: usize = 3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Keeps the provider reader across turns until the owning native goal stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeGoalLifetime {
     Disabled,
     Active,
     Settled,
 }
 
+/// Drains native continuation after an admitted Harness goal termination.
+struct NativeGoalSettlement {
+    request_id: u64,
+    termination: crate::goal::GoalTermination,
+    acknowledged: bool,
+    terminal_evidence: Option<crate::goal::GoalState>,
+    interrupted_turn: HashSet<String>,
+    pending_interrupt: HashMap<u64, String>,
+}
+
+impl NativeGoalSettlement {
+    /// Keep the reader until native cleanup and every raced turn have settled.
+    fn drained(&self) -> bool {
+        self.acknowledged && self.interrupted_turn.is_empty() && self.pending_interrupt.is_empty()
+    }
+}
+
 impl NativeGoalLifetime {
+    /// Retain the reader only when the admitted task owns a native goal.
     fn for_request(request: &BackendRequest) -> Self {
         if request
             .control_context
@@ -62,19 +80,96 @@ fn steering_prompt(command: &SteerCommand) -> String {
 #[derive(Default)]
 struct DescendantTracker {
     active_turn_by_thread: HashMap<String, Option<String>>,
+    owned_thread: HashSet<String>,
+    observed_turn: HashMap<String, ObservedDescendantTurn>,
+}
+
+/// Retain early child turn evidence without treating it as proof of ancestry.
+enum ObservedDescendantTurn {
+    Active(String),
+    Completed(String),
+}
+
+impl ObservedDescendantTurn {
+    /// Get the exact turn named by either lifecycle observation.
+    fn id(&self) -> &str {
+        match self {
+            Self::Active(id) | Self::Completed(id) => id,
+        }
+    }
 }
 
 impl DescendantTracker {
+    /// Admit child lifecycle evidence only through trusted parent relationships.
     fn observe(&mut self, message: &Value, parent_thread_id: &str) {
+        // Buffer transport observations until a trusted parent establishes child ownership.
+        if let (Some(thread_id), Some(turn_id)) =
+            (message_thread_id(message), message_turn_id(message))
+            && thread_id != parent_thread_id
+        {
+            match message.get("method").and_then(Value::as_str) {
+                Some("turn/started") => {
+                    self.observed_turn.insert(
+                        thread_id.into(),
+                        ObservedDescendantTurn::Active(turn_id.into()),
+                    );
+                }
+                Some("turn/completed")
+                    if self
+                        .observed_turn
+                        .get(thread_id)
+                        .is_none_or(|turn| turn.id() == turn_id) =>
+                {
+                    self.observed_turn.insert(
+                        thread_id.into(),
+                        ObservedDescendantTurn::Completed(turn_id.into()),
+                    );
+                }
+                _ => {}
+            }
+        }
+        // Admit relationships only through the root or an already owned ancestor.
         for lifecycle in agent_lifecycle_list(message) {
+            let trusted_parent = lifecycle.parent_thread_id.as_deref().is_some_and(|parent| {
+                parent == parent_thread_id || self.owned_thread.contains(parent)
+            });
+            if !trusted_parent {
+                continue;
+            }
             let Some(thread_id) = lifecycle.provider_thread_id else {
                 continue;
             };
             if thread_id == parent_thread_id {
                 continue;
             }
+            // A retained child can rejoin through an explicit operation from its trusted parent.
+            let resumes_child = lifecycle.status.is_active()
+                && matches!(
+                    lifecycle.operation.to_ascii_lowercase().as_str(),
+                    "sendinput" | "wait" | "resumeagent"
+                );
+            if lifecycle.starts_child || resumes_child {
+                self.owned_thread.insert(thread_id.clone());
+            }
+            if !self.owned_thread.contains(&thread_id) {
+                continue;
+            }
             if lifecycle.status.is_active() {
-                self.active_turn_by_thread.entry(thread_id).or_default();
+                match self.observed_turn.get(&thread_id) {
+                    Some(ObservedDescendantTurn::Active(turn_id)) => {
+                        self.active_turn_by_thread
+                            .insert(thread_id, Some(turn_id.clone()));
+                    }
+                    Some(ObservedDescendantTurn::Completed(_)) if resumes_child => {
+                        self.active_turn_by_thread.insert(thread_id, None);
+                    }
+                    Some(ObservedDescendantTurn::Completed(_)) => {
+                        self.active_turn_by_thread.remove(&thread_id);
+                    }
+                    None => {
+                        self.active_turn_by_thread.entry(thread_id).or_default();
+                    }
+                }
             } else {
                 self.active_turn_by_thread.remove(&thread_id);
             }
@@ -83,6 +178,7 @@ impl DescendantTracker {
             && let (Some(thread_id), Some(turn_id)) =
                 (message_thread_id(message), message_turn_id(message))
             && thread_id != parent_thread_id
+            && self.owned_thread.contains(thread_id)
         {
             self.active_turn_by_thread
                 .insert(thread_id.into(), Some(turn_id.into()));
@@ -147,9 +243,21 @@ struct DescendantCleanup {
     command: SteerCommand,
     thread: HashSet<String>,
     target: HashSet<(String, String)>,
-    pending_request: HashSet<u64>,
+    pending_request: HashMap<u64, CleanupRequest>,
     deadline: tokio::time::Instant,
     parent: Option<crate::backend::SteerTarget>,
+    command_item: HashMap<String, HashSet<crate::backend::ToolId>>,
+    terminal_verified: HashSet<String>,
+    terminal_found: HashSet<String>,
+    terminal_cursor: HashMap<String, HashSet<String>>,
+}
+
+/// Keep native request acknowledgments bound to the cleanup operation that issued them.
+enum CleanupRequest {
+    GoalPause,
+    TurnInterrupt { target: crate::backend::SteerTarget },
+    TerminalList { thread_id: String },
+    TerminalTerminate { thread_id: String },
 }
 
 fn is_parent_wait_message(message: &Value, parent_thread_id: &str) -> bool {
@@ -218,6 +326,11 @@ pub(super) struct CodexTurnCoordinator<'a> {
     stopping: bool,
     native_goal: NativeGoalLifetime,
     provider_goal_active: bool,
+    goal_settlement: Option<NativeGoalSettlement>,
+    owned_turn: HashSet<(String, crate::backend::ProviderTurnId)>,
+    command_item: HashMap<String, HashSet<crate::backend::ToolId>>,
+    observed_command:
+        HashMap<(String, crate::backend::ProviderTurnId), HashSet<crate::backend::ToolId>>,
 }
 
 impl<'a> CodexTurnCoordinator<'a> {
@@ -248,7 +361,11 @@ impl<'a> CodexTurnCoordinator<'a> {
             cleanup: None,
             stopping: false,
             provider_goal_active,
+            goal_settlement: None,
             native_goal: NativeGoalLifetime::for_request(request),
+            owned_turn: HashSet::new(),
+            command_item: HashMap::new(),
+            observed_command: HashMap::new(),
         }
     }
 
@@ -277,6 +394,8 @@ impl<'a> CodexTurnCoordinator<'a> {
         provider_started: bool,
         observed_message_list: Vec<Value>,
     ) -> Result<Value> {
+        self.owned_turn
+            .insert((self.thread_id.into(), turn_id.clone().into()));
         let mut last_completion = Value::Null;
         let mut parent_turn = Some(ParentTurn {
             id: turn_id,
@@ -285,7 +404,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         });
         for message in observed_message_list {
             self.descendant.observe(&message, self.thread_id);
-            self.observe_goal(&message);
+            self.observe_native_state(&message)?;
             if let Some(turn_id) =
                 CodexBackend::notification_thread_turn_id(&message, "turn/started", self.thread_id)
             {
@@ -309,11 +428,19 @@ impl<'a> CodexTurnCoordinator<'a> {
         }
         let mut pending_command = HashMap::<u64, SteerCommand>::new();
         loop {
+            self.synchronize_goal_control().await?;
+            if self.goal_settlement.is_some() && !self.goal_control_is_current() {
+                return Err(crate::task::StaleTask.into());
+            }
             if parent_turn.is_none()
                 && (self.stopping || self.native_goal != NativeGoalLifetime::Active)
                 && self.cleanup.is_none()
                 && self.descendant.active_count() == 0
                 && pending_command.is_empty()
+                && self
+                    .goal_settlement
+                    .as_ref()
+                    .is_none_or(NativeGoalSettlement::drained)
             {
                 return Ok(last_completion);
             }
@@ -337,13 +464,16 @@ impl<'a> CodexTurnCoordinator<'a> {
                         if message_thread_id(message.message()) == Some(self.thread_id)
                             && message_turn_id(message.message()).is_some_and(|turn_id| turn_id != active.id) {
                             self.process.set_activity_publication(false);
-                            self.process.publish_received(message, self.output).await?;
+                            let message = self.process.publish_received(message, self.output).await?;
                             self.process.set_activity_publication(true);
+                            self.observe_native_state(&message)?;
+                            self.drain_settled_goal_turn(&message).await?;
                             continue;
                         }
                         let message = self.process.publish_received(message, self.output).await?;
-                        self.observe_goal(&message);
                         self.descendant.observe(&message, self.thread_id);
+                        self.observe_native_state(&message)?;
+                        self.drain_settled_goal_turn(&message).await?;
                         self.admit_cleanup_targets().await;
                         self.complete_pending_command(&message, &mut pending_command).await?;
                         self.complete_cleanup_request(&message).await?;
@@ -361,7 +491,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                         if let Some(completion) = active.completion.take() {
                             last_completion = completion;
                             parent_turn = None;
-                            if self.descendant.active_count() == 0 && pending_command.is_empty() && self.cleanup.is_none() && (self.stopping || self.native_goal != NativeGoalLifetime::Active) {
+                            if self.descendant.active_count() == 0 && pending_command.is_empty() && self.cleanup.is_none() && (self.stopping || self.native_goal != NativeGoalLifetime::Active) && self.goal_settlement.as_ref().is_none_or(NativeGoalSettlement::drained) {
                                 self.clear_wait().await?;
                                 return Ok(last_completion);
                             }
@@ -411,9 +541,12 @@ impl<'a> CodexTurnCoordinator<'a> {
                 }
                 message = self.process.receive_message() => {
                     let message = self.process.publish_received(message?, self.output).await?;
-                    self.observe_goal(&message);
                     let had_active = self.descendant.active_count() > 0;
                     self.descendant.observe(&message, self.thread_id);
+                    self.observe_native_state(&message)?;
+                    if self.drain_settled_goal_turn(&message).await? {
+                        continue;
+                    }
                     self.admit_cleanup_targets().await;
                     self.complete_pending_command(&message, &mut pending_command).await?;
                     self.complete_cleanup_request(&message).await?;
@@ -432,7 +565,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                     }
                     if self.native_goal == NativeGoalLifetime::Settled {
                         self.clear_wait().await?;
-                        if pending_command.is_empty() { return Ok(last_completion); }
+                        if self.cleanup.is_none() && pending_command.is_empty() && self.goal_settlement.as_ref().is_none_or(NativeGoalSettlement::drained) { return Ok(last_completion); }
                         continue;
                     }
                     if !had_active {
@@ -440,7 +573,8 @@ impl<'a> CodexTurnCoordinator<'a> {
                     }
                     self.clear_wait().await?;
                     if self.stopping {
-                        return Ok(Value::Null);
+                        if self.cleanup.is_none() && pending_command.is_empty() && self.goal_settlement.as_ref().is_none_or(NativeGoalSettlement::drained) { return Ok(Value::Null); }
+                        continue;
                     }
                     self.finalization_attempt += 1;
                     anyhow::ensure!(
@@ -455,11 +589,13 @@ impl<'a> CodexTurnCoordinator<'a> {
         }
     }
 
+    /// Admit a follow-up turn and retain native activity received before its acknowledgment.
     async fn start_parent_turn(
         &mut self,
         text: String,
         submission: Option<std::sync::Arc<super::super::submission::Submission>>,
     ) -> Result<ParentTurn> {
+        // Prepare the next turn without borrowing command authority from its predecessor.
         let mut request = self.request.clone();
         request.submission = submission;
         let input = crate::attachment::codex_input(text, self.request.input.attachments()).await?;
@@ -493,6 +629,9 @@ impl<'a> CodexTurnCoordinator<'a> {
             .and_then(Value::as_str)
             .context("Codex follow-up turn omitted turn id")?
             .to_owned();
+        // Bind early provider activity to the acknowledged turn before replaying it.
+        self.owned_turn
+            .insert((self.thread_id.into(), id.clone().into()));
         let mut parent = ParentTurn {
             id,
             provider_started,
@@ -500,7 +639,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         };
         for message in observed_message_list {
             self.descendant.observe(&message, self.thread_id);
-            self.native_goal.observe(&message, self.thread_id);
+            self.observe_native_state(&message)?;
             parent.observe(&message, self.thread_id);
         }
         Ok(parent)
@@ -643,7 +782,7 @@ impl<'a> CodexTurnCoordinator<'a> {
             tokio::time::Instant::now(),
         )
         .await;
-        let Some(request_id) = message.get("id").and_then(Value::as_u64) else {
+        let Some(request_id) = CodexJsonRpc::response_id(message) else {
             return Ok(());
         };
         let Some(command) = pending_command.remove(&request_id) else {
@@ -691,6 +830,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         Ok(())
     }
 
+    /// Collect native turns and their exact command processes before releasing execution ownership.
     async fn start_cleanup(&mut self, command: SteerCommand, parent_turn_id: Option<&str>) {
         if self.cleanup.is_some() {
             command
@@ -700,10 +840,15 @@ impl<'a> CodexTurnCoordinator<'a> {
                 .await;
             return;
         }
+        // Capture the owned execution tree before requesting native interruption.
         let thread = self.descendant.active_thread_list();
         self.stopping = true;
         self.process.cancel_request_work();
-        if thread.is_empty() && parent_turn_id.is_none() && !self.provider_goal_active {
+        if thread.is_empty()
+            && parent_turn_id.is_none()
+            && !self.provider_goal_active
+            && self.command_item.is_empty()
+        {
             command
                 .complete(self.process.collect_requests(self.output).await)
                 .await;
@@ -713,13 +858,18 @@ impl<'a> CodexTurnCoordinator<'a> {
             command,
             thread: thread.into_iter().collect(),
             target: HashSet::new(),
-            pending_request: HashSet::new(),
+            pending_request: HashMap::new(),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             parent: parent_turn_id.map(|turn_id| crate::backend::SteerTarget {
                 thread_id: self.thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
             }),
+            command_item: self.command_item.clone(),
+            terminal_verified: HashSet::new(),
+            terminal_found: HashSet::new(),
+            terminal_cursor: HashMap::new(),
         };
+        // Suspend native continuation before collecting turn and command acknowledgments.
         if self.provider_goal_active {
             match self
                 .process
@@ -732,7 +882,9 @@ impl<'a> CodexTurnCoordinator<'a> {
                 .await
             {
                 Ok(request_id) => {
-                    cleanup.pending_request.insert(request_id);
+                    cleanup
+                        .pending_request
+                        .insert(request_id, CleanupRequest::GoalPause);
                 }
                 Err(error) => {
                     cleanup.command.complete(Err(error)).await;
@@ -749,11 +901,204 @@ impl<'a> CodexTurnCoordinator<'a> {
         }
     }
 
-    fn observe_goal(&mut self, message: &Value) {
-        if let Some(state) = native_goal_state(message, self.thread_id) {
+    /// Validate the accepted control against the current task before stopping its native goal.
+    fn goal_control_is_current(&self) -> bool {
+        let Some(control) = self.output.completion.goal_control.as_ref() else {
+            return false;
+        };
+        self.request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.task_controller.as_ref())
+            .and_then(|controller| controller.current().ok().flatten())
+            .is_some_and(|task| control.permit.validate(Some(&task)).is_ok())
+    }
+
+    /// Stop native auto-continuation only after canonical goal control was accepted.
+    async fn synchronize_goal_control(&mut self) -> Result<()> {
+        if self.native_goal != NativeGoalLifetime::Active
+            || self.goal_settlement.is_some()
+            || !self.goal_control_is_current()
+        {
+            return Ok(());
+        }
+        let termination = self
+            .output
+            .completion
+            .goal_control
+            .as_ref()
+            .unwrap()
+            .termination;
+        let request_id = self
+            .process
+            .send_request(
+                "thread/goal/set",
+                json!({
+                    "threadId":self.thread_id,
+                    "status":match termination {
+                        crate::goal::GoalTermination::Complete => "complete",
+                        crate::goal::GoalTermination::Blocked => "blocked",
+                    },
+                    "origin":"automatic",
+                }),
+            )
+            .await?;
+        self.goal_settlement = Some(NativeGoalSettlement {
+            request_id,
+            termination,
+            acknowledged: false,
+            terminal_evidence: None,
+            interrupted_turn: HashSet::new(),
+            pending_interrupt: HashMap::new(),
+        });
+        Ok(())
+    }
+
+    /// Interrupt raced automatic turns while retaining their terminal acknowledgments.
+    async fn drain_settled_goal_turn(&mut self, message: &Value) -> Result<bool> {
+        let current = self.goal_control_is_current();
+        let Some(settlement) = self.goal_settlement.as_mut() else {
+            return Ok(false);
+        };
+        if let Some(turn_id) =
+            CodexBackend::notification_thread_turn_id(message, "turn/started", self.thread_id)
+        {
+            if !current {
+                return Ok(true);
+            }
+            if settlement.interrupted_turn.insert(turn_id.into()) {
+                let request_id = self
+                    .process
+                    .send_request(
+                        "turn/interrupt",
+                        json!({
+                            "threadId":self.thread_id, "turnId":turn_id,
+                        }),
+                    )
+                    .await?;
+                settlement
+                    .pending_interrupt
+                    .insert(request_id, turn_id.into());
+            }
+            return Ok(true);
+        }
+        if let Some(turn_id) =
+            CodexBackend::notification_thread_turn_id(message, "turn/completed", self.thread_id)
+        {
+            return Ok(settlement.interrupted_turn.remove(turn_id));
+        }
+        Ok(false)
+    }
+
+    /// Retain owned native command and goal evidence before acknowledging terminal cleanup.
+    fn observe_native_state(&mut self, message: &Value) -> Result<()> {
+        // Retain exact command ownership even after the provider ends its turn.
+        if let (Some(thread_id), Some(turn_id)) =
+            (message_thread_id(message), message_turn_id(message))
+        {
+            if message.get("method").and_then(Value::as_str) == Some("turn/completed")
+                && let Some(cleanup) = self.cleanup.as_mut()
+                && cleanup.command_item.contains_key(thread_id)
+            {
+                cleanup.terminal_verified.remove(thread_id);
+            }
+            if message.get("method").and_then(Value::as_str) == Some("turn/started")
+                && (thread_id == self.thread_id
+                    || self
+                        .descendant
+                        .active_turn_by_thread
+                        .contains_key(thread_id))
+            {
+                self.owned_turn.insert((thread_id.into(), turn_id.into()));
+            }
+            if message.get("method").and_then(Value::as_str) == Some("item/started")
+                && message.pointer("/params/item/type").and_then(Value::as_str)
+                    == Some("commandExecution")
+                && let Some(item_id) = message.pointer("/params/item/id").and_then(Value::as_str)
+            {
+                self.observed_command
+                    .entry((thread_id.into(), turn_id.into()))
+                    .or_default()
+                    .insert(item_id.into());
+            }
+        }
+        // Promote early observations only after trusted ancestry identifies their exact turn.
+        for thread_id in &self.descendant.owned_thread {
+            if let Some(turn) = self.descendant.observed_turn.get(thread_id) {
+                self.owned_turn
+                    .insert((thread_id.clone(), turn.id().into()));
+            }
+        }
+        for (owner, item) in &self.observed_command {
+            if !self.owned_turn.contains(owner) {
+                continue;
+            }
+            let retained = self.command_item.entry(owner.0.clone()).or_default();
+            for item_id in item {
+                if retained.insert(item_id.clone())
+                    && let Some(cleanup) = self.cleanup.as_mut()
+                {
+                    cleanup
+                        .command_item
+                        .entry(owner.0.clone())
+                        .or_default()
+                        .insert(item_id.clone());
+                    cleanup.terminal_verified.remove(&owner.0);
+                }
+            }
+        }
+        // Reconcile goal settlement independently from native command ownership.
+        let observed_state = native_goal_state(message, self.thread_id);
+        if let Some(state) = observed_state {
             self.provider_goal_active = state == crate::goal::GoalState::Active;
         }
         self.native_goal.observe(message, self.thread_id);
+        let current = self.goal_control_is_current();
+        let Some(settlement) = self.goal_settlement.as_mut() else {
+            return Ok(());
+        };
+        if let Some(state) = observed_state.filter(|state| *state != crate::goal::GoalState::Active)
+        {
+            settlement.terminal_evidence = Some(state);
+        }
+        if let Some(result) = CodexJsonRpc::request_result(
+            message,
+            settlement.request_id,
+            "persist explicitly terminated native goal",
+        ) {
+            result?;
+            settlement.acknowledged = true;
+            self.native_goal = NativeGoalLifetime::Settled;
+            self.provider_goal_active = false;
+        }
+        if let Some(request_id) = CodexJsonRpc::response_id(message)
+            && let Some(turn_id) = settlement.pending_interrupt.remove(&request_id)
+        {
+            let result = CodexJsonRpc::request_result(
+                message,
+                request_id,
+                "interrupt raced native goal turn",
+            )
+            .context("native goal interrupt response omitted its result")?;
+            // Natural completion can win the interrupt race; only this exact turn's evidence settles it.
+            if settlement.interrupted_turn.contains(&turn_id) {
+                result?;
+            }
+        }
+        // Acknowledgment persists the admitted outcome even when its notification arrives later.
+        if settlement.acknowledged && current {
+            self.native_goal = NativeGoalLifetime::Settled;
+            self.provider_goal_active = false;
+            self.output.completion.evidence.native_state = Some(
+                settlement
+                    .terminal_evidence
+                    .unwrap_or(match settlement.termination {
+                        crate::goal::GoalTermination::Complete => crate::goal::GoalState::Complete,
+                        crate::goal::GoalTermination::Blocked => crate::goal::GoalState::Blocked,
+                    }),
+            );
+        }
+        Ok(())
     }
 
     async fn admit_cleanup_targets(&mut self) {
@@ -785,7 +1130,9 @@ impl<'a> CodexTurnCoordinator<'a> {
                     cleanup
                         .target
                         .insert((target.thread_id.clone(), target.turn_id.clone()));
-                    cleanup.pending_request.insert(request_id);
+                    cleanup
+                        .pending_request
+                        .insert(request_id, CleanupRequest::TurnInterrupt { target });
                 }
                 Err(error) => {
                     cleanup.command.complete(Err(error)).await;
@@ -797,25 +1144,111 @@ impl<'a> CodexTurnCoordinator<'a> {
         self.settle_cleanup(tokio::time::Instant::now()).await;
     }
 
+    /// Decode cleanup acknowledgments and verify owned process absence independently of turn completion.
     async fn complete_cleanup_request(&mut self, message: &Value) -> Result<()> {
-        let Some(request_id) = message.get("id").and_then(Value::as_u64) else {
+        // Match the acknowledgment to its exact native cleanup request.
+        let Some(request_id) = CodexJsonRpc::response_id(message) else {
             self.settle_cleanup(tokio::time::Instant::now()).await;
             return Ok(());
         };
         let Some(mut cleanup) = self.cleanup.take() else {
             return Ok(());
         };
-        if !cleanup.pending_request.remove(&request_id) {
+        let Some(request) = cleanup.pending_request.remove(&request_id) else {
             self.cleanup = Some(cleanup);
             return Ok(());
-        }
+        };
+        // Advance only the inventory or termination operation that owns this acknowledgment.
         match CodexJsonRpc::request_result(message, request_id, "child cleanup")
             .context("Codex child cleanup response omitted its result")
         {
-            Ok(Ok(_)) => self.cleanup = Some(cleanup),
+            Ok(Ok(result)) => {
+                match request {
+                    CleanupRequest::GoalPause | CleanupRequest::TurnInterrupt { .. } => {}
+                    CleanupRequest::TerminalTerminate { thread_id } => {
+                        // A false response can mean natural exit; only another inventory proves absence.
+                        anyhow::ensure!(
+                            result.get("terminated").and_then(Value::as_bool).is_some(),
+                            "native terminal termination omitted its outcome"
+                        );
+                        cleanup.terminal_verified.remove(&thread_id);
+                    }
+                    CleanupRequest::TerminalList { thread_id } => {
+                        let rows = result
+                            .get("data")
+                            .and_then(Value::as_array)
+                            .context("native terminal inventory is missing")?;
+                        for row in rows {
+                            let item_id = row
+                                .get("itemId")
+                                .and_then(Value::as_str)
+                                .context("native terminal item identity is missing")?;
+                            if !cleanup.command_item.get(&thread_id).is_some_and(|owned| {
+                                owned.contains(&crate::backend::ToolId::from(item_id))
+                            }) {
+                                continue;
+                            }
+                            let process_id = row
+                                .get("processId")
+                                .and_then(Value::as_str)
+                                .context("native terminal process identity is missing")?;
+                            cleanup.terminal_found.insert(thread_id.clone());
+                            let request_id = self
+                                .process
+                                .send_request(
+                                    "thread/backgroundTerminals/terminate",
+                                    json!({"threadId":thread_id,"processId":process_id}),
+                                )
+                                .await?;
+                            cleanup.pending_request.insert(
+                                request_id,
+                                CleanupRequest::TerminalTerminate {
+                                    thread_id: thread_id.clone(),
+                                },
+                            );
+                        }
+                        if let Some(cursor) = result.get("nextCursor").and_then(Value::as_str) {
+                            anyhow::ensure!(
+                                cleanup
+                                    .terminal_cursor
+                                    .entry(thread_id.clone())
+                                    .or_default()
+                                    .insert(cursor.into()),
+                                "native terminal inventory repeated a pagination cursor"
+                            );
+                            let request_id = self
+                                .process
+                                .send_request(
+                                    "thread/backgroundTerminals/list",
+                                    json!({"threadId":thread_id,"cursor":cursor}),
+                                )
+                                .await?;
+                            cleanup
+                                .pending_request
+                                .insert(request_id, CleanupRequest::TerminalList { thread_id });
+                        } else if !cleanup.terminal_found.contains(&thread_id) {
+                            cleanup.terminal_verified.insert(thread_id);
+                        }
+                    }
+                }
+                self.cleanup = Some(cleanup);
+            }
             Ok(Err(error)) => {
-                cleanup.command.complete(Err(error)).await;
-                return Ok(());
+                // Natural completion settles only the exact turn targeted by this rejected interrupt.
+                let completed = match request {
+                    CleanupRequest::TurnInterrupt { target } => self
+                        .completed_turn
+                        .contains(&(target.thread_id, target.turn_id)),
+                    CleanupRequest::GoalPause
+                    | CleanupRequest::TerminalList { .. }
+                    | CleanupRequest::TerminalTerminate { .. } => false,
+                };
+                if completed {
+                    self.cleanup = Some(cleanup);
+                } else {
+                    cleanup.command.complete(Err(error)).await;
+                    return Ok(());
+                }
             }
             Err(error) => {
                 self.cleanup = Some(cleanup);
@@ -826,11 +1259,60 @@ impl<'a> CodexTurnCoordinator<'a> {
         Ok(())
     }
 
+    /// Release cleanup only after native turns and every owned command inventory have settled.
     async fn settle_cleanup(&mut self, now: tokio::time::Instant) {
-        let Some(cleanup) = self.cleanup.take() else {
+        let Some(mut cleanup) = self.cleanup.take() else {
             return;
         };
+        // Reconcile only command identities observed under this invocation's admitted turns.
+        let scan_thread = cleanup
+            .command_item
+            .keys()
+            .filter(|thread_id| {
+                !cleanup.terminal_verified.contains(*thread_id)
+                    && !cleanup
+                        .pending_request
+                        .values()
+                        .any(|request| match request {
+                            CleanupRequest::GoalPause | CleanupRequest::TurnInterrupt { .. } => {
+                                false
+                            }
+                            CleanupRequest::TerminalList { thread_id: pending }
+                            | CleanupRequest::TerminalTerminate { thread_id: pending } => {
+                                pending == *thread_id
+                            }
+                        })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for thread_id in scan_thread {
+            cleanup.terminal_found.remove(&thread_id);
+            cleanup.terminal_cursor.remove(&thread_id);
+            match self
+                .process
+                .send_request(
+                    "thread/backgroundTerminals/list",
+                    json!({"threadId":thread_id}),
+                )
+                .await
+            {
+                Ok(request_id) => {
+                    cleanup
+                        .pending_request
+                        .insert(request_id, CleanupRequest::TerminalList { thread_id });
+                }
+                Err(error) => {
+                    cleanup.command.complete(Err(error)).await;
+                    return;
+                }
+            }
+        }
+        // Commit completion only after every native effect has positive terminal evidence.
         if cleanup.pending_request.is_empty()
+            && cleanup
+                .command_item
+                .keys()
+                .all(|thread_id| cleanup.terminal_verified.contains(thread_id))
             && cleanup.parent.as_ref().is_none_or(|parent| {
                 self.completed_turn
                     .contains(&(parent.thread_id.clone(), parent.turn_id.clone()))
@@ -921,6 +1403,504 @@ async fn settle_interruptions(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum CommandStartTiming {
+        Initial,
+        BeforeFollowupAcknowledgment,
+        ChildBeforeSpawnAcknowledgment,
+    }
+
+    #[derive(Clone, Copy)]
+    enum InterruptReply {
+        Acknowledged,
+        AcknowledgedWithServerRequests,
+        RejectedAfterCompletion,
+        RejectedAfterUnrelatedCompletion,
+    }
+
+    /// Keep cancellation pending until exact owned commands disappear, preserving older terminals.
+    #[tokio::test]
+    async fn cancellation_collects_owned_native_commands_after_turn_completion() -> Result<()> {
+        assert_owned_command_cleanup(CommandStartTiming::Initial, InterruptReply::Acknowledged)
+            .await
+    }
+
+    /// Preserve commands received before a follow-up turn acknowledges its identity.
+    #[tokio::test]
+    async fn cancellation_collects_commands_started_before_followup_acknowledgment() -> Result<()> {
+        assert_owned_command_cleanup(
+            CommandStartTiming::BeforeFollowupAcknowledgment,
+            InterruptReply::Acknowledged,
+        )
+        .await
+    }
+
+    /// Accept a rejected interrupt only after its exact target has already completed.
+    #[tokio::test]
+    async fn cancellation_accepts_interrupt_rejection_after_exact_turn_completion() -> Result<()> {
+        assert_owned_command_cleanup(
+            CommandStartTiming::Initial,
+            InterruptReply::RejectedAfterCompletion,
+        )
+        .await
+    }
+
+    /// Preserve an interrupt failure when only another turn has completed.
+    #[tokio::test]
+    async fn cancellation_rejects_interrupt_error_after_unrelated_turn_completion() -> Result<()> {
+        assert_owned_command_cleanup(
+            CommandStartTiming::Initial,
+            InterruptReply::RejectedAfterUnrelatedCompletion,
+        )
+        .await
+    }
+
+    /// Preserve cleanup acknowledgment ownership when server requests reuse client request IDs.
+    #[tokio::test]
+    async fn cancellation_ignores_server_requests_reusing_cleanup_response_ids() -> Result<()> {
+        assert_owned_command_cleanup(
+            CommandStartTiming::Initial,
+            InterruptReply::AcknowledgedWithServerRequests,
+        )
+        .await
+    }
+
+    /// Collect a completed child's early command only after its parent proves the child relationship.
+    #[tokio::test]
+    async fn cancellation_collects_early_child_commands_after_trusted_spawn() -> Result<()> {
+        assert_owned_command_cleanup(
+            CommandStartTiming::ChildBeforeSpawnAcknowledgment,
+            InterruptReply::Acknowledged,
+        )
+        .await
+    }
+
+    /// Retain the reader for an earlier steering acknowledgment after child cleanup finishes.
+    #[tokio::test]
+    async fn cleanup_retains_reader_until_pending_steer_acknowledgment() -> Result<()> {
+        use crate::backend::approval::PermissionCoordinator;
+        use crate::backend::steering::SteeringLane;
+        use crate::session::ApprovalMode;
+        use crate::trace::TraceStore;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Arc;
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let (steer_seen, observed_steer) = tokio::sync::oneshot::channel();
+        let (release_steer, released_steer) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            let steer: Value =
+                serde_json::from_str(socket.next().await.context("steer missing")??.to_text()?)?;
+            assert_eq!(steer["method"], "turn/steer");
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":steer["id"],"method":"item/tool/call","params":{"threadId":"parent","turnId":"current","callId":"colliding-steer-call","tool":"goal_status","arguments":{}}}).to_string().into())).await?;
+            let server_response: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("colliding server request was not answered")??
+                    .to_text()?,
+            )?;
+            assert_eq!(server_response["id"], steer["id"]);
+            steer_seen.send(()).unwrap();
+            let mut interrupt = Vec::new();
+            for _ in 0..2 {
+                let request: Value = serde_json::from_str(
+                    socket
+                        .next()
+                        .await
+                        .context("cleanup interrupt missing")??
+                        .to_text()?,
+                )?;
+                assert_eq!(request["method"], "turn/interrupt");
+                interrupt.push(request);
+            }
+            for request in interrupt {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":{}}).to_string().into(),
+                    ))
+                    .await?;
+            }
+            for message in [
+                json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"current","status":"interrupted"}}}),
+                json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"interrupted"}}}),
+            ] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        message.to_string().into(),
+                    ))
+                    .await?;
+            }
+            released_steer.await?;
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id":steer["id"],"result":{}}).to_string().into(),
+                ))
+                .await?;
+            let _ = socket.next().await;
+            Ok::<_, anyhow::Error>(())
+        });
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            ApprovalMode::Ask,
+            permission,
+            None,
+            trace,
+            "session".into(),
+        )
+        .await?;
+        process
+            .normalization
+            .bind(Some(crate::backend::InvocationScope::new(
+                crate::backend::ExecutionOwner::root("session"),
+                "exchange",
+            )));
+        let request = BackendRequest {
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace,
+            input: crate::backend::BackendInput::from_text("run child"),
+            mode: crate::backend::PromptMode::Chat,
+            model: "fixture-model".into(),
+            effort: "low".into(),
+            context_window: None,
+            access: Default::default(),
+            service_tier: crate::backend::ServiceTier::Standard,
+            approval_mode: ApprovalMode::Ask,
+            backend_session_id: Some("parent".into()),
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        };
+        let lane = SteeringLane::default();
+        let mut steering = lane.activate(None)?;
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_finished = finished.clone();
+        let mut output = BackendOutput::default();
+        let run = async {
+            let result = CodexTurnCoordinator::new(&backend, &mut process, &mut output, &mut steering, None, &request, "parent").run("current".into(), true, vec![
+                json!({"method":"item/completed","params":{"threadId":"parent","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child"],"status":"completed"}}}),
+                json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn"}}}),
+            ]).await?;
+            finished.store(true, std::sync::atomic::Ordering::Release);
+            Ok::<_, anyhow::Error>(result)
+        };
+        let control = async {
+            let steer_lane = lane.clone();
+            let steer = tokio::spawn(async move { steer_lane.steer("correction".into()).await });
+            observed_steer.await?;
+            lane.cleanup_execution().await?;
+            tokio::task::yield_now().await;
+            assert!(
+                !observed_finished.load(std::sync::atomic::Ordering::Acquire),
+                "cleanup dropped the reader before the earlier steering acknowledgment"
+            );
+            assert!(
+                !steer.is_finished(),
+                "steering completed without its native acknowledgment"
+            );
+            release_steer.send(()).unwrap();
+            steer.await??;
+            Ok::<_, anyhow::Error>(())
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::try_join!(run, control)
+        })
+        .await??;
+        assert_eq!(result["turn"]["status"], "interrupted");
+        drop(process);
+        server.await??;
+        Ok(())
+    }
+
+    /// Exercise native command ownership and acknowledgment order over the real Codex transport.
+    async fn assert_owned_command_cleanup(
+        timing: CommandStartTiming,
+        reply: InterruptReply,
+    ) -> Result<()> {
+        use crate::backend::approval::PermissionCoordinator;
+        use crate::backend::steering::SteeringLane;
+        use crate::session::ApprovalMode;
+        use crate::trace::TraceStore;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Arc;
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_completed = completed.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            if let CommandStartTiming::BeforeFollowupAcknowledgment = timing {
+                let start: Value = serde_json::from_str(
+                    socket
+                        .next()
+                        .await
+                        .context("follow-up start missing")??
+                        .to_text()?,
+                )?;
+                assert_eq!(start["method"], "turn/start");
+                for message in [
+                    json!({"method":"item/started","params":{"threadId":"parent","turnId":"earlier-turn","item":{"id":"earlier-command","type":"commandExecution","processId":"unrelated","command":"keep running","cwd":".","status":"inProgress"}}}),
+                    json!({"method":"item/started","params":{"threadId":"parent","turnId":"current","item":{"id":"owned-command","type":"commandExecution","processId":null,"command":"slow command","cwd":".","status":"inProgress"}}}),
+                    json!({"id":start["id"],"result":{"turn":{"id":"current"}}}),
+                ] {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            message.to_string().into(),
+                        ))
+                        .await?;
+                }
+            }
+            let interrupt: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("interrupt missing")??
+                    .to_text()?,
+            )?;
+            assert_eq!(interrupt["method"], "turn/interrupt");
+            assert_eq!(interrupt["params"]["threadId"], "parent");
+            let inventory: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("inventory missing")??
+                    .to_text()?,
+            )?;
+            assert_eq!(inventory["method"], "thread/backgroundTerminals/list");
+            let expected_thread = match timing {
+                CommandStartTiming::ChildBeforeSpawnAcknowledgment => "child",
+                CommandStartTiming::Initial | CommandStartTiming::BeforeFollowupAcknowledgment => {
+                    "parent"
+                }
+            };
+            assert_eq!(inventory["params"]["threadId"], expected_thread);
+            if let InterruptReply::AcknowledgedWithServerRequests = reply {
+                for request in [&interrupt, &inventory] {
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"method":"item/tool/call","params":{"threadId":"parent","turnId":"current","callId":"colliding-server-call","tool":"goal_status","arguments":{}}}).to_string().into())).await?;
+                    let response: Value = serde_json::from_str(
+                        socket
+                            .next()
+                            .await
+                            .context("server request response missing")??
+                            .to_text()?,
+                    )?;
+                    assert_eq!(response["id"], request["id"]);
+                    assert!(
+                        response.get("error").is_some(),
+                        "cancelled server tool request was not rejected normally"
+                    );
+                }
+            }
+            if let InterruptReply::RejectedAfterUnrelatedCompletion = reply {
+                for message in [
+                    json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"unrelated-turn","status":"completed"}}}),
+                    json!({"id":interrupt["id"],"error":{"code":-32600,"message":"interrupt failed"}}),
+                    json!({"id":inventory["id"],"result":{"data":[],"nextCursor":null}}),
+                    json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"current","status":"interrupted"}}}),
+                ] {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            message.to_string().into(),
+                        ))
+                        .await?;
+                }
+                let _ = socket.next().await;
+                return Ok::<_, anyhow::Error>(());
+            }
+            for message in [
+                json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"current","status":"interrupted"}}}),
+                match reply {
+                    InterruptReply::Acknowledged
+                    | InterruptReply::AcknowledgedWithServerRequests => {
+                        json!({"id":interrupt["id"],"result":{}})
+                    }
+                    InterruptReply::RejectedAfterCompletion => {
+                        json!({"id":interrupt["id"],"error":{"code":-32600,"message":"turn already completed"}})
+                    }
+                    InterruptReply::RejectedAfterUnrelatedCompletion => {
+                        unreachable!("rejected interrupt fixture completed above")
+                    }
+                },
+                json!({"id":inventory["id"],"result":{"data":[{"itemId":"earlier-command","processId":"unrelated","command":"keep running","cwd":"."}],"nextCursor":"owned-page"}}),
+            ] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        message.to_string().into(),
+                    ))
+                    .await?;
+            }
+            let page: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("inventory page missing")??
+                    .to_text()?,
+            )?;
+            assert_eq!(page["params"]["cursor"], "owned-page");
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":page["id"],"result":{"data":[{"itemId":"owned-command","processId":"owned-process","command":"slow command","cwd":"."}],"nextCursor":null}}).to_string().into())).await?;
+            let terminate: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("termination missing")??
+                    .to_text()?,
+            )?;
+            assert_eq!(terminate["method"], "thread/backgroundTerminals/terminate");
+            assert_eq!(terminate["params"]["processId"], "owned-process");
+            assert_eq!(terminate["params"]["threadId"], expected_thread);
+            assert!(
+                !observed_completed.load(std::sync::atomic::Ordering::Acquire),
+                "turn completion released cleanup before native command collection"
+            );
+            // Natural exit may race termination; absence, rather than the boolean alone, settles it.
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id":terminate["id"],"result":{"terminated":false}})
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+            let verify: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("verification missing")??
+                    .to_text()?,
+            )?;
+            assert_eq!(verify["method"], "thread/backgroundTerminals/list");
+            assert!(verify["params"].get("cursor").is_none());
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":verify["id"],"result":{"data":[{"itemId":"earlier-command","processId":"unrelated","command":"keep running","cwd":"."}],"nextCursor":null}}).to_string().into())).await?;
+            let _ = socket.next().await;
+            Ok::<_, anyhow::Error>(())
+        });
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            ApprovalMode::Ask,
+            permission,
+            None,
+            trace,
+            "session".into(),
+        )
+        .await?;
+        process
+            .normalization
+            .bind(Some(crate::backend::InvocationScope::new(
+                crate::backend::ExecutionOwner::root("session"),
+                "exchange",
+            )));
+        let request = BackendRequest {
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace,
+            input: crate::backend::BackendInput::from_text("run command"),
+            mode: crate::backend::PromptMode::Chat,
+            model: "fixture-model".into(),
+            effort: "low".into(),
+            context_window: None,
+            access: Default::default(),
+            service_tier: crate::backend::ServiceTier::Standard,
+            approval_mode: ApprovalMode::Ask,
+            backend_session_id: Some("parent".into()),
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        };
+        let lane = SteeringLane::default();
+        let mut steering = lane.activate(None)?;
+        let cleanup = tokio::spawn(async move {
+            lane.cleanup_execution().await?;
+            completed.store(true, std::sync::atomic::Ordering::Release);
+            Ok::<_, anyhow::Error>(())
+        });
+        let mut output = BackendOutput::default();
+        let mut coordinator = CodexTurnCoordinator::new(
+            &backend,
+            &mut process,
+            &mut output,
+            &mut steering,
+            None,
+            &request,
+            "parent",
+        );
+        let mut observed = vec![
+            json!({"method":"turn/started","params":{"threadId":"foreign","turn":{"id":"foreign-turn"}}}),
+            json!({"method":"item/started","params":{"threadId":"foreign","turnId":"foreign-turn","item":{"id":"foreign-command","type":"commandExecution","command":"unrelated","cwd":".","status":"inProgress"}}}),
+            json!({"method":"item/completed","params":{"threadId":"foreign","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["foreign-child"],"status":"completed"}}}),
+            json!({"method":"turn/started","params":{"threadId":"foreign-child","turn":{"id":"foreign-child-turn"}}}),
+            json!({"method":"item/started","params":{"threadId":"foreign-child","turnId":"foreign-child-turn","item":{"id":"foreign-child-command","type":"commandExecution","command":"unrelated child","cwd":".","status":"inProgress"}}}),
+        ];
+        match timing {
+            CommandStartTiming::Initial => observed.extend([
+                json!({"method":"item/started","params":{"threadId":"parent","turnId":"earlier-turn","item":{"id":"earlier-command","type":"commandExecution","processId":"unrelated","command":"keep running","cwd":".","status":"inProgress"}}}),
+                json!({"method":"item/started","params":{"threadId":"parent","turnId":"current","item":{"id":"owned-command","type":"commandExecution","processId":null,"command":"slow command","cwd":".","status":"inProgress"}}}),
+            ]),
+            CommandStartTiming::ChildBeforeSpawnAcknowledgment => observed.extend([
+                json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn"}}}),
+                json!({"method":"item/started","params":{"threadId":"child","turnId":"child-turn","item":{"id":"owned-command","type":"commandExecution","processId":null,"command":"slow child command","cwd":".","status":"inProgress"}}}),
+                json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"completed"}}}),
+                json!({"method":"item/completed","params":{"threadId":"parent","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child"],"status":"completed"}}}),
+            ]),
+            CommandStartTiming::BeforeFollowupAcknowledgment => {},
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            match timing {
+                CommandStartTiming::Initial
+                | CommandStartTiming::ChildBeforeSpawnAcknowledgment => {
+                    coordinator.run("current".into(), true, observed).await
+                }
+                CommandStartTiming::BeforeFollowupAcknowledgment => {
+                    let parent = coordinator
+                        .start_parent_turn("follow-up".into(), None)
+                        .await?;
+                    coordinator
+                        .run(parent.id, parent.provider_started, observed)
+                        .await
+                }
+            }
+        })
+        .await??;
+        assert_eq!(result["turn"]["status"], "interrupted");
+        let cleanup_result = cleanup.await?;
+        match reply {
+            InterruptReply::RejectedAfterUnrelatedCompletion => assert!(
+                cleanup_result.is_err(),
+                "unrelated completion suppressed a genuine interrupt failure"
+            ),
+            InterruptReply::Acknowledged
+            | InterruptReply::AcknowledgedWithServerRequests
+            | InterruptReply::RejectedAfterCompletion => cleanup_result?,
+        }
+        drop(process);
+        server.await??;
+        Ok(())
+    }
 
     #[test]
     fn harness_goal_does_not_enable_native_reader_lifetime() {
@@ -1327,6 +2307,7 @@ mod test {
             },
         };
         let observed = vec![
+            json!({"method":"item/completed","params":{"threadId":"parent","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child"],"status":"completed"}}}),
             json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn","status":"inProgress"}}}),
             json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"first","status":"completed"}}}),
         ];
@@ -1354,6 +2335,422 @@ mod test {
         assert!(encoded.contains("PARENT-DONE"));
         drop(process);
         tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_goal_controls_persist_native_termination_and_drain_raced_turns() -> Result<()>
+    {
+        use crate::backend::approval::PermissionCoordinator;
+        use crate::backend::steering::SteeringLane;
+        use crate::backend::{BackendInput, PromptMode};
+        use crate::session::ApprovalMode;
+        use crate::trace::TraceStore;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Arc;
+
+        for (tool, termination) in [
+            ("goal_complete", crate::goal::GoalState::Complete),
+            ("goal_blocked", crate::goal::GoalState::Blocked),
+        ] {
+            for (notification_first, interrupt_succeeds, terminal_evidence, ownership_replaced) in [
+                (false, true, true, false),
+                (true, true, true, false),
+                (false, false, true, false),
+                (false, false, false, false),
+                (false, true, false, true),
+            ] {
+                let (directory, mut store, controller) =
+                    crate::task::SessionTaskController::test_goal();
+                let workspace = directory.path().to_string_lossy().into_owned();
+                let permission = PermissionCoordinator::transient(&workspace)?;
+                let trace = Arc::new(TraceStore::open(directory.path())?);
+                let backend = CodexBackend::new_with_permission_coordinator(
+                    vec!["unused".into()],
+                    Arc::clone(&permission),
+                    Arc::clone(&trace),
+                    None,
+                )?;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let endpoint = format!("ws://{}", listener.local_addr()?);
+                let server_controller = controller.clone();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({
+                                "id":700, "method":"item/tool/call", "params":{
+                                    "threadId":"parent", "turnId":"first", "callId":"finish",
+                                    "tool":tool, "arguments":if tool == "goal_complete" {
+                                        json!({"summary":"Fixture finished"})
+                                    } else {
+                                        json!({"reason":"Fixture blocked"})
+                                    },
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    let response: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(response["id"], 700);
+                    assert_eq!(response["result"]["success"], true, "{response}");
+                    let settlement_request: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(settlement_request["method"], "thread/goal/set");
+                    assert_eq!(settlement_request["params"]["threadId"], "parent");
+                    let status = if tool == "goal_complete" {
+                        "complete"
+                    } else {
+                        "blocked"
+                    };
+                    assert_eq!(settlement_request["params"]["status"], status);
+                    assert_eq!(settlement_request["params"]["origin"], "automatic");
+                    if ownership_replaced {
+                        let current = server_controller.current().unwrap().unwrap();
+                        server_controller
+                            .change(
+                                &mut store,
+                                Some(&current.revision),
+                                crate::task::TaskChange::Install(Box::new(
+                                    crate::task::ActiveTask::goal(
+                                        "New user task".into(),
+                                        Default::default(),
+                                        true,
+                                        2,
+                                    ),
+                                )),
+                                2,
+                            )
+                            .unwrap();
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                json!({
+                                    "method":"turn/started","params":{"threadId":"parent",
+                                        "turn":{"id":"new-user-turn","status":"inProgress"}}
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        if let Some(Ok(message)) = socket.next().await {
+                            assert!(
+                                !message.is_text(),
+                                "stale owner interrupted the new user turn: {message}"
+                            );
+                        }
+                        return;
+                    }
+                    // A provider turn can race the settlement acknowledgment after the original ends.
+                    for message in [
+                        json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"first","status":"completed"}}}),
+                        json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"raced","status":"inProgress"}}}),
+                    ] {
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                message.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    let notification = json!({"method":"thread/goal/updated","params":{
+                        "threadId":"parent","goal":{"status":status}
+                    }});
+                    let acknowledgment =
+                        json!({"id":settlement_request["id"],"result":{"goal":{"status":status}}});
+                    let ordered = if notification_first {
+                        [notification, acknowledgment]
+                    } else {
+                        [acknowledgment, notification]
+                    };
+                    for message in ordered {
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                message.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    let interrupt: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(interrupt["method"], "turn/interrupt");
+                    assert_eq!(interrupt["params"]["turnId"], "raced");
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+                        "id":interrupt["id"],"method":"item/tool/call","params":{
+                            "threadId":"parent","turnId":"raced","callId":"colliding-goal-interrupt",
+                            "tool":"goal_status","arguments":{}
+                        }
+                    }).to_string().into())).await.unwrap();
+                    let server_response: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        server_response["id"], interrupt["id"],
+                        "colliding server call was not handled independently"
+                    );
+                    let completed_turn = if terminal_evidence {
+                        "raced"
+                    } else {
+                        "unrelated"
+                    };
+                    let interrupt_response = if interrupt_succeeds {
+                        json!({"id":interrupt["id"],"result":{}})
+                    } else {
+                        json!({"id":interrupt["id"],"error":{"code":-32602,"message":"turn is not active"}})
+                    };
+                    for message in [
+                        json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":completed_turn,"status":"completed"}}}),
+                        interrupt_response,
+                    ] {
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                message.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    let _ = socket.next().await;
+                });
+                let mut process = CodexJsonRpc::connect(
+                    &endpoint,
+                    &workspace,
+                    ApprovalMode::Ask,
+                    permission,
+                    None,
+                    trace,
+                    "session".into(),
+                )
+                .await?;
+                process
+                    .normalization
+                    .bind(Some(crate::backend::InvocationScope::new(
+                        crate::backend::ExecutionOwner::root("session"),
+                        "exchange",
+                    )));
+                let mut context = crate::control_tools::ControlTurnContext::inactive(
+                    PromptMode::GoalContinuation,
+                );
+                context.native_goal = Some("Fixture objective".into());
+                context.task_controller = Some(controller.clone());
+                process.set_control_context(context.clone()).await;
+                let request = BackendRequest {
+                    execution_owner: None,
+                    harness_session_id: "session".into(),
+                    workspace,
+                    input: BackendInput::from_text("Finish fixture"),
+                    mode: PromptMode::GoalContinuation,
+                    model: "test".into(),
+                    effort: "low".into(),
+                    context_window: None,
+                    service_tier: crate::backend::ServiceTier::Standard,
+                    access: Default::default(),
+                    approval_mode: ApprovalMode::Ask,
+                    backend_session_id: Some("parent".into()),
+                    submission: None,
+                    recovered_input: Vec::new(),
+                    control_context: Some(context),
+                };
+                let lane = SteeringLane::default();
+                let mut steering = lane.activate(None)?;
+                let mut output = BackendOutput::default();
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    CodexTurnCoordinator::new(
+                        &backend,
+                        &mut process,
+                        &mut output,
+                        &mut steering,
+                        None,
+                        &request,
+                        "parent",
+                    )
+                    .run("first".into(), true, vec![]),
+                )
+                .await?;
+                if ownership_replaced {
+                    assert!(result.unwrap_err().is::<crate::task::StaleTask>());
+                } else if interrupt_succeeds || terminal_evidence {
+                    assert_eq!(result?["turn"]["id"], "first");
+                    assert_eq!(output.completion.evidence.native_state, Some(termination));
+                } else {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("turn is not active")
+                    );
+                }
+                if !ownership_replaced {
+                    output
+                        .completion
+                        .goal_control
+                        .as_ref()
+                        .unwrap()
+                        .permit
+                        .validate(controller.current()?.as_ref())?;
+                }
+                drop(process);
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_and_stale_goal_controls_preserve_native_continuation() -> Result<()> {
+        use crate::backend::approval::PermissionCoordinator;
+        use crate::backend::steering::SteeringLane;
+        use crate::backend::{BackendInput, PromptMode};
+        use crate::session::ApprovalMode;
+        use crate::trace::TraceStore;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Arc;
+
+        for stale in [false, true] {
+            let (directory, mut store, controller) =
+                crate::task::SessionTaskController::test_goal();
+            let previous = controller.current()?.unwrap();
+            let mut output = BackendOutput::default();
+            output.completion.backend_session_id = Some("parent".into());
+            if stale {
+                output.completion.goal_control = Some(crate::goal::GoalControl {
+                    permit: previous.permit(),
+                    termination: crate::goal::GoalTermination::Complete,
+                });
+                controller.change(
+                    &mut store,
+                    Some(&previous.revision),
+                    crate::task::TaskChange::Pause,
+                    2,
+                )?;
+            }
+            let workspace = directory.path().to_string_lossy().into_owned();
+            let permission = PermissionCoordinator::transient(&workspace)?;
+            let trace = Arc::new(TraceStore::open(directory.path())?);
+            let backend = CodexBackend::new_with_permission_coordinator(
+                vec!["unused".into()],
+                Arc::clone(&permission),
+                Arc::clone(&trace),
+                None,
+            )?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("ws://{}", listener.local_addr()?);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                if !stale {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({
+                                "id":701,"method":"item/tool/call","params":{
+                                    "threadId":"parent","turnId":"first","callId":"invalid",
+                                    "tool":"goal_complete","arguments":{},
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    let response: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(response["result"]["success"], false);
+                }
+                for message in [
+                    json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"first","status":"completed"}}}),
+                    json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"second","status":"inProgress"}}}),
+                    json!({"method":"thread/goal/updated","params":{"threadId":"parent","goal":{"status":"complete"}}}),
+                    json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"second","status":"completed"}}}),
+                ] {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            message.to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                if let Some(Ok(message)) = socket.next().await {
+                    assert!(
+                        !message.is_text(),
+                        "rejected or stale control stopped native continuation: {message}"
+                    );
+                }
+            });
+            let mut process = CodexJsonRpc::connect(
+                &endpoint,
+                &workspace,
+                ApprovalMode::Ask,
+                permission,
+                None,
+                trace,
+                "session".into(),
+            )
+            .await?;
+            process
+                .normalization
+                .bind(Some(crate::backend::InvocationScope::new(
+                    crate::backend::ExecutionOwner::root("session"),
+                    "exchange",
+                )));
+            let mut context =
+                crate::control_tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
+            context.native_goal = Some("Fixture objective".into());
+            context.task_controller = Some(controller);
+            process.set_control_context(context.clone()).await;
+            let request = BackendRequest {
+                execution_owner: None,
+                harness_session_id: "session".into(),
+                workspace,
+                input: BackendInput::from_text("Continue"),
+                mode: PromptMode::GoalContinuation,
+                model: "test".into(),
+                effort: "low".into(),
+                context_window: None,
+                service_tier: crate::backend::ServiceTier::Standard,
+                access: Default::default(),
+                approval_mode: ApprovalMode::Ask,
+                backend_session_id: Some("parent".into()),
+                submission: None,
+                recovered_input: Vec::new(),
+                control_context: Some(context),
+            };
+            let lane = SteeringLane::default();
+            let mut steering = lane.activate(None)?;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                CodexTurnCoordinator::new(
+                    &backend,
+                    &mut process,
+                    &mut output,
+                    &mut steering,
+                    None,
+                    &request,
+                    "parent",
+                )
+                .run("first".into(), true, vec![]),
+            )
+            .await??;
+            assert_eq!(result["turn"]["id"], "second");
+            assert_eq!(
+                output.completion.evidence.native_state,
+                Some(crate::goal::GoalState::Complete)
+            );
+            drop(process);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+        }
         Ok(())
     }
 
@@ -1635,6 +3032,7 @@ mod test {
     #[test]
     fn replaces_child_state_from_wait_lifecycle_updates() {
         let mut tracker = DescendantTracker::default();
+        tracker.observe(&json!({"method":"item/completed","params":{"threadId":"parent-thread","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child-one","child-two"],"status":"completed"}}}), "parent-thread");
         tracker.observe(
             &json!({
                 "method": "item/completed",
@@ -1656,6 +3054,39 @@ mod test {
         );
         assert_eq!(tracker.active_count(), 1);
         assert!(tracker.active_turn_by_thread.contains_key("child-two"));
+    }
+
+    /// Admit descendants only through a trusted parent, retaining ancestry after completion.
+    #[test]
+    fn descendant_ownership_rejects_foreign_lifecycle_and_retains_completed_parent_ancestry() {
+        let mut tracker = DescendantTracker::default();
+        tracker.observe(&json!({"method":"turn/started","params":{"threadId":"foreign","turn":{"id":"foreign-turn"}}}), "parent");
+        tracker.observe(&json!({"method":"item/completed","params":{"threadId":"foreign","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["foreign-child"],"status":"completed"}}}), "parent");
+        assert!(tracker.owned_thread.is_empty());
+        assert_eq!(tracker.active_count(), 0);
+        tracker.observe(&json!({"method":"item/completed","params":{"threadId":"parent","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child"],"status":"completed"}}}), "parent");
+        tracker.observe(&json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn"}}}), "parent");
+        tracker.observe(&json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn"}}}), "parent");
+        assert_eq!(tracker.active_count(), 0);
+        tracker.observe(&json!({"method":"item/completed","params":{"threadId":"child","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["grandchild"],"status":"completed"}}}), "parent");
+        assert!(tracker.owned_thread.contains("grandchild"));
+        tracker.observe(&json!({"method":"item/completed","params":{"threadId":"foreign","item":{"type":"collabAgentToolCall","tool":"closeAgent","receiverThreadIds":["grandchild"],"status":"completed"}}}), "parent");
+        assert!(tracker.active_turn_by_thread.contains_key("grandchild"));
+    }
+
+    /// Reattach a retained child only when the active root explicitly sends or waits for it.
+    #[test]
+    fn descendant_ownership_accepts_reused_child_from_trusted_parent_operation() {
+        for operation in ["sendInput", "wait", "resumeAgent"] {
+            let mut tracker = DescendantTracker::default();
+            tracker.observe(&json!({"method":"turn/started","params":{"threadId":"retained-child","turn":{"id":"new-child-turn"}}}), "parent");
+            assert_eq!(tracker.active_count(), 0);
+            tracker.observe(&json!({"method":"item/completed","params":{"threadId":"parent","item":{"type":"collabAgentToolCall","tool":operation,"receiverThreadIds":["retained-child"],"agentsStates":{"retained-child":{"status":"running"}},"status":"completed"}}}), "parent");
+            assert_eq!(
+                tracker.target_for_thread("retained-child").unwrap().turn_id,
+                "new-child-turn"
+            );
+        }
     }
 
     #[test]
@@ -1787,9 +3218,14 @@ mod test {
         assert!(parent.provider_started);
     }
 }
+/// Ignore a previous child turn's completion after its trusted successor starts.
 #[test]
 fn stale_child_completion_cannot_settle_a_newer_turn() {
     let mut tracker = DescendantTracker::default();
+    tracker.observe(
+        &json!({"method":"item/completed","params":{"threadId":"parent","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child"],"status":"completed"}}}),
+        "parent",
+    );
     tracker.observe(
         &json!({"method":"turn/started", "params": {
             "threadId":"child", "turn":{"id":"new"}

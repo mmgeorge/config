@@ -11,6 +11,54 @@ use std::time::Duration;
 
 pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = include_str!("../plan/prompts/system.md");
 
+/// Select the complete provider-owned goal state without confusing suspension with absence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeGoalUpdate {
+    /// Remove a native goal whose task no longer exists.
+    Absent,
+    /// Retain the canonical objective and its current lifecycle state.
+    Present {
+        /// Canonical task objective, preserved across suspension and resumption.
+        objective: String,
+        /// Lifecycle state the provider must persist.
+        status: NativeGoalStatus,
+    },
+}
+
+/// Describe the lifecycle states accepted by native goal synchronization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeGoalStatus {
+    /// Permit native goal continuation.
+    Active,
+    /// Retain the goal while suspending continuation.
+    Paused,
+    /// Retain the successfully completed outcome.
+    Complete,
+    /// Retain a blocker that requires resolution before continuation.
+    Blocked,
+    /// Preserve the provider's usage-limit stop state.
+    UsageLimited,
+    /// Preserve the provider's budget-limit stop state.
+    BudgetLimited,
+}
+
+impl NativeGoalUpdate {
+    /// Preserve native lifecycle states and suspend Harness-only stalled goals.
+    pub fn from_goal(objective: String, state: crate::goal::GoalState) -> Self {
+        use crate::goal::GoalState;
+        let status = match state {
+            GoalState::Active => NativeGoalStatus::Active,
+            GoalState::Paused | GoalState::Stalled => NativeGoalStatus::Paused,
+            GoalState::UsageLimited => NativeGoalStatus::UsageLimited,
+            GoalState::BudgetLimited => NativeGoalStatus::BudgetLimited,
+            GoalState::Complete => NativeGoalStatus::Complete,
+            GoalState::Blocked => NativeGoalStatus::Blocked,
+            GoalState::Cleared => return Self::Absent,
+        };
+        Self::Present { objective, status }
+    }
+}
+
 /// Identifies one supported provider implementation without leaking launch strings across consumers.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -979,12 +1027,7 @@ pub trait Backend: Send + Sync {
     }
 
     /// Update a native provider goal when that backend owns goal persistence.
-    async fn goal_status(
-        &self,
-        _request: BackendRequest,
-        _objective: Option<String>,
-        _status: &str,
-    ) -> Result<()> {
+    async fn goal_status(&self, _request: BackendRequest, _update: NativeGoalUpdate) -> Result<()> {
         Ok(())
     }
 

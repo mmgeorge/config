@@ -75,12 +75,37 @@ fn native_agent_exclusions() -> Vec<String> {
 type SharedCopilotSession = Arc<github_copilot_sdk::session::Session>;
 type CopilotSessionSlot = Arc<Mutex<Option<CopilotSessionBinding>>>;
 
+/// Distinguish replaceable initialization from possibly committed conversation input.
+#[derive(Clone, Copy)]
+enum CopilotSessionHistory {
+    Prepared,
+    Submitted,
+}
+
+/// Select whether an existing compatible connection can satisfy the request.
+#[derive(Clone, Copy, PartialEq)]
+enum CopilotSessionReuse {
+    Compatible,
+    Refresh,
+}
+
 struct CopilotSessionBinding {
     session: SharedCopilotSession,
+    history: CopilotSessionHistory,
     tool_schema: Vec<Value>,
     compaction: Option<compaction::CompactionMonitor>,
     mcp_failure: HashMap<String, String>,
     _profile: Option<crate::settings::ResourceProfile>,
+}
+
+impl CopilotSessionBinding {
+    /// Get the native identity only after user input may have reached the provider.
+    fn resumable_id(&self) -> Option<String> {
+        match self.history {
+            CopilotSessionHistory::Prepared => None,
+            CopilotSessionHistory::Submitted => Some(self.session.id().to_string()),
+        }
+    }
 }
 
 /// Retains terminal observations after the prompt event subscription ends.
@@ -308,7 +333,11 @@ impl CopilotBackend {
         Ok(started)
     }
 
-    async fn session(&self, request: &BackendRequest) -> Result<SharedCopilotSession> {
+    async fn session(
+        &self,
+        request: &BackendRequest,
+        reuse: CopilotSessionReuse,
+    ) -> Result<SharedCopilotSession> {
         BackendKind::Copilot.validate_access(&request.access)?;
         let session_slot = self.session_slot(&request.runtime_key()?).await;
         let turn_event = self.turn_event(&request.runtime_key()?).await;
@@ -322,7 +351,8 @@ impl CopilotBackend {
             .map(|definition| definition.mcp_value())
             .collect::<Vec<_>>();
         if let Some(binding) = active_session.as_mut().filter(|binding| {
-            request.control_context.is_none() || binding.tool_schema == tool_schema
+            reuse == CopilotSessionReuse::Compatible
+                && (request.control_context.is_none() || binding.tool_schema == tool_schema)
         }) {
             if binding.compaction.is_none() {
                 binding.compaction = self
@@ -419,31 +449,25 @@ impl CopilotBackend {
         let skill_directories = profile
             .as_ref()
             .map(|profile| vec![profile.path().join("skills")]);
-        let retained_session_id = active_session
+        let retained_session_id = match active_session.as_ref() {
+            Some(binding) => binding.resumable_id(),
+            None => request.backend_session_id.clone(),
+        };
+        // Same-ID resume must unregister the old router first. A new prepared ID can
+        // keep the previous connection alive until its replacement is fully ready.
+        if active_session
             .as_ref()
-            .map(|binding| binding.session.id().to_string());
-        // Dropping the old SDK session after resume unregisters the replacement's event router.
-        if let Some(mut binding) = active_session.take() {
-            if let Some(mut monitor) = self
-                .terminal_monitor
-                .lock()
-                .await
-                .remove(&request.runtime_key()?)
-            {
-                monitor.task.abort();
-                let _ = (&mut monitor.task).await;
-            }
-            drop(binding.compaction.take());
-            if let Err(error) = binding.session.disconnect().await {
-                *active_session = Some(binding);
-                return Err(error).context("disconnect Copilot session before refreshing tools");
-            }
-            drop(binding);
-        }
-        let session = if let Some(session_id) = retained_session_id
-            .as_deref()
-            .or(request.backend_session_id.as_deref())
+            .is_some_and(|binding| matches!(binding.history, CopilotSessionHistory::Submitted))
         {
+            self.disconnect_binding(&request.runtime_key()?, &mut active_session)
+                .await?;
+        }
+        let history = if retained_session_id.is_some() {
+            CopilotSessionHistory::Submitted
+        } else {
+            CopilotSessionHistory::Prepared
+        };
+        let session = if let Some(session_id) = retained_session_id.as_deref() {
             let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
             config.suppress_resume_event = Some(true);
             config.excluded_tools = Some(native_agent_exclusions());
@@ -537,12 +561,7 @@ impl CopilotBackend {
                 .await
                 .context("create Copilot session")?
         };
-        self.permission_context(&request.runtime_key()?)
-            .await
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
-            .session_directory = SessionDirectory::new(&session)?;
+        let session_directory = SessionDirectory::new(&session)?;
         let session = Arc::new(session);
         if let Some(resources) = &resources {
             let mut stage = "inspect Copilot skill selection".to_owned();
@@ -624,6 +643,19 @@ impl CopilotBackend {
         } else {
             HashMap::new()
         };
+        if let Err(error) = self
+            .disconnect_binding(&request.runtime_key()?, &mut active_session)
+            .await
+        {
+            let _ = session.disconnect().await;
+            return Err(error);
+        }
+        self.permission_context(&request.runtime_key()?)
+            .await
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
+            .session_directory = session_directory;
         let compaction = self
             .compaction_subscription_by_harness
             .lock()
@@ -641,12 +673,34 @@ impl CopilotBackend {
             });
         *active_session = Some(CopilotSessionBinding {
             session: Arc::clone(&session),
+            history,
             tool_schema,
             compaction,
             mcp_failure,
             _profile: profile,
         });
         Ok(session)
+    }
+
+    /// Retire a binding without letting its old SDK router unregister a resumed session.
+    async fn disconnect_binding(
+        &self,
+        runtime_key: &str,
+        active: &mut Option<CopilotSessionBinding>,
+    ) -> Result<()> {
+        let Some(mut binding) = active.take() else {
+            return Ok(());
+        };
+        if let Some(mut monitor) = self.terminal_monitor.lock().await.remove(runtime_key) {
+            monitor.task.abort();
+            let _ = (&mut monitor.task).await;
+        }
+        drop(binding.compaction.take());
+        if let Err(error) = binding.session.disconnect().await {
+            *active = Some(binding);
+            return Err(error).context("disconnect Copilot session before refreshing tools");
+        }
+        Ok(())
     }
 
     async fn session_slot(&self, harness_session_id: &str) -> CopilotSessionSlot {
@@ -803,7 +857,9 @@ impl Backend for CopilotBackend {
         };
         let mut request = submission.request.clone();
         request.backend_session_id = Some(session_id.clone());
-        let session = self.session(&request).await?;
+        let session = self
+            .session(&request, CopilotSessionReuse::Compatible)
+            .await?;
         let mut cursor = cursor.clone();
         let mut seen = std::collections::HashSet::new();
         let mut receipt = None;
@@ -863,7 +919,7 @@ impl Backend for CopilotBackend {
 
     async fn reconcile_settings(
         &self,
-        mut request: BackendCatalogRequest,
+        request: BackendCatalogRequest,
         setting: &crate::settings::PortableSettings,
     ) -> Result<()> {
         if self.settings_root.is_none() {
@@ -874,24 +930,11 @@ impl Backend for CopilotBackend {
             return Ok(());
         }
         self.cleanup_execution(&request.runtime_key()?).await?;
-        let slot = self.session_slot(&request.runtime_key()?).await;
-        let mut binding = slot.lock().await;
-        if let Some(active) = binding.as_ref() {
-            request.backend_session_id = Some(active.session.id().to_string());
-            active
-                .session
-                .disconnect()
-                .await
-                .context("disconnect Copilot before applying shared resources")?;
-        }
-        binding.take();
-        drop(binding);
-        self.terminal_monitor
-            .lock()
-            .await
-            .remove(&request.runtime_key()?);
-        self.session(&Self::catalog_backend_request(&request))
-            .await?;
+        self.session(
+            &Self::catalog_backend_request(&request),
+            CopilotSessionReuse::Refresh,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1097,7 +1140,7 @@ let event_sink = Some(event_sink);
                 .as_ref()
                 .and_then(crate::control_tools::TaskAuthority::capture);
         }
-        let session = self.session(&request).await?;
+        let session = self.session(&request, CopilotSessionReuse::Compatible).await?;
         let mut subscription = event_stream::SessionEventStream::new(
             &session,
             |_| true,
@@ -1167,6 +1210,14 @@ let event_sink = Some(event_sink);
                     submission
                         .persist(move |submission| submission.sending(target))
                         .await?;
+                }
+                // A failed transport may still have committed input; never replace that history.
+                {
+                    let slot = self.session_slot(&request.runtime_key()?).await;
+                    let mut binding = slot.lock().await;
+                    let active = binding.as_mut().context("Copilot submission lost its session")?;
+                    anyhow::ensure!(Arc::ptr_eq(&active.session, &session), "Copilot submission changed its session");
+                    active.history = CopilotSessionHistory::Submitted;
                 }
                 let receipt = session.send(message).await.context("send Copilot prompt")?;
                 if let Some(submission) = &request.submission {
@@ -1363,7 +1414,9 @@ let event_sink = Some(event_sink);
             owner: request.owner()?,
             operation_id: id.clone(),
         };
-        let session = self.session(&request).await?;
+        let session = self
+            .session(&request, CopilotSessionReuse::Compatible)
+            .await?;
         let slot = self.session_slot(&request.runtime_key()?).await;
         let manual = slot
             .lock()
@@ -1478,12 +1531,16 @@ let event_sink = Some(event_sink);
                 target_request
                     .harness_session_id
                     .clone_from(&request.target_harness_session_id);
-                self.session(&target_request).await?.id().to_string()
+                self.session(&target_request, CopilotSessionReuse::Compatible)
+                    .await?
+                    .id()
+                    .to_string()
             }
         };
         target_request.harness_session_id = request.target_harness_session_id;
         target_request.backend_session_id = Some(backend_session_id.clone());
-        self.session(&target_request).await?;
+        self.session(&target_request, CopilotSessionReuse::Compatible)
+            .await?;
         Ok(crate::backend::BackendForkResult {
             backend_session_id,
             timing: vec![crate::backend::BackendTimingRecord {
@@ -1513,7 +1570,9 @@ let event_sink = Some(event_sink);
             .skill);
         }
         let backend_request = Self::catalog_backend_request(&request);
-        let session = self.session(&backend_request).await?;
+        let session = self
+            .session(&backend_request, CopilotSessionReuse::Compatible)
+            .await?;
         let skill_list = session
             .rpc()
             .skills()
@@ -1578,7 +1637,9 @@ let event_sink = Some(event_sink);
             })
             .await
             .context("persist Copilot disabled skills")?;
-        let session = self.session(&backend_request).await?;
+        let session = self
+            .session(&backend_request, CopilotSessionReuse::Compatible)
+            .await?;
         if enabled {
             session
                 .rpc()
@@ -1602,7 +1663,9 @@ let event_sink = Some(event_sink);
     }
 
     async fn initialize_session(&self, request: BackendRequest) -> Result<Option<String>> {
-        let session = self.session(&request).await?;
+        let session = self
+            .session(&request, CopilotSessionReuse::Compatible)
+            .await?;
         Ok(Some(session.id().to_string()))
     }
 
@@ -1660,7 +1723,9 @@ let event_sink = Some(event_sink);
 
     async fn mcp_list(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
         let backend_request = Self::catalog_backend_request(&request);
-        let session = self.session(&backend_request).await?;
+        let session = self
+            .session(&backend_request, CopilotSessionReuse::Compatible)
+            .await?;
         let mcp_failure = self
             .session_slot(&request.runtime_key()?)
             .await
@@ -1820,7 +1885,9 @@ let event_sink = Some(event_sink);
                 .await
                 .with_context(|| format!("persist disabled Copilot MCP {name}"))?;
         }
-        let session = self.session(&backend_request).await?;
+        let session = self
+            .session(&backend_request, CopilotSessionReuse::Compatible)
+            .await?;
         if enabled {
             session
                 .rpc()

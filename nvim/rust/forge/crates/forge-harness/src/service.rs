@@ -4138,6 +4138,7 @@ fn initialize_failure(request_id: u64, error: &anyhow::Error) -> Response {
 #[cfg(test)]
 mod tests {
     include!("service/task_state_test.rs");
+    include!("service/task_presentation_test.rs");
     use super::*;
     use crate::backend::{
         Backend, BackendCatalogRequest, BackendDescriptor, BackendEventSink, BackendKind,

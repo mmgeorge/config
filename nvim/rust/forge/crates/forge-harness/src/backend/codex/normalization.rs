@@ -27,6 +27,75 @@ struct NativeTool {
     terminal: bool,
     kind: ToolActivityKind,
     has_changes: bool,
+    request: NativeToolRequest,
+}
+
+#[derive(Default)]
+struct NativeToolRequest {
+    name: Option<Value>,
+    namespace: Option<Value>,
+    arguments: Option<Value>,
+    command: Option<Value>,
+    cwd: Option<Value>,
+    item_type: Option<Value>,
+}
+
+impl NativeToolRequest {
+    /// Reject contradictions in supplied request fields while accepting sparse progress events.
+    fn observe(&mut self, params: &Value) -> Result<()> {
+        let envelope = params.get("update").unwrap_or(params);
+        let item = envelope.get("item").unwrap_or(envelope);
+        let supplied = Self {
+            name: item
+                .get("tool")
+                .or_else(|| item.get("name"))
+                .or_else(|| item.get("toolName"))
+                .or_else(|| item.get("tool_name"))
+                .filter(|value| !value.is_null())
+                .cloned(),
+            namespace: item
+                .get("server")
+                .or_else(|| item.get("namespace"))
+                .filter(|value| !value.is_null())
+                .cloned(),
+            arguments: item.get("arguments").cloned(),
+            command: item
+                .get("command")
+                .or_else(|| envelope.get("command"))
+                .filter(|value| !value.is_null())
+                .cloned(),
+            cwd: item
+                .get("cwd")
+                .or_else(|| envelope.get("cwd"))
+                .filter(|value| !value.is_null())
+                .cloned(),
+            item_type: item.get("type").filter(|value| !value.is_null()).cloned(),
+        };
+        for (previous, current) in [
+            (&self.name, &supplied.name),
+            (&self.namespace, &supplied.namespace),
+            (&self.arguments, &supplied.arguments),
+            (&self.command, &supplied.command),
+            (&self.cwd, &supplied.cwd),
+            (&self.item_type, &supplied.item_type),
+        ] {
+            if let (Some(previous), Some(current)) = (previous, current)
+                && previous != current
+            {
+                return Err(BackendError::Protocol {
+                    message: "Codex tool request replay changed its invocation".into(),
+                }
+                .into());
+            }
+        }
+        self.name = self.name.take().or(supplied.name);
+        self.namespace = self.namespace.take().or(supplied.namespace);
+        self.arguments = self.arguments.take().or(supplied.arguments);
+        self.command = self.command.take().or(supplied.command);
+        self.cwd = self.cwd.take().or(supplied.cwd);
+        self.item_type = self.item_type.take().or(supplied.item_type);
+        Ok(())
+    }
 }
 
 impl CodexNormalization {
@@ -423,14 +492,6 @@ impl CodexNormalization {
                         .ok_or_else(|| BackendError::Protocol {
                             message: format!("Codex {method} omitted its required tool identity"),
                         })?;
-                    if apply_control && let Some(invocation) = control_invocation(method, &params)?
-                    {
-                        apply_invocation(&invocation, &mut output.completion)?;
-                    }
-                    self.replay_sensitive = true;
-                    output.completion.evidence.tool_called = true;
-                    output.completion.evidence.workspace_changed |=
-                        successful_file_change(&snapshot);
                     let address = ToolAddress {
                         turn,
                         tool_id: snapshot.id.clone().into(),
@@ -444,7 +505,17 @@ impl CodexNormalization {
                             terminal: false,
                             kind: snapshot.kind,
                             has_changes: false,
+                            request: NativeToolRequest::default(),
                         });
+                    native.request.observe(&params)?;
+                    if apply_control && let Some(invocation) = control_invocation(method, &params)?
+                    {
+                        apply_invocation(&invocation, &mut output.completion)?;
+                    }
+                    self.replay_sensitive = true;
+                    output.completion.evidence.tool_called = true;
+                    output.completion.evidence.workspace_changed |=
+                        successful_file_change(&snapshot);
                     native.has_changes |= !snapshot.change.is_empty();
                     if native.kind == ToolActivityKind::FileChange
                         && native.has_changes

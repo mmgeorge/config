@@ -390,21 +390,36 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     execute.backend_session_id = executed.backend_session_id;
     tokio::time::timeout(
         Duration::from_secs(10),
-        backend.goal_status(execute.clone(), Some("Complete the plan".into()), "paused"),
+        backend.goal_status(
+            execute.clone(),
+            forge_harness::backend::NativeGoalUpdate::from_goal(
+                "Complete the plan".into(),
+                forge_harness::goal::GoalState::Paused,
+            ),
+        ),
     )
     .await
     .expect("Codex goal pause timed out")
     .unwrap();
     tokio::time::timeout(
         Duration::from_secs(10),
-        backend.goal_status(execute.clone(), Some("Complete the plan".into()), "active"),
+        backend.goal_status(
+            execute.clone(),
+            forge_harness::backend::NativeGoalUpdate::from_goal(
+                "Complete the plan".into(),
+                forge_harness::goal::GoalState::Active,
+            ),
+        ),
     )
     .await
     .expect("Codex goal resume timed out")
     .unwrap();
     tokio::time::timeout(
         Duration::from_secs(10),
-        backend.goal_status(execute.clone(), None, "cleared"),
+        backend.goal_status(
+            execute.clone(),
+            forge_harness::backend::NativeGoalUpdate::Absent,
+        ),
     )
     .await
     .expect("Codex goal clear timed out")

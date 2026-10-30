@@ -1834,7 +1834,13 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
     let task = controller.task_controller.current()?.unwrap();
     let mut applied = None;
     controller.reconcile_native_goal(&mut applied).await?;
-    assert!(applied.as_ref().unwrap().objective.is_none());
+    assert_eq!(
+        applied.as_ref().unwrap().update,
+        crate::backend::NativeGoalUpdate::Present {
+            objective: "Original objective".into(),
+            status: crate::backend::NativeGoalStatus::Paused,
+        }
+    );
     controller.task_controller.acknowledge_entry(
         &mut store,
         &task.revision,
@@ -1843,14 +1849,26 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
     )?;
     controller.reconcile_native_goal(&mut applied).await?;
     assert_eq!(
-        applied.as_ref().unwrap().objective.as_deref(),
+        match &applied.as_ref().unwrap().update {
+            crate::backend::NativeGoalUpdate::Present {
+                objective,
+                status: crate::backend::NativeGoalStatus::Active,
+            } => Some(objective.as_str()),
+            _ => None,
+        },
         Some("Original objective")
     );
     controller
         .task_controller
         .change(&mut store, Some(&task.revision), TaskChange::Pause, 3)?;
     controller.reconcile_native_goal(&mut applied).await?;
-    assert!(applied.as_ref().unwrap().objective.is_none());
+    assert_eq!(
+        applied.as_ref().unwrap().update,
+        crate::backend::NativeGoalUpdate::Present {
+            objective: "Original objective".into(),
+            status: crate::backend::NativeGoalStatus::Paused,
+        }
+    );
     let paused = controller.task_controller.current()?.unwrap();
     controller.task_controller.change(
         &mut store,
@@ -1859,7 +1877,13 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
         4,
     )?;
     controller.reconcile_native_goal(&mut applied).await?;
-    assert!(applied.as_ref().unwrap().objective.is_none());
+    assert_eq!(
+        applied.as_ref().unwrap().update,
+        crate::backend::NativeGoalUpdate::Present {
+            objective: "Original objective".into(),
+            status: crate::backend::NativeGoalStatus::Paused,
+        }
+    );
     let resumed = controller.task_controller.current()?.unwrap();
     controller.task_controller.acknowledge_entry(
         &mut store,
@@ -1869,7 +1893,13 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
     )?;
     controller.reconcile_native_goal(&mut applied).await?;
     assert_eq!(
-        applied.as_ref().unwrap().objective.as_deref(),
+        match &applied.as_ref().unwrap().update {
+            crate::backend::NativeGoalUpdate::Present {
+                objective,
+                status: crate::backend::NativeGoalStatus::Active,
+            } => Some(objective.as_str()),
+            _ => None,
+        },
         Some("Original objective")
     );
     let mut replacement =
@@ -1882,7 +1912,13 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
         6,
     )?;
     controller.reconcile_native_goal(&mut applied).await?;
-    assert!(applied.as_ref().unwrap().objective.is_none());
+    assert_eq!(
+        applied.as_ref().unwrap().update,
+        crate::backend::NativeGoalUpdate::Present {
+            objective: "Replacement objective".into(),
+            status: crate::backend::NativeGoalStatus::Paused,
+        }
+    );
     let replacement = controller.task_controller.current()?.unwrap();
     controller.task_controller.change(
         &mut store,
@@ -1891,8 +1927,366 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
         7,
     )?;
     controller.reconcile_native_goal(&mut applied).await?;
-    assert!(applied.as_ref().unwrap().objective.is_none());
+    assert_eq!(
+        applied.as_ref().unwrap().update,
+        crate::backend::NativeGoalUpdate::Absent
+    );
     assert!(!*controller.cancellation.subscribe().borrow());
     service.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// Hold native acknowledgments so service task changes can overtake transport completion.
+struct ControlledGoalTransport {
+    request: tokio::sync::mpsc::UnboundedSender<(
+        crate::backend::NativeGoalUpdate,
+        tokio::sync::oneshot::Sender<()>,
+    )>,
+}
+
+#[async_trait::async_trait]
+impl crate::backend::Backend for ControlledGoalTransport {
+    /// Release this in-process transport without starting provider processes.
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Advertise native goal persistence through the normal service boundary.
+    fn descriptor(&self) -> crate::backend::BackendDescriptor {
+        let mut capability = crate::backend::mock_capability();
+        capability.native_goal = true;
+        crate::backend::BackendDescriptor {
+            kind: crate::backend::BackendKind::Mock,
+            label: "Controlled goal transport".into(),
+            capability,
+        }
+    }
+    /// Reject unrelated execution in the goal transport fixture.
+    async fn prompt_stream(
+        &self,
+        _: crate::backend::BackendRequest,
+        _: crate::backend::BackendEventSink,
+    ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+        Err(anyhow::anyhow!("goal fixture does not execute prompts").into())
+    }
+    /// Report the fixture's idle turn lane.
+    async fn has_active_turn(&self, _: &str) -> bool {
+        false
+    }
+    /// Collect the fixture's empty execution tree.
+    async fn cleanup_execution(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Identify the native conversation retained by the fixture.
+    async fn active_session_id_for(&self, _: &str) -> Option<String> {
+        Some("native-thread".into())
+    }
+    /// Delay a native write acknowledgment until the test releases its transport barrier.
+    async fn goal_status(
+        &self,
+        _: crate::backend::BackendRequest,
+        update: crate::backend::NativeGoalUpdate,
+    ) -> Result<()> {
+        let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+        self.request
+            .send((update, acknowledge))
+            .map_err(|_| anyhow::anyhow!("controlled goal transport closed"))?;
+        acknowledged
+            .await
+            .context("controlled goal acknowledgment dropped")?;
+        Ok(())
+    }
+}
+
+/// Prevent cancellation from clearing a paused native goal and repair superseded acknowledgments.
+#[tokio::test]
+async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -> Result<()> {
+    use crate::backend::{NativeGoalStatus, NativeGoalUpdate};
+    use crate::task::{ActiveTask, TaskChange, TaskWorkflow};
+    let fixture = tempfile::tempdir()?;
+    let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
+    let mut controller = SessionController::new(broker)?;
+    let (request, mut received) = tokio::sync::mpsc::unbounded_channel();
+    Arc::get_mut(&mut controller)
+        .context("fixture controller is uniquely owned")?
+        .backend = Arc::new(ControlledGoalTransport { request });
+    let (sink, _output) = forge_protocol::outbound::channel();
+    controller.start_provider(&sink).await;
+    while !controller.provider_ready().await {
+        tokio::task::yield_now().await;
+    }
+    controller.observer.set_native_goal_for_test(true)?;
+    let mut store = SqliteStore::open(&controller.data_root)?;
+    let session_id = controller.observer.session_id().to_owned();
+    let mut session = store.load_session(&session_id)?.unwrap();
+    session.backend_session_id = Some("native-thread".into());
+    store.save_session(&session)?;
+    controller.task_controller.change(
+        &mut store,
+        None,
+        TaskChange::Install(Box::new(ActiveTask::goal(
+            "Retain native goal".into(),
+            Default::default(),
+            true,
+            1,
+        ))),
+        1,
+    )?;
+
+    // Hold the active write while cancellation commits a newer paused contract.
+    let owner = controller.clone();
+    let synchronize = tokio::spawn(async move {
+        let mut applied = None;
+        owner.reconcile_native_goal(&mut applied).await?;
+        Ok::<_, anyhow::Error>(applied)
+    });
+    let (update, acknowledge) = received.recv().await.context("active request missing")?;
+    assert_eq!(
+        update,
+        NativeGoalUpdate::Present {
+            objective: "Retain native goal".into(),
+            status: NativeGoalStatus::Active
+        }
+    );
+    task_state::apply(
+        &controller,
+        &session_id,
+        &Request {
+            id: 2,
+            method: "session.command.apply".into(),
+            params: json!({"operation_id":"cancel-native-goal","action":"pause"}),
+        },
+        20,
+        &sink,
+    )
+    .await?;
+    acknowledge.send(()).unwrap();
+    let (update, acknowledge) = received
+        .recv()
+        .await
+        .context("stale acknowledgment was not repaired")?;
+    assert_eq!(
+        update,
+        NativeGoalUpdate::Present {
+            objective: "Retain native goal".into(),
+            status: NativeGoalStatus::Paused
+        }
+    );
+    acknowledge.send(()).unwrap();
+    let mut applied = synchronize.await??;
+    assert_eq!(applied.as_ref().unwrap().update, update);
+
+    // Resume and block through canonical task transitions without deleting native identity.
+    let paused = controller.task_controller.current()?.unwrap();
+    controller
+        .task_controller
+        .change(&mut store, Some(&paused.revision), TaskChange::Resume, 3)?;
+    for status in [NativeGoalStatus::Active, NativeGoalStatus::Blocked] {
+        if status == NativeGoalStatus::Blocked {
+            let mut blocked = controller.task_controller.current()?.unwrap();
+            let TaskWorkflow::Goal { goal } = &mut blocked.workflow else {
+                anyhow::bail!("fixture goal was replaced")
+            };
+            goal.state = crate::goal::GoalState::Blocked;
+            let revision = blocked.revision.clone();
+            controller.task_controller.change(
+                &mut store,
+                Some(&revision),
+                TaskChange::Update(Box::new(blocked)),
+                4,
+            )?;
+        }
+        let reconciliation = controller.reconcile_native_goal(&mut applied);
+        tokio::pin!(reconciliation);
+        assert!(futures_util::poll!(reconciliation.as_mut()).is_pending());
+        let (update, acknowledge) = received
+            .recv()
+            .await
+            .context("retained goal update missing")?;
+        assert_eq!(
+            update,
+            NativeGoalUpdate::Present {
+                objective: "Retain native goal".into(),
+                status
+            }
+        );
+        acknowledge.send(()).unwrap();
+        reconciliation.await?;
+    }
+
+    // Preserve provider limit evidence until an explicit retry activates the same objective.
+    for (state, status) in [
+        (
+            crate::goal::GoalState::UsageLimited,
+            NativeGoalStatus::UsageLimited,
+        ),
+        (
+            crate::goal::GoalState::BudgetLimited,
+            NativeGoalStatus::BudgetLimited,
+        ),
+    ] {
+        let mut limited = controller.task_controller.current()?.unwrap();
+        let revision = limited.revision.clone();
+        let TaskWorkflow::Goal { goal } = &mut limited.workflow else {
+            anyhow::bail!("fixture goal was replaced")
+        };
+        goal.state = state;
+        controller.task_controller.change(
+            &mut store,
+            Some(&revision),
+            TaskChange::Update(Box::new(limited)),
+            5,
+        )?;
+        let reconciliation = controller.reconcile_native_goal(&mut applied);
+        tokio::pin!(reconciliation);
+        assert!(futures_util::poll!(reconciliation.as_mut()).is_pending());
+        let (update, acknowledge) = received
+            .recv()
+            .await
+            .context("limited goal update missing")?;
+        assert_eq!(
+            update,
+            NativeGoalUpdate::Present {
+                objective: "Retain native goal".into(),
+                status
+            }
+        );
+        acknowledge.send(()).unwrap();
+        reconciliation.await?;
+    }
+    let limited = controller.task_controller.current()?.unwrap();
+    controller.task_controller.change(
+        &mut store,
+        Some(&limited.revision),
+        TaskChange::Resume,
+        5,
+    )?;
+    {
+        let reconciliation = controller.reconcile_native_goal(&mut applied);
+        tokio::pin!(reconciliation);
+        assert!(futures_util::poll!(reconciliation.as_mut()).is_pending());
+        let (update, acknowledge) = received.recv().await.context("goal retry update missing")?;
+        assert_eq!(
+            update,
+            NativeGoalUpdate::Present {
+                objective: "Retain native goal".into(),
+                status: NativeGoalStatus::Active
+            }
+        );
+        acknowledge.send(()).unwrap();
+        reconciliation.await?;
+    }
+
+    // Clear only after the canonical owner has actually been removed.
+    let blocked = controller.task_controller.current()?.unwrap();
+    controller
+        .task_controller
+        .change(&mut store, Some(&blocked.revision), TaskChange::Clear, 5)?;
+    {
+        let reconciliation = controller.reconcile_native_goal(&mut applied);
+        tokio::pin!(reconciliation);
+        assert!(futures_util::poll!(reconciliation.as_mut()).is_pending());
+        let (update, acknowledge) = received.recv().await.context("explicit clear missing")?;
+        assert_eq!(update, NativeGoalUpdate::Absent);
+        acknowledge.send(()).unwrap();
+        reconciliation.await?;
+    }
+
+    // Retain Execute's native owner across phase suspension and explicit retry.
+    let prepared = controller.observer.plan_file.prepare_entry(
+        &session_id,
+        "Retain native execution".into(),
+        None,
+        6,
+    )?;
+    store.save_plan(&prepared.record)?;
+    let execution = crate::plan::PlanExecutionRecord {
+        id: "native-execution".into(),
+        session_id: session_id.clone(),
+        plan_id: prepared.record.id,
+        baseline_checkpoint: None,
+        state: crate::plan::PlanExecutionState::Active,
+        phase: crate::plan::PlanPhase::Implement,
+        implementation_report: None,
+        original_revision: 1,
+        revision: 1,
+        generation: 0,
+        planning_backend_session_id: None,
+        execution_backend_session_id: None,
+        lifecycle: Vec::new(),
+        findings: Vec::new(),
+        progress: Default::default(),
+        verification: Vec::new(),
+        check_runs: Vec::new(),
+        revision_history: Vec::new(),
+        approval_comments: Vec::new(),
+        pending_revision_reason: None,
+        review_paused: false,
+        observed_source: Default::default(),
+        observed_generation: 0,
+        observed_check: Default::default(),
+        created_at_ms: 6,
+        completed_at_ms: None,
+    };
+    store.save_plan_execution(&execution)?;
+    controller.task_controller.change(
+        &mut store,
+        None,
+        TaskChange::Install(Box::new(ActiveTask::execute(
+            "Retain native execution".into(),
+            execution,
+            Default::default(),
+            true,
+            6,
+        ))),
+        6,
+    )?;
+    for (state, status) in [
+        (
+            crate::plan::PlanExecutionState::Paused,
+            NativeGoalStatus::Paused,
+        ),
+        (
+            crate::plan::PlanExecutionState::Blocked,
+            NativeGoalStatus::Blocked,
+        ),
+        (
+            crate::plan::PlanExecutionState::Active,
+            NativeGoalStatus::Active,
+        ),
+    ] {
+        let mut task = controller.task_controller.current()?.unwrap();
+        let revision = task.revision.clone();
+        let TaskWorkflow::Execute { execution } = &mut task.workflow else {
+            anyhow::bail!("fixture execution was replaced")
+        };
+        execution.record.state = state;
+        store.save_plan_execution(&execution.record)?;
+        controller.task_controller.change(
+            &mut store,
+            Some(&revision),
+            TaskChange::Update(Box::new(task)),
+            7,
+        )?;
+        let reconciliation = controller.reconcile_native_goal(&mut applied);
+        tokio::pin!(reconciliation);
+        let progress = futures_util::poll!(reconciliation.as_mut());
+        assert!(
+            progress.is_pending(),
+            "Execute {state:?} reconciliation settled before transport: {progress:?}"
+        );
+        let (update, acknowledge) = received
+            .recv()
+            .await
+            .context("execution native update missing")?;
+        assert_eq!(
+            update,
+            NativeGoalUpdate::Present {
+                objective: "Retain native execution".into(),
+                status
+            }
+        );
+        acknowledge.send(()).unwrap();
+        reconciliation.await?;
+    }
     Ok(())
 }

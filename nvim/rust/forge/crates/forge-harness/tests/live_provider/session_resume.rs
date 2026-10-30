@@ -83,7 +83,7 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
         if provider == "codex" {
             let mut goal_request = request.clone();
             goal_request.backend_session_id = Some(prepared.clone());
-            second.goal_status(goal_request, None, "cleared").await?;
+            second.goal_status(goal_request, forge_harness::backend::NativeGoalUpdate::Absent).await?;
         }
         // Exercise the live binding independently of a caller-supplied identity.
         request.backend_session_id = None;
@@ -100,8 +100,8 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
         assert_token(&warm.event);
         second.background_terminals(inventory).await?;
         if provider == "codex" {
-            second.goal_status(request.clone(), Some("Verify resumed thread".into()), "active").await?;
-            second.goal_status(request.clone(), None, "cleared").await?;
+            second.goal_status(request.clone(), forge_harness::backend::NativeGoalUpdate::from_goal("Verify resumed thread".into(), forge_harness::goal::GoalState::Active)).await?;
+            second.goal_status(request.clone(), forge_harness::backend::NativeGoalUpdate::Absent).await?;
         }
         Ok(conversation)
     }.await;
@@ -116,7 +116,12 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
         inventory.backend_session_id = resumed;
         third.background_terminals(inventory).await?;
         if provider == "codex" {
-            third.goal_status(request.clone(), None, "cleared").await?;
+            third
+                .goal_status(
+                    request.clone(),
+                    forge_harness::backend::NativeGoalUpdate::Absent,
+                )
+                .await?;
         }
         assert_token(&third.prompt(request).await?.event);
         Ok(())

@@ -2253,30 +2253,32 @@ impl Backend for CodexBackend {
     async fn goal_status(
         &self,
         request: BackendRequest,
-        objective: Option<String>,
-        status: &str,
+        update: crate::backend::NativeGoalUpdate,
     ) -> Result<()> {
         let (mut process, mut output, thread_id) = self
             .thread_connection(Self::catalog_from_request(&request))
             .await?
             .context("Codex thread has not started")?;
-        if status == "cleared" {
-            process
-                .request(
-                    "thread/goal/clear",
-                    json!({ "threadId": thread_id }),
-                    &mut output,
-                )
-                .await?;
-        } else {
-            process
-                .request(
+        let (method, params) = match update {
+            crate::backend::NativeGoalUpdate::Absent => {
+                ("thread/goal/clear", json!({ "threadId": thread_id }))
+            }
+            crate::backend::NativeGoalUpdate::Present { objective, status } => {
+                let status = match status {
+                    crate::backend::NativeGoalStatus::Active => "active",
+                    crate::backend::NativeGoalStatus::Paused => "paused",
+                    crate::backend::NativeGoalStatus::Complete => "complete",
+                    crate::backend::NativeGoalStatus::Blocked => "blocked",
+                    crate::backend::NativeGoalStatus::UsageLimited => "usageLimited",
+                    crate::backend::NativeGoalStatus::BudgetLimited => "budgetLimited",
+                };
+                (
                     "thread/goal/set",
                     json!({ "threadId": thread_id, "objective": objective, "status": status }),
-                    &mut output,
                 )
-                .await?;
-        }
+            }
+        };
+        process.request(method, params, &mut output).await?;
         Ok(())
     }
 

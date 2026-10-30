@@ -3504,10 +3504,17 @@ impl HarnessBroker {
             match snapshot.goal {
                 Some(goal) => {
                     self.backend
-                        .goal_status(request, Some(goal.objective), goal_state_name(goal.state))
+                        .goal_status(
+                            request,
+                            crate::backend::NativeGoalUpdate::from_goal(goal.objective, goal.state),
+                        )
                         .await?
                 }
-                None => self.backend.goal_status(request, None, "cleared").await?,
+                None => {
+                    self.backend
+                        .goal_status(request, crate::backend::NativeGoalUpdate::Absent)
+                        .await?
+                }
             }
         }
         Ok(())
@@ -6508,16 +6515,9 @@ impl HarnessBroker {
         else {
             return Ok(false);
         };
-        if matches!(
-            backend_event,
-            BackendEvent::Usage { .. }
-                | BackendEvent::Tool {
-                    update: crate::backend::ToolUpdate::Output { .. }
-                        | crate::backend::ToolUpdate::Changes { .. }
-                        | crate::backend::ToolUpdate::SkillRead { .. },
-                    ..
-                }
-        ) {
+        if matches!(backend_event, BackendEvent::Usage { .. })
+            || matches!(backend_event, BackendEvent::Tool { update, .. } if update.can_update_settled())
+        {
             owner.observe_turn(backend_event, self.clock.now_ms())?;
             self.store.save_exchange(&owner)?;
             let status = self.live_interaction_status(Some(current))?;
@@ -7364,15 +7364,14 @@ impl HarnessBroker {
         Ok(())
     }
 
-    async fn sync_native_goal(&mut self, goal: &GoalRecord, status: &str) -> Result<()> {
+    async fn sync_native_goal(&mut self, goal: &GoalRecord, state: GoalState) -> Result<()> {
         if !goal.native || self.session.backend_session_id.is_none() {
             return Ok(());
         }
         self.backend
             .goal_status(
                 self.backend_request(BackendInput::from_text(""), PromptMode::GoalContinuation),
-                Some(goal.objective.clone()),
-                status,
+                crate::backend::NativeGoalUpdate::from_goal(goal.objective.clone(), state),
             )
             .await
     }
@@ -7589,7 +7588,7 @@ impl HarnessBroker {
         let mut session = self.session.clone();
         if let Some(task) = self.task_controller.current()? {
             if let Some(goal) = self.current_goal()? {
-                self.sync_native_goal(&goal, "cleared").await?;
+                self.sync_native_goal(&goal, GoalState::Cleared).await?;
             }
             self.task_controller.change(
                 &mut self.store,
@@ -7823,7 +7822,7 @@ impl HarnessBroker {
         if goal.state != GoalState::Active {
             return Ok(());
         }
-        self.sync_native_goal(&goal, "paused").await?;
+        self.sync_native_goal(&goal, GoalState::Paused).await?;
         let task = self
             .task_controller
             .current()?
@@ -8777,19 +8776,6 @@ fn resolve_fork_name(
                 .find(|candidate| !existing_name_set.contains(candidate))
                 .expect("fork ordinal space is unbounded")
         })
-}
-
-fn goal_state_name(state: GoalState) -> &'static str {
-    match state {
-        GoalState::Active => "active",
-        GoalState::Paused => "paused",
-        GoalState::Complete => "complete",
-        GoalState::Blocked => "blocked",
-        GoalState::UsageLimited => "usage_limited",
-        GoalState::BudgetLimited => "budget_limited",
-        GoalState::Stalled => "stalled",
-        GoalState::Cleared => "cleared",
-    }
 }
 
 fn default_model() -> String {
@@ -15554,6 +15540,94 @@ let sink = Some(sink);
             Some("parent-interaction")
         );
         assert!(run_list[0].provider_thread_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn late_tool_title_updates_the_settled_owner_without_touching_current_turn() -> Result<()>
+    {
+        use crate::backend::{ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let mut settled = completed_interaction("settled-title", &broker.session.id, Vec::new());
+        let provider = crate::turn::test_support::address(&settled, "settled-provider-turn");
+        let mut turn =
+            crate::turn::test_support::TestTurn::new("settled-turn".into(), provider.clone(), 1);
+        for (update, now_ms) in [
+            (
+                ToolUpdate::Requested {
+                    invocation: ToolInvocation {
+                        kind: ToolActivityKind::ToolCall,
+                        name: "webSearch".into(),
+                        title: "Web Search".into(),
+                        arguments: Value::Null,
+                    },
+                },
+                1,
+            ),
+            (ToolUpdate::Started, 2),
+            (
+                ToolUpdate::Finished {
+                    outcome: ToolOutcome::Succeeded,
+                },
+                3,
+            ),
+        ] {
+            turn.record_tool("search", update, now_ms)?;
+        }
+        turn.finish(crate::turn::TurnOutcome::Completed, 3)?;
+        let recorded = turn.into_exchange();
+        settled.turn = recorded.turn;
+        settled.node_list = recorded.node_list;
+        settled.entry = recorded.entry;
+        settled.rebuild_tool_counter();
+        broker.store.save_exchange(&settled)?;
+
+        let mut current = completed_interaction("current-title", &broker.session.id, Vec::new());
+        current.ordinal = 2;
+        current.phase = crate::exchange::ExchangePhase::Running;
+        let current_provider =
+            crate::turn::test_support::address(&current, "current-provider-turn");
+        current.turn.push(crate::turn::Turn::new(
+            "current-turn".into(),
+            current_provider,
+            4,
+        ));
+        broker.store.save_exchange(&current)?;
+        let current_before = serde_json::to_value(&current)?;
+        let mut event = Vec::new();
+        assert!(
+            broker
+                .route_settled_parent_event(
+                    &current,
+                    &BackendEvent::Tool {
+                        address: crate::backend::ToolAddress {
+                            turn: provider,
+                            tool_id: "search".into(),
+                        },
+                        update: ToolUpdate::TitleChanged {
+                            title: "Web Search · documentation".into(),
+                        },
+                    },
+                    &mut event,
+                )
+                .await?
+        );
+        let saved = broker.store.load_exchange(&settled.id)?.unwrap();
+        let tool = saved.tools().next().unwrap().1;
+        assert_eq!(tool.title, "Web Search · documentation");
+        assert_eq!(tool.state(), crate::turn::ToolState::Completed);
+        assert_eq!(tool.started_at_ms, Some(2));
+        assert_eq!(tool.completed_at_ms, Some(3));
+        assert_eq!(saved.state(), ExchangeState::Complete);
+        assert_eq!(serde_json::to_value(&current)?, current_before);
+        assert_eq!(
+            serde_json::to_value(broker.store.load_exchange(&current.id)?.unwrap())?,
+            current_before
+        );
+        assert!(!event.is_empty(), "late metadata did not reach the client");
+        Ok(())
     }
 
     #[tokio::test]

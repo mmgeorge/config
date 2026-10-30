@@ -363,3 +363,80 @@ async fn late_background_output_preserves_original_tool_address_and_outcome() ->
     );
     Ok(())
 }
+
+/// Keep full request replay and partial execution snapshots on one immutable call.
+#[tokio::test]
+async fn tool_request_replay_preserves_invocation_through_failure_and_next_call()
+-> anyhow::Result<()> {
+    let request = json!({
+        "messageId":"request-one","content":"",
+        "toolRequests":[{"toolCallId":"first","name":"read","arguments":{"path":"first.txt"}}]
+    });
+    let output = collect(
+        vec![
+            start(),
+            event("assistant.message", request.clone()),
+            event("assistant.message", request),
+            event(
+                "tool.execution_start",
+                json!({"toolCallId":"first","toolName":"read"}),
+            ),
+            event(
+                "tool.execution_start",
+                json!({"toolCallId":"first","toolName":"read","arguments":{"path":"first.txt"}}),
+            ),
+            event(
+                "tool.execution_complete",
+                json!({"toolCallId":"first","success":false,"error":{"message":"not found"}}),
+            ),
+            event(
+                "tool.execution_complete",
+                json!({"toolCallId":"first","success":false,"error":{"message":"not found"}}),
+            ),
+            event(
+                "assistant.message",
+                json!({"messageId":"request-two","content":"",
+                    "toolRequests":[{"toolCallId":"second","name":"read","arguments":{"path":"second.txt"}}]}),
+            ),
+            event(
+                "tool.execution_start",
+                json!({"toolCallId":"second","toolName":"read"}),
+            ),
+            event(
+                "tool.execution_complete",
+                json!({"toolCallId":"second","success":true,"result":{"content":"found"}}),
+            ),
+        ],
+        None,
+    )
+    .await?;
+    let mut store = crate::turn::ToolStore::default();
+    let mut request_count = 0;
+    for observation in &output.event {
+        if let BackendEvent::Tool { address, update } = observation {
+            store.merge(address, update, 1)?;
+            if matches!(update, ToolUpdate::Requested { .. }) {
+                request_count += 1;
+            }
+        }
+    }
+    assert_eq!(request_count, 2);
+    assert_eq!(
+        store.get("first").unwrap().state(),
+        crate::turn::ToolState::Failed
+    );
+    assert_eq!(
+        store.get("second").unwrap().state(),
+        crate::turn::ToolState::Completed
+    );
+    assert_eq!(
+        store.execution("first").unwrap().invocation.arguments,
+        json!({"path":"first.txt"})
+    );
+    assert_eq!(
+        store.execution("second").unwrap().invocation.arguments,
+        json!({"path":"second.txt"})
+    );
+    assert_eq!(store.get("second").unwrap().output.as_ref(), "found");
+    Ok(())
+}

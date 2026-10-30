@@ -688,11 +688,26 @@ impl CodexJsonRpc {
         Ok(message)
     }
 
+    /// Identify client responses without confusing independent server request IDs with acknowledgments.
+    pub(super) fn response_id(message: &Value) -> Option<u64> {
+        if message.get("method").is_some() {
+            return None;
+        }
+        message.get("id").and_then(Value::as_u64)
+    }
+
     /// Resolve one matching JSON-RPC response without consuming unrelated messages.
     pub fn request_result(message: &Value, id: u64, method: &str) -> Option<Result<Value>> {
-        if message.get("id").and_then(Value::as_u64) != Some(id) || message.get("method").is_some()
-        {
+        if Self::response_id(message) != Some(id) {
             return None;
+        }
+        if message.get("result").is_some() == message.get("error").is_some() {
+            return Some(Err(crate::backend::BackendError::Protocol {
+                message: format!(
+                    "backend {method} response {id} must contain exactly one of result or error"
+                ),
+            }
+            .into()));
         }
         if let Some(error) = message.get("error") {
             let missing_session = method == "thread/resume"
@@ -716,7 +731,7 @@ impl CodexJsonRpc {
             }
             .into()));
         }
-        Some(Ok(message.get("result").cloned().unwrap_or(Value::Null)))
+        Some(Ok(message["result"].clone()))
     }
 
     /// Collect provider events until a named terminal notification arrives.
@@ -1979,6 +1994,44 @@ pub(super) fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    /// Keep both directions' numeric IDs separate while rejecting malformed client responses.
+    #[test]
+    fn response_identity_distinguishes_server_requests_and_validates_response_envelopes() {
+        use super::CodexJsonRpc;
+        use serde_json::json;
+        let server_request = json!({"id":17,"method":"item/tool/call","params":{}});
+        assert_eq!(CodexJsonRpc::response_id(&server_request), None);
+        assert!(CodexJsonRpc::request_result(&server_request, 17, "turn/steer").is_none());
+        assert_eq!(
+            CodexJsonRpc::request_result(&json!({"id":17,"result":null}), 17, "turn/steer")
+                .unwrap()
+                .unwrap(),
+            serde_json::Value::Null
+        );
+        assert!(
+            CodexJsonRpc::request_result(
+                &json!({"id":17,"error":{"code":-32600,"message":"denied"}}),
+                17,
+                "turn/steer"
+            )
+            .unwrap()
+            .is_err()
+        );
+        for malformed in [
+            json!({"id":17}),
+            json!({"id":17,"result":null,"error":{"code":-32600,"message":"denied"}}),
+        ] {
+            let error = CodexJsonRpc::request_result(&malformed, 17, "turn/steer")
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<crate::backend::BackendError>(),
+                Some(crate::backend::BackendError::Protocol { .. })
+            ));
+            assert!(error.to_string().contains("turn/steer response 17"));
+        }
+    }
+
     /// Distinguish missing history from permission, transient, and unrelated RPC failures.
     #[test]
     fn classifies_only_missing_resume_history() {
@@ -3625,6 +3678,196 @@ mod test {
         assert_eq!(completed.id, "command-completed-with-different-provider-id");
         assert_eq!(completed.status.as_deref(), Some("completed"));
         assert!(!activity.output_delta);
+    }
+
+    #[tokio::test]
+    async fn codex_sparse_tool_progress_preserves_one_request_and_final_titles() -> Result<()> {
+        let mut normalization = fixture_normalization();
+        let address = crate::backend::TurnAddress {
+            scope: fixture_scope(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        let mut turn = crate::turn::test_support::TestTurn::new("turn".into(), address, 0);
+        let mut output = BackendOutput::default();
+        let mut request_count = 0;
+        for (method, params) in [
+            (
+                "item/started",
+                json!({"item":{"id":"command", "type":"commandExecution", "status":"inProgress"}}),
+            ),
+            (
+                "item/commandExecution/outputDelta",
+                json!({"itemId":"command", "delta":"partial output"}),
+            ),
+            (
+                "item/completed",
+                json!({"item":{"id":"command", "type":"commandExecution", "command":"Get-Content README.md", "cwd":"D:/fixture", "status":"completed", "aggregatedOutput":"final output"}}),
+            ),
+            (
+                "item/started",
+                json!({"item":{"id":"mcp", "type":"mcpToolCall", "server":"fixture", "tool":"inspect", "arguments":{"path":"README.md"}, "status":"inProgress"}}),
+            ),
+            (
+                "item/mcpToolCall/progress",
+                json!({"itemId":"mcp", "message":"Inspecting README.md"}),
+            ),
+            (
+                "item/completed",
+                json!({"item":{"id":"mcp", "type":"mcpToolCall", "server":"fixture", "tool":"inspect", "arguments":{"path":"README.md"}, "status":"completed", "result":{"content":[{"type":"text","text":"inspected"}]}}}),
+            ),
+        ] {
+            let previous_count = output.event.len();
+            normalize_event(
+                &mut normalization,
+                &json!({"method":method,"params":params}),
+                &mut output,
+                None,
+            )
+            .await;
+            for event in &output.event[previous_count..] {
+                let BackendEvent::Tool { address, update } = event else {
+                    panic!("expected tool lifecycle");
+                };
+                request_count += usize::from(matches!(update, ToolUpdate::Requested { .. }));
+                turn.record_tool(address.tool_id.as_str(), update.clone(), 1000)?;
+            }
+        }
+        assert_eq!(
+            request_count, 2,
+            "progress must never replay a changed request"
+        );
+        let command = turn.tools().find(|tool| tool.id == "command").unwrap();
+        assert_eq!(command.title, "Get-Content README.md");
+        assert_eq!(command.status, "completed");
+        assert_eq!(&*command.output, "final output");
+        let mcp = turn.tools().find(|tool| tool.id == "mcp").unwrap();
+        assert_eq!(mcp.title, "fixture.inspect({\"path\":\"README.md\"})");
+        assert_eq!(mcp.status, "completed");
+        assert!(mcp.output.contains("inspected"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_conflicting_request_fields_fail_without_replacing_prior_identity() -> Result<()>
+    {
+        for (field, replacement) in [
+            ("tool", json!("other")),
+            ("server", json!("other-server")),
+            ("namespace", json!("other-namespace")),
+            ("arguments", json!({"path":"other.md"})),
+            ("command", json!("Remove-Item README.md")),
+            ("cwd", json!("D:/other")),
+            ("type", json!("dynamicToolCall")),
+        ] {
+            let mut normalization = fixture_normalization();
+            let mut output = BackendOutput::default();
+            let mut original = json!({"id":"call", "type":"mcpToolCall", "server":"fixture", "tool":"inspect",
+                "arguments":{"path":"README.md"}, "command":"Get-Content README.md", "cwd":"D:/fixture"});
+            if field == "namespace" {
+                original.as_object_mut().unwrap().remove("server");
+                original["namespace"] = json!("fixture");
+                original["type"] = json!("dynamicToolCall");
+            }
+            normalize_event(
+                &mut normalization,
+                &json!({"method":"item/started", "params":{"item":original}}),
+                &mut output,
+                None,
+            )
+            .await;
+            let previous_count = output.event.len();
+            let mut changed = original.clone();
+            changed[field] = replacement;
+            let failure = normalization
+                .normalize(
+                    &json!({"method":"item/completed", "params":{
+                "threadId":"thread", "turnId":"turn", "item":changed}}),
+                    &mut output,
+                    None,
+                    "",
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                failure.to_string().contains("changed its invocation"),
+                "{field}: {failure}"
+            );
+            assert_eq!(
+                output.event.len(),
+                previous_count,
+                "{field} published a partial update"
+            );
+            normalize_event(
+                &mut normalization,
+                &json!({"method":"item/completed", "params":{"item":original}}),
+                &mut output,
+                None,
+            )
+            .await;
+            assert!(matches!(
+                output.event.last(),
+                Some(BackendEvent::Tool {
+                    update: ToolUpdate::Finished { .. },
+                    ..
+                })
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_null_arguments_remain_distinct_from_missing_arguments() -> Result<()> {
+        for (original, changed) in [(Value::Null, json!({})), (json!({}), Value::Null)] {
+            let mut normalization = fixture_normalization();
+            let mut output = BackendOutput::default();
+            let item = json!({"id":"call", "type":"mcpToolCall", "server":"fixture", "tool":"inspect", "arguments":original});
+            normalize_event(
+                &mut normalization,
+                &json!({"method":"item/started", "params":{"item":item}}),
+                &mut output,
+                None,
+            )
+            .await;
+            let previous_count = output.event.len();
+            normalize_event(&mut normalization, &json!({"method":"item/mcpToolCall/progress", "params":{"itemId":"call", "message":"Working"}}), &mut output, None).await;
+            assert!(
+                output.event.len() > previous_count,
+                "missing arguments rejected valid progress"
+            );
+            let previous_count = output.event.len();
+            let mut contradictory = item.clone();
+            contradictory["arguments"] = changed;
+            let failure = normalization
+                .normalize(
+                    &json!({"method":"item/completed", "params":{
+                "threadId":"thread", "turnId":"turn", "item":contradictory}}),
+                    &mut output,
+                    None,
+                    "",
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(failure.to_string().contains("changed its invocation"));
+            assert_eq!(output.event.len(), previous_count);
+            normalize_event(
+                &mut normalization,
+                &json!({"method":"item/completed", "params":{"item":item}}),
+                &mut output,
+                None,
+            )
+            .await;
+            assert!(matches!(
+                output.event.last(),
+                Some(BackendEvent::Tool {
+                    update: ToolUpdate::Finished { .. },
+                    ..
+                })
+            ));
+        }
+        Ok(())
     }
 
     #[tokio::test]

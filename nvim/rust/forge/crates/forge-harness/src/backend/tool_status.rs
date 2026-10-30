@@ -34,13 +34,44 @@ pub enum ToolOutcome {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolUpdate {
-    Requested { invocation: ToolInvocation },
-    Input { update: TextUpdate },
+    Requested {
+        invocation: ToolInvocation,
+    },
+    /// Update display text without replacing the admitted tool invocation.
+    TitleChanged {
+        title: String,
+    },
+    Input {
+        update: TextUpdate,
+    },
     Started,
-    Output { update: TextUpdate },
-    Changes { changes: super::ProviderChangeSet },
-    SkillRead { read: Vec<crate::skill::SkillRead> },
-    Finished { outcome: ToolOutcome },
+    Output {
+        update: TextUpdate,
+    },
+    Changes {
+        changes: super::ProviderChangeSet,
+    },
+    SkillRead {
+        read: Vec<crate::skill::SkillRead>,
+    },
+    Finished {
+        outcome: ToolOutcome,
+    },
+}
+
+impl ToolUpdate {
+    /// Permit late metadata and output without reopening an existing tool execution.
+    pub(crate) fn can_update_settled(&self) -> bool {
+        match self {
+            Self::TitleChanged { .. }
+            | Self::Output { .. }
+            | Self::Changes { .. }
+            | Self::SkillRead { .. } => true,
+            Self::Requested { .. } | Self::Input { .. } | Self::Started | Self::Finished { .. } => {
+                false
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]

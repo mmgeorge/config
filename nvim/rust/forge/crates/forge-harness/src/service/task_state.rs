@@ -121,6 +121,7 @@ pub(super) async fn apply_command(
     Ok(())
 }
 
+/// Reconcile committed task state before publishing its session notification and response.
 async fn publish_response(
     controller: &SessionController,
     command: &SessionCommand,
@@ -128,6 +129,24 @@ async fn publish_response(
     receipt: Value,
     sink: &MessageSender,
 ) -> Result<Option<Value>> {
+    let mut snapshot = controller.observer.snapshot()?;
+    let patch = controller
+        .presentation
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+        .reconcile_with_status_thoughts(
+            std::mem::take(&mut snapshot.timeline),
+            controller.observer.status_thoughts.load(Ordering::Relaxed),
+        )?;
+    snapshot.timeline_revision = patch.revision;
+    if !patch.is_empty() {
+        sink.send_event(SessionEvent {
+            session_id: snapshot.session.id.clone(),
+            event: "document_changed".into(),
+            payload: patch.notification(),
+        })
+        .await?;
+    }
     let mut session = SqliteStore::read_only(&controller.data_root)?
         .load_session(controller.observer.session_id())?
         .context("session command owner is missing")?;
@@ -139,7 +158,7 @@ async fn publish_response(
     })
     .await?;
     let result = if command.response == CommandResponse::Snapshot {
-        let mut snapshot = serde_json::to_value(controller.observer.snapshot()?)?;
+        let mut snapshot = serde_json::to_value(snapshot)?;
         snapshot["task_operation"] = receipt;
         snapshot
     } else {

@@ -21,6 +21,265 @@ fn event_channel(
     )))
 }
 
+/// Replace eager sessions for the first scoped tool catalog, then preserve submitted history.
+#[tokio::test]
+async fn copilot_prepared_schema_refresh_recreates_before_submission_and_resumes_after()
+-> Result<()> {
+    for mode in [PromptMode::Chat, PromptMode::Plan] {
+        let (root, backend, mut request) = fixture()?;
+        crate::settings::SettingsStore::open(root.path())?.configure_catalog(root.path())?;
+        let local_session = serde_json::from_value(json!({
+            "id":request.harness_session_id,"primary_agent_id":"agent","name":"Local name retained",
+            "workspace":request.workspace,"backend":"copilot","model":"default","effort":"medium",
+            "provider_fork_state":{"state":"ready"},"approval_mode":"ask",
+            "created_at_ms":1,"updated_at_ms":1
+        }))?;
+        let policy = Arc::new(
+            crate::permissions::matcher::CompiledPermissionDocument::compile(
+                crate::permissions::document::default_permission_document(),
+                root.path(),
+            ),
+        );
+        let (inspection, _lease) = crate::control_tools::harness::HarnessInspectionScope::open(
+            local_session,
+            root.path().into(),
+            "permissions.json".into(),
+            policy,
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&backend.trace),
+        )?;
+        let mut context = ControlTurnContext::inactive(mode);
+        context.harness = Some(inspection);
+        let (client_read, mut server_write) = tokio::io::duplex(65536);
+        let (client_write, mut server_read) = tokio::io::duplex(65536);
+        *backend.client.lock().await = Some(Client::from_streams(
+            client_read,
+            client_write,
+            PathBuf::from(&request.workspace),
+        )?);
+        let (sink, mut events) = event_channel(&request)?;
+        let server = async {
+            let first = read_request(&mut server_read).await?;
+            assert_eq!(first["method"], "session.create");
+            let prepared = first["params"]["sessionId"].clone();
+            respond(
+                &mut server_write,
+                &first,
+                json!({"result":{"sessionId":prepared,"workspacePath":"."}}),
+            )
+            .await?;
+            let replacement = read_request(&mut server_read).await?;
+            assert_eq!(
+                replacement["method"], "session.create",
+                "empty native history cannot be resumed"
+            );
+            let submitted = replacement["params"]["sessionId"].clone();
+            assert_ne!(submitted, prepared);
+            assert!(
+                replacement["params"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "harness_config")
+            );
+            respond(
+                &mut server_write,
+                &replacement,
+                json!({"result":{"sessionId":submitted,"workspacePath":"."}}),
+            )
+            .await?;
+            let disconnect = read_request(&mut server_read).await?;
+            assert_eq!(disconnect["method"], "session.destroy");
+            assert_eq!(disconnect["params"]["sessionId"], prepared);
+            respond(&mut server_write, &disconnect, json!({"result":{}})).await?;
+            let todos = read_request(&mut server_read).await?;
+            assert_eq!(todos["method"], "session.plan.readSqlTodosWithDependencies");
+            respond(
+                &mut server_write,
+                &todos,
+                json!({"result":{"rows":[],"dependencies":[]}}),
+            )
+            .await?;
+            let tail = read_request(&mut server_read).await?;
+            assert_eq!(tail["method"], "session.eventLog.tail");
+            respond(
+                &mut server_write,
+                &tail,
+                json!({"result":{"cursor":"before"}}),
+            )
+            .await?;
+            let send = read_request(&mut server_read).await?;
+            assert_eq!(send["method"], "session.send");
+            assert_eq!(send["params"]["sessionId"], submitted);
+            respond(
+                &mut server_write,
+                &send,
+                json!({"result":{"messageId":"user"}}),
+            )
+            .await?;
+            for (kind, data) in [
+                ("assistant.turn_start", json!({"turnId":"turn"})),
+                (
+                    "assistant.message",
+                    json!({"messageId":"answer","phase":"final_answer","content":"READY"}),
+                ),
+                ("session.idle", json!({})),
+            ] {
+                write_frame(&mut server_write,json!({"jsonrpc":"2.0","method":"session.event","params":{
+                    "sessionId":submitted,"event":{"id":kind,"type":kind,"timestamp":"2026-10-30T00:00:00Z","data":data}
+                }})).await?;
+            }
+            let disconnect = read_request(&mut server_read).await?;
+            assert_eq!(disconnect["method"], "session.destroy");
+            respond(&mut server_write, &disconnect, json!({"result":{}})).await?;
+            let resume = read_request(&mut server_read).await?;
+            assert_eq!(resume["method"], "session.resume");
+            assert_eq!(resume["params"]["sessionId"], submitted);
+            assert_eq!(resume["params"]["disableResume"], true);
+            respond(
+                &mut server_write,
+                &resume,
+                json!({"result":{"sessionId":submitted,"workspacePath":"."}}),
+            )
+            .await?;
+            let reload = read_request(&mut server_read).await?;
+            assert_eq!(reload["method"], "session.skills.reload");
+            respond(&mut server_write, &reload, json!({"result":{}})).await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let workflow = async {
+            let prepared = backend
+                .initialize_session(request.clone())
+                .await?
+                .context("missing prepared identity")?;
+            request.backend_session_id = Some(prepared.clone());
+            request.mode = mode;
+            request.control_context = Some(context);
+            let completion = backend.prompt_stream(request.clone(), sink).await?;
+            assert_ne!(
+                completion.backend_session_id.as_deref(),
+                Some(prepared.as_str())
+            );
+            request.control_context.as_mut().unwrap().mode = PromptMode::PlanQuestion;
+            assert_eq!(
+                backend.initialize_session(request).await?,
+                completion.backend_session_id
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(server, workflow)
+        })
+        .await??;
+        while events.try_next()?.is_some() {}
+    }
+    Ok(())
+}
+
+/// Keep the connected prepared session when creation fails, including resource refresh.
+#[tokio::test]
+async fn copilot_failed_prepared_refresh_keeps_original_until_retry_commits() -> Result<()> {
+    let (_root, backend, mut request) = fixture()?;
+    let (client_read, mut server_write) = tokio::io::duplex(65536);
+    let (client_write, mut server_read) = tokio::io::duplex(65536);
+    *backend.client.lock().await = Some(Client::from_streams(
+        client_read,
+        client_write,
+        PathBuf::from(&request.workspace),
+    )?);
+    let server = async {
+        let create = read_request(&mut server_read).await?;
+        assert_eq!(create["method"], "session.create");
+        let prepared = create["params"]["sessionId"].clone();
+        respond(
+            &mut server_write,
+            &create,
+            json!({"result":{"sessionId":prepared,"workspacePath":"."}}),
+        )
+        .await?;
+        let failed = read_request(&mut server_read).await?;
+        assert_eq!(failed["method"], "session.create");
+        respond(
+            &mut server_write,
+            &failed,
+            json!({"error":{"code":-32603,"message":"fixture replacement failed"}}),
+        )
+        .await?;
+        let retry = read_request(&mut server_read).await?;
+        assert_eq!(
+            retry["method"], "session.create",
+            "retry tried to resume an unpersisted ID"
+        );
+        let replacement = retry["params"]["sessionId"].clone();
+        assert_ne!(replacement, prepared);
+        respond(
+            &mut server_write,
+            &retry,
+            json!({"result":{"sessionId":replacement,"workspacePath":"."}}),
+        )
+        .await?;
+        let destroy = read_request(&mut server_read).await?;
+        assert_eq!(destroy["method"], "session.destroy");
+        assert_eq!(destroy["params"]["sessionId"], prepared);
+        respond(&mut server_write, &destroy, json!({"result":{}})).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let workflow = async {
+        let prepared = backend
+            .initialize_session(request.clone())
+            .await?
+            .context("missing prepared identity")?;
+        request.backend_session_id = Some(prepared.clone());
+        let failure = backend
+            .session(&request, CopilotSessionReuse::Refresh)
+            .await;
+        assert!(failure.is_err());
+        let retained = backend
+            .session(&request, CopilotSessionReuse::Compatible)
+            .await?;
+        assert_eq!(retained.id().as_str(), prepared);
+        let replacement = backend
+            .session(&request, CopilotSessionReuse::Refresh)
+            .await?;
+        assert_ne!(replacement.id().as_str(), prepared);
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::try_join!(server, workflow)
+    })
+    .await??;
+    Ok(())
+}
+
+/// Preserve a genuine missing-history failure instead of starting an unrelated conversation.
+#[tokio::test]
+async fn copilot_missing_resumed_history_remains_strict() -> Result<()> {
+    let (_root, backend, mut request) = fixture()?;
+    request.backend_session_id = Some("missing-populated-session".into());
+    let (client_read, mut server_write) = tokio::io::duplex(65536);
+    let (client_write, mut server_read) = tokio::io::duplex(65536);
+    *backend.client.lock().await = Some(Client::from_streams(
+        client_read,
+        client_write,
+        PathBuf::from(&request.workspace),
+    )?);
+    let server = async {
+        let resume = read_request(&mut server_read).await?;
+        assert_eq!(resume["method"], "session.resume");
+        respond(&mut server_write,&resume,json!({"error":{"code":-32603,"message":"Session not found: missing-populated-session"}})).await
+    };
+    let workflow = async {
+        let failure = backend.initialize_session(request).await.unwrap_err();
+        assert!(matches!(
+            failure.downcast_ref::<BackendError>(),
+            Some(BackendError::SessionMissing { .. })
+        ));
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::try_join!(server, workflow)?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn copilot_retry_waits_for_idle_and_keeps_the_native_session() -> Result<()> {
     let (fixture, backend, mut request) = fixture()?;
@@ -202,7 +461,10 @@ async fn copilot_disables_tool_search_and_binds_session_files_on_create_and_resu
             Ok::<_, anyhow::Error>(())
         };
         let (session, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::try_join!(backend.session(&request), server)
+            tokio::try_join!(
+                backend.session(&request, CopilotSessionReuse::Compatible),
+                server
+            )
         })
         .await??;
         let (sink, mut events) = event_channel(&request)?;
@@ -431,7 +693,10 @@ async fn copilot_cleanup_sends_abort_before_a_pending_send_response() -> Result<
         )
         .await
     };
-    let (session, ()) = tokio::try_join!(backend.session(&request), create)?;
+    let (session, ()) = tokio::try_join!(
+        backend.session(&request, CopilotSessionReuse::Compatible),
+        create
+    )?;
     let turn = backend.turn_event(&session_id).await;
     let active = turn.activate(None, None)?;
     let (submitted, submission) = tokio::sync::oneshot::channel();

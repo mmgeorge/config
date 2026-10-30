@@ -498,13 +498,7 @@ impl Exchange {
         let existing = self
             .tools_for_turn(turn_id)
             .any(|tool| tool.id == address.tool_id.as_str());
-        let late = existing
-            && matches!(
-                update,
-                crate::backend::ToolUpdate::Output { .. }
-                    | crate::backend::ToolUpdate::Changes { .. }
-                    | crate::backend::ToolUpdate::SkillRead { .. }
-            );
+        let late = existing && update.can_update_settled();
         ensure!(
             self.turn.iter().any(|turn| turn.id() == turn_id
                 && turn.provider() == &address.turn
@@ -820,6 +814,20 @@ mod tests {
             },
             6,
         )?;
+        let node_count = restored.node_list.len();
+        assert!(restored.observe_turn(
+            &BackendEvent::Tool {
+                address: crate::backend::ToolAddress {
+                    turn: address.clone(),
+                    tool_id: "first".into(),
+                },
+                update: ToolUpdate::TitleChanged {
+                    title: "Inspect completed results".into(),
+                },
+            },
+            7,
+        )?);
+        assert_eq!(restored.node_list.len(), node_count);
         let owner = restored
             .entry
             .iter()
@@ -840,6 +848,10 @@ mod tests {
             commentary.tool[0].store.get("first").unwrap().output,
             "late output"
         );
+        let updated = commentary.tool[0].store.get("first").unwrap();
+        assert_eq!(updated.title, "Inspect completed results");
+        assert_eq!(updated.state(), crate::turn::ToolState::Completed);
+        assert_eq!(updated.completed_at_ms, Some(5));
         assert_eq!(restored.tool_counter.completed, 1);
         let view = restored.content(&restored.node_list.iter().collect::<Vec<_>>(), true)?;
         assert_eq!(view.commentary[0].tools.call.len(), 2);

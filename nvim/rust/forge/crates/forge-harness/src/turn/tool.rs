@@ -178,6 +178,7 @@ impl ToolStore {
                     ));
                 }
             }
+            ToolUpdate::TitleChanged { title } => tool.title.clone_from(title),
             ToolUpdate::Input { update } => match update {
                 TextUpdate::Append(text) => execution.input.push_str(text),
                 TextUpdate::Replace(text) => execution.input.clone_from(text),
@@ -243,6 +244,103 @@ fn tool_failed(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keep invocation identity immutable while display metadata evolves and survives reload.
+    #[test]
+    fn title_updates_preserve_invocation_identity_and_settled_execution()
+    -> Result<(), crate::backend::BackendError> {
+        let address = ToolAddress {
+            turn: crate::backend::TurnAddress {
+                scope: crate::backend::InvocationScope::new(
+                    crate::backend::ExecutionOwner::root("session"),
+                    "exchange",
+                ),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+            },
+            tool_id: "call".into(),
+        };
+        let invocation = ToolInvocation {
+            kind: crate::backend::ToolActivityKind::ToolCall,
+            name: "web_search".into(),
+            title: "Web Search".into(),
+            arguments: serde_json::json!({"query":"Neovim"}),
+        };
+        let mut store = ToolStore::default();
+        assert!(
+            store
+                .merge(
+                    &address,
+                    &ToolUpdate::TitleChanged {
+                        title: "Too early".into()
+                    },
+                    0
+                )
+                .is_err()
+        );
+        store.merge(
+            &address,
+            &ToolUpdate::Requested {
+                invocation: invocation.clone(),
+            },
+            1,
+        )?;
+        store.merge(&address, &ToolUpdate::Started, 2)?;
+        store.merge(
+            &address,
+            &ToolUpdate::TitleChanged {
+                title: "Web Search · Neovim".into(),
+            },
+            3,
+        )?;
+        store.merge(
+            &address,
+            &ToolUpdate::Finished {
+                outcome: ToolOutcome::Succeeded,
+            },
+            4,
+        )?;
+        let mut restored: ToolStore =
+            serde_json::from_value(serde_json::to_value(store).unwrap()).unwrap();
+        restored.merge(
+            &address,
+            &ToolUpdate::TitleChanged {
+                title: "Web Search · Neovim documentation".into(),
+            },
+            5,
+        )?;
+        restored.merge(
+            &address,
+            &ToolUpdate::Requested {
+                invocation: invocation.clone(),
+            },
+            6,
+        )?;
+        assert_eq!(restored.execution("call").unwrap().invocation, invocation);
+        let call = restored.get("call").unwrap();
+        assert_eq!(call.title, "Web Search · Neovim documentation");
+        assert_eq!(call.started_at_ms, Some(2));
+        assert_eq!(call.completed_at_ms, Some(4));
+        assert_eq!(call.state(), ToolState::Completed);
+        let mut changed = invocation;
+        changed.arguments = serde_json::json!({"query":"different"});
+        assert!(
+            restored
+                .merge(
+                    &address,
+                    &ToolUpdate::Requested {
+                        invocation: changed
+                    },
+                    7
+                )
+                .is_err()
+        );
+        assert_eq!(
+            restored.get("call").unwrap().title,
+            "Web Search · Neovim documentation"
+        );
+        Ok(())
+    }
 
     #[test]
     fn tool_identity_input_and_denial_survive_reopening_without_restarting_execution()

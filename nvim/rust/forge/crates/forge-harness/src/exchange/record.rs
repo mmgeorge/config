@@ -534,15 +534,7 @@ impl Exchange {
                     return Ok(false);
                 };
                 let late_update = existing_tool
-                    && matches!(
-                        event,
-                        BackendEvent::Tool {
-                            update: crate::backend::ToolUpdate::Output { .. }
-                                | crate::backend::ToolUpdate::Changes { .. }
-                                | crate::backend::ToolUpdate::SkillRead { .. },
-                            ..
-                        }
-                    );
+                    && matches!(event, BackendEvent::Tool { update, .. } if update.can_update_settled());
                 if turn.state() != TurnState::Running && !late_update {
                     return Ok(false);
                 }
