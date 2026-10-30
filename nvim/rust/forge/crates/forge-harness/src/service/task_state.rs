@@ -90,7 +90,10 @@ pub(super) async fn apply_command(
     }
     let active_elicitation =
         publish_response(controller, command, request_id, receipt.view(), sink).await?;
-    if let Some(event) = command.action.event_name() {
+    if let Some(event) = command
+        .action
+        .event_name(lifecycle.as_ref().map(|record| record.kind))
+    {
         let execution =
             controller
                 .task_controller
@@ -99,7 +102,7 @@ pub(super) async fn apply_command(
                     crate::task::TaskWorkflow::Execute { execution } => Some(execution.record),
                     _ => None,
                 });
-        let payload = if matches!(command.action, SessionAction::BeginAcceptance { .. }) {
+        let payload = if event == "plan_acceptance_started" {
             active_elicitation.unwrap_or(Value::Null)
         } else {
             json!({"plan":plan,"lifecycle":lifecycle,"execution":execution})

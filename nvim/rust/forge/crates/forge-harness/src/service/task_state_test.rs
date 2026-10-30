@@ -1286,6 +1286,126 @@ async fn reviewed_execution_fixture(
     )
 }
 
+/// Keep approved inline feedback in Plan until its revision is submitted, then promote only once.
+#[tokio::test]
+async fn accepted_inline_feedback_revises_before_execution_without_changing_policy() -> Result<()> {
+    use crate::backend::mock_response::MockResponseCommand;
+    for decision in ["accept-feedback", "accept-empty", "request-changes"] {
+        let fixture = tempfile::tempdir()?;
+        crate::checks::configure_fixture(fixture.path());
+        let service = service();
+        service.open_session(1, initialize(&fixture, "mock")).await?;
+        let registry = service.registry().await?;
+        let session_id = registry.initial_session_id().to_owned();
+        let controller = registry.resolve(&session_id).await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let reader = tokio::spawn(async move {
+            while output.recv().await?.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        controller.attach_input(&sink).await?;
+        service.dispatch(Some(session_id.clone()), Request {
+            id: 30, method: "session.configure".into(),
+            params: json!({"plan_auto_approve_revisions":false}),
+        }, &sink).await?;
+        let selection = reviewed_execution_fixture(&service, &controller, &session_id, &sink).await?;
+        let plan_id = selection["plan_id"].as_str().unwrap();
+        let store = SqliteStore::read_only(&controller.data_root)?;
+        let initial = store.load_plan(plan_id)?.unwrap();
+        let source = controller.observer.capture_plan_review(
+            plan_id, initial.review_digest.as_deref().unwrap(),
+        )?;
+        let line = source.rendered.navigation.anchor.first().unwrap().line;
+        let feedback = "Conversation context:\nPlan question:\nWhy this design?\n\nPlan answer:\nIt preserves ownership.\n\nRequested change:\nClarify the ownership boundary.";
+        let annotations = if decision == "accept-empty" {
+            json!([])
+        } else {
+            json!([{"start_line":line,"end_line":line,"body":feedback}])
+        };
+        let control = controller.backend.mock_response_control().unwrap();
+        let hold = control.dispatch(&session_id, MockResponseCommand::Hold {
+            mode: None, any_session: false,
+        }).await?;
+        let hold_id = hold["id"].as_str().unwrap().to_owned();
+        service.dispatch(Some(session_id.clone()), Request {
+            id: 32, method: "session.command.apply".into(),
+            params: json!({
+                "operation_id":"review-decision",
+                "action":if decision == "request-changes" { "request_changes" } else { "begin_acceptance" },
+                "plan_id":plan_id,"digest":initial.review_digest,
+                "saved_source_digest":source.saved_digest,
+                "comment":"Preserve the public API.","annotations":annotations,
+            }),
+        }, &sink).await?;
+        if decision != "request-changes" {
+            let mut selected = selection.clone();
+            selected["approval_mode"] = json!("ask");
+            selected["plan_compact"] = json!(false);
+            service.dispatch(Some(session_id.clone()), Request {
+                id: 33, method: "session.command.apply".into(), params: selected,
+            }, &sink).await?;
+        }
+        let pending = tokio::time::timeout(Duration::from_secs(5), control.dispatch(
+            &session_id, MockResponseCommand::Wait { id: hold_id.clone() },
+        )).await??;
+        let revising = decision != "accept-empty";
+        assert_eq!(pending["mode"], serde_json::to_value(if revising {
+            crate::backend::PromptMode::Plan
+        } else {
+            crate::backend::PromptMode::ExecutePlan
+        })?);
+        if revising {
+            assert!(pending["prompt"].as_str().unwrap().contains(feedback));
+            let saved = store.load_plan(plan_id)?.unwrap();
+            assert_eq!(saved.state, crate::plan::PlanState::Revising);
+            assert_eq!(saved.accepted_revision, None);
+            assert_eq!(saved.revision_approval.is_some(), decision == "accept-feedback");
+            let next = control.dispatch(&session_id, MockResponseCommand::Hold {
+                mode: Some(crate::backend::PromptMode::ExecutePlan), any_session: false,
+            }).await?;
+            let next_id = next["id"].as_str().unwrap().to_owned();
+            control.dispatch(&session_id, MockResponseCommand::Release { id: hold_id }).await?;
+            if decision == "accept-feedback" {
+                tokio::time::timeout(Duration::from_secs(5), control.dispatch(
+                    &session_id, MockResponseCommand::Wait { id: next_id.clone() },
+                )).await??;
+                let accepted = store.load_plan(plan_id)?.unwrap();
+                assert_eq!(accepted.accepted_revision, Some(initial.model_revision + 1));
+                assert!(accepted.revision_approval.is_none());
+                assert!(matches!(
+                    controller.task_controller.current()?.unwrap().workflow,
+                    crate::task::TaskWorkflow::Execute { .. }
+                ));
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let plan = store.load_plan(plan_id)?.unwrap();
+                        if plan.state == crate::plan::PlanState::AwaitingReview
+                            && controller.coordinator.execution.available_permits() > 0
+                        {
+                            assert_eq!(plan.accepted_revision, None);
+                            assert!(plan.revision_approval.is_none());
+                            break Ok::<(), anyhow::Error>(());
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }).await??;
+            }
+            control.dispatch(&session_id, MockResponseCommand::Cancel { id: next_id }).await?;
+        } else {
+            let accepted = store.load_plan(plan_id)?.unwrap();
+            assert_eq!(accepted.accepted_revision, Some(initial.model_revision));
+            assert!(accepted.revision_approval.is_none());
+            control.dispatch(&session_id, MockResponseCommand::Cancel { id: hold_id }).await?;
+        }
+        assert!(!store.load_session(&session_id)?.unwrap().plan_auto_approve_revisions);
+        service.shutdown(Duration::from_secs(2)).await?;
+        drop(sink);
+        tokio::time::timeout(Duration::from_secs(2), reader).await???;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt() -> Result<()> {
     use crate::backend::mock_response::MockResponseCommand;

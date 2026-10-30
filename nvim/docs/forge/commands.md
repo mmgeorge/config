@@ -547,13 +547,18 @@ Regular diffs and PlanReview render enclosing declarations as syntax-highlighted
 source lines. An indented `...` marks omitted source between visible regions.
 New functions and methods contain an `Algorithm` block in academic pseudocode.
 Algorithm blocks highlight control keywords, assignment and comparison operators, literals,
-and identifiers. Variables and named fields are white, while descriptive prose is comment gray.
+and identifiers. Variables and named fields are white. Only `#` comments use comment coloring.
+Write operations as calls such as `spawn_square(...)`. Prose statements, prose expressions,
+and adjacent operands without an operator are rejected at submission. Use comma-separated
+tuples and lists, and keep each complete statement on one line.
 Algorithm and Change headings use the same style as Calls, Constructs, and Accesses.
 Wrapped rows preserve source indentation after the diff gutter. Constructors retain type highlighting.
 Press `.` on an Algorithm parameter name to jump to that parameter in the function signature.
 Press it on a call or member name to jump to its declaration. Receiver types take priority,
 then Calls, Constructs, and Accesses resolve shortened names. Ambiguous matches report the
 candidate names without moving the cursor. Jump-back returns to the original Algorithm token.
+Unlisted unqualified lowercase calls represent abstract operations and have no declaration
+navigation target. They do not require implementation functions or new `Calls` entries.
 Write constructions explicitly as `Projectile(damage = 1)` or `CombatEntity()` for a marker.
 Each `Constructs` entry must match an invocation in the Algorithm, using its exact qualified
 name and named arguments. Keep construction separate from the operation that queues or inserts it.
@@ -588,6 +593,12 @@ Approving a plan and requesting changes both open an optional-comment popup. Pre
 `Esc` or `Ctrl-C` cancels the decision. Approval comments remain with the accepted
 revision and are included in execution context. A plan changed while its popup is
 open must be reviewed again before the decision can be submitted.
+Accepting with inline comments asks the agent to revise the plan first, then
+automatically approves the next submitted revision and starts or resumes execution.
+Each comment includes its source context and any question-and-answer thread it
+belongs to. Question-only threads are not sent as change requests. This approval
+applies only to that review cycle and does not change the global auto-approval
+setting. Requesting changes still requires another review.
 Save pending annotations before a definition jump that changes the projection.
 `Constructs` lists directly instantiated types in green and factory calls with function highlighting.
 Factories are identified by their owned named return type. `Calls` lists other invocations and

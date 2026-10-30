@@ -719,6 +719,36 @@ impl SessionController {
             return Ok(());
         }
         let snapshot = self.coordinator.submissions.snapshot()?;
+        // Recover a submitted revision whose approval was interrupted before execution promotion.
+        if !snapshot.suspended
+            && !snapshot.messages.iter().any(|message| {
+                matches!(message.purpose, crate::input::InputPurpose::User)
+                    && !matches!(
+                        message.delivery,
+                        InputDelivery::Accepted | InputDelivery::Delivering
+                    )
+            })
+            && let Some(command) = crate::task::command::SessionCommand::approved_revision(&task)?
+        {
+            let Ok(_control) = self.coordinator.control.clone().try_acquire_owned() else {
+                return Ok(());
+            };
+            let Ok(_execution) = self.coordinator.execution.clone().try_acquire_owned() else {
+                return Ok(());
+            };
+            task.permit()
+                .validate(self.task_controller.current()?.as_ref())?;
+            super::task_state::apply_command(
+                self,
+                self.observer.session_id(),
+                &command,
+                None,
+                self.goal_max_turns,
+                sink,
+            )
+            .await?;
+            return Ok(());
+        }
         let (id, text, purpose) = if let Some(entry) = task
             .entry
             .as_ref()

@@ -1666,7 +1666,7 @@ mod tests {
         let mut document = super::super::document::test_fixture("algorithm-rename", "Rename");
         let mut design = super::super::DeclarationDesign::default();
         design.proposed.insert("main.rs".into(), "pub struct Client { pub endpoint: u32 }\npub struct Other { pub endpoint: u32 }\nimpl Client { pub fn send(&self); }\npub fn run(client: &Client, other: &Other);\n".into());
-        let source = "Record Client.endpoint\nclient.send()\nvalue ← client.endpoint\nother.endpoint ← 0\ncreated ← Client(endpoint = 1)\nreturn \"Client.endpoint client.send()\" # Client.endpoint";
+        let source = "record(Client.endpoint)\nclient.send()\nvalue ← client.endpoint\nother.endpoint ← 0\ncreated ← Client(endpoint = 1)\nreturn \"Client.endpoint client.send()\" # Client.endpoint";
         design.proposed_calls.insert(
             "main.rs".into(),
             vec![super::super::FunctionBody {
@@ -1696,17 +1696,17 @@ mod tests {
             (
                 "Client",
                 "Transport",
-                "Record Transport.endpoint\nclient.send()\nvalue ← client.endpoint\nother.endpoint ← 0",
+                "record(Transport.endpoint)\nclient.send()\nvalue ← client.endpoint\nother.endpoint ← 0",
             ),
             (
                 "endpoint",
                 "address",
-                "Record Client.address\nclient.send()\nvalue ← client.address\nother.endpoint ← 0",
+                "record(Client.address)\nclient.send()\nvalue ← client.address\nother.endpoint ← 0",
             ),
             (
                 "send",
                 "dispatch",
-                "Record Client.endpoint\nclient.dispatch()\nvalue ← client.endpoint\nother.endpoint ← 0",
+                "record(Client.endpoint)\nclient.dispatch()\nvalue ← client.endpoint\nother.endpoint ← 0",
             ),
         ] {
             let symbol = index.declaration["main.rs"]

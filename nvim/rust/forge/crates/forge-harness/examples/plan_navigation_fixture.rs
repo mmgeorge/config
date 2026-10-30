@@ -94,7 +94,7 @@ fn main() -> Result<()> {
         design.proposed_calls.get_mut("src/change.rs").unwrap().push(FunctionBody {
             owner: "planned_probe".into(),
             behavior: Some(forge_harness::plan::FunctionBehavior::Algorithm(
-                "result ← value\nRecord ProbeResult.value\ndirection ← movement_direction(0)\nabilities.start_dash(direction)\nabilities.cooldown ← 0\nDecrease cooldown_remaining and weapon.cooldown by elapsed seconds with a zero floor while preserving the stored firing order\nif result ≠ none:\n  return ProbeResult(value = result)\nreturn ProbeResult(value = none)".into(),
+                "result ← value\nrecord(ProbeResult.value)\ndirection ← movement_direction(0)\nabilities.start_dash(direction)\nabilities.cooldown ← 0\ndecrease_cooldowns(cooldown_remaining, weapon.cooldown, elapsed_seconds, minimum_remaining = 0, preserve_order = stored_firing_order)\n# Preserve firing order while decreasing cooldowns\nif result ≠ none:\n  return ProbeResult(value = result)\nreturn ProbeResult(value = none)".into(),
             )),
             evidence: None,
             call: Some(vec![

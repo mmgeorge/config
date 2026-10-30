@@ -556,6 +556,9 @@ pub(crate) fn resolve_algorithm_reference(
             })
         }));
     }
+    if receiver.is_none() && !qualified && !member.chars().next().is_some_and(char::is_uppercase) {
+        return Ok(None);
+    }
     let name = if receiver.is_some() && !qualified {
         let [receiver_type] = types.as_slice() else {
             anyhow::bail!("Algorithm receiver has no unique signature type or Calls target");
@@ -1330,17 +1333,17 @@ mod tests {
     fn algorithm_typed_fields_require_matching_accesses() {
         for (expression, access, valid) in [
             (
-                "Record Projectile.previous_position",
+                "record(Projectile.previous_position)",
                 Some("Projectile::previous_position"),
                 true,
             ),
-            ("Record Projectile.previous_position", None, false),
+            ("record(Projectile.previous_position)", None, false),
             (
-                "Record Projectile.missing",
+                "record(Projectile.missing)",
                 Some("Projectile::previous_position"),
                 false,
             ),
-            ("Advance the position", None, true),
+            ("advance_position()", None, true),
         ] {
             let mut design = super::super::DeclarationDesign::default();
             design.proposed.insert(
@@ -1443,7 +1446,7 @@ mod tests {
         }
         for (source, token, expected, kind) in [
             (
-                "Record Projectile.previous_position",
+                "record(Projectile.previous_position)",
                 "Projectile",
                 "Projectile",
                 CallKind::Value,
@@ -1461,7 +1464,7 @@ mod tests {
                 CallKind::Call,
             ),
             (
-                "abilities.remaining",
+                "return abilities.remaining",
                 "remaining",
                 "PlayerAbilities::remaining",
                 CallKind::Property,
@@ -1508,7 +1511,7 @@ mod tests {
         };
         assert_eq!(reference.name, "Other::start_dash");
         assert!(
-            select(&body, "Decrease cooldown", "Decrease")
+            select(&body, "decrease_cooldown()", "decrease_cooldown")
                 .unwrap()
                 .is_none()
         );
@@ -1669,6 +1672,32 @@ mod tests {
             FunctionBehavior::Algorithm("if ready\n  return value\nreturn none".into()),
         );
         validate_behaviors(&design).unwrap();
+        for prose in [
+            "spawn a 2D camera",
+            "candidate ← earliest eligible item",
+            "if candidate is ready\n  process(candidate)",
+            "spawn(position = the origin)",
+        ] {
+            let source = format!(
+                "pub fn run();\nAlgorithm\n  {}\n",
+                prose.replace('\n', "\n  ")
+            );
+            let (text, bodies) = parse("main.rs", &source, &[]).unwrap();
+            design.proposed.insert("main.rs".into(), text);
+            design.proposed_calls.insert("main.rs".into(), bodies);
+            let error = validate_behaviors(&design).unwrap_err().to_string();
+            assert!(
+                error.contains("main.rs: run") && error.contains("Algorithm line"),
+                "{error}"
+            );
+            assert!(error.contains("prose belongs in # comments"), "{error}");
+        }
+        design.proposed_calls.get_mut("main.rs").unwrap()[0].behavior =
+            Some(FunctionBehavior::Algorithm(
+                "spawn_camera_2d()\nspawn_square(position = (200, 0), components = [target])"
+                    .into(),
+            ));
+        validate_behaviors(&design).unwrap();
     }
 
     #[test]
@@ -1698,7 +1727,7 @@ mod tests {
                 true,
             ),
             (
-                "queue spawn(Projectile(damage = inspect(value)), CombatEntity())",
+                "spawn(Projectile(damage = inspect(value)), CombatEntity())",
                 true,
             ),
         ] {

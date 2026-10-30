@@ -1080,7 +1080,7 @@ mod test {
             .unwrap()
             .proposed["src/lib.rs"];
         let repair_patch = format!(
-            "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n {}\n+\n+pub fn inspect(owner: &Owner);\n+Algorithm\n+  inspect owner.private\n+Accesses\n+  Owner::private\n*** End Patch",
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n {}\n+\n+pub fn inspect(owner: &Owner);\n+Algorithm\n+  inspect_value(owner.private)\n+Accesses\n+  Owner::private\n*** End Patch",
             declaration.lines().last().unwrap()
         );
         runtime.invoke(change(3, &repair_patch)).await.unwrap();
@@ -1227,7 +1227,7 @@ mod test {
         ] {
             assert!(runtime.invoke(read(arguments)).await.is_err());
         }
-        let result = runtime.invoke(ControlToolInvocation { task_permit: None, name:"design_patch".into(), arguments:json!({"plan_id":"plan", "expected_version":1, "patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;\n+Algorithm\n+  return the number of targets\n*** End Patch"}) }).await.unwrap();
+        let result = runtime.invoke(ControlToolInvocation { task_permit: None, name:"design_patch".into(), arguments:json!({"plan_id":"plan", "expected_version":1, "patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;\n+Algorithm\n+  return count(targets)\n*** End Patch"}) }).await.unwrap();
         assert!(
             result.message.contains("version is 2")
                 && result.message.contains(
@@ -1280,7 +1280,7 @@ mod test {
                 evidence: None,
                 call: None,
                 behavior: Some(crate::plan::FunctionBehavior::Algorithm(
-                    "inspect value".into(),
+                    "inspect_value(value)".into(),
                 )),
             }],
         );

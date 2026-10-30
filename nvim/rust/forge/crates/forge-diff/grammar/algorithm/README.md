@@ -1,7 +1,7 @@
 # Forge Algorithm grammar
 
 This repository owns the statement grammar in `grammar.js`. Tree-sitter builds typed
-statements and expression tokens for academic pseudocode. Indentation remains in the
+statements and structured expressions for academic pseudocode. Indentation remains in the
 source coordinates. `syntax/algorithm.rs` validates block nesting, branch placement,
 and loop control at plan submission, while the syntax service can highlight incomplete drafts.
 
@@ -11,7 +11,15 @@ or `CombatEntity()` for a marker. The plan validator matches each `Constructs` t
 against these nodes and requires named fields for constructor arguments. Nested calls
 remain visible to validation. Ordinary helper calls can use positional arguments.
 
-Regenerate from this directory with Tree-sitter CLI 0.26.8:
+Statements are assignments to references or indexed elements, calls, control flow, returns,
+and loop control. Expressions combine references, calls, literals, tuples, lists, and indexing
+with unary or binary operators. Separate tuple, list, and argument elements with commas.
+Each complete statement occupies one line. Free-form prose is invalid, including inside
+conditions and argument values. Put explanations in standalone or trailing `#` comments.
+Quoted strings remain literal data. Lowercase abstract operation calls do not require
+repository declarations or implicit `Calls` entries.
+
+Regenerate from this directory with Tree-sitter CLI 0.27.0, retaining ABI 14:
 
 ```text
 tree-sitter generate --abi 14

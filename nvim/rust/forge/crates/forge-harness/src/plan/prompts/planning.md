@@ -270,7 +270,11 @@ Submission checks syntax and indentation:
 - Put each statement on its own line, align siblings, and dedent only to an existing level.
 - Use `return` with an optional value, and `break` and `continue` only inside loops.
 - Use `=` for equality and `≠`, `≤`, or `≥` for comparison. Do not use native braces or semicolons.
-- Expressions may use plain language, identifiers, numbers, quoted strings, parentheses, and brackets.
+- Operations must be calls such as `process(candidate)`, not prose such as `process candidate`. Assign only to references or indexed elements.
+- Expressions use identifiers, qualified references, calls, numeric and quoted string literals, `none`, `true`, `false`, and `null`, combined with arithmetic, comparison, logical, membership, or set operators. Separate tuple, list, and argument elements with commas. Index collections with `items[index]`.
+- Reject prose in statements, conditions, arguments, and assignment values. Put explanations in standalone or trailing `#` comments. Keep each complete statement on one line, including calls.
+
+Use lowercase named abstract operations to keep algorithms high-level. An abstract operation does not require a repository function or a `Calls` entry. Concrete calls resolve through explicit reference sections or typed receivers, while unlisted unqualified lowercase operations have no declaration navigation target.
 
 Write construction as `Type(field = value, ...)`, or `Type()` for a type with no fields, using the exact name from `Constructs`, including factories such as `Store::new(config = config)`. Every `Constructs` entry needs a matching construction in the algorithm, with named arguments or none. Construct a value before the step that queues, spawns, inserts, or publishes it, and do not hide its fields in prose such as "queue a shot with damage". Reused shared assets are not new constructions, and ordinary helper calls may use positional arguments.
 

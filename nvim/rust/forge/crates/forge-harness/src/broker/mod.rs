@@ -6992,6 +6992,7 @@ impl HarnessBroker {
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
         plan.acceptance = None;
+        plan.revision_approval = None;
         let change = format!(
             "Removed planned tests: {}",
             selected
@@ -7068,6 +7069,7 @@ impl HarnessBroker {
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
         plan.acceptance = None;
+        plan.revision_approval = None;
         plan.manual_changes.push(format!(
             "Updated plan checks: {}",
             changes
@@ -7175,6 +7177,7 @@ impl HarnessBroker {
         plan.title.clone_from(&document.title);
         plan.review_digest = Some(digest);
         plan.acceptance = None;
+        plan.revision_approval = None;
         let change = format!("Renamed {previous_name} to {new_name}");
         plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();
@@ -13687,7 +13690,7 @@ let sink = Some(sink);
                     let edit = runtime.invoke(ControlToolInvocation { task_permit: None,
                         name: "design_patch".into(),
                         arguments: json!({"plan_id":document.plan_id, "expected_version":document.version,
-                            "patch":"*** Begin Patch\n*** Add File: src/controls.rs\n+pub fn keyboard_movement();\n+Algorithm\n+  update movement from keyboard input\n*** End Patch"}),
+                            "patch":"*** Begin Patch\n*** Add File: src/controls.rs\n+pub fn keyboard_movement();\n+Algorithm\n+  update_movement(keyboard_input())\n*** End Patch"}),
                     }).await?;
                     apply_invocation(&edit.invocation.unwrap(), &mut output)?;
                 }

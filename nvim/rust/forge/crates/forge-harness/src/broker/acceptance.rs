@@ -41,6 +41,7 @@ impl BrokerObserver {
                 "plan changed after the review action began"
             );
         }
+
         let mut effects = crate::storage::TaskEffects::default();
         effects.plan_guard.push(crate::storage::PlanArtifactGuard {
             id: plan.id.clone(),
@@ -59,8 +60,10 @@ impl BrokerObserver {
                 "active plan has no pending acceptance"
             );
             plan.acceptance = None;
+            plan.revision_approval = None;
             plan.updated_at_ms = now_ms;
         } else if matches!(action, SessionAction::CancelPlan { .. }) {
+            plan.revision_approval = None;
             if executing {
                 let task = task.as_mut().unwrap();
                 let TaskWorkflow::Execute { execution } = &mut task.workflow else {
@@ -181,7 +184,11 @@ impl BrokerObserver {
                 let mut acceptance = PlanAcceptance::new(digest.clone(), &mode)?;
                 acceptance.saved_source_digest = Some(reviewed.saved_digest.clone());
                 acceptance.overall_comment = review.comment.clone();
+                // Validate anchors before committing acceptance or losing the captured feedback.
+                crate::plan::resolve_annotations(&reviewed.rendered, review.annotations.clone())?;
+                acceptance.annotations = review.annotations.clone();
                 plan.acceptance = Some(acceptance);
+                plan.revision_approval = None;
                 plan.updated_at_ms = now_ms;
             } else {
                 self.prepare_review_revision(
@@ -192,7 +199,9 @@ impl BrokerObserver {
                     now_ms,
                 )?;
                 plan.user_revision += 1;
-                if matches!(action, SessionAction::BeginAcceptance { .. }) {
+                if matches!(action, SessionAction::BeginAcceptance { .. })
+                    && review.annotations.is_empty()
+                {
                     let task = task.as_mut().unwrap();
                     let TaskWorkflow::Execute { execution } = &mut task.workflow else {
                         unreachable!()
@@ -200,6 +209,7 @@ impl BrokerObserver {
                     plan.accepted_revision = Some(plan.model_revision);
                     plan.accepted_digest = plan.review_digest.clone();
                     plan.state = PlanState::Accepted;
+                    plan.revision_approval = None;
                     execution.record.revision = plan.model_revision;
                     execution.record.revision_history.push(
                         crate::plan::execution::ExecutionRevision {
@@ -244,6 +254,14 @@ impl BrokerObserver {
                         &plan.manual_changes,
                     );
                     plan.acceptance = None;
+                    plan.revision_approval =
+                        if matches!(action, SessionAction::BeginAcceptance { .. }) {
+                            Some(crate::plan::ReviewRevisionApproval::ResumeExecution {
+                                reviewed_revision: plan.model_revision,
+                            })
+                        } else {
+                            None
+                        };
                     if executing {
                         let task = task.as_mut().unwrap();
                         let TaskWorkflow::Execute { execution } = &mut task.workflow else {
@@ -522,6 +540,56 @@ impl BrokerObserver {
             );
         }
         drop(metadata);
+        // Revise accepted inline feedback before installing any implementation entry.
+        if let Some(acceptance) = &plan.acceptance
+            && !acceptance.annotations.is_empty()
+        {
+            anyhow::ensure!(
+                acceptance.review_digest == digest
+                    && acceptance.saved_source_digest.as_deref()
+                        == Some(reviewed.saved_digest.as_str()),
+                "accepted feedback no longer matches the reviewed plan"
+            );
+            let prepared = self.prepare_review_change(
+                &crate::task::command::SessionAction::RequestChanges {
+                    review: crate::task::command::PlanReviewRequest {
+                        plan_id: Some(plan.id.clone()),
+                        digest: Some(digest),
+                        saved_source_digest: Some(reviewed.saved_digest.clone()),
+                        comment: acceptance.overall_comment.clone(),
+                        annotations: acceptance.annotations.clone(),
+                        ..Default::default()
+                    },
+                },
+                session.active_task.as_ref(),
+                now_ms,
+            )?;
+            let mut task = match prepared.change {
+                crate::task::TaskChange::Update(task) | crate::task::TaskChange::Install(task) => {
+                    *task
+                }
+                _ => anyhow::bail!("accepted feedback did not produce a revision task"),
+            };
+            let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow else {
+                anyhow::bail!("accepted feedback lost its planning task");
+            };
+            active.artifact.revision_approval =
+                Some(crate::plan::ReviewRevisionApproval::StartExecution {
+                    reviewed_revision: active.artifact.model_revision,
+                    execution: crate::task::ExecutionEntry {
+                        approval_mode,
+                        executor: session.plan_executor,
+                        compact: session.plan_compact,
+                    },
+                    comment: acceptance.overall_comment.clone(),
+                });
+            let mut effects = prepared.effects;
+            *effects
+                .plan
+                .last_mut()
+                .context("review revision is missing")? = active.artifact.clone();
+            return Ok((task, effects));
+        }
         let anchor = store
             .latest_exchange(&session.id)?
             .as_ref()
@@ -568,6 +636,7 @@ impl BrokerObserver {
         plan.accepted_digest = Some(digest);
         plan.accepted_revision = Some(plan.model_revision);
         plan.acceptance = None;
+        plan.revision_approval = None;
         if plan.state != PlanState::Accepted {
             PlanStateMachine::apply(&mut plan, PlanEvent::Accepted, now_ms)?;
         }
@@ -645,5 +714,150 @@ impl BrokerObserver {
         });
         effects.plan.push(plan);
         Ok((task, effects))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::execution::ExecutionOperation;
+
+    /// Consume explicit review approval once even when automatic execution revisions are disabled.
+    #[tokio::test]
+    async fn inline_execution_review_approves_only_its_replacement_revision() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.session.plan_auto_approve_revisions = false;
+        broker.save_session()?;
+        let mut document = crate::plan::test_fixture("review-plan", "Review ownership");
+        let mut design = crate::plan::DeclarationDesign::open(workspace.path())?;
+        design.document.objective = "Preserve ownership".into();
+        design.document.background = "A review fixture".into();
+        design.document.design = "Keep state in its owner.".into();
+        design.proposed.insert(
+            "src/owner.rs".into(),
+            "/// Own application state.\npub struct Owner;\n".into(),
+        );
+        document.design = Some(design);
+        let mut plan = broker
+            .plan_file
+            .prepare_entry(
+                &broker.session.id,
+                "Review ownership".into(),
+                Some(document),
+                1,
+            )?
+            .record;
+        let (document, _, digest) = broker.plan_file.submit_document_revision(
+            &broker.session.id,
+            &plan.id,
+            1,
+            plan.document_version,
+        )?;
+        plan.document_version = document.version;
+        plan.submitted_version = Some(document.version);
+        plan.model_revision = 1;
+        plan.review_digest = Some(digest.clone());
+        plan.state = PlanState::AwaitingReview;
+        broker.store.save_plan(&plan)?;
+        broker.snapshot()?;
+        broker.dispatch_session_command(
+            "session.plan.accept",
+            json!({"plan_id":plan.id,"digest":digest,"approval_mode":"ask","plan_compact":false}),
+        )?;
+        let task = broker.task_controller.current()?.unwrap();
+        broker
+            .task_controller
+            .update(&mut broker.store, &task.permit(), 2, |task| {
+                let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow else {
+                    anyhow::bail!("expected execution");
+                };
+                execution.record.phase = crate::plan::PlanPhase::Resolve;
+                task.entry.as_mut().unwrap().delivery = crate::task::TaskInputDelivery::Accepted;
+                Ok(())
+            })?;
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"review-exchange","session_id":broker.session.id,
+            "agent_id":broker.session.primary_agent_id,"ordinal":1,
+            "prompt":"Revise ownership","state":"complete","kind":"plan_execution",
+            "plan_id":plan.id,"created_at_ms":1,"completed_at_ms":2,
+            "attributed_matches_checkpoint":true,"node_list":[]
+        }))?;
+        broker.store.save_exchange(&exchange)?;
+        for revision in 2..=4 {
+            let task = broker.task_controller.current()?.unwrap();
+            let execution = broker.current_execution()?.unwrap();
+            let mut document = broker
+                .plan_file
+                .read_working_document(&broker.session.id, &plan.id)?;
+            document.version += 1;
+            document.design.as_mut().unwrap().document.design =
+                format!("Keep state in its owner, revision {revision}.");
+            broker
+                .handle_execution_control(
+                    &execution.id,
+                    execution.generation,
+                    &task.permit(),
+                    ExecutionOperation::Draft(document.clone()),
+                    &mut exchange,
+                )
+                .await?;
+            let task = broker.task_controller.current()?.unwrap();
+            let execution = broker.current_execution()?.unwrap();
+            broker
+                .handle_execution_control(
+                    &execution.id,
+                    execution.generation,
+                    &task.permit(),
+                    ExecutionOperation::Submit {
+                        document,
+                        reason: "Clarify ownership".into(),
+                    },
+                    &mut exchange,
+                )
+                .await?;
+            let submitted = broker.store.load_plan(&plan.id)?.unwrap();
+            if revision == 3 {
+                assert_eq!(submitted.state, PlanState::Accepted);
+                assert_eq!(submitted.accepted_revision, Some(3));
+                assert!(submitted.revision_approval.is_none());
+                assert!(!broker.session.plan_auto_approve_revisions);
+                continue;
+            }
+            assert_eq!(submitted.state, PlanState::AwaitingReview);
+            assert!(submitted.revision_approval.is_none());
+            if revision == 4 {
+                break;
+            }
+            let source = broker
+                .observer
+                .capture_plan_review(&plan.id, submitted.review_digest.as_deref().unwrap())?;
+            let line = source.rendered.navigation.anchor.first().unwrap().line;
+            let (_, events) = broker.dispatch_session_command(
+                "session.plan.acceptance.begin",
+                json!({
+                    "plan_id":plan.id,"digest":submitted.review_digest,
+                    "annotations":[{"start_line":line,"end_line":line,"body":"Clarify the owner."}]
+                }),
+            )?;
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.event == "plan_changes_requested")
+            );
+            let pending = broker.store.load_plan(&plan.id)?.unwrap();
+            assert_eq!(pending.state, PlanState::Revising);
+            assert!(pending.revision_approval.as_ref().unwrap().authorizes(3));
+            let execution = broker.current_execution()?.unwrap();
+            assert!(
+                execution
+                    .findings
+                    .iter()
+                    .any(|finding| finding.contains("Clarify the owner."))
+            );
+        }
+        Ok(())
     }
 }

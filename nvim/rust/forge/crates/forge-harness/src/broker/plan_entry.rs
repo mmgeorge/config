@@ -69,7 +69,9 @@ impl HarnessBroker {
         )?;
         let plan = prepared.effects.plan.last().cloned();
         let lifecycle = prepared.effects.lifecycle.last().cloned();
-        let event_name = command.action.event_name();
+        let event_name = command
+            .action
+            .event_name(lifecycle.as_ref().map(|record| record.kind));
         let receipt = crate::task::TaskOperation {
             revision: 0,
             id: command.operation_id,

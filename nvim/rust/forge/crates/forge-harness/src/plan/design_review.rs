@@ -1925,7 +1925,8 @@ mod tests {
                 "function run()\nend\nfunction following()\nend\n",
             ),
         ] {
-            let algorithm = "result ← ProbeResult(value = inspect(value))\nDecrease cooldown_remaining and weapon.cooldown by elapsed seconds\nif result ≠ none\n  return result\nreturn none";
+            let algorithm = "result ← ProbeResult(value = inspect(value))\ndecrease(cooldown_remaining, weapon.cooldown, elapsed)\nspawn_square(position = (200, 0), components = [player, speed, score])\n# Preserve ordering while decreasing cooldowns\nif result ≠ none\n  return result\nreturn none";
+            forge_diff::syntax::validate_algorithm(algorithm).unwrap();
             let calls = vec![super::super::FunctionBody {
                 owner: "run".into(),
                 behavior: Some(super::super::FunctionBehavior::Algorithm(algorithm.into())),
@@ -2000,15 +2001,21 @@ mod tests {
                 ("if result", "if", "@keyword.conditional.algorithm"),
                 ("return result", "return", "@keyword.return.algorithm"),
                 (
-                    "Decrease cooldown_remaining",
+                    "decrease(cooldown_remaining",
                     "cooldown_remaining",
                     "@variable.algorithm",
                 ),
                 (
-                    "Decrease cooldown_remaining",
+                    "decrease(cooldown_remaining",
                     "weapon.cooldown",
                     "@variable.algorithm",
                 ),
+                ("spawn_square", "player", "@variable.algorithm"),
+                ("spawn_square", "speed", "@variable.algorithm"),
+                ("spawn_square", "score", "@variable.algorithm"),
+                ("spawn_square", "position", "@variable.member.algorithm"),
+                ("spawn_square", "200", "@number.algorithm"),
+                ("spawn_square", "spawn_square", "@function.call.algorithm"),
             ] {
                 let block = blocks
                     .iter()
@@ -2029,7 +2036,9 @@ mod tests {
                         .metadata
                         .visible_decoration
                         .iter()
-                        .any(|span| span.capture == "@comment")
+                        .any(|span| span.capture == "@comment"
+                            || span.capture == "@comment.algorithm"
+                            || span.capture == "@error.algorithm")
                 );
                 assert!(block.metadata.target.iter().any(|range| {
                     targets.get(&range.id).is_some_and(|anchor| {
@@ -2037,30 +2046,28 @@ mod tests {
                     })
                 }));
             }
-            let prose = blocks
+            let comment = blocks
                 .iter()
                 .find(|block| {
                     block
                         .text
                         .row(0)
                         .unwrap_or_default()
-                        .contains("Decrease cooldown_remaining")
+                        .contains("# Preserve ordering")
                 })
                 .unwrap();
-            let prose_text = prose.text.row(0).unwrap();
-            assert!(prose.metadata.visible_decoration.iter().any(|span| {
+            let comment_text = comment.text.row(0).unwrap();
+            assert!(comment.metadata.visible_decoration.iter().any(|span| {
                 span.capture == "@comment.algorithm"
-                    && prose_text[span.range.start.column..span.range.end.column]
-                        .starts_with("Decrease")
+                    && comment_text[span.range.start.column..span.range.end.column]
+                        .starts_with("# Preserve")
             }));
             assert!(
-                !prose
+                !comment
                     .metadata
                     .visible_decoration
                     .iter()
-                    .any(|span| span.capture == "@variable.algorithm"
-                        && &prose_text[span.range.start.column..span.range.end.column]
-                            == "Decrease")
+                    .any(|span| span.capture == "@variable.algorithm")
             );
             assert!(blocks.iter().any(|block| {
                 block.text.row(0).unwrap_or_default().contains("following")

@@ -773,6 +773,7 @@ fn outcome_effect(
     match &task.workflow {
         TaskWorkflow::Plan { plan } => {
             let mut artifact = plan.artifact.clone();
+            artifact.revision_approval = None;
             artifact.state = match terminal {
                 super::TaskOutcomeState::Complete => crate::plan::PlanState::Accepted,
                 super::TaskOutcomeState::Cancelled => crate::plan::PlanState::Cancelled,

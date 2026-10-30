@@ -411,7 +411,13 @@ impl HarnessBroker {
                         revision_request: true,
                     },
                 });
-                if self.session.plan_auto_approve_revisions {
+                let approved_review = matches!(
+                    &plan.revision_approval,
+                    Some(approval @ crate::plan::ReviewRevisionApproval::ResumeExecution { .. })
+                        if approval.authorizes(plan.model_revision)
+                );
+                if approved_review || self.session.plan_auto_approve_revisions {
+                    plan.revision_approval = None;
                     plan.accepted_digest = Some(digest);
                     plan.accepted_revision = Some(plan.model_revision);
                     plan.state = PlanState::Accepted;

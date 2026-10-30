@@ -47,6 +47,8 @@ mod prompt;
 mod render;
 mod resolution;
 mod review_annotation;
+mod review_approval;
+pub use review_approval::ReviewRevisionApproval;
 mod review_cache;
 pub(crate) use review_cache::PlanReviewRevision;
 mod review_feedback;
@@ -148,6 +150,9 @@ pub struct PlanRecord {
     pub elicitation: Option<PlanElicitation>,
     #[serde(default)]
     pub acceptance: Option<PlanAcceptance>,
+    /// One review cycle's approval, consumed when its revised plan is accepted.
+    #[serde(default)]
+    pub revision_approval: Option<ReviewRevisionApproval>,
     #[serde(default)]
     pub question_ledger: PlanQuestionLedger,
     #[serde(default)]
@@ -376,6 +381,9 @@ pub struct PlanElicitation {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanAcceptance {
     pub review_digest: String,
+    /// Inline feedback captured with the approved source snapshot.
+    #[serde(default)]
+    pub annotations: Vec<PlanAnnotationInput>,
     #[serde(default)]
     /// Retains the reviewer's optional acceptance note without changing the reviewed design.
     pub overall_comment: Option<String>,
@@ -417,6 +425,7 @@ impl PlanAcceptance {
         .normalize()?;
         Ok(Self {
             review_digest,
+            annotations: Vec::new(),
             overall_comment: None,
             saved_source_digest: None,
             approval_mode_list: approval_mode_list.to_vec(),

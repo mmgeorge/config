@@ -155,7 +155,7 @@
       "revision": "repository-owned",
       "location": "",
       "generator": {
-        "version": "tree-sitter 0.26.8",
+        "version": "tree-sitter 0.27.0",
         "arguments": [
           "generate",
           "--abi",
@@ -165,11 +165,11 @@
       "files": [
         {
           "path": "README.md",
-          "sha256": "4b13a8e878eae7e7742997299560fc2652aa7069274f5c769edf0100c9d220c7"
+          "sha256": "5612413dd6f4317a390b8a3036e69fe673d3522d706572404b7b5527e19c2a92"
         },
         {
           "path": "grammar.js",
-          "sha256": "45a0e19a30c3fe506c62d3b027d340a70701728e1fcc1dba87d8580615c6e20f"
+          "sha256": "bb78b26a891674dd250ec48e15287e107b67c95101fe6f091ffa7dd2be66aba2"
         },
         {
           "path": "tree-sitter.json",
@@ -177,15 +177,15 @@
         },
         {
           "path": "src/grammar.json",
-          "sha256": "c6bc11699c343c10cd659cb16a3c732afacd00ea2eec07bf4d9a3c991beedd42"
+          "sha256": "911870d731639296f14583f60f629bb0517e4a32512b657482a9f282b2b1a568"
         },
         {
           "path": "src/node-types.json",
-          "sha256": "b03575f366a9e08ab314f946c97353fe91a3ab9f1a0cbb994b3eac630398a28f"
+          "sha256": "d6d2f8e46ff20512640d792fa0ba1e8f378354ba16ebf95b4937cd7b1ea7ace4"
         },
         {
           "path": "src/parser.c",
-          "sha256": "a91b8df115f800e77b54314824d6992ccec008fb525c91a010ee3a72a785fc57"
+          "sha256": "ce4adbe17273f29413ba1d14571e938be578ff96200a66ae08c1863c352ef14a"
         },
         {
           "path": "src/tree_sitter/alloc.h",
@@ -193,7 +193,7 @@
         },
         {
           "path": "src/tree_sitter/array.h",
-          "sha256": "31e60a1bff6f715afacce03b5b70efe42b58371b4f9595dd4af52a577ff9608c"
+          "sha256": "20e6ba85abb9d5b7e2e6dedf675c9424a057a06feee03aa3e2dd48a1cb4bf8a2"
         },
         {
           "path": "src/tree_sitter/parser.h",

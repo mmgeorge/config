@@ -58,7 +58,7 @@ vim.fn.writefile({ "[package]", 'name = "call_navigation"', 'version = "0.1.0"',
 vim.fn.writefile({ "invalid Rust {" }, workspace .. "/unrelated.rs")
 local initialized = vim.system({ "git", "init", "--quiet", workspace }, { text = true }):wait(10000)
 assert(initialized.code == 0, initialized.stderr)
-local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
+local executable = data .. "/forge-test-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
 local behavior_generator = (vim.g.forge_test_plan_behavior or vim.g.forge_test_plan_tests or vim.g.forge_test_plan_flows) and (vim.g.forge_test_fixture_generator
   or vim.fs.dirname(require("forge.builder").binary_path()) .. "/examples/plan_navigation_fixture" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
@@ -456,7 +456,7 @@ local success, failure = xpcall(function()
       assert(rendered[2].foreground == expected[2], "constructor highlight did not render: " .. vim.inspect(rendered))
     end
     for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-      if vim.trim(text) == "Record ProbeResult.value" then
+      if vim.trim(text) == "record(ProbeResult.value)" then
         vim.api.nvim_win_set_cursor(review.win, { index, 0 })
         vim.cmd("normal! zz")
         vim.cmd("redraw!")
@@ -471,8 +471,8 @@ local success, failure = xpcall(function()
       { "abilities.start_dash(direction)", "abilities", "abilities: &mut PlayerAbilities", "abilities" },
       { "result ← value", "value", "value: Option<u32>", "value" },
       { "abilities.cooldown ← 0", "cooldown", "cooldown: u32", "cooldown" },
-      { "Record ProbeResult.value", "ProbeResult", "pub struct ProbeResult", "ProbeResult" },
-      { "Record ProbeResult.value", "value", "pub value: Option<u32>", "value" },
+      { "record(ProbeResult.value)", "ProbeResult", "pub struct ProbeResult", "ProbeResult" },
+      { "record(ProbeResult.value)", "value", "pub value: Option<u32>", "value" },
     }) do
       local origin_row, origin_column
       for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
@@ -499,7 +499,7 @@ local success, failure = xpcall(function()
     end
     vim.o.columns = original_columns
     for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-      if vim.trim(text) == "Record ProbeResult.value" then
+      if vim.trim(text) == "record(ProbeResult.value)" then
         vim.api.nvim_win_set_cursor(review.win, { index, assert(text:find("value", 1, true)) - 1 })
         break
       end
@@ -524,7 +524,7 @@ local success, failure = xpcall(function()
     for _, body in ipairs(renamed.design.proposed_calls["src/change.rs"]) do
       if body.owner == "planned_probe" then renamed_body = body.behavior.text end
     end
-    assert(renamed_body and renamed_body:find("Record ProbeResult.payload", 1, true)
+    assert(renamed_body and renamed_body:find("record(ProbeResult.payload)", 1, true)
       and renamed_body:find("ProbeResult(payload = result)", 1, true), "Algorithm rename missed a field use")
     assert(renamed_body:find("result ← value", 1, true), "Algorithm rename changed the same-named signature variable")
     assert(vim.deep_equal(renamed.design.baseline, document.design.baseline), "Algorithm rename changed captured baselines")
@@ -578,21 +578,29 @@ local success, failure = xpcall(function()
       end
     end
     assert(headers.Algorithm and headers.Change and headers.Constructs, "behavior and reference heading fixture is incomplete")
-    local prose_row, prose_text
+    vim.api.nvim_set_hl(0, "@function.call.algorithm", { fg = 0xff55aa })
+    local operation_row, operation_text, comment_row, comment_text
     for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-      if text:find("Decrease cooldown_remaining", 1, true) then prose_row, prose_text = index, text break end
+      if text:find("decrease_cooldowns(", 1, true) then operation_row, operation_text = index, text end
+      if text:find("# Preserve firing order", 1, true) then comment_row, comment_text = index, text end
     end
-    assert(prose_row, "long Algorithm prose is missing")
+    assert(operation_row and comment_row, "Algorithm operation or comment is missing")
+    vim.api.nvim_win_set_cursor(review.win, { comment_row, 0 })
+    vim.cmd("normal! zz")
+    vim.cmd("redraw!")
+    local comment_position = vim.fn.screenpos(review.win, comment_row, assert((comment_text:find("#", 1, true))))
+    local comment_cell = vim.api.nvim__inspect_cell(1, comment_position.row - 1, comment_position.col - 1)
+    assert(comment_cell[2].foreground == 0x888888, "Algorithm comment is not comment gray")
     for _, width in ipairs({ 80, 120, 160 }) do
       vim.o.columns = width
-      vim.api.nvim_win_set_cursor(review.win, { prose_row, 0 })
+      vim.api.nvim_win_set_cursor(review.win, { operation_row, 0 })
       vim.cmd("normal! zz")
       vim.cmd("redraw!")
-      local first = vim.fn.screenpos(review.win, prose_row, assert((prose_text:find("Decrease", 1, true))))
-      local last = vim.fn.screenpos(review.win, prose_row, #prose_text)
-      local prose_cell = vim.api.nvim__inspect_cell(1, first.row - 1, first.col - 1)
-      assert(prose_cell[2].foreground == 0x888888, "Algorithm prose is not comment gray")
-      local variable = vim.fn.screenpos(review.win, prose_row, assert((prose_text:find("cooldown_remaining", 1, true))))
+      local first = vim.fn.screenpos(review.win, operation_row, assert((operation_text:find("decrease_cooldowns", 1, true))))
+      local last = vim.fn.screenpos(review.win, operation_row, #operation_text)
+      local operation_cell = vim.api.nvim__inspect_cell(1, first.row - 1, first.col - 1)
+      assert(operation_cell[2].foreground == 0xff55aa, "Algorithm operation lost its call highlighting")
+      local variable = vim.fn.screenpos(review.win, operation_row, assert((operation_text:find("cooldown_remaining", 1, true))))
       local variable_cell = vim.api.nvim__inspect_cell(1, variable.row - 1, variable.col - 1)
       assert(variable_cell[2].foreground == 0xffffff, "Algorithm variable is not white")
       if width < 160 then assert(last.row > first.row, "long Algorithm row did not wrap at " .. width) end

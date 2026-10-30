@@ -149,7 +149,7 @@ struct Block {
 
 /// Validate pseudocode structure and return its explicit invocation sites.
 /// Returns a line-and-column diagnostic without modifying the source.
-/// Operations and conditions retain natural-language expressions.
+/// Operations require calls, and expressions exclude natural-language prose.
 pub fn validate_algorithm(source: &str) -> Result<Vec<AlgorithmInvocation>, SyntaxError> {
     let mut parser = Parser::new();
     parser
@@ -161,7 +161,7 @@ pub fn validate_algorithm(source: &str) -> Result<Vec<AlgorithmInvocation>, Synt
         return Err(diagnostic(
             position.row + 1,
             position.column + 1,
-            "invalid pseudocode statement, expression, or delimiter",
+            "invalid structured pseudocode: use assignments, calls, and control flow; prose belongs in # comments",
         ));
     }
     let mut cursor = tree.root_node().walk();
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn validates_nested_control_flow_and_unicode_operations() {
-        validate_algorithm("résultat ← none\nfor each candidate in candidates\n  if candidate.score ≥ 10\n    résultat ← candidate\n    break\n  otherwise if candidate.ready\n    continue\n  otherwise\n    inspect candidate\nreturn résultat").unwrap();
+        validate_algorithm("résultat ← none\nfor each candidate in candidates\n  if candidate.score ≥ 10\n    résultat ← candidate\n    break\n  otherwise if candidate.ready\n    continue\n  otherwise\n    inspect(candidate)\nreturn résultat").unwrap();
         validate_algorithm("if ready:\n  return value\notherwise:\n  return none").unwrap();
     }
 
@@ -407,10 +407,10 @@ mod tests {
             "value ← (missing",
             "otherwise\n  return none",
             "if ready\nreturn none",
-            "inspect value\n  return none",
+            "inspect(value)\n  return none",
             "break",
             "# only a comment",
-            "if ready\n  inspect value\n return none",
+            "if ready\n  inspect(value)\n return none",
             "if ready\n\treturn none",
         ] {
             assert!(validate_algorithm(source).is_err(), "accepted {source:?}");
@@ -419,13 +419,13 @@ mod tests {
 
     #[test]
     fn accepts_complete_content_beyond_former_display_thresholds() {
-        let source = "inspect candidate\n".repeat(5000);
+        let source = "inspect(candidate)\n".repeat(5000);
         validate_algorithm(&source).unwrap();
     }
 
     #[test]
     fn retains_explicit_constructors_nested_calls_and_named_arguments() {
-        let source = "projectile ← combat::Projectile(damage = 1, previous_position = player.position)\nvelocity ← Velocity(linear = 560 × direction)\nmarker ← CombatEntity()\nresult ← Store::new(config = inspect(source))\nqueue spawn(projectile, velocity, marker)";
+        let source = "projectile ← combat::Projectile(damage = 1, previous_position = player.position)\nvelocity ← Velocity(linear = 560 × direction)\nmarker ← CombatEntity()\nresult ← Store::new(config = inspect(source))\nspawn(projectile, velocity, marker)";
         let invocation = validate_algorithm(source).unwrap();
         assert_eq!(
             invocation
@@ -453,5 +453,51 @@ mod tests {
         ] {
             assert!(validate_algorithm(source).is_err(), "accepted {source:?}");
         }
+    }
+
+    /// Reject prose in every expression position rather than partially accepting its tokens.
+    #[test]
+    fn rejects_prose_statements_conditions_and_values() {
+        for source in [
+            "spawn a 2D camera",
+            "spawn a yellow 30 by 30 target square at (200, 0) with target",
+            "process candidate",
+            "candidate ← earliest eligible item",
+            "if candidate is ready\n  process(candidate)",
+            "while more items remain\n  advance()",
+            "for each item in eligible items\n  process(item)",
+            "return the selected value",
+            "spawn(position = the origin)",
+            "spawn(player speed)",
+            "position ← (200 0)",
+            "components ← [player speed]",
+            "value ← 2D",
+            "value ← left +",
+            "value ← left right",
+            "value ← ()",
+            "player",
+            "1 ← value",
+        ] {
+            let error = format!("{:?}", validate_algorithm(source).unwrap_err());
+            assert!(
+                error.contains("Algorithm line") && error.contains("column"),
+                "{error}"
+            );
+            assert!(
+                error.contains("prose belongs in # comments"),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    /// Preserve abstract operations, explicit construction, collections, and comment boundaries.
+    #[test]
+    fn accepts_structured_setup_and_expression_forms() {
+        let source = "player ← Player()\nspeed ← MovementSpeed(units_per_second = 250.0)\nscore ← Score(collected = 0)\ntarget ← Target()\nspawn_camera_2d()\nspawn_square(color = blue, size = (32, 32), position = (0, 0), components = [player, speed, score])\nspawn_square(color = yellow, size = (30, 30), position = (200, 0), components = [target])";
+        assert_eq!(validate_algorithm(source).unwrap().len(), 7);
+        validate_algorithm("# Explain why the operation is deferred\nqueue(entity) # Not an invocation: pretend()\nresult ← -(left + right) × 2\nready ← not empty(items) and count ≥ 1\nselected ← items[index]\nitems[index] ← result\nfor each (key, value) in entries\n  if key ∈ allowed ∪ extra\n    process(key, value)\nwhile ready\n  break\nreturn []").unwrap();
+        let invocation =
+            validate_algorithm("return \"ordinary prose is string data\" # pretend()").unwrap();
+        assert!(invocation.is_empty());
     }
 }

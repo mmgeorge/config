@@ -135,6 +135,59 @@ pub(crate) struct ResumeRequest {
 }
 
 impl SessionCommand {
+    /// Promote a submitted review revision using only its saved, one-cycle execution choices.
+    pub(crate) fn approved_revision(task: &super::ActiveTask) -> Result<Option<Self>> {
+        let super::TaskWorkflow::Plan { plan } = &task.workflow else {
+            return Ok(None);
+        };
+        if plan.paused
+            || plan.artifact.state != crate::plan::PlanState::AwaitingReview
+            || plan.artifact.submitted_version != Some(plan.artifact.document_version)
+            || !task.entry_accepted()
+        {
+            return Ok(None);
+        }
+        let Some(
+            approval @ crate::plan::ReviewRevisionApproval::StartExecution {
+                execution,
+                comment,
+                ..
+            },
+        ) = &plan.artifact.revision_approval
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            approval.authorizes(plan.artifact.model_revision),
+            "review approval does not authorize this plan revision"
+        );
+        Ok(Some(Self {
+            operation_id: format!(
+                "review-revision:{}:{}:{}",
+                plan.artifact.id, plan.artifact.user_revision, plan.artifact.model_revision
+            ),
+            action: SessionAction::Execute {
+                selection: ExecuteSelection {
+                    plan_id: Some(plan.artifact.id.clone()),
+                    digest: Some(
+                        plan.artifact
+                            .review_digest
+                            .clone()
+                            .context("approved revision has no submitted digest")?,
+                    ),
+                    approval_mode: Some(execution.approval_mode),
+                    plan_executor: Some(execution.executor.clone()),
+                    plan_compact: Some(execution.compact),
+                    comment: comment.clone(),
+                    ..Default::default()
+                },
+            },
+            response: CommandResponse::Snapshot,
+            display_text: None,
+            metadata: BTreeMap::new(),
+        }))
+    }
+
     pub(crate) fn queued_input(message: &crate::input::InputMessage) -> Result<Option<Self>> {
         if message.delivery != crate::input::InputDelivery::Queued
             || message.reservation.is_some()
@@ -438,7 +491,14 @@ impl SessionAction {
         )
     }
 
-    pub(crate) fn event_name(&self) -> Option<&'static str> {
+    /// Report the committed review outcome rather than the requested acceptance action.
+    pub(crate) fn event_name(
+        &self,
+        lifecycle: Option<crate::plan::PlanLifecycleKind>,
+    ) -> Option<&'static str> {
+        if lifecycle == Some(crate::plan::PlanLifecycleKind::ChangesRequested) {
+            return Some("plan_changes_requested");
+        }
         match self {
             Self::BeginAcceptance { .. } => Some("plan_acceptance_started"),
             Self::CancelAcceptance { .. } => Some("plan_acceptance_cancelled"),
@@ -619,6 +679,78 @@ mod tests {
         assert_eq!(request.params["saved_source_digest"], "saved-digest");
         assert_eq!(request.params["review"]["sequence"], 9);
         assert_eq!(request.params["plan_compact"], true);
+        Ok(())
+    }
+
+    /// Recover only a completed authorized submission, preserving pauses and excluding later revisions.
+    #[test]
+    fn approved_revision_requires_current_submission_and_preserves_execution_choices() -> Result<()>
+    {
+        let mut record: crate::plan::PlanRecord = serde_json::from_value(json!({
+            "id":"plan","session_id":"session","request":"Review","title":"Review",
+            "state":"revising","working_path":"","document_version":2,
+            "model_revision":1,"user_revision":1,"created_at_ms":1,"updated_at_ms":1
+        }))?;
+        record.revision_approval = Some(crate::plan::ReviewRevisionApproval::StartExecution {
+            reviewed_revision: 1,
+            execution: super::super::ExecutionEntry {
+                approval_mode: crate::session::ApprovalMode::Deny,
+                executor: crate::session::PlanExecutor::default(),
+                compact: true,
+            },
+            comment: Some("Keep public behavior.".into()),
+        });
+        let mut task = super::super::ActiveTask::plan(record, 1);
+        task.request_entry("Apply feedback".into(), 1)?;
+        task.entry.as_mut().unwrap().delivery = super::super::TaskInputDelivery::Accepted;
+        assert!(SessionCommand::approved_revision(&task)?.is_none());
+        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+            unreachable!()
+        };
+        plan.artifact.state = crate::plan::PlanState::AwaitingReview;
+        plan.artifact.model_revision = 2;
+        plan.artifact.review_digest = Some("revised".into());
+        assert!(SessionCommand::approved_revision(&task)?.is_none());
+        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+            unreachable!()
+        };
+        plan.artifact.submitted_version = Some(2);
+        plan.paused = true;
+        assert!(SessionCommand::approved_revision(&task)?.is_none());
+        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+            unreachable!()
+        };
+        plan.paused = false;
+        let recovered = serde_json::from_value(serde_json::to_value(&task)?)?;
+        let command = SessionCommand::approved_revision(&recovered)?.unwrap();
+        assert_eq!(command.action.to_params()?["approval_mode"], "deny");
+        assert_eq!(command.action.to_params()?["plan_compact"], true);
+        assert_eq!(command.action.to_params()?["digest"], "revised");
+        assert_eq!(
+            command.action.to_params()?["comment"],
+            "Keep public behavior."
+        );
+        assert_eq!(
+            command.operation_id,
+            SessionCommand::approved_revision(&task)?
+                .unwrap()
+                .operation_id
+        );
+        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+            unreachable!()
+        };
+        plan.artifact.model_revision = 3;
+        assert!(SessionCommand::approved_revision(&task).is_err());
+        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+            unreachable!()
+        };
+        crate::plan::state_machine::PlanStateMachine::apply(
+            &mut plan.artifact,
+            crate::plan::state_machine::PlanEvent::Cancelled,
+            3,
+        )?;
+        assert!(plan.artifact.revision_approval.is_none());
+        assert!(SessionCommand::approved_revision(&task)?.is_none());
         Ok(())
     }
 

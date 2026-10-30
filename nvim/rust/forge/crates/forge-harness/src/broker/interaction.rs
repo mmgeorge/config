@@ -791,6 +791,13 @@ impl HarnessBroker {
         self.store.save_exchange(&interaction)?;
         if !remains_open
             && let Some(task) = self.task_controller.current()?
+            && task.entry.as_ref().map(|entry| &entry.id) == output.dispatched_entry_id.as_ref()
+            && let Some(command) = crate::task::command::SessionCommand::approved_revision(&task)?
+        {
+            event.extend(self.commit_session_command(command)?.1);
+        }
+        if !remains_open
+            && let Some(task) = self.task_controller.current()?
             && let crate::task::TaskWorkflow::Execute { execution } = &task.workflow
             && output.dispatched_execution_id.as_deref() == Some(execution.record.id.as_str())
             && task.entry.as_ref().map(|entry| &entry.id) == output.dispatched_entry_id.as_ref()
