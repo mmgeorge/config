@@ -84,3 +84,33 @@ require('forge').setup({
 Harper suggestions apply only after choosing a code action. Every edit is checked again against the current buffer and its editable regions; typing or submitting invalidates an older suggestion. The server runs from Forge's cache directory to avoid holding a working-directory lock inside a project or build directory.
 
 Forge replaces Harper's user, workspace, and file dictionary actions with one global action per word. Forge appends to the configured source wordlist, invalidates automatic correction's cached vocabulary, and refreshes running Harper clients. Harper reads a plain-word copy in Forge's cache, including configured terminology, rather than rewriting the commented source file. Forge owns `harper.settings.userDictPath` for this integration.
+
+### Disable a rule globally
+
+Choose **Disable Harper rule "RuleName" globally** from a diagnostic's code actions to
+disable that rule across projects and editor restarts. Forge uses Harper's diagnostic
+`code`, not its message text, and omits the action when the rule cannot be identified.
+The existing **Ignore Harper error** action remains separate and ignores an occurrence.
+
+Disabled rules live in [`nvim/spell/harper-rules.json`](../../spell/harper-rules.json), a
+version-controlled JSON object mapping rule names to `false`. For example, disabling
+repeated-word warnings saves this setting:
+
+```json
+{
+  "RepeatedWords": false
+}
+```
+
+These overrides take precedence over `harper.settings.linters`. Remove a rule's entry
+and save the file in Neovim to restore its configured/default behavior. Every running
+Harper client receives the new settings and rechecks unsaved text. A newly started
+client loads the same file. Other rules and automatic spelling correction remain unchanged.
+
+Set `harper.disabled_rules` to another file path, or `false` to disable persistence
+and hide the global rule action. The containing directory must exist. A missing file
+means no overrides. Invalid JSON, unsupported values, unsaved edits to the settings
+buffer, and write failures are reported without applying a new live configuration.
+Rule writes are serialized and use a temporary file plus an exclusive `.lock` file.
+If an editor crashes while writing, remove the leftover lock only after confirming
+no writer is active. Saving a rule does not create a Git commit.

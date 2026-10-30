@@ -188,10 +188,12 @@ local M = {}
 ---@field enabled boolean
 ---@field cmd string[]
 ---@field settings table
+---@field disabled_rules string|false
 
 ---@type ForgeConfig
 M.defaults = {
-  harper = { enabled = true, cmd = { 'harper-ls', '--stdio' }, settings = {
+  harper = { enabled = true, cmd = { 'harper-ls', '--stdio' },
+    disabled_rules = require("forge.text.harper_rules").default_path, settings = {
     dialect = 'American', diagnosticSeverity = 'hint',
     -- Largest exact JSON integer avoids Harper's small default document cutoff.
     maxFileLength = 9007199254740991,
@@ -411,6 +413,10 @@ function M.setup(opts)
     or type(options.harper.settings)~='table' then error('harper requires enabled, cmd, and settings') end
   for _,argument in ipairs(options.harper.cmd) do
     if type(argument)~='string' or argument=='' then error('harper cmd must contain nonempty strings') end
+  end
+  if options.harper.disabled_rules ~= false and
+    (type(options.harper.disabled_rules) ~= "string" or options.harper.disabled_rules == "") then
+    error("harper.disabled_rules must be a file path or false")
   end
   if type(correction) ~= "table" or type(correction.enabled) ~= "boolean" or correction.language ~= "en-US" then
     error("text_correction requires enabled boolean and language en-US")

@@ -42,7 +42,12 @@ function M.setup()
     vim.api.nvim_create_autocmd("BufWritePost",{group=group,callback=function(event)
       if require("forge.text.wordlist").invalidate(event.file) then
         if package.loaded["forge.text.input"] then require("forge.text.input").invalidate_all() end
-        require("forge.text.harper").refresh_dictionaries()
+        require("forge.text.harper").refresh_settings()
+      end
+      local rules=require("forge.infra.config").options.harper.disabled_rules
+      if rules and vim.fs.normalize(vim.fn.resolve(vim.fn.fnamemodify(event.file,":p")))
+        == vim.fs.normalize(vim.fn.resolve(vim.fn.fnamemodify(rules,":p"))) then
+        require("forge.text.harper").refresh_settings()
       end
     end})
   end

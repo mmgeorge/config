@@ -12,6 +12,21 @@ The Lua adapter merges its personal and programming wordlist files, user termino
 
 The Harper adapter collapses its three dictionary-add commands into one global action per word. The wordlist owner serializes asynchronous append operations, preserves source comments, rejects unsaved source-buffer conflicts, and invalidates correction profiles after a successful addition. The adapter refreshes each running Harper client and republishes current buffer text because Harper's configuration-change handler rereads files from disk. Saving the source wordlist uses the same refresh path. The source vocabulary remains under the dotfiles checkout, while Harper's generated copies stay in Neovim's cache.
 
+`forge.text.harper_rules` owns the repository's `nvim/spell/harper-rules.json` overrides.
+It reads complete JSON asynchronously, validates rule-to-false entries, and serializes
+atomic replacements under an exclusive writer lock. Unsaved settings buffers and I/O
+failures reject the write without changing the prior rule file. `harper.disabled_rules`
+selects the path or disables this feature with `false`.
+
+The Harper adapter retains current, eligible diagnostic metadata and offers one global
+disable action per overlapping string `code` from source `Harper`. Messages, numeric
+codes, other servers, stale diagnostics, and protected regions cannot authorize a rule
+change. Action records retain the buffer generation, changed tick, rule name, and settings
+path. Only a successful save triggers `refresh_settings`, shared with dictionary reloads.
+That path overlays persisted disabled rules onto configured linters for every active
+client and republishes unsaved text. Client startup reads the same overrides, and saving
+the rule file in Neovim refreshes clients so deleting an entry restores configured/default behavior.
+
 ## `text.correct`
 
 Evaluate one completed lexical word and return either `unchanged` or `replace`. The request contains `profile`, `profile_revision`, `occurrence`, `context`, `target`, and optional `protected` ranges. `target` and every protected range use zero-based half-open UTF-8 byte offsets into `context`. The service rejects invalid boundaries, protected targets, technical-token targets, unavailable profiles, and stale profile revisions.

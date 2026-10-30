@@ -17,3 +17,5 @@ mcp
 cwd
 
 codex
+
+winbar

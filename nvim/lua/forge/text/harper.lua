@@ -3,7 +3,7 @@ local context=require('forge.text.context')
 local state_by_buffer={}
 local action_by_id={}
 local action_sequence=0
-local dictionary_revision=0
+local settings_revision=0
 local watching_install=false
 local source_language={c='c',cpp='cpp',cs='csharp',clojure='clojure',cmake='cmake',dart='dart',elixir='elixir',
   go='go',groovy='groovy',haskell='haskell',html='html',java='java',javascript='javascript',
@@ -14,6 +14,36 @@ local command_name='forge.harper.apply'
 
 local function configuration()
   return require('forge.infra.config').options.harper
+end
+
+--- Merge persisted global rule switches with the configured server settings and dictionary.
+---@param owner {root: string}
+---@param callback fun(settings?: table, failure?: string)
+local function settings_for(owner,callback)
+  require('forge.text.harper_rules').load(configuration().disabled_rules or false,function(disabled,failure)
+    if failure then callback(nil,failure) return end
+    require('forge.text.wordlist').harper_dictionary(owner,function(path,dictionary_failure)
+      if dictionary_failure then callback(nil,dictionary_failure) return end
+      local settings=vim.deepcopy(configuration().settings)
+      settings.linters=vim.tbl_extend('force',settings.linters or {},disabled)
+      settings.userDictPath=path
+      callback(settings)
+    end)
+  end)
+end
+
+--- Match a diagnostic to a selected range, including a zero-width cursor request.
+---@param diagnostic lsp.Range
+---@param selection lsp.Range
+---@return boolean
+local function overlaps(diagnostic,selection)
+  local function before(left,right)
+    return left.line<right.line or (left.line==right.line and left.character<right.character)
+  end
+  if selection.start.line==selection['end'].line and selection.start.character==selection['end'].character then
+    return not before(selection.start,diagnostic.start) and before(selection.start,diagnostic['end'])
+  end
+  return before(selection.start,diagnostic['end']) and before(diagnostic.start,selection['end'])
 end
 
 local function position(state,value)
@@ -53,20 +83,38 @@ end
 
 local function apply(command)
   local record=action_by_id[command.arguments and command.arguments[1]]
-  if not record then return end
+  if not record then
+    require('forge.infra.notifications').error('Harper suggestion is outdated','Harper')
+    return
+  end
   action_by_id[command.arguments[1]]=nil
   local state=record.state
-  if not valid(state,record.generation,record.tick) or not edit_allowed(state,record.action.edit) then
+  if not valid(state,record.generation,record.tick) or not edit_allowed(state,record.action.edit)
+    or (record.rule and not allowed(state,record.range)) then
     require('forge.infra.notifications').error('Harper suggestion is outdated or outside editable prose','Harper')
     return
   end
   local client=vim.lsp.get_client_by_id(state.client_id)
-  if not client then return end
+  if not client then
+    require('forge.infra.notifications').error('Harper client stopped; request the action again','Harper')
+    return
+  end
   require('forge.text').invalidate(state.buffer)
+  if record.rule then
+    if configuration().disabled_rules~=record.rule_path then
+      require('forge.infra.notifications').error('Harper rule settings changed; request the action again','Harper')
+      return
+    end
+    require('forge.text.harper_rules').disable(record.rule_path,record.rule,function(failure)
+      if failure then require('forge.infra.notifications').error(failure,'Harper rules') return end
+      M.refresh_settings()
+    end)
+    return
+  end
   if record.word then
     require('forge.text.wordlist').add(require('forge.infra.config').options.text_correction.wordlist,record.word,function(failure)
       if failure then require('forge.infra.notifications').error(failure,'Global dictionary') return end
-      M.refresh_dictionaries()
+      M.refresh_settings()
     end)
     return
   end
@@ -86,6 +134,8 @@ local function diagnostics(error,result,handler_context)
   for _,diagnostic in ipairs(result.diagnostics or {}) do
     if allowed(state,diagnostic.range) then filtered.diagnostics[#filtered.diagnostics+1]=diagnostic end
   end
+  state.diagnostics=filtered.diagnostics
+  state.diagnostic_tick=vim.api.nvim_buf_get_changedtick(state.buffer)
   vim.lsp.diagnostic.on_publish_diagnostics(nil,filtered,handler_context)
 end
 
@@ -150,8 +200,28 @@ local function transport(command,directory)
         if error then callback(error) return end
         actions=translate(actions,uri_by_alias)
         local filtered={}
+        local rule_actions={}
         local added_word={}
         if valid(state,generation,tick) then
+          local rule_path=configuration().disabled_rules
+          local added_rule={}
+          local requested=params.context and params.context.only
+          local rule_requested=not requested or vim.tbl_contains(requested,'') or vim.tbl_contains(requested,'quickfix')
+          if rule_path and rule_requested and state.diagnostic_tick==tick then
+            for _,diagnostic in ipairs(state.diagnostics or {}) do
+              local rule=diagnostic.code
+              if diagnostic.source=='Harper' and require('forge.text.harper_rules').valid_rule(rule)
+                and not added_rule[rule] and allowed(state,diagnostic.range) and overlaps(diagnostic.range,params.range) then
+                added_rule[rule]=true
+                local title='Disable Harper rule "'..rule..'" globally'
+                action_sequence=action_sequence+1
+                action_by_id[action_sequence]={state=state,generation=generation,tick=tick,action={},
+                  rule=rule,rule_path=rule_path,range=diagnostic.range}
+                rule_actions[#rule_actions+1]={title=title,kind='quickfix',diagnostics={diagnostic},
+                  command={title=title,command=command_name,arguments={action_sequence}}}
+              end
+            end
+          end
           for _,action in ipairs(actions or {}) do
             local server_command=type(action.command)=='table' and action.command or action
             local dictionary_command=server_command.command
@@ -173,6 +243,7 @@ local function transport(command,directory)
                 isPreferred=action.isPreferred,command={title=title,command=command_name,arguments={action_sequence}}}
             end
           end
+          vim.list_extend(filtered,rule_actions)
         end
         callback(nil,filtered)
       end,notify_reply)
@@ -221,13 +292,13 @@ function M.attach(buffer,owner)
   if not command then return end
   if state.starting then return end
   state.starting=true
-  require('forge.text.wordlist').harper_dictionary(owner,function(path,failure)
+  local revision=settings_revision
+  settings_for(owner,function(settings,failure)
     state.starting=false
     if not state.active or state_by_buffer[buffer]~=state then return end
-    if failure then require('forge.infra.notifications').error(failure,'Harper dictionary') return end
-    local settings=vim.deepcopy(configuration().settings)
-    settings.userDictPath=path
-    local directory=vim.fs.dirname(path)
+    if revision~=settings_revision then M.attach(buffer,state.owner) return end
+    if failure then require('forge.infra.notifications').error(failure,'Harper settings') return end
+    local directory=vim.fs.dirname(settings.userDictPath)
     state.client_id=vim.lsp.start({name='harper_ls',cmd=transport(command,directory),root_dir=owner.root,
     get_language_id=function(target,filetype)
       local target_state=state_by_buffer[target]
@@ -243,24 +314,22 @@ function M.attach(buffer,owner)
   end)
 end
 
---- Refresh each live Harper client after the shared vocabulary changes.
-function M.refresh_dictionaries()
-  dictionary_revision=dictionary_revision+1
-  local revision=dictionary_revision
+--- Refresh each live Harper client after shared vocabulary or rule settings change.
+function M.refresh_settings()
+  settings_revision=settings_revision+1
+  local revision=settings_revision
   local refreshed={}
   for _,state in pairs(state_by_buffer) do
     local client=state.client_id and vim.lsp.get_client_by_id(state.client_id)
     if client and not refreshed[client.id] then
       refreshed[client.id]=true
-      require('forge.text.wordlist').harper_dictionary(state.owner,function(path,failure)
-        if revision~=dictionary_revision then return end
-        if failure then require('forge.infra.notifications').error(failure,'Harper dictionary') return end
+      settings_for(state.owner,function(settings,failure)
+        if revision~=settings_revision then return end
+        if failure then require('forge.infra.notifications').error(failure,'Harper settings') return end
         if client:is_stopped() then return end
-        local settings=vim.deepcopy(configuration().settings)
-        settings.userDictPath=path
         client.settings={['harper-ls']=settings}
         if not client:notify('workspace/didChangeConfiguration',{settings=client.settings}) then
-          require('forge.infra.notifications').error('Cannot refresh Harper dictionary','Harper')
+          require('forge.infra.notifications').error('Cannot refresh Harper settings','Harper')
         end
         -- Harper reloads from disk on configuration changes, so restore unsaved and virtual text.
         for buffer,attached in pairs(state_by_buffer) do
@@ -308,7 +377,7 @@ function M.setup()
         end) end
       end)
     end
-    M.refresh_dictionaries()
+    M.refresh_settings()
     return
   end
   local buffers={}

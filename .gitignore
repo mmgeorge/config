@@ -32,3 +32,5 @@ node_modules/
 /caddy/autosave.json
 /homebrew/trust.json.lock
 /swiftpm/
+/nvim/spell/harper-rules.json.lock
+/nvim/spell/harper-rules.json.tmp.*
