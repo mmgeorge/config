@@ -73,9 +73,6 @@ impl PlanStateMachine {
             }
         };
         plan.state = next_state;
-        if matches!(event, PlanEvent::Accepted | PlanEvent::Cancelled) {
-            plan.revision_approval = None;
-        }
         if matches!(
             event,
             PlanEvent::FeedbackConsumed
@@ -114,7 +111,6 @@ mod test {
             accepted_digest: None,
             elicitation: None,
             acceptance: None,
-            revision_approval: None,
             question_ledger: Default::default(),
             generation: Default::default(),
             validation_warning: Vec::new(),

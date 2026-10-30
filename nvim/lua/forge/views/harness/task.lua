@@ -8,6 +8,7 @@ local operation_sequence = 0
 ---@class ForgeHarnessActiveTask
 ---@field kind 'goal'|'plan'|'execute'
 ---@field revision string
+---@field auto_accept_plan boolean
 ---@field goal? {objective:string, state:string}
 ---@field plan? {paused:boolean, artifact:{title:string, state:string}}
 ---@field execution? {title:string, record:{phase:string, state:string}}

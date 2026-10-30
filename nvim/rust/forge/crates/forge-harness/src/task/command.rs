@@ -30,6 +30,9 @@ pub(crate) enum SessionAction {
     NewGoal { text: String },
     #[serde(rename = "plan")]
     NewPlan { text: String },
+    /// Change acceptance policy without replacing or interrupting the task.
+    #[serde(rename = "plan_accept")]
+    PlanAccept { enabled: bool },
     #[serde(rename = "execute")]
     Execute {
         #[serde(flatten)]
@@ -135,32 +138,21 @@ pub(crate) struct ResumeRequest {
 }
 
 impl SessionCommand {
-    /// Promote a submitted review revision using only its saved, one-cycle execution choices.
+    /// Promote a current full submission when the task enables automatic acceptance.
     pub(crate) fn approved_revision(task: &super::ActiveTask) -> Result<Option<Self>> {
         let super::TaskWorkflow::Plan { plan } = &task.workflow else {
             return Ok(None);
         };
-        if plan.paused
+        if !task.auto_accept_plan
+            || plan.paused
+            || plan.artifact.acceptance.is_some()
             || plan.artifact.state != crate::plan::PlanState::AwaitingReview
             || plan.artifact.submitted_version != Some(plan.artifact.document_version)
             || !task.entry_accepted()
         {
             return Ok(None);
         }
-        let Some(
-            approval @ crate::plan::ReviewRevisionApproval::StartExecution {
-                execution,
-                comment,
-                ..
-            },
-        ) = &plan.artifact.revision_approval
-        else {
-            return Ok(None);
-        };
-        ensure!(
-            approval.authorizes(plan.artifact.model_revision),
-            "review approval does not authorize this plan revision"
-        );
+        let choice = task.plan_execution.as_ref();
         Ok(Some(Self {
             operation_id: format!(
                 "review-revision:{}:{}:{}",
@@ -175,10 +167,10 @@ impl SessionCommand {
                             .clone()
                             .context("approved revision has no submitted digest")?,
                     ),
-                    approval_mode: Some(execution.approval_mode),
-                    plan_executor: Some(execution.executor.clone()),
-                    plan_compact: Some(execution.compact),
-                    comment: comment.clone(),
+                    approval_mode: choice.map(|choice| choice.execution.approval_mode),
+                    plan_executor: choice.map(|choice| choice.execution.executor.clone()),
+                    plan_compact: choice.map(|choice| choice.execution.compact),
+                    comment: choice.and_then(|choice| choice.comment.clone()),
                     ..Default::default()
                 },
             },
@@ -257,6 +249,7 @@ impl SessionCommand {
             action,
             "goal"
                 | "plan"
+                | "plan_accept"
                 | "execute"
                 | "attach_plan"
                 | "fork"
@@ -391,6 +384,11 @@ impl SessionCommand {
             "select a plan and revision with the /replan picker"
         );
         let action = match trimmed {
+            "/plan accept on" => SessionAction::PlanAccept { enabled: true },
+            "/plan accept off" => SessionAction::PlanAccept { enabled: false },
+            _ if trimmed == "/plan accept" || trimmed.starts_with("/plan accept ") => {
+                anyhow::bail!("use /plan accept on or /plan accept off")
+            }
             "/goal pause" => SessionAction::Pause,
             "/goal clear" | "/plan cancel" => SessionAction::Clear,
             "/goal resume" | "/plan retry" => SessionAction::Resume {
@@ -682,17 +680,18 @@ mod tests {
         Ok(())
     }
 
-    /// Recover only a completed authorized submission, preserving pauses and excluding later revisions.
+    /// Keep automatic acceptance across submissions while honoring pause and explicit disable.
     #[test]
     fn approved_revision_requires_current_submission_and_preserves_execution_choices() -> Result<()>
     {
-        let mut record: crate::plan::PlanRecord = serde_json::from_value(json!({
+        let record: crate::plan::PlanRecord = serde_json::from_value(json!({
             "id":"plan","session_id":"session","request":"Review","title":"Review",
             "state":"revising","working_path":"","document_version":2,
             "model_revision":1,"user_revision":1,"created_at_ms":1,"updated_at_ms":1
         }))?;
-        record.revision_approval = Some(crate::plan::ReviewRevisionApproval::StartExecution {
-            reviewed_revision: 1,
+        let mut task = super::super::ActiveTask::plan(record, 1);
+        task.auto_accept_plan = true;
+        task.plan_execution = Some(crate::task::PlanExecutionChoice {
             execution: super::super::ExecutionEntry {
                 approval_mode: crate::session::ApprovalMode::Deny,
                 executor: crate::session::PlanExecutor::default(),
@@ -700,7 +699,6 @@ mod tests {
             },
             comment: Some("Keep public behavior.".into()),
         });
-        let mut task = super::super::ActiveTask::plan(record, 1);
         task.request_entry("Apply feedback".into(), 1)?;
         task.entry.as_mut().unwrap().delivery = super::super::TaskInputDelivery::Accepted;
         assert!(SessionCommand::approved_revision(&task)?.is_none());
@@ -740,7 +738,10 @@ mod tests {
             unreachable!()
         };
         plan.artifact.model_revision = 3;
-        assert!(SessionCommand::approved_revision(&task).is_err());
+        assert!(SessionCommand::approved_revision(&task)?.is_some());
+        task.auto_accept_plan = false;
+        assert!(SessionCommand::approved_revision(&task)?.is_none());
+        task.auto_accept_plan = true;
         let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
             unreachable!()
         };
@@ -749,8 +750,27 @@ mod tests {
             crate::plan::state_machine::PlanEvent::Cancelled,
             3,
         )?;
-        assert!(plan.artifact.revision_approval.is_none());
         assert!(SessionCommand::approved_revision(&task)?.is_none());
+        Ok(())
+    }
+
+    /// Keep policy commands distinct from plan creation, including invalid arguments.
+    #[test]
+    fn plan_accept_commands_do_not_start_planning() -> Result<()> {
+        for (text, enabled) in [("/plan accept on", true), ("/plan accept off", false)] {
+            let command = SessionCommand::parse_text(text, None)?.unwrap();
+            assert!(
+                matches!(command.action, SessionAction::PlanAccept { enabled: value } if value == enabled)
+            );
+            assert!(!command.action.admits_entry());
+            let request = command.to_request(1)?;
+            assert_eq!(request.params["action"], "plan_accept");
+            assert_eq!(request.params["enabled"], enabled);
+            assert!(SessionCommand::parse_request(&request)?.is_some());
+        }
+        for text in ["/plan accept", "/plan accept yes", "/plan accept on extra"] {
+            assert!(SessionCommand::parse_text(text, None).is_err());
+        }
         Ok(())
     }
 

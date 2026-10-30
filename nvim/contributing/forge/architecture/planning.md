@@ -52,7 +52,7 @@ Plan metadata stores execution flows separately from prose, typed by `design_flo
 
 Acceptance creates a durable `PlanAcceptance` and reuses the question picker for provider-context reuse and execution authorization, so an accepted write plan never inherits Read authorization. Dismissing the picker cancels acceptance. Once every question resolves, Harness emits `Plan accepted` inside the execution exchange and creates the guarded `Complete accepted plan: <title>` goal. An acceptance comment becomes reviewer context in execution prompts. Phase transitions and revision decisions carry an `ExchangeAnchor`, so `TimelineProjector` places them inside their owning exchange.
 
-When acceptance includes inline comments, Harness first sends ordinary changes-requested feedback to the planning agent. A one-cycle approval retains the execution choices and accepts the next valid submitted revision before implementation starts. Existing execution revisions use the same one-cycle approval to resume Resolve. This approval is independent of the global revision-approval preference. [Plan review](plan-review.md#decisions) describes its persistence and invalidation boundaries.
+When acceptance includes inline comments, Harness sends changes-requested feedback to the planning agent in the same exchange and enables the task's automatic-acceptance flag. Every complete submission checks that flag before starting or resuming execution. `/plan accept off` restores manual review without interrupting revision work; submitting does not reset the flag. [Plan review](plan-review.md#decisions) describes policy ownership and execution-setting retention.
 
 ## Implementation and conformance
 

@@ -47,8 +47,6 @@ mod prompt;
 mod render;
 mod resolution;
 mod review_annotation;
-mod review_approval;
-pub use review_approval::ReviewRevisionApproval;
 mod review_cache;
 pub(crate) use review_cache::PlanReviewRevision;
 mod review_feedback;
@@ -150,9 +148,6 @@ pub struct PlanRecord {
     pub elicitation: Option<PlanElicitation>,
     #[serde(default)]
     pub acceptance: Option<PlanAcceptance>,
-    /// One review cycle's approval, consumed when its revised plan is accepted.
-    #[serde(default)]
-    pub revision_approval: Option<ReviewRevisionApproval>,
     #[serde(default)]
     pub question_ledger: PlanQuestionLedger,
     #[serde(default)]

@@ -6,9 +6,10 @@ pub(crate) mod command;
 mod controller;
 pub(crate) use active::StaleTask;
 pub use active::{
-    ActiveTask, ExecutionEntry, ExecutionTask, GoalTask, PlanTask, TaskContinuation,
-    TaskContinuationWork, TaskDecision, TaskEntry, TaskInputDelivery, TaskInputId, TaskOutcome,
-    TaskOutcomeState, TaskPermit, TaskRevision, TaskTurn, TaskTurnId, TaskWorkflow,
+    ActiveTask, ExecutionEntry, ExecutionTask, GoalTask, PlanExecutionChoice, PlanTask,
+    TaskContinuation, TaskContinuationWork, TaskDecision, TaskEntry, TaskInputDelivery,
+    TaskInputId, TaskOutcome, TaskOutcomeState, TaskPermit, TaskRevision, TaskTurn, TaskTurnId,
+    TaskWorkflow,
 };
 pub(crate) use controller::SessionTaskController;
 pub(crate) use controller::TaskChange;

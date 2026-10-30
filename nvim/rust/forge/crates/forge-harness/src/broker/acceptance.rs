@@ -60,10 +60,8 @@ impl BrokerObserver {
                 "active plan has no pending acceptance"
             );
             plan.acceptance = None;
-            plan.revision_approval = None;
             plan.updated_at_ms = now_ms;
         } else if matches!(action, SessionAction::CancelPlan { .. }) {
-            plan.revision_approval = None;
             if executing {
                 let task = task.as_mut().unwrap();
                 let TaskWorkflow::Execute { execution } = &mut task.workflow else {
@@ -188,7 +186,6 @@ impl BrokerObserver {
                 crate::plan::resolve_annotations(&reviewed.rendered, review.annotations.clone())?;
                 acceptance.annotations = review.annotations.clone();
                 plan.acceptance = Some(acceptance);
-                plan.revision_approval = None;
                 plan.updated_at_ms = now_ms;
             } else {
                 self.prepare_review_revision(
@@ -209,7 +206,6 @@ impl BrokerObserver {
                     plan.accepted_revision = Some(plan.model_revision);
                     plan.accepted_digest = plan.review_digest.clone();
                     plan.state = PlanState::Accepted;
-                    plan.revision_approval = None;
                     execution.record.revision = plan.model_revision;
                     execution.record.revision_history.push(
                         crate::plan::execution::ExecutionRevision {
@@ -254,16 +250,11 @@ impl BrokerObserver {
                         &plan.manual_changes,
                     );
                     plan.acceptance = None;
-                    plan.revision_approval =
-                        if matches!(action, SessionAction::BeginAcceptance { .. }) {
-                            Some(crate::plan::ReviewRevisionApproval::ResumeExecution {
-                                reviewed_revision: plan.model_revision,
-                            })
-                        } else {
-                            None
-                        };
                     if executing {
                         let task = task.as_mut().unwrap();
+                        if matches!(action, SessionAction::BeginAcceptance { .. }) {
+                            task.auto_accept_plan = true;
+                        }
                         let TaskWorkflow::Execute { execution } = &mut task.workflow else {
                             unreachable!()
                         };
@@ -289,6 +280,12 @@ impl BrokerObserver {
                             active.paused = false;
                         }
                         revised.request_entry(instruction, now_ms)?;
+                        revised
+                            .entry
+                            .as_mut()
+                            .context("revision entry is missing")?
+                            .review_exchange =
+                            anchor.as_ref().map(|anchor| anchor.exchange_id.clone());
                         task = Some(revised);
                     }
                     effects.lifecycle.push(self.review_lifecycle(
@@ -402,6 +399,7 @@ impl BrokerObserver {
             execution.record.state = PlanExecutionState::Active;
         }
         execution.record.generation += 1;
+        let review_exchange = anchor.as_ref().map(|anchor| anchor.exchange_id.clone());
         if let Some(anchor) = anchor {
             execution.record.append_lifecycle(
                 anchor,
@@ -429,6 +427,10 @@ impl BrokerObserver {
                 &plan.manual_changes,
             );
             task.request_entry(instruction, now_ms)?;
+            task.entry
+                .as_mut()
+                .context("review entry is missing")?
+                .review_exchange = review_exchange;
         }
         Ok(())
     }
@@ -570,25 +572,16 @@ impl BrokerObserver {
                 }
                 _ => anyhow::bail!("accepted feedback did not produce a revision task"),
             };
-            let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow else {
-                anyhow::bail!("accepted feedback lost its planning task");
-            };
-            active.artifact.revision_approval =
-                Some(crate::plan::ReviewRevisionApproval::StartExecution {
-                    reviewed_revision: active.artifact.model_revision,
-                    execution: crate::task::ExecutionEntry {
-                        approval_mode,
-                        executor: session.plan_executor,
-                        compact: session.plan_compact,
-                    },
-                    comment: acceptance.overall_comment.clone(),
-                });
-            let mut effects = prepared.effects;
-            *effects
-                .plan
-                .last_mut()
-                .context("review revision is missing")? = active.artifact.clone();
-            return Ok((task, effects));
+            task.auto_accept_plan = true;
+            task.plan_execution = Some(crate::task::PlanExecutionChoice {
+                execution: crate::task::ExecutionEntry {
+                    approval_mode,
+                    executor: session.plan_executor,
+                    compact: session.plan_compact,
+                },
+                comment: acceptance.overall_comment.clone(),
+            });
+            return Ok((task, prepared.effects));
         }
         let anchor = store
             .latest_exchange(&session.id)?
@@ -636,7 +629,6 @@ impl BrokerObserver {
         plan.accepted_digest = Some(digest);
         plan.accepted_revision = Some(plan.model_revision);
         plan.acceptance = None;
-        plan.revision_approval = None;
         if plan.state != PlanState::Accepted {
             PlanStateMachine::apply(&mut plan, PlanEvent::Accepted, now_ms)?;
         }
@@ -703,6 +695,14 @@ impl BrokerObserver {
             false,
             now_ms,
         );
+        let planning_task = session.active_task.as_ref().filter(|task| {
+            matches!(&task.workflow, crate::task::TaskWorkflow::Plan { plan: active }
+                if active.artifact.id == plan.id)
+        });
+        task.auto_accept_plan = planning_task
+            .map(|task| task.auto_accept_plan)
+            .unwrap_or(session.plan_auto_approve_revisions);
+        task.plan_execution = planning_task.and_then(|task| task.plan_execution.clone());
         task.request_entry(instruction, now_ms)?;
         task.entry
             .as_mut()
@@ -722,7 +722,7 @@ mod tests {
     use super::*;
     use crate::plan::execution::ExecutionOperation;
 
-    /// Consume explicit review approval once even when automatic execution revisions are disabled.
+    /// Retain explicit automatic acceptance until a command disables it during execution.
     #[tokio::test]
     async fn inline_execution_review_approves_only_its_replacement_revision() -> Result<()> {
         let workspace = super::super::test::repository();
@@ -786,7 +786,13 @@ mod tests {
             "attributed_matches_checkpoint":true,"node_list":[]
         }))?;
         broker.store.save_exchange(&exchange)?;
-        for revision in 2..=4 {
+        for revision in 2..=5 {
+            if revision == 5 {
+                broker.dispatch_session_command(
+                    "session.command.apply",
+                    json!({"action":"plan_accept","enabled":false}),
+                )?;
+            }
             let task = broker.task_controller.current()?.unwrap();
             let execution = broker.current_execution()?.unwrap();
             let mut document = broker
@@ -819,16 +825,16 @@ mod tests {
                 )
                 .await?;
             let submitted = broker.store.load_plan(&plan.id)?.unwrap();
-            if revision == 3 {
+            if revision == 3 || revision == 4 {
                 assert_eq!(submitted.state, PlanState::Accepted);
-                assert_eq!(submitted.accepted_revision, Some(3));
-                assert!(submitted.revision_approval.is_none());
+                assert_eq!(submitted.accepted_revision, Some(revision));
+                assert!(broker.task_controller.current()?.unwrap().auto_accept_plan);
                 assert!(!broker.session.plan_auto_approve_revisions);
                 continue;
             }
             assert_eq!(submitted.state, PlanState::AwaitingReview);
-            assert!(submitted.revision_approval.is_none());
-            if revision == 4 {
+            assert!(!broker.task_controller.current()?.unwrap().auto_accept_plan);
+            if revision == 5 {
                 break;
             }
             let source = broker
@@ -849,7 +855,7 @@ mod tests {
             );
             let pending = broker.store.load_plan(&plan.id)?.unwrap();
             assert_eq!(pending.state, PlanState::Revising);
-            assert!(pending.revision_approval.as_ref().unwrap().authorizes(3));
+            assert!(broker.task_controller.current()?.unwrap().auto_accept_plan);
             let execution = broker.current_execution()?.unwrap();
             assert!(
                 execution

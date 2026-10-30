@@ -13,6 +13,7 @@ use super::{ActiveTask, TaskKind, TaskPermit, TaskRevision, TaskStatus, TaskWork
 pub(crate) enum TaskChange {
     Install(Box<ActiveTask>),
     Update(Box<ActiveTask>),
+    SetPlanAcceptance(bool),
     Preserve,
     Pause,
     Resume,
@@ -654,6 +655,20 @@ impl SessionTaskController {
     ) -> Result<Option<ActiveTask>> {
         match change {
             TaskChange::Preserve => {}
+            TaskChange::SetPlanAcceptance(enabled) => {
+                let task = active
+                    .as_mut()
+                    .context("plan acceptance requires an active task")?;
+                ensure!(
+                    matches!(
+                        task.workflow,
+                        TaskWorkflow::Plan { .. } | TaskWorkflow::Execute { .. }
+                    ),
+                    "plan acceptance requires a Plan or Execute task"
+                );
+                task.auto_accept_plan = enabled;
+                task.updated_at_ms = now_ms;
+            }
             TaskChange::Update(mut next) => {
                 let current = active.as_ref().context("session has no active task")?;
                 ensure!(
@@ -773,7 +788,6 @@ fn outcome_effect(
     match &task.workflow {
         TaskWorkflow::Plan { plan } => {
             let mut artifact = plan.artifact.clone();
-            artifact.revision_approval = None;
             artifact.state = match terminal {
                 super::TaskOutcomeState::Complete => crate::plan::PlanState::Accepted,
                 super::TaskOutcomeState::Cancelled => crate::plan::PlanState::Cancelled,

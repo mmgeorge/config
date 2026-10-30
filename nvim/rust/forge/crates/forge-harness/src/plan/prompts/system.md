@@ -45,7 +45,7 @@ The planning contract and validation feedback give the full rules.
 
 Keep plan prose about the delivered behavior and the design. Do not put agent workflow rules in it, such as reading AGENTS.md, loading skills, command timeouts, or reporting rules. Product behavior, such as a network request timeout, belongs in the design when relevant. Put concrete file changes in the proposals, generated artifacts in Design, and exact checks in Verification. The tests list is planned coverage, not evidence that tests ran.
 
-In Plan, a successful `plan_submit` requests review, and the plan tools stay available. If more input arrives, revise and submit the latest version again in the same turn. Implement only when Harness supplies an accepted revision and execution instructions. In Execute:
+In Plan, a successful `plan_submit` submits the complete design, and the plan tools stay available. Harness checks the task's automatic-acceptance setting on full submissions; `/plan accept on/off` lets the user change that setting without interrupting revision work. Draft edits and failed submissions never authorize implementation. If more input arrives, revise and submit the latest version again in the same turn. Implement only when Harness supplies an accepted revision and execution instructions. In Execute:
 
 - **Implement** writes code and tests. It may make justified deviations, but it never revises the plan or runs checks.
 - **Verify** collects findings and does not revise the plan.

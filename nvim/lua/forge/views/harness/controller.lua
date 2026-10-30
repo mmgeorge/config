@@ -249,6 +249,9 @@ local function status_text()
     append_status(task_control.phase(current_task), "ForgeHarnessGoal")
     if task_control.status(current_task) ~= "running" then append_status(task_control.status(current_task), "ForgeHarnessGoal") end
   end
+  if current_task and (current_task.kind == "plan" or current_task.kind == "execute") then
+    append_status("Auto-accept: " .. (current_task.auto_accept_plan and "on" or "off"), "ForgeHarnessGoal")
+  end
   local artifact_count = #(state.artifact or {})
   if artifact_count > 0 then
     append_status(("%d %s"):format(artifact_count, artifact_count == 1 and "artifact" or "artifacts"), "ForgeStatusLabel")
@@ -1563,6 +1566,10 @@ function M.submit()
     end)
     return
   end
+  if text == "/plan accept on" or text == "/plan accept off" then
+    M.task_transition({ action = "plan_accept", enabled = text == "/plan accept on" }, text)
+    return
+  end
   local task_action = ({ ["/task resume"] = "resume", ["/task pause"] = "pause", ["/task clear"] = "clear",
     ["/goal resume"] = "resume", ["/goal pause"] = "pause", ["/goal clear"] = "clear",
     ["/plan cancel"] = "clear", ["/plan retry"] = "resume" })[text]
@@ -2206,6 +2213,7 @@ end
 ---@param method? string
 function M.task_transition(action, submitted_text, completed, method)
   local state = harness_state()
+  local policy_change = action.action == "plan_accept"
   if submitted_text then action.attachments = attachment.capture(state.composer_buf).attachments end
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
   if not state.session then notifications.warn("Harness is still initializing", "Harness task") return end
@@ -2214,7 +2222,7 @@ function M.task_transition(action, submitted_text, completed, method)
   elseif vim.tbl_contains({ "resume", "clear", "chat", "plan", "goal", "execute" }, action.action) then
     state.queue_paused = false
   end
-  if action.action ~= "configure" then
+  if action.action ~= "configure" and not policy_change then
     state.task_config = nil
     if state.configuration_completion then
       state.configuration_completion.complete(false)
@@ -2226,22 +2234,24 @@ function M.task_transition(action, submitted_text, completed, method)
     input_state.perform(state, { kind = "resume" })
     return
   end
-  set_busy(true)
+  if not policy_change then set_busy(true) end
   task_control.transition(state, action, M.render, function(failure, background)
     if background then
       if completed then completed(not failure) end
       return
     end
     if harness_state() ~= state then
-      state.busy = false
+      if not policy_change then state.busy = false end
       if state.presentation and state.presentation.transcript then
         state.presentation.status_view:resize()
       end
       synchronize_state(nil, state)
       return
     end
-    set_busy(false)
-    state.cancel_requested = false
+    if not policy_change then
+      set_busy(false)
+      state.cancel_requested = false
+    end
     if completed then completed(not failure) end
     synchronize_state(function(_, sync_failure)
       if sync_failure then return end

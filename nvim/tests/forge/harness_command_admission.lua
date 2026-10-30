@@ -6,6 +6,11 @@ assert(not source.accepts_prompt("/"))
 assert(source.accepts_prompt("/sessions anything /unrecognized"))
 assert(source.accepts_prompt("/plan arbitrary prompt"))
 assert(source.accepts_prompt("/plan"))
+assert(source.accepts_prompt("/plan accept on"))
+assert(source.accepts_prompt("/plan accept off"))
+assert(not source.accepts_prompt("/plan accept"))
+assert(not source.accepts_prompt("/plan accept yes"))
+assert(not source.accepts_prompt("/plan accept on extra"))
 assert(source.accepts_prompt("/checks edit on"))
 assert(source.accepts_prompt("/checks edit off"))
 assert(source.accepts_prompt("  /checks edit on  "))
@@ -70,6 +75,19 @@ for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
   assert(#state.queue == 0)
 end
 assert(#requests == 2 and requests[1].method == "session.plan.list" and requests[2].method == "session.plan.list")
+local task_transition = controller.task_transition
+for _, enabled in ipairs({ true, false }) do
+  local command = "/plan accept " .. (enabled and "on" or "off")
+  local routed = false
+  controller.task_transition = function(action, text)
+    assert(action.action == "plan_accept" and action.enabled == enabled and text == command)
+    routed = true
+  end
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { command })
+  controller.submit()
+  assert(routed, "plan acceptance policy was sent as a new planning request")
+end
+controller.task_transition = task_transition
 state.busy = true
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan" })
 controller.submit()

@@ -698,6 +698,25 @@ impl Exchange {
         Ok(())
     }
 
+    /// Continue explicit review feedback under the original exchange and checkpoint.
+    pub(crate) fn revise_plan(&mut self, now_ms: i64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(
+                self.state(),
+                ExchangeState::Complete | ExchangeState::Running
+            ) && !self.awaiting_input()
+                && self.elicitation().is_none()
+                && self
+                    .turn
+                    .iter()
+                    .all(|turn| turn.state() != crate::turn::TurnState::Running),
+            "plan revision requires a settled review exchange"
+        );
+        self.phase = super::ExchangePhase::Running;
+        self.finalization_error = None;
+        self.resume(now_ms)
+    }
+
     /// Reopen completed source work for its automatic check repair without replacing its identity.
     pub(crate) fn repair_checks(&mut self, now_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(

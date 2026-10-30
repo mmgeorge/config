@@ -36,7 +36,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 55;
+const SESSION_FORMAT_VERSION: u32 = 56;
 const PREFERENCE_FORMAT_VERSION: u32 = 41;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.

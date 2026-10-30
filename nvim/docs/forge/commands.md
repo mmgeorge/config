@@ -496,7 +496,9 @@ block preserves the pending status and the eventual answer. Closing PlanReview
 while an answer is running keeps the review open and explains the pending operation.
 If the buffer is forcibly closed, completed answers remain available after reopening.
 Planning has an approval preference (Keep current, ask, deny, or allow) and an
-Auto-approve control. Execute has an approval default (ask, deny, or allow) for new
+Auto-approve default for execution started without an active planning task.
+An active Plan or Execute task uses its own `/plan accept on/off` setting instead.
+Execute has an approval default (ask, deny, or allow) for new
 goals and accepted plans. Neither preference changes filesystem access.
 Tools contains Timeouts and separate Space toggles for Subagents and LSP. Display contains Thoughts, and Debug at the
 end contains Logging. The explanation below the rows follows the focused field. Related settings share
@@ -594,11 +596,16 @@ Approving a plan and requesting changes both open an optional-comment popup. Pre
 revision and are included in execution context. A plan changed while its popup is
 open must be reviewed again before the decision can be submitted.
 Accepting with inline comments asks the agent to revise the plan first, then
-automatically approves the next submitted revision and starts or resumes execution.
+enables automatic acceptance for the task and starts or resumes execution after submission.
 Each comment includes its source context and any question-and-answer thread it
-belongs to. Question-only threads are not sent as change requests. This approval
-applies only to that review cycle and does not change the global auto-approval
-setting. Requesting changes still requires another review.
+belongs to. Question-only threads are not sent as change requests. Feedback and revision
+work remain in the same exchange, labeled as requested changes rather than a new plan.
+Use `/plan accept on` or `/plan accept off` at any time during a Plan or Execute task
+to change automatic acceptance without interrupting the agent. The winbar shows
+`Auto-accept: on/off`. Successful full submissions check this task setting; drafts and
+failed submissions never authorize implementation. The setting survives submissions,
+pauses, and restarts until changed or the task ends. Requesting changes leaves it
+unchanged. Turn it off before resubmission when another review is required.
 Save pending annotations before a definition jump that changes the projection.
 `Constructs` lists directly instantiated types in green and factory calls with function highlighting.
 Factories are identified by their owned named return type. `Calls` lists other invocations and

@@ -411,33 +411,12 @@ impl HarnessBroker {
                         revision_request: true,
                     },
                 });
-                let approved_review = matches!(
-                    &plan.revision_approval,
-                    Some(approval @ crate::plan::ReviewRevisionApproval::ResumeExecution { .. })
-                        if approval.authorizes(plan.model_revision)
-                );
-                if approved_review || self.session.plan_auto_approve_revisions {
-                    plan.revision_approval = None;
-                    plan.accepted_digest = Some(digest);
-                    plan.accepted_revision = Some(plan.model_revision);
-                    plan.state = PlanState::Accepted;
-                    execution.revision = plan.model_revision;
-                    execution.revision_history.push(ExecutionRevision {
-                        revision: execution.revision,
-                        reason,
-                        approval: "automatic".into(),
-                        recorded_at_ms: now_ms,
-                    });
-                    execution.progress = SemanticProgress::default();
-                    title = "Plan revision accepted (auto)";
-                } else {
-                    plan.state = PlanState::AwaitingReview;
-                    execution.pending_revision_reason = Some(reason);
-                    execution.review_paused = true;
-                    execution.state = PlanExecutionState::Paused;
-                    goal.state = GoalState::Paused;
-                    title = "Plan revision awaiting review";
-                }
+                plan.state = PlanState::AwaitingReview;
+                execution.pending_revision_reason = Some(reason);
+                execution.review_paused = true;
+                execution.state = PlanExecutionState::Paused;
+                goal.state = GoalState::Paused;
+                title = "Plan revision awaiting review";
                 execution.generation += 1;
             }
             ExecutionOperation::Phase(request) => {
@@ -596,30 +575,48 @@ impl HarnessBroker {
         }
         goal.updated_at_ms = now_ms;
         plan.updated_at_ms = now_ms;
-        if !phase_completion || execution.state == PlanExecutionState::Complete {
-            execution.append_lifecycle(
-                crate::plan::ExchangeAnchor::capture(interaction),
-                now_ms,
-                if phase_completion {
-                    PlanExecutionLifecycleEvent::Completed {
-                        title: plan.title.clone(),
-                    }
-                } else {
-                    PlanExecutionLifecycleEvent::Phase {
-                        title: title.into(),
-                        phase: execution.phase,
-                        revision: if plan.state == PlanState::AwaitingReview {
-                            plan.model_revision
-                        } else {
-                            execution.revision
-                        },
-                        state: execution.state,
-                    }
-                },
-            );
-        }
         self.task_controller
             .update_with_effects(&mut self.store, task_permit, now_ms, |task| {
+                // Decide acceptance under the same write admission as live policy changes.
+                let title = if !phase_completion && task.auto_accept_plan {
+                    plan.accepted_digest = plan.review_digest.clone();
+                    plan.accepted_revision = Some(plan.model_revision);
+                    plan.state = PlanState::Accepted;
+                    execution.revision = plan.model_revision;
+                    execution.revision_history.push(ExecutionRevision {
+                        revision: execution.revision,
+                        reason: execution
+                            .pending_revision_reason
+                            .take()
+                            .context("submitted revision reason is missing")?,
+                        approval: "automatic".into(),
+                        recorded_at_ms: now_ms,
+                    });
+                    execution.progress = SemanticProgress::default();
+                    execution.review_paused = false;
+                    execution.state = PlanExecutionState::Active;
+                    "Plan revision accepted (auto)"
+                } else {
+                    title
+                };
+                if !phase_completion || execution.state == PlanExecutionState::Complete {
+                    execution.append_lifecycle(
+                        crate::plan::ExchangeAnchor::capture(interaction),
+                        now_ms,
+                        if phase_completion {
+                            PlanExecutionLifecycleEvent::Completed {
+                                title: plan.title.clone(),
+                            }
+                        } else {
+                            PlanExecutionLifecycleEvent::Phase {
+                                title: title.into(),
+                                phase: execution.phase,
+                                revision: plan.model_revision,
+                                state: execution.state,
+                            }
+                        },
+                    );
+                }
                 let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
                 else {
                     anyhow::bail!("execution task changed");

@@ -1286,11 +1286,86 @@ async fn reviewed_execution_fixture(
     )
 }
 
-/// Keep approved inline feedback in Plan until its revision is submitted, then promote only once.
+/// Apply live policy changes to the first full submission without replacing provider work.
+#[tokio::test]
+async fn plan_accept_policy_controls_initial_submission() -> Result<()> {
+    use crate::backend::mock_response::MockResponseCommand;
+    for enabled in [true, false] {
+        let fixture = tempfile::tempdir()?;
+        crate::checks::configure_fixture(fixture.path());
+        let service = service();
+        service.open_session(1, initialize(&fixture, "mock")).await?;
+        let registry = service.registry().await?;
+        let session_id = registry.initial_session_id().to_owned();
+        let controller = registry.resolve(&session_id).await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let reader = tokio::spawn(async move {
+            while output.recv().await?.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        controller.attach_input(&sink).await?;
+        let control = controller.backend.mock_response_control().unwrap();
+        let hold = control.dispatch(&session_id, MockResponseCommand::Hold {
+            mode: Some(crate::backend::PromptMode::Plan), any_session: false,
+        }).await?;
+        let hold_id = hold["id"].as_str().unwrap().to_owned();
+        service.dispatch(Some(session_id.clone()), Request {
+            id: 2, method: "session.command.apply".into(),
+            params: json!({"action":"plan","text":"Inspect ownership"}),
+        }, &sink).await?;
+        tokio::time::timeout(Duration::from_secs(5), control.dispatch(
+            &session_id, MockResponseCommand::Wait { id: hold_id.clone() },
+        )).await??;
+        let before = controller.task_controller.current()?.unwrap();
+        for selected in if enabled { vec![true] } else { vec![true, false] } {
+            service.dispatch(Some(session_id.clone()), Request {
+                id: 3, method: "session.prompt.submit".into(),
+                params: json!({"text":if selected {"/plan accept on"} else {"/plan accept off"}}),
+            }, &sink).await?;
+        }
+        assert_eq!(controller.task_controller.current()?.unwrap().revision, before.revision);
+        let next = control.dispatch(&session_id, MockResponseCommand::Hold {
+            mode: Some(crate::backend::PromptMode::ExecutePlan), any_session: false,
+        }).await?;
+        let next_id = next["id"].as_str().unwrap().to_owned();
+        control.dispatch(&session_id, MockResponseCommand::Release { id: hold_id }).await?;
+        if enabled {
+            tokio::time::timeout(Duration::from_secs(5), control.dispatch(
+                &session_id, MockResponseCommand::Wait { id: next_id.clone() },
+            )).await??;
+            let task = controller.task_controller.current()?.unwrap();
+            assert!(task.auto_accept_plan);
+            assert!(matches!(task.workflow, crate::task::TaskWorkflow::Execute { .. }));
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(task) = controller.task_controller.current()?
+                        && let crate::task::TaskWorkflow::Plan { plan } = &task.workflow
+                        && plan.artifact.state == crate::plan::PlanState::AwaitingReview
+                        && controller.coordinator.execution.available_permits() > 0
+                    {
+                        assert!(!task.auto_accept_plan);
+                        assert_eq!(plan.artifact.accepted_revision, None);
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await??;
+        }
+        control.dispatch(&session_id, MockResponseCommand::Cancel { id: next_id }).await?;
+        service.shutdown(Duration::from_secs(2)).await?;
+        drop(sink);
+        tokio::time::timeout(Duration::from_secs(2), reader).await???;
+    }
+    Ok(())
+}
+
+/// Keep feedback in its exchange and honor task policy changes before revised submission.
 #[tokio::test]
 async fn accepted_inline_feedback_revises_before_execution_without_changing_policy() -> Result<()> {
     use crate::backend::mock_response::MockResponseCommand;
-    for decision in ["accept-feedback", "accept-empty", "request-changes"] {
+    for decision in ["accept-feedback", "accept-empty", "request-changes", "accept-off", "request-on"] {
+        let request_changes = decision.starts_with("request");
         let fixture = tempfile::tempdir()?;
         crate::checks::configure_fixture(fixture.path());
         let service = service();
@@ -1312,6 +1387,7 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
         let plan_id = selection["plan_id"].as_str().unwrap();
         let store = SqliteStore::read_only(&controller.data_root)?;
         let initial = store.load_plan(plan_id)?.unwrap();
+        let original_exchange = store.latest_exchange(&session_id)?.unwrap();
         let source = controller.observer.capture_plan_review(
             plan_id, initial.review_digest.as_deref().unwrap(),
         )?;
@@ -1331,13 +1407,13 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
             id: 32, method: "session.command.apply".into(),
             params: json!({
                 "operation_id":"review-decision",
-                "action":if decision == "request-changes" { "request_changes" } else { "begin_acceptance" },
+                "action":if request_changes { "request_changes" } else { "begin_acceptance" },
                 "plan_id":plan_id,"digest":initial.review_digest,
                 "saved_source_digest":source.saved_digest,
                 "comment":"Preserve the public API.","annotations":annotations,
             }),
         }, &sink).await?;
-        if decision != "request-changes" {
+        if !request_changes {
             let mut selected = selection.clone();
             selected["approval_mode"] = json!("ask");
             selected["plan_compact"] = json!(false);
@@ -1355,23 +1431,34 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
             crate::backend::PromptMode::ExecutePlan
         })?);
         if revising {
+            assert_eq!(store.latest_exchange(&session_id)?.unwrap().id, original_exchange.id);
             assert!(pending["prompt"].as_str().unwrap().contains(feedback));
             let saved = store.load_plan(plan_id)?.unwrap();
             assert_eq!(saved.state, crate::plan::PlanState::Revising);
             assert_eq!(saved.accepted_revision, None);
-            assert_eq!(saved.revision_approval.is_some(), decision == "accept-feedback");
+            assert_eq!(controller.task_controller.current()?.unwrap().auto_accept_plan, !request_changes);
+            if decision == "accept-off" || decision == "request-on" {
+                let before = controller.task_controller.current()?.unwrap();
+                service.dispatch(Some(session_id.clone()), Request {
+                    id: 34, method: "session.prompt.submit".into(),
+                    params: json!({"text":if decision == "accept-off" {"/plan accept off"} else {"/plan accept on"}}),
+                }, &sink).await?;
+                let after = controller.task_controller.current()?.unwrap();
+                assert_eq!(before.revision, after.revision, "policy changes must not invalidate provider work");
+                assert_eq!(after.auto_accept_plan, decision == "request-on");
+            }
             let next = control.dispatch(&session_id, MockResponseCommand::Hold {
                 mode: Some(crate::backend::PromptMode::ExecutePlan), any_session: false,
             }).await?;
             let next_id = next["id"].as_str().unwrap().to_owned();
             control.dispatch(&session_id, MockResponseCommand::Release { id: hold_id }).await?;
-            if decision == "accept-feedback" {
+            if decision == "accept-feedback" || decision == "request-on" {
                 tokio::time::timeout(Duration::from_secs(5), control.dispatch(
                     &session_id, MockResponseCommand::Wait { id: next_id.clone() },
                 )).await??;
                 let accepted = store.load_plan(plan_id)?.unwrap();
                 assert_eq!(accepted.accepted_revision, Some(initial.model_revision + 1));
-                assert!(accepted.revision_approval.is_none());
+                assert!(controller.task_controller.current()?.unwrap().auto_accept_plan);
                 assert!(matches!(
                     controller.task_controller.current()?.unwrap().workflow,
                     crate::task::TaskWorkflow::Execute { .. }
@@ -1384,7 +1471,7 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
                             && controller.coordinator.execution.available_permits() > 0
                         {
                             assert_eq!(plan.accepted_revision, None);
-                            assert!(plan.revision_approval.is_none());
+                            assert!(!controller.task_controller.current()?.unwrap().auto_accept_plan);
                             break Ok::<(), anyhow::Error>(());
                         }
                         tokio::task::yield_now().await;
@@ -1395,7 +1482,6 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
         } else {
             let accepted = store.load_plan(plan_id)?.unwrap();
             assert_eq!(accepted.accepted_revision, Some(initial.model_revision));
-            assert!(accepted.revision_approval.is_none());
             control.dispatch(&session_id, MockResponseCommand::Cancel { id: hold_id }).await?;
         }
         assert!(!store.load_session(&session_id)?.unwrap().plan_auto_approve_revisions);

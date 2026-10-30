@@ -32,6 +32,8 @@ local command_list = {
   { label = "/agents edit", detail = "Edit global subagent profiles" },
   { label = "/agents spawn", detail = "Create a fresh child from a profile" },
   { label = "/plan", detail = "Browse plans, or create a planning task with a prompt" },
+  { label = "/plan accept on", detail = "Automatically accept full submissions for the current task" },
+  { label = "/plan accept off", detail = "Require review of full submissions for the current task" },
   { label = "/task", detail = "List current and previous tasks" },
   { label = "/task new", detail = "Create a Plan, Execute, or Goal task" },
   { label = "/task resume", detail = "Resume the current or latest unfinished task" },
@@ -87,6 +89,11 @@ end
 ---@return string? failure
 function CommandSource.accepts_prompt(text)
   local trimmed = vim.trim(text)
+  if trimmed == "/plan accept" or trimmed:match("^/plan%s+accept%s+") then
+    if trimmed ~= "/plan accept on" and trimmed ~= "/plan accept off" then
+      return false, "Use /plan accept on or /plan accept off."
+    end
+  end
   if trimmed:match("^/checks%s+") then
     local setting = trimmed:match("^/checks%s+edit%s+(%S+)$")
     if setting ~= "on" and setting ~= "off" then

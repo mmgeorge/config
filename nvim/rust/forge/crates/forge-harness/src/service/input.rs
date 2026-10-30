@@ -719,7 +719,7 @@ impl SessionController {
             return Ok(());
         }
         let snapshot = self.coordinator.submissions.snapshot()?;
-        // Recover a submitted revision whose approval was interrupted before execution promotion.
+        // Recover complete submissions without replaying provider work.
         if !snapshot.suspended
             && !snapshot.messages.iter().any(|message| {
                 matches!(message.purpose, crate::input::InputPurpose::User)
@@ -728,7 +728,7 @@ impl SessionController {
                         InputDelivery::Accepted | InputDelivery::Delivering
                     )
             })
-            && let Some(command) = crate::task::command::SessionCommand::approved_revision(&task)?
+            && crate::task::command::SessionCommand::approved_revision(&task)?.is_some()
         {
             let Ok(_control) = self.coordinator.control.clone().try_acquire_owned() else {
                 return Ok(());
@@ -738,6 +738,14 @@ impl SessionController {
             };
             task.permit()
                 .validate(self.task_controller.current()?.as_ref())?;
+            let current = self
+                .task_controller
+                .current()?
+                .context("planning task is missing")?;
+            let Some(command) = crate::task::command::SessionCommand::approved_revision(&current)?
+            else {
+                return Ok(());
+            };
             super::task_state::apply_command(
                 self,
                 self.observer.session_id(),

@@ -130,6 +130,7 @@ impl BrokerObserver {
     ) -> Result<PreparedTaskChange> {
         let effects = crate::storage::TaskEffects::default();
         let change = match action {
+            SessionAction::PlanAccept { enabled } => TaskChange::SetPlanAcceptance(*enabled),
             SessionAction::NewGoal { text } => {
                 let mut task = ActiveTask::goal(
                     text.clone(),

@@ -3271,6 +3271,26 @@ impl HarnessBroker {
                 task.revision == revision,
                 "task input was replaced before dispatch"
             );
+            let review_exchange =
+                if matches!(&origin, crate::exchange::ExchangeOrigin::TaskStarted { .. }) {
+                    task.entry
+                        .as_ref()
+                        .and_then(|entry| entry.review_exchange.as_ref())
+                } else {
+                    None
+                };
+            if let Some(expected) = review_exchange {
+                let mut exchange = self
+                    .store
+                    .latest_exchange(&self.session.id)?
+                    .context("review exchange is missing")?;
+                anyhow::ensure!(
+                    &exchange.id == expected,
+                    "review exchange changed before revision dispatch"
+                );
+                exchange.revise_plan(self.clock.now_ms())?;
+                self.store.save_exchange(&exchange)?;
+            }
             if let crate::task::TaskWorkflow::Plan { plan } = &task.workflow {
                 let mut admission = ExchangeAdmission::chat(text.clone());
                 admission.origin = origin;
@@ -3283,7 +3303,9 @@ impl HarnessBroker {
                     self.check_setup = false;
                     return result;
                 }
-                return self.run_planning_interaction(text, Some(admission)).await;
+                return self
+                    .run_planning_interaction(text, review_exchange.is_none().then_some(admission))
+                    .await;
             }
             let mode = if task.kind() == crate::task::TaskKind::Execute {
                 PromptMode::ExecutePlan
@@ -3296,7 +3318,7 @@ impl HarnessBroker {
                 .run_interaction_input(
                     text.clone(),
                     mode,
-                    Some(admission),
+                    review_exchange.is_none().then_some(admission),
                     BackendInput::from_text(text),
                 )
                 .await;
@@ -6239,6 +6261,17 @@ impl HarnessBroker {
                             let input_id = input_id
                                 .as_ref()
                                 .context("task entry is missing its input identity")?;
+                            if self.task_controller.current()?.is_some_and(|task| {
+                                task.entry.as_ref().is_some_and(|entry| {
+                                    entry.id.as_str() == input_id
+                                        && entry.review_exchange.as_deref() == Some(&interaction.id)
+                                })
+                            }) {
+                                interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                                runtime.active_wait = None;
+                                self.store.save_exchange(interaction)?;
+                                return Ok(());
+                            }
                             let id = format!("{}:task-start:{input_id}", self.session.id);
                             if let Some(existing) =
                                 self.store.load_session_event(&self.session.id, &id)?
@@ -6992,7 +7025,6 @@ impl HarnessBroker {
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
         plan.acceptance = None;
-        plan.revision_approval = None;
         let change = format!(
             "Removed planned tests: {}",
             selected
@@ -7069,7 +7101,6 @@ impl HarnessBroker {
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
         plan.acceptance = None;
-        plan.revision_approval = None;
         plan.manual_changes.push(format!(
             "Updated plan checks: {}",
             changes
@@ -7177,7 +7208,6 @@ impl HarnessBroker {
         plan.title.clone_from(&document.title);
         plan.review_digest = Some(digest);
         plan.acceptance = None;
-        plan.revision_approval = None;
         let change = format!("Renamed {previous_name} to {new_name}");
         plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();

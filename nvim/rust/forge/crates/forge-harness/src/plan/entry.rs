@@ -65,7 +65,6 @@ impl PlanFileStore {
                 accepted_digest: None,
                 elicitation: None,
                 acceptance: None,
-                revision_approval: None,
                 question_ledger: Default::default(),
                 generation: Default::default(),
                 validation_warning: Vec::new(),

@@ -24,6 +24,10 @@ impl TaskRevision {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ActiveTask {
     pub revision: TaskRevision,
+    /// Accept complete plan submissions until the user disables this task policy.
+    pub auto_accept_plan: bool,
+    /// Preserve execution choices independently of automatic acceptance.
+    pub plan_execution: Option<PlanExecutionChoice>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +90,8 @@ pub struct TaskEntry {
     pub id: TaskInputId,
     pub instruction: String,
     pub delivery: TaskInputDelivery,
+    /// Keep review feedback and its revision turns in their originating exchange.
+    pub review_exchange: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionEntry>,
 }
@@ -95,6 +101,15 @@ pub struct ExecutionEntry {
     pub approval_mode: crate::session::ApprovalMode,
     pub executor: crate::session::PlanExecutor,
     pub compact: bool,
+}
+
+/// Retain the user's execution settings and review context during planning.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanExecutionChoice {
+    /// Settings selected for entering implementation.
+    pub execution: ExecutionEntry,
+    /// Reviewer context carried into execution prompts.
+    pub comment: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -200,6 +215,8 @@ impl ActiveTask {
     ) -> Self {
         Self {
             revision: TaskRevision::fresh(),
+            auto_accept_plan: false,
+            plan_execution: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             entry: None,
@@ -218,6 +235,8 @@ impl ActiveTask {
     pub fn plan(artifact: PlanRecord, now_ms: i64) -> Self {
         Self {
             revision: TaskRevision::fresh(),
+            auto_accept_plan: false,
+            plan_execution: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             entry: None,
@@ -240,6 +259,8 @@ impl ActiveTask {
     ) -> Self {
         Self {
             revision: TaskRevision::fresh(),
+            auto_accept_plan: false,
+            plan_execution: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             entry: None,
@@ -272,6 +293,7 @@ impl ActiveTask {
             id: TaskInputId::fresh(),
             instruction,
             delivery: TaskInputDelivery::Pending,
+            review_exchange: None,
             execution: None,
         });
         Ok(())

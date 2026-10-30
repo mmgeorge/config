@@ -411,6 +411,14 @@ local success, failure = xpcall(function()
     { use_winbar = true, maxwidth = 200 }).str
   assert(title:find("execute · implement", 1, true))
   assert(not title:find("running", 1, true))
+  for _, enabled in ipairs({ true, false }) do
+    state.session.active_task.auto_accept_plan = enabled
+    controller.refresh_winbar()
+    local displayed = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+      { use_winbar = true, maxwidth = 200 }).str
+    assert(displayed:find("Auto-accept: " .. (enabled and "on" or "off"), 1, true),
+      "winbar did not follow authoritative task acceptance policy")
+  end
   state.busy = false
   for _, status in ipairs({ "paused", "blocked" }) do
     state.session.active_task.execution.record.state = status
@@ -422,6 +430,8 @@ local success, failure = xpcall(function()
   end
   state.session.active_task = nil
   controller.refresh_winbar()
+  assert(not vim.wo[state.transcript_win].winbar:find("Auto-accept:", 1, true),
+    "clearing the task retained its acceptance indicator")
   local original_window = state.transcript_win
   vim.api.nvim_set_current_win(original_window)
   vim.cmd("vsplit")
