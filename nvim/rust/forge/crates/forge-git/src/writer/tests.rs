@@ -433,6 +433,7 @@ async fn patch_stages_one_raw_hunk_and_unstages_it() {
         GitWriteAction::Patch {
             direction: PatchDirection::Stage,
             target: PatchTarget {
+                scoped: None,
                 path: path("sample.txt"),
                 analysis,
                 selected,
@@ -458,6 +459,7 @@ async fn patch_stages_one_raw_hunk_and_unstages_it() {
         GitWriteAction::Patch {
             direction: PatchDirection::Unstage,
             target: PatchTarget {
+                scoped: None,
                 path: path("sample.txt"),
                 analysis,
                 selected,
@@ -514,6 +516,7 @@ async fn patch_groups_batch_distinct_files_and_preserve_unselected_hunks() {
                 GitWriteAction::Patch {
                     direction,
                     target: PatchTarget {
+                        scoped: None,
                         path: path(name),
                         analysis,
                         selected,
@@ -583,6 +586,7 @@ async fn staged_hunk_discard_preserves_other_staged_and_unstaged_changes() {
         GitWriteAction::Patch {
             direction: PatchDirection::DiscardStaged,
             target: PatchTarget {
+                scoped: None,
                 path: path("sample.txt"),
                 analysis,
                 selected,
@@ -630,6 +634,7 @@ async fn staged_hunk_conflict_fails_preflight_without_modifying_index() {
         GitWriteAction::Patch {
             direction: PatchDirection::DiscardStaged,
             target: PatchTarget {
+                scoped: None,
                 path: path("sample.txt"),
                 analysis,
                 selected,
@@ -1229,6 +1234,7 @@ async fn patch_addition_uses_missing_source_and_round_trips() {
     });
     let selected = vec![analysis.hunks()[0].id];
     let target = PatchTarget {
+        scoped: None,
         path: path("added.txt"),
         analysis,
         selected,
@@ -1402,6 +1408,7 @@ async fn compound_discard_reverses_overlap_and_preserves_unselected_changes() {
         });
         let selected = vec![analysis.hunks()[0].id];
         PatchTarget {
+            scoped: None,
             path: path("sample.txt"),
             analysis,
             selected,
@@ -1460,6 +1467,7 @@ async fn compound_discard_reports_completed_unstaged_step_before_staged_conflict
         });
         let selected = vec![analysis.hunks()[0].id];
         PatchTarget {
+            scoped: None,
             path: path("sample.txt"),
             analysis,
             selected,
@@ -1545,4 +1553,217 @@ async fn whole_file_stage_accepts_large_sources_and_changes_after_preparation() 
         b"execution contents\n"
     );
     service.acknowledge(outcome.operation).unwrap();
+}
+
+fn scoped_patch_target(old: &str, new: &str, replacement: &str, reverse: bool) -> PatchTarget {
+    use forge_diff::source::{Representation, SourceVersion};
+    let source = |text: &str| {
+        SourceVersion::new(text.as_bytes().to_vec(), Representation::GitCanonical).unwrap()
+    };
+    let analysis = compute_hunks(SourcePair {
+        old: source(old),
+        new: source(new),
+    });
+    let payload = compute_hunks(if reverse {
+        SourcePair {
+            old: source(replacement),
+            new: source(new),
+        }
+    } else {
+        SourcePair {
+            old: source(old),
+            new: source(replacement),
+        }
+    });
+    let scoped = EditSelection::capture(
+        &payload,
+        &payload
+            .hunks()
+            .iter()
+            .map(|hunk| hunk.id)
+            .collect::<Vec<_>>(),
+        if reverse {
+            EditDirection::Reverse
+        } else {
+            EditDirection::Forward
+        },
+    )
+    .unwrap();
+    PatchTarget {
+        path: path("sample.txt"),
+        selected: analysis.hunks().iter().map(|hunk| hunk.id).collect(),
+        analysis,
+        scoped: Some(Box::new(scoped)),
+    }
+}
+
+#[tokio::test]
+async fn scoped_patches_preserve_excluded_bytes_for_each_write_direction() {
+    let old = "pub fn visible() { before(); }\nfn hidden() { private_before(); }\n";
+    let new = "pub fn visible() { after(); }\nfn hidden() { private_after(); }\n";
+    for direction in [
+        PatchDirection::Stage,
+        PatchDirection::Unstage,
+        PatchDirection::Discard,
+        PatchDirection::DiscardStaged,
+    ] {
+        let (directory, _, repository, service) = fixture().await;
+        std::fs::write(directory.path().join("sample.txt"), old).unwrap();
+        git(directory.path(), &["add", "sample.txt"]);
+        git(directory.path(), &["commit", "-m", "baseline"]);
+        std::fs::write(directory.path().join("sample.txt"), new).unwrap();
+        let reverse = direction != PatchDirection::Stage;
+        if matches!(
+            direction,
+            PatchDirection::Unstage | PatchDirection::DiscardStaged
+        ) {
+            git(directory.path(), &["add", "sample.txt"]);
+        }
+        let expected = if reverse {
+            new.replacen("after();", "before();", 1)
+        } else {
+            old.replacen("before();", "after();", 1)
+        };
+        let target = scoped_patch_target(old, new, &expected, reverse);
+        assert_eq!(target.analysis.hunks().len(), 1);
+        let outcome = run(
+            &service,
+            &repository,
+            GitWriteAction::Patch { direction, target },
+        )
+        .await;
+        assert_eq!(
+            outcome.target[0].completion,
+            TargetCompletion::Completed,
+            "{direction:?}: {outcome:?}"
+        );
+        let index = git(directory.path(), &["show", ":sample.txt"]);
+        let worktree = std::fs::read(directory.path().join("sample.txt")).unwrap();
+        let expected_index = if direction == PatchDirection::Discard {
+            old
+        } else {
+            &expected
+        };
+        let expected_worktree = if matches!(
+            direction,
+            PatchDirection::Discard | PatchDirection::DiscardStaged
+        ) {
+            &expected
+        } else {
+            new
+        };
+        assert_eq!(index, expected_index.as_bytes(), "{direction:?}");
+        assert_eq!(worktree, expected_worktree.as_bytes(), "{direction:?}");
+    }
+}
+
+#[tokio::test]
+async fn scoped_patch_rejects_foreign_baselines_and_unselected_raw_regions() {
+    let (_, _, repository, service) = fixture().await;
+    let old = "one\ntwo\nthree\nfour\nfive\n";
+    let new = "ONE\ntwo\nthree\nfour\nFIVE\n";
+    let mut target = scoped_patch_target(old, new, "one\ntwo\nthree\nfour\nFIVE\n", false);
+    target.selected.truncate(1);
+    let error = service
+        .prepare(
+            Arc::clone(&repository),
+            GitWriteAction::Patch {
+                direction: PatchDirection::Stage,
+                target,
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("ownership anchor"), "{error:#}");
+    let target = scoped_patch_target(old, new, "ONE\ntwo\nthree\nfour\nfive\n", false);
+    let error = service
+        .prepare(
+            Arc::clone(&repository),
+            GitWriteAction::Patch {
+                direction: PatchDirection::Discard,
+                target,
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("source changed"), "{error:#}");
+}
+
+#[tokio::test]
+async fn scoped_discard_validates_excluded_source_bytes_before_writing() {
+    let (directory, _, repository, service) = fixture().await;
+    let old = "public_before\nprivate_before\n";
+    let new = "public_after\nprivate_after\n";
+    std::fs::write(directory.path().join("sample.txt"), old).unwrap();
+    git(directory.path(), &["add", "sample.txt"]);
+    std::fs::write(directory.path().join("sample.txt"), new).unwrap();
+    let target = scoped_patch_target(old, new, "public_before\nprivate_after\n", true);
+    let intent = service
+        .prepare(
+            Arc::clone(&repository),
+            GitWriteAction::Patch {
+                direction: PatchDirection::Discard,
+                target,
+            },
+        )
+        .await
+        .unwrap();
+    let external = "public_after\nprivate_external\n";
+    std::fs::write(directory.path().join("sample.txt"), external).unwrap();
+    let outcome = service.submit(intent).unwrap().finish().await.unwrap();
+    assert_eq!(outcome.target[0].completion, TargetCompletion::Rejected);
+    assert_eq!(
+        std::fs::read(directory.path().join("sample.txt")).unwrap(),
+        external.as_bytes()
+    );
+    assert_eq!(
+        git(directory.path(), &["show", ":sample.txt"]),
+        old.as_bytes()
+    );
+    service.acknowledge(outcome.operation).unwrap();
+}
+
+#[tokio::test]
+async fn scoped_partial_creation_and_deletion_preserve_remaining_file_presence() {
+    for direction in [PatchDirection::Stage, PatchDirection::Discard] {
+        let (directory, _, repository, service) = fixture().await;
+        let full = "public\nprivate\n";
+        let (old, new, expected) = if direction == PatchDirection::Stage {
+            (full, "", "private\n")
+        } else {
+            ("", full, "private\n")
+        };
+        if old.is_empty() {
+            std::fs::remove_file(directory.path().join("sample.txt")).unwrap();
+        } else {
+            std::fs::write(directory.path().join("sample.txt"), old).unwrap();
+        }
+        git(directory.path(), &["add", "sample.txt"]);
+        git(directory.path(), &["commit", "-m", "baseline"]);
+        if new.is_empty() {
+            std::fs::remove_file(directory.path().join("sample.txt")).unwrap();
+        } else {
+            std::fs::write(directory.path().join("sample.txt"), new).unwrap();
+        }
+        let target = scoped_patch_target(old, new, expected, direction == PatchDirection::Discard);
+        let outcome = run(
+            &service,
+            &repository,
+            GitWriteAction::Patch { direction, target },
+        )
+        .await;
+        assert_eq!(
+            outcome.target[0].completion,
+            TargetCompletion::Completed,
+            "{direction:?}: {outcome:?}"
+        );
+        let actual = if direction == PatchDirection::Stage {
+            git(directory.path(), &["show", ":sample.txt"])
+        } else {
+            std::fs::read(directory.path().join("sample.txt")).unwrap()
+        };
+        assert_eq!(actual, expected.as_bytes());
+    }
 }

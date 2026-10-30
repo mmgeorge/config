@@ -8,6 +8,7 @@ local comment_request = {}
 local action_request = {}
 local lifecycle_request = {}
 local hold_action, delayed_action = false, nil
+local diff_view = { visibility = "all", presentation = "full" }
 local function metadata(text, accepted)
   return { target = { { id = "body-action", range = {
     start = { row = 0, column = 0 }, ["end"] = { row = 0, column = #text } } } },
@@ -28,13 +29,13 @@ local delayed_header, header_request
 local hold_header = true
 adapter._set_runner_for_test(function(method, params, callback)
   if method == "github.review.document.open" then
-    if params.target.number == 8 then delayed_open = callback
+    if not params.target then
+      discovery_request = params
+      if params.number == 9 then delayed_discovery = callback
+      else callback({ document = "review-discovered" }) end
+    elseif params.target.number == 8 then delayed_open = callback
     else callback({ document = "review-adapter" }) end
   elseif method == "github.actor.get" then callback({ login = "viewer" })
-  elseif method == "github.review.document.open" then
-    discovery_request = params
-    if params.number == 9 then delayed_discovery = callback
-    else callback({ document = "review-discovered" }) end
   elseif method == "github.review.document.header.load" then
     header_request = params
     if hold_header then hold_header = false delayed_header = callback else callback({ ready = true }) end
@@ -69,7 +70,14 @@ adapter._set_runner_for_test(function(method, params, callback)
         effect.id, effect.kind, effect.position = "review-test-focus", "cursor", { row = 0, column = 0 }
         callback({ patch = {}, effect = effect, diagnostic = vim.NIL })
       end
-    else callback({ patch = {}, effect = vim.NIL, diagnostic = vim.NIL }) end
+    else
+      if params.input.action == "toggle_visibility" then
+        diff_view.visibility = diff_view.visibility == "all" and "public" or "all"
+      elseif params.input.action == "toggle_presentation" then
+        diff_view.presentation = diff_view.presentation == "full" and "semantic" or "full"
+      end
+      callback({ patch = {}, effect = vim.NIL, diagnostic = vim.NIL, diff_view = vim.deepcopy(diff_view) })
+    end
   elseif method == "github.review.document.transition" then
     lifecycle_request[#lifecycle_request + 1] = params.desired
     callback({ lifecycle = { state = params.desired == "CLOSED" and "CLOSED" or "OPEN", is_draft = params.desired == "DRAFT" },
@@ -118,6 +126,37 @@ for _, mode in ipairs({ "n", "x" }) do
   assert(vim.wait(1000, function() return not state.action_running end))
   assert(action_request[#action_request].action == "browse", "browse invoked generic row activation")
 end
+action_request = {}
+local visibility_map = vim.fn.maparg("ov", "n", false, true)
+local presentation_map = vim.fn.maparg("ox", "n", false, true)
+assert(visibility_map.buffer == 1 and presentation_map.buffer == 1,
+  "editable PR fields omitted independent diff controls")
+visibility_map.callback()
+assert(vim.wait(1000, function() return not state.action_running end))
+assert(state.diff_view.visibility == "public" and state.diff_view.presentation == "full")
+presentation_map.callback()
+assert(vim.wait(1000, function() return not state.action_running end))
+assert(state.diff_view.visibility == "public" and state.diff_view.presentation == "semantic")
+state.action_running = true
+visibility_map.callback()
+visibility_map.callback()
+presentation_map.callback()
+assert(#action_request == 2, "busy controls started overlapping requests")
+state.action_running = false
+assert(adapter.drain_diff_controls(state))
+assert(vim.wait(1000, function() return not state.action_running end))
+assert(#action_request == 3 and action_request[3].action == "toggle_presentation",
+  "busy controls did not coalesce independent toggle parity")
+assert(state.diff_view.visibility == "public" and state.diff_view.presentation == "full")
+state.lifecycle_running = true
+visibility_map.callback()
+visibility_map.callback()
+presentation_map.callback()
+assert(#action_request == 3, "diff controls overlapped a native mutation")
+state.lifecycle_running = false
+assert(adapter.drain_diff_controls(state))
+assert(vim.wait(1000, function() return not state.action_running end))
+assert(#action_request == 4 and state.diff_view.presentation == "semantic")
 action_request = {}
 assert(vim.wait(1000, function() return #section_request == 1 end),
   "native review did not request Rust-owned initial loading")
@@ -258,7 +297,9 @@ assert(vim.wait(1000, function() return comment_delivered end))
 assert(#action_request == 0, "comment save dispatched generic activation")
 assert(comment_request[1].action == "save")
 hold_action = true
-assert(adapter.activate(state))
+assert(adapter.activate(state), vim.inspect({ active = state.active, view_ready = state.view_ready,
+  running = state.action_running, pending = state.activation_pending, cursor = vim.api.nvim_win_get_cursor(state.window),
+  errors = errors }))
 assert(delayed_action)
 vim.api.nvim_win_set_cursor(state.window, { 1, 2 })
 delayed_action()

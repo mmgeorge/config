@@ -1,8 +1,8 @@
-use anyhow::Result;
+#[cfg(test)]
 use forge_buffer::block::BufferBlock;
+#[cfg(test)]
 use forge_buffer::document::BufferDocument;
-use forge_buffer::patch::BufferPatch;
-use forge_buffer::sequence::SequenceEdit;
+#[cfg(test)]
 use std::collections::HashMap;
 
 #[cfg(test)]
@@ -60,43 +60,6 @@ pub(crate) fn reconstruct(
     delivery
 }
 
-pub(super) fn replace(
-    document: &mut BufferDocument,
-    replacement: Vec<BufferBlock>,
-) -> Result<Option<BufferPatch>> {
-    let previous = document
-        .blocks(document.revision(), 0..document.block_count())?
-        .enumerate()
-        .map(|(index, block)| (block.id.clone(), (index, block)))
-        .collect::<HashMap<_, _>>();
-    let mut edits = Vec::new();
-    let mut old_start = 0;
-    let mut new_start = 0;
-    for (new_index, block) in replacement.iter().enumerate() {
-        let Some(&(old_index, old_block)) = previous.get(&block.id) else {
-            continue;
-        };
-        if old_index < old_start || old_block != block {
-            continue;
-        }
-        if old_index != old_start || new_index != new_start {
-            edits.push(SequenceEdit {
-                range: old_start..old_index,
-                block: replacement[new_start..new_index].to_vec(),
-            });
-        }
-        old_start = old_index + 1;
-        new_start = new_index + 1;
-    }
-    if old_start != document.block_count() || new_start != replacement.len() {
-        edits.push(SequenceEdit {
-            range: old_start..document.block_count(),
-            block: replacement[new_start..].to_vec(),
-        });
-    }
-    document.edit_many(edits).map_err(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,7 +86,10 @@ mod tests {
             let mut changed = original.clone();
             changed[1] = block(1, "first change");
             changed[count - 2] = block(count - 2, "last change");
-            let patch = replace(&mut document, changed.clone()).unwrap().unwrap();
+            let patch = document
+                .splice(0..document.block_count(), changed.clone())
+                .unwrap()
+                .unwrap();
             assert_eq!(patch.text_edit.len(), 2);
             assert_eq!(
                 patch
@@ -139,8 +105,15 @@ mod tests {
                     .contains("retained declaration")
             );
             assert_eq!(document.snapshot().block, changed);
-            assert!(replace(&mut document, changed).unwrap().is_none());
-            replace(&mut document, original.clone()).unwrap();
+            assert!(
+                document
+                    .splice(0..document.block_count(), changed)
+                    .unwrap()
+                    .is_none()
+            );
+            document
+                .splice(0..document.block_count(), original.clone())
+                .unwrap();
             assert_eq!(document.snapshot().block, original);
         }
     }
@@ -161,7 +134,9 @@ mod tests {
             vec![],
             original,
         ] {
-            replace(&mut document, replacement.clone()).unwrap();
+            document
+                .splice(0..document.block_count(), replacement.clone())
+                .unwrap();
             assert_eq!(document.snapshot().block, replacement);
         }
     }

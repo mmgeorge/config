@@ -273,13 +273,60 @@ reviews, walkthrough excerpts, and Harness change trees. Consumers supply source
 rows, stable block identities, and domain targets. The presenter never performs
 repository mutations or resolves plan and comment actions.
 
+`forge-diff::view::DiffViewState` owns independent All/Public visibility and
+Full/Semantic presentation for each document. Source views start Full/All.
+PlanReview declares Semantic-only capabilities and starts Public. Native owners
+validate document, view, revision, sequence, and target before accepting a control.
+Requested generations coalesce superseded control work. Publication adopts the
+prepared rows and committed options together, and recovery snapshots carry those
+same options. Lua binds `ov` and `ox` through the shared diff keymap group.
+
+`SourceDiffProjection` retains one exact source comparison with separate Full,
+semantic-heading, and declaration-body cursors. `SourceComparison` matches
+declarations and classifies raw edits against their source ranges. Body-only edits
+produce a modified signature marker without intraline signature emphasis. The
+collapsed suffix counts contiguous canonical edit regions, with duplicate regions
+removed across comparison sides and containing declarations. Unfolding a source
+declaration requests its real diff rows. PlanReview supplies plan sections inside
+the same declaration presentation. Consumers continue to own comments, navigation,
+and mutation targets. Status actions resolve canonical byte edits and restrict
+declaration actions to the selected visibility.
+
+Status uses the shared source cursor for its initial Full/All body and every
+subsequent control state. Source replacement retains named declaration expansion
+and the previously delivered row extent while discarding old source rows. The
+shared expansion snapshot contains declaration identities and row quotas, so
+reconciliation does not need to clone an obsolete source comparison. Canonical
+Full hunk folds and group targets continue to own unchanged bridge rows.
+
+The shared source renderer publishes source navigation anchors independently of
+action targets. When a presentation removes a displayed body row, the buffer
+resolves its source line to the narrowest containing declaration in the same
+comparison scope. Each window and selection endpoint resolves independently at
+the synchronous publication boundary, so collapsing source detail cannot move
+the cursor into an adjacent review annotation.
+
+`SavedDiffProjection` validates retained patch evidence against complete captured
+sources before using semantic classification. Unavailable, sparse, mismatched, and
+unsupported evidence retains an explicit raw fallback. Harness authenticates
+checkpoint identity and resolves object-store or captured baseline content without
+reading current worktree files. Its timeline adapter loads files on demand, converts
+shared sections to native nodes, and leaves continuation markers to the timeline
+section owner. A source refresh retains the previous shared body until the new
+comparison is prepared. Closed diff roots schedule no legacy syntax jobs, and an
+installed shared comparison owns its syntax analysis.
+
+Saved-source successors inherit expansion by unambiguous file path through
+`SavedDiffProjection`. Declaration expansion survives a refresh while Public
+visibility hides that declaration. Closed files defer source analysis and body
+formatting until opened. Row quotas restore delivered content through repeated
+bounded batches and never impose a total-content limit.
+
 Presentation options reuse `ContentLayout` for nesting and marker columns.
 Count headings serve status and PlanReview. Source-range headings serve PR and
-walkthrough views. Saved timeline headings retain their exact text, including
-suffixes, and saved patch rows retain their existing context. The shared patch
-adapter normalizes those rows without recomputing the diff. Timeline summaries,
-indentation, expansion policies, and immutable declaration navigation remain
-owned by Harness.
+walkthrough views. Timeline summaries, indentation, expansion policies, and
+immutable declaration navigation remain owned by Harness. Saved raw fallback rows
+preserve the original patch metadata and source context.
 
 `DisplayCursor::new` provides the single compact policy for generated diffs.
 It retains changed rows, context between grouped edits, and enclosing structural

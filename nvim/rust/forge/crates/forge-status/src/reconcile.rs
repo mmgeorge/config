@@ -26,6 +26,9 @@ pub(crate) fn reconcile(
     for (target, next) in &mut file {
         if let Some(previous) = document.file.get(target) {
             if same_source(previous, next) {
+                if let Some(statistics) = previous.source_statistics {
+                    next.retain_statistics(statistics);
+                }
                 unchanged.insert(target.clone());
                 retained_bytes += previous.retained_bytes;
             } else {
@@ -89,6 +92,7 @@ pub(crate) fn delta(before: &crate::StatusSnapshot, after: &crate::StatusSnapsho
         }
     }
     StatusDelta {
+        diff_view: (before.diff_view != after.diff_view).then_some(after.diff_view),
         document: after.document.clone(),
         base: before.revision,
         next: after.revision,

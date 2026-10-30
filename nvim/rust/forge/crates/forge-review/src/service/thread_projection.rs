@@ -15,8 +15,23 @@ use super::thread::ReviewThread;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ReviewTarget {
+    DiffView {
+        action: forge_diff::view::DiffViewAction,
+    },
+    SourceSection {
+        path: String,
+        identity: String,
+    },
+    CommitSource {
+        commit: String,
+        path: String,
+        declaration: Option<String>,
+    },
     Lifecycle {
         available: Vec<forge_github::pull_request::DesiredPullRequestState>,
+    },
+    FileMore {
+        path: String,
     },
     FileDiff {
         path: String,

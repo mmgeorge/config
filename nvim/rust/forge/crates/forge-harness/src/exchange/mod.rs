@@ -22,7 +22,9 @@ pub use node::{
 pub use origin::{ExchangeOrigin, TaskStart};
 pub(crate) use record::ExchangeActivity;
 pub use record::{Exchange, ExchangeComment, ExchangeOutcome, ExchangeState, HistoryDisposition};
-pub(crate) use thought::{CommentaryView, EntryPart, ThoughtCall, ThoughtGroup};
+pub(crate) use thought::{
+    CommentaryView, EntryPart, ExchangeContentView, ThoughtCall, ThoughtGroup,
+};
 
 pub use crate::turn::ToolCall;
 

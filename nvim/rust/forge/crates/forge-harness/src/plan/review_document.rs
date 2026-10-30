@@ -12,6 +12,7 @@ use forge_buffer::input::DocumentInput;
 use forge_buffer::patch::BufferSnapshot;
 use forge_buffer::view::DocumentViews;
 use forge_buffer::width::WidthProfile;
+use forge_diff::view::{DiffCapabilities, DiffViewAction, DiffViewState, DiffVisibility};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -167,6 +168,7 @@ impl PlanReviewStore {
         let opened = serde_json::json!({"snapshot":document.snapshot(), "saved_source_digest":document.saved_digest(),
             "plan_id":document.source.document.plan_id, "version":document.source.document.version,
             "path":document.source.path, "public_only":document.source.public_only,
+            "diff_view":document.diff_view.committed(), "diff_capabilities":DiffCapabilities::SemanticOnly,
             "annotation":document.annotation.annotation(), "source_edit":source_edit,
             "checks":document.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default()});
         store.insert(document.id.clone(), (document, admission));
@@ -432,9 +434,9 @@ impl PlanReviewStore {
             .snapshot();
             return Ok(serde_json::json!({"schema":snapshot}));
         }
-        if action == "toggle_public" {
+        if action == "toggle_visibility" {
             document.validate_input(input)?;
-            return document.toggle_public();
+            return document.toggle_visibility();
         }
         if action == "toggle_declaration" {
             let owner = input.block.clone();
@@ -490,6 +492,7 @@ impl PlanReviewStore {
 }
 
 pub(crate) struct ReadOnlyPlanReview {
+    diff_view: DiffViewState,
     reference: Mutex<HashMap<bool, super::references::PlanReferenceIndex>>,
     reference_context: Mutex<HashMap<bool, super::reference_context::ReferenceContext>>,
     focused_annotation: Option<String>,
@@ -858,7 +861,9 @@ impl EditablePlanReview<'_> {
             stage.complete(serde_json::json!({"count":annotation.annotation().len()}));
         }
         let edit = trace.map(|trace| trace.stage("review.edit_document"));
-        let patch = super::review_delivery::replace(&mut document.document, block)?;
+        let patch = document
+            .document
+            .splice(0..document.document.block_count(), block)?;
         if let Some(stage) = edit {
             stage.complete(serde_json::json!({}));
         }
@@ -1328,7 +1333,9 @@ impl ReadOnlyPlanReview {
                 blocks.iter().any(|block| block.id == jump.block),
                 "reference destination remains collapsed"
             );
-            let patch = super::review_delivery::replace(&mut self.document, blocks)?;
+            let patch = self
+                .document
+                .splice(0..self.document.block_count(), blocks)?;
             Ok((patch, targets, jump))
         })();
         if projection.is_err() {
@@ -1376,7 +1383,7 @@ impl ReadOnlyPlanReview {
                 }
                 if !matching.is_empty() {
                     let choices = matching.iter().enumerate().map(|(index, symbol)| serde_json::json!({
-                        "index": index, "label": format!("{}:{} — {}", symbol.destination.path, symbol.destination.line, symbol.destination.name)
+                        "index": index, "label": format!("{}:{} â€” {}", symbol.destination.path, symbol.destination.line, symbol.destination.name)
                     })).collect::<Vec<_>>();
                     return Ok(serde_json::json!({"symbol_choices": choices}));
                 }
@@ -2098,6 +2105,14 @@ impl ReadOnlyPlanReview {
         let mut view_width = DocumentViews::default();
         view_width.open(view.clone(), width.clone())?;
         Ok(Self {
+            diff_view: DiffViewState::new(
+                DiffCapabilities::SemanticOnly,
+                if source.public_only {
+                    DiffVisibility::Public
+                } else {
+                    DiffVisibility::All
+                },
+            ),
             reference: Default::default(),
             reference_context: Default::default(),
             focused_annotation,
@@ -2275,13 +2290,17 @@ impl ReadOnlyPlanReview {
         Ok(target)
     }
 
-    fn toggle_public(&mut self) -> Result<serde_json::Value> {
+    fn toggle_visibility(&mut self) -> Result<serde_json::Value> {
         ensure!(
             self.source.document.design.is_some(),
             "public visibility requires a declaration design"
         );
         self.retain_annotation_revision();
-        let public_only = !self.source.public_only;
+        let request = self
+            .diff_view
+            .request(DiffViewAction::ToggleVisibility)
+            .map_err(|error| anyhow::anyhow!("plan visibility request failed: {error:?}"))?;
+        let public_only = request.options.visibility == DiffVisibility::Public;
         self.source.public_only = public_only;
         let projection = super::review_projection::project(
             &self.source,
@@ -2291,19 +2310,27 @@ impl ReadOnlyPlanReview {
             None,
         )
         .and_then(|(block, target)| {
-            let patch = super::review_delivery::replace(&mut self.document, block)?;
+            let patch = self
+                .document
+                .splice(0..self.document.block_count(), block)?;
             Ok((patch, target))
         });
         if projection.is_err() {
-            self.source.public_only = !public_only;
+            self.diff_view.fail(request);
+            self.source.public_only =
+                self.diff_view.committed().visibility == DiffVisibility::Public;
         }
         let (patch, target) = projection?;
+        ensure!(
+            self.diff_view.commit(request),
+            "plan visibility request was superseded"
+        );
         self.source.public_only = public_only;
         self.focused_annotation = None;
         self.target = target;
         let source_edit = self.source_edit();
         Ok(
-            serde_json::json!({"patch":patch, "source_edit":source_edit, "annotation":self.annotation.annotation(), "public_only":public_only}),
+            serde_json::json!({"patch":patch, "source_edit":source_edit, "annotation":self.annotation.annotation(), "public_only":public_only, "diff_view": self.diff_view.committed(), "diff_capabilities": DiffCapabilities::SemanticOnly}),
         )
     }
 
@@ -2330,7 +2357,9 @@ impl ReadOnlyPlanReview {
             None,
         )
         .and_then(|(block, target)| {
-            let patch = super::review_delivery::replace(&mut self.document, block)?;
+            let patch = self
+                .document
+                .splice(0..self.document.block_count(), block)?;
             Ok((patch, target))
         });
         if projection.is_err() {
@@ -2379,7 +2408,9 @@ impl ReadOnlyPlanReview {
                 &revision,
                 self.focused_annotation.as_deref(),
             )?;
-            let patch = super::review_delivery::replace(&mut self.document, block)?;
+            let patch = self
+                .document
+                .splice(0..self.document.block_count(), block)?;
             self.target = target;
             self.width = profile;
             Some(patch)
@@ -2474,7 +2505,7 @@ mod tests {
                 .iter()
                 .filter(|block| block.id.0.starts_with("plan:configured-checks:"))
                 .flat_map(|block| block.text.wire_rows())
-                .filter_map(|row| row.split(" │ ").nth(1))
+                .filter_map(|row| row.split(" â”‚ ").nth(1))
                 .map(str::trim_end)
                 .collect::<String>();
             assert_eq!(displayed, format!("Command{command}"), "viewport {columns}");
@@ -2864,7 +2895,7 @@ mod tests {
             })
             .unwrap();
         document.toggle_declaration(&opening.id).unwrap();
-        document.toggle_public().unwrap();
+        document.toggle_visibility().unwrap();
         let resolver = Arc::clone(&document.source.resolver);
         let collapse = document.source.collapse.clone();
         let revision = document.snapshot().revision;
@@ -3087,7 +3118,7 @@ mod tests {
         let member = find(&document, "ArenaSize");
         let result = document.toggle_declaration(&member.id).unwrap();
         assert_eq!(result["jump"]["block"], opening.id.0);
-        document.toggle_public().unwrap();
+        document.toggle_visibility().unwrap();
         assert!(
             find(&document, "pub enum ConfigError")
                 .text
@@ -3098,7 +3129,7 @@ mod tests {
         assert!(find(&document, "limit: u32").metadata.collapse.len() == 1);
         let config = find(&document, "pub struct Config");
         document.toggle_declaration(&config.id).unwrap();
-        document.toggle_public().unwrap();
+        document.toggle_visibility().unwrap();
         assert!(
             find(&document, "pub struct Config")
                 .text
@@ -3623,7 +3654,7 @@ mod tests {
                 .unwrap()[jump.position.column..]
                 .starts_with("User")
         );
-        document.toggle_public().unwrap();
+        document.toggle_visibility().unwrap();
         let (anchor, row) = select(&document, "hidden: Hidden");
         let result = document
             .describe(anchor, "open", &row, row.find("Hidden").unwrap())
@@ -4036,7 +4067,7 @@ mod tests {
             source: super::super::PlanAnnotationInput {
                 start_line: line,
                 end_line: line,
-                body: "literal **comment**\nλ\r\n".into(),
+                body: "literal **comment**\nÎ»\r\n".into(),
             },
         };
         store

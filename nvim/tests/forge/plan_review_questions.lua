@@ -89,7 +89,7 @@ assert(not text():find("This is an older answer.", 1, true), "late answer appear
 vim.cmd("write")
 pending[4].callback(nil, "Provider unavailable")
 assert(#notices == 1 and notices[1] == "Provider unavailable", "provider failure was not surfaced")
-assert(comments.capture(buffer)[1].source.body == "Newer unsaved question?" and not owner.saving,
+assert(not vim.bo[buffer].modified and comments.capture(buffer)[1].source.body == "Newer unsaved question?" and not owner.saving,
   "provider failure lost the saved question or blocked retry")
 assert(not text():find("Generating response", 1, true), "provider failure retained a generating placeholder")
 vim.cmd("write")
@@ -98,7 +98,7 @@ pending[5].callback(response("Newer unsaved question?", "The interface establish
 pending[4].progress({ question_id = "1", model = "obsolete-model", effort = "low" })
 assert(not text():find("obsolete-model", 1, true), "retired request progress replaced the completed answer")
 assert(not vim.bo[buffer].modified and text():find("ownership boundary.", 1, true), "retry did not retain the answer")
-owner.action("toggle_public", function(_, failure) assert(not failure, failure) end)
+owner.action("toggle_visibility", function(_, failure) assert(not failure, failure) end)
 local refreshed = vim.deepcopy(opened)
 refreshed.patch = {}
 refreshed.annotation = response("Newer unsaved question?", "unused").annotation
@@ -121,7 +121,7 @@ local row = vim.api.nvim_win_get_cursor(0)[1] - 1
 vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "Which getter should I use?" })
 vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
 vim.cmd("write")
-assert(pending[7].method == "session.plan.question.answer" and saves[#saves].annotation[2].parent_id == "1",
+assert(pending[7].method == "session.plan.question.answer" and saves[#saves].annotation[2].parent_id == "1" and pending[7].params.question_ids[1] == "2",
   "question request omitted the follow-up identity")
 local threaded = response("Newer unsaved question?", "The interface establishes the ownership boundary.")
 threaded.annotation[2] = { id = "2", kind = "question", parent_id = "1",

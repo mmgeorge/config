@@ -2,6 +2,8 @@ local M = {}
 local buffer = require("forge.buffer")
 local input = require("forge.input")
 local next_document = 0
+local dispatch_diff
+local dispatch_source
 local runner_for_test
 local cache = {}
 local window_presentation = require("forge.window_presentation")
@@ -37,9 +39,10 @@ local function request(state, params, callback)
 end
 
 local function close_view(state, window, view)
+  if state.commands then state.commands.release_window(window) end
   input.close(view.input)
   local owned = window_presentation.release(window, view)
-  if owned and vim.api.nvim_win_is_valid(window) and vim.wo[window].winbar == view.header then
+  if (owned or view.input.document_folds) and vim.api.nvim_win_is_valid(window) and vim.wo[window].winbar == view.header then
     vim.wo[window].winbar = view.winbar
     for name, value in pairs(view.presentation) do
       if vim.wo[window][name] == view.applied[name] then vim.wo[window][name] = value end
@@ -56,21 +59,25 @@ end
 local function view_for(state, window)
   local view = state.view[window]
   if not view then
+    if state.commands then state.commands.release_window(window) end
     local original_winbar = vim.wo[window].winbar
     local header = state.kind == "commit_message" and ("%%#WinBar# 󰈔 %%*%%#DropBarFileName#%s%%*"):format(state.display_revision)
       or "%#ForgeFileRevisionHeader# " .. (state.title or "Historical source"):gsub("%%", "%%%%"):gsub("[\r\n]", " ") .. " — read-only revision %*"
-    view = { input = input.open(state.replica, window, { exact_source = true }), winbar = original_winbar,
+    view = { input = input.open(state.replica, window, { exact_source = state.diff_view == nil }), winbar = original_winbar,
       header = header, presentation = {}, applied = {} }
     local baseline = state.presentation[window] or window_presentation.capture(window)
     state.presentation[window] = nil
-    for name, value in pairs(baseline) do
-      view.presentation[name] = vim.wo[window][name]
-      view.applied[name] = value
-      vim.wo[window][name] = view.applied[name]
+    if not view.input.document_folds then
+      for name, value in pairs(baseline) do
+        view.presentation[name] = vim.wo[window][name]
+        view.applied[name] = value
+        vim.wo[window][name] = view.applied[name]
+      end
+      window_presentation.retain(window, view, baseline)
     end
-    window_presentation.retain(window, view, baseline)
     state.view[window] = view
     vim.wo[window].winbar = header
+    if state.commands then state.commands.refresh() end
   end
   return view.input
 end
@@ -110,6 +117,107 @@ local function display_source(state, window, layout)
   position_requested(state)
 end
 
+local function apply_delivery(state, delivery)
+  if delivery.patch and delivery.patch ~= vim.NIL then
+    local applied = buffer.apply_patch(state.replica, delivery.patch)
+    if not applied or applied.kind ~= "Applied" then return false end
+  end
+  state.more = delivery.more == true
+  if delivery.diff_view and delivery.diff_view ~= vim.NIL then state.diff_view = delivery.diff_view end
+  if state.commands then state.commands.refresh() end
+  if delivery.state and (delivery.state.state == "failed" or delivery.state.state == "unavailable") then
+    state.notice(delivery.state.diagnostic)
+  end
+  return true
+end
+
+local function dispatch_input(state, captured)
+  state.pending = true
+  request(state, { operation = "demand", input = captured }, function(delivery, request_failure)
+    state.pending = false
+    if request_failure or not delivery then state.notice(request_failure or "Missing source delivery")
+    else apply_delivery(state, delivery) end
+    M.demand(state)
+  end)
+  return true
+end
+
+dispatch_diff = function(state)
+  if not state.diff_view or state.pending or not state.active or state.replica.status ~= "Applied" then return false end
+  local action
+  for _, candidate in ipairs({ "toggle_visibility", "toggle_presentation" }) do
+    if state.diff_toggle and state.diff_toggle[candidate] then action = candidate break end
+  end
+  if not action then return false end
+  local window = vim.api.nvim_get_current_win()
+  if vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then
+    window = vim.fn.win_findbuf(state.replica.buffer)[1]
+  end
+  if not window then return false end
+  local captured, failure = input.capture(state.replica, view_for(state, window), action)
+  if not captured then state.notice(failure) return false end
+  state.diff_toggle[action] = false
+  return dispatch_input(state, captured)
+end
+
+local function native_section_node(state, identity)
+  local source = state.replica.projection and state.replica.projection.source or state.replica
+  return source.sequence and source.sequence.node[identity]
+end
+
+local function source_request(state, window, action, location)
+  local captured, failure = input.capture(state.replica, view_for(state, window), action)
+  if not captured then state.notice(failure) return false end
+  if location then
+    captured.block = location.block
+    captured.position = require("forge.node_projection").source_position(state.replica, location.block, location.position)
+    captured.target = location.target
+  end
+  return dispatch_input(state, captured)
+end
+
+dispatch_source = function(state)
+  if not state.active or state.pending or state.replica.status ~= "Applied" then return false end
+  local window = vim.api.nvim_get_current_win()
+  if vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then window = vim.fn.win_findbuf(state.replica.buffer)[1] end
+  if not window then return false end
+  for identity, expanded in pairs(state.source_section or {}) do
+    state.source_section[identity] = nil
+    local node = native_section_node(state, identity)
+    if node then
+      local captured, failure = input.capture(state.replica, view_for(state, window), expanded and "source_expand" or "source_collapse")
+      if not captured then state.notice(failure) return false end
+      captured.block, captured.position, captured.target = identity, { row = 0, column = 0 }, nil
+      for _, target in ipairs(node.entry.metadata.target or {}) do
+        if target.range.start.row == 0 and target.range.start.column == 0 then captured.target = target.id break end
+      end
+      return dispatch_input(state, captured)
+    end
+  end
+  return false
+end
+
+local function source_changed(state, identity, closed)
+  local window = vim.api.nvim_get_current_win()
+  if vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then return end
+  local cursor = vim.api.nvim_win_get_cursor(window)
+  local location = buffer.locate(state.replica, cursor[1] - 1, cursor[2])
+  local node = location and state.replica.sequence.node[location.block]
+  local owner = identity or node and node.entry.metadata.content_node
+  if not owner or owner == vim.NIL then return end
+  if closed == nil then closed = require("forge.nodes").closed(state.replica, owner) end
+  state.source_section = state.source_section or {}
+  state.source_section[owner] = not closed
+  dispatch_source(state)
+end
+
+function M.toggle_diff(state, action)
+  if not state.diff_view then return end
+  state.diff_toggle = state.diff_toggle or {}
+  state.diff_toggle[action] = not state.diff_toggle[action]
+  dispatch_diff(state)
+end
+
 function M.demand(state)
   if not host_current(state) then return end
   if not state.active or state.pending or state.scheduled or state.replica.status ~= "Applied" then return end
@@ -118,6 +226,7 @@ function M.demand(state)
     state.scheduled = false
     if not host_current(state) then return end
     if not state.active or state.pending then return end
+    if dispatch_diff(state) or dispatch_source(state) then return end
     for window in pairs(state.return_view) do
       if not vim.api.nvim_win_is_valid(window) then state.return_view[window] = nil end
     end
@@ -130,18 +239,25 @@ function M.demand(state)
     for _, window in ipairs(vim.fn.win_findbuf(state.replica.buffer)) do
       local view = view_for(state, window)
       local last = vim.api.nvim_win_call(window, function() return vim.fn.line("w$") + vim.api.nvim_win_get_height(window) end)
-      if state.more and (state.replica.row_count <= last or state.requested_row and state.requested_row > state.replica.row_count) then
+      if state.native_sections then
+        local first = vim.api.nvim_win_call(window, function() return vim.fn.line("w0") end)
+        for row = first, math.min(last, state.replica.row_count) do
+          local location = buffer.locate(state.replica, row - 1, 0)
+          local node = location and state.replica.sequence.node[location.block]
+          local owner = node and node.entry.metadata.content_node
+          if location and location.block:match(":more$") and owner and owner ~= vim.NIL
+            and not require("forge.nodes").closed(state.replica, owner) then
+            if source_request(state, window, "demand", location) then return end
+          end
+        end
+      elseif state.more and (state.replica.row_count <= last or state.requested_row and state.requested_row > state.replica.row_count) then
         local captured, failure = input.capture(state.replica, view, "demand")
         if not captured then state.notice(failure) return end
         state.pending = true
         request(state, { operation = "demand", input = captured }, function(delivery, request_failure)
           state.pending = false
           if request_failure or not delivery then state.notice(request_failure or "Missing source delivery") return end
-          if delivery.patch and delivery.patch ~= vim.NIL then buffer.apply_patch(state.replica, delivery.patch) end
-          state.more = delivery.more == true
-          if delivery.state and (delivery.state.state == "failed" or delivery.state.state == "unavailable") then
-            state.notice(delivery.state.diagnostic)
-          end
+          apply_delivery(state, delivery)
           M.demand(state)
         end)
         return
@@ -157,10 +273,15 @@ function M.open(options)
     window = options.window or vim.api.nvim_get_current_win(), requested_row = options.line, used = next_document, session_id = options.session_id }
   state.origin = vim.api.nvim_win_get_buf(state.window)
   state.notice = options.on_error or function(message) vim.notify(message, vim.log.levels.ERROR, { title = "Forge source" }) end
-  state.replica = buffer.open(state.document, { notice = state.notice, recover = function()
+  state.replica = buffer.open(state.document, { preserve_view = true, notice = state.notice, recover = function()
     request(state, { operation = "snapshot", document = state.document }, function(snapshot, failure)
       if failure or not snapshot then state.notice(failure or "Missing source snapshot") return end
-      buffer.apply_snapshot(state.replica, snapshot)
+      local applied = buffer.apply_snapshot(state.replica, snapshot)
+      if applied and applied.kind == "Applied" then
+        if snapshot.diff_view and snapshot.diff_view ~= vim.NIL then state.diff_view = snapshot.diff_view end
+        if snapshot.more ~= nil then state.more = snapshot.more == true end
+        if state.commands then state.commands.refresh() end
+      end
       M.demand(state)
     end)
   end })
@@ -169,7 +290,7 @@ function M.open(options)
   vim.bo[state.replica.buffer].bufhidden = "hide"
   vim.bo[state.replica.buffer].readonly = true
   state.group = vim.api.nvim_create_augroup("ForgeSourceDocument" .. next_document, { clear = true })
-  vim.api.nvim_create_autocmd({ "CursorMoved", "WinScrolled", "BufWinEnter" }, {
+  vim.api.nvim_create_autocmd({ "CursorMoved", "WinScrolled", "BufWinEnter", "WinEnter" }, {
     group = state.group, buffer = state.replica.buffer, callback = function() M.demand(state) end,
   })
   vim.api.nvim_create_autocmd("BufWinLeave", { group = state.group, buffer = state.replica.buffer, callback = function()
@@ -196,7 +317,7 @@ function M.open(options)
     end
     if options.is_current and not options.is_current() then M.close(state) return end
     if opened.source_row then state.requested_row = opened.source_row + 1 end
-    if options.on_annotation and opened.annotation then options.on_annotation(opened.annotation, opened.stale, opened.review) end
+    if options.on_annotation and opened.annotation then options.on_annotation(opened.annotation, opened.stale, opened.review, opened.review_diff_view) end
     local key = options.workspace .. "\0" .. options.path .. "\0" .. opened.title .. "\0" .. opened.object
     if options.annotation_document then key = key .. "\0" .. options.annotation_document end
     local existing = cache[key]
@@ -216,10 +337,24 @@ function M.open(options)
     local display_revision = revision:match("^%x+$") and revision:sub(1, 7) or revision
     state.display_revision = display_revision
     state.title, state.more = opened.title, opened.more == true
+    state.diff_view = opened.diff_view ~= vim.NIL and opened.diff_view or nil
+    local first = opened.snapshot.block[1]
+    state.native_sections = first and #(first.metadata.section or {}) > 0 or false
     if display_revision ~= revision then
       state.title = state.title:gsub(" @ " .. revision .. "$", " @ " .. display_revision)
     end
     buffer.apply_snapshot(state.replica, opened.snapshot)
+    if state.diff_view then
+      state.commands = require("forge.document_commands").attach(state.replica, {
+        view = "diff", title = state.title, diff_view = function() return state.diff_view end,
+        changed = function(identity, closed) source_changed(state, identity, closed) end,
+        handler = {
+          close = function() M.close(state) end,
+          toggle_visibility = function() M.toggle_diff(state, "toggle_visibility") end,
+          toggle_presentation = function() M.toggle_diff(state, "toggle_presentation") end,
+        },
+      })
+    end
     if options.is_current and not options.is_current() then M.close(state) return end
     if params.operation == "commit_message" then
       vim.api.nvim_buf_set_name(state.replica.buffer, "GitCommit://" .. display_revision)
@@ -273,6 +408,7 @@ end
 function M.close(state, on_closed)
   if not state.active then return end
   state.active = false
+  if state.commands then state.commands.close() end
   if state.cache_key and cache[state.cache_key] == state then cache[state.cache_key] = nil end
   for window, view in pairs(state.view) do close_view(state, window, view) end
   vim.api.nvim_del_augroup_by_id(state.group)

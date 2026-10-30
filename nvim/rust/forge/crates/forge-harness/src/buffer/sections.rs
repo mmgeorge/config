@@ -779,7 +779,7 @@ impl SectionProjection {
                 let after = page_boundary(&candidate.block.iter().collect::<Vec<_>>(), id);
                 ensure!(
                     after.is_none() || after != before,
-                    "section loading made no progress; reopen the section to retry"
+                    "section loading made no progress for {id}: previous={before:?}, prepared={after:?}"
                 );
             }
             Ok(candidate)
@@ -829,7 +829,14 @@ fn page_boundary(blocks: &[&BufferBlock], id: &str) -> Option<(BlockId, usize)> 
     blocks[..boundary]
         .iter()
         .rev()
-        .find(|block| block.text.row_count() > 0)
+        .find(|block| {
+            block.text.row_count() > 0
+                && block
+                    .metadata
+                    .content_node
+                    .as_ref()
+                    .is_none_or(|owner| block.id.0.strip_suffix(":end") != Some(owner.0.as_str()))
+        })
         .map(|block| (block.id.clone(), block.text.byte_count()))
 }
 
@@ -1058,9 +1065,19 @@ fn render(
                 },
             };
             fold.closed = !expanded;
-            if output[heading + 1..]
-                .iter()
-                .any(|block| block.text.row_count() > 0)
+            if !expanded && let Some(suffix) = fold.collapsed_suffix.take() {
+                let mut row = output[heading]
+                    .text
+                    .rows()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                row[fold.start.row].push_str(&suffix);
+                output[heading].text = BufferText::from_rows(row)?;
+            }
+            if original.collapsed_suffix.is_some()
+                || output[heading + 1..]
+                    .iter()
+                    .any(|block| block.text.row_count() > 0)
             {
                 output[heading].metadata.fold.push(fold);
             }
@@ -1171,6 +1188,7 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
         id: source.id.clone(),
         text: BufferText::from_rows(&rows)?,
         metadata: BlockMetadata {
+            source_anchor: metadata.source_anchor.clone(),
             status: metadata
                 .status
                 .as_ref()

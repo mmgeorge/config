@@ -48,6 +48,7 @@ impl ForgeRuntime {
         );
         let sources = forge_status::source_document::SourceDocumentService::new(
             Arc::clone(&repositories),
+            Arc::clone(&diff),
             Arc::clone(&syntax),
         );
         let generation = commit_message::GenerationService::new(

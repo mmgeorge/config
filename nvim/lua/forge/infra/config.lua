@@ -97,6 +97,10 @@
 ---@field close ForgeKeymap
 ---@field help ForgeKeymap
 
+---@class ForgeDiffKeymapConfig
+---@field toggle_visibility ForgeKeymap
+---@field toggle_presentation ForgeKeymap
+
 ---@class ForgePlanReviewKeymapConfig
 ---@field checks ForgeKeymap
 ---@field delete_tests ForgeKeymap
@@ -131,6 +135,7 @@
 ---@field close ForgeKeymap
 
 ---@class ForgeKeymapConfig
+---@field diff ForgeDiffKeymapConfig
 ---@field form ForgeFormKeymapConfig
 ---@field status ForgeStatusKeymapConfig
 ---@field review ForgeReviewKeymapConfig
@@ -243,6 +248,10 @@ M.defaults = {
     input_height = 3,
   },
   keymaps = {
+    diff = {
+      toggle_visibility = "ov",
+      toggle_presentation = "ox",
+    },
     status = {
       close = "q",
       refresh = "R",
@@ -313,7 +322,6 @@ M.defaults = {
       references = { "or", "of" },
       visual_line_with_gutter = "W",
       toggle = "<Tab>",
-      toggle_public = "<S-Tab>",
       open = "<CR>",
       jump_entity = ".",
       entity_info = "ol",

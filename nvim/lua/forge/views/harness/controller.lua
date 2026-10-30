@@ -271,15 +271,14 @@ function M.refresh_winbar()
     right_status[#right_status + 1] = { text = hint.key, group = "ForgeStatusHintKey" }
     right_status[#right_status + 1] = { text = " " .. hint.label, group = "ForgeStatusHint" }
   end
-  keymaps.apply_view_winbar(
-    state.transcript_win,
-    "",
-    "harness",
-    state.command_set,
-    status_text(),
-    nil,
-    right_status
-  )
+  local window = {}
+  if state.transcript_win then window[state.transcript_win] = true end
+  for attached in pairs(state.presentation and state.presentation.views or {}) do window[attached] = true end
+  local status = status_text()
+  for attached in pairs(window) do
+    keymaps.apply_view_winbar(attached, "", "harness", state.command_set, status,
+      { diff_view = state.presentation and state.presentation.diff_view }, right_status)
+  end
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     vim.wo[state.composer_win].winbar = ""
   end
@@ -2466,6 +2465,12 @@ function M.command_set()
   command_set.register(set, "sessions", M.open_session_picker)
   command_set.register(set, "background", M.open_background_picker)
   command_set.register(set, "open_timeline", M.open_timeline_entry)
+  for _, action in ipairs({ "toggle_visibility", "toggle_presentation" }) do
+    command_set.register(set, action, function()
+      local presentation = harness_state().presentation
+      if presentation then presentation.toggle_diff(action) end
+    end)
+  end
   command_set.register(set, "reopen_question", M.reopen_question)
   command_set.register(set, "model", M.select_model)
   command_set.register(set, "effort_down", function() M.change_effort(-1) end)
@@ -2492,6 +2497,8 @@ function M.composer_command_set()
   local set = M.command_set()
   command_set.unregister(set, "visual_line_with_gutter")
   command_set.unregister(set, "open_timeline")
+  command_set.unregister(set, "toggle_visibility")
+  command_set.unregister(set, "toggle_presentation")
   command_set.register(set, "history_previous", prompt_history.previous)
   command_set.register(set, "history_next", prompt_history.next)
   return set

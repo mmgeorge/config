@@ -81,6 +81,31 @@ local success, failure = xpcall(function()
   patch(replacement)
   assert_cursor("60", 0)
 
+  local function source_block(id, text, scope, first, last)
+    local value = block(id, text)
+    value.metadata.source_anchor = { owner = scope, before = { start = first, ["end"] = last },
+      after = { start = first, ["end"] = last } }
+    return value
+  end
+  local source_body = source_block("body:first", "    updated();", "source:first", 23, 24)
+  local sibling_body = source_block("body:sibling", "    sibling();", "source:first", 65, 66)
+  local annotation = block("annotation", "Retained review annotation")
+  patch({ source_body, sibling_body, annotation })
+  cursor_at("body:first", 4)
+  cursor_at("body:sibling", 4, second_window)
+  patch({
+    source_block("declaration:parent", "pub fn parent() {", "source:first", 0, 50),
+    source_block("declaration:nested", "    fn nested() {", "source:first", 20, 30),
+    source_block("declaration:sibling", "pub fn sibling() {", "source:first", 60, 70),
+    source_block("declaration:other-file", "pub fn unrelated() {", "source:other", 23, 24),
+    annotation,
+  })
+  assert_cursor("declaration:nested", 4)
+  assert_cursor("declaration:sibling", 4, second_window)
+  patch({ source_body, sibling_body, annotation })
+  assert_cursor("body:first", 4)
+  assert_cursor("body:sibling", 4, second_window)
+
   local function status_rows()
     local value = block("status", "Working · 447s")
     value.text = { "Working · 447s", "Adding slow LSP requirement", "", "Queued follow-up inputs", "• queued input" }

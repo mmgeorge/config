@@ -6,6 +6,8 @@ local M = {}
 
 ---@type ForgeStatusCommandSpec[]
 M.specs = {
+  { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
+  { id = "toggle_presentation", label = "presentation", desc = "Toggle Full/Semantic diff presentation", modes = "n", keymap = "diff", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
   { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
   { id = "collapse_parent", label = "Collapse Parent", desc = "Collapse Parent", modes = "n", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
   { id = "next_hunk", label = "next hunk", desc = "Jump to the next hunk", modes = "n", pinned = false, views = { status = true, diff = true } },
@@ -41,6 +43,8 @@ M.specs = {
 
 M.hint_command_ids_by_view = {
   status = {
+    "toggle_visibility",
+    "toggle_presentation",
     "stage",
     "unstage",
     "ignore",
@@ -52,6 +56,8 @@ M.hint_command_ids_by_view = {
     "help",
   },
   pr = {
+    "toggle_visibility",
+    "toggle_presentation",
     "toggle",
     "browse",
     "review",
@@ -63,6 +69,8 @@ M.hint_command_ids_by_view = {
     "help",
   },
   review = {
+    "toggle_visibility",
+    "toggle_presentation",
     "toggle",
     "collapse_parent",
     "viewed",
@@ -76,6 +84,8 @@ M.hint_command_ids_by_view = {
     "help",
   },
   diff = {
+    "toggle_visibility",
+    "toggle_presentation",
     "open",
     "refresh",
     "close",
@@ -94,6 +104,8 @@ M.view_specs = {
     { id = "help", label = "help", desc = "Show form commands", modes = "n", pinned = true },
   },
   harness = {
+    { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = true },
+    { id = "toggle_presentation", label = "presentation", desc = "Toggle Full/Semantic diff presentation", modes = "n", keymap = "diff", pinned = true },
     { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
     { id = "submit", label = "submit", desc = "Submit the composer", modes = { "n", "i" }, pinned = false,
       hints = { composer = function() return "submit" end } },
@@ -149,7 +161,7 @@ M.view_specs = {
     { id = "references", label = "references", desc = "Find symbol usages in this plan snapshot", modes = "n", pinned = true },
     { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
     { id = "jump_entity", label = "definition", desc = "Jump to the selected declaration, call, or property definition", modes = "n", pinned = true },
-    { id = "toggle_public", label = "public", desc = "Toggle public-only declarations", modes = "n", pinned = true },
+    { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = true },
     { id = "toggle", label = "fold", desc = "Toggle the current declaration diff file or hunk", modes = "n", pinned = true },
     { id = "open", label = "open", desc = "Jump to the selected definition or open the source file", modes = "n", pinned = true },
     { id = "comment", label = "comment", desc = "Annotate the current plan line or selection", modes = { "n", "x" }, visual = true, pinned = true },

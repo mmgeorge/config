@@ -19,6 +19,10 @@ pub(super) struct ChangeTree {
     pub preview_error: Option<String>,
 }
 
+pub(super) fn file_identity(root: &str, path: &str) -> String {
+    format!("{root}:file:{}:{path}", path.len())
+}
+
 fn file_action(
     path: &str,
     line: usize,
@@ -81,6 +85,7 @@ impl ChangeTree {
             TranscriptAction::Diff {
                 text: patch.into(),
                 syntax: true,
+                checkpoint: None,
             },
         );
         tree.block[0] = replacement;
@@ -117,6 +122,7 @@ impl ChangeTree {
                     TranscriptAction::Diff {
                         text: text.into(),
                         syntax: false,
+                        checkpoint: None,
                     },
                 )?;
                 return Ok(tree);
@@ -162,6 +168,7 @@ impl ChangeTree {
             TranscriptAction::Diff {
                 text: text.into(),
                 syntax: true,
+                checkpoint: None,
             },
         )?;
         let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
@@ -172,7 +179,7 @@ impl ChangeTree {
                 .as_ref()
                 .or(file.old_path.as_ref())
                 .expect("validated patch path");
-            let file_id = format!("{id}:file:{}:{path}", path.len());
+            let file_id = file_identity(id, path);
             let added = file
                 .hunk
                 .iter()

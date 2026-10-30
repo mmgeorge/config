@@ -167,6 +167,7 @@ Source: [service/document.rs](../../../rust/forge/crates/forge-review/src/servic
 ```rust
 #[derive(Debug, Serialize)]
 pub struct ReviewMaterialization {
+    pub diff_view: forge_diff::view::DiffViewOptions,
     pub field: Vec<crate::review::ReviewField>,
     pub comment: Vec<crate::review::ReviewCommentSnapshot>,
     pub inline_anchor: std::collections::BTreeMap<TargetId, crate::comments::CommentAnchor>,
@@ -215,6 +216,8 @@ Source: [service/input.rs](../../../rust/forge/crates/forge-review/src/service/i
 ```rust
 #[derive(Debug, serde::Serialize)]
 pub struct ReviewActionDelivery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
     pub patch: Vec<forge_buffer::patch::BufferPatch>,
     pub effect: Option<ReviewActionEffect>,
     pub diagnostic: Option<String>,

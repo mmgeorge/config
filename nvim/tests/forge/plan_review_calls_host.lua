@@ -103,7 +103,7 @@ local success, failure = xpcall(function()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan change the dispatch interface" })
   require("forge.views.harness.controller").submit()
-  await(function() return not state.busy and state.active_plan end, "plan did not arrive")
+  await(function() return not state.busy and state.active_plan and state.active_plan.review_digest end, "submitted plan did not arrive")
   if vim.g.forge_test_plan_behavior or vim.g.forge_test_plan_tests or vim.g.forge_test_plan_flows then
     local seeded = vim.system({ behavior_generator, data .. "/forge/harness", workspace, state.session.id, state.active_plan.id, vim.g.forge_test_plan_tests and "tests" or vim.g.forge_test_plan_flows and "flows" or "behavior" }, { text = true }):wait(30000)
     assert(seeded.code == 0, (seeded.stderr or "") .. (seeded.stdout or ""))
@@ -184,7 +184,7 @@ local success, failure = xpcall(function()
     assert(document.design.proposed["src/change.rs"]:find("mod added_tests", 1, true), "test declarations were removed from saved data")
     for _, expected_public in ipairs({ true, false }) do
       if review.public_only ~= expected_public then
-        review.command_set.action_by_id.toggle_public.run({})
+        review.command_set.action_by_id.toggle_visibility.run({})
         await(function() return review.public_only == expected_public end, "review visibility did not change")
       end
       local visible = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
@@ -676,6 +676,7 @@ local success, failure = xpcall(function()
   end
   assert(not vim.wo[review.win].number and not vim.wo[review.win].relativenumber and vim.wo[review.win].statuscolumn == "",
     "PlanReview displayed editor line numbers")
+  assert(table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("pub fn reviewed_change", 1, true), "new function was absent before reference navigation")
   local description_row
   local paragraph = vim.split(document.design.document.design, "\n", { plain = true })[1]
   for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
@@ -716,7 +717,7 @@ local success, failure = xpcall(function()
   end
   assert(leaf_row, "baseline signature is absent")
   assert(call_count <= 1, "review did not deduplicate the saved occurrences")
-  assert(call_count == 0 and table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("pub fn run() {...}", 1, true), "Calls body did not start collapsed")
+  assert(call_count == 0 and table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("pub fn run() { … ", 1, true), "Calls body did not start collapsed")
   for _, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
     assert(not row:match("^%s*Calls$") and not row:match("^%s*Constructs$") and not row:match("^%s*Accesses$"), "collapsed functions exposed a body category")
   end
@@ -746,7 +747,7 @@ local success, failure = xpcall(function()
     if row:find("count: usize", 1, true) then property_row, property_column = index, row:find("count", 1, true) - 1 end
   end
   assert(property_row, "captured property declaration is absent")
-  assert(table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("pub fn update(client: &mut Client) {...}", 1, true), "property body did not start collapsed")
+  assert(table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("pub fn update(client: &mut Client) { … ", 1, true), "property body did not start collapsed")
   vim.api.nvim_set_current_win(review.win)
   vim.api.nvim_win_set_cursor(review.win, { property_row, property_column })
   vim.cmd("silent! normal! zv")
@@ -778,10 +779,16 @@ local success, failure = xpcall(function()
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), { property_row, property_column }), "comma did not return to the property declaration")
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-i>", true, false, true), "ntx", false)
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), property_cursor), "forward jump did not return to the selected access")
-  local expanded_body = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
-  assert(expanded_body:find("pub fn update(client: &mut Client) {\n  Calls\n    leaf\n  Constructs\n  Accesses\n    Client::count\n}", 1, true), "reference selection did not reveal both categories inside the function body")
+  local expanded_rows = vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)
+  for index, row in ipairs(expanded_rows) do
+    local location = review.owner.replica.decoration_location and review.owner.replica.decoration_location(index - 1)
+      or require("forge.buffer").locate(review.owner.replica, index - 1, 0)
+    expanded_rows[index] = row:sub((location and location.display_indent or 0) + 1)
+  end
+  local expanded_body = table.concat(expanded_rows, "\n")
+  assert(expanded_body:find("pub fn update(client: &mut Client) {\n  Calls\n    leaf\n  Constructs\n  Accesses\n    Client::count\n}", 1, true), "reference selection did not reveal both categories inside the function body:\n" .. expanded_body)
   local following_comment = false
-  for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+  for index, row in ipairs(expanded_rows) do
     if row == "/// Describes the following declaration." then
       following_comment = true
       local location = require("forge.buffer").locate(review.owner.replica, index - 1, 0)
@@ -855,6 +862,8 @@ local success, failure = xpcall(function()
   assert(vim.api.nvim_win_get_buf(review.win) == review.buf, "reference selection left the plan buffer")
   local cursor = vim.api.nvim_win_get_cursor(review.win)
   local target = vim.api.nvim_buf_get_lines(review.buf, cursor[1] - 1, cursor[1], false)[1]
+  local target_location = review.owner.replica.decoration_location and review.owner.replica.decoration_location(cursor[1] - 1)
+  target = target:sub((target_location and target_location.display_indent or 0) + 1)
   assert(target:match("^%s+leaf$"), "reference jump missed the Calls entry: " .. target)
   local call_location = require("forge.buffer").locate(review.owner.replica, cursor[1] - 1, cursor[2])
   local call_style = review.owner.replica.sequence.node[call_location.block].entry.metadata.visible_decoration
@@ -930,7 +939,7 @@ local success, failure = xpcall(function()
         vim.api.nvim_win_set_cursor(review.win, { index, row:find("reviewed_change", 1, true) - 1 }) return
       end
     end
-    error("new plan function is absent")
+    error("new plan function is absent:\n" .. table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n") .. "\nProposed source:\n" .. document.design.proposed["src/change.rs"])
   end
   local function rename_input()
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do

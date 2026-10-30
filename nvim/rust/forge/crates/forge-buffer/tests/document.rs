@@ -15,6 +15,94 @@ fn block(id: usize, rows: &[&str]) -> BufferBlock {
 }
 
 #[test]
+fn empty_subtree_replacement_rebases_an_enclosing_fold_and_allows_an_empty_document() {
+    use forge_buffer::{
+        block::{BlockAnchor, FoldRange},
+        identity::FoldId,
+    };
+    let mut heading = block(0, &["heading"]);
+    heading.metadata.fold.push(FoldRange {
+        id: FoldId("empty-body".into()),
+        start: TextPosition { row: 0, column: 0 },
+        heading_start: None,
+        end: BlockAnchor {
+            block: BlockId("block-1".into()),
+            position: TextPosition { row: 1, column: 0 },
+        },
+        closed: false,
+        collapsed_suffix: None,
+        collapse_children: false,
+        expand_children: false,
+    });
+    let mut document = BufferDocument::new(
+        DocumentId("empty-subtree".into()),
+        vec![heading, block(1, &["body"])],
+    )
+    .unwrap();
+    let before = document.snapshot();
+    let patch = document.splice(1..2, vec![]).unwrap().unwrap();
+    assert_eq!(
+        apply_snapshot_reference(&before, &patch).unwrap(),
+        document.snapshot()
+    );
+    let fold = &document.snapshot().block[0].metadata.fold[0];
+    assert_eq!(fold.end.block, BlockId("block-0".into()));
+    assert_eq!(fold.end.position, TextPosition { row: 1, column: 0 });
+    let before = document.snapshot();
+    let patch = document.splice(0..1, vec![]).unwrap().unwrap();
+    assert_eq!(
+        apply_snapshot_reference(&before, &patch).unwrap(),
+        document.snapshot()
+    );
+    assert_eq!(document.block_count(), 0);
+    assert!(document.splice(0..0, vec![]).unwrap().is_none());
+}
+
+#[test]
+fn subtree_replacement_preserves_unchanged_rows_between_changed_blocks() {
+    let mut document = BufferDocument::new(
+        DocumentId("retained-source".into()),
+        vec![
+            block(0, &["heading"]),
+            block(1, &["first"]),
+            block(2, &["retained"]),
+            block(3, &["last"]),
+        ],
+    )
+    .unwrap();
+    let before = document.snapshot();
+    let patch = document
+        .splice(
+            1..4,
+            vec![
+                block(1, &["updated first"]),
+                block(2, &["retained"]),
+                block(3, &["updated last"]),
+                block(4, &["continuation"]),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        apply_snapshot_reference(&before, &patch).unwrap(),
+        document.snapshot()
+    );
+    assert!(
+        patch
+            .text_edit
+            .iter()
+            .all(|edit| { !(edit.start_row <= 2 && 2 < edit.start_row + edit.removed_rows) })
+    );
+    assert!(!patch.removed_block.contains(&BlockId("block-2".into())));
+    assert!(
+        document
+            .splice(1..5, document.snapshot().block[1..].to_vec())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn source_metadata_preserves_long_overlay_and_fold_summary_text() {
     use forge_buffer::block::{BlockAnchor, FoldRange, SourceOverlay};
     use forge_buffer::identity::FoldId;

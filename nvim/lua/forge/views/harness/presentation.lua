@@ -41,6 +41,7 @@ function M.open(options, callback)
   end
   local queued, active = {}, false
   local flush_staging
+  local flush_diff
   local staging_reveal, staging_revealed
   local function cancel_staging_reveal()
     local pending = staging_reveal
@@ -125,7 +126,8 @@ function M.open(options, callback)
     end
   end
   local function dispatch_next()
-    if active or owner.applying or #queued == 0 then return end
+    if active or owner.applying then return end
+    if #queued == 0 then if flush_diff then flush_diff() end return end
     while #queued > 0 and not valid_request(queued[1]) do
       local discarded = table.remove(queued, 1)
       if discarded.cancel then discarded.cancel() end
@@ -240,6 +242,7 @@ function M.open(options, callback)
         if result.kind ~= "Applied" then
           fail("Harness snapshot could not be adopted: " .. tostring(result.kind))
         else
+          if snapshot.diff_view and snapshot.diff_view ~= vim.NIL then owner.diff_view = snapshot.diff_view end
           flush_staging()
           if options.on_update then options.on_update() end
         end
@@ -359,6 +362,7 @@ function M.open(options, callback)
     owner.status_view:apply(opened.status, guard(function(applied)
     if not applied then reject_open("Harness status could not be adopted") return end
     owner.ready = true
+    owner.diff_view = opened.diff_view and opened.diff_view ~= vim.NIL and opened.diff_view or { visibility = "all", presentation = "full" }
     flush_staging()
     render_markdown()
     vim.schedule(function() if alive() then owner.observe_sections() end end)
@@ -549,6 +553,7 @@ function M.open(options, callback)
       owner.applying = true
       local function complete()
         owner.applying, owner.syncing = false, false
+        if result.diff_view and result.diff_view ~= vim.NIL then owner.diff_view = result.diff_view end
         publish_openings()
         local switched_timeline = owner.restore_timeline ~= nil
         if owner.restore_timeline then
@@ -589,6 +594,33 @@ function M.open(options, callback)
           complete_status()
       end))
     end)
+  end
+
+  flush_diff = function()
+    if not alive() or not owner.ready or owner.failure or active or #queued > 0 or owner.applying or owner.pending or owner.syncing or owner.selecting or owner.diff_inflight then return end
+    local action
+    for _, candidate in ipairs({ "toggle_visibility", "toggle_presentation" }) do
+      if owner.diff_toggle and owner.diff_toggle[candidate] then action = candidate break end
+    end
+    if not action then return end
+    local view = action_view()
+    if not view then return end
+    local captured, failure = input.capture(owner.transcript, view, action)
+    if not captured then notice(failure) return end
+    owner.diff_toggle[action], owner.diff_inflight = nil, true
+    request({ operation = "diff_input", input = captured }, function(_, failure)
+      owner.diff_inflight = false
+      if not alive() then return end
+      if failure then notice(failure) end
+      owner.sync()
+    end, nil, function() owner.diff_inflight = false end)
+  end
+
+  function owner.toggle_diff(action)
+    if action ~= "toggle_visibility" and action ~= "toggle_presentation" then return end
+    owner.diff_toggle = owner.diff_toggle or {}
+    owner.diff_toggle[action] = not owner.diff_toggle[action]
+    flush_diff()
   end
 
   function owner.set_section(section, expanded, more, selected_view)

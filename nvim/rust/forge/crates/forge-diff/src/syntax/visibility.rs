@@ -14,6 +14,52 @@ pub struct DeclarationVisibility {
 }
 
 impl DeclarationVisibility {
+    /// Select exact source rows using the retained syntax tree without plan-only test masks.
+    /// Unsupported languages and malformed regions retain their complete source rows.
+    pub fn from_source(syntax: &super::SyntaxHandle, public_only: bool) -> Self {
+        let text = syntax.source().text();
+        let language = syntax.language();
+        let Some(tree) = syntax.0.tree.first() else {
+            return Self {
+                rows: vec![true; text.lines().count()],
+                replacement: HashMap::new(),
+            };
+        };
+        if !public_only
+            || !matches!(
+                language,
+                SyntaxLanguage::Rust
+                    | SyntaxLanguage::Typescript
+                    | SyntaxLanguage::Tsx
+                    | SyntaxLanguage::Javascript
+                    | SyntaxLanguage::Lua
+            )
+        {
+            return Self {
+                rows: vec![true; text.lines().count()],
+                replacement: HashMap::new(),
+            };
+        }
+        let mut visibility = Visibility {
+            language,
+            source: true,
+            text,
+            rows: vec![false; text.lines().count()],
+            types: HashMap::new(),
+            replacement: HashMap::new(),
+            lines: text.lines().collect(),
+            returned: text
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("return ").map(str::to_owned)),
+        };
+        visibility.collect_types(tree.root_node());
+        visibility.group(tree.root_node(), Scope::Top);
+        Self {
+            rows: visibility.rows,
+            replacement: HashMap::new(),
+        }
+    }
+
     /// Select inspection rows and abbreviate trait implementations without changing stored declarations.
     ///
     /// Public-only inspection includes public declarations and their attached documentation.
@@ -48,6 +94,7 @@ impl DeclarationVisibility {
         }
         let mut visibility = Visibility {
             language,
+            source: false,
             text: &surrogate,
             rows: vec![!public_only; text.lines().count()],
             types: HashMap::new(),
@@ -100,6 +147,7 @@ enum Scope {
 
 struct Visibility<'text> {
     language: SyntaxLanguage,
+    source: bool,
     text: &'text str,
     rows: Vec<bool>,
     types: HashMap<String, bool>,
@@ -307,6 +355,43 @@ impl Visibility<'_> {
     }
 
     fn item(&mut self, node: Node<'_>, scope: Scope) -> bool {
+        if self.source {
+            let known = matches!(
+                node.kind(),
+                "impl_item"
+                    | "function_item"
+                    | "function_signature_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "trait_item"
+                    | "mod_item"
+                    | "type_item"
+                    | "const_item"
+                    | "static_item"
+                    | "field_declaration"
+                    | "enum_variant"
+                    | "export_statement"
+                    | "function_declaration"
+                    | "class_declaration"
+                    | "abstract_class_declaration"
+                    | "interface_declaration"
+                    | "type_alias_declaration"
+                    | "enum_declaration"
+                    | "lexical_declaration"
+                    | "variable_declaration"
+                    | "method_definition"
+                    | "method_signature"
+                    | "abstract_method_signature"
+                    | "public_field_definition"
+                    | "property_signature"
+                    | "assignment_statement"
+                    | "field"
+            );
+            if node.has_error() || !known {
+                self.mark(node);
+                return true;
+            }
+        }
         if self.language == SyntaxLanguage::Rust {
             if node.kind() == "impl_item" {
                 let Some(owner) = node.child_by_field_name("type") else {
@@ -348,6 +433,10 @@ impl Visibility<'_> {
             if !matches!(scope, Scope::Inherited) && !self.public(node) && !entry_point {
                 return false;
             }
+            if self.source && matches!(node.kind(), "function_item" | "function_signature_item") {
+                self.mark(node);
+                return true;
+            }
             if let Some(body) = node.child_by_field_name("body") {
                 let child_scope = match body.kind() {
                     _ if node.kind() == "enum_variant" => Scope::Inherited,
@@ -364,7 +453,7 @@ impl Visibility<'_> {
         }
         if matches!(
             self.language,
-            SyntaxLanguage::Typescript | SyntaxLanguage::Tsx
+            SyntaxLanguage::Typescript | SyntaxLanguage::Tsx | SyntaxLanguage::Javascript
         ) {
             if node.kind() == "export_statement" {
                 if let Some(declaration) = node.child_by_field_name("declaration") {

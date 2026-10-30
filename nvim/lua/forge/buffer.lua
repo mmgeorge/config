@@ -85,6 +85,19 @@ local function validate_metadata(entry, read_row, region_seen)
     identity(target.id)
     validate_range(target.range)
   end
+  local source_anchor = entry.metadata.source_anchor
+  if source_anchor and source_anchor ~= vim.NIL then
+    identity(source_anchor.owner)
+    local located = false
+    for _, side in ipairs({ "before", "after" }) do
+      local range = source_anchor[side]
+      if range and range ~= vim.NIL then
+        assert(counter(range.start) < counter(range["end"]), "invalid source navigation bounds")
+        located = true
+      end
+    end
+    assert(located, "source navigation has no represented lines")
+  end
   for _, list in ipairs({ entry.metadata.decoration, entry.metadata.visible_decoration or {}, entry.metadata.source_highlight or {} }) do
     for _, decoration in ipairs(array(list)) do
       identity(decoration.capture)
@@ -1031,6 +1044,17 @@ function M.set_expansion(session, id, expanded)
   if not ok then result = M.fail_apply(session, result) end
   if result ~= true and (type(result) ~= "table" or result.kind ~= "Applied") then owner.choice = previous return false end
   return true
+end
+
+---@param fragment ForgeBufferFragment
+---@return ForgeBufferFragment
+function M.fork_fragment(fragment)
+  local blocks = {}
+  for index = 0, fragment.sequence:count() - 1 do
+    local node = fragment.sequence:at(index)
+    blocks[#blocks + 1] = { id = node.id, text = node.entry.text, metadata = node.entry.metadata }
+  end
+  return M.fragment({ document = fragment.document, revision = fragment.revision, block = blocks }, fragment.editable_source, fragment)
 end
 
 ---@param fragment ForgeBufferFragment

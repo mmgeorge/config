@@ -58,6 +58,7 @@ pub struct ReviewField {
 
 #[derive(Debug, Serialize)]
 pub struct ReviewSnapshot {
+    pub diff_view: forge_diff::view::DiffViewOptions,
     pub document: DocumentId,
     pub field: Vec<ReviewField>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +70,7 @@ pub struct ReviewSnapshot {
 /// Owns PR fields, comment bodies, and one submitted mutation independently of physical buffer rows.
 /// Local edits remain admissible during a save. A second save requires settlement of the first.
 pub struct ReviewDocument {
+    pub(crate) diff_view: forge_diff::view::DiffViewState,
     pub(crate) views: forge_buffer::view::DocumentViews,
     pub(crate) input:
         BTreeMap<forge_buffer::identity::ViewId, forge_buffer::identity::InputSequence>,
@@ -79,7 +81,7 @@ pub struct ReviewDocument {
     pub(crate) file: BTreeMap<String, crate::service::file::RetainedFile>,
     pub(crate) file_loading: std::collections::BTreeSet<String>,
     pub(crate) commit_diff: crate::commit_diff::CommitDiffStore,
-    pub(crate) commit_projected: BTreeMap<String, usize>,
+    pub(crate) commit_view: BTreeMap<String, crate::service::commit::RetainedCommit>,
     pub(crate) projection_link:
         BTreeMap<forge_buffer::identity::BlockId, Vec<forge_buffer::markdown::MarkdownLink>>,
     pub(crate) section_revision: u64,
@@ -133,6 +135,10 @@ impl ReviewDocument {
         edits.insert(RegionId("title".into()), RegionRevision(0), title)?;
         edits.insert(RegionId("body".into()), RegionRevision(0), body)?;
         Ok(Self {
+            diff_view: forge_diff::view::DiffViewState::new(
+                forge_diff::view::DiffCapabilities::Source,
+                forge_diff::view::DiffVisibility::All,
+            ),
             views: forge_buffer::view::DocumentViews::default(),
             input: BTreeMap::new(),
             projection_target: BTreeMap::new(),
@@ -141,7 +147,7 @@ impl ReviewDocument {
             file: BTreeMap::new(),
             file_loading: std::collections::BTreeSet::new(),
             commit_diff: crate::commit_diff::CommitDiffStore::default(),
-            commit_projected: BTreeMap::new(),
+            commit_view: BTreeMap::new(),
             projection_link: BTreeMap::new(),
             section_revision: 0,
             section: BTreeMap::new(),
@@ -341,6 +347,7 @@ impl ReviewDocument {
             });
         }
         Ok(ReviewSnapshot {
+            diff_view: self.diff_view.committed(),
             document: self.id.clone(),
             uncertain: !self.saving && (!self.pending.is_empty() || self.pending_comment.is_some()),
             field,

@@ -339,7 +339,7 @@ local function build_projection(state, width)
     local source_line = math.max(1, math.min(tonumber(source_row.source_line) or 1, source_count))
     local row = #projection.line_list
     if projection.source_row_by_line[source_line] == nil then projection.source_row_by_line[source_line] = row end
-    projection.line_list[#projection.line_list + 1] = string.rep(" ", source_row.display_indent or 0) .. (source_row.text or "")
+    projection.line_list[#projection.line_list + 1] = string.rep(" ", source_row.display_indent or 0) .. (source_row.display_text or source_row.text or "")
     projection.line_meta_list[#projection.line_list] = vim.deepcopy(source_row)
     projection.source_record_list[#projection.source_record_list + 1] = {
       row = row,

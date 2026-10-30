@@ -41,6 +41,10 @@ enum WalkthroughRequest {
         document: DocumentId,
         input: DocumentInput,
     },
+    ReviewInput {
+        document: DocumentId,
+        input: DocumentInput,
+    },
     AnnotationSnapshot {
         document: DocumentId,
         annotation: DocumentId,
@@ -73,6 +77,7 @@ struct WalkthroughSource {
     source_row: usize,
     stale: bool,
     review: bool,
+    review_diff_view: Option<forge_diff::view::DiffViewOptions>,
 }
 
 pub(super) async fn route(host: &ForgeRuntime, params: Value) -> Result<Value> {
@@ -138,6 +143,15 @@ pub(super) async fn route(host: &ForgeRuntime, params: Value) -> Result<Value> {
                 }
             };
             serde_json::to_value(WalkthroughSource {
+                review_diff_view: if review.unwrap_or(false) {
+                    Some(
+                        host.walkthrough
+                            .review_snapshot(&parent, &annotation_document)?
+                            .diff_view,
+                    )
+                } else {
+                    None
+                },
                 source,
                 annotation: change.annotation,
                 source_row: change.row,
@@ -148,13 +162,15 @@ pub(super) async fn route(host: &ForgeRuntime, params: Value) -> Result<Value> {
         WalkthroughRequest::AnnotationSource { document, input } => {
             json!({"source_row": host.walkthrough.annotation_source(&document, input)?})
         }
+        WalkthroughRequest::ReviewInput { document, input } => serde_json::to_value(
+            host.walkthrough
+                .review_input(&document, input, &host.diff)
+                .await?,
+        )?,
         WalkthroughRequest::AnnotationSnapshot {
             document,
             annotation,
-        } => serde_json::to_value(
-            host.walkthrough
-                .annotation_snapshot(&document, &annotation)?,
-        )?,
+        } => serde_json::to_value(host.walkthrough.review_snapshot(&document, &annotation)?)?,
         WalkthroughRequest::AnnotationView {
             document,
             annotation,

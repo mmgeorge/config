@@ -632,6 +632,19 @@ Select `operation = "close"`. The native declaration is in [WalkthroughRequest](
 
 Producer: [nvim/lua/forge/walkthrough.lua:11](../../../../nvim/lua/forge/walkthrough.lua).
 
+## session.document / PresentationRequest / diff_input
+
+Select `operation = "diff_input"` for timeline diff controls. The host validates
+the captured document input and publishes its prepared patches with committed
+options. Actions are `toggle_visibility` and `toggle_presentation`.
+
+| Field | Native type / JSON value | Presence |
+| --- | --- | --- |
+| `operation` | `"diff_input"` | Required discriminator |
+| `input` | `DocumentInput` | Required |
+
+Decoder: [PresentationRequest](../../../rust/forge/crates/forge-harness/src/buffer/session.rs).
+
 ## session.document / PresentationRequest / status_action
 
 Select `operation = "status_action"`. The native declaration is in [PresentationRequest](../../../rust/forge/crates/forge-harness/src/buffer/session.rs).

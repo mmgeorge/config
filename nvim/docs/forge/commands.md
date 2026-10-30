@@ -47,6 +47,33 @@ source for deleted files. Set `status_open_target = "buffer"` in
 `require("forge").setup({ ... })` to open files in the Status window instead.
 The default is `status_open_target = "tab"`.
 
+## Diff controls
+
+Status, branch comparisons, PR and commit reviews, walkthrough review excerpts,
+and saved timeline diffs start with **Full** presentation and **All** visibility.
+The controls apply to the owning document across its windows.
+
+| Key | Control | Values |
+| --- | --- | --- |
+| `ov` | Declaration visibility | All / Public |
+| `ox` | Diff presentation | Full / Semantic |
+
+Configure these keys through `keymaps.diff.toggle_visibility` and
+`keymaps.diff.toggle_presentation`. Harness binds them in the transcript, leaving
+the composer available for editing.
+
+Semantic presentation shows declaration signatures. A `~` marker also identifies
+body-only edits when the signature remains unchanged. A collapsed body shows its
+change count, such as `pub fn update() { … 2 changes }`. Unfold the declaration to
+read its source diff. PlanReview starts in Public visibility and supports Semantic
+presentation only, so it binds `ov` without `ox`. Its unfolded declarations contain
+the saved Change, Algorithm, Calls, Constructs, and Accesses sections.
+
+Public visibility preserves unclassified source changes under an explicit fallback
+label. Unsupported syntax or unavailable historical source cannot silently remove
+those changes. Saved timeline diffs use captured checkpoint sources, and opening
+their source view preserves that historical comparison after worktree edits.
+
 ## Generated commit messages
 
 Automatic About drafts and commit-message regeneration send a compact diff to the
@@ -520,6 +547,10 @@ list. Navigation and test selection retain the full qualified name.
 Names absent from the plan fall back to exact workspace symbol lookup through
 running project language servers. Removed declarations do not fall back to old
 source definitions.
+
+Inside PlanReview, `ov` toggles All/Public declaration visibility. Plan review
+supports Semantic presentation only and does not bind `ox`. Configure visibility
+through `keymaps.diff.toggle_visibility`.
 
 Inside PlanReview, `oc` opens plan-specific check selection. Space toggles a
 check, with `●` for enabled and `○` for disabled. Visual `j` deletes selected

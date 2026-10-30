@@ -12,6 +12,45 @@ The client captures a document ID, revision, view ID, sequence, block, and posit
 
 Width profiles describe the current view rather than persisted content. The caller captures current columns, tab width, variable tab widths, ambiguous-character policy, and explicit cell-width overrides. Resizing a view does not truncate its underlying document.
 
+## Diff view controls
+
+Every source diff starts with `diff_view = { "visibility": "all", "presentation": "full" }`.
+Visibility accepts `all` or `public`. Presentation accepts `full` or `semantic`.
+PlanReview starts Public and supports only Semantic. Its capability rejects a
+presentation toggle and its client exposes only the visibility command.
+
+The native document owns both controls across all attached windows. Clients send
+`toggle_visibility` or `toggle_presentation` through the owning document input
+lifecycle. Timeline uses `session.document` with `operation = "diff_input"` and
+an `input: DocumentInput` payload. Status uses its existing native `input`
+operation. PR, commit, walkthrough, and saved-source documents use their owning
+review or source input operation. Lua maps visibility to `ov` and presentation
+to `ox` through the shared diff keymap group.
+
+Control deliveries publish committed `diff_view` together with the prepared
+body patches. Recovery snapshots carry the same committed options. Clients retain
+their previous usable body during preparation and adopt options only with its
+matching body. Superseded requests cannot publish over a newer control request.
+Non-diff source documents omit the optional `diff_view` field.
+
+Canonical source coordinates remain authoritative for navigation, comments, and
+repository mutations. A semantic heading includes only its selected declaration
+and visibility scope, even when a raw hunk also contains excluded private edits.
+Saved timeline comparisons use captured sources. Missing or inconsistent captured
+evidence produces an explicit raw fallback without reading current worktree bytes.
+
+Source: [forge-diff view state](../../../rust/forge/crates/forge-diff/src/view.rs).
+
+Diff blocks can carry optional `source_anchor` metadata with an opaque `owner`
+scope identifying its owner and exact source pair, with nullable `before` and
+`after` line ranges. Each range is a zero-based,
+half-open `{ "start": number, "end": number }` interval. At least one interval
+must be nonempty. A source row represents one line and a semantic heading
+represents its declaration's complete extent. The buffer restores a removed
+row to the closest source range in the same scope, preferring the narrowest
+containing declaration. These anchors affect cursor and selection restoration
+and grant no repository or comment action.
+
 ## HostInitialize
 
 Decoder source: [nvim/rust/forge/src/router.rs](../../../rust/forge/src/router.rs).

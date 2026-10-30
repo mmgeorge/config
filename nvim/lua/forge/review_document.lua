@@ -142,6 +142,8 @@ finish_close = function(state, dispose)
       or state.save_recovering) then
     state.closing, state.hidden = false, true
     if state.view then state.closed_view = state.view input.close(state.view) state.view = nil end
+    for _, view in pairs(state.window_view or {}) do input.close(view) end
+    state.window_view = nil
     if vim.api.nvim_win_is_valid(state.window) and vim.api.nvim_win_get_buf(state.window) == state.replica.buffer
       and vim.api.nvim_buf_is_valid(state.origin) then vim.api.nvim_win_set_buf(state.window, state.origin) end
     return
@@ -150,6 +152,8 @@ finish_close = function(state, dispose)
   state.active = false
   if state.commands then state.commands.close() state.commands = nil end
   if state.view then input.close(state.view) end
+  for _, view in pairs(state.window_view or {}) do input.close(view) end
+  state.window_view = nil
   if state.group then pcall(vim.api.nvim_del_augroup_by_id, state.group) end
   if state.replica then
     buffer.close(state.replica, { preserve_buffer = state.unloading })
@@ -179,6 +183,7 @@ local function publication_unavailable(state, comment_recovery)
 end
 
 local function settled(state)
+  if M.drain_diff_controls(state) then return end
   if publication_unavailable(state) then return end
   local pending = state.pending_operation
   if pending then
@@ -220,6 +225,18 @@ function M.attach_fold_window(state, window)
   if not state.active or not state.replica or not vim.api.nvim_win_is_valid(window)
     or vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then return end
   require("forge.nodes").attach(state.replica, window)
+  if state.view and window == vim.api.nvim_get_current_win() then
+    state.window_view = state.window_view or { [state.view.window] = state.view }
+    local view = state.window_view[window]
+    if not view or not view.active then
+      view = input.open(state.replica, window, { margin = 0, virtualedit = "", conceal = { level = 2, cursor = "" } })
+      state.window_view[window] = view
+    end
+    if view ~= state.view then
+      state.window, state.view, state.view_ready = window, view, view.ready == true
+      if not state.view_ready then M.resize(state) end
+    end
+  end
   state.fold_initialized = state.fold_initialized or {}
   state.fold_initialized[window] = state.fold_initialized[window] or {}
   for identity in pairs(state.replica.fold and state.replica.fold.record or {}) do
@@ -341,7 +358,14 @@ function M.refresh(state, callback)
       state.refresh_pending = true
       return
     end
+    local retained_view
     if state.local_comment_view then
+      local retained = {}
+      for _, block in ipairs(delivery.snapshot.block) do retained[block.id] = true end
+      local previous = state.replica.preserve_view
+      state.replica.preserve_view = true
+      retained_view = require("forge.buffer_view").capture(state.replica, function(identity) return retained[identity] == true end)
+      state.replica.preserve_view = previous
       require("forge.review_comments").detach(state)
       state.snapshot_required = true
     end
@@ -352,6 +376,7 @@ function M.refresh(state, callback)
       if applied.kind == "Applied" then state.snapshot_required = nil end
     elseif delivery.patch and delivery.patch ~= vim.NIL then applied = buffer.apply_patch(state.replica, delivery.patch)
     elseif delivery.snapshot and delivery.snapshot.revision == state.replica.revision then
+      if delivery.diff_view then state.diff_view = delivery.diff_view if state.commands then state.commands.refresh() end end
       M.sync_editing(state)
       M.sync_dirty(state)
       finish_refresh(state, true)
@@ -367,6 +392,7 @@ function M.refresh(state, callback)
       finish_refresh(state, false)
       return
     end
+    if applied.kind == "Applied" and delivery.diff_view then state.diff_view = delivery.diff_view if state.commands then state.commands.refresh() end end
     if not state.shown and applied.kind == "Applied" then
       vim.bo[state.replica.buffer].buftype = "acwrite"
       state.shown = true
@@ -381,6 +407,7 @@ function M.refresh(state, callback)
       if state.on_open then state.on_open(state) end
     end
     if applied.kind == "Applied" and delivery.comment then require("forge.review_comments").attach(state, delivery) end
+    if applied.kind == "Applied" and retained_view then require("forge.buffer_view").restore(state.replica, retained_view) end
 
     M.sync_editing(state)
     M.sync_dirty(state)
@@ -409,14 +436,17 @@ end
 
 function M.resize(state)
   if not state.active or state.rebinding or not state.view then return end
-  local width = require("forge.width").capture(state.window)
-  request(state, "github.review.document.view.set", { document = state.document, view = state.view.id, width = width }, function(delivery, failure)
+  local view = state.view
+  local width = require("forge.width").capture(view.window)
+  request(state, "github.review.document.view.set", { document = state.document, view = view.id, width = width }, function(delivery, failure)
     if failure then failed(state, failure) return end
     if type(delivery) == "table" and delivery.patch and delivery.patch ~= vim.NIL then
       local applied = buffer.apply_patch(state.replica, delivery.patch)
       if applied.kind ~= "Applied" and applied.kind ~= "Deferred" then failed(state, applied.reason or applied.kind) return end
       if applied.kind == "Deferred" then state.refresh_pending = true end
     end
+    view.ready = true
+    if state.view ~= view then return end
     state.view_ready = true
     M.sync_editing(state)
     settled(state)
@@ -432,17 +462,21 @@ function M.activate(state, action)
   if not vim.deep_equal(pending.cursor, vim.api.nvim_win_get_cursor(state.window)) then return false end
   local captured, failure = input.capture(state.replica, state.view, pending.action or "activate")
   if not captured then if failure then failed(state, failure) end return false end
-  if not captured.target and captured.action ~= "browse" then return false end
+  if not captured.target and captured.action ~= "browse" and not captured.action:match("^toggle_") and not captured.action:match("^source_") then return false end
   state.action_running = true
   request(state, "github.review.document.input.apply", { input = captured, directory = state.directory }, function(delivery, action_failure)
     state.action_running = false
     if action_failure or type(delivery) ~= "table" or type(delivery.patch) ~= "table" then
-      failed(state, action_failure or "Missing native review action delivery") return
+      failed(state, action_failure or "Missing native review action delivery") settled(state) return
     end
     for _, patch in ipairs(delivery.patch) do
       local applied = buffer.apply_patch(state.replica, patch)
       if applied.kind ~= "Applied" and applied.kind ~= "Deferred" then failed(state, applied.reason or applied.kind) return end
       if applied.kind == "Deferred" then state.refresh_pending = true end
+    end
+    if delivery.diff_view and not state.refresh_pending then
+      state.diff_view = delivery.diff_view
+      if state.commands then state.commands.refresh() end
     end
     if delivery.effect and delivery.effect ~= vim.NIL then state.effect_pending = delivery.effect end
     if delivery.comment and delivery.comment ~= vim.NIL then M.focus_comment(state, delivery.comment) end
@@ -459,6 +493,29 @@ function M.activate(state, action)
     end
   end)
   return true
+end
+
+function M.toggle_diff(state, action)
+  if not state.active then return false end
+  state.diff_controls = state.diff_controls or {}
+  state.diff_controls[action] = not state.diff_controls[action]
+  M.drain_diff_controls(state)
+  return true
+end
+
+function M.drain_diff_controls(state)
+  if not state.diff_controls or not state.active or state.closing or state.action_running or state.rendering
+    or state.host_lost or state.rebinding or operation_busy(state) or not state.view_ready or not state.replica
+    or editable.suspend_generated_text(state.replica.editable) then return false end
+  for _, action in ipairs({ "toggle_visibility", "toggle_presentation" }) do
+    if state.diff_controls[action] then
+      state.diff_controls[action] = false
+      if M.activate(state, action) then return true end
+      state.diff_controls[action] = true
+      return false
+    end
+  end
+  return false
 end
 
 ---@param state table
@@ -1083,6 +1140,8 @@ function M.rebind(state, callback)
           if not valid then reject("Replacement review cannot restore every local field") return end
           local retained_buffer, sequence = state.replica.buffer, state.replica.editable.sequence
           if state.view then input.close(state.view) end
+          for _, view in pairs(state.window_view or {}) do input.close(view) end
+          state.window_view = nil
           if state.commands then state.commands.close() state.commands = nil end
           require("forge.review_comments").detach(state)
           buffer.invalidate(state.replica)
@@ -1117,6 +1176,7 @@ function M.rebind(state, callback)
             end
           end
           state.fields, state.save_uncertain = delivery.field or opened.field, opened.uncertain == true
+          state.diff_view = delivery.diff_view or opened.diff_view or state.diff_view
           for _, field in ipairs(state.fields or {}) do
             if field.uncertain then state.save_uncertain = true end
           end
@@ -1217,6 +1277,7 @@ function M.open(options)
     state.document = opened.document
     state.generation = require("forge.client").host_get_generation()
     state.fields = opened.field
+    state.diff_view = opened.diff_view or { visibility = "all", presentation = "full" }
     state.save_uncertain = opened.uncertain == true
     request(state, "github.review.document.header.load", { document = state.document, directory = state.directory }, function(_, header_failure)
     if header_failure then
@@ -1246,6 +1307,8 @@ function M.open(options)
     vim.api.nvim_create_autocmd("BufWriteCmd", { group = state.group, buffer = state.replica.buffer, callback = function() M.save(state) end })
     vim.api.nvim_create_autocmd("BufUnload", { group = state.group, buffer = state.replica.buffer, callback = function() state.unloading = true finish_close(state, true) end })
     vim.api.nvim_create_autocmd("BufWinEnter", { group = state.group, buffer = state.replica.buffer,
+      callback = function() M.attach_fold_window(state, vim.api.nvim_get_current_win()) end })
+    vim.api.nvim_create_autocmd("WinEnter", { group = state.group, buffer = state.replica.buffer,
       callback = function() M.attach_fold_window(state, vim.api.nvim_get_current_win()) end })
     vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter", "InsertEnter", "InsertLeave", "TextChanged", "TextChangedI" }, {
       group = state.group, buffer = state.replica.buffer,
@@ -1288,12 +1351,20 @@ function M.open(options)
       editable = function() return M.editable_region(state) ~= nil end,
       view = batched and "review" or "pr", title = (batched and "Review #" or "PR #") .. tostring(state.number or ""),
       narrow_title = "< #" .. tostring(state.number or ""),
-      changed = function()
+      diff_view = function() return state.diff_view end,
+      changed = function(identity, closed)
         local cursor = vim.api.nvim_win_get_cursor(state.window)
         local location = buffer.locate(state.replica, cursor[1] - 1, cursor[2])
-        if location and location.target then M.activate(state, "expand") end
+        local node = location and state.replica.sequence.node[location.block]
+        local owner = node and node.entry.metadata.content_node
+        if owner and owner ~= vim.NIL and (not identity or owner == identity) then
+          if closed == nil then closed = require("forge.nodes").closed(state.replica, owner) end
+          M.activate(state, closed and "source_collapse" or "source_expand")
+        elseif location and location.target and closed ~= true then M.activate(state, "expand") end
       end,
       handler = {
+        toggle_visibility = function() M.toggle_diff(state, "toggle_visibility") end,
+        toggle_presentation = function() M.toggle_diff(state, "toggle_presentation") end,
         close = function() M.close(state) end,
         refresh = function() M.refresh(state) end,
         open = function() M.activate(state, "open") end,

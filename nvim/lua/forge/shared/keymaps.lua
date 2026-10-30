@@ -126,23 +126,35 @@ function M.render_hintbar(hint, width, options)
   options = options or {}
   local title = options.title or ""
   local total = vim.fn.strdisplaywidth(title) + 2
+  local essential = { help = true, close = true }
   for index, entry in ipairs(hint) do
     total = total + vim.fn.strdisplaywidth(entry.key .. " " .. entry.label) + (index > 1 and 3 or 0)
+    if entry.id == "toggle_visibility" or entry.id == "toggle_presentation" then
+      essential[entry.id], essential.close = true, false
+    end
   end
   local narrow = total > width and type(options.narrow_title) == "string"
   if total > width then title = options.narrow_title or "" end
-  local available = width - vim.fn.strdisplaywidth(title) - (title ~= "" and not narrow and 2 or 0)
+  local available = width - vim.fn.strdisplaywidth(title) - (title ~= "" and (narrow and 1 or 2) or 0)
   local reserved = 0
+  local required, required_count = 0, 0
   for _, entry in ipairs(hint) do
-    if entry.id == "help" or entry.id == "close" then reserved = reserved + vim.fn.strdisplaywidth(entry.key .. " " .. entry.label) + 3 end
+    if essential[entry.id] then
+      local length = vim.fn.strdisplaywidth(entry.key .. " " .. entry.label)
+      reserved = reserved + length + 3
+      required = required + length + (required_count > 0 and 3 or 0)
+      required_count = required_count + 1
+    end
   end
+  if required > available then title, narrow, available = "", true, width end
   local parts = options.inline and {} or { "%#ForgeStatusLabel#", title:gsub("%%", "%%%%"), narrow and "%*" or "%*%<%=" }
+  if not options.inline and narrow and title ~= "" then parts[#parts + 1] = " " end
   local selected = 0
   for _, entry in ipairs(hint) do
     local entry_width = vim.fn.strdisplaywidth(entry.key .. " " .. entry.label)
-    local essential = entry.id == "help" or entry.id == "close"
-    if essential then reserved = reserved - entry_width - 3 end
-    if essential or entry_width + (selected > 0 and 3 or 0) + reserved <= available then
+    local required_entry = essential[entry.id]
+    if required_entry then reserved = reserved - entry_width - 3 end
+    if required_entry or entry_width + (selected > 0 and 3 or 0) + reserved <= available then
       if selected > 0 then parts[#parts + 1] = "%#ForgeStatusHint# | %*" available = available - 3 end
       parts[#parts + 1] = ("%%#ForgeStatusHintKey#%s%%*%%#ForgeStatusHint# %s%%*")
         :format(entry.key:gsub("%%", "%%%%"), entry.label:gsub("%%", "%%%%"))
@@ -174,12 +186,16 @@ function M.view_hint_entries(group, command_set, context, surface)
   for _, command_id in ipairs(command_set.order or {}) do
     local action = command_set.action_by_id[command_id]
     local spec = spec_by_id[command_id]
-    local key = M.view_keys_for(group, command_id)[1]
+    local key = M.view_keys_for(spec and spec.keymap or group, command_id)[1]
     if action and spec and key and (not action.enabled or action.enabled(context)) then
       local label
       if surface then
         if spec.hints and spec.hints[surface] then label = spec.hints[surface](context) end
       elseif spec.pinned then label = spec.label end
+      if label and context.diff_view then
+        if command_id == "toggle_visibility" then label = context.diff_view.visibility == "public" and "Public" or "All"
+        elseif command_id == "toggle_presentation" then label = context.diff_view.presentation == "semantic" and "Semantic" or "Full" end
+      end
       if label then segments[#segments + 1] = { id = command_id, key = key, label = label } end
     end
   end
@@ -231,10 +247,13 @@ function M.apply_view_winbar(win, title, group, command_set, status, context, ri
       :format(left, center, rendered_right, hint)
     return
   end
-  local help_action = command_set.action_by_id.help
-  local help_key = help_action and M.view_keys_for(group, "help")[1] or nil
-  local help_hint = help_key and M.render_hintbar({ { id = "help", key = help_key, label = "help" } },
-    vim.api.nvim_win_get_width(win), { inline = true }) or ""
+  local compact_hint = {}
+  for _, entry in ipairs(M.view_hint_entries(group, command_set, context)) do
+    if entry.id == "help" or entry.id == "toggle_visibility" or entry.id == "toggle_presentation" then
+      compact_hint[#compact_hint + 1] = entry
+    end
+  end
+  local help_hint = M.render_hintbar(compact_hint, vim.api.nvim_win_get_width(win), { inline = true })
   local compact_content = right_status_rendered
   if help_hint ~= "" then
     if compact_content ~= "" then compact_content = compact_content .. separator end

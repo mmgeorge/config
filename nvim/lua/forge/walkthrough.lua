@@ -6,7 +6,11 @@ local serial = 0
 local function request(state, params, callback)
   state.queue[#state.queue + 1] = { params = params, callback = callback }
   local function pump()
-    if state.pending or #state.queue == 0 then return end
+    if state.pending then return end
+    if #state.queue == 0 then
+      for _, owner in ipairs(state.source or {}) do if owner.flush_review then owner.flush_review() end end
+      return
+    end
     local item = table.remove(state.queue, 1)
     if not state.active and item.params.operation ~= "close" then pump() return end
     state.pending = true
@@ -172,6 +176,62 @@ function M.open_change(state)
       require("forge.source_document").demand(owner.source)
     end)
   end
+  function owner.toggle_review(action)
+    owner.review_toggle = owner.review_toggle or {}
+    owner.review_toggle[action] = not owner.review_toggle[action]
+    owner.flush_review()
+  end
+  function owner.flush_review()
+    if not owner.active or not owner.annotation or owner.annotation.status ~= "Applied" or state.pending or #state.queue > 0 then return end
+    local window = vim.api.nvim_get_current_win()
+    if vim.api.nvim_win_get_buf(window) ~= owner.annotation.buffer then window = vim.fn.win_findbuf(owner.annotation.buffer)[1] end
+    local view = window and owner.annotation_view[window]
+    if not view then return end
+    local action, location
+    for _, candidate in ipairs({ "toggle_visibility", "toggle_presentation" }) do
+      if owner.review_toggle and owner.review_toggle[candidate] then owner.review_toggle[candidate] = nil action = candidate break end
+    end
+    if not action then
+      for identity, expanded in pairs(owner.review_section or {}) do
+        owner.review_section[identity] = nil
+        local native = owner.annotation.projection and owner.annotation.projection.source or owner.annotation
+        local node = native.sequence.node[identity]
+        if node then
+          action = expanded and "source_expand" or "source_collapse"
+          location = { block = identity, position = { row = 0, column = 0 }, target = node.entry.metadata.target[1] and node.entry.metadata.target[1].id }
+          break
+        end
+      end
+    end
+    if not action then
+      local extent = vim.api.nvim_win_call(window, function() return { vim.fn.line("w0"), vim.fn.line("w$") + vim.api.nvim_win_get_height(window) } end)
+      for row = extent[1], math.min(extent[2], owner.annotation.row_count) do
+        local candidate = buffer.locate(owner.annotation, row - 1, 0)
+        if candidate and candidate.block:match(":more$") then action, location = "demand", candidate break end
+      end
+    end
+    if not action then return end
+    local captured_review, failure = input.capture(owner.annotation, view, action)
+    if not captured_review then state.notice(failure) return end
+    if location then
+      captured_review.block = location.block
+      captured_review.position = require("forge.node_projection").source_position(owner.annotation, location.block, location.position)
+      captured_review.target = location.target
+    end
+    request(state, { operation = "review_input", document = state.document, input = captured_review }, function(delivery, failure)
+      if failure then state.notice(failure)
+      elseif owner.active and delivery then
+        local applied = delivery.patch == vim.NIL or not delivery.patch or buffer.apply_patch(owner.annotation, delivery.patch)
+        if applied == true or type(applied) == "table" and applied.kind == "Applied" then
+          owner.diff_view = delivery.diff_view
+          if owner.annotation_commands then owner.annotation_commands.refresh() end
+        end
+      end
+    end)
+  end
+  vim.api.nvim_create_autocmd({ "CursorMoved", "WinScrolled" }, { group = owner.group, callback = function()
+    if owner.annotation and vim.api.nvim_get_current_buf() == owner.annotation.buffer then owner.flush_review() end
+  end })
   owner.source = require("forge.source_document").open_walkthrough({ workspace = state.workspace, window = source_window,
     input = captured, annotation_document = annotation_id, review = true,
     is_current = function()
@@ -190,13 +250,18 @@ function M.open_change(state)
       owner.show_review()
       vim.api.nvim_set_current_win(owner.window)
     end,
-    on_annotation = function(snapshot, _, review)
+    on_annotation = function(snapshot, _, review, diff_view)
       if not owner.active or not current(state, view, captured) then return end
       if review ~= true then owner.close() state.notice("Missing Walkthrough review projection") return end
-      owner.annotation = buffer.open(annotation_id, { notice = state.notice, recover = function()
+      owner.diff_view = diff_view and diff_view ~= vim.NIL and diff_view or { presentation = "full", visibility = "all" }
+      owner.annotation = buffer.open(annotation_id, { preserve_view = true, notice = state.notice, recover = function()
         request(state, { operation = "annotation_snapshot", document = state.document, annotation = annotation_id }, function(snapshot, failure)
           if failure then state.notice(failure)
-          elseif owner.active and snapshot then buffer.apply_snapshot(owner.annotation, snapshot) end
+          elseif owner.active and snapshot then
+            local applied = buffer.apply_snapshot(owner.annotation, snapshot)
+            if applied and applied.kind == "Applied" and snapshot.diff_view then owner.diff_view = snapshot.diff_view end
+            if owner.annotation_commands then owner.annotation_commands.refresh() end
+          end
         end)
       end })
       buffer.apply_snapshot(owner.annotation, snapshot)
@@ -204,7 +269,22 @@ function M.open_change(state)
       vim.bo[owner.annotation.buffer].readonly = true
       vim.api.nvim_buf_set_name(owner.annotation.buffer, owner.annotation_name)
       owner.annotation_commands = require("forge.document_commands").attach(owner.annotation, { view = "diff", title = "Walkthrough review",
-        handler = { close = owner.close, open = owner.open_source } })
+        diff_view = function() return owner.diff_view end,
+        changed = function(identity, closed)
+          if not identity then
+            local cursor = vim.api.nvim_win_get_cursor(0)
+            local location = buffer.locate(owner.annotation, cursor[1] - 1, cursor[2])
+            local node = location and owner.annotation.sequence.node[location.block]
+            identity = node and node.entry.metadata.content_node
+          end
+          if not identity or identity == vim.NIL then return end
+          owner.review_section = owner.review_section or {}
+          owner.review_section[identity] = not (closed == nil and require("forge.nodes").closed(owner.annotation, identity) or closed)
+          owner.flush_review()
+        end,
+        handler = { close = owner.close, open = owner.open_source,
+          toggle_visibility = function() owner.toggle_review("toggle_visibility") end,
+          toggle_presentation = function() owner.toggle_review("toggle_presentation") end } })
       vim.api.nvim_create_autocmd("BufWipeout", { group = owner.group, buffer = owner.annotation.buffer,
         callback = function() vim.schedule(owner.close) end })
       vim.api.nvim_create_autocmd({ "BufWinEnter", "BufWinLeave" }, { group = owner.group, buffer = owner.annotation.buffer,

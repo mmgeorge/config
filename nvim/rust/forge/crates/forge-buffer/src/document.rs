@@ -182,9 +182,10 @@ impl BufferDocument {
         block: Vec<BufferBlock>,
     ) -> Result<Option<BufferPatch>, ContractError> {
         let incoming: HashMap<_, _> = block.iter().map(|block| (&block.id, block)).collect();
-        let last = block
-            .last()
-            .ok_or(ContractError("subtree replacement requires an anchor"))?;
+        let last = block.last().or_else(|| {
+            let previous = range.start.checked_sub(1)?;
+            self.sequence.range(previous..previous + 1).ok()?.next()
+        });
         let mut owners = HashMap::new();
         for (offset, removed) in self.sequence.range(range.clone())?.enumerate() {
             for owner in self.sequence.fold_endpoint_owner(&removed.id) {
@@ -210,6 +211,8 @@ impl BufferDocument {
                             fold.end.position.row = retained.text.row_count();
                         }
                     } else {
+                        let last =
+                            last.ok_or(ContractError("fold endpoint has no retained anchor"))?;
                         fold.end = crate::block::BlockAnchor {
                             block: last.id.clone(),
                             position: crate::block::TextPosition {
@@ -232,7 +235,36 @@ impl BufferDocument {
                 )
             })
             .collect::<Vec<_>>();
-        edits.push(SequenceEdit { range, block });
+        let previous = self
+            .sequence
+            .range(range.clone())?
+            .enumerate()
+            .map(|(offset, block)| (&block.id, (range.start + offset, block)))
+            .collect::<HashMap<_, _>>();
+        let mut old_start = range.start;
+        let mut new_start = 0;
+        for (new_index, replacement) in block.iter().enumerate() {
+            let Some(&(old_index, original)) = previous.get(&replacement.id) else {
+                continue;
+            };
+            if old_index < old_start || original != replacement {
+                continue;
+            }
+            if old_index != old_start || new_index != new_start {
+                edits.push(SequenceEdit {
+                    range: old_start..old_index,
+                    block: block[new_start..new_index].to_vec(),
+                });
+            }
+            old_start = old_index + 1;
+            new_start = new_index + 1;
+        }
+        if old_start != range.end || new_start != block.len() {
+            edits.push(SequenceEdit {
+                range: old_start..range.end,
+                block: block[new_start..].to_vec(),
+            });
+        }
         self.edit_many(edits)
     }
 

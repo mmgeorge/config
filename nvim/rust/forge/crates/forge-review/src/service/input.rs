@@ -9,6 +9,8 @@ use crate::review::ReviewDocument;
 
 #[derive(Debug, serde::Serialize)]
 pub struct ReviewActionDelivery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
     pub patch: Vec<forge_buffer::patch::BufferPatch>,
     pub effect: Option<ReviewActionEffect>,
     pub diagnostic: Option<String>,
@@ -59,6 +61,10 @@ impl ReviewService {
                     | "open"
                     | "browse"
                     | "expand"
+                    | "toggle_visibility"
+                    | "toggle_presentation"
+                    | "source_expand"
+                    | "source_collapse"
                     | "lifecycle:draft"
                     | "lifecycle:open"
                     | "lifecycle:closed"
@@ -73,11 +79,13 @@ impl ReviewService {
             .expect("review document poisoned")
             .capture_input(&input)?;
         if input.action == "open"
-            && let ReviewTarget::FileDiff { path } = &target
+            && let ReviewTarget::FileDiff { path } | ReviewTarget::SourceSection { path, .. } =
+                &target
         {
             target = ReviewTarget::WorkspaceFile { path: path.clone() };
         }
         let mut delivery = ReviewActionDelivery {
+            diff_view: None,
             patch: Vec::new(),
             effect: None,
             diagnostic: None,
@@ -93,12 +101,55 @@ impl ReviewService {
         if input.action == "expand"
             && !matches!(
                 target,
-                ReviewTarget::FileDiff { .. } | ReviewTarget::CommitDiff { .. }
+                ReviewTarget::FileDiff { .. }
+                    | ReviewTarget::CommitDiff { .. }
+                    | ReviewTarget::FileMore { .. }
+                    | ReviewTarget::SourceSection { .. }
+                    | ReviewTarget::CommitSource { .. }
             )
         {
             return Ok(delivery);
         }
         match target {
+            ReviewTarget::DiffView { action } => {
+                let changed = self.change_diff_view(&input.document, action).await?;
+                delivery.patch = changed.patch;
+                delivery.diff_view = changed.options;
+            }
+            ReviewTarget::SourceSection { path, identity } => {
+                let result = self
+                    .change_file_view(
+                        &input.document,
+                        path,
+                        super::file::FileViewChange::Declaration {
+                            identity,
+                            expanded: input.action != "source_collapse",
+                        },
+                    )
+                    .await?;
+                if let Some(patch) = result.patch {
+                    delivery.patch.push(patch);
+                }
+            }
+            ReviewTarget::CommitSource {
+                commit,
+                path,
+                declaration,
+            } => {
+                let change = match declaration {
+                    Some(identity) => super::file::FileViewChange::Declaration {
+                        identity,
+                        expanded: input.action != "source_collapse",
+                    },
+                    None => super::file::FileViewChange::Continuation,
+                };
+                if let Some(patch) = self
+                    .change_commit_source(&input.document, commit, path, change)
+                    .await?
+                {
+                    delivery.patch.push(patch);
+                }
+            }
             ReviewTarget::Lifecycle { available } => {
                 if matches!(input.action.as_str(), "activate" | "open") {
                     delivery.choice = Some(available.into_iter().map(lifecycle_choice).collect());
@@ -131,6 +182,11 @@ impl ReviewService {
                     level: Some(level),
                 });
                 delivery.refresh = true;
+            }
+            ReviewTarget::FileMore { path } => {
+                if let Some(patch) = self.read_file_more(&input.document, path).await?.patch {
+                    delivery.patch.push(patch);
+                }
             }
             ReviewTarget::FileDiff { path } => {
                 let result = self
@@ -404,6 +460,43 @@ impl ReviewDocument {
             row.is_char_boundary(input.position.column),
             "review input byte position is invalid"
         );
+        if matches!(
+            input.action.as_str(),
+            "toggle_visibility" | "toggle_presentation"
+        ) {
+            self.input.insert(input.view.clone(), input.sequence);
+            return Ok(ReviewTarget::DiffView {
+                action: if input.action == "toggle_visibility" {
+                    forge_diff::view::DiffViewAction::ToggleVisibility
+                } else {
+                    forge_diff::view::DiffViewAction::TogglePresentation
+                },
+            });
+        }
+        if matches!(input.action.as_str(), "source_expand" | "source_collapse") {
+            let owner = block
+                .metadata
+                .content_node
+                .as_ref()
+                .context("review source section is missing")?;
+            let target = self
+                .projection_target
+                .get(&forge_buffer::identity::TargetId(owner.0.clone()))
+                .filter(|target| {
+                    matches!(
+                        target,
+                        ReviewTarget::SourceSection { .. }
+                            | ReviewTarget::CommitSource {
+                                declaration: Some(_),
+                                ..
+                            }
+                    )
+                })
+                .cloned()
+                .context("review source section is no longer retained")?;
+            self.input.insert(input.view.clone(), input.sequence);
+            return Ok(target);
+        }
         if input.action == "browse" {
             let selected = if let Some(target) = &input.target {
                 ensure!(
@@ -488,11 +581,15 @@ impl ReviewDocument {
                 );
             }
             ReviewTarget::FileDiff { .. }
+            | ReviewTarget::FileMore { .. }
             | ReviewTarget::WorkspaceFile { .. }
             | ReviewTarget::CommitMessage { .. }
             | ReviewTarget::CommitDiff { .. }
             | ReviewTarget::InlineComment { .. }
             | ReviewTarget::Lifecycle { .. }
+            | ReviewTarget::DiffView { .. }
+            | ReviewTarget::SourceSection { .. }
+            | ReviewTarget::CommitSource { .. }
             | ReviewTarget::Browser { .. } => {}
         }
         self.input.insert(input.view.clone(), input.sequence);

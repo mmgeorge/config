@@ -6,9 +6,7 @@ use forge_buffer::{
     identity::{BlockId, DocumentId, DocumentRevision, InputSequence, TargetId, ViewId},
     text::BufferText,
 };
-use forge_diff::{
-    cache::AnalysisHandle, display::DisplayCursor, raw::RawHunkId, syntax::SyntaxHandle,
-};
+use forge_diff::{cache::AnalysisHandle, raw::RawHunkId, syntax::SyntaxHandle};
 use forge_git::{
     repository::RepositoryState,
     snapshot::{
@@ -23,6 +21,7 @@ pub(crate) use forge_buffer::admission::{DocumentAdmission, DocumentAdmissionSto
 pub(crate) struct StatusDocument {
     pub id: DocumentId,
     pub revision: DocumentRevision,
+    pub diff_view: forge_diff::view::DiffViewState,
     pub repository: Arc<RepositoryState>,
     pub observed_head: HeadState,
     pub file: HashMap<TargetId, FileTarget>,
@@ -41,9 +40,11 @@ pub(crate) struct StatusDocument {
     pub pending: Vec<u64>,
 }
 
+#[derive(Clone)]
 pub(crate) struct HunkTarget {
     pub file: TargetId,
     pub raw: Vec<RawHunkId>,
+    pub declaration: Option<String>,
 }
 
 #[derive(Clone)]
@@ -62,11 +63,13 @@ pub(crate) struct FileTarget {
     pub stamp: WorktreeStamp,
     pub origin_stamp: Option<WorktreeStamp>,
     pub retained_bytes: usize,
+    pub source_statistics: Option<forge_git::snapshot::LineStats>,
     pub section: StatusSection,
     pub hunk: HashMap<RawHunkId, TargetId>,
     pub group: HashMap<usize, DisplayGroupTarget>,
     pub source_row: HashMap<BlockId, Vec<Option<forge_diff::source::SourceCoordinate>>>,
     pub projection: SourceProjection,
+    pub source_view: Option<forge_diff::source_projection::SourceDiffProjection>,
     pub old_syntax: Option<SyntaxHandle>,
     pub new_syntax: Option<SyntaxHandle>,
     pub projected: Option<crate::mutation::ProjectedIndex>,
@@ -78,7 +81,6 @@ pub(crate) enum SourceProjection {
     Loading(Arc<AtomicBool>),
     Loaded {
         analysis: AnalysisHandle,
-        cursor: Box<DisplayCursor>,
         complete: bool,
     },
     Unavailable(String),
@@ -106,13 +108,6 @@ impl SourceProjection {
         }
     }
 
-    pub fn cursor(&self) -> Option<&DisplayCursor> {
-        match self {
-            Self::Loaded { cursor, .. } => Some(cursor),
-            _ => None,
-        }
-    }
-
     pub fn loading(&self) -> Option<&Arc<AtomicBool>> {
         match self {
             Self::Loading(active) => Some(active),
@@ -120,16 +115,24 @@ impl SourceProjection {
         }
     }
 
-    pub fn loaded(analysis: AnalysisHandle, cursor: DisplayCursor) -> Self {
+    pub fn loaded(analysis: AnalysisHandle) -> Self {
         Self::Loaded {
             analysis,
-            cursor: Box::new(cursor),
             complete: false,
         }
     }
 }
 
 impl FileTarget {
+    pub(crate) fn retain_statistics(&mut self, statistics: forge_git::snapshot::LineStats) {
+        self.source_statistics = Some(statistics);
+        if self.section == StatusSection::Staged {
+            self.record.staged_stats = statistics;
+        } else {
+            self.record.unstaged_stats = statistics;
+        }
+    }
+
     pub fn body_mut(&mut self) -> Result<&mut BufferDocument> {
         match &mut self.body {
             Some(body) => Ok(body),
@@ -291,6 +294,10 @@ impl StatusDocument {
         Ok(Self {
             id,
             revision: DocumentRevision(0),
+            diff_view: forge_diff::view::DiffViewState::new(
+                forge_diff::view::DiffCapabilities::Source,
+                forge_diff::view::DiffVisibility::All,
+            ),
             repository,
             observed_head,
             file,
@@ -376,6 +383,7 @@ impl StatusDocument {
             document: self.id.clone(),
             revision: self.revision,
             view,
+            diff_view: self.diff_view.committed(),
             head,
             context: self.context.clone(),
             section,
@@ -498,9 +506,11 @@ pub(crate) fn inventory(
                     stamp: observed.worktree.clone(),
                     origin_stamp: observed.origin.clone(),
                     retained_bytes: 0,
+                    source_statistics: None,
                     notice_delivered: false,
                     source_row: HashMap::new(),
                     projection: SourceProjection::Deferred,
+                    source_view: None,
                     hunk: HashMap::new(),
                     group: HashMap::new(),
                     section,

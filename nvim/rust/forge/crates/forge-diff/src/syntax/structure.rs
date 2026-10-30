@@ -5,6 +5,16 @@ use super::{SyntaxHandle, SyntaxLanguage};
 /// One declaration in an exact source snapshot. Coordinates count Unicode code points from one.
 #[derive(Clone, Debug)]
 pub struct SourceDeclaration {
+    /// Exact UTF-8 byte extent, including attached documentation and attributes.
+    pub source_bytes: std::ops::Range<usize>,
+    /// Signature bytes before the executable body or initializer.
+    pub signature_bytes: std::ops::Range<usize>,
+    /// Body or initializer bytes, including delimiters belonging to this declaration.
+    pub detail_bytes: std::ops::Range<usize>,
+    /// Native syntax identifies a function or a binding whose value is a function.
+    pub callable: bool,
+    /// False when parser recovery leaves malformed or missing syntax in this declaration.
+    pub syntax_valid: bool,
     pub name: String,
     pub kind: String,
     pub signature: String,
@@ -33,6 +43,13 @@ impl SyntaxHandle {
                 None,
                 &mut declaration,
             );
+        }
+        for entry in &mut declaration {
+            if entry.start_line < entry.range_start_line {
+                let start = self.0.line[entry.start_line - 1];
+                entry.source_bytes.start = start;
+                entry.signature_bytes.start = start;
+            }
         }
         declaration
     }
@@ -172,11 +189,12 @@ fn visit(
                 .rfind('\n')
                 .map_or(0, |index| index + 1);
             let column = source[line_start..name_node.start_byte()].chars().count() + 1;
-            let mut start_line = node.start_position().row + 1;
-            for previous in source[..node.start_byte()]
+            let source_owner = super::outline::declaration_owner(node);
+            let mut start_line = source_owner.start_position().row + 1;
+            for previous in source[..source_owner.start_byte()]
                 .lines()
                 .rev()
-                .skip(usize::from(node.start_position().column > 0))
+                .skip(usize::from(source_owner.start_position().column > 0))
             {
                 let previous = previous.trim();
                 if previous.starts_with("///")
@@ -193,7 +211,25 @@ fn visit(
                 }
             }
             owner = Some(result.len());
+            let callable = matches!(
+                kind,
+                "function_item"
+                    | "function_signature_item"
+                    | "function_declaration"
+                    | "generator_function_declaration"
+                    | "method_definition"
+                    | "method_signature"
+                    | "abstract_method_signature"
+            ) || node.child_by_field_name("value").is_some_and(|value| {
+                matches!(value.kind(), "arrow_function" | "function_expression")
+            }) || language == SyntaxLanguage::Lua
+                && lua_value(node).is_some_and(|value| value.kind() == "function_definition");
             result.push(SourceDeclaration {
+                source_bytes: source_owner.byte_range(),
+                signature_bytes: source_owner.start_byte()..end,
+                detail_bytes: end..source_owner.end_byte(),
+                callable,
+                syntax_valid: !source_owner.has_error() && !source_owner.is_missing(),
                 name,
                 kind: kind.into(),
                 signature,

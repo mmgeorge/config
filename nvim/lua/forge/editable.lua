@@ -183,6 +183,7 @@ function M.saved_capture(state, captured)
   for _, entry in pairs(state.region) do
     if entry.pending then state.suspended = true end
   end
+  if state.native and state.native.restored then state.native.restored() end
 end
 
 local function native_fault(state, message)

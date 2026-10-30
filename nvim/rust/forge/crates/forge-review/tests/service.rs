@@ -18,6 +18,8 @@ use forge_review::service::ReviewService;
 use tokio::sync::Semaphore;
 
 struct TestRemote {
+    commit_detail: Mutex<Option<forge_github::review_source::ReviewCommitDetail>>,
+    immutable_content: Mutex<std::collections::BTreeMap<(String, String), Vec<u8>>>,
     section_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     source_content: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
     source_request: Mutex<Vec<forge_github::review_source::ReviewSourceRequest>>,
@@ -127,6 +129,8 @@ impl GithubRemote for TestRemote {
 
 fn remote() -> Arc<TestRemote> {
     Arc::new(TestRemote {
+        commit_detail: Mutex::new(None),
+        immutable_content: Mutex::new(Default::default()),
         section_barrier: Mutex::new(None),
         source_content: Mutex::new(None),
         source_request: Mutex::new(Vec::new()),
@@ -157,6 +161,28 @@ fn remote() -> Arc<TestRemote> {
 }
 
 impl forge_github::review_api::GithubReviewRemote for TestRemote {
+    fn read_commit_detail(
+        &self,
+        request: forge_github::review_source::ReviewCommitDetailRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<forge_github::review_source::ReviewCommitDetail, RemoteFailure>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let detail = self
+                .commit_detail
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("unexpected commit detail read");
+            assert_eq!(detail.commit, request.commit);
+            Ok(detail)
+        })
+    }
     fn read_comparison(
         &self,
         request: forge_github::review_source::ReviewComparisonRequest,
@@ -190,27 +216,35 @@ impl forge_github::review_api::GithubReviewRemote for TestRemote {
             self.source_request.lock().unwrap().push(request.clone());
             let old = request.commit == "c".repeat(40);
             Ok(forge_github::review_source::ReviewSource {
-                request,
-                blob: Some(if old { "d".repeat(40) } else { "e".repeat(40) }),
-                bytes: self
-                    .source_content
+                bytes: if let Some(bytes) = self
+                    .immutable_content
                     .lock()
                     .unwrap()
-                    .as_ref()
-                    .map(|(previous, current)| {
-                        if old {
-                            previous.clone()
-                        } else {
-                            current.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        if old {
-                            b"fn old() {}\r\n".to_vec()
-                        } else {
-                            b"fn new() {}\n".to_vec()
-                        }
-                    }),
+                    .get(&(request.commit.clone(), request.path.clone()))
+                {
+                    bytes.clone()
+                } else {
+                    self.source_content
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|(previous, current)| {
+                            if old {
+                                previous.clone()
+                            } else {
+                                current.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            if old {
+                                b"fn old() {}\r\n".to_vec()
+                            } else {
+                                b"fn new() {}\n".to_vec()
+                            }
+                        })
+                },
+                request,
+                blob: Some(if old { "d".repeat(40) } else { "e".repeat(40) }),
             })
         })
     }
@@ -1342,6 +1376,190 @@ async fn pull_request_sections_keep_legacy_order_and_open_description_fold() {
 }
 
 #[tokio::test]
+async fn file_diff_controls_share_visibility_and_preserve_lazy_source_actions() {
+    use forge_buffer::{
+        block::TextPosition,
+        identity::{InputSequence, ViewId},
+        input::DocumentInput,
+    };
+    use forge_diff::{
+        cache::CacheLimits,
+        engine::DiffEngine,
+        syntax::SyntaxEngine,
+        view::{DiffPresentation, DiffVisibility},
+    };
+    use forge_github::review_api::ReviewPage;
+    use forge_review::service::ReviewSectionKind;
+    let remote = remote();
+    *remote.source_content.lock().unwrap() = Some((
+        b"pub fn visible() {\n    previous();\n}\nfn hidden() {\n    old_private();\n}\n".to_vec(),
+        b"pub fn visible() {\n    updated();\n}\nfn hidden() {\n    new_private();\n}\n".to_vec(),
+    ));
+    remote.section_page.lock().unwrap().extend([
+        ReviewPage { records: vec![serde_json::json!({"number":7,"node_id":"PR_test","title":"Initial title", "state":"open", "html_url":"https://example.invalid/owner/repo/pull/7",
+            "base":{"sha":"a".repeat(40)},"head":{"sha":"b".repeat(40),"repo":{"full_name":"fork/project"}}})], next_cursor: None, complete:true },
+        ReviewPage { records: vec![serde_json::json!({"filename":"source.rs","status":"modified","sha":"e".repeat(40),"additions":2,"deletions":2})], next_cursor:None, complete:true },
+    ]);
+    let diff = DiffEngine::new(CacheLimits::default(), 2);
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
+    let service = ReviewService::with_engines(github(&remote), diff, syntax);
+    let opened = service.open_pr(remote.clone(), target()).await.unwrap();
+    let directory = remote.recovery.path().to_path_buf();
+    for section in [ReviewSectionKind::Overview, ReviewSectionKind::Files] {
+        service
+            .read_section(
+                &opened.document,
+                directory.clone(),
+                remote.clone(),
+                section,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    service
+        .materialize(&opened.document, Default::default())
+        .await
+        .unwrap();
+    service
+        .read_file(
+            &opened.document,
+            directory.clone(),
+            remote.clone(),
+            "source.rs".into(),
+        )
+        .await
+        .unwrap();
+    let view = ViewId("semantic-file-controls".into());
+    service
+        .view(&opened.document, view.clone(), Default::default())
+        .await
+        .unwrap();
+    let mut frame = service
+        .materialize(&opened.document, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(frame.diff_view.visibility, DiffVisibility::All);
+    assert_eq!(frame.diff_view.presentation, DiffPresentation::Full);
+    assert!(
+        frame
+            .snapshot
+            .block
+            .iter()
+            .any(|block| block.text.row(0) == Some("    new_private();"))
+    );
+    let initial = serde_json::to_value(&frame).unwrap();
+    let mut transition = Vec::new();
+    let acquired = remote.source_request.lock().unwrap().len();
+    for (sequence, action) in [
+        "toggle_presentation",
+        "source_expand",
+        "toggle_visibility",
+        "toggle_presentation",
+        "toggle_visibility",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let selected = if action == "source_expand" {
+            frame
+                .snapshot
+                .block
+                .iter()
+                .find(|block| block.text.row(0) == Some("pub fn visible() {"))
+                .unwrap()
+        } else {
+            &frame.snapshot.block[0]
+        };
+        let delivery = service
+            .act(
+                DocumentInput {
+                    document: opened.document.clone(),
+                    revision: frame.snapshot.revision,
+                    view: view.clone(),
+                    sequence: InputSequence(sequence as u64 + 1),
+                    action: action.into(),
+                    block: selected.id.clone(),
+                    position: TextPosition { row: 0, column: 0 },
+                    target: None,
+                },
+                directory.clone(),
+            )
+            .await
+            .unwrap();
+        for patch in &delivery.patch {
+            patch.validate().unwrap();
+        }
+        frame = service
+            .materialize(&opened.document, Default::default())
+            .await
+            .unwrap();
+        transition.push(serde_json::json!({"action":action,"delivery":delivery,"expected":frame}));
+        let contains = |text: &str| {
+            frame
+                .snapshot
+                .block
+                .iter()
+                .any(|block| block.text.wire_rows().iter().any(|row| row.contains(text)))
+        };
+        match sequence {
+            0 => {
+                assert_eq!(frame.diff_view.presentation, DiffPresentation::Semantic);
+                assert!(!contains("updated()") && !contains("new_private()"));
+                let heading = frame
+                    .snapshot
+                    .block
+                    .iter()
+                    .find(|block| block.text.row(0) == Some("pub fn visible() {"))
+                    .unwrap();
+                assert_eq!(
+                    heading.metadata.fold[0].collapsed_suffix.as_deref(),
+                    Some(" … 1 change }")
+                );
+                assert!(
+                    heading
+                        .metadata
+                        .gutter
+                        .iter()
+                        .any(|gutter| gutter.chunk.iter().any(|chunk| chunk.text.contains('~')))
+                );
+            }
+            1 => {
+                assert!(contains("updated()") && !contains("new_private()"));
+                let added = frame
+                    .snapshot
+                    .block
+                    .iter()
+                    .find(|block| block.text.row(0) == Some("    updated();"))
+                    .unwrap();
+                assert!(!added.metadata.target.is_empty());
+            }
+            2 => {
+                assert_eq!(frame.diff_view.visibility, DiffVisibility::Public);
+                assert!(contains("updated()") && !contains("hidden"));
+            }
+            3 => {
+                assert_eq!(frame.diff_view.presentation, DiffPresentation::Full);
+                assert_eq!(frame.diff_view.visibility, DiffVisibility::Public);
+                assert!(contains("updated()") && !contains("new_private()"));
+            }
+            4 => assert!(contains("updated()") && contains("new_private()")),
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(remote.source_request.lock().unwrap().len(), acquired);
+    assert!(remote.writes.lock().unwrap().is_empty());
+    assert!(remote.inline_creation.lock().unwrap().is_empty());
+    std::fs::write(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/review-semantic-fixture.json"),
+        serde_json::to_vec(&serde_json::json!({"initial":initial,"transition":transition}))
+            .unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
 async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
     use forge_diff::{cache::CacheLimits, engine::DiffEngine, syntax::SyntaxEngine};
     use forge_github::review_api::ReviewPage;
@@ -1445,7 +1663,7 @@ async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
             forge_buffer::input::DocumentInput {
                 document: opened.document.clone(),
                 revision: initial.snapshot.revision,
-                view,
+                view: view.clone(),
                 sequence: forge_buffer::identity::InputSequence(1),
                 action: "activate".into(),
                 block: status.id.clone(),
@@ -1471,7 +1689,7 @@ async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
     let first = service
         .read_file(
             &opened.document,
-            directory,
+            directory.clone(),
             remote.clone(),
             "notes.txt".into(),
         )
@@ -1492,16 +1710,48 @@ async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
     let mut more = true;
     let mut batches = 0;
     while more {
-        let delivered = service
-            .read_file_more(&opened.document, "notes.txt".into())
+        let frame = service
+            .materialize(&opened.document, Default::default())
             .await
             .unwrap();
-        let patch = delivered.patch.as_ref().unwrap();
+        assert!(frame.patch.is_none());
+        let selected = frame
+            .snapshot
+            .block
+            .iter()
+            .find(|block| block.id.0.ends_with(":more"))
+            .unwrap();
+        let delivered = service
+            .act(
+                forge_buffer::input::DocumentInput {
+                    document: opened.document.clone(),
+                    revision: frame.snapshot.revision,
+                    view: view.clone(),
+                    sequence: forge_buffer::identity::InputSequence(batches + 2),
+                    action: "activate".into(),
+                    block: selected.id.clone(),
+                    position: forge_buffer::block::TextPosition { row: 0, column: 0 },
+                    target: Some(selected.metadata.target[0].id.clone()),
+                },
+                directory.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delivered.patch.len(), 1);
+        let patch = &delivered.patch[0];
         assert_eq!(patch.base, revision);
         revision = patch.next;
         patch.validate().unwrap();
         continuation.push(serde_json::to_value(patch).unwrap());
-        more = delivered.more;
+        let frame = service
+            .materialize(&opened.document, Default::default())
+            .await
+            .unwrap();
+        more = frame
+            .snapshot
+            .block
+            .iter()
+            .any(|block| block.id.0.ends_with(":more"));
         batches += 1;
         assert!(batches <= 3);
     }
@@ -4941,6 +5191,10 @@ async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_u
         "native file action did not publish a diff patch"
     );
     let file_patch = &diff.patch[0];
+    let rendered = service
+        .materialize(&opened.document, WidthProfile::default())
+        .await
+        .unwrap();
     let inline = file_patch
         .metadata_edit
         .iter()
@@ -4948,7 +5202,7 @@ async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_u
             edit.metadata
                 .target
                 .iter()
-                .find(|target| target.id.0.contains(":inline:"))
+                .find(|target| rendered.inline_anchor.contains_key(&target.id))
                 .map(|target| (edit.block.clone(), target.id.clone()))
         })
         .expect("changed native diff row has an inline comment target");
@@ -5502,4 +5756,420 @@ async fn dropped_save_receiver_keeps_the_queued_reviewer_change() {
     .unwrap();
     assert_eq!(remote.reviewer_writes.lock().unwrap().len(), 1);
     service.close();
+}
+
+#[tokio::test]
+async fn commit_diff_controls_isolate_immutable_sources_and_preserve_them_on_refresh() {
+    use forge_buffer::{
+        block::TextPosition,
+        identity::{InputSequence, ViewId},
+        input::DocumentInput,
+    };
+    use forge_diff::{
+        cache::CacheLimits,
+        engine::DiffEngine,
+        syntax::SyntaxEngine,
+        view::{DiffPresentation, DiffVisibility},
+    };
+    use forge_github::{
+        review_api::ReviewPage,
+        review_source::{ReviewCommitDetail, ReviewCommitFile},
+    };
+    use forge_review::service::ReviewSectionKind;
+    let remote = remote();
+    let source = |public: &str, private: &str| {
+        format!("pub fn visible() {{\n    {public}();\n}}\nfn hidden() {{\n    {private}();\n}}\n")
+            .into_bytes()
+    };
+    remote.immutable_content.lock().unwrap().extend([
+        (
+            ("c".repeat(40), "source.rs".into()),
+            source("previous", "old_private"),
+        ),
+        (
+            ("b".repeat(40), "source.rs".into()),
+            source("pr_current", "pr_private"),
+        ),
+        (
+            ("f".repeat(40), "source.rs".into()),
+            source("first_commit", "first_private"),
+        ),
+        (
+            ("a".repeat(40), "source.rs".into()),
+            source("second_commit", "second_private"),
+        ),
+    ]);
+    remote.section_page.lock().unwrap().extend([
+        ReviewPage { records: vec![serde_json::json!({"number":7,"node_id":"PR_test","title":"Initial title", "state":"open",
+            "base":{"sha":"a".repeat(40)},"head":{"sha":"b".repeat(40),"repo":{"full_name":"owner/repo"}}})], next_cursor:None, complete:true },
+        ReviewPage { records: vec![serde_json::json!({"filename":"source.rs","status":"modified","sha":"e".repeat(40)})], next_cursor:None, complete:true },
+        ReviewPage { records: vec![
+            serde_json::json!({"sha":"f".repeat(40),"commit":{"message":"first commit", "committer":{"date":"1 day ago"}}}),
+            serde_json::json!({"sha":"a".repeat(40),"commit":{"message":"second commit", "committer":{"date":"2 days ago"}}}),
+        ], next_cursor:None, complete:true },
+    ]);
+    let diff = DiffEngine::new(CacheLimits::default(), 2);
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
+    let service = ReviewService::with_engines(github(&remote), diff.clone(), syntax.clone());
+    let opened = service.open_pr(remote.clone(), target()).await.unwrap();
+    let directory = remote.recovery.path().to_path_buf();
+    for section in [
+        ReviewSectionKind::Overview,
+        ReviewSectionKind::Files,
+        ReviewSectionKind::Commits,
+    ] {
+        service
+            .read_section(
+                &opened.document,
+                directory.clone(),
+                remote.clone(),
+                section,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let view = ViewId("semantic-commit-controls".into());
+    service
+        .view(&opened.document, view.clone(), Default::default())
+        .await
+        .unwrap();
+    service
+        .read_file(
+            &opened.document,
+            directory.clone(),
+            remote.clone(),
+            "source.rs".into(),
+        )
+        .await
+        .unwrap();
+    for commit in ["f".repeat(40), "a".repeat(40)] {
+        *remote.commit_detail.lock().unwrap() = Some(ReviewCommitDetail {
+            commit: commit.clone(),
+            parent: Some("c".repeat(40)),
+            subject: "commit".into(),
+            file: vec![ReviewCommitFile {
+                path: "source.rs".into(),
+                previous_path: None,
+                status: "modified".into(),
+                patch: Some("@@ -1 +1 @@\n-sparse_previous\n+sparse_current".into()),
+            }],
+        });
+        let frame = service
+            .materialize(&opened.document, Default::default())
+            .await
+            .unwrap();
+        let anchor = frame
+            .snapshot
+            .block
+            .iter()
+            .find(|block| {
+                block
+                    .metadata
+                    .target
+                    .iter()
+                    .any(|target| target.id.0.ends_with(":diff"))
+                    && block
+                        .text
+                        .wire_rows()
+                        .iter()
+                        .any(|row| row.starts_with(&commit[..7]))
+            })
+            .unwrap()
+            .id
+            .clone();
+        service
+            .read_commit_diff(
+                &opened.document,
+                directory.clone(),
+                remote.clone(),
+                commit.clone(),
+                anchor.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            service
+                .read_commit_diff(
+                    &opened.document,
+                    directory.clone(),
+                    remote.clone(),
+                    commit,
+                    anchor
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let mut frame = service
+        .materialize(&opened.document, Default::default())
+        .await
+        .unwrap();
+    let contains = |frame: &forge_review::service::ReviewMaterialization, text: &str| {
+        frame
+            .snapshot
+            .block
+            .iter()
+            .any(|block| block.text.wire_rows().iter().any(|row| row.contains(text)))
+    };
+    for text in [
+        "pr_current",
+        "pr_private",
+        "first_commit",
+        "first_private",
+        "second_commit",
+        "second_private",
+    ] {
+        assert!(contains(&frame, text), "{text}");
+    }
+    assert!(!contains(&frame, "sparse_current"));
+    let acquired = remote.source_request.lock().unwrap().len();
+    let initial = serde_json::to_value(&frame).unwrap();
+    let mut transitions = Vec::new();
+    for (sequence, action) in [
+        "toggle_presentation",
+        "source_expand",
+        "toggle_visibility",
+        "toggle_presentation",
+        "toggle_visibility",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let selected = if action == "source_expand" {
+            frame
+                .snapshot
+                .block
+                .iter()
+                .find(|block| {
+                    block
+                        .id
+                        .0
+                        .starts_with(&format!("commit:{}:", "f".repeat(40)))
+                        && block.text.row(0) == Some("pub fn visible() {")
+                })
+                .unwrap()
+        } else {
+            &frame.snapshot.block[0]
+        };
+        let delivery = service
+            .act(
+                DocumentInput {
+                    document: opened.document.clone(),
+                    revision: frame.snapshot.revision,
+                    view: view.clone(),
+                    sequence: InputSequence(sequence as u64 + 1),
+                    action: action.into(),
+                    block: selected.id.clone(),
+                    position: TextPosition { row: 0, column: 0 },
+                    target: None,
+                },
+                directory.clone(),
+            )
+            .await
+            .unwrap();
+        for patch in &delivery.patch {
+            patch.validate().unwrap();
+        }
+        frame = service
+            .materialize(&opened.document, Default::default())
+            .await
+            .unwrap();
+        assert!(
+            frame.patch.is_none(),
+            "refresh must retain the published commit bodies"
+        );
+        transitions.push(serde_json::json!({"action":action,"delivery":delivery,"expected":frame}));
+        match sequence {
+            0 => {
+                assert_eq!(frame.diff_view.presentation, DiffPresentation::Semantic);
+                assert!(
+                    !contains(&frame, "first_commit")
+                        && !contains(&frame, "second_commit")
+                        && !contains(&frame, "pr_current")
+                );
+                let headings = frame
+                    .snapshot
+                    .block
+                    .iter()
+                    .filter(|block| block.text.row(0) == Some("pub fn visible() {"))
+                    .collect::<Vec<_>>();
+                assert_eq!(headings.len(), 3);
+                assert!(
+                    headings
+                        .iter()
+                        .all(|block| block.metadata.fold[0].collapsed_suffix.as_deref()
+                            == Some(" … 1 change }"))
+                );
+            }
+            1 => {
+                assert!(contains(&frame, "first_commit"));
+                assert!(!contains(&frame, "second_commit") && !contains(&frame, "pr_current"));
+            }
+            2 => {
+                assert_eq!(frame.diff_view.visibility, DiffVisibility::Public);
+                assert!(!contains(&frame, "hidden") && contains(&frame, "first_commit"));
+            }
+            3 => {
+                assert_eq!(frame.diff_view.presentation, DiffPresentation::Full);
+                for text in ["first_commit", "second_commit", "pr_current"] {
+                    assert!(contains(&frame, text));
+                }
+                assert!(!contains(&frame, "first_private"));
+            }
+            4 => {
+                for text in ["first_private", "second_private", "pr_private"] {
+                    assert!(contains(&frame, text));
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            frame
+                .inline_anchor
+                .keys()
+                .all(|target| !target.0.starts_with("commit:")),
+            "commit rows cannot create current PR comments"
+        );
+    }
+    assert_eq!(remote.source_request.lock().unwrap().len(), acquired);
+    assert!(remote.inline_creation.lock().unwrap().is_empty());
+    assert_eq!(diff.analysis_pool().usage().admitted_jobs, 0);
+    assert_eq!(syntax.usage().active_jobs, 0);
+    std::fs::write(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/review-commit-semantic-fixture.json"),
+        serde_json::to_vec(&serde_json::json!({"initial":initial,"transition":transitions}))
+            .unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn commit_diff_source_failure_keeps_sparse_patch_and_root_boundary_accessible() {
+    use forge_buffer::{
+        block::TextPosition,
+        identity::{InputSequence, ViewId},
+        input::DocumentInput,
+    };
+    use forge_diff::{cache::CacheLimits, engine::DiffEngine, syntax::SyntaxEngine};
+    use forge_github::{
+        review_api::ReviewPage,
+        review_source::{ReviewCommitDetail, ReviewCommitFile},
+    };
+    use forge_review::service::ReviewSectionKind;
+    for root in [false, true] {
+        let remote = remote();
+        *remote.source_content.lock().unwrap() = Some((vec![0], vec![0]));
+        let commit = "f".repeat(40);
+        *remote.commit_detail.lock().unwrap() = Some(ReviewCommitDetail {
+            commit: commit.clone(),
+            parent: (!root).then(|| "c".repeat(40)),
+            subject: "commit".into(),
+            file: vec![ReviewCommitFile {
+                path: "source.rs".into(),
+                previous_path: None,
+                status: "modified".into(),
+                patch: Some("@@ -20 +20 @@\n-old_sparse\n+new_sparse".into()),
+            }],
+        });
+        remote.section_page.lock().unwrap().push_back(ReviewPage {records:vec![serde_json::json!({"sha":commit,"commit":{"message":"fixture", "committer":{"date":"1 day ago"}}})],next_cursor:None,complete:true});
+        let diff = DiffEngine::new(CacheLimits::default(), 2);
+        let service = ReviewService::with_engines(
+            github(&remote),
+            diff.clone(),
+            SyntaxEngine::new(diff.analysis_pool()),
+        );
+        let opened = service.open_pr(remote.clone(), target()).await.unwrap();
+        let directory = remote.recovery.path().to_path_buf();
+        service
+            .read_section(
+                &opened.document,
+                directory.clone(),
+                remote.clone(),
+                ReviewSectionKind::Commits,
+                None,
+            )
+            .await
+            .unwrap();
+        let view = ViewId("commit-fallback".into());
+        service
+            .view(&opened.document, view.clone(), Default::default())
+            .await
+            .unwrap();
+        let frame = service
+            .materialize(&opened.document, Default::default())
+            .await
+            .unwrap();
+        let anchor = frame
+            .snapshot
+            .block
+            .iter()
+            .find(|block| {
+                block
+                    .metadata
+                    .target
+                    .iter()
+                    .any(|target| target.id.0.ends_with(":diff"))
+            })
+            .unwrap()
+            .id
+            .clone();
+        service
+            .read_commit_diff(
+                &opened.document,
+                directory.clone(),
+                remote.clone(),
+                commit,
+                anchor,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for (sequence, action) in ["toggle_presentation", "toggle_visibility"]
+            .into_iter()
+            .enumerate()
+        {
+            let frame = service
+                .materialize(&opened.document, Default::default())
+                .await
+                .unwrap();
+            service
+                .act(
+                    DocumentInput {
+                        document: opened.document.clone(),
+                        revision: frame.snapshot.revision,
+                        view: view.clone(),
+                        sequence: InputSequence(sequence as u64 + 1),
+                        action: action.into(),
+                        block: frame.snapshot.block[0].id.clone(),
+                        position: TextPosition { row: 0, column: 0 },
+                        target: None,
+                    },
+                    directory.clone(),
+                )
+                .await
+                .unwrap();
+        }
+        let frame = service
+            .materialize(&opened.document, Default::default())
+            .await
+            .unwrap();
+        let rows = frame
+            .snapshot
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if root {
+            assert!(rows.contains("root commit has no parent"));
+            assert!(remote.source_request.lock().unwrap().is_empty());
+        } else {
+            assert!(rows.contains("Unclassified source changes"));
+            assert!(rows.contains("new_sparse") && rows.contains("@@ -20 +20 @@"));
+        }
+    }
 }

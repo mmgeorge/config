@@ -17,6 +17,7 @@ package.loaded["forge.views.harness.controller"] = { refresh_winbar = function()
 local path = vim.fn.tempname() .. ".md"
 vim.fn.writefile({ "# Physical plan" }, path)
 local pending
+local public_only = true
 client.request = function(request_specification, callback)
   local session_id = request_specification.session_id
   local method = request_specification.method
@@ -29,7 +30,7 @@ client.request = function(request_specification, callback)
   end
   assert(method == "session.document")
   if params.operation == "plan_open" then
-    local opened = { path = path, version = 1, saved_source_digest = "saved", snapshot = { document = params.document, revision = 0,
+    local opened = { path = path, version = 1, public_only = public_only, saved_source_digest = "saved", snapshot = { document = params.document, revision = 0,
       block = {
       { id = "overview", text = { "Plan overview", "" }, metadata = { decoration = {}, editable_region = {}, target = {} } },
       { id = "file", text = { "file src/plan.rs", "child entity" }, metadata = { decoration = {}, editable_region = {}, target = {}, fold = {
@@ -64,6 +65,9 @@ client.request = function(request_specification, callback)
     callback(opened)
   elseif params.operation == "plan_action" and params.input.action == "jump_entity" then
     callback({ jump = { block = "overview", position = { row = 0, column = 5 } } })
+  elseif params.operation == "plan_action" and params.input.action == "toggle_visibility" then
+    public_only = not public_only
+    callback({ public_only = public_only })
   else callback({}) end
 end
 local success, failure = xpcall(function()
@@ -89,10 +93,8 @@ local success, failure = xpcall(function()
     local decision_win = vim.api.nvim_get_current_win()
     local decision_buf = vim.api.nvim_win_get_buf(decision_win)
     vim.api.nvim_buf_set_lines(decision_buf, 0, -1, false, vim.split(comment, "\n", { plain = true }))
-    local mapping_list = vim.api.nvim_buf_get_keymap(decision_buf, "n")
-    for _, mapping in ipairs(mapping_list) do
-      if mapping.lhs == key then mapping.callback() return end
-    end
+    local mapping = vim.fn.maparg(key, "n", false, true)
+    if mapping.buffer == 1 and mapping.callback then mapping.callback() return end
     error("missing decision mapping " .. key)
   end
   assert(closed("plan:file-tree:1"), "file tree did not start closed")
@@ -125,10 +127,19 @@ local success, failure = xpcall(function()
   assert(not vim.wo.foldenable and closed("plan:design:1"))
   local task_row = row("task")
   vim.api.nvim_set_current_win(review.win)
-  for _, command in ipairs({ "toggle", "open", "jump_entity", "toggle_public", "comment", "delete", "accept", "request_changes", "close", "help" }) do
+  for _, command in ipairs({ "toggle", "open", "jump_entity", "toggle_visibility", "comment", "delete", "accept", "request_changes", "close", "help" }) do
     assert(review.command_set.action_by_id[command], "missing PlanReview command " .. command)
   end
   assert(vim.fn.maparg("q", "n", false, true).buffer == 1, "PlanReview did not bind q")
+  local visibility = vim.fn.maparg("ov", "n", false, true)
+  assert(visibility.buffer == 1 and visibility.desc == "Toggle All/Public diff visibility", "PlanReview did not bind shared ov")
+  assert(not review.command_set.action_by_id.toggle_presentation, "Semantic-only PlanReview exposed a presentation toggle")
+  assert(vim.fn.maparg("ox", "n", false, true).buffer ~= 1, "Semantic-only PlanReview bound ox")
+  assert(review.public_only == true)
+  vim.api.nvim_feedkeys("ov", "xt", false)
+  assert(vim.wait(1000, function() return review.public_only == false end), "ov did not select All")
+  vim.api.nvim_feedkeys("ov", "xt", false)
+  assert(vim.wait(1000, function() return review.public_only == true end), "ov did not restore Public")
   assert(vim.fn.maparg("J", "n", false, true).buffer == 1, "PlanReview did not bind J to comment deletion")
   vim.api.nvim_win_set_cursor(review.win, { task_row + 1, 3 })
   vim.cmd("clearjumps")
@@ -208,10 +219,10 @@ local success, failure = xpcall(function()
   assert(state.plan_review == nil, "q did not close review")
   native.open(review.plan)
   review = state.plan_review
-  review.owner.saving = true
+  review.owner.annotation_saving, review.owner.saving = true, true
   review.command_set.action_by_id.accept.run({})
   answer_decision("", "<CR>")
-  assert(review.owner.pending_operation and state.busy)
+  assert(#review.owner.pending_operation == 1 and state.busy)
   generation = 2
   native.open(review.plan)
   local recovered = state.plan_review

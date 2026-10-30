@@ -2,7 +2,8 @@ use std::ops::Range;
 
 use forge_buffer::ContractError;
 use forge_buffer::block::{
-    BlockAnchor, BufferBlock, ContentLayout, Decoration, TextChunk, TextPosition, TextRange,
+    BlockAnchor, BufferBlock, ContentLayout, Decoration, FoldRange, TextChunk, TextPosition,
+    TextRange,
 };
 use forge_buffer::identity::{BlockId, FoldId};
 use forge_buffer::text::BufferText;
@@ -41,6 +42,29 @@ pub struct FoldPolicy {
     pub collapse_children: bool,
     /// Whether opening this fold also opens its descendants.
     pub expand_children: bool,
+}
+
+/// Declaration fold positions in a prepared block sequence. The body content belongs to its view.
+pub struct DeclarationFoldLayout {
+    pub id: FoldId,
+    pub heading: usize,
+    pub opening: usize,
+    pub closing: usize,
+    pub closed: bool,
+    pub summary: String,
+}
+
+/// Format a collapsed implementation marker from distinct raw edit regions.
+/// A signature-only change keeps the body marker without a zero-change label.
+pub fn declaration_body_summary(changes: usize, closing: &str) -> String {
+    if changes == 0 {
+        format!(" … {closing}")
+    } else {
+        format!(
+            " … {changes} change{} {closing}",
+            if changes == 1 { "" } else { "s" }
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +110,53 @@ pub struct DiffPresenter {
 }
 
 impl DiffPresenter {
+    /// Attach a declaration fold without changing source text or consumer action targets.
+    ///
+    /// Invalid positions return an error before mutation. A one-block declaration or an
+    /// already installed identity returns false. Endpoints include the complete closing block.
+    pub fn declaration_fold(
+        block: &mut [BufferBlock],
+        layout: DeclarationFoldLayout,
+    ) -> Result<bool, ContractError> {
+        if layout.heading > layout.opening
+            || layout.opening > layout.closing
+            || layout.closing >= block.len()
+        {
+            return Err(ContractError("declaration fold positions are inconsistent"));
+        }
+        if layout.opening == layout.closing
+            || block[layout.opening]
+                .metadata
+                .fold
+                .iter()
+                .any(|fold| fold.id == layout.id)
+        {
+            return Ok(false);
+        }
+        let end = BlockAnchor {
+            block: block[layout.closing].id.clone(),
+            position: TextPosition {
+                row: block[layout.closing].text.row_count(),
+                column: 0,
+            },
+        };
+        let heading_start = Some(BlockAnchor {
+            block: block[layout.heading].id.clone(),
+            position: TextPosition { row: 0, column: 0 },
+        });
+        block[layout.opening].metadata.fold.push(FoldRange {
+            id: layout.id,
+            start: TextPosition { row: 0, column: 0 },
+            end,
+            heading_start,
+            collapsed_suffix: Some(layout.summary),
+            closed: layout.closed,
+            collapse_children: false,
+            expand_children: false,
+        });
+        Ok(true)
+    }
+
     /// Retains layout options without allocating document identities or action targets.
     pub fn new(options: PresentationOptions) -> Self {
         Self {
@@ -137,29 +208,11 @@ impl DiffPresenter {
             metadata: Default::default(),
         };
         block.metadata.layout = self.options.layout.clone();
-        let (_, background, number, _) = change.style();
-        let width = line_width.max(3).max(
-            lines
-                .iter()
-                .flatten()
-                .map(|line| line.to_string().len())
-                .max()
-                .unwrap_or(0),
+        let columns = summary_columns(
+            change,
+            lines.map(|line| line.map(|line| line as usize)),
+            line_width,
         );
-        let mut columns = Vec::new();
-        for line in lines {
-            columns.push(TextChunk {
-                text: format!(
-                    "{:>width$}",
-                    line.map(|line| line.to_string()).unwrap_or_default()
-                ),
-                capture: number.into(),
-            });
-            columns.push(TextChunk {
-                text: "  ".into(),
-                capture: background.into(),
-            });
-        }
         crate::projection::append_change_row(
             &mut block.metadata,
             0,
@@ -167,6 +220,76 @@ impl DiffPresenter {
             columns,
             self.options.indent,
         )?;
+        Ok(block)
+    }
+
+    /// Render exact signature fragments with a declaration marker and native syntax colors.
+    ///
+    /// Body-only revisions add no token emphasis. Missing syntax retains usable text.
+    /// Foreign syntax returns a contract error before producing a block.
+    pub fn declaration_signature(
+        &self,
+        id: BlockId,
+        signature: &crate::source_view::DeclarationSignature,
+        old: Option<&SyntaxHandle>,
+        new: Option<&SyntaxHandle>,
+    ) -> Result<BufferBlock, ContractError> {
+        let syntax = match signature.origin.side {
+            crate::source::SourceSide::Old => old,
+            crate::source::SourceSide::New => new,
+        };
+        if syntax.is_some_and(|syntax| syntax.source_identity() != signature.source_identity) {
+            return Err(ContractError(
+                "declaration signature syntax belongs to another source",
+            ));
+        }
+        let mut block = BufferBlock {
+            id,
+            text: BufferText::from_rows(signature.text.lines())?,
+            metadata: Default::default(),
+        };
+        block.metadata.layout = self.options.layout.clone();
+        let name_line = match signature.origin.side {
+            crate::source::SourceSide::Old => signature.old_line,
+            crate::source::SourceSide::New => signature.new_line,
+        };
+        for (row, text) in signature.text.lines().enumerate() {
+            let source_line = signature.origin.line + row;
+            let marker = name_line == Some(source_line + 1);
+            let change = if marker {
+                signature.change
+            } else {
+                RowChange::Context
+            };
+            let lines = if marker {
+                [signature.old_line, signature.new_line]
+            } else {
+                [None, None]
+            };
+            crate::projection::append_change_row(
+                &mut block.metadata,
+                row,
+                change,
+                summary_columns(change, lines, 3),
+                self.options.indent,
+            )?;
+            if let Some(syntax) = syntax {
+                crate::projection::append_syntax_fragment(
+                    &mut block.metadata,
+                    syntax,
+                    crate::syntax::SyntaxPoint {
+                        row: source_line,
+                        column: if row == 0 {
+                            signature.origin.byte_column
+                        } else {
+                            0
+                        },
+                    },
+                    row,
+                    text,
+                )?;
+            }
+        }
         Ok(block)
     }
 
@@ -349,9 +472,92 @@ pub fn counts<'row>(rows: impl IntoIterator<Item = &'row DisplayRow>) -> (u64, u
         })
 }
 
+fn summary_columns(
+    change: RowChange,
+    lines: [Option<usize>; 2],
+    line_width: usize,
+) -> Vec<TextChunk> {
+    let (_, background, number, _) = change.style();
+    let width = line_width.max(3).max(
+        lines
+            .iter()
+            .flatten()
+            .map(|line| line.to_string().len())
+            .max()
+            .unwrap_or(0),
+    );
+    let mut columns = Vec::new();
+    for line in lines {
+        columns.push(TextChunk {
+            text: format!(
+                "{:>width$}",
+                line.map(|line| line.to_string()).unwrap_or_default()
+            ),
+            capture: number.into(),
+        });
+        columns.push(TextChunk {
+            text: "  ".into(),
+            capture: background.into(),
+        });
+    }
+    columns
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declaration_fold_preserves_supplied_content_and_validates_before_mutation() {
+        let presenter = DiffPresenter::new(Default::default());
+        let mut block = vec![
+            presenter
+                .summary(
+                    BlockId("signature".into()),
+                    "fn parse() {",
+                    RowChange::Modified,
+                    [Some(1), Some(1)],
+                    3,
+                )
+                .unwrap(),
+            BufferBlock {
+                id: BlockId("details".into()),
+                text: BufferText::from_rows(["Change", "  Parse input.", "}"]).unwrap(),
+                metadata: Default::default(),
+            },
+        ];
+        let original = block.clone();
+        let invalid = DeclarationFoldLayout {
+            id: FoldId("parse".into()),
+            heading: 0,
+            opening: 0,
+            closing: 2,
+            closed: true,
+            summary: " … 1 change }".into(),
+        };
+        assert!(DiffPresenter::declaration_fold(&mut block, invalid).is_err());
+        assert_eq!(block, original);
+        let layout = || DeclarationFoldLayout {
+            id: FoldId("parse".into()),
+            heading: 0,
+            opening: 0,
+            closing: 1,
+            closed: true,
+            summary: " … 1 change }".into(),
+        };
+        assert!(DiffPresenter::declaration_fold(&mut block, layout()).unwrap());
+        let fold = &block[0].metadata.fold[0];
+        assert_eq!(fold.end.block, BlockId("details".into()));
+        assert_eq!(fold.end.position.row, 3);
+        assert_eq!(fold.collapsed_suffix.as_deref(), Some(" … 1 change }"));
+        assert!(fold.closed);
+        assert_eq!(block[1], original[1]);
+        assert_eq!(block[0].text, original[0].text);
+        assert_eq!(block[0].metadata.gutter, original[0].metadata.gutter);
+        assert_eq!(block[0].metadata.target, original[0].metadata.target);
+        assert!(!DiffPresenter::declaration_fold(&mut block, layout()).unwrap());
+        assert_eq!(block[0].metadata.fold.len(), 1);
+    }
 
     #[test]
     fn streamed_hunk_heading_is_emitted_once_and_failed_identity_does_not_advance() {
@@ -442,5 +648,14 @@ mod tests {
             assert_eq!(rows[2].new_coordinate().unwrap().line, 20);
             assert_eq!(counts(&rows), (1, 1));
         }
+    }
+    #[test]
+    fn declaration_body_summary_counts_regions_and_omits_zero_labels() {
+        assert_eq!(super::declaration_body_summary(0, "}"), " … }");
+        assert_eq!(super::declaration_body_summary(1, "}"), " … 1 change }");
+        assert_eq!(
+            super::declaration_body_summary(2, "end"),
+            " … 2 changes end"
+        );
     }
 }

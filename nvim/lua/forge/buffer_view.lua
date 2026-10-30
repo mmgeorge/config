@@ -50,6 +50,7 @@ end
 ---@field projection_offset? integer Physical offset within an attached annotation.
 ---@field source_row? integer Row in the canonical source before projection.
 ---@field column_offset? integer Virtual screen-column offset inside a character.
+---@field source_anchor? {owner: string, before?: integer, after?: integer} Canonical source location when its display block disappears.
 
 ---@param session table Native buffer replica.
 ---@param cursor integer[] One-based row and zero-based byte column.
@@ -63,6 +64,17 @@ local function capture_position(session, cursor, retained)
     local index, start = session.sequence:position(node.id)
     local canonical_row = source and start + source.position.row or original_row
     local block, offset = node.id, canonical_row - start
+    local source_anchor
+    local represented = node.entry.metadata.source_anchor
+    if not retained(block) and represented and represented ~= vim.NIL then
+      source_anchor = { owner = represented.owner }
+      for _, side in ipairs({ "before", "after" }) do
+        local range = represented[side]
+        if range and range ~= vim.NIL then
+          source_anchor[side] = math.min(range["end"] - 1, range.start + offset)
+        end
+      end
+    end
     local projection_offset = source and session.physical_row
       and original_row - session.physical_row(canonical_row) or nil
     if not retained(block) and session.retain_removed_position then
@@ -102,6 +114,7 @@ local function capture_position(session, cursor, retained)
     end
     return {
       block = block, row = offset, original_row = original_row,
+      source_anchor = source_anchor,
       column = source and projection_offset == 0 and source.position.column or cursor[2],
       source_column = source ~= nil and projection_offset == 0,
       projection_offset = projection_offset,
@@ -152,10 +165,33 @@ end
 local function resolve_position(session, saved, allow_eol)
   local row = math.min(saved.original_row, math.max(0, session.row_count - 1))
   local node = saved.block and session.sequence.node[saved.block]
+  local source_anchor = saved.source_anchor
+  local source_offset, nearest_distance, nearest_extent
+  if source_anchor then
+    for index = 0, session.sequence:count() - 1 do
+      local candidate = session.sequence:at(index)
+      local represented = candidate.entry.metadata.source_anchor
+      if represented and represented ~= vim.NIL and represented.owner == source_anchor.owner then
+        for _, side in ipairs({ "after", "before" }) do
+          local line, range = source_anchor[side], represented[side]
+          if line and range and range ~= vim.NIL then
+            local distance = math.max(range.start - line, line - range["end"] + 1, 0)
+            local extent = range["end"] - range.start
+            if not nearest_distance or distance < nearest_distance
+              or distance == nearest_distance and extent < nearest_extent then
+              node, nearest_distance, nearest_extent = candidate, distance, extent
+              local offset = math.max(0, line - range.start)
+              source_offset = offset < candidate.entry.row_count and offset or 0
+            end
+          end
+        end
+      end
+    end
+  end
   if node then
-    local _, start = session.sequence:position(saved.block)
-    local offset = saved.row
-    if saved.source_row and session.next_projection_mapping then
+    local _, start = session.sequence:position(node.id)
+    local offset = source_offset or saved.row
+    if source_offset == nil and saved.source_row and session.next_projection_mapping then
       offset = require("forge.node_projection").visible_position(session.next_projection_mapping, saved.block, saved.source_row) or 0
     end
     row = start + math.min(offset, node.entry.row_count - 1)

@@ -10,15 +10,16 @@ local buffer = vim.api.nvim_create_buf(false, true)
 vim.api.nvim_set_current_buf(buffer)
 local commands = controller.composer_command_set()
 keymaps.setup_view_keymaps(buffer, "harness", commands)
-for _, id in ipairs({ "visual_line_with_gutter", "open_timeline" }) do
+local transcript_only = { visual_line_with_gutter = true, open_timeline = true, toggle_visibility = true, toggle_presentation = true }
+for id in pairs(transcript_only) do
   assert(commands.action_by_id[id] == nil, "composer inherited transcript command: " .. id)
 end
-for _, key in ipairs({ "d", "c", "x", "p", "P", "W", ".", "<CR>" }) do
+for _, key in ipairs({ "d", "c", "x", "p", "P", "W", ".", "<CR>", "ov", "ox" }) do
   local mapping = vim.fn.maparg(key, "n", false, true)
   assert(mapping.buffer ~= 1, "composer shadowed ordinary editing key: " .. key)
 end
 for _, spec in ipairs(command_specs.view_specs.harness) do
-  if spec.id ~= "visual_line_with_gutter" and spec.id ~= "open_timeline" then
+  if not transcript_only[spec.id] then
     assert(commands.action_by_id[spec.id], "missing composer command: " .. spec.id)
     local modes = type(spec.modes) == "table" and spec.modes or { spec.modes or "n" }
     for _, key in ipairs(keymaps.view_keys_for("harness", spec.id)) do

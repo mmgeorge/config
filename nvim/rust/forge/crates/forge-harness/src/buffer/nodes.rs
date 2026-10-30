@@ -9,7 +9,7 @@ use forge_buffer::node::NodeState;
 use forge_buffer::width::WidthProfile;
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 /// Changes explicit expansion or advances the current node's loaded extent.
 pub enum NodeAction {
@@ -24,7 +24,7 @@ pub enum NodeAction {
     RetryLoading,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 /// Binds a node action to the requesting view and source incarnation.
 pub struct NodeRequest {
     /// Exact presentation lifetime.

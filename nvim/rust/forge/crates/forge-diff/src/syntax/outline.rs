@@ -143,7 +143,7 @@ fn declaration_prefix<'tree>(node: Node<'tree>, source: &str) -> Node<'tree> {
     prefix
 }
 
-fn container(mut node: Node<'_>) -> Node<'_> {
+pub(super) fn declaration_owner(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent() {
         let wrapper = parent.child_by_field_name("definition") == Some(node)
             || parent.child_by_field_name("declaration") == Some(node)
@@ -177,10 +177,13 @@ fn binding(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     }
     let parent = value.parent()?;
     if parent.kind() == "assignment" && parent.child_by_field_name("right") == Some(value) {
-        return Some((container(parent), parent.child_by_field_name("left")?));
+        return Some((
+            declaration_owner(parent),
+            parent.child_by_field_name("left")?,
+        ));
     }
     if parent.kind() == "init_declarator" && parent.child_by_field_name("value") == Some(value) {
-        return Some((container(parent), declarator_name(parent)?));
+        return Some((declaration_owner(parent), declarator_name(parent)?));
     }
     if matches!(
         parent.kind(),
@@ -195,7 +198,7 @@ fn binding(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
             .or_else(|| parent.child_by_field_name("pattern"))
             .or_else(|| parent.child_by_field_name("key"))
     {
-        return Some((container(parent), name));
+        return Some((declaration_owner(parent), name));
     }
     if parent.kind() != "expression_list" || parent.named_child_count() != 1 {
         return None;
@@ -209,7 +212,7 @@ fn binding(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
         return None;
     }
     Some((
-        container(assignment),
+        declaration_owner(assignment),
         variables.child_by_field_name("name")?,
     ))
 }
@@ -225,7 +228,7 @@ fn declaration<'tree, 'source>(
     if kind == "function_definition"
         && let Some(name) = declarator_name(node)
     {
-        let owner = container(node);
+        let owner = declaration_owner(node);
         return (!owner.has_error()).then_some((owner, source.get(name.byte_range())?));
     }
     let expression = matches!(
@@ -236,7 +239,7 @@ fn declaration<'tree, 'source>(
     let (owner, name) = if expression {
         binding(node)?
     } else {
-        (container(node), node.child_by_field_name("name")?)
+        (declaration_owner(node), node.child_by_field_name("name")?)
     };
     (!owner.has_error()).then_some((owner, source.get(name.byte_range())?))
 }

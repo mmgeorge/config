@@ -51,10 +51,9 @@ local previous = { plan = plan, owner = owner, buf = native_buffer, win = vim.ap
   tab = vim.api.nvim_get_current_tabpage() }
 harness.plan_review = previous
 local before = vim.api.nvim_buf_get_lines(native_buffer, 0, -1, false)
-owner.saving = true
-owner.annotation_saving = true
+owner.annotation_saving, owner.saving = true, true
 vim.cmd("write")
-assert(owner.pending_operation[1].capture[1].source.body == "draft\nλ\r\n")
+assert(owner.pending_operation[1] and owner.pending_operation[1].capture[1].source.body == "draft\nλ\r\n")
 generation = 2
 require("forge.views.plan_review.native_controller").open(plan)
 assert(#pending == 2)
@@ -96,8 +95,7 @@ assert(vim.bo[native_buffer].modified)
 assert(failure_notice and failure_notice:find("physical source conflict", 1, true))
 print("plan_review_recovery: conflicts preserve retained text and ownership")
 generation = 2
-replacement.owner.saving = true
-replacement.owner.annotation_saving = true
+replacement.owner.annotation_saving, replacement.owner.saving = true, true
 local submitted
 replacement.owner.submit("session.plan.changes.request", { comment = "Revision requested" }, function(result, failure)
   assert(result and not failure, failure)

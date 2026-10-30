@@ -1502,6 +1502,7 @@ Source: [buffer/session.rs](../../../rust/forge/crates/forge-harness/src/buffer/
 ```rust
 #[derive(Serialize)]
 pub struct PresentationOpen {
+    pub diff_view: forge_diff::view::DiffViewOptions,
     pub status: BufferSnapshot,
     pub syntax_pending: bool,
     pub transcript: BufferSnapshot,
@@ -1516,6 +1517,7 @@ Source: [buffer/session.rs](../../../rust/forge/crates/forge-harness/src/buffer/
 ```rust
 #[derive(Serialize)]
 pub struct PresentationSync {
+    pub diff_view: forge_diff::view::DiffViewOptions,
     pub status: BufferSnapshot,
     pub syntax_pending: bool,
     pub patch: Vec<BufferPatch>,

@@ -40,7 +40,12 @@ impl<'source> UnifiedPatch<'source> {
             let line = raw.trim_end_matches('\r');
             if let Some(paths) = line.strip_prefix("diff --git ") {
                 let (old, new) = git_paths(paths)?;
+                let start = raw.as_ptr() as usize - source.as_ptr() as usize;
+                if let Some(previous) = result.file.last_mut() {
+                    previous.source_range.end = start;
+                }
                 result.file.push(PatchFile {
+                    source_range: start..source.len(),
                     old_path: Some(old),
                     new_path: Some(new),
                     binary: false,
@@ -50,7 +55,12 @@ impl<'source> UnifiedPatch<'source> {
                 source_header = false;
             } else if let Some(path) = line.strip_prefix("--- ") {
                 if source_header || result.file.is_empty() {
+                    let start = raw.as_ptr() as usize - source.as_ptr() as usize;
+                    if let Some(previous) = result.file.last_mut() {
+                        previous.source_range.end = start;
+                    }
                     result.file.push(PatchFile {
+                        source_range: start..source.len(),
                         old_path: None,
                         new_path: None,
                         binary: false,
@@ -140,6 +150,8 @@ impl<'source> UnifiedPatch<'source> {
 #[derive(Debug)]
 /// Owns file identity and borrows the available hunks of a saved change.
 pub struct PatchFile<'source> {
+    /// Exact file section in the original patch, including extended metadata and binary payloads.
+    pub source_range: Range<usize>,
     /// Repository-relative old path, absent for file creation.
     pub old_path: Option<String>,
     /// Repository-relative new path, absent for file deletion.
@@ -150,6 +162,66 @@ pub struct PatchFile<'source> {
     pub line_ending_changes: usize,
     /// Hunks retain their absolute source positions and patch order.
     pub hunk: Vec<PatchHunk<'source>>,
+}
+
+impl PatchFile<'_> {
+    /// Verify complete source coverage without reconstructing a file from sparse patch fragments.
+    /// Both hunk bytes and all unchanged gaps must match. Memory use is constant in source length.
+    pub fn matches_source(&self, source: &crate::source::SourcePair) -> bool {
+        if self.binary
+            || (self.old_path.is_none() && !source.old.bytes().is_empty())
+            || (self.new_path.is_none() && !source.new.bytes().is_empty())
+        {
+            return false;
+        }
+        let mut old = source.old.text().split_inclusive('\n');
+        let mut new = source.new.text().split_inclusive('\n');
+        let mut old_position = 0;
+        let mut new_position = 0;
+        for hunk in &self.hunk {
+            let Some(old_gap) = hunk.old_lines.start.checked_sub(old_position) else {
+                return false;
+            };
+            let Some(new_gap) = hunk.new_lines.start.checked_sub(new_position) else {
+                return false;
+            };
+            if old_gap != new_gap {
+                return false;
+            }
+            for _ in 0..old_gap {
+                match (old.next(), new.next()) {
+                    (Some(old), Some(new)) if old == new => {}
+                    _ => return false,
+                }
+            }
+            old_position = hunk.old_lines.start;
+            new_position = hunk.new_lines.start;
+            for row in &hunk.row {
+                let matches = |line: Option<&str>| {
+                    line.is_some_and(|line| {
+                        let text = line.strip_suffix('\n');
+                        text.unwrap_or(line) == row.text && row.no_newline == text.is_none()
+                    })
+                };
+                if let Some(position) = row.old_line() {
+                    if position != old_position || !matches(old.next()) {
+                        return false;
+                    }
+                    old_position += 1;
+                }
+                if let Some(position) = row.new_line() {
+                    if position != new_position || !matches(new.next()) {
+                        return false;
+                    }
+                    new_position += 1;
+                }
+            }
+            if old_position != hunk.old_lines.end || new_position != hunk.new_lines.end {
+                return false;
+            }
+        }
+        old.eq(new)
+    }
 }
 
 #[derive(Debug)]
@@ -706,5 +778,65 @@ mod tests {
                 .len(),
             262_145
         );
+    }
+}
+
+#[cfg(test)]
+mod source_coverage_tests {
+    use super::*;
+    use crate::source::{Representation, SourcePair, SourceVersion};
+
+    fn source(old: &str, new: &str) -> SourcePair {
+        SourcePair {
+            old: SourceVersion::new(old.as_bytes().to_vec(), Representation::Raw).unwrap(),
+            new: SourceVersion::new(new.as_bytes().to_vec(), Representation::Raw).unwrap(),
+        }
+    }
+
+    #[test]
+    fn saved_patch_source_coverage_checks_unchanged_gaps_and_exact_terminators() {
+        let patch =
+            UnifiedPatch::parse("--- a/source.rs\n+++ b/source.rs\n@@ -2 +2 @@\n-before\n+after\n")
+                .unwrap();
+        assert!(patch.file[0].matches_source(&source(
+            "prefix\nbefore\nsuffix\n",
+            "prefix\nafter\nsuffix\n"
+        )));
+        for pair in [
+            source("prefix\nbefore\nsuffix\n", "other\nafter\nsuffix\n"),
+            source("prefix\nbefore\nsuffix\n", "prefix\nafter\nother\n"),
+            source("prefix\nbefore\nsuffix\n", "prefix\nafter\nsuffix"),
+            source("prefix\nwrong\nsuffix\n", "prefix\nafter\nsuffix\n"),
+            source("prefix\nbefore\nsuffix\n", "prefix\nafter\n"),
+        ] {
+            assert!(!patch.file[0].matches_source(&pair));
+        }
+        let crlf = UnifiedPatch::parse(
+            "--- a/source.rs\n+++ b/source.rs\n@@ -1 +1 @@\n-before\r\n+after\r\n",
+        )
+        .unwrap();
+        assert!(crlf.file[0].matches_source(&source("before\r\n", "after\r\n")));
+        assert!(!crlf.file[0].matches_source(&source("before\n", "after\n")));
+        let eof = UnifiedPatch::parse("--- a/source.rs\n+++ b/source.rs\n@@ -1 +1 @@\n-before\n\\ No newline at end of file\n+after\n\\ No newline at end of file\n").unwrap();
+        assert!(eof.file[0].matches_source(&source("before", "after")));
+        assert!(!eof.file[0].matches_source(&source("before\n", "after")));
+    }
+
+    #[test]
+    fn saved_patch_source_coverage_accepts_sparse_hunks_only_with_complete_source_evidence() {
+        let old = (0..40_000)
+            .map(|line| format!("value {line}\n"))
+            .collect::<String>();
+        let new = old.replace("value 20000\n", "changed\n");
+        let patch = UnifiedPatch::parse(
+            "--- a/source.rs\n+++ b/source.rs\n@@ -20001 +20001 @@\n-value 20000\n+changed\n",
+        )
+        .unwrap();
+        assert!(patch.file[0].matches_source(&source(&old, &new)));
+        assert!(!patch.file[0].matches_source(&source("value 20000\n", "changed\n")));
+        let added =
+            UnifiedPatch::parse("--- /dev/null\n+++ b/source.rs\n@@ -0,0 +1 @@\n+after\n").unwrap();
+        assert!(added.file[0].matches_source(&source("", "after\n")));
+        assert!(!added.file[0].matches_source(&source("unreported\n", "after\n")));
     }
 }

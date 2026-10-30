@@ -268,6 +268,7 @@ enum StatusRequest {
         reference: String,
         worktree: bool,
         path: Option<String>,
+        diff_view: Option<forge_diff::view::DiffViewOptions>,
     },
     BodySnapshot {
         document: DocumentId,
@@ -285,6 +286,14 @@ enum StatusRequest {
         document: DocumentId,
     },
     Demand {
+        input: forge_status::StatusInput,
+    },
+    DiffView {
+        input: forge_status::StatusInput,
+        #[serde(default)]
+        related: Vec<DocumentId>,
+    },
+    SourceSection {
         input: forge_status::StatusInput,
     },
     OpenTarget {
@@ -614,11 +623,11 @@ impl HostRouter {
                         .harness
                         .saved_diff(envelope.session_id, input)
                         .await?;
-                    let result = self.host.sources.open_diff_text(
-                        document,
-                        "Saved diff".into(),
-                        text.into_bytes(),
-                    )?;
+                    let result = self
+                        .host
+                        .sources
+                        .open_saved_diff(document, "Saved diff".into(), text)
+                        .await?;
                     send_completed_result(sink, request.id, result).await?;
                     return Ok(());
                 }
@@ -690,7 +699,7 @@ impl HostRouter {
                         serde_json::to_value(self.host.sources.demand(input).await?)?
                     }
                     SourceRequest::Snapshot { document } => {
-                        serde_json::to_value(self.host.sources.snapshot(&document).await?)?
+                        serde_json::to_value(self.host.sources.snapshot_state(&document).await?)?
                     }
                     SourceRequest::CloseView { document, view } => {
                         self.host.sources.close_view(&document, &view).await?;
@@ -761,6 +770,7 @@ impl HostRouter {
                         reference,
                         worktree,
                         path,
+                        diff_view,
                     } => {
                         let path = path
                             .map(|path| {
@@ -783,6 +793,7 @@ impl HostRouter {
                                         worktree,
                                         path,
                                     },
+                                    diff_view.unwrap_or_default(),
                                 )
                                 .await?,
                         )?
@@ -817,6 +828,12 @@ impl HostRouter {
                     }
                     StatusRequest::Demand { input } => {
                         serde_json::to_value(self.host.status.demand(input).await?)?
+                    }
+                    StatusRequest::DiffView { input, related } => serde_json::to_value(
+                        self.host.status.change_diff_views(input, related).await?,
+                    )?,
+                    StatusRequest::SourceSection { input } => {
+                        serde_json::to_value(self.host.status.source_section(input).await?)?
                     }
                     StatusRequest::OpenTarget { input } => {
                         serde_json::to_value(self.host.status.open_target(input).await?)?

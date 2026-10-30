@@ -36,6 +36,7 @@ impl std::ops::Deref for ReviewEditResult {
 
 #[derive(Debug, Serialize)]
 pub struct ReviewMaterialization {
+    pub diff_view: forge_diff::view::DiffViewOptions,
     pub field: Vec<crate::review::ReviewField>,
     pub comment: Vec<crate::review::ReviewCommentSnapshot>,
     pub inline_anchor: std::collections::BTreeMap<TargetId, crate::comments::CommentAnchor>,
@@ -74,6 +75,7 @@ impl ReviewService {
             section_revision,
             mut section,
             mut file,
+            commits,
             owner_width,
             repository,
             mode,
@@ -142,6 +144,7 @@ impl ReviewService {
                         })
                     })
                     .collect::<std::collections::BTreeMap<_, _>>(),
+                document.commit_view.clone(),
                 owner_width,
                 document.target.repository.repository_name(),
                 document.mode,
@@ -483,6 +486,16 @@ impl ReviewService {
                                 &width,
                                 &mut target,
                             )?);
+                            if let Some(commit) = item.commit.as_ref()
+                                && let Some(view) = commits.get(&commit.sha)
+                            {
+                                block.extend(view.block.iter().cloned());
+                                target.extend(
+                                    view.target
+                                        .iter()
+                                        .map(|(id, target)| (id.clone(), target.clone())),
+                                );
+                            }
                             continue;
                         }
                         if kind == super::ReviewSectionKind::Conversation {
@@ -707,7 +720,30 @@ impl ReviewService {
                 0
             };
         }
+        let projection = document.projection.as_ref().expect("published projection");
+        let commit_counts = document
+            .commit_view
+            .iter()
+            .map(|(commit, view)| {
+                (
+                    commit.clone(),
+                    if projection.block_index(&view.anchor).is_some() {
+                        view.block.len()
+                    } else {
+                        0
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        for (commit, count) in commit_counts {
+            document
+                .commit_view
+                .get_mut(&commit)
+                .expect("retained commit")
+                .projected_blocks = count;
+        }
         Ok(ReviewMaterialization {
+            diff_view: document.diff_view.committed(),
             field: document.snapshot()?.field,
             inline_anchor: document
                 .projection_target

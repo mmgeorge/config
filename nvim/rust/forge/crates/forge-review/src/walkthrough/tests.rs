@@ -2,6 +2,183 @@ use super::*;
 use forge_git::command::{CommandLimits, read_command};
 
 #[tokio::test]
+async fn walkthrough_semantic_controls_preserve_captured_sources_annotations_and_navigation()
+-> Result<()> {
+    use forge_diff::view::{DiffPresentation, DiffVisibility};
+    let (directory, service, document) = fixture(false).await;
+    service.close_collected(&document).await;
+    let before = "pub fn visible() {\n    previous();\n}\nfn hidden() { old_private(); }\n";
+    let after = before
+        .replace("previous", "updated")
+        .replace("old_private", "new_private");
+    let root = directory.path().to_owned();
+    let captured_after = after.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        std::fs::write(root.as_path().join("source.rs"), before)?;
+        git(root.as_path(), &["add", "source.rs"]);
+        git(
+            root.as_path(),
+            &["commit", "-m", "captured comparison baseline"],
+        );
+        let artifact_path = root.as_path().join(".walkthrough.json");
+        let mut artifact: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&artifact_path)?)?;
+        artifact["commit"] = serde_json::json!(git(root.as_path(), &["rev-parse", "HEAD"]));
+        std::fs::write(&artifact_path, serde_json::to_vec(&artifact)?)?;
+        std::fs::write(root.as_path().join("source.rs"), &captured_after)?;
+        Ok(())
+    })
+    .await??;
+    let opened = service
+        .open(document.clone(), directory.path().to_owned(), false)
+        .await?;
+    let input = source_input(&service, &document);
+    let annotation = DocumentId("walkthrough:semantic".into());
+    let mut change = service
+        .resolve_change(input.clone(), annotation.clone())
+        .await?;
+    let diff = forge_diff::engine::DiffEngine::new(Default::default(), 2);
+    let syntax = forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool());
+    service
+        .project_review(&input, &annotation, &mut change, &diff, &syntax)
+        .await?;
+    let view = ViewId("walkthrough:semantic:view".into());
+    service.annotation_view(
+        &document,
+        &annotation,
+        view.clone(),
+        Some(WidthProfile::default()),
+    )?;
+    let initial = service.review_snapshot(&document, &annotation)?;
+    let original = initial.snapshot.clone();
+    std::fs::write(
+        directory.path().join("source.rs"),
+        "unrelated worktree content\n",
+    )?;
+    let mut frame = initial.snapshot.clone();
+    let mut transitions = Vec::new();
+    for (index, action) in [
+        "toggle_presentation",
+        "source_expand",
+        "toggle_visibility",
+        "toggle_presentation",
+        "toggle_visibility",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let block = if action == "source_expand" {
+            frame
+                .block
+                .iter()
+                .find(|block| block.text.row(0) == Some("pub fn visible() {"))
+                .context("missing semantic signature")?
+        } else {
+            &frame.block[0]
+        };
+        let input = DocumentInput {
+            document: annotation.clone(),
+            revision: frame.revision,
+            view: view.clone(),
+            sequence: InputSequence(index as u64 + 1),
+            action: action.into(),
+            block: block.id.clone(),
+            position: TextPosition { row: 0, column: 0 },
+            target: block
+                .metadata
+                .target
+                .first()
+                .map(|target| target.id.clone()),
+        };
+        let delivery = service
+            .review_input(&document, input.clone(), &diff)
+            .await?;
+        assert!(service.review_input(&document, input, &diff).await.is_err());
+        if let Some(patch) = &delivery.patch {
+            patch.validate()?;
+        }
+        frame = service.annotation_snapshot(&document, &annotation)?;
+        let rows = frame
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rows.contains("Captured contract"));
+        assert!(!rows.contains("unrelated worktree content"));
+        if index == 0 {
+            assert!(!rows.contains("updated();"));
+            let heading = frame
+                .block
+                .iter()
+                .find(|block| block.text.row(0) == Some("pub fn visible() {"))
+                .unwrap();
+            assert!(heading.metadata.fold[0].closed);
+            assert!(
+                heading.metadata.fold[0]
+                    .collapsed_suffix
+                    .as_ref()
+                    .unwrap()
+                    .contains("1 change")
+            );
+        } else {
+            assert!(rows.contains("updated();"));
+        }
+        if index == 2 || index == 3 {
+            assert!(!rows.contains("hidden"));
+        }
+        assert_eq!(
+            service.review_snapshot(&document, &annotation)?.diff_view,
+            delivery.diff_view
+        );
+        transitions.push(serde_json::json!({"action":action,"delivery":delivery,"expected":frame}));
+    }
+    let recovered = service.review_snapshot(&document, &annotation)?;
+    assert_eq!(recovered.diff_view.presentation, DiffPresentation::Full);
+    assert_eq!(recovered.diff_view.visibility, DiffVisibility::All);
+    assert_eq!(recovered.snapshot.block, original.block);
+    let source = frame
+        .block
+        .iter()
+        .find(|block| {
+            block
+                .text
+                .row(0)
+                .is_some_and(|row| row.contains("updated();"))
+        })
+        .unwrap();
+    assert_eq!(
+        service.annotation_source(
+            &document,
+            DocumentInput {
+                document: annotation,
+                revision: frame.revision,
+                view,
+                sequence: InputSequence(6),
+                action: "open".into(),
+                block: source.id.clone(),
+                position: TextPosition { row: 0, column: 0 },
+                target: source
+                    .metadata
+                    .target
+                    .first()
+                    .map(|target| target.id.clone())
+            }
+        )?,
+        1
+    );
+    std::fs::write(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/walkthrough-semantic-fixture.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"walkthrough":opened,"initial":initial,"transition":transitions}),
+        )?,
+    )?;
+    service.close_collected(&document).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn composite_review_preserves_diff_source_coordinates_and_annotation_reflow() {
     let (directory, service, document) = fixture(false).await;
     service.close_collected(&document).await;

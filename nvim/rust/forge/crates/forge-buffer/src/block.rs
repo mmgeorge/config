@@ -63,6 +63,17 @@ pub struct BlockAnchor {
     pub position: TextPosition,
 }
 
+/// Source-relative navigation bounds survive replacement of a presentation's block identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceAnchor {
+    /// Stable comparison scope that prevents navigation into another file or excerpt.
+    pub owner: String,
+    /// Zero-based, half-open lines represented from the comparison's previous source.
+    pub before: Option<std::ops::Range<usize>>,
+    /// Zero-based, half-open lines represented from the comparison's successor source.
+    pub after: Option<std::ops::Range<usize>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Identifies a projected container whose body can be hidden independently of native folds.
 pub struct Collapse {
@@ -161,6 +172,9 @@ pub enum StatusHint {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMetadata {
+    /// Navigation evidence independent of executable targets and current display rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_anchor: Option<SourceAnchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusPresentation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +223,10 @@ impl BlockMetadata {
         self.content_node
             .as_ref()
             .map_or(0, |node| node.0.capacity())
+            + self
+                .source_anchor
+                .as_ref()
+                .map_or(0, |anchor| anchor.owner.capacity())
             + self.node.as_ref().map_or(0, |node| {
                 node.id.0.capacity() + node.parent.as_ref().map_or(0, |parent| parent.0.capacity())
             })
@@ -321,6 +339,19 @@ impl BufferBlock {
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
+        if let Some(anchor) = &self.metadata.source_anchor
+            && (anchor.owner.is_empty()
+                || anchor.before.is_none() && anchor.after.is_none()
+                || anchor
+                    .before
+                    .iter()
+                    .chain(&anchor.after)
+                    .any(|range| range.start >= range.end))
+        {
+            return Err(ContractError(
+                "source navigation requires an owner and nonempty line bounds",
+            ));
+        }
         if self
             .metadata
             .status

@@ -118,7 +118,7 @@ local function action(review, name)
     if failure then notice(failure) return end
     if name == "toggle_declaration" then
       effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
-    elseif name == "toggle_public" then
+    elseif name == "toggle_visibility" then
       review.public_only = result.public_only
       review.owner.public_only = result.public_only
       refresh_winbar(review)
@@ -324,7 +324,7 @@ local function commands(review)
   command_set.register(set, "checks", function()
     require("forge.views.plan_review.checks").open(review, function(enabled, receive) update_checks(review, enabled, nil, receive) end)
   end)
-  for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_visibility" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function()
     prompt_decision(review, "session.plan.acceptance.begin", "Approval comment (optional)")

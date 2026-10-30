@@ -31,9 +31,10 @@ impl<
 }
 
 mod comment;
-mod commit;
+pub(crate) mod commit;
 mod document;
 pub(crate) mod file;
+mod file_view;
 mod input;
 mod snapshot;
 pub(crate) mod thread_projection;

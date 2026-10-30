@@ -50,7 +50,8 @@ pub struct BackgroundManager {
     admission: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     tasks: Mutex<JoinSet<()>>,
     runtime_admission: Semaphore,
-    presentation: Mutex<HashMap<String, crate::buffer::session::SessionPresentation>>,
+    presentation:
+        Mutex<HashMap<String, Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>>>,
 }
 
 impl BackgroundManager {
@@ -498,27 +499,55 @@ impl BackgroundManager {
                 plan_file: &plan_file,
             })?;
         let entries = store.with_fork_history(&selected.id, entries, &plan_file)?;
-        let mut presentations = self.presentation.lock().await;
-        let presentation = presentations.entry(selected.id.clone()).or_insert_with(|| {
-            crate::buffer::session::SessionPresentation::new(selected.id.clone())
-        });
-        presentation.reconcile(entries)?;
+        let presentation = {
+            let mut presentations = self.presentation.lock().await;
+            presentations
+                .entry(selected.id.clone())
+                .or_insert_with(|| {
+                    Arc::new(std::sync::Mutex::new(
+                        crate::buffer::session::SessionPresentation::new(selected.id.clone()),
+                    ))
+                })
+                .clone()
+        };
+        presentation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Background presentation lock poisoned"))?
+            .reconcile(entries)?;
         let result = if let Some(request) = query.presentation {
             let request = serde_json::from_value(request)?;
-            if let crate::buffer::session::PresentationRequest::Highlight { document } = request {
-                let job = presentation.capture_syntax(&document)?;
+            if let Some(result) = crate::buffer::session::diff_view::update(
+                presentation.clone(),
+                &request,
+                query.data_root,
+                self.diff.clone(),
+                self.syntax.clone(),
+            )
+            .await?
+            {
+                Some(result)
+            } else if let crate::buffer::session::PresentationRequest::Highlight { document } =
+                request
+            {
+                let job = presentation
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Background presentation lock poisoned"))?
+                    .capture_syntax(&document)?;
                 if let Some(job) = job {
-                    drop(presentations);
                     let highlighted = job.analyze(&self.syntax).await?;
-                    let mut current = self.presentation.lock().await;
-                    current
-                        .get_mut(&selected.id)
-                        .context("Background view closed during syntax")?
+                    presentation
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Background presentation lock poisoned"))?
                         .apply_syntax(&document, &job, highlighted)?;
                 }
                 Some(json!({}))
             } else {
-                Some(presentation.dispatch(request)?)
+                Some(
+                    presentation
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Background presentation lock poisoned"))?
+                        .dispatch(request)?,
+                )
             }
         } else {
             None

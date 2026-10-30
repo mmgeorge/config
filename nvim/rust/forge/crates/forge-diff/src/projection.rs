@@ -151,7 +151,7 @@ pub fn append_source_syntax_row(
         if capture.family != SyntaxFamily::Highlight {
             continue;
         }
-        let Some(range) = syntax_row_range(capture, source_row, row, text) else {
+        let Some(range) = syntax_row_range(capture, source_row, row, text, 0) else {
             continue;
         };
         if capture.language == SyntaxLanguage::MarkdownInline
@@ -262,14 +262,25 @@ fn syntax_row_range(
     source_row: usize,
     row: usize,
     text: &str,
+    source_column: usize,
 ) -> Option<TextRange> {
     let start = if capture.range.start.row == source_row {
-        capture.range.start.column.min(text.len())
+        capture
+            .range
+            .start
+            .column
+            .saturating_sub(source_column)
+            .min(text.len())
     } else {
         0
     };
     let end = if capture.range.end.row == source_row {
-        capture.range.end.column.min(text.len())
+        capture
+            .range
+            .end
+            .column
+            .saturating_sub(source_column)
+            .min(text.len())
     } else {
         text.len()
     };
@@ -291,9 +302,6 @@ pub(crate) fn append_change_row(
 ) -> Result<(), ContractError> {
     if indent > 4096 {
         return Err(ContractError("diff indentation exceeds 4096 cells"));
-    }
-    if metadata.gutter.len() >= 256 {
-        return Err(ContractError("diff row batch exceeds 256 gutters"));
     }
     let (sign, background, number, _) = change.style();
     if indent > 0 {
@@ -461,13 +469,33 @@ pub fn append_syntax_row(
     row: usize,
     text: &str,
 ) -> Result<(), ContractError> {
+    append_syntax_fragment(
+        metadata,
+        syntax,
+        crate::syntax::SyntaxPoint {
+            row: source_row,
+            column: 0,
+        },
+        row,
+        text,
+    )
+}
+
+/// Project a clipped signature fragment while retaining original syntax byte coordinates.
+pub fn append_syntax_fragment(
+    metadata: &mut BlockMetadata,
+    syntax: &SyntaxHandle,
+    source: crate::syntax::SyntaxPoint,
+    row: usize,
+    text: &str,
+) -> Result<(), ContractError> {
     let mut captures: Vec<_> = syntax
-        .captures_intersecting_rows(source_row, source_row.saturating_add(1))
+        .captures_intersecting_rows(source.row, source.row.saturating_add(1))
         .filter(|capture| capture.family == SyntaxFamily::Highlight)
         .collect();
     captures.sort_by_key(|capture| (capture.tree, capture.pattern));
     for capture in captures {
-        let Some(range) = syntax_row_range(capture, source_row, row, text) else {
+        let Some(range) = syntax_row_range(capture, source.row, row, text, source.column) else {
             continue;
         };
         metadata.visible_decoration.push(Decoration {

@@ -1,4 +1,4 @@
-mod hunks;
+mod diff_view;
 mod ignored;
 mod mutation;
 mod navigation;
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub mod context;
 mod document;
 mod reconcile;
+mod selection;
 mod service;
 mod source;
 pub mod source_document;

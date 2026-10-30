@@ -20,6 +20,8 @@ use super::projection::{ProjectedEntry, ProjectionSource, TranscriptAction, proj
 
 const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
 
+pub(crate) mod diff_view;
+
 pub struct SessionPresentation {
     session_id: String,
     timeline: TimelineStream,
@@ -28,6 +30,7 @@ pub struct SessionPresentation {
 }
 
 struct OpenPresentation {
+    diff: diff_view::TimelineDiffStore,
     status: super::status::StatusDocument,
     display: super::identity::DisplayRegistry,
     history_input_id: HashSet<String>,
@@ -94,6 +97,7 @@ struct EntryPresentation {
 
 #[derive(Serialize)]
 pub struct PresentationOpen {
+    pub diff_view: forge_diff::view::DiffViewOptions,
     pub status: BufferSnapshot,
     pub syntax_pending: bool,
     pub transcript: BufferSnapshot,
@@ -102,6 +106,7 @@ pub struct PresentationOpen {
 
 #[derive(Serialize)]
 pub struct PresentationSync {
+    pub diff_view: forge_diff::view::DiffViewOptions,
     pub status: BufferSnapshot,
     pub syntax_pending: bool,
     pub patch: Vec<BufferPatch>,
@@ -111,6 +116,9 @@ pub struct PresentationSync {
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PresentationRequest {
+    DiffInput {
+        input: DocumentInput,
+    },
     StatusAction {
         document: DocumentId,
         status: DocumentId,
@@ -291,6 +299,9 @@ impl SessionPresentation {
     pub fn dispatch(&mut self, request: PresentationRequest) -> Result<serde_json::Value> {
         use serde_json::{json, to_value};
         match request {
+            PresentationRequest::DiffInput { .. } => {
+                anyhow::bail!("timeline diff controls require the asynchronous service owner")
+            }
             PresentationRequest::StatusAction {
                 document,
                 status,
@@ -485,7 +496,15 @@ impl SessionPresentation {
                 self.set_staging(&document, sequence, queue, steering)?;
                 Ok(json!({"updated":true}))
             }
-            PresentationRequest::Snapshot { document } => Ok(to_value(self.snapshot(&document)?)?),
+            PresentationRequest::Snapshot { document } => {
+                let mut snapshot = to_value(self.snapshot(&document)?)?;
+                if let Some(open) = &self.open
+                    && open.transcript_id == document
+                {
+                    snapshot["diff_view"] = to_value(open.diff.view.committed())?;
+                }
+                Ok(snapshot)
+            }
             PresentationRequest::Input { input } => match self.action(input)? {
                 TranscriptAction::Diff { .. } => Ok(json!({"kind":"diff"})),
                 action => Ok(to_value(action)?),
@@ -603,6 +622,7 @@ impl SessionPresentation {
             open.sections.register(view.clone());
             open.input.entry(view).or_insert(InputSequence(0));
             return Ok(PresentationOpen {
+                diff_view: open.diff.view.committed(),
                 status: open.status.snapshot(),
                 syntax_pending: syntax_pending(open),
                 transcript: open.sections.document.snapshot()?,
@@ -686,15 +706,14 @@ impl SessionPresentation {
             started.elapsed().as_secs_f64() * 1000.0,
         );
         let opened = PresentationOpen {
+            diff_view: forge_diff::view::DiffViewOptions::default(),
             status: status.snapshot(),
-            syntax_pending: !syntax.is_empty()
-                || action
-                    .values()
-                    .any(|action| matches!(action, TranscriptAction::Diff { syntax: true, .. })),
+            syntax_pending: !syntax.is_empty(),
             transcript: snapshot,
             startup_timing,
         };
         self.open = Some(OpenPresentation {
+            diff: diff_view::TimelineDiffStore::default(),
             status,
             display,
             history_input_id: history_input_ids(self.timeline.entry_list()),
@@ -761,6 +780,7 @@ impl SessionPresentation {
         }
         if cursor == current {
             Ok(PresentationSync {
+                diff_view: open.diff.view.committed(),
                 status: open.status.snapshot(),
                 syntax_pending: syntax_pending(open),
                 patch,
@@ -768,6 +788,7 @@ impl SessionPresentation {
             })
         } else {
             Ok(PresentationSync {
+                diff_view: open.diff.view.committed(),
                 status: open.status.snapshot(),
                 syntax_pending: syntax_pending(open),
                 patch: Vec::new(),
@@ -823,8 +844,11 @@ impl SessionPresentation {
             .action
             .iter()
             .find_map(|(target, action)| match action {
-                TranscriptAction::Diff { text, syntax: true }
-                    if !open.syntax_done.contains(target) =>
+                TranscriptAction::Diff {
+                    text, syntax: true, ..
+                } if !open.syntax_done.contains(target)
+                    && !open.diff.root.contains_key(target)
+                    && open.sections.expansion(&target.0) == Some(true) =>
                 {
                     Some(super::syntax::TranscriptSyntax::Diff(
                         super::syntax::SavedDiffSyntax {
@@ -863,7 +887,7 @@ impl SessionPresentation {
         };
         let current_source = match job {
             super::syntax::TranscriptSyntax::Diff(job) => {
-                matches!(open.action.get(&job.target), Some(TranscriptAction::Diff { text, syntax: true }) if text == &job.text)
+                matches!(open.action.get(&job.target), Some(TranscriptAction::Diff { text, syntax: true, .. }) if text == &job.text)
             }
             super::syntax::TranscriptSyntax::Markdown(job) => {
                 open.syntax.get(&job.target) == Some(job)
@@ -929,15 +953,21 @@ impl SessionPresentation {
 
     pub fn action(&mut self, input: DocumentInput) -> Result<TranscriptAction> {
         let open = self.validate_input(&input)?;
-        open.action
-            .get(
-                input
-                    .target
-                    .as_ref()
-                    .context("transcript input has no action")?,
-            )
-            .cloned()
-            .context("transcript target is not actionable")
+        let target = input
+            .target
+            .as_ref()
+            .context("transcript input has no action")?;
+        let action = open
+            .diff
+            .action(target)
+            .or_else(|| open.action.get(target).cloned())
+            .context("transcript target is not actionable")?;
+        if matches!(action, TranscriptAction::File { .. })
+            && let Some(captured) = diff_view::captured_file_action(open, &input.block)
+        {
+            return Ok(captured);
+        }
+        Ok(action)
     }
 
     fn validate_input(&mut self, input: &DocumentInput) -> Result<&mut OpenPresentation> {
@@ -1252,6 +1282,8 @@ fn syntax_pending(open: &OpenPresentation) -> bool {
     open.action.iter().any(|(target, action)| {
         matches!(action, TranscriptAction::Diff { syntax: true, .. })
             && !open.syntax_done.contains(target)
+            && !open.diff.root.contains_key(target)
+            && open.sections.expansion(&target.0) == Some(true)
     }) || open
         .syntax
         .keys()
@@ -1629,6 +1661,7 @@ fn reflow(
         if open.entry.contains_key(&entry.entry.id) {
             entry.require_workspace_preview()?;
         }
+        open.diff.overlay(&mut entry)?;
         if !unsettled.contains(&entry.entry.id) {
             settle_responses(&mut entry);
         }
@@ -1950,6 +1983,7 @@ fn apply_projection<'operation>(
                 if open.entry.contains_key(&entry.entry.id) {
                     entry.require_workspace_preview()?;
                 }
+                open.diff.overlay(&mut entry)?;
                 if !unsettled.contains(&entry.entry.id) {
                     settle_responses(&mut entry);
                 }
@@ -3135,6 +3169,35 @@ mod tests {
         Ok(())
     }
 
+    fn expand_saved_diff(owner: &mut SessionPresentation, view: &str) -> Result<()> {
+        let open = owner
+            .open
+            .as_mut()
+            .context("fixture presentation is closed")?;
+        let root = open
+            .action
+            .iter()
+            .filter_map(|(target, action)| {
+                matches!(action, TranscriptAction::Diff { .. }).then_some(target.0.clone())
+            })
+            .collect::<Vec<_>>();
+        ensure!(!root.is_empty(), "fixture has no saved diff");
+        for (index, root) in root.iter().enumerate() {
+            open.sections.set(
+                &mut open.transcript,
+                crate::buffer::sections::SectionRequest {
+                    view: ViewId(view.into()),
+                    sequence: index as u64 + 1,
+                    id: root,
+                    expanded: true,
+                    more: false,
+                    page: None,
+                },
+            )?;
+        }
+        retain_patches(open, Vec::new())
+    }
+
     fn expand_sections(owner: &mut SessionPresentation, view: &str) -> Result<()> {
         let open = owner.open.as_mut().unwrap();
         let ids: Vec<_> = open
@@ -4271,6 +4334,468 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn timeline_semantic_controls_retain_captured_sources_and_lazy_native_nodes() -> Result<()>
+    {
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use forge_diff::{engine::DiffEngine, syntax::SyntaxEngine};
+        let data = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        let before = "pub fn visible() {\n    previous();\n}\nfn hidden() { old_private(); }\n";
+        let after = before
+            .replace("previous", "updated")
+            .replace("old_private", "new_private");
+        let saved_after = after.clone();
+        let saved_workspace = workspace.path().to_owned();
+        let saved_data = data.path().to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            ensure!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&saved_workspace).status()?.success(), "fixture git initialization failed");
+            let mut store = crate::storage::SqliteStore::open(&saved_data)?;
+            let connection = rusqlite::Connection::open(saved_data.join("harness.sqlite3"))?;
+            connection.execute("INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES('session', ?1, 0, '{}')", [saved_workspace.to_string_lossy().as_ref()])?;
+            for (id, text) in [("before", before), ("after", saved_after.as_str())] {
+                store.save_checkpoint(&crate::checkpoint::CheckpointRecord {
+                    id: id.into(), session_id: "session".into(), workspace: saved_workspace.to_string_lossy().into_owned(), head: "UNBORN".into(), tree: None,
+                    file: vec![crate::checkpoint::CheckpointFile { path: "source.rs".into(), object_id: store.objects.put(text.as_bytes())?, mode: 0o100644 }],
+                    deleted: Vec::new(), checkout: Default::default(), excluded: Default::default(), created_at_ms: 0,
+                })?;
+            }
+            Ok(())
+        }).await??;
+        let patch = format!(
+            "--- a/source.rs\n+++ b/source.rs\n@@ -1,4 +1,4 @@\n{}{}",
+            before
+                .lines()
+                .map(|row| format!("-{row}\n"))
+                .collect::<String>(),
+            after
+                .lines()
+                .map(|row| format!("+{row}\n"))
+                .collect::<String>()
+        );
+        let mut entry = interaction_entry("semantic-inline");
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+            unreachable!()
+        };
+        exchange.checkpoint_before = Some("before".into());
+        exchange.checkpoint_after = Some("after".into());
+        exchange.checkpoint_diff_text = Some(patch);
+        let document = DocumentId("timeline:semantic".into());
+        let view = ViewId("timeline:semantic:view".into());
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![entry.clone()])?;
+        let initial = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let presentation = std::sync::Arc::new(std::sync::Mutex::new(owner));
+        let diff = DiffEngine::new(Default::default(), 2);
+        let syntax = SyntaxEngine::new(diff.analysis_pool());
+        let mut sequence = 0;
+        let mut transition = Vec::new();
+        for selector in [
+            "changes", "file", "semantic", "public", "visible", "full", "all",
+        ] {
+            sequence += 1;
+            let frame = presentation.lock().unwrap().snapshot(&document)?;
+            let request = if selector == "semantic"
+                || selector == "public"
+                || selector == "full"
+                || selector == "all"
+            {
+                let block = frame
+                    .block
+                    .iter()
+                    .find(|block| {
+                        block
+                            .metadata
+                            .node
+                            .as_ref()
+                            .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::File)
+                    })
+                    .context("missing native file heading")?;
+                PresentationRequest::DiffInput {
+                    input: DocumentInput {
+                        document: document.clone(),
+                        revision: frame.revision,
+                        view: view.clone(),
+                        sequence: InputSequence(sequence),
+                        action: if selector == "semantic" || selector == "full" {
+                            "toggle_presentation".into()
+                        } else {
+                            "toggle_visibility".into()
+                        },
+                        block: block.id.clone(),
+                        position: forge_buffer::block::TextPosition { row: 0, column: 0 },
+                        target: block
+                            .metadata
+                            .target
+                            .first()
+                            .map(|target| target.id.clone()),
+                    },
+                }
+            } else {
+                let node = frame
+                    .block
+                    .iter()
+                    .find_map(|block| {
+                        block.metadata.node.as_ref().filter(|node| match selector {
+                            "changes" => node.kind == forge_buffer::node::NodeKind::Changes,
+                            "file" => node.kind == forge_buffer::node::NodeKind::File,
+                            "visible" => block
+                                .text
+                                .row(0)
+                                .is_some_and(|text| text.contains("pub fn visible()")),
+                            _ => false,
+                        })
+                    })
+                    .context("missing native expansion node")?;
+                PresentationRequest::Node {
+                    request: NodeRequest {
+                        document: document.clone(),
+                        view: view.clone(),
+                        sequence,
+                        node: node.id.0.clone(),
+                        generation: node.generation,
+                        action: NodeAction::SetExpansion { expanded: true },
+                        rows: 80,
+                        width: WidthProfile::default(),
+                    },
+                }
+            };
+            let revision = frame.revision;
+            let result = diff_view::update(
+                presentation.clone(),
+                &request,
+                data.path().to_owned(),
+                diff.clone(),
+                syntax.clone(),
+            )
+            .await?
+            .context("timeline diff input was not handled")?;
+            let frame = presentation.lock().unwrap().snapshot(&document)?;
+            let text = frame
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if selector == "changes" {
+                assert!(!text.contains("updated();"));
+                assert_eq!(syntax.usage().active_jobs, 0);
+                std::fs::write(
+                    workspace.path().join("source.rs"),
+                    "unrelated later worktree content\n",
+                )?;
+            }
+            if selector == "semantic" {
+                assert!(text.contains("pub fn visible()"));
+                assert!(!text.contains("updated();"));
+            }
+            if selector == "public" || selector == "visible" || selector == "full" {
+                assert!(!text.contains("hidden"));
+            }
+            if selector == "visible" || selector == "full" || selector == "all" {
+                assert!(text.contains("updated();"));
+            }
+            if selector == "all" {
+                assert!(text.contains("new_private();"));
+            }
+            assert!(!text.contains("unrelated later worktree"));
+            let synchronized = presentation.lock().unwrap().sync(&document, revision)?;
+            transition.push(serde_json::json!({"step":selector,"result":result,"expected":frame,"sync":synchronized}));
+        }
+        {
+            let mut owner = presentation.lock().unwrap();
+            let snapshot = owner.snapshot(&document)?;
+            owner.dispatch(PresentationRequest::Resize {
+                document: document.clone(),
+                view: view.clone(),
+                width: WidthProfile {
+                    columns: 120,
+                    ..Default::default()
+                },
+            })?;
+            assert_eq!(
+                owner.open.as_ref().unwrap().diff.view.committed(),
+                forge_diff::view::DiffViewOptions::default()
+            );
+            let resized = owner.snapshot(&document)?;
+            assert!(resized.block.iter().any(|block| {
+                block
+                    .text
+                    .row(0)
+                    .is_some_and(|text| text.contains("updated();"))
+            }));
+            let recovered = owner.dispatch(PresentationRequest::Snapshot { document })?;
+            assert_eq!(
+                recovered["diff_view"],
+                serde_json::json!({"presentation":"full","visibility":"all"})
+            );
+            std::fs::write(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/timeline-semantic-fixture.json"),
+                serde_json::to_vec(
+                    &serde_json::json!({"initial":initial,"transition":transition,"before_resize":snapshot,"resized":resized}),
+                )?,
+            )?;
+        }
+        let frame = presentation
+            .lock()
+            .unwrap()
+            .snapshot(&DocumentId("timeline:semantic".into()))?;
+        let heading = frame
+            .block
+            .iter()
+            .find(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::File)
+            })
+            .unwrap();
+        let public = PresentationRequest::DiffInput {
+            input: DocumentInput {
+                document: frame.document.clone(),
+                revision: frame.revision,
+                view: ViewId("timeline:semantic:view".into()),
+                sequence: InputSequence(8),
+                action: "toggle_visibility".into(),
+                block: heading.id.clone(),
+                position: forge_buffer::block::TextPosition { row: 0, column: 0 },
+                target: heading
+                    .metadata
+                    .target
+                    .first()
+                    .map(|target| target.id.clone()),
+            },
+        };
+        diff_view::update(
+            presentation.clone(),
+            &public,
+            data.path().to_owned(),
+            diff.clone(),
+            syntax.clone(),
+        )
+        .await?;
+        let later = format!(
+            "pub fn visible() {{\n{}}}\nfn hidden() {{ later_private(); }}\n",
+            (0..700)
+                .map(|index| format!("    later_public_{index}();\n"))
+                .collect::<String>()
+        );
+        let mut store = crate::storage::SqliteStore::open(data.path())?;
+        store.save_checkpoint(&crate::checkpoint::CheckpointRecord {
+            id: "after-next".into(),
+            session_id: "session".into(),
+            workspace: workspace.path().to_string_lossy().into_owned(),
+            head: "UNBORN".into(),
+            tree: None,
+            file: vec![crate::checkpoint::CheckpointFile {
+                path: "source.rs".into(),
+                object_id: store.objects.put(later.as_bytes())?,
+                mode: 0o100644,
+            }],
+            deleted: Vec::new(),
+            checkout: Default::default(),
+            excluded: Default::default(),
+            created_at_ms: 0,
+        })?;
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+            unreachable!()
+        };
+        exchange.checkpoint_after = Some("after-next".into());
+        exchange.checkpoint_diff_text = Some(format!(
+            "--- a/source.rs\n+++ b/source.rs\n@@ -1,4 +1,{} @@\n{}{}",
+            later.lines().count(),
+            before
+                .lines()
+                .map(|row| format!("-{row}\n"))
+                .collect::<String>(),
+            later
+                .lines()
+                .map(|row| format!("+{row}\n"))
+                .collect::<String>()
+        ));
+        presentation.lock().unwrap().reconcile(vec![entry])?;
+        let frame = presentation
+            .lock()
+            .unwrap()
+            .snapshot(&DocumentId("timeline:semantic".into()))?;
+        assert!(
+            frame
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .any(|text| text.contains("updated();"))
+        );
+        assert!(
+            diff_view::update(
+                presentation.clone(),
+                &PresentationRequest::Sync {
+                    document: frame.document.clone(),
+                    revision: frame.revision
+                },
+                data.path().to_owned(),
+                diff.clone(),
+                syntax.clone()
+            )
+            .await?
+            .is_none()
+        );
+        let frame = presentation
+            .lock()
+            .unwrap()
+            .snapshot(&DocumentId("timeline:semantic".into()))?;
+        let node = frame
+            .block
+            .iter()
+            .find_map(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .filter(|node| node.kind == forge_buffer::node::NodeKind::File)
+            })
+            .unwrap();
+        let expansion = PresentationRequest::Node {
+            request: NodeRequest {
+                document: frame.document,
+                view: ViewId("timeline:semantic:view".into()),
+                sequence: 9,
+                node: node.id.0.clone(),
+                generation: node.generation,
+                action: NodeAction::SetExpansion { expanded: true },
+                rows: 80,
+                width: WidthProfile::default(),
+            },
+        };
+        diff_view::update(
+            presentation.clone(),
+            &expansion,
+            data.path().to_owned(),
+            diff.clone(),
+            syntax.clone(),
+        )
+        .await?;
+        let frame = presentation
+            .lock()
+            .unwrap()
+            .snapshot(&DocumentId("timeline:semantic".into()))?;
+        let text = frame
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("later_public"));
+        assert!(!text.contains("later_private"));
+        let mut sequence = 9;
+        for semantic in [false, true] {
+            if semantic {
+                let frame = presentation
+                    .lock()
+                    .unwrap()
+                    .snapshot(&DocumentId("timeline:semantic".into()))?;
+                let heading = frame
+                    .block
+                    .iter()
+                    .find(|block| {
+                        block
+                            .metadata
+                            .node
+                            .as_ref()
+                            .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::File)
+                    })
+                    .unwrap();
+                sequence += 1;
+                diff_view::update(
+                    presentation.clone(),
+                    &PresentationRequest::DiffInput {
+                        input: DocumentInput {
+                            document: frame.document,
+                            revision: frame.revision,
+                            view: ViewId("timeline:semantic:view".into()),
+                            sequence: InputSequence(sequence),
+                            action: "toggle_presentation".into(),
+                            block: heading.id.clone(),
+                            position: forge_buffer::block::TextPosition { row: 0, column: 0 },
+                            target: heading
+                                .metadata
+                                .target
+                                .first()
+                                .map(|target| target.id.clone()),
+                        },
+                    },
+                    data.path().to_owned(),
+                    diff.clone(),
+                    syntax.clone(),
+                )
+                .await?;
+            }
+            let mut previous = String::new();
+            loop {
+                let frame = presentation
+                    .lock()
+                    .unwrap()
+                    .snapshot(&DocumentId("timeline:semantic".into()))?;
+                let text = frame
+                    .block
+                    .iter()
+                    .flat_map(|block| block.text.wire_rows())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(!text.contains("later_private"));
+                if text.contains("later_public_699();") {
+                    break;
+                }
+                ensure!(text != previous, "timeline source paging did not advance");
+                previous = text;
+                let node = frame
+                    .block
+                    .iter()
+                    .filter_map(|block| block.metadata.node.as_ref())
+                    .find(|node| {
+                        node.more
+                            && (node.kind == forge_buffer::node::NodeKind::File
+                                || semantic && node.kind == forge_buffer::node::NodeKind::Group)
+                    })
+                    .context("source continuation is missing")?;
+                sequence += 1;
+                let action = if node.display == forge_buffer::node::NodeDisplay::Heading {
+                    NodeAction::SetExpansion { expanded: true }
+                } else {
+                    NodeAction::LoadMore
+                };
+                diff_view::update(
+                    presentation.clone(),
+                    &PresentationRequest::Node {
+                        request: NodeRequest {
+                            document: frame.document,
+                            view: ViewId("timeline:semantic:view".into()),
+                            sequence,
+                            node: node.id.0.clone(),
+                            generation: node.generation,
+                            action,
+                            rows: 80,
+                            width: WidthProfile::default(),
+                        },
+                    },
+                    data.path().to_owned(),
+                    diff.clone(),
+                    syntax.clone(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "timeline paging semantic={semantic} sequence={sequence} node={} rows={}",
+                        node.id.0,
+                        frame.block.len()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn workspace_result_replacement_preserves_expansion_and_navigation() -> Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
@@ -4841,7 +5366,7 @@ mod tests {
                 .action
                 .values()
                 .any(|action| matches!(
-                    action, TranscriptAction::Diff { text, syntax: false } if text == source
+                    action, TranscriptAction::Diff { text, syntax: false, .. } if text == source
                 ))
         );
         let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
@@ -4854,6 +5379,8 @@ mod tests {
         };
         change.diff_text = source.replace("+outside\n", "");
         owner.reconcile(vec![entry])?;
+        assert!(owner.capture_syntax(&document)?.is_none());
+        expand_saved_diff(&mut owner, "invalid-diff")?;
         assert!(owner.capture_syntax(&document)?.is_some());
         Ok(())
     }
@@ -4899,6 +5426,11 @@ mod tests {
             ViewId("syntax".into()),
             WidthProfile::default(),
         )?;
+        assert!(
+            owner.capture_syntax(&document)?.is_none(),
+            "closed diff scheduled syntax work"
+        );
+        expand_saved_diff(&mut owner, "syntax")?;
         let job = owner.capture_syntax(&document)?.expect("saved diff work");
         let blocks = job.analyze(&engine).await?;
         let block_id = blocks[0].id.clone();

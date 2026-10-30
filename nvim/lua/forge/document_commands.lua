@@ -135,8 +135,14 @@ function M.attach(session, options)
   local normalize_gutter = options.view == "diff" or options.view == "status"
   local handler = vim.tbl_extend("force", {
     toggle = function()
-      require("forge.nodes").toggle_heading(session, vim.api.nvim_get_current_win())
-      if options.changed then options.changed() end
+      local notified = false
+      require("forge.nodes").toggle_heading(session, vim.api.nvim_get_current_win(), {
+        on_toggled = function(identity, closed)
+          notified = true
+          if options.changed then options.changed(identity, closed) end
+        end,
+      })
+      if not notified and options.changed then options.changed() end
     end,
     collapse_parent = function()
       require("forge.nodes").collapse_parent(session, vim.api.nvim_get_current_win())
@@ -166,7 +172,8 @@ function M.attach(session, options)
   function owner.sync_editing()
     if not options.editable or owner.closed then return end
     local editing = options.editable()
-    local keep = { browse = true, sync = true, toggle = true, collapse_parent = true, close = true, help = true }
+    local keep = { browse = true, sync = true, toggle = true, collapse_parent = true, close = true, help = true,
+      toggle_visibility = true, toggle_presentation = true }
     for _, mapping in ipairs(owner.mapping) do
       local active = not editing or keep[mapping.command] == true
       if mapping.active ~= active then
@@ -203,6 +210,13 @@ function M.attach(session, options)
   end
   local function update_winbar()
     if owner.closed or options.winbar == false or #hint == 0 then return end
+    local diff_view = options.diff_view and options.diff_view()
+    if diff_view then
+      for _, entry in ipairs(hint) do
+        if entry.id == "toggle_visibility" then entry.label = diff_view.visibility == "public" and "Public" or "All"
+        elseif entry.id == "toggle_presentation" then entry.label = diff_view.presentation == "semantic" and "Semantic" or "Full" end
+      end
+    end
     for window in pairs(owner.window) do
       if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= session.buffer then owner.release_window(window) end
     end
@@ -224,6 +238,7 @@ function M.attach(session, options)
       end
     end
   end
+  owner.refresh = update_winbar
   vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "WinEnter", "WinResized" }, { group = group, callback = update_winbar })
   vim.api.nvim_create_autocmd("BufWinLeave", { group = group, buffer = session.buffer,
     callback = function() owner.release_window(vim.api.nvim_get_current_win()) end })

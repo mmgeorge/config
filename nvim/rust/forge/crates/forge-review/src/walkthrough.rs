@@ -14,6 +14,7 @@ use forge_buffer::{
     view::DocumentViews,
     width::WidthProfile,
 };
+use forge_diff::view::{DiffCapabilities, DiffViewState, DiffVisibility};
 use forge_git::{
     content::{ContentOrigin, ContentSource, WorktreeConversion},
     repository::RepositoryState,
@@ -55,6 +56,7 @@ struct WalkthroughDocument {
     annotation: HashMap<DocumentId, WalkthroughAnnotation>,
 }
 struct WalkthroughAnnotation {
+    diff_view: DiffViewState,
     buffer: BufferDocument,
     content: schema::Annotation,
     anchor: String,
@@ -380,6 +382,7 @@ impl WalkthroughService {
             document.annotation.insert(
                 annotation_document,
                 WalkthroughAnnotation {
+                    diff_view: DiffViewState::new(DiffCapabilities::Source, DiffVisibility::All),
                     buffer: annotation_buffer,
                     content: annotation,
                     anchor,

@@ -101,7 +101,7 @@ local function relative_file_path(session, snapshot, path)
   local workspace = context and context.workspace or session.workspace
   if type(workspace) ~= "string" or type(session.display_cwd) ~= "string" then return path end
   local absolute = vim.fs.normalize(vim.fs.joinpath(workspace, path), { expand_env = false })
-  local base, parents = session.display_cwd, 0
+  local base, parents = vim.fs.normalize(session.display_cwd, { expand_env = false }), 0
   local windows = vim.fn.has("win32") == 1
   local comparison = windows and absolute:lower() or absolute
   while true do
@@ -517,6 +517,7 @@ local function delta_snapshot(inventory, delta)
     snapshot.context = optional(delta.context) or snapshot.context
     snapshot.head = optional(delta.head) or snapshot.head
     snapshot.pending = delta.pending or {}
+    snapshot.diff_view = optional(delta.diff_view) or snapshot.diff_view
     return snapshot
 end
 
@@ -537,42 +538,69 @@ end
 ---@param update table
 ---@return table
 function M.apply_update(session, update)
-  local owner = history.owner(session, update.document)
-  if session.status == "Closed" or update.document ~= session.document and not owner then return { kind = "Discarded" } end
-  if owner and not owner.snapshot then return { kind = "Discarded" } end
-  local source = owner and owner.snapshot or session.inventory
-  if update.delta.next <= source.revision then return { kind = "Discarded" } end
-  local previous_file = session.file
-  local previous_snapshot = owner and owner.snapshot
-  local candidate_file
+  return M.apply_updates(session, { update })
+end
+
+---@param session ForgeStatusReplica
+---@param updates table[] Native transactions and queued events in revision order.
+---@return table
+function M.apply_updates(session, updates)
+  if session.status == "Closed" then return { kind = "Discarded" } end
+  local previous_file, previous_inventory = session.file, session.inventory
+  local previous_snapshot, candidate_file = {}, nil
   local ok, result = pcall(function()
-    local snapshot = delta_snapshot(source, update.delta)
-    if owner then owner.snapshot = snapshot end
+    local inventory = previous_inventory
     local file = vim.tbl_extend("force", {}, previous_file)
     candidate_file = file
-    local record = {}
-    for _, value in ipairs(snapshot.file) do record[owner and history.file_key(owner, value.id) or value.id] = value end
-    for _, native_delivery in ipairs(update.body) do
-      local delivery = history.delivery(session, native_delivery)
-      local value = assert(record[delivery.file], "status update body has no file")
-      assert(delivery.generation == value.generation, "status update body generation differs")
-      assert(delivery.snapshot and delivery.snapshot.document == "body:" .. identity_text(delivery.file) .. ":" .. identity_text(delivery.generation), "status update body identity differs")
-      local previous = file[delivery.file]
-      local body = previous and previous.record.generation == value.generation and previous.body
-      file[delivery.file] = { record = value,
-        body = body and body.revision >= delivery.snapshot.revision and body or buffer.fragment(delivery.snapshot),
-        recovering = previous and previous.record.generation == value.generation and previous.recovering or nil }
+    local adopted = 0
+    for _, update in ipairs(updates) do
+      local owner = history.owner(session, update.document)
+      local source = owner and owner.snapshot or update.document == session.document and inventory
+      if source and update.delta.next > source.revision then
+        local snapshot = delta_snapshot(source, update.delta)
+        if owner then
+          if previous_snapshot[owner] == nil then previous_snapshot[owner] = owner.snapshot end
+          owner.snapshot = snapshot
+        else inventory = snapshot end
+        local record = {}
+        for _, value in ipairs(snapshot.file) do record[owner and history.file_key(owner, value.id) or value.id] = value end
+        for _, native_delivery in ipairs(update.body) do
+          local delivery = history.delivery(session, native_delivery)
+          local value = assert(record[delivery.file], "status update body has no file")
+          assert(delivery.generation == value.generation, "status update body generation differs")
+          local previous = file[delivery.file]
+          local body = previous and previous.record.generation == value.generation and previous.body
+          local document = "body:" .. identity_text(delivery.file) .. ":" .. identity_text(delivery.generation)
+          if optional(delivery.snapshot) then
+            assert(delivery.snapshot.document == document, "status update body identity differs")
+            if not body or body.revision < delivery.snapshot.revision then body = buffer.fragment(delivery.snapshot) end
+          elseif optional(delivery.patch) then
+            local patch = delivery.patch
+            assert(patch.document == document, "status update body identity differs")
+            assert(body, "status update patch has no retained body")
+            if body.revision < patch.next then
+              assert(body.revision == patch.base, "status update body revision differs")
+              local prepared = buffer.prepare_fragment_patch(body, patch)
+              body = buffer.fork_fragment(body)
+              buffer.apply_fragment_patch(body, patch, prepared)
+            end
+          end
+          file[delivery.file] = { record = value, body = body,
+            recovering = previous and previous.record.generation == value.generation and previous.recovering or nil }
+        end
+        adopted = adopted + 1
+      end
     end
+    if adopted == 0 then return { kind = "Discarded" } end
     session.file = file
-    local prepared = prepare(session, owner and session.inventory or snapshot)
+    local prepared = prepare(session, inventory)
     session.file = previous_file
     local buffer_us, edits = adopt(session, prepared)
-    trace(session, "status.optimistic.applied", { operation = update.operation_id, phase = update.phase, edits = #edits, buffer_us = buffer_us,
-      native_us = update.elapsed_us, files = #update.delta.file, bodies = #update.body, pending = #update.delta.pending })
+    trace(session, "status.optimistic.applied", { updates = adopted, edits = #edits, buffer_us = buffer_us })
     return { kind = "Applied", revision = session.revision }
   end)
   if not ok then
-    if owner then owner.snapshot = previous_snapshot end
+    for owner, snapshot in pairs(previous_snapshot) do owner.snapshot = snapshot end
     if session.file == candidate_file then session.file = previous_file end
     return buffer.fail_apply(session, result)
   end
@@ -680,7 +708,7 @@ function M.capture(session, view, action, selection)
   end
   if not location then return nil, "status row has no target" end
   local model = session.file[location.kind == "file" and location.id or location.file]
-  if model and model.owner and action ~= "open" and action ~= "navigate" and action ~= "demand" then
+  if model and model.owner and action ~= "open" and action ~= "navigate" and action ~= "demand" and action ~= "source_expand" and action ~= "source_collapse" then
     return nil, "Historical commit diffs are read-only"
   end
   assert(view.sequence < maximum, "input sequence exhausted")

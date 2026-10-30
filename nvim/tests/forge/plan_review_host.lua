@@ -53,6 +53,19 @@ local success, failure = xpcall(function()
   local comments = require("forge.draft_comments")
   local rendered = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
   assert(rendered:find("src/change.rs", 1, true) and rendered:find("requested_change", 1, true))
+  assert(review.public_only and review.owner.public_only, "PlanReview did not start Public")
+  local visibility = vim.fn.maparg("ov", "n", false, true)
+  assert(visibility.buffer == 1 and visibility.callback, "PlanReview did not bind ov")
+  assert(vim.fn.maparg("ox", "n", false, true).buffer ~= 1,
+    "Semantic-only PlanReview exposed a presentation toggle")
+  visibility.callback()
+  await(function() return review.public_only == false and review.owner.public_only == false end,
+    "ov did not publish All visibility")
+  visibility.callback()
+  await(function() return review.public_only == true and review.owner.public_only == true end,
+    "ov did not restore Public visibility")
+  assert(vim.deep_equal(vim.fn.readfile(plan.working_path, "b"), canonical),
+    "diff controls changed the saved plan")
   local owner, window, tab = review.owner, review.win, review.tab
   local trace_status
   client.request({ session_id = review.session_id, method = "host.trace.configure", params = { enabled = true } }, function(result, failure)
@@ -159,7 +172,7 @@ local success, failure = xpcall(function()
     if method == "session.plan.acceptance.begin" then submitted_capture = vim.deepcopy(params) end
     return original_request(request_specification, callback)
   end
-  review.owner.saving = true
+  review.owner.annotation_saving, review.owner.saving = true, true
   review.command_set.action_by_id.accept.run({})
   local decision_buf = vim.api.nvim_get_current_buf()
   local decision_mapping
@@ -168,7 +181,7 @@ local success, failure = xpcall(function()
   end
   assert(decision_mapping, "approval decision popup did not bind Enter")
   decision_mapping()
-  assert(review.owner.pending_operation and not submitted_capture)
+  assert(review.owner.pending_operation[1] and not submitted_capture)
   local original_document = review.owner.document
   local original_generation = client.host_get_generation()
   client.host_stop()

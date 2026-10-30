@@ -33,10 +33,13 @@ function M.owner(session, document)
 end
 
 local function metadata(owner, value)
+  if type(value.content_node) == "string" then value.content_node = owner.prefix .. value.content_node end
+  for _, section in ipairs(value.section or {}) do section.id = owner.prefix .. section.id end
   for _, target in ipairs(value.target or {}) do target.id = owner.prefix .. target.id end
   for _, fold in ipairs(value.fold or {}) do
     fold.id = owner.prefix .. fold.id
     fold["end"].block = owner.prefix .. fold["end"].block
+    if type(fold.heading_start) == "table" then fold.heading_start.block = owner.prefix .. fold.heading_start.block end
   end
 end
 

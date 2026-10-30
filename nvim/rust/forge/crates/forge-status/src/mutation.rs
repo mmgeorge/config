@@ -7,17 +7,17 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use forge_buffer::{
     block::{TargetRange, TextPosition},
-    identity::{BlockId, DocumentId, DocumentRevision, TargetId},
+    identity::{DocumentId, DocumentRevision, TargetId},
 };
 use forge_diff::{
     body::BodyKind,
     cache::AnalysisHandle,
-    display::DisplayCursor,
     edit::{AppliedEdit, EditDirection, EditSelection},
     engine::DiffRequest,
     raw::{RawHunkId, compute_hunks},
     source::{Representation, SourcePair, SourceVersion},
     syntax::{SyntaxHandle, SyntaxRequest},
+    view::DiffVisibility,
     workers::WorkPriority,
 };
 use forge_git::{
@@ -36,10 +36,10 @@ use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, broadcast, watch};
 
 use crate::{
-    BodyDelivery, BodyState, StatusInput, StatusLocation, StatusSection, StatusSelection,
-    StatusService,
+    BodyDelivery, StatusInput, StatusLocation, StatusSection, StatusSelection, StatusService,
     document::{FileTarget, StatusDocument},
     protocol::file_target,
+    selection::{SelectedSource, observed},
 };
 
 struct PreparedContext {
@@ -247,7 +247,10 @@ impl ProjectedIndex {
             IndexSource::Head => {
                 observed.change.unstaged_stats = self.original.change.staged_stats;
             }
-            IndexSource::Captured(_) => {}
+            IndexSource::Captured(_) => {
+                observed.change.staged_stats = LineStats::Unknown;
+                observed.change.unstaged_stats = LineStats::Unknown;
+            }
         }
         Ok(observed)
     }
@@ -331,51 +334,8 @@ impl ProjectedIndex {
 pub(crate) struct SelectionVersion {
     revision: DocumentRevision,
     file: HashMap<u64, SelectedSource>,
-    target: HashMap<TargetId, (u64, Vec<RawHunkId>)>,
-}
-
-#[derive(Clone)]
-struct SelectedSource {
-    observed: ObservedPath,
-    section: StatusSection,
-    analysis: Option<AnalysisHandle>,
-    generation: u64,
-    body_revision: Option<DocumentRevision>,
-    block: HashMap<BlockId, Vec<TargetRange>>,
-    hunk: HashMap<RawHunkId, TargetId>,
-    group: Vec<(crate::document::DisplayGroupTarget, Vec<RawHunkId>)>,
-}
-
-impl SelectedSource {
-    fn capture(file: &FileTarget, hunk: &HashMap<TargetId, crate::document::HunkTarget>) -> Self {
-        Self {
-            observed: observed(file),
-            section: file.section,
-            analysis: file.projection.analysis().cloned(),
-            generation: file.generation,
-            body_revision: file.body.as_ref().map(|body| body.revision()),
-            block: file
-                .body
-                .as_ref()
-                .map(|body| {
-                    body.snapshot()
-                        .block
-                        .into_iter()
-                        .map(|block| (block.id, block.metadata.target))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            hunk: file.hunk.clone(),
-            group: file
-                .group
-                .values()
-                .filter_map(|group| {
-                    hunk.get(&group.target)
-                        .map(|hunk| (group.clone(), hunk.raw.clone()))
-                })
-                .collect(),
-        }
-    }
+    target: HashMap<TargetId, (u64, Vec<RawHunkId>, Option<String>)>,
+    visibility: DiffVisibility,
 }
 
 impl SelectionVersion {
@@ -403,12 +363,15 @@ impl SelectionVersion {
             + self
                 .target
                 .values()
-                .map(|(_, raw)| 128 + raw.len() * 32)
+                .map(|(_, raw, declaration)| {
+                    128 + raw.len() * 32 + declaration.as_ref().map_or(0, String::capacity)
+                })
                 .sum::<usize>()
     }
     pub(crate) fn capture(document: &StatusDocument) -> Self {
         Self {
             revision: document.revision,
+            visibility: document.diff_view.committed().visibility,
             file: document
                 .file
                 .values()
@@ -418,10 +381,12 @@ impl SelectionVersion {
                 .hunk
                 .iter()
                 .filter_map(|(id, hunk)| {
-                    document
-                        .file
-                        .get(&hunk.file)
-                        .map(|file| (id.clone(), (file.id, hunk.raw.clone())))
+                    document.file.get(&hunk.file).map(|file| {
+                        (
+                            id.clone(),
+                            (file.id, hunk.raw.clone(), hunk.declaration.clone()),
+                        )
+                    })
                 })
                 .collect(),
         }
@@ -430,12 +395,12 @@ impl SelectionVersion {
     fn select(
         &self,
         location: &StatusLocation,
-        selected: &mut HashMap<u64, Option<HashSet<RawHunkId>>>,
+        selected: &mut HashMap<u64, crate::selection::ChangeSelection>,
     ) -> Result<()> {
         match location {
             StatusLocation::File { id } => {
                 ensure!(self.file.contains_key(id), "selected file expired");
-                selected.insert(*id, None);
+                selected.entry(*id).or_default().whole = true;
             }
             StatusLocation::Section { section } => {
                 for (id, file) in &self.file {
@@ -443,7 +408,7 @@ impl SelectionVersion {
                         || (*section == StatusSection::Unstaged
                             && file.section == StatusSection::Untracked)
                     {
-                        selected.insert(*id, None);
+                        selected.entry(*id).or_default().whole = true;
                     }
                 }
             }
@@ -474,17 +439,15 @@ impl SelectionVersion {
                     target.as_ref().is_none_or(|target| target == &actual.id),
                     "selected hunk target differs from its row"
                 );
-                let (owner, raw) = self
+                let (owner, raw, declaration) = self
                     .target
                     .get(&actual.id)
                     .context("selected row is not a hunk")?;
                 ensure!(*owner == *file, "selected hunk belongs to another file");
-                if !selected.contains_key(file) {
-                    selected.insert(*file, Some(HashSet::new()));
-                }
-                if let Some(Some(selected)) = selected.get_mut(file) {
-                    selected.extend(raw);
-                }
+                selected
+                    .entry(*file)
+                    .or_default()
+                    .include(raw, declaration.as_deref());
             }
             _ => anyhow::bail!("selected status row has no changes"),
         }
@@ -496,15 +459,6 @@ fn contains(target: &TargetRange, position: TextPosition) -> bool {
     let position = (position.row, position.column);
     (target.range.start.row, target.range.start.column) <= position
         && position < (target.range.end.row, target.range.end.column)
-}
-
-fn observed(file: &FileTarget) -> ObservedPath {
-    ObservedPath {
-        change: file.record.clone(),
-        worktree: file.stamp.clone(),
-        origin: file.origin_stamp.clone(),
-        analysis: Default::default(),
-    }
 }
 
 fn empty() -> SourceVersion {
@@ -645,7 +599,7 @@ impl StatusService {
     ) -> Result<(StatusActionAccepted, StatusOperationTicket)> {
         let started = Instant::now();
         let owner = self.get(&input.document)?;
-        let (repository, head, version) = {
+        let (repository, head, mut version) = {
             let mut document = owner.lock().await;
             document._admission.check()?;
             input.validate()?;
@@ -690,6 +644,16 @@ impl StatusService {
         } else {
             version.select(&input.location, &mut selected)?;
         }
+        for (id, selected) in &selected {
+            if selected.requires_comparison(version.visibility) {
+                version
+                    .file
+                    .get_mut(id)
+                    .context("selected source expired")?
+                    .prepare_comparison(self, &repository, selected.whole)
+                    .await?;
+            }
+        }
         let worktree = repository
             .identity
             .worktree
@@ -727,23 +691,21 @@ impl StatusService {
             {
                 continue;
             }
-            let mut edit = raw
-                .map(|selected| {
-                    EditSelection::capture(
-                        source
-                            .analysis
-                            .as_ref()
-                            .context("selected hunk analysis expired")?,
-                        &selected.into_iter().collect::<Vec<_>>(),
-                        if stage {
-                            EditDirection::Forward
-                        } else {
-                            EditDirection::Reverse
-                        },
-                    )
-                    .map_err(anyhow::Error::from)
-                })
-                .transpose()?;
+            let mut edit = if let Some(analysis) = &source.analysis {
+                raw.capture(
+                    analysis,
+                    source.comparison.as_deref(),
+                    version.visibility,
+                    if stage {
+                        EditDirection::Forward
+                    } else {
+                        EditDirection::Reverse
+                    },
+                )?
+            } else {
+                ensure!(raw.whole, "selected hunk analysis expired");
+                None
+            };
             if let Some(selected) = &mut edit
                 && let Some(projected) = state.projected.get(&source.observed.change.path)
                 && let Some(pair) =
@@ -1044,6 +1006,18 @@ impl StatusService {
             let before = SelectionVersion::capture(&document);
             let before_snapshot = document.snapshot();
             let revision = document.revision;
+            let mut expansion: HashMap<_, _> = document
+                .file
+                .values()
+                .filter_map(|file| {
+                    file.source_view.as_ref().map(|view| {
+                        (
+                            (file.record.path.clone(), file.section),
+                            view.expansion_state(),
+                        )
+                    })
+                })
+                .collect();
             let loaded: HashMap<_, _> = document
                 .file
                 .values()
@@ -1073,6 +1047,8 @@ impl StatusService {
                 .values()
                 .map(|file| (file.record.path.clone(), observed(file)))
                 .collect();
+            let mut source_statistics = HashMap::new();
+            let mut source_analysis = HashMap::new();
             for path in affected {
                 if document
                     .local_path
@@ -1082,7 +1058,36 @@ impl StatusService {
                     continue;
                 }
                 if let Some(projected) = journal.projected.get(path) {
-                    observation.insert(path.clone(), projected.record(hash)?);
+                    let mut observed = projected.record(hash)?;
+                    for section in [StatusSection::Staged, StatusSection::Unstaged] {
+                        if let Some(source) = projected.captured_sources(section) {
+                            let analysis = self
+                                .diff
+                                .compare(DiffRequest {
+                                    source,
+                                    priority: WorkPriority::Foreground,
+                                })
+                                .await
+                                .map_err(|error| {
+                                    anyhow::anyhow!("projected line counts unavailable: {error:?}")
+                                })?;
+                            let counts = analysis.line_counts();
+                            let statistics = LineStats::Exact {
+                                added: counts.added,
+                                deleted: counts.deleted,
+                            };
+                            if section == StatusSection::Staged {
+                                observed.change.staged_stats = statistics;
+                            } else {
+                                observed.change.unstaged_stats = statistics;
+                            }
+                            source_statistics.insert((path.clone(), section), statistics);
+                            if loaded.contains_key(path) {
+                                source_analysis.insert((path.clone(), section), analysis);
+                            }
+                        }
+                    }
+                    observation.insert(path.clone(), observed);
                 } else if let Some(confirmed) = journal.confirmed.get(path) {
                     let mut confirmed = confirmed.clone();
                     if let Some(previous) = observation.get(path) {
@@ -1115,6 +1120,13 @@ impl StatusService {
                 context,
                 ignored,
             )?;
+            for file in document.file.values_mut() {
+                if let Some(statistics) =
+                    source_statistics.get(&(file.record.path.clone(), file.section))
+                {
+                    file.retain_statistics(*statistics);
+                }
+            }
             document.pending = journal
                 .pending
                 .iter()
@@ -1151,16 +1163,23 @@ impl StatusService {
                 {
                     continue;
                 }
-                let analysis = self
-                    .diff
-                    .compare(DiffRequest {
-                        source,
-                        priority: WorkPriority::Foreground,
-                    })
-                    .await
-                    .map_err(|error| anyhow::anyhow!("optimistic diff unavailable: {error:?}"))?;
+                let analysis =
+                    match source_analysis.remove(&(file.record.path.clone(), file.section)) {
+                        Some(analysis) => analysis,
+                        None => self
+                            .diff
+                            .compare(DiffRequest {
+                                source,
+                                priority: WorkPriority::Foreground,
+                            })
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!("optimistic diff unavailable: {error:?}")
+                            })?,
+                    };
                 let (id, mut file) = entry.remove_entry();
-                let result = (|| -> Result<BodyDelivery> {
+                let result = async {
+                    let previous_view = file.source_view.take();
                     reset_body(&mut document, &mut file)?;
                     file.old_syntax = syntax
                         .iter()
@@ -1175,25 +1194,37 @@ impl StatusService {
                         added: counts.added,
                         deleted: counts.deleted,
                     };
-                    if file.section == StatusSection::Staged {
-                        file.record.staged_stats = stats;
-                    } else {
-                        file.record.unstaged_stats = stats;
+                    file.retain_statistics(stats);
+                    file.source_view = Some(match previous_view {
+                        Some(previous) => previous.replace_source(
+                            analysis.clone(),
+                            file.old_syntax.clone(),
+                            file.new_syntax.clone(),
+                        ),
+                        None => forge_diff::source_projection::SourceDiffProjection::new(
+                            analysis.clone(),
+                            file.old_syntax.clone(),
+                            file.new_syntax.clone(),
+                            Default::default(),
+                        ),
+                    });
+                    if let Some(expansion) =
+                        expansion.remove(&(file.record.path.clone(), file.section))
+                    {
+                        file.source_view
+                            .as_mut()
+                            .expect("prepared source view")
+                            .restore_expansion(expansion);
                     }
-                    let cursor = DisplayCursor::new(analysis.clone(), 3)
-                        .with_syntax_context(file.old_syntax.as_ref(), file.new_syntax.as_ref());
-                    file.projection = crate::document::SourceProjection::loaded(analysis, cursor);
+                    file.projection = crate::document::SourceProjection::loaded(analysis);
                     if let Some(previous) = before.file.get(&file.id) {
                         preserve_identity(&mut document, &mut file, previous, &journal.transition);
                     }
-                    let limit = loaded[&file.record.path].min(2048);
-                    let mut rows = 0;
-                    while file.projection.state() == BodyState::Partial && rows < limit {
-                        self.deliver(&mut document, &id, &mut file)?;
-                        rows += 128;
-                    }
-                    Ok(full_delivery(&document, &file))
-                })();
+                    let rows = loaded[&file.record.path];
+                    self.render_source_file(&mut document, &id, &mut file, rows)
+                        .await
+                }
+                .await;
                 document.file.insert(id, file);
                 delivery.push(result?);
             }
@@ -1330,34 +1361,44 @@ impl StatusService {
         }
         let previous = SelectedSource::capture(entry.get(), hunk);
         let (target, mut file) = entry.remove_entry();
-        let result = (|| -> Result<BodyDelivery> {
-            let limit = file
-                .body
-                .as_ref()
-                .map_or(128, |body| {
-                    body.snapshot()
-                        .block
-                        .iter()
-                        .map(|block| block.text.row_count())
-                        .sum::<usize>()
-                        .max(128)
-                })
-                .min(2048);
+        let result = async {
+            let limit = file.body.as_ref().map_or(128, |body| {
+                body.snapshot()
+                    .block
+                    .iter()
+                    .map(|block| block.text.row_count())
+                    .sum::<usize>()
+                    .max(128)
+            });
+            let previous_view = file.source_view.take();
             reset_body(&mut document, &mut file)?;
+            let counts = analysis.line_counts();
+            file.retain_statistics(LineStats::Exact {
+                added: counts.added,
+                deleted: counts.deleted,
+            });
             file.context_requested = true;
             file.old_syntax = old;
             file.new_syntax = new;
-            let cursor = DisplayCursor::new(analysis.clone(), 3)
-                .with_syntax_context(file.old_syntax.as_ref(), file.new_syntax.as_ref());
-            file.projection = crate::document::SourceProjection::loaded(analysis.clone(), cursor);
+            file.source_view = Some(match previous_view {
+                Some(previous) => previous.replace_source(
+                    analysis.clone(),
+                    file.old_syntax.clone(),
+                    file.new_syntax.clone(),
+                ),
+                None => forge_diff::source_projection::SourceDiffProjection::new(
+                    analysis.clone(),
+                    file.old_syntax.clone(),
+                    file.new_syntax.clone(),
+                    Default::default(),
+                ),
+            });
+            file.projection = crate::document::SourceProjection::loaded(analysis.clone());
             preserve_identity(&mut document, &mut file, &previous, &VecDeque::new());
-            let mut rows = 0;
-            while file.projection.state() == BodyState::Partial && rows < limit {
-                self.deliver(&mut document, &target, &mut file)?;
-                rows += 128;
-            }
-            Ok(full_delivery(&document, &file))
-        })();
+            self.render_source_file(&mut document, &target, &mut file, limit)
+                .await
+        }
+        .await;
         document.file.insert(target, file);
         let delivery = result?;
         document.revision = document.revision.next()?;
@@ -1646,6 +1687,7 @@ fn recovery_update(
     StatusUpdate {
         document: document.clone(),
         delta: crate::StatusDelta {
+            diff_view: None,
             document: document.clone(),
             base: DocumentRevision(0),
             next: DocumentRevision(0),
@@ -1688,7 +1730,7 @@ fn prediction_copy(state: &WorktreeJournal) -> WorktreeJournal {
     }
 }
 
-fn remember(document: &mut StatusDocument, before: SelectionVersion) {
+pub(crate) fn remember(document: &mut StatusDocument, before: SelectionVersion) {
     document.history.push_back(before);
     let mut retained: usize = document
         .history
@@ -1752,6 +1794,7 @@ fn preserve_identity(
                 document.hunk.insert(
                     target.clone(),
                     crate::document::HunkTarget {
+                        declaration: None,
                         file: file_target(file.id),
                         raw: vec![*next],
                     },
@@ -1759,11 +1802,10 @@ fn preserve_identity(
             }
         }
     }
-    let Some(cursor) = file.projection.cursor() else {
+    let Some(projection) = &file.source_view else {
         return;
     };
-    let mut index = 0;
-    while let Some(group) = cursor.group(index) {
+    for (index, group) in projection.full_groups().enumerate() {
         for (identity, raw) in &previous.group {
             let mapped: Option<HashSet<_>> = raw
                 .iter()
@@ -1774,10 +1816,17 @@ fn preserve_identity(
                     && group.raw_ids.iter().all(|raw| mapped.contains(raw))
             }) {
                 file.group.insert(index, identity.clone());
+                document.hunk.insert(
+                    identity.target.clone(),
+                    crate::document::HunkTarget {
+                        file: file_target(file.id),
+                        raw: group.raw_ids.clone(),
+                        declaration: None,
+                    },
+                );
                 break;
             }
         }
-        index += 1;
     }
 }
 
@@ -1791,6 +1840,8 @@ fn reset_body(document: &mut StatusDocument, file: &mut FileTarget) -> Result<()
     document.retained_bytes = document.retained_bytes.saturating_sub(file.retained_bytes);
     file.retained_bytes = 0;
     file.body = None;
+    file.source_view = None;
+    file.source_statistics = None;
     file.hunk.clear();
     file.group.clear();
     file.source_row.clear();
@@ -1801,19 +1852,6 @@ fn reset_body(document: &mut StatusDocument, file: &mut FileTarget) -> Result<()
         .hunk
         .retain(|_, hunk| hunk.file != file_target(file.id));
     Ok(())
-}
-
-fn full_delivery(document: &StatusDocument, file: &FileTarget) -> BodyDelivery {
-    BodyDelivery {
-        document: document.id.clone(),
-        file: file.id,
-        generation: file.generation,
-        snapshot: file.body.as_ref().map(|body| body.snapshot()),
-        patch: None,
-        state: file.projection.state().clone(),
-        more: file.projection.state() == BodyState::Partial,
-        syntax_diagnostic: None,
-    }
 }
 
 fn rejected(
@@ -1978,6 +2016,7 @@ fn write_action(target: &[MutationTarget]) -> Result<GitWriteAction> {
                     after_exists: target.after_exists,
                 },
                 target: PatchTarget {
+                    scoped: None,
                     path,
                     analysis,
                     selected,

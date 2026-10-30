@@ -73,10 +73,18 @@ pub(crate) fn destination(
         }
         if let Some(body) = file.body.as_ref() {
             let origin_index = origin_body.and_then(|(block, _)| body.block_index(block));
+            let group = file
+                .group
+                .values()
+                .map(|group| &group.header)
+                .collect::<std::collections::HashSet<_>>();
             let mut header: Vec<_> = body
                 .blocks(body.revision(), 0..body.block_count())?
                 .enumerate()
-                .filter(|(_, block)| block.id.0.starts_with("hunk-header:"))
+                .filter(|(_, block)| {
+                    group.contains(&block.id)
+                        || !block.metadata.section.is_empty() && !block.metadata.target.is_empty()
+                })
                 .collect();
             if !forward {
                 header.reverse();

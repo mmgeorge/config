@@ -107,15 +107,14 @@ impl SavedDiffSyntax {
         let patch = UnifiedPatch::parse(&self.text)?.display()?;
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut block = Vec::new();
-        for (file_index, file) in patch.file.iter().enumerate() {
-            let Some(language) = file
-                .new_path
-                .as_deref()
-                .or(file.old_path.as_deref())
-                .and_then(SyntaxLanguage::for_path)
-            else {
+        for file in &patch.file {
+            let Some(path) = file.new_path.as_deref().or(file.old_path.as_deref()) else {
                 continue;
             };
+            let Some(language) = SyntaxLanguage::for_path(path) else {
+                continue;
+            };
+            let file_id = super::changes::file_identity(&self.target.0, path);
             for (hunk_index, hunk) in file.hunk.iter().enumerate() {
                 let old_request = SyntaxRequest {
                     source: fragment(hunk, true)?,
@@ -134,7 +133,7 @@ impl SavedDiffSyntax {
                         .map_err(|error| {
                             anyhow::anyhow!("Saved diff syntax analysis failed: {error:?}")
                         })?;
-                let hunk_id = format!("{}:file:{file_index}:hunk:{hunk_index}", self.target.0);
+                let hunk_id = format!("{file_id}:hunk:{hunk_index}");
                 for (batch, rows) in hunk.row.chunks(128).enumerate() {
                     let mut result = BufferBlock {
                         id: BlockId(format!("{hunk_id}:rows:{batch}")),

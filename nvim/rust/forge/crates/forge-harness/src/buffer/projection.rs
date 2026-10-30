@@ -44,6 +44,8 @@ pub enum TranscriptAction {
         text: String,
         #[serde(skip)]
         syntax: bool,
+        #[serde(skip)]
+        checkpoint: Option<SavedCheckpoint>,
     },
     File {
         path: String,
@@ -70,6 +72,13 @@ pub enum TranscriptAction {
     Url {
         url: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedCheckpoint {
+    pub session_id: String,
+    pub before: String,
+    pub after: String,
 }
 
 pub struct ProjectedEntry {
@@ -1222,10 +1231,9 @@ impl TimelineRenderer<'_> {
                 interaction,
                 agents,
                 depth,
-                &interaction.node_list.iter().collect::<Vec<_>>(),
+                interaction.content(&interaction.node_list.iter().collect::<Vec<_>>(), true)?,
                 None,
                 MarkdownRole::Response,
-                true,
             );
         }
         if depth == 0 && self.leading_separator {
@@ -1236,10 +1244,9 @@ impl TimelineRenderer<'_> {
             interaction,
             agents,
             depth,
-            &layout.opening,
+            interaction.content(&layout.opening, false)?,
             Some(&layout.questions),
             MarkdownRole::Response,
-            false,
         )?;
         if let crate::exchange::ExchangeOrigin::TaskStarted { start } = &interaction.origin {
             self.task_started(&interaction.id, start, &interaction.prompt)?;
@@ -1297,10 +1304,9 @@ impl TimelineRenderer<'_> {
             interaction,
             agents,
             depth,
-            &layout.activity,
+            interaction.content(&layout.activity, true)?,
             Some(&layout.questions),
             MarkdownRole::Response,
-            true,
         )?;
         let exchange_start = section.start;
         self.finish_section(
@@ -1321,19 +1327,17 @@ impl TimelineRenderer<'_> {
             interaction,
             agents,
             depth,
-            &layout.results,
+            interaction.content(&layout.results, false)?,
             Some(&layout.questions),
             MarkdownRole::Response,
-            false,
         )?;
         self.content(
             interaction,
             agents,
             depth,
-            &layout.conclusion,
+            interaction.content(&layout.conclusion, false)?,
             Some(&layout.questions),
             MarkdownRole::Response,
-            false,
         )?;
         let mut continuation = layout.continuation.as_slice();
         while let Some(node) = continuation.first() {
@@ -1352,10 +1356,9 @@ impl TimelineRenderer<'_> {
                 interaction,
                 agents,
                 depth,
-                content,
+                interaction.content(content, false)?,
                 Some(&layout.questions),
                 MarkdownRole::Response,
-                false,
             )?;
             drop(margin);
             self.offset_layout(start, indent / 2);
@@ -1677,12 +1680,10 @@ impl TimelineRenderer<'_> {
         interaction: &'exchange Exchange,
         agents: &HashMap<&str, &TimelineEntry>,
         depth: usize,
-        visible: &[&'exchange ExchangeNode],
+        content: crate::exchange::ExchangeContentView<'exchange>,
         questions: Option<&super::question::QuestionHistory<'exchange>>,
         response_role: MarkdownRole,
-        include_initial: bool,
     ) -> Result<()> {
-        let content = interaction.content(visible, include_initial)?;
         for part in &content.part {
             match part {
                 crate::exchange::EntryPart::Event(nodes) => {
@@ -2459,10 +2460,9 @@ impl TimelineRenderer<'_> {
             exchange,
             agents,
             depth,
-            &clarification.content,
+            exchange.content(&clarification.content, false)?,
             None,
             MarkdownRole::Message,
-            false,
         )?;
         self.finish_section(section, &id, closed);
         Ok(())
@@ -2506,7 +2506,7 @@ impl TimelineRenderer<'_> {
         if comparison.text().is_empty() {
             return Ok(());
         }
-        let tree = super::changes::ChangeTree::render(
+        let mut tree = super::changes::ChangeTree::render(
             &TranscriptRenderer::new(&self.content_width())?,
             identity,
             "Workspace changes",
@@ -2527,8 +2527,22 @@ impl TimelineRenderer<'_> {
                 Some(TranscriptAction::Diff {
                     text: comparison.text().into(),
                     syntax: false,
+                    checkpoint: Some(SavedCheckpoint {
+                        session_id: comparison.session_id.into(),
+                        before: comparison.before.into(),
+                        after: comparison.after.into(),
+                    }),
                 }),
             );
+        }
+        for action in tree.action.values_mut() {
+            if let TranscriptAction::Diff { checkpoint, .. } = action {
+                *checkpoint = Some(SavedCheckpoint {
+                    session_id: comparison.session_id.into(),
+                    before: comparison.before.into(),
+                    after: comparison.after.into(),
+                });
+            }
         }
         self.action.extend(tree.action);
         for block in tree.block {

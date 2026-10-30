@@ -24,6 +24,8 @@ use forge_diff::{
 use forge_git::{RepositoryPath, content::ContentSource, store::RepositoryStore};
 use serde::Serialize;
 
+mod saved;
+
 use crate::{
     BodyState,
     document::DocumentAdmission,
@@ -33,6 +35,8 @@ use crate::{
 
 #[derive(Debug, Serialize)]
 pub struct SourceOpen {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
     pub snapshot: BufferSnapshot,
     pub state: BodyState,
     pub more: bool,
@@ -45,13 +49,25 @@ pub struct SourceOpen {
 
 #[derive(Debug, Serialize)]
 pub struct SourceDelivery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
     pub patch: Option<BufferPatch>,
     pub state: BodyState,
     pub more: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SourceSnapshot {
+    #[serde(flatten)]
+    pub snapshot: BufferSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
+    pub more: bool,
+}
+
 pub struct SourceDocumentService {
     store: Arc<RepositoryStore>,
+    diff: Arc<forge_diff::engine::DiffEngine>,
     syntax: Arc<SyntaxEngine>,
     document: Mutex<HashMap<DocumentId, Arc<tokio::sync::Mutex<SourceDocument>>>>,
     admitted: Arc<crate::document::DocumentAdmissionStore>,
@@ -59,6 +75,9 @@ pub struct SourceDocumentService {
 }
 
 struct SourceDocument {
+    saved: Option<saved::SavedDocument>,
+    saved_diagnostic: Option<String>,
+    diff_view: Option<forge_diff::view::DiffViewState>,
     buffer: BufferDocument,
     source: Option<SourceVersion>,
     syntax: Option<SyntaxHandle>,
@@ -77,9 +96,14 @@ struct PreparedSource {
 }
 
 impl SourceDocumentService {
-    pub fn new(store: Arc<RepositoryStore>, syntax: Arc<SyntaxEngine>) -> Self {
+    pub fn new(
+        store: Arc<RepositoryStore>,
+        diff: Arc<forge_diff::engine::DiffEngine>,
+        syntax: Arc<SyntaxEngine>,
+    ) -> Self {
         Self {
             store,
+            diff,
             syntax,
             document: Mutex::new(HashMap::new()),
             admitted: Arc::new(crate::document::DocumentAdmissionStore::default()),
@@ -189,6 +213,14 @@ impl SourceDocumentService {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let mut document = SourceDocument {
+            saved: None,
+            saved_diagnostic: None,
+            diff_view: (kind == "diff").then(|| {
+                forge_diff::view::DiffViewState::new(
+                    forge_diff::view::DiffCapabilities::Source,
+                    forge_diff::view::DiffVisibility::All,
+                )
+            }),
             buffer: BufferDocument::new(id.clone(), Vec::new())?,
             retained: source.retained_bytes() + title.len(),
             source: Some(source),
@@ -200,7 +232,18 @@ impl SourceDocumentService {
             _admission: admission,
         };
         document.deliver()?;
+        if kind == "diff" && document.buffer.block_count() == 0 {
+            document.buffer.edit(
+                0..0,
+                vec![BufferBlock {
+                    id: BlockId("source:0".into()),
+                    text: BufferText::from_rows(["No changed files"])?,
+                    metadata: BlockMetadata::default(),
+                }],
+            )?;
+        }
         let output = SourceOpen {
+            diff_view: document.diff_view.as_ref().map(|view| view.committed()),
             snapshot: document.buffer.snapshot(),
             state: document.state.clone(),
             more: document.state == BodyState::Partial,
@@ -261,6 +304,9 @@ impl SourceDocumentService {
         };
         let title = format!("{} @ {revision}", path.display_label());
         let mut document = SourceDocument {
+            saved: None,
+            saved_diagnostic: None,
+            diff_view: None,
             buffer: BufferDocument::new(id.clone(), Vec::new())?,
             source: None,
             syntax: None,
@@ -308,6 +354,7 @@ impl SourceDocumentService {
             }
         }
         let output = SourceOpen {
+            diff_view: document.diff_view.as_ref().map(|view| view.committed()),
             snapshot: document.buffer.snapshot(),
             state: document.state.clone(),
             more: document.state == BodyState::Partial,
@@ -333,14 +380,28 @@ impl SourceDocumentService {
     pub async fn demand(&self, input: DocumentInput) -> Result<SourceDelivery> {
         input.validate()?;
         ensure!(
-            input.action == "demand",
-            "source document accepts only demand input"
+            matches!(
+                input.action.as_str(),
+                "demand"
+                    | "toggle_visibility"
+                    | "toggle_presentation"
+                    | "source_expand"
+                    | "source_collapse"
+            ),
+            "unsupported source document input"
+        );
+        let owner = self.get(&input.document)?;
+        if owner.lock().await.saved.is_some() {
+            return self.saved_input(owner, input).await;
+        }
+        ensure!(
+            !matches!(input.action.as_str(), "source_expand" | "source_collapse"),
+            "plain source has no semantic sections"
         );
         ensure!(
             input.target.is_none(),
             "plain source input cannot name a semantic target"
         );
-        let owner = self.get(&input.document)?;
         let mut document = owner.lock().await;
         ensure!(
             document.buffer.revision() == input.revision,
@@ -365,8 +426,27 @@ impl SourceDocumentService {
                 .is_none_or(|previous| input.sequence > *previous),
             "source input sequence is stale"
         );
+        if input.action != "demand" {
+            let result = document.change_diff_view(if input.action == "toggle_visibility" {
+                forge_diff::view::DiffViewAction::ToggleVisibility
+            } else {
+                forge_diff::view::DiffViewAction::TogglePresentation
+            })?;
+            document.input.insert(input.view, input.sequence);
+            return Ok(result);
+        }
         document.input.insert(input.view, input.sequence);
         document.deliver()
+    }
+
+    pub async fn snapshot_state(&self, id: &DocumentId) -> Result<SourceSnapshot> {
+        let owner = self.get(id)?;
+        let document = owner.lock().await;
+        Ok(SourceSnapshot {
+            snapshot: document.buffer.snapshot(),
+            diff_view: document.diff_view.as_ref().map(|view| view.committed()),
+            more: document.state == BodyState::Partial,
+        })
     }
 
     pub async fn snapshot(&self, id: &DocumentId) -> Result<BufferSnapshot> {
@@ -411,10 +491,64 @@ impl SourceDocumentService {
 }
 
 impl SourceDocument {
+    fn change_diff_view(
+        &mut self,
+        action: forge_diff::view::DiffViewAction,
+    ) -> Result<SourceDelivery> {
+        self._admission.check()?;
+        let request = self
+            .diff_view
+            .as_mut()
+            .context("plain sources have no diff controls")?
+            .request(action)
+            .map_err(|error| anyhow::anyhow!("source diff control failed: {error:?}"))?;
+        let prepared = (|| -> Result<_> {
+            let fallback = BlockId("source:diff:fallback".into());
+            let previous = usize::from(self.buffer.block_index(&fallback).is_some());
+            let block = if request.options == forge_diff::view::DiffViewOptions::default() {
+                Vec::new()
+            } else {
+                vec![BufferBlock {
+                    id: fallback,
+                    text: BufferText::from_rows(
+                        format!(
+                            "Unclassified source changes: {}",
+                            self.saved_diagnostic
+                                .as_deref()
+                                .unwrap_or("complete captured sources are unavailable")
+                        )
+                        .lines(),
+                    )?,
+                    metadata: BlockMetadata::default(),
+                }]
+            };
+            let mut buffer = self.buffer.clone();
+            let patch = buffer.splice(0..previous, block)?;
+            Ok((buffer, patch))
+        })();
+        let view = self.diff_view.as_mut().expect("validated diff controls");
+        let (buffer, patch) = match prepared {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                view.fail(request);
+                return Err(failure);
+            }
+        };
+        ensure!(view.commit(request), "source diff control was superseded");
+        self.buffer = buffer;
+        Ok(SourceDelivery {
+            patch,
+            state: self.state.clone(),
+            more: self.state == BodyState::Partial,
+            diff_view: self.diff_view.as_ref().map(|view| view.committed()),
+        })
+    }
+
     fn deliver(&mut self) -> Result<SourceDelivery> {
         self._admission.check()?;
         if self.state != BodyState::Partial {
             return Ok(SourceDelivery {
+                diff_view: self.diff_view.as_ref().map(|view| view.committed()),
                 patch: None,
                 state: self.state.clone(),
                 more: false,
@@ -490,6 +624,7 @@ impl SourceDocument {
             self.state = BodyState::Ready;
         }
         Ok(SourceDelivery {
+            diff_view: self.diff_view.as_ref().map(|view| view.committed()),
             patch,
             state: self.state.clone(),
             more: self.state == BodyState::Partial,
@@ -507,7 +642,11 @@ mod tests {
     async fn saved_diff_retains_large_read_only_source_through_bounded_delivery() -> Result<()> {
         let store = Arc::new(RepositoryStore::default());
         let diff = DiffEngine::new(CacheLimits::default(), 2);
-        let service = SourceDocumentService::new(store, SyntaxEngine::new(diff.analysis_pool()));
+        let service = SourceDocumentService::new(
+            store,
+            diff.clone(),
+            SyntaxEngine::new(diff.analysis_pool()),
+        );
         let text = format!("+{}\n", "x".repeat(254))
             .repeat(70_000)
             .into_bytes();
@@ -560,6 +699,148 @@ mod tests {
                 )
                 .is_ok()
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn saved_diff_controls_preserve_unclassified_patch_and_independent_options() -> Result<()>
+    {
+        use forge_diff::view::{DiffPresentation, DiffVisibility};
+        let store = Arc::new(RepositoryStore::default());
+        let diff = DiffEngine::new(CacheLimits::default(), 2);
+        let syntax = SyntaxEngine::new(diff.analysis_pool());
+        let service = SourceDocumentService::new(store, diff.clone(), syntax.clone());
+        let id = DocumentId("saved-control".into());
+        let text = "--- a/source.rs\n+++ b/source.rs\n@@ -20 +20 @@\n-before();\n+after();\n";
+        let opened =
+            service.open_diff_text(id.clone(), "Saved diff".into(), text.as_bytes().to_vec())?;
+        assert_eq!(
+            opened.diff_view.unwrap().presentation,
+            DiffPresentation::Full
+        );
+        assert_eq!(opened.diff_view.unwrap().visibility, DiffVisibility::All);
+        let mut frame = opened.snapshot.clone();
+        let mut transition = Vec::new();
+        for (sequence, action) in [
+            "toggle_presentation",
+            "toggle_visibility",
+            "toggle_presentation",
+            "toggle_visibility",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let delivery = service
+                .demand(DocumentInput {
+                    document: id.clone(),
+                    revision: frame.revision,
+                    view: ViewId("saved-control-view".into()),
+                    sequence: InputSequence(sequence as u64 + 1),
+                    action: action.into(),
+                    block: frame.block[0].id.clone(),
+                    position: TextPosition { row: 0, column: 0 },
+                    target: None,
+                })
+                .await?;
+            if let Some(patch) = &delivery.patch {
+                patch.validate()?;
+            }
+            frame = service.snapshot(&id).await?;
+            let raw = frame
+                .block
+                .iter()
+                .filter(|block| block.id.0 != "source:diff:fallback")
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            assert_eq!(raw, text);
+            assert_eq!(
+                frame
+                    .block
+                    .iter()
+                    .any(|block| block.id.0 == "source:diff:fallback"),
+                sequence != 3
+            );
+            let recovered = service.snapshot_state(&id).await?;
+            assert_eq!(recovered.snapshot, frame);
+            assert_eq!(recovered.diff_view, delivery.diff_view);
+            assert_eq!(recovered.more, delivery.more);
+            let options = delivery.diff_view.unwrap();
+            assert_eq!(
+                options.presentation,
+                if sequence < 2 {
+                    DiffPresentation::Semantic
+                } else {
+                    DiffPresentation::Full
+                }
+            );
+            assert_eq!(
+                options.visibility,
+                if sequence == 1 || sequence == 2 {
+                    DiffVisibility::Public
+                } else {
+                    DiffVisibility::All
+                }
+            );
+            transition
+                .push(serde_json::json!({"action":action,"delivery":delivery,"expected":frame}));
+        }
+        let empty = service.open_diff_text(
+            DocumentId("empty-control".into()),
+            "Empty diff".into(),
+            Vec::new(),
+        )?;
+        assert_eq!(
+            empty.snapshot.block[0].text.row(0),
+            Some("No changed files")
+        );
+        let empty_control = service
+            .demand(DocumentInput {
+                document: empty.snapshot.document,
+                revision: empty.snapshot.revision,
+                view: ViewId("empty-view".into()),
+                sequence: InputSequence(1),
+                action: "toggle_visibility".into(),
+                block: empty.snapshot.block[0].id.clone(),
+                position: TextPosition { row: 0, column: 0 },
+                target: None,
+            })
+            .await?;
+        assert_eq!(
+            empty_control.diff_view.unwrap().visibility,
+            DiffVisibility::Public
+        );
+        let plain = service.open_text(
+            DocumentId("plain-control".into()),
+            "plain".into(),
+            b"retained text".to_vec(),
+        )?;
+        assert!(
+            service
+                .demand(DocumentInput {
+                    document: plain.snapshot.document.clone(),
+                    revision: plain.snapshot.revision,
+                    view: ViewId("plain-view".into()),
+                    sequence: InputSequence(1),
+                    action: "toggle_presentation".into(),
+                    block: plain.snapshot.block[0].id.clone(),
+                    position: TextPosition { row: 0, column: 0 },
+                    target: None
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            service.snapshot(&plain.snapshot.document).await?,
+            plain.snapshot
+        );
+        assert_eq!(syntax.usage().active_jobs, 0);
+        assert_eq!(diff.analysis_pool().usage().admitted_jobs, 0);
+        std::fs::write(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/saved-diff-controls-fixture.json"),
+            serde_json::to_vec(&serde_json::json!({"initial":opened,"transition":transition}))?,
+        )?;
         Ok(())
     }
 }

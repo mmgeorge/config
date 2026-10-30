@@ -13,6 +13,7 @@ pub struct StatusSnapshot {
     pub document: DocumentId,
     pub revision: DocumentRevision,
     pub view: StatusView,
+    pub diff_view: forge_diff::view::DiffViewOptions,
     pub head: StatusHead,
     pub context: Option<StatusContext>,
     pub section: Vec<StatusSectionRecord>,
@@ -71,6 +72,8 @@ pub enum StatusStatistics {
 #[derive(Clone, Debug, Serialize)]
 /// Contiguous inventory change. Body revisions advance independently of this revision.
 pub struct StatusDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
     pub document: DocumentId,
     pub base: DocumentRevision,
     pub next: DocumentRevision,

@@ -10,7 +10,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use forge_diff::raw::{RawDiff, RawHunkId, patch_body};
+use forge_diff::{
+    edit::{EditDirection, EditSelection},
+    raw::{RawDiff, RawHunkId, compute_hunks, patch_body},
+    source::SourcePair,
+};
 use tokio::sync::oneshot;
 
 use crate::{
@@ -214,6 +218,8 @@ pub struct PatchTarget {
     pub path: RepositoryPath,
     pub analysis: RawDiff,
     pub selected: Vec<RawHunkId>,
+    /// Exact replacements within the selected raw hunks. Original sources validate preconditions.
+    pub scoped: Option<Box<EditSelection>>,
 }
 
 #[derive(Clone, Debug)]
@@ -921,11 +927,11 @@ impl GitWriteAction {
                     == unstaged.analysis.source().old.identity(),
                 "compound discard index sources differ"
             );
-            validate_patch_selection(staged)?;
-            validate_patch_selection(unstaged)?;
+            validate_patch_selection(staged, PatchDirection::DiscardStaged)?;
+            validate_patch_selection(unstaged, PatchDirection::Discard)?;
         }
-        if let Self::Patch { target, .. } = self {
-            validate_patch_selection(target)?;
+        if let Self::Patch { direction, target } = self {
+            validate_patch_selection(target, *direction)?;
         }
         Ok(())
     }
@@ -953,6 +959,10 @@ impl GitWriteAction {
                 target.analysis.retained_source_bytes()
                     + target.analysis.retained_result_bytes()
                     + target.selected.capacity() * size_of::<RawHunkId>()
+                    + target
+                        .scoped
+                        .as_deref()
+                        .map_or(0, EditSelection::retained_bytes)
             }
             Self::DiscardCombined { staged, unstaged } => [staged, unstaged]
                 .iter()
@@ -960,6 +970,10 @@ impl GitWriteAction {
                     target.analysis.retained_source_bytes()
                         + target.analysis.retained_result_bytes()
                         + target.selected.capacity() * size_of::<RawHunkId>()
+                        + target
+                            .scoped
+                            .as_deref()
+                            .map_or(0, EditSelection::retained_bytes)
                 })
                 .sum(),
             Self::CreateBranch { name } => name.capacity(),
@@ -1574,7 +1588,7 @@ fn run_reverse_patch(
     )
 }
 
-fn validate_patch_selection(target: &PatchTarget) -> Result<()> {
+fn validate_patch_selection(target: &PatchTarget, direction: PatchDirection) -> Result<()> {
     ensure!(
         !target.selected.is_empty(),
         "patch requires selected raw hunks"
@@ -1586,10 +1600,46 @@ fn validate_patch_selection(target: &PatchTarget) -> Result<()> {
         );
         patch_body(&target.analysis, *identity)?;
     }
+    if let Some(scoped) = &target.scoped {
+        ensure!(!scoped.is_empty(), "scoped patch has no remaining changes");
+        let direction = match direction {
+            PatchDirection::Index { .. } | PatchDirection::Stage => EditDirection::Forward,
+            PatchDirection::Unstage | PatchDirection::Discard | PatchDirection::DiscardStaged => {
+                EditDirection::Reverse
+            }
+        };
+        let boundary = EditSelection::capture(&target.analysis, &target.selected, direction)?;
+        scoped.validate_subset(&boundary)?;
+    }
     Ok(())
 }
 
 fn encode_patch(target: &PatchTarget, before_exists: bool, after_exists: bool) -> Result<Vec<u8>> {
+    let scoped = target
+        .scoped
+        .as_ref()
+        .map(|selection| {
+            let applied = selection.apply()?;
+            let source = if selection.before().identity() == target.analysis.source().old.identity()
+            {
+                SourcePair {
+                    old: selection.before().clone(),
+                    new: applied.after().clone(),
+                }
+            } else {
+                SourcePair {
+                    old: applied.after().clone(),
+                    new: selection.before().clone(),
+                }
+            };
+            Ok::<_, forge_diff::edit::EditError>(compute_hunks(source))
+        })
+        .transpose()?;
+    let analysis = scoped.as_ref().unwrap_or(&target.analysis);
+    let before_exists =
+        before_exists || scoped.is_some() && !analysis.source().old.bytes().is_empty();
+    let after_exists =
+        after_exists || scoped.is_some() && !analysis.source().new.bytes().is_empty();
     let mut output = Vec::new();
     output.extend_from_slice(b"--- ");
     if before_exists {
@@ -1604,11 +1654,10 @@ fn encode_patch(target: &PatchTarget, before_exists: bool, after_exists: bool) -
         output.extend_from_slice(b"/dev/null");
     }
     output.push(b'\n');
-    for hunk in target
-        .analysis
+    for hunk in analysis
         .hunks()
         .iter()
-        .filter(|hunk| target.selected.contains(&hunk.id))
+        .filter(|hunk| scoped.is_some() || target.selected.contains(&hunk.id))
     {
         writeln!(
             output,
@@ -1618,7 +1667,7 @@ fn encode_patch(target: &PatchTarget, before_exists: bool, after_exists: bool) -
             hunk.new_lines.start + usize::from(!hunk.new_lines.is_empty()),
             hunk.new_lines.len()
         )?;
-        output.extend_from_slice(&patch_body(&target.analysis, hunk.id)?.bytes);
+        output.extend_from_slice(&patch_body(analysis, hunk.id)?.bytes);
     }
     Ok(output)
 }

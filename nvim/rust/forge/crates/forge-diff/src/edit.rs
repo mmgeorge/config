@@ -1,10 +1,16 @@
 //! Captured byte replacements survive unrelated local edits without selecting a new diff hunk.
 
-use std::{collections::HashSet, fmt, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    ops::Range,
+};
 
 use crate::{
-    raw::{RawDiff, RawHunkId},
-    source::{SourceError, SourceVersion},
+    raw::{RawDiff, RawHunk, RawHunkId, compute_hunks},
+    semantic_view::{DeclarationInventory, SourceComparison},
+    source::{SourceError, SourcePair, SourceVersion},
+    view::DiffVisibility,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +24,13 @@ struct ByteReplacement {
     range: Range<usize>,
     source: SourceVersion,
     replacement: Range<usize>,
+}
+
+struct ScopedRun<'source> {
+    owner: Option<&'source str>,
+    occurrence: usize,
+    bytes: Range<usize>,
+    admitted: bool,
 }
 
 /// Pins the exact selected bytes independently of display groups and subsequent raw hunk IDs.
@@ -37,6 +50,7 @@ pub struct AppliedEdit {
 pub enum EditError {
     UnknownHunk,
     DifferentSource,
+    AmbiguousScope,
     Overlap,
     SizeOverflow,
     Allocation(String),
@@ -48,6 +62,9 @@ impl fmt::Display for EditError {
         match self {
             Self::UnknownHunk => formatter.write_str("selected edit belongs to another comparison"),
             Self::DifferentSource => formatter.write_str("selected edit source changed externally"),
+            Self::AmbiguousScope => {
+                formatter.write_str("partial edit has no unique source ownership anchor")
+            }
             Self::Overlap => formatter.write_str("selected edit overlaps a newer local change"),
             Self::SizeOverflow => {
                 formatter.write_str("selected edit size exceeds addressable memory")
@@ -98,8 +115,165 @@ impl EditSelection {
         })
     }
 
+    /// Capture raw edits within selected declarations or visibility, including descendants.
+    /// Hidden source bytes remain pinned to the baseline in both edit directions. Foreign
+    /// comparisons and ambiguous ownership fail before a selection can be published.
+    pub fn capture_scoped(
+        analysis: &RawDiff,
+        selected: &[RawHunkId],
+        direction: EditDirection,
+        comparison: &SourceComparison,
+        declaration: Option<&[&str]>,
+        visibility: DiffVisibility,
+    ) -> Result<Self, EditError> {
+        if comparison.source.old.identity() != analysis.source().old.identity()
+            || comparison.source.new.identity() != analysis.source().new.identity()
+        {
+            return Err(EditError::DifferentSource);
+        }
+        if !comparison.classified {
+            if declaration.is_some() {
+                return Err(EditError::AmbiguousScope);
+            }
+            return Self::capture(analysis, selected, direction);
+        }
+        if declaration.is_none() && visibility == DiffVisibility::All {
+            return Self::capture(analysis, selected, direction);
+        }
+        let old_owner = scoped_owner(&comparison.before, declaration)?;
+        let new_owner = scoped_owner(&comparison.after, declaration)?;
+        if declaration.is_some()
+            && !old_owner.iter().any(|selected| *selected)
+            && !new_owner.iter().any(|selected| *selected)
+        {
+            return Err(EditError::AmbiguousScope);
+        }
+        let selected = selected.iter().copied().collect::<HashSet<_>>();
+        let mut found = 0;
+        let mut replacement = Vec::new();
+        let before = match direction {
+            EditDirection::Forward => &analysis.source().old,
+            EditDirection::Reverse => &analysis.source().new,
+        };
+        for hunk in analysis
+            .hunks()
+            .iter()
+            .filter(|hunk| selected.contains(&hunk.id))
+        {
+            found += 1;
+            let old = scoped_runs(
+                analysis,
+                hunk,
+                true,
+                &comparison.before,
+                &old_owner,
+                declaration.is_none(),
+                visibility,
+            );
+            let new = scoped_runs(
+                analysis,
+                hunk,
+                false,
+                &comparison.after,
+                &new_owner,
+                declaration.is_none(),
+                visibility,
+            );
+            let (before_run, after_run, source, range, incoming) = match direction {
+                EditDirection::Forward => (
+                    old,
+                    new,
+                    &analysis.source().new,
+                    hunk.old_bytes.clone(),
+                    hunk.new_bytes.clone(),
+                ),
+                EditDirection::Reverse => (
+                    new,
+                    old,
+                    &analysis.source().old,
+                    hunk.new_bytes.clone(),
+                    hunk.old_bytes.clone(),
+                ),
+            };
+            if before_run.iter().chain(&after_run).all(|run| run.admitted) {
+                replacement.push(ByteReplacement {
+                    range,
+                    source: source.clone(),
+                    replacement: incoming,
+                });
+            } else if before_run.iter().chain(&after_run).any(|run| run.admitted) {
+                let content = scoped_replacement(before, source, &before_run, &after_run)?;
+                if before.bytes()[range.clone()] != content {
+                    let source = SourceVersion::new(content, before.identity().representation)
+                        .map_err(EditError::Source)?;
+                    let baseline = SourceVersion::new(
+                        before.bytes()[range.clone()].to_vec(),
+                        before.identity().representation,
+                    )
+                    .map_err(EditError::Source)?;
+                    let scoped = compute_hunks(SourcePair {
+                        old: baseline,
+                        new: source,
+                    });
+                    replacement.extend(scoped.hunks().iter().map(|hunk| ByteReplacement {
+                        range: range.start + hunk.old_bytes.start..range.start + hunk.old_bytes.end,
+                        source: scoped.source().new.clone(),
+                        replacement: hunk.new_bytes.clone(),
+                    }));
+                }
+            }
+        }
+        if found != selected.len() {
+            return Err(EditError::UnknownHunk);
+        }
+        Ok(Self {
+            before: before.clone(),
+            replacement,
+        })
+    }
+
     pub fn before(&self) -> &SourceVersion {
         &self.before
+    }
+
+    /// Combine disjoint captures against the same baseline, rejecting overlapping replacements.
+    pub fn combine(mut self, other: Self) -> Result<Self, EditError> {
+        if self.before.identity() != other.before.identity() {
+            return Err(EditError::DifferentSource);
+        }
+        self.replacement.extend(other.replacement);
+        self.replacement
+            .sort_by_key(|replacement| replacement.range.start);
+        self.replacement.dedup_by(|right, left| {
+            left.range == right.range
+                && left.source.bytes()[left.replacement.clone()]
+                    == right.source.bytes()[right.replacement.clone()]
+        });
+        if self.replacement.windows(2).any(|pair| {
+            pair[0].range.end > pair[1].range.start || pair[0].range.start == pair[1].range.start
+        }) {
+            return Err(EditError::Overlap);
+        }
+        Ok(self)
+    }
+
+    /// Rejects replacements outside a captured boundary or against another baseline.
+    pub fn validate_subset(&self, boundary: &Self) -> Result<(), EditError> {
+        if self.before.identity() != boundary.before.identity() {
+            return Err(EditError::DifferentSource);
+        }
+        for replacement in &self.replacement {
+            let index = boundary
+                .replacement
+                .partition_point(|allowed| allowed.range.end < replacement.range.start);
+            if !boundary.replacement.get(index).is_some_and(|allowed| {
+                allowed.range.start <= replacement.range.start
+                    && replacement.range.end <= allowed.range.end
+            }) {
+                return Err(EditError::AmbiguousScope);
+            }
+        }
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -223,6 +397,190 @@ impl EditSelection {
             replacement,
         })
     }
+}
+
+fn scoped_owner(
+    inventory: &DeclarationInventory,
+    identity: Option<&[&str]>,
+) -> Result<Vec<bool>, EditError> {
+    let Some(identity) = identity else {
+        return Ok(vec![true; inventory.declaration.len()]);
+    };
+    let mut selected = vec![false; inventory.declaration.len()];
+    let mut found = HashSet::new();
+    for (index, declaration) in inventory.declaration.iter().enumerate() {
+        if identity.contains(&inventory.identity[index].as_str()) {
+            if !found.insert(inventory.identity[index].as_str()) {
+                return Err(EditError::AmbiguousScope);
+            }
+            selected[index] = true;
+        } else {
+            selected[index] = declaration.parent.is_some_and(|parent| selected[parent]);
+        }
+    }
+    Ok(selected)
+}
+
+fn scoped_runs<'source>(
+    analysis: &RawDiff,
+    hunk: &RawHunk,
+    old_side: bool,
+    inventory: &'source DeclarationInventory,
+    selected: &[bool],
+    unclassified: bool,
+    visibility: DiffVisibility,
+) -> Vec<ScopedRun<'source>> {
+    let (source, bytes, first) = if old_side {
+        (
+            &analysis.source().old,
+            &hunk.old_bytes,
+            hunk.old_lines.start,
+        )
+    } else {
+        (
+            &analysis.source().new,
+            &hunk.new_bytes,
+            hunk.new_lines.start,
+        )
+    };
+    let mut runs = Vec::<ScopedRun<'source>>::new();
+    let mut offset = bytes.start;
+    for (line, text) in source.text()[bytes.clone()]
+        .split_inclusive('\n')
+        .enumerate()
+    {
+        let row = first + line;
+        let owner = inventory.row_owner.get(row).copied().flatten();
+        let admitted = owner.map_or(unclassified, |owner| selected[owner])
+            && (visibility == DiffVisibility::All
+                || inventory.public_rows.get(row).copied().unwrap_or(true));
+        let identity = owner
+            .map(|owner| inventory.identity[owner].as_str())
+            .or(admitted.then_some(""));
+        let end = offset + text.len();
+        if let Some(previous) = runs
+            .last_mut()
+            .filter(|previous| previous.owner == identity && previous.admitted == admitted)
+        {
+            previous.bytes.end = end;
+        } else {
+            runs.push(ScopedRun {
+                owner: identity,
+                occurrence: 0,
+                bytes: offset..end,
+                admitted,
+            });
+        }
+        offset = end;
+    }
+    let mut occurrence = HashMap::new();
+    for run in &mut runs {
+        let count = occurrence.entry(run.owner).or_insert(0);
+        run.occurrence = *count;
+        *count += 1;
+    }
+    runs
+}
+
+fn scoped_index<'source>(
+    runs: &[ScopedRun<'source>],
+) -> Result<HashMap<(&'source str, usize), usize>, EditError> {
+    runs.iter()
+        .enumerate()
+        .map(|(position, run)| {
+            Ok((
+                (run.owner.ok_or(EditError::AmbiguousScope)?, run.occurrence),
+                position,
+            ))
+        })
+        .collect()
+}
+
+fn scoped_replacement(
+    before: &SourceVersion,
+    after: &SourceVersion,
+    previous: &[ScopedRun<'_>],
+    incoming: &[ScopedRun<'_>],
+) -> Result<Vec<u8>, EditError> {
+    let old = scoped_index(previous)?;
+    let new = scoped_index(incoming)?;
+    for run in previous
+        .iter()
+        .chain(incoming)
+        .filter(|run| run.admitted && run.occurrence > 0)
+    {
+        let key = (run.owner.expect("indexed source owner"), run.occurrence);
+        if !old.contains_key(&key) || !new.contains_key(&key) {
+            return Err(EditError::AmbiguousScope);
+        }
+    }
+    let mut retained = vec![Vec::new(); incoming.len() + 1];
+    for (position, run) in previous.iter().enumerate().filter(|(_, run)| !run.admitted) {
+        let owner = (run.owner.expect("indexed source owner"), run.occurrence);
+        if let Some(index) = new.get(&owner) {
+            if incoming[*index].admitted {
+                return Err(EditError::AmbiguousScope);
+            }
+            continue;
+        }
+        let next = previous[position + 1..]
+            .iter()
+            .find_map(|run| new.get(&(run.owner?, run.occurrence)).copied());
+        let preceding = previous[..position]
+            .iter()
+            .rev()
+            .find_map(|run| new.get(&(run.owner?, run.occurrence)).copied());
+        let anchor = match (preceding, next) {
+            (Some(previous), Some(next)) if previous >= next => {
+                return Err(EditError::AmbiguousScope);
+            }
+            (_, Some(next)) => next,
+            (Some(previous), None) => previous + 1,
+            (None, None) if incoming.iter().any(|run| run.admitted) => {
+                return Err(EditError::AmbiguousScope);
+            }
+            (None, None) => 0,
+        };
+        retained[anchor].push(run.bytes.clone());
+    }
+    let mut piece = Vec::new();
+    for (position, retained) in retained.iter().enumerate() {
+        for bytes in retained {
+            piece.push((before, bytes.clone()));
+        }
+        let Some(run) = incoming.get(position) else {
+            break;
+        };
+        if run.admitted {
+            if old
+                .get(&(run.owner.expect("indexed source owner"), run.occurrence))
+                .is_some_and(|index| !previous[*index].admitted)
+            {
+                return Err(EditError::AmbiguousScope);
+            }
+            piece.push((after, run.bytes.clone()));
+        } else if let Some(index) =
+            old.get(&(run.owner.expect("indexed source owner"), run.occurrence))
+        {
+            if previous[*index].admitted {
+                return Err(EditError::AmbiguousScope);
+            }
+            piece.push((before, previous[*index].bytes.clone()));
+        }
+    }
+    let length = piece.iter().try_fold(0usize, |length, (_, bytes)| {
+        length
+            .checked_add(bytes.len())
+            .ok_or(EditError::SizeOverflow)
+    })?;
+    let mut content = Vec::new();
+    content
+        .try_reserve_exact(length)
+        .map_err(|error| EditError::Allocation(error.to_string()))?;
+    for (source, bytes) in piece {
+        content.extend_from_slice(&source.bytes()[bytes]);
+    }
+    Ok(content)
 }
 
 impl AppliedEdit {

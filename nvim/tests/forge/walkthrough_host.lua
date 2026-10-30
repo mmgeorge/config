@@ -12,6 +12,10 @@ local client = require("forge.client") client._host_set_launcher_for_test(vim.sy
 local walkthrough = require("forge.walkthrough")
 require("forge.infra.config").options.walkthrough_inventory = false
 local state, notices = nil, {}
+local semantic = vim.g.forge_walkthrough_semantic_host == true
+local path = semantic and "source.rs" or "source.lua"
+local before = semantic and { "pub fn visible() {", "    previous();", "}", "fn hidden() { old_private(); }" } or { "local captured = 1", "return captured" }
+local after = semantic and { "pub fn visible() {", "    updated();", "}", "fn hidden() { new_private(); }" } or { "local captured = 2", "return captured" }
 local function git(arguments)
   local command = { "git", "-C", fixture } vim.list_extend(command, arguments)
   local result = vim.system(command, {text=true,timeout=10000}):wait()
@@ -19,10 +23,10 @@ local function git(arguments)
 end
 local ok, failure = xpcall(function()
   git({"init","--quiet"}) git({"config","user.name","Forge Fixture"}) git({"config","user.email","forge@example.test"})
-  vim.fn.writefile({"local captured = 1", "return captured"}, fixture .. "/source.lua")
-  git({"add","source.lua"}) git({"commit","--quiet","-m","base"})
-  vim.fn.writefile({"local captured = 2", "return captured"}, fixture .. "/source.lua")
-  local artifact = { version=12, root="Native Walkthrough", overview="Overview", flow={{text="Source lifecycle"}}, commit=git({"rev-parse","HEAD"}), tasks={{title="Task complete heading",subtasks={{title="Subtask complete heading",changes={{action="Modify",kind="Function",target="captured",note="Native source resolution",file="source.lua",line=2,annotation={title="Immutable annotation",comment="Read-only native Markdown"}}}}}}} }
+  vim.fn.writefile(before, fixture .. "/" .. path)
+  git({"add",path}) git({"commit","--quiet","-m","base"})
+  vim.fn.writefile(after, fixture .. "/" .. path)
+  local artifact = { version=12, root="Native Walkthrough", overview="Overview", flow={{text="Source lifecycle"}}, commit=git({"rev-parse","HEAD"}), tasks={{title="Task complete heading",subtasks={{title="Subtask complete heading",changes={{action="Modify",kind="Function",target="captured",note="Native source resolution",file=path,line=2,annotation={title="Immutable annotation",comment="Read-only native Markdown"}}}}}}} }
   vim.fn.writefile({vim.json.encode(artifact)}, fixture .. "/.walkthrough.json")
   state = walkthrough.open({workspace=fixture,on_error=function(message) notices[#notices+1]=message end})
   assert(vim.wait(45000,function() return #notices>0 or state.replica.status=="Applied" and not state.pending and #state.queue==0 end,10), "Walkthrough did not settle")
@@ -41,17 +45,42 @@ local ok, failure = xpcall(function()
   assert(owner.review and #vim.api.nvim_list_wins()==2)
   assert(vim.bo[owner.annotation.buffer].readonly)
   local review = vim.api.nvim_buf_get_lines(owner.annotation.buffer,0,-1,true)
-  assert(vim.tbl_contains(review,"local captured = 1") and vim.tbl_contains(review,"local captured = 2"))
-  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(owner.source.replica.buffer,0,-1,true),{"local captured = 2","return captured"}))
+  local old_row, new_row = before[semantic and 2 or 1], after[semantic and 2 or 1]
+  assert(vim.tbl_contains(review,old_row) and vim.tbl_contains(review,new_row))
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(owner.source.replica.buffer,0,-1,true),after))
+  if semantic then
+    vim.fn.writefile({ "unrelated later worktree contents" }, fixture .. "/" .. path)
+    local function invoke(key, presentation, visibility)
+      vim.fn.maparg(key,"n",false,true).callback()
+      assert(vim.wait(5000,function() return #notices>0 or not state.pending and #state.queue==0
+        and owner.diff_view.presentation==presentation and owner.diff_view.visibility==visibility end,10), "native diff control did not settle")
+      assert(#notices==0,table.concat(notices,"\n"))
+    end
+    invoke("ox","semantic","all")
+    local signature
+    for index,text in ipairs(vim.api.nvim_buf_get_lines(owner.annotation.buffer,0,-1,true)) do
+      if text:find("pub fn visible() {",1,true) then signature=index break end
+    end
+    assert(signature,"native semantic signature missing")
+    vim.api.nvim_win_set_cursor(0,{signature,0})
+    invoke("<Tab>","semantic","all")
+    assert(vim.wait(5000,function() return table.concat(vim.api.nvim_buf_get_lines(owner.annotation.buffer,0,-1,true),"\n"):find("updated();",1,true) end,10))
+    invoke("ov","semantic","public")
+    assert(not table.concat(vim.api.nvim_buf_get_lines(owner.annotation.buffer,0,-1,true),"\n"):find("hidden",1,true))
+    invoke("ox","full","public")
+    invoke("ov","full","all")
+    review=vim.api.nvim_buf_get_lines(owner.annotation.buffer,0,-1,true)
+    assert(vim.tbl_contains(review,new_row) and not vim.tbl_contains(review,"unrelated later worktree contents"))
+  end
   local source_row
-  for index,line in ipairs(review) do if line=="local captured = 2" then source_row=index break end end
+  for index,line in ipairs(review) do if line==new_row then source_row=index break end end
   assert(source_row, "source row missing: " .. vim.inspect(review))
   vim.api.nvim_set_current_win(owner.window)
   vim.api.nvim_win_set_cursor(0,{source_row,0})
   vim.fn.maparg("o","n",false,true).callback()
   assert(vim.wait(5000,function() return #notices>0 or vim.api.nvim_get_current_buf()==owner.source.replica.buffer end,10),"native source action did not settle")
   assert(#notices==0,table.concat(notices,"\n"))
-  assert(vim.api.nvim_win_get_cursor(0)[1]==1)
+  assert(vim.api.nvim_win_get_cursor(0)[1]==(semantic and 2 or 1))
   vim.fn.maparg("q","n",false,true).callback()
   assert(vim.api.nvim_get_current_buf()==owner.annotation.buffer)
   assert(git({"diff","--cached","--name-only"})=="")

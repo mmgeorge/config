@@ -82,7 +82,7 @@ fn literal_source_uses_shared_admission_and_bounded_first_delivery() {
     let store = Arc::new(RepositoryStore::default());
     let diff = DiffEngine::new(CacheLimits::default(), 2);
     let syntax = SyntaxEngine::new(diff.analysis_pool());
-    let service = crate::source_document::SourceDocumentService::new(store, syntax);
+    let service = crate::source_document::SourceDocumentService::new(store, diff.clone(), syntax);
     let text = (0..300)
         .map(|line| format!("message {line}\n"))
         .collect::<String>();
@@ -441,6 +441,7 @@ async fn source_document_retains_exact_revision_and_bounded_continuation() {
     git(directory.path(), &["commit", "-m", "historical source"]);
     let service = crate::source_document::SourceDocumentService::new(
         Arc::new(RepositoryStore::default()),
+        diff.clone(),
         SyntaxEngine::new(diff.analysis_pool()),
     );
     let opened = service
@@ -488,6 +489,7 @@ async fn source_document_index_revision_is_immutable_and_distinct_from_later_ind
     let (directory, _, diff, _) = fixture().await;
     let service = crate::source_document::SourceDocumentService::new(
         Arc::new(RepositoryStore::default()),
+        diff.clone(),
         SyntaxEngine::new(diff.analysis_pool()),
     );
     let first = service
@@ -1150,10 +1152,18 @@ async fn body_gutters_and_folds_keep_source_rows_unchanged() {
         .unwrap();
     assert_eq!(rows(&loaded), vec!["@@ +1 -1", "old", "new"]);
     assert!(!loaded.block[1].metadata.gutter.is_empty());
-    assert_eq!(
-        loaded.block[0].metadata.fold[0].end.block,
-        loaded.block[1].id
-    );
+    let fold = &loaded.block[0].metadata.fold[0];
+    let end = loaded
+        .block
+        .iter()
+        .position(|block| block.id == fold.end.block)
+        .unwrap();
+    assert_eq!(fold.end.position.row, loaded.block[end].text.row_count());
+    let folded = loaded.block[1..=end]
+        .iter()
+        .flat_map(|block| block.text.wire_rows())
+        .collect::<Vec<_>>();
+    assert_eq!(folded, vec!["old", "new"]);
     assert!(
         loaded
             .block
@@ -1324,6 +1334,7 @@ async fn comparisons_reuse_native_bodies_and_reject_mutations() {
                 worktree: true,
                 path: None,
             },
+            Default::default(),
         )
         .await
         .unwrap();
@@ -1368,6 +1379,7 @@ async fn comparisons_reuse_native_bodies_and_reject_mutations() {
                 worktree: true,
                 path: None,
             },
+            Default::default(),
         )
         .await
         .unwrap();
@@ -1382,6 +1394,7 @@ async fn comparisons_reuse_native_bodies_and_reject_mutations() {
                 worktree: false,
                 path: None,
             },
+            Default::default(),
         )
         .await
         .unwrap();
@@ -1582,7 +1595,12 @@ async fn oversized_syntax_preserves_status_and_source_text_without_warnings() {
     let store = Arc::new(RepositoryStore::default());
     let syntax = SyntaxEngine::new(diff.analysis_pool());
     let writer = Arc::new(GitWriteService::new(Arc::clone(&store)));
-    let service = StatusService::new(Arc::clone(&store), diff, Arc::clone(&syntax), writer);
+    let service = StatusService::new(
+        Arc::clone(&store),
+        diff.clone(),
+        Arc::clone(&syntax),
+        writer,
+    );
     let (opened, timing) = service
         .open_with_timing(
             DocumentId("syntax-status".into()),
@@ -1642,7 +1660,7 @@ async fn oversized_syntax_preserves_status_and_source_text_without_warnings() {
         .unwrap();
     assert!(repeated.syntax_diagnostic.is_none());
 
-    let source = crate::source_document::SourceDocumentService::new(store, syntax);
+    let source = crate::source_document::SourceDocumentService::new(store, diff.clone(), syntax);
     let historical = source
         .open(
             DocumentId("syntax-source".into()),
@@ -1707,6 +1725,7 @@ async fn removed_status_row_opens_captured_blob_after_index_changes() {
     git(directory.path(), &["add", "sample.txt"]);
     let source = crate::source_document::SourceDocumentService::new(
         Arc::new(RepositoryStore::default()),
+        diff.clone(),
         SyntaxEngine::new(diff.analysis_pool()),
     );
     let opened = source
@@ -1757,7 +1776,7 @@ async fn display_group_context_stages_nearby_raw_hunks_only() {
     let headers: Vec<_> = loaded
         .block
         .iter()
-        .filter(|block| block.id.0.starts_with("hunk-header:"))
+        .filter(|block| is_hunk_heading(block))
         .collect();
     assert_eq!(headers.len(), 2);
     let (body, row) = loaded
@@ -1838,7 +1857,7 @@ async fn semantic_display_group_stages_and_unstages_only_its_raw_hunks() {
         let headers: Vec<_> = loaded
             .block
             .iter()
-            .filter(|block| block.id.0.starts_with("hunk-header:"))
+            .filter(|block| is_hunk_heading(block))
             .collect();
         assert_eq!(headers.len(), 2, "{path}");
         assert_eq!(headers[0].text.wire_rows()[0], "@@ +3 -3");
@@ -1903,7 +1922,7 @@ async fn semantic_display_group_stages_and_unstages_only_its_raw_hunks() {
         let header = loaded
             .block
             .iter()
-            .find(|block| block.id.0.starts_with("hunk-header:"))
+            .find(|block| is_hunk_heading(block))
             .unwrap();
         let mut captured = input(&snapshot, path, 3, "unstage");
         captured.location = body_location(selected, &loaded, header, 0);
@@ -1929,6 +1948,14 @@ async fn semantic_display_group_stages_and_unstages_only_its_raw_hunks() {
     }
 }
 
+fn is_hunk_heading(block: &forge_buffer::block::BufferBlock) -> bool {
+    block
+        .metadata
+        .decoration
+        .iter()
+        .any(|decoration| decoration.capture == "ForgeHunkHeader")
+}
+
 fn assert_impl_context(snapshot: &BufferSnapshot, expected_groups: usize) {
     let source = rows(snapshot);
     assert_eq!(
@@ -1950,7 +1977,7 @@ fn assert_impl_context(snapshot: &BufferSnapshot, expected_groups: usize) {
         snapshot
             .block
             .iter()
-            .filter(|block| block.id.0.starts_with("hunk-header:"))
+            .filter(|block| is_hunk_heading(block))
             .count(),
         expected_groups
     );
@@ -1958,7 +1985,7 @@ fn assert_impl_context(snapshot: &BufferSnapshot, expected_groups: usize) {
         snapshot
             .block
             .iter()
-            .filter(|block| block.id.0.starts_with("hunk-header:"))
+            .filter(|block| is_hunk_heading(block))
             .all(|block| !block.text.wire_rows()[0].contains("impl")
                 && !block.text.wire_rows()[0].contains("fn run"))
     );
@@ -2512,7 +2539,7 @@ async fn optimistic_hunks_accept_stage_stage_unstage_before_git_and_preserve_con
         loaded
             .block
             .iter()
-            .filter(|block| block.id.0.starts_with("hunk-header:"))
+            .filter(|block| is_hunk_heading(block))
             .count(),
         2
     );
@@ -3464,5 +3491,880 @@ async fn collapsed_file_counts_survive_queued_stage_unstage_stage() {
     assert_eq!(
         git(directory.path(), &["diff", "--cached", "--name-only"]),
         b"deleted.txt\nnew.txt\nsample.txt\n"
+    );
+}
+
+async fn semantic_status_fixture(
+    staged: bool,
+) -> (
+    tempfile::TempDir,
+    StatusService,
+    StatusSnapshot,
+    String,
+    String,
+) {
+    let (directory, service, _, _) = fixture().await;
+    let old = "pub fn visible() { before(); }\nfn hidden() { private_before(); }\n".to_owned();
+    let new = old.replace("before", "after");
+    std::fs::write(directory.path().join("sample.rs"), &old).unwrap();
+    git(directory.path(), &["add", "sample.rs"]);
+    git(directory.path(), &["commit", "-m", "semantic baseline"]);
+    std::fs::write(directory.path().join("sample.rs"), &new).unwrap();
+    if staged {
+        git(directory.path(), &["add", "sample.rs"]);
+    }
+    let opened = service
+        .open(
+            DocumentId(format!("semantic-status-{staged}")),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    (directory, service, opened, old, new)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_full_round_trip_preserves_partial_and_complete_loaded_pages() {
+    let (directory, service, _, _) = fixture().await;
+    let before = format!(
+        "pub fn visible() {{\n{}}}\n",
+        (0..1300)
+            .map(|index| format!("    before_{index}();\n"))
+            .collect::<String>()
+    );
+    let after = before.replace("before_", "after_");
+    std::fs::write(directory.path().join("sample.rs"), &before).unwrap();
+    git(directory.path(), &["add", "sample.rs"]);
+    git(
+        directory.path(),
+        &["commit", "-m", "large semantic baseline"],
+    );
+    std::fs::write(directory.path().join("sample.rs"), after).unwrap();
+    let opened = service
+        .open(
+            DocumentId("semantic-status-pages".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    let mut sequence = 0;
+    for _ in 0..3 {
+        sequence += 1;
+        service
+            .demand(input(&opened, "sample.rs", sequence, "demand"))
+            .await
+            .unwrap();
+    }
+    for complete in [false, true] {
+        if complete {
+            loop {
+                sequence += 1;
+                if !service
+                    .demand(input(&opened, "sample.rs", sequence, "demand"))
+                    .await
+                    .unwrap()
+                    .more
+                {
+                    break;
+                }
+            }
+        }
+        let current = service.snapshot(&opened.document).await.unwrap();
+        let original = body(&service, &current, file(&current, "sample.rs", None)).await;
+        assert_eq!(
+            rows(&original)
+                .iter()
+                .any(|row| row.contains("after_1299();")),
+            complete
+        );
+        for _ in 0..2 {
+            let current = service.snapshot(&opened.document).await.unwrap();
+            sequence += 1;
+            service
+                .change_diff_view(input(
+                    &current,
+                    "sample.rs",
+                    sequence,
+                    "toggle_presentation",
+                ))
+                .await
+                .unwrap();
+        }
+        let current = service.snapshot(&opened.document).await.unwrap();
+        let restored = body(&service, &current, file(&current, "sample.rs", None)).await;
+        assert_eq!(
+            rows(&restored),
+            rows(&original),
+            "Full round trip lost a loaded page, complete={complete}"
+        );
+    }
+    let current = service.snapshot(&opened.document).await.unwrap();
+    sequence += 1;
+    service
+        .input(input(&current, "sample.rs", sequence, "stage"))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let selected = file(&current, "sample.rs", Some(StatusSection::Staged));
+    let original = body(&service, &current, selected).await;
+    assert!(
+        rows(&original)
+            .iter()
+            .any(|row| row.contains("after_1299();")),
+        "mutation truncated a completely delivered body"
+    );
+    for _ in 0..2 {
+        let current = service.snapshot(&opened.document).await.unwrap();
+        sequence += 1;
+        service
+            .change_diff_view(input(
+                &current,
+                "sample.rs",
+                sequence,
+                "toggle_presentation",
+            ))
+            .await
+            .unwrap();
+    }
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let restored = body(
+        &service,
+        &current,
+        file(&current, "sample.rs", Some(StatusSection::Staged)),
+    )
+    .await;
+    assert_eq!(
+        rows(&restored),
+        rows(&original),
+        "post-mutation Full round trip lost source rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_status_controls_keep_semantic_bodies_lazy_and_visibility_independent() {
+    use forge_diff::view::{DiffPresentation, DiffVisibility};
+    let (_directory, service, opened, _, _) = semantic_status_fixture(false).await;
+    assert_eq!(opened.diff_view.presentation, DiffPresentation::Full);
+    assert_eq!(opened.diff_view.visibility, DiffVisibility::All);
+    service
+        .demand(input(&opened, "sample.rs", 1, "demand"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let delivery = service
+        .change_diff_view(input(&current, "sample.rs", 2, "toggle_presentation"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        delivery.delta.diff_view.unwrap().presentation,
+        DiffPresentation::Semantic
+    );
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let selected = file(&current, "sample.rs", None);
+    let loaded = body(&service, &current, selected).await;
+    let text = rows(&loaded).join("\n");
+    assert!(text.contains("pub fn visible()"), "{text}");
+    assert!(text.contains("fn hidden()"), "{text}");
+    assert!(!text.contains("before()"), "{text}");
+    assert!(!text.contains("after()"), "{text}");
+    assert!(
+        loaded
+            .block
+            .iter()
+            .flat_map(|block| &block.metadata.fold)
+            .any(|fold| fold
+                .collapsed_suffix
+                .as_ref()
+                .is_some_and(|suffix| suffix.contains("1 change")))
+    );
+    let heading = loaded
+        .block
+        .iter()
+        .find(|block| {
+            block
+                .text
+                .row(0)
+                .is_some_and(|row| row.contains("pub fn visible()"))
+        })
+        .unwrap();
+    let mut expand = input(&current, "sample.rs", 3, "source_expand");
+    expand.location = body_location(selected, &loaded, heading, 0);
+    service.source_section(expand).await.unwrap();
+    let loaded = body(&service, &current, selected).await;
+    let text = rows(&loaded).join("\n");
+    assert!(
+        text.contains("before()") && text.contains("after()"),
+        "{text}"
+    );
+    service
+        .change_diff_view(input(&current, "sample.rs", 4, "toggle_visibility"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let loaded = body(&service, &current, file(&current, "sample.rs", None)).await;
+    let text = rows(&loaded).join("\n");
+    assert!(
+        !text.contains("hidden") && !text.contains("private_"),
+        "{text}"
+    );
+    assert!(text.contains("after()"), "{text}");
+    service
+        .change_diff_view(input(&current, "sample.rs", 5, "toggle_presentation"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    assert_eq!(current.diff_view.presentation, DiffPresentation::Full);
+    assert_eq!(current.diff_view.visibility, DiffVisibility::Public);
+    let text = rows(&body(&service, &current, file(&current, "sample.rs", None)).await).join("\n");
+    assert!(
+        text.contains("after()") && !text.contains("private_"),
+        "{text}"
+    );
+    service.refresh(&opened.document).await.unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    assert_eq!(current.diff_view.visibility, DiffVisibility::Public);
+    service
+        .change_diff_view(input(&current, "sample.rs", 6, "toggle_visibility"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let text = rows(&body(&service, &current, file(&current, "sample.rs", None)).await).join("\n");
+    assert!(
+        text.contains("private_before") && text.contains("private_after"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_mutation_refresh_retains_unfolded_sibling_declarations() {
+    let (directory, service, opened, old, _) = semantic_status_fixture(false).await;
+    service
+        .demand(input(&opened, "sample.rs", 1, "demand"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    service
+        .change_diff_view(input(&current, "sample.rs", 2, "toggle_presentation"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let selected = file(&current, "sample.rs", None);
+    let loaded = body(&service, &current, selected).await;
+    let visible = loaded
+        .block
+        .iter()
+        .find(|block| {
+            block
+                .text
+                .row(0)
+                .is_some_and(|text| text.contains("pub fn visible()"))
+        })
+        .unwrap();
+    let mut expand = input(&current, "sample.rs", 3, "source_expand");
+    expand.location = body_location(selected, &loaded, visible, 0);
+    service.source_section(expand).await.unwrap();
+    let loaded = body(&service, &current, selected).await;
+    let hidden = loaded
+        .block
+        .iter()
+        .find(|block| {
+            block
+                .text
+                .row(0)
+                .is_some_and(|text| text.contains("fn hidden()"))
+        })
+        .unwrap();
+    let mut stage = input(&current, "sample.rs", 4, "stage");
+    stage.location = body_location(selected, &loaded, hidden, 0);
+    let outcome = service.input(stage).await.unwrap().finish().await.unwrap();
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed)
+    );
+    assert_eq!(
+        git(directory.path(), &["show", ":sample.rs"]),
+        old.replace("private_before", "private_after").as_bytes()
+    );
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let loaded = body(
+        &service,
+        &current,
+        file(&current, "sample.rs", Some(StatusSection::Unstaged)),
+    )
+    .await;
+    let text = rows(&loaded).join("\n");
+    assert!(
+        text.contains("before();") && text.contains("after();"),
+        "mutation collapsed an unfolded sibling: {text}"
+    );
+    let visible = loaded
+        .block
+        .iter()
+        .find(|block| {
+            block
+                .text
+                .row(0)
+                .is_some_and(|text| text == "pub fn visible() {")
+        })
+        .unwrap();
+    assert!(!visible.metadata.fold[0].closed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_collapsed_file_actions_preserve_excluded_changes_for_all_mutations() {
+    for (action, staged) in [
+        ("stage", false),
+        ("unstage", true),
+        ("discard", false),
+        ("discard", true),
+    ] {
+        let (directory, service, opened, old, new) = semantic_status_fixture(staged).await;
+        service
+            .change_diff_view(input(&opened, "sample.rs", 1, "toggle_visibility"))
+            .await
+            .unwrap();
+        let current = service.snapshot(&opened.document).await.unwrap();
+        let outcome = service
+            .input(input(&current, "sample.rs", 2, action))
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert!(
+            outcome
+                .target
+                .iter()
+                .all(|target| target.completion == TargetCompletion::Completed),
+            "{action}/{staged}: {outcome:?}"
+        );
+        if action != "discard" {
+            let current = service.snapshot(&opened.document).await.unwrap();
+            for file in current.file.iter().filter(|file| file.path == "sample.rs") {
+                assert_eq!(
+                    file.stats,
+                    crate::protocol::StatusStatistics::Exact {
+                        added: 1,
+                        deleted: 1
+                    },
+                    "{action}/{staged}: {:?}",
+                    file.section
+                );
+            }
+        }
+        let expected = if action == "stage" {
+            old.replacen("before();", "after();", 1)
+        } else {
+            new.replacen("after();", "before();", 1)
+        };
+        let index = git(directory.path(), &["show", ":sample.rs"]);
+        let worktree = std::fs::read(directory.path().join("sample.rs")).unwrap();
+        assert_eq!(
+            index,
+            if action == "discard" && !staged {
+                old.as_bytes()
+            } else {
+                expected.as_bytes()
+            },
+            "{action}/{staged}"
+        );
+        assert_eq!(
+            worktree,
+            if action == "discard" {
+                expected.as_bytes()
+            } else {
+                new.as_bytes()
+            },
+            "{action}/{staged}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_heading_actions_scope_shared_raw_hunks_and_preserve_presentation_after_staging() {
+    use forge_diff::view::DiffPresentation;
+    let (directory, service, opened, old, new) = semantic_status_fixture(false).await;
+    service
+        .demand(input(&opened, "sample.rs", 1, "demand"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    service
+        .change_diff_view(input(&current, "sample.rs", 2, "toggle_presentation"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let selected = file(&current, "sample.rs", None);
+    let loaded = body(&service, &current, selected).await;
+    let heading = loaded
+        .block
+        .iter()
+        .find(|block| {
+            block
+                .text
+                .row(0)
+                .is_some_and(|row| row.contains("pub fn visible()"))
+        })
+        .unwrap();
+    let mut capture = input(&current, "sample.rs", 3, "stage");
+    capture.location = body_location(selected, &loaded, heading, 0);
+    let outcome = service
+        .input(capture)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        git(directory.path(), &["show", ":sample.rs"]),
+        old.replacen("before();", "after();", 1).as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("sample.rs")).unwrap(),
+        new.as_bytes()
+    );
+    let current = service.snapshot(&opened.document).await.unwrap();
+    assert_eq!(current.diff_view.presentation, DiffPresentation::Semantic);
+    for selected in current.file.iter().filter(|file| file.path == "sample.rs") {
+        assert_eq!(
+            selected.stats,
+            crate::protocol::StatusStatistics::Exact {
+                added: 1,
+                deleted: 1
+            }
+        );
+        let loaded = body(&service, &current, selected).await;
+        assert!(
+            loaded
+                .block
+                .iter()
+                .any(|block| !block.metadata.section.is_empty()),
+            "{:?}",
+            rows(&loaded)
+        );
+        assert!(!rows(&loaded).join("\n").contains("after()"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linked_status_diff_controls_publish_matching_bodies_and_protocol_fixture() {
+    use forge_diff::view::{DiffPresentation, DiffVisibility};
+    let (directory, service, initial, _, _) = semantic_status_fixture(false).await;
+    let revision = String::from_utf8(git(directory.path(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let child_initial = service
+        .open_comparison(
+            DocumentId(format!("{}:commit:{revision}", initial.document.0)),
+            directory.path().to_owned(),
+            forge_git::revision::comparison::ComparisonRequest {
+                reference: revision,
+                head: None,
+                worktree: false,
+                path: None,
+            },
+            initial.diff_view,
+        )
+        .await
+        .unwrap();
+    let parent_full = service
+        .demand(input(&initial, "sample.rs", 1, "demand"))
+        .await
+        .unwrap();
+    let child_full = service
+        .demand(input(&child_initial, "sample.rs", 1, "demand"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&initial.document).await.unwrap();
+    let semantic = service
+        .change_diff_views(
+            input(&current, "sample.rs", 2, "toggle_presentation"),
+            vec![child_initial.document.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(semantic.len(), 2);
+    assert!(semantic.iter().all(|update| {
+        update
+            .delta
+            .diff_view
+            .is_some_and(|options| options.presentation == DiffPresentation::Semantic)
+    }));
+    let current = service.snapshot(&initial.document).await.unwrap();
+    let selected = file(&current, "sample.rs", None);
+    let loaded = body(&service, &current, selected).await;
+    let heading = loaded
+        .block
+        .iter()
+        .find(|block| {
+            block
+                .text
+                .row(0)
+                .is_some_and(|row| row.contains("pub fn visible()"))
+        })
+        .unwrap();
+    let mut expand = input(&current, "sample.rs", 3, "source_expand");
+    expand.location = body_location(selected, &loaded, heading, 0);
+    let expanded = service.source_section(expand).await.unwrap();
+    let public = service
+        .change_diff_views(
+            input(&current, "sample.rs", 4, "toggle_visibility"),
+            vec![child_initial.document.clone()],
+        )
+        .await
+        .unwrap();
+    for document in [&initial.document, &child_initial.document] {
+        let snapshot = service.snapshot(document).await.unwrap();
+        assert_eq!(snapshot.diff_view.visibility, DiffVisibility::Public);
+        let text =
+            rows(&body(&service, &snapshot, file(&snapshot, "sample.rs", None)).await).join("\n");
+        assert!(
+            !text.contains("private_") && !text.contains("hidden"),
+            "{text}"
+        );
+    }
+    let current = service.snapshot(&initial.document).await.unwrap();
+    let inherited = service
+        .open_comparison(
+            DocumentId("inherited-controls".into()),
+            directory.path().to_owned(),
+            forge_git::revision::comparison::ComparisonRequest {
+                reference: "HEAD".into(),
+                head: None,
+                worktree: false,
+                path: None,
+            },
+            current.diff_view,
+        )
+        .await
+        .unwrap();
+    assert_eq!(inherited.diff_view, current.diff_view);
+    let inherited_body = service
+        .demand(input(&inherited, "sample.rs", 1, "demand"))
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap();
+    assert!(
+        inherited_body
+            .block
+            .iter()
+            .any(|block| !block.metadata.section.is_empty())
+    );
+    assert!(!rows(&inherited_body).join("\n").contains("hidden"));
+    assert!(service.close(&inherited.document));
+    let public_full = service
+        .change_diff_views(
+            input(&current, "sample.rs", 5, "toggle_presentation"),
+            vec![child_initial.document.clone()],
+        )
+        .await
+        .unwrap();
+    let current = service.snapshot(&initial.document).await.unwrap();
+    let all_full = service
+        .change_diff_views(
+            input(&current, "sample.rs", 6, "toggle_visibility"),
+            vec![child_initial.document.clone()],
+        )
+        .await
+        .unwrap();
+    for document in [&initial.document, &child_initial.document] {
+        let snapshot = service.snapshot(document).await.unwrap();
+        assert_eq!(snapshot.diff_view, Default::default());
+        let text =
+            rows(&body(&service, &snapshot, file(&snapshot, "sample.rs", None)).await).join("\n");
+        assert!(text.contains("private_"), "{text}");
+    }
+    let current = service.snapshot(&initial.document).await.unwrap();
+    assert!(
+        service
+            .change_diff_views(
+                input(&current, "sample.rs", 7, "toggle_visibility"),
+                vec![DocumentId("missing-related".into())]
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service.snapshot(&initial.document).await.unwrap().diff_view,
+        current.diff_view
+    );
+    let fixture = serde_json::json!({
+        "initial": initial, "child_initial": child_initial, "full": [parent_full, child_full],
+        "semantic": semantic, "expanded": expanded, "public": public, "public_full": public_full, "all_full": all_full,
+    });
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/status-semantic-fixture.json");
+    std::fs::write(&artifact, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    println!("semantic status fixture: {}", artifact.display());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_collapsed_actions_reject_parser_service_failure_without_including_hidden_bytes() {
+    for action in ["stage", "discard"] {
+        let (directory, service, initial, old, new) = semantic_status_fixture(false).await;
+        service
+            .change_diff_view(input(&initial, "sample.rs", 1, "toggle_visibility"))
+            .await
+            .unwrap();
+        service.syntax.close();
+        let current = service.snapshot(&initial.document).await.unwrap();
+        let failure = service
+            .act(input(&current, "sample.rs", 2, action), None)
+            .await
+            .err()
+            .unwrap();
+        assert!(failure.to_string().contains("classify"), "{failure:#}");
+        assert_eq!(
+            git(directory.path(), &["show", ":sample.rs"]),
+            old.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("sample.rs")).unwrap(),
+            new.as_bytes()
+        );
+        assert_eq!(
+            service.snapshot(&initial.document).await.unwrap().diff_view,
+            current.diff_view
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_raw_and_declaration_selection_preserves_each_hunks_scope() {
+    let (directory, service, _, old, new) = semantic_status_fixture(false).await;
+    let old = format!("use crate::Old;\n\n{old}");
+    let new = format!("use crate::New;\n\n{new}");
+    std::fs::write(directory.path().join("sample.rs"), &old).unwrap();
+    git(directory.path(), &["add", "sample.rs"]);
+    git(
+        directory.path(),
+        &["commit", "-m", "mixed selection baseline"],
+    );
+    std::fs::write(directory.path().join("sample.rs"), &new).unwrap();
+    let opened = service
+        .open(
+            DocumentId("mixed-semantic-selection".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    service
+        .demand(input(&opened, "sample.rs", 1, "demand"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    service
+        .change_diff_view(input(&current, "sample.rs", 2, "toggle_presentation"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    service
+        .demand(input(&current, "sample.rs", 3, "demand"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let selected = file(&current, "sample.rs", None);
+    let loaded = body(&service, &current, selected).await;
+    let heading = loaded
+        .block
+        .iter()
+        .find(|block| {
+            block
+                .text
+                .row(0)
+                .is_some_and(|row| row.contains("pub fn visible()"))
+        })
+        .unwrap();
+    let raw = loaded
+        .block
+        .iter()
+        .find(|block| {
+            block
+                .text
+                .row(0)
+                .is_some_and(|row| row.contains("crate::New"))
+        })
+        .unwrap();
+    let mut captured = input(&current, "sample.rs", 4, "stage");
+    captured.location = body_location(selected, &loaded, heading, 0);
+    let selection = StatusSelection {
+        target: vec![
+            captured.location.clone(),
+            body_location(selected, &loaded, raw, 0),
+        ],
+    };
+    let outcome = service
+        .input_selection(captured, selection)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        git(directory.path(), &["show", ":sample.rs"]),
+        old.replace("crate::Old", "crate::New")
+            .replacen("before();", "after();", 1)
+            .as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("sample.rs")).unwrap(),
+        new.as_bytes()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_linked_diff_preparation_preserves_every_usable_body_and_setting() {
+    let (directory, service, initial, _, _) = semantic_status_fixture(false).await;
+    let child = service
+        .open_comparison(
+            DocumentId("failed-linked-child".into()),
+            directory.path().to_owned(),
+            forge_git::revision::comparison::ComparisonRequest {
+                reference: "HEAD".into(),
+                head: None,
+                worktree: false,
+                path: None,
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    service
+        .demand(input(&initial, "sample.rs", 1, "demand"))
+        .await
+        .unwrap();
+    service
+        .demand(input(&child, "sample.rs", 1, "demand"))
+        .await
+        .unwrap();
+    let parent_before = body(&service, &initial, file(&initial, "sample.rs", None)).await;
+    let child_before = body(&service, &child, file(&child, "sample.rs", None)).await;
+    service.diff.analysis_pool().close();
+    let current = service.snapshot(&initial.document).await.unwrap();
+    assert!(
+        service
+            .change_diff_views(
+                input(&current, "sample.rs", 2, "toggle_presentation"),
+                vec![child.document.clone()]
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service.snapshot(&initial.document).await.unwrap().diff_view,
+        initial.diff_view
+    );
+    assert_eq!(
+        service.snapshot(&child.document).await.unwrap().diff_view,
+        child.diff_view
+    );
+    assert_eq!(
+        body(&service, &initial, file(&initial, "sample.rs", None)).await,
+        parent_before
+    );
+    assert_eq!(
+        body(&service, &child, file(&child, "sample.rs", None)).await,
+        child_before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_navigation_resolves_semantic_declarations_and_shared_full_hunk_headers() {
+    let (_directory, service, opened, _, _) = semantic_status_fixture(false).await;
+    service
+        .demand(input(&opened, "sample.rs", 1, "demand"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    service
+        .change_diff_view(input(&current, "sample.rs", 2, "toggle_presentation"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let first = service
+        .navigate(input(&current, "sample.rs", 3, "navigate"), true)
+        .await
+        .unwrap()
+        .effect
+        .unwrap();
+    let StatusLocation::Body { block, .. } = &first.location else {
+        panic!("semantic navigation did not select a declaration")
+    };
+    let loaded = body(&service, &current, file(&current, "sample.rs", None)).await;
+    assert!(
+        loaded
+            .block
+            .iter()
+            .find(|entry| entry.id == *block)
+            .unwrap()
+            .text
+            .row(0)
+            .unwrap()
+            .contains("pub fn visible()")
+    );
+    let mut next = input(&current, "sample.rs", 4, "navigate");
+    next.location = first.location;
+    let next = service.navigate(next, true).await.unwrap().effect.unwrap();
+    let StatusLocation::Body { block, .. } = &next.location else {
+        panic!("semantic navigation did not select the next declaration")
+    };
+    assert!(
+        loaded
+            .block
+            .iter()
+            .find(|entry| entry.id == *block)
+            .unwrap()
+            .text
+            .row(0)
+            .unwrap()
+            .contains("fn hidden()")
+    );
+    service
+        .change_diff_view(input(&current, "sample.rs", 5, "toggle_presentation"))
+        .await
+        .unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let next = service
+        .navigate(input(&current, "sample.rs", 6, "navigate"), true)
+        .await
+        .unwrap()
+        .effect
+        .unwrap();
+    let StatusLocation::Body { block, .. } = next.location else {
+        panic!("Full navigation did not select a shared hunk")
+    };
+    let loaded = body(&service, &current, file(&current, "sample.rs", None)).await;
+    assert!(
+        loaded
+            .block
+            .iter()
+            .find(|entry| entry.id == block)
+            .unwrap()
+            .text
+            .row(0)
+            .unwrap()
+            .starts_with("@@")
     );
 }

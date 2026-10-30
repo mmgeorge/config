@@ -157,6 +157,7 @@ pub struct DisplayChunk {
 }
 
 /// Owns one immutable analysis and fixed context setting for the entire delivery lifecycle.
+#[derive(Clone)]
 pub struct DisplayCursor {
     diff: AnalysisHandle,
     group: Vec<DisplayHunk>,
@@ -177,7 +178,7 @@ pub struct DisplayCursor {
     gap_emitted: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StructuralContext {
     label: Option<String>,
     before: Vec<Candidate>,
@@ -465,6 +466,25 @@ impl DisplayCursor {
             })
             .cloned();
         cursor.group = selected.into_iter().collect();
+        cursor
+    }
+
+    /// Select only display groups intersecting either exact source extent.
+    /// Consumers still filter individual rows when a group spans adjacent declarations.
+    pub fn within_source_ranges(
+        diff: AnalysisHandle,
+        context: usize,
+        old: Option<Range<usize>>,
+        new: Option<Range<usize>>,
+    ) -> Self {
+        let mut cursor = Self::new(diff, context);
+        cursor.group.retain(|group| {
+            old.as_ref().is_some_and(|range| {
+                range.start < group.old_lines.end && group.old_lines.start < range.end
+            }) || new.as_ref().is_some_and(|range| {
+                range.start < group.new_lines.end && group.new_lines.start < range.end
+            })
+        });
         cursor
     }
 

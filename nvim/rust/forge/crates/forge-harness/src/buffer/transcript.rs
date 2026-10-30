@@ -349,12 +349,12 @@ impl<'profile> TranscriptRenderer<'profile> {
         if block.text.row_count() <= 1
             || block.metadata.node.is_some()
             || !block.metadata.fold.is_empty()
-            || !block
+            || block
                 .metadata
                 .layout
                 .as_ref()
                 .and_then(|layout| layout.marker.as_ref())
-                .is_some_and(|marker| marker.text == "◇")
+                .is_none_or(|marker| marker.text != "◇")
         {
             return;
         }

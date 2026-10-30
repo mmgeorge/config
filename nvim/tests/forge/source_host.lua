@@ -54,6 +54,18 @@ local ok, failure = xpcall(function()
   assert(vim.bo[state.replica.buffer].readonly and not vim.bo[state.replica.buffer].modifiable)
   assert(vim.b[state.replica.buffer].forge_native_document, "native source ownership missing")
   assert(not client._client.harness_ready, "source open initialized Harness")
+  local snapshot
+  client.request({ method = "repository.source.document", params = { operation = "snapshot", document = state.document } },
+    function(result, request_failure)
+      if request_failure then notices[#notices + 1] = tostring(request_failure) else snapshot = result end
+    end)
+  assert(vim.wait(3000, function() return snapshot ~= nil or #notices > 0 end, 10), "native source snapshot did not arrive")
+  assert(#notices == 0, table.concat(notices, "\n"))
+  assert(snapshot.document == state.document and snapshot.revision == state.replica.revision)
+  assert(snapshot.more == false and snapshot.diff_view == nil, "plain source snapshot acquired diff controls")
+  local captured = {}
+  for _, block in ipairs(snapshot.block) do vim.list_extend(captured, block.text) end
+  assert(vim.deep_equal(captured, lines), "source recovery snapshot differs from captured rows")
   local closed = false
   source.close(state, function() closed = true end)
   assert(vim.wait(3000, function() return closed end, 10), "native source close did not settle")

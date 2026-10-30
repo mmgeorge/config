@@ -54,7 +54,12 @@ local host_unavailable_message = "Forge host stopped or restarted; refresh or re
 ---@field finish_open? fun(failure?: string) Completes startup timing on ready, failure, or close.
 ---@field fold_open? {window: table<integer, boolean>, command: string}
 ---@field navigation? ForgeStatusNavigation
----@field commands? {close: fun()}
+---@field commands? {close: fun(), refresh: fun()}
+---@field diff_pending? table<string, boolean>
+---@field diff_window? integer
+---@field diff_active? boolean
+---@field diff_update? table[]
+---@field source_pending? table<string, boolean>
 ---@field native_context? boolean
 ---@field context? table
 ---@field ready? boolean
@@ -110,7 +115,9 @@ local function request(state, params, callback, method)
         local next_request = table.remove(state.request_queue, 1)
         if next_request then next_request()
         elseif state.active then
-          if state.navigation then M.navigate_step(state) else M.demand(state) end
+          if not M.flush_diff_controls(state) then
+            if state.navigation then M.navigate_step(state) else M.demand(state) end
+          end
         end
         if params.operation == "open" or params.operation == "comparison" or params.operation == "local" then
           require("forge.startup_log").write("status.callback.finished", { document = state.document, operation = params.operation,
@@ -199,6 +206,121 @@ local function view_for(state, window)
   return view
 end
 
+local function apply_diff_updates(state, updates)
+  local queued = state.diff_update or {}
+  state.diff_update = nil
+  vim.list_extend(queued, updates)
+  table.sort(queued, function(left, right)
+    if left.document == right.document then return left.delta.base < right.delta.base end
+    return left.document < right.document
+  end)
+  local usable = {}
+  for _, update in ipairs(queued) do
+    if update.resync then M.apply_update(state, update) else usable[#usable + 1] = update end
+  end
+  if #usable == 0 then return end
+  local result = buffer.apply_updates(state.replica, usable)
+  if result.kind == "Desynchronized" then
+    recover(state)
+    for _, owner in pairs(state.replica.commit) do if owner.snapshot then recover_commit(state, owner) end end
+    return
+  end
+  if result.kind ~= "Applied" then return end
+  state.done = {}
+  for _, update in ipairs(usable) do
+    local owner = history.owner(state.replica, update.document)
+    for _, delivery in ipairs(update.body or {}) do
+      state.done[owner and history.file_key(owner, delivery.file) or delivery.file] = delivery.more ~= true
+    end
+  end
+  if state.commands then state.commands.refresh() end
+end
+
+---@param state ForgeNativeStatus
+---@param action string
+function M.toggle_diff(state, action)
+  if not state.active then return end
+  state.diff_pending = state.diff_pending or {}
+  state.diff_pending[action] = not state.diff_pending[action]
+  state.diff_window = vim.api.nvim_get_current_win()
+  M.flush_diff_controls(state)
+end
+
+---@param state ForgeNativeStatus
+---@param identity string
+---@param expanded boolean
+function M.source_section(state, identity, expanded)
+  state.source_pending = state.source_pending or {}
+  state.source_pending[identity] = expanded
+  state.diff_window = vim.api.nvim_get_current_win()
+  M.flush_diff_controls(state)
+end
+
+---@param state ForgeNativeStatus
+---@return boolean
+function M.flush_diff_controls(state)
+  if state.diff_active then return true end
+  if not state.active or not state.ready or state.request_active or state.pending or state.replica.status ~= "Applied" then return false end
+  local window = state.diff_window
+  if not window or not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then
+    window = vim.fn.win_findbuf(state.replica.buffer)[1]
+  end
+  if not window then return false end
+  local view = view_for(state, window)
+  local action
+  for _, candidate in ipairs({ "toggle_visibility", "toggle_presentation" }) do
+    if state.diff_pending and state.diff_pending[candidate] then action = candidate state.diff_pending[candidate] = nil break end
+  end
+  if action then
+    local related = {}
+    for _, owner in pairs(state.replica.commit) do if owner.snapshot then related[#related + 1] = owner.document end end
+    table.sort(related)
+    if view.sequence >= 9007199254740991 then notice("input sequence exhausted") return false end
+    view.sequence = view.sequence + 1
+    state.diff_active = true
+    request(state, { operation = "diff_view", related = related, input = {
+      document = state.document, revision = state.replica.revision, view = view.id,
+      sequence = view.sequence, action = action, location = { kind = "boundary", after_files = false },
+    } }, function(result, failure)
+      state.diff_active = nil
+      if failure or type(result) ~= "table" then
+        notice(failure or "Missing diff control delivery")
+        apply_diff_updates(state, {})
+        return
+      end
+      apply_diff_updates(state, result)
+    end)
+    return true
+  end
+  for identity, expanded in pairs(state.source_pending or {}) do
+    state.source_pending[identity] = nil
+    local owner = state.replica.body_owner[identity]
+    local model = owner and state.replica.file[owner]
+    local heading = model and model.body and model.body.block[identity]
+    local target = heading and heading.metadata.target[1]
+    if target then
+      if view.sequence >= 9007199254740991 then notice("input sequence exhausted") return false end
+      view.sequence = view.sequence + 1
+      local captured = history.input(state.replica, {
+        document = state.document, revision = state.replica.revision, view = view.id,
+        sequence = view.sequence, action = expanded and "source_expand" or "source_collapse",
+        location = { kind = "body", file = owner, generation = model.record.generation,
+          revision = model.body.revision, block = identity, position = { row = 0, column = 0 }, target = target.id },
+      })
+      request(state, { operation = "source_section", input = captured }, function(delivery, failure)
+        if failure or not delivery then notice(failure or "Missing source section delivery") return end
+        local result = buffer.apply_body(state.replica, delivery)
+        if result.kind == "Applied" then
+          local owner = history.owner(state.replica, delivery.document)
+          state.done[owner and history.file_key(owner, delivery.file) or delivery.file] = delivery.more ~= true
+        end
+      end)
+      return true
+    end
+  end
+  return false
+end
+
 ---@param state ForgeNativeStatus
 ---@return ForgeStatusInput|{commit: string}|nil
 local function visible_demand(state)
@@ -231,6 +353,14 @@ local function visible_demand(state)
       local location = buffer.locate(state.replica, row, 0)
       local deferred_open = state.fold_open and location and location.block:match("^file:")
       local semantic = location and location.location
+      local source = location and state.replica.source_entry[location.block]
+      local node = source and source.metadata and source.metadata.content_node
+      local heading = node and state.replica.source_entry[node]
+      local section = heading and heading.metadata and heading.metadata.section and heading.metadata.section[1]
+      if section and section.more and not require("forge.nodes").closed(state.replica, node)
+        and (location.block:match(":more$") or not section.open) then
+        return { section = node }
+      end
       if (folded < row + 1 or state.fold_open) and semantic and semantic.kind == "context" and semantic.role:match("^recent:") then
         local oid = semantic.role:sub(8)
         if not state.replica.commit[oid] then return { commit = oid } end
@@ -293,6 +423,7 @@ function M.demand(state)
       return
     end
     if state.request_active then return end
+    if demand.section then M.source_section(state, demand.section, true) return end
     if demand.commit then
       local owner = history.new(state.document, demand.commit)
       state.replica.commit[demand.commit] = owner
@@ -308,7 +439,7 @@ function M.demand(state)
       end
       request(state, { operation = "comparison", document = owner.document,
         workspace = state.replica.inventory.context.workspace,
-        reference = owner.oid, worktree = false }, function(result, failure)
+        reference = owner.oid, worktree = false, diff_view = state.replica.inventory.diff_view }, function(result, failure)
         if failure or not result then
           owner.failure = failure or "Missing commit comparison"
           if owner.unsubscribe then owner.unsubscribe() owner.unsubscribe = nil end
@@ -617,6 +748,11 @@ end
 ---@param update table
 function M.apply_update(state, update)
   if not state.active or not host_current(state) then return end
+  if state.diff_active then
+    state.diff_update = state.diff_update or {}
+    state.diff_update[#state.diff_update + 1] = update
+    return
+  end
   local owner = history.owner(state.replica, update.document)
   if update.resync then
     if update.phase == "accepted" then
@@ -753,6 +889,8 @@ function M.open(options)
     unstage = function(visual) M.action(state, "unstage", visual) end,
     discard = function(visual) M.action(state, "discard", visual) end,
     ignore = function(visual) M.action(state, "ignore", visual) end,
+    toggle_visibility = function() M.toggle_diff(state, "toggle_visibility") end,
+    toggle_presentation = function() M.toggle_diff(state, "toggle_presentation") end,
   }
   local function bind_commands()
   state.replica.node_action = function(id, expanded)
@@ -780,7 +918,12 @@ function M.open(options)
   state.commands = require("forge.document_commands").attach(state.replica, {
     view = options.comparison and "diff" or "status", title = comparison_title,
     narrow_title = comparison_title,
-    keymaps = options.keymaps, handler = vim.tbl_extend("force", handler, options.handler or {}), changed = function()
+    diff_view = function() return state.replica.inventory and state.replica.inventory.diff_view end,
+    keymaps = options.keymaps, handler = vim.tbl_extend("force", handler, options.handler or {}), changed = function(identity, closed)
+      local source = identity and state.replica.source_entry[identity]
+      if source and source.metadata and source.metadata.section and #source.metadata.section > 0 then
+        M.source_section(state, identity, not closed)
+      end
       local started = vim.uv.hrtime()
       local cursor = vim.api.nvim_win_get_cursor(0)
       local located = buffer.locate(state.replica, cursor[1] - 1, cursor[2])

@@ -15,6 +15,7 @@ pub struct StatusSnapshot {
     pub document: DocumentId,
     pub revision: DocumentRevision,
     pub view: StatusView,
+    pub diff_view: forge_diff::view::DiffViewOptions,
     pub head: StatusHead,
     pub context: Option<StatusContext>,
     pub section: Vec<StatusSectionRecord>,
@@ -109,6 +110,8 @@ Source: [nvim/rust/forge/crates/forge-status/src/protocol.rs](../../../rust/forg
 #[derive(Clone, Debug, Serialize)]
 /// Contiguous inventory change. Body revisions advance independently of this revision.
 pub struct StatusDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
     pub document: DocumentId,
     pub base: DocumentRevision,
     pub next: DocumentRevision,
@@ -192,6 +195,8 @@ Source: [nvim/rust/forge/crates/forge-status/src/source_document.rs](../../../ru
 ```rust
 #[derive(Debug, Serialize)]
 pub struct SourceOpen {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
     pub snapshot: BufferSnapshot,
     pub state: BodyState,
     pub more: bool,
@@ -210,8 +215,27 @@ Source: [nvim/rust/forge/crates/forge-status/src/source_document.rs](../../../ru
 ```rust
 #[derive(Debug, Serialize)]
 pub struct SourceDelivery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
     pub patch: Option<BufferPatch>,
     pub state: BodyState,
+    pub more: bool,
+}
+```
+
+## SourceSnapshot
+
+Source recovery returns its snapshot, committed controls, and continuation state
+from the same document revision. Non-diff source documents omit `diff_view`.
+Source: [source_document.rs](../../../rust/forge/crates/forge-status/src/source_document.rs).
+
+```rust
+#[derive(Debug, Serialize)]
+pub struct SourceSnapshot {
+    #[serde(flatten)]
+    pub snapshot: BufferSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_view: Option<forge_diff::view::DiffViewOptions>,
     pub more: bool,
 }
 ```

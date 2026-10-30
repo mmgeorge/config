@@ -164,7 +164,7 @@ impl HarnessService {
         &self,
         session_id: Option<String>,
         input: forge_buffer::input::DocumentInput,
-    ) -> Result<String> {
+    ) -> Result<forge_diff::saved_source::SavedDiffSource> {
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
         let session_id = session_id.context("an explicit session_id is required")?;
@@ -175,7 +175,16 @@ impl HarnessService {
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
             .action(input)?;
         match action {
-            crate::buffer::projection::TranscriptAction::Diff { text, .. } => Ok(text),
+            crate::buffer::projection::TranscriptAction::Diff {
+                text, checkpoint, ..
+            } => {
+                let data_root = controller.data_root.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::buffer::saved_diff::capture(&data_root, checkpoint.as_ref(), text)
+                })
+                .await
+                .context("saved diff source worker failed")
+            }
             _ => anyhow::bail!("transcript target is not a saved diff"),
         }
     }
@@ -189,6 +198,17 @@ impl HarnessService {
         let registry = self.registry().await?;
         let session_id = session_id.context("an explicit session_id is required")?;
         let controller = registry.resolve(&session_id).await?;
+        if let Some(result) = crate::buffer::session::diff_view::update(
+            controller.presentation.clone(),
+            &request,
+            controller.data_root.clone(),
+            self.diff.clone(),
+            self.syntax.clone(),
+        )
+        .await?
+        {
+            return Ok(result);
+        }
         match &request {
             crate::buffer::session::PresentationRequest::Recap { model }
             | crate::buffer::session::PresentationRequest::SessionName { model } => {

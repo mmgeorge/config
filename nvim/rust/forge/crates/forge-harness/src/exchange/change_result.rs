@@ -2,11 +2,16 @@ use super::{Exchange, ExchangeState};
 
 /// Borrows a saved comparison with both checkpoint identities present.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CheckpointComparison<'exchange>(&'exchange str);
+pub(crate) struct CheckpointComparison<'exchange> {
+    text: &'exchange str,
+    pub session_id: &'exchange str,
+    pub before: &'exchange str,
+    pub after: &'exchange str,
+}
 
 impl<'exchange> CheckpointComparison<'exchange> {
     pub(crate) fn text(self) -> &'exchange str {
-        self.0
+        self.text
     }
 }
 
@@ -31,7 +36,12 @@ impl Exchange {
             &self.checkpoint_after,
             self.checkpoint_diff_text.as_deref(),
         ) {
-            (Some(_), Some(_), Some(text)) => Some(CheckpointComparison(text)),
+            (Some(before), Some(after), Some(text)) => Some(CheckpointComparison {
+                text,
+                session_id: &self.session_id,
+                before,
+                after,
+            }),
             _ => None,
         };
         if let Some(reason) = self.finalization_error.as_deref() {

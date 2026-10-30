@@ -16,7 +16,7 @@ pub(super) struct FileDiff {
     /// Shared diff groups including structural context.
     pub hunk: Vec<ReviewHunk>,
     /// Matched callable ownership used by review-only modification styling.
-    pub alignment: super::review_alignment::ReviewAlignment,
+    pub alignment: forge_diff::declaration_change::DeclarationAlignment,
 }
 
 impl FileDiff {
@@ -38,8 +38,7 @@ impl FileDiff {
             old: SourceVersion::new(old.as_bytes().to_vec(), Representation::DisplayOnly)?,
             new: SourceVersion::new(new.as_bytes().to_vec(), Representation::DisplayOnly)?,
         };
-        let alignment =
-            super::review_alignment::ReviewAlignment::new(path, destination, before, after)?;
+        let alignment = super::review_alignment::compare(path, destination, before, after)?;
         let diff = if alignment.anchors.is_empty() {
             forge_diff::raw::compute_hunks(source)
         } else {

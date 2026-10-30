@@ -11,13 +11,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use forge_buffer::{
-    block::{BlockMetadata, TargetRange, TextPosition, TextRange},
+    block::{BlockMetadata, TextRange},
     identity::{BlockId, DocumentId, TargetId},
     patch::{BufferPatch, BufferSnapshot},
-    sequence::SequenceEdit,
 };
 use forge_diff::{
-    display::{ChunkLimits, DisplayCursor, DisplayState},
     engine::{DiffEngine, DiffRequest},
     syntax::{SyntaxEngine, SyntaxHandle, SyntaxRequest},
     workers::WorkPriority,
@@ -33,7 +31,7 @@ use tokio::time::timeout;
 
 use crate::{
     StatusSection,
-    document::{FileTarget, HunkTarget, StatusDocument, label},
+    document::{FileTarget, StatusDocument, label},
     protocol::{
         StatusDelta, StatusInput, StatusLocation, StatusSelection, StatusSnapshot, file_target,
     },
@@ -178,11 +176,7 @@ impl From<forge_git::snapshot::ObservationTiming> for StatusObservationTiming {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct SelectedFile {
-    pub whole: bool,
-    pub hunk: std::collections::HashSet<forge_diff::raw::RawHunkId>,
-}
+pub(crate) use crate::selection::ChangeSelection as SelectedFile;
 
 /// Owns at most eight status documents and reuses the host's repository and analysis services.
 #[derive(Clone)]
@@ -456,6 +450,7 @@ impl StatusService {
         id: DocumentId,
         workspace: PathBuf,
         mut request: forge_git::revision::comparison::ComparisonRequest,
+        view: forge_diff::view::DiffViewOptions,
     ) -> Result<StatusSnapshot> {
         id.validate()?;
         ensure!(
@@ -477,7 +472,7 @@ impl StatusService {
         .value;
         let title = request.reference.clone();
         request.reference = observation.commit.to_string();
-        let document = StatusDocument::comparison(
+        let mut document = StatusDocument::comparison(
             id.clone(),
             repository,
             &observation,
@@ -485,6 +480,14 @@ impl StatusService {
             admission,
             title,
         )?;
+        let prepared = document
+            .diff_view
+            .request_options(view)
+            .map_err(|error| anyhow::anyhow!("initial comparison controls failed: {error:?}"))?;
+        ensure!(
+            document.diff_view.commit(prepared),
+            "initial comparison controls were superseded"
+        );
         self.register_document(document).await
     }
 
@@ -704,7 +707,7 @@ impl StatusService {
                 syntax_diagnostic: None,
             });
         }
-        if file.projection.cursor().is_none()
+        if file.projection.analysis().is_none()
             && !matches!(
                 file.projection.state(),
                 BodyState::Ready | BodyState::Unavailable(_) | BodyState::Failed(_)
@@ -751,8 +754,15 @@ impl StatusService {
                 "status demand was superseded"
             );
             match loaded {
-                Ok((analysis, cursor, old_syntax, new_syntax, diagnostic)) => {
-                    file.projection = crate::document::SourceProjection::loaded(analysis, cursor);
+                Ok((analysis, old_syntax, new_syntax, diagnostic)) => {
+                    file.source_view =
+                        Some(forge_diff::source_projection::SourceDiffProjection::new(
+                            analysis.clone(),
+                            old_syntax.clone(),
+                            new_syntax.clone(),
+                            Default::default(),
+                        ));
+                    file.projection = crate::document::SourceProjection::loaded(analysis);
                     file.old_syntax = old_syntax;
                     file.new_syntax = new_syntax;
                     file.context_requested = true;
@@ -771,12 +781,24 @@ impl StatusService {
             }
             drop(lease);
         }
+        if document.file[&file_id].projection.analysis().is_some() {
+            drop(document);
+            let mut delivery = self
+                .demand_source_view(
+                    &input.document,
+                    &file_id,
+                    crate::diff_view::SourceViewChange::Demand,
+                )
+                .await?;
+            delivery.syntax_diagnostic = syntax_diagnostic.or(delivery.syntax_diagnostic);
+            return Ok(delivery);
+        }
         let mut file = document
             .file
             .remove(&file_id)
             .context("status file disappeared")?;
         let result = self
-            .deliver(&mut document, &file_id, &mut file)
+            .deliver_notice(&mut document, &file_id, &mut file)
             .map(|mut delivery| {
                 delivery.syntax_diagnostic = syntax_diagnostic;
                 delivery
@@ -921,6 +943,64 @@ impl StatusService {
                 );
             }
         }
+        let visibility = document.diff_view.committed().visibility;
+        let mut scoped_source = selected
+            .iter()
+            .filter(|(_, selected)| {
+                input.action != "ignore" && selected.requires_comparison(visibility)
+            })
+            .map(|(id, _)| {
+                (
+                    id.clone(),
+                    crate::selection::SelectedSource::capture(&document.file[id], &document.hunk),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut scoped_edit = HashMap::new();
+        if !scoped_source.is_empty() {
+            let repository = Arc::clone(&document.repository);
+            drop(document);
+            for (id, source) in &mut scoped_source {
+                let selected = &selected
+                    .iter()
+                    .find(|(target, _)| target == id)
+                    .context("selected source disappeared")?
+                    .1;
+                source
+                    .prepare_comparison(self, &repository, selected.whole)
+                    .await?;
+                if let Some(analysis) = &source.analysis {
+                    let edit = selected.capture(
+                        analysis,
+                        source.comparison.as_deref(),
+                        visibility,
+                        if input.action == "stage" {
+                            forge_diff::edit::EditDirection::Forward
+                        } else {
+                            forge_diff::edit::EditDirection::Reverse
+                        },
+                    )?;
+                    captured.insert(id.clone(), analysis.clone());
+                    scoped_edit.insert(id.clone(), edit);
+                }
+            }
+            document = owner.lock().await;
+            document._admission.check()?;
+            ensure!(
+                document.revision == input.revision
+                    && document.input.get(&input.view) == Some(&input.sequence),
+                "scoped status input changed while capturing sources"
+            );
+            for (id, source) in &scoped_source {
+                let current = document.file.get(id).context("scoped target disappeared")?;
+                ensure!(
+                    current.record == source.observed.change
+                        && current.stamp == source.observed.worktree
+                        && current.generation == source.generation,
+                    "scoped status source changed"
+                );
+            }
+        }
         let mut action = Vec::new();
         let mut observed = Vec::new();
         let observed_head = document.observed_head.clone();
@@ -928,6 +1008,13 @@ impl StatusService {
         let mut ignored_unstage = std::collections::HashSet::new();
         for (id, selected) in selected {
             let file = &document.file[&id];
+            if scoped_edit
+                .get(&id)
+                .and_then(Option::as_ref)
+                .is_some_and(|edit| edit.is_empty())
+            {
+                continue;
+            }
             if input.action == "ignore" {
                 if file.section == StatusSection::Staged {
                     let mut path = vec![file.record.path.clone()];
@@ -994,6 +1081,7 @@ impl StatusService {
                 action.push(GitWriteAction::Patch {
                     direction,
                     target: PatchTarget {
+                        scoped: scoped_edit.remove(&id).flatten().map(Box::new),
                         path: file.record.path.clone(),
                         analysis: (**captured
                             .get(&id)
@@ -1003,7 +1091,7 @@ impl StatusService {
                         selected: if selected.whole {
                             captured[&id].hunks().iter().map(|hunk| hunk.id).collect()
                         } else {
-                            selected.hunk.into_iter().collect()
+                            selected.hunk.into_keys().collect()
                         },
                     },
                 });
@@ -1038,6 +1126,9 @@ impl StatusService {
         }
         drop(document);
         if action.is_empty() {
+            if private_path.is_empty() && visibility == forge_diff::view::DiffVisibility::Public {
+                return Ok(StatusAction::Projection(None));
+            }
             ensure!(
                 !private_path.is_empty(),
                 "selection contains no applicable changes"
@@ -1254,7 +1345,7 @@ impl StatusService {
             .context("unknown status document")
     }
 
-    pub(crate) fn deliver(
+    pub(crate) fn deliver_notice(
         &self,
         document: &mut StatusDocument,
         target: &TargetId,
@@ -1288,106 +1379,10 @@ impl StatusService {
             };
             return body_delivery(document, file, patch);
         }
-        let crate::document::SourceProjection::Loaded {
-            cursor, complete, ..
-        } = &mut file.projection
-        else {
-            return body_delivery(document, file, None);
-        };
-        let chunk = cursor.next_rows(ChunkLimits {
-            rows: 128,
-            ..ChunkLimits::default()
-        });
-        *complete = matches!(chunk.state, DisplayState::Complete);
-        let mut block = match forge_diff::presentation::DiffPresenter::new(Default::default())
-            .batch(
-                BlockId(document.next_id("body")?),
-                &chunk.rows,
-                |index| cursor.group(index),
-                file.old_syntax.as_ref(),
-                file.new_syntax.as_ref(),
-            ) {
-            Ok(block) => block,
-            Err(failure) => {
-                file.projection =
-                    crate::document::SourceProjection::Unavailable(failure.to_string());
-                return self.deliver(document, target, file);
-            }
-        };
-        let mut source_rows = Vec::with_capacity(chunk.rows.len());
-        for (row, display) in chunk.rows.iter().enumerate() {
-            let range = TextRange {
-                start: TextPosition { row, column: 0 },
-                end: TextPosition {
-                    row: row + 1,
-                    column: 0,
-                },
-            };
-            let row_target = if let Some(raw) = display.raw_id {
-                if let Some(id) = file.hunk.get(&raw) {
-                    id.clone()
-                } else {
-                    let id = TargetId(document.next_id("hunk")?);
-                    file.hunk.insert(raw, id.clone());
-                    document.hunk.insert(
-                        id.clone(),
-                        HunkTarget {
-                            file: target.clone(),
-                            raw: vec![raw],
-                        },
-                    );
-                    id
-                }
-            } else {
-                target.clone()
-            };
-            if !display.is_gap() {
-                block.metadata.target.push(TargetRange {
-                    id: row_target,
-                    range: range.clone(),
-                });
-            }
-            source_rows.push(display.new_coordinate().or(display.old_coordinate()));
-        }
-        let retained = chunk.text_bytes
-            + (block.metadata.decoration.len() + block.metadata.visible_decoration.len()) * 160
-            + block.metadata.target.len() * 160
-            + block.metadata.gutter.len() * 128
-            + source_rows.capacity()
-                * std::mem::size_of::<Option<forge_diff::source::SourceCoordinate>>();
-        let projection = crate::hunks::project(
-            document,
-            file,
-            target,
-            block,
-            source_rows,
-            &chunk
-                .rows
-                .iter()
-                .map(|row| row.group_index)
-                .collect::<Vec<_>>(),
-        )?;
-        let retained = retained + projection.retained;
-        let patch = if projection.block.is_empty() {
-            None
-        } else {
-            let body = file.body_mut()?;
-            let after = body.block_count();
-            let mut edits = projection.edit;
-            edits.push(SequenceEdit {
-                range: after..after,
-                block: projection.block,
-            });
-            let patch = body.edit_many(edits)?;
-            file.source_row.extend(projection.source);
-            document.retained_bytes += retained;
-            file.retained_bytes += retained;
-            patch
-        };
-        body_delivery(document, file, patch)
+        body_delivery(document, file, None)
     }
 
-    async fn load(
+    pub(crate) async fn load(
         &self,
         repository: &Arc<forge_git::repository::RepositoryState>,
         record: &forge_git::snapshot::PathRecord,
@@ -1396,7 +1391,6 @@ impl StatusService {
         projected: Option<&crate::mutation::ProjectedIndex>,
     ) -> Result<(
         forge_diff::cache::AnalysisHandle,
-        DisplayCursor,
         Option<SyntaxHandle>,
         Option<SyntaxHandle>,
         Option<String>,
@@ -1462,9 +1456,7 @@ impl StatusService {
             projected.is_some() || generation == repository.generation(),
             "status body source generation changed"
         );
-        let cursor = DisplayCursor::new(analysis.clone(), 3)
-            .with_syntax_context(old_syntax.as_ref(), new_syntax.as_ref());
-        Ok((analysis, cursor, old_syntax, new_syntax, diagnostic))
+        Ok((analysis, old_syntax, new_syntax, diagnostic))
     }
 }
 
@@ -1514,7 +1506,10 @@ fn resolve_input(document: &StatusDocument, input: &StatusInput) -> Result<Targe
     resolve_position(document, input)?.context("status input position has no target")
 }
 
-fn resolve_position(document: &StatusDocument, input: &StatusInput) -> Result<Option<TargetId>> {
+pub(crate) fn resolve_position(
+    document: &StatusDocument,
+    input: &StatusInput,
+) -> Result<Option<TargetId>> {
     document._admission.check()?;
     input.validate()?;
     ensure!(
@@ -1717,8 +1712,7 @@ fn select_target(
         selected
             .entry(hunk.file.clone())
             .or_default()
-            .hunk
-            .extend(hunk.raw.iter().copied());
+            .include(&hunk.raw, hunk.declaration.as_deref());
     }
 }
 

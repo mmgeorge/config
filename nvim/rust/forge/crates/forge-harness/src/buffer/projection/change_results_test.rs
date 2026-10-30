@@ -95,7 +95,7 @@ fn workspace_results_ignore_incomplete_provider_reports() {
     assert!(!text(&projected).contains("incorrect.rs"));
     assert!(
         matches!(&projected.action[&TargetId("workspace:results:changes".into())],
-        TranscriptAction::Diff { text, syntax: true } if Some(text) == reopened.checkpoint_diff_text.as_ref())
+        TranscriptAction::Diff { text, syntax: true, .. } if Some(text) == reopened.checkpoint_diff_text.as_ref())
     );
 }
 

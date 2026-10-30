@@ -92,7 +92,7 @@ local success, failure = xpcall(function()
   require("forge.views.plan_review").open(plan)
   await(function() return state.plan_review and state.plan_review.owner.ready end, "PlanReview did not open")
   local review = state.plan_review
-  review.command_set.action_by_id.toggle_public.run({})
+  review.command_set.action_by_id.toggle_visibility.run({})
   await(function() return review.public_only == false end, "could not expose captured calls")
   local requests, lookups, completions, receipts = 0, {}, {}, {}
   local original_request = client.request

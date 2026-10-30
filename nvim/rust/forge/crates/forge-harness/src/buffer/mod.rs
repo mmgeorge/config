@@ -19,3 +19,5 @@ pub mod transcript;
 pub use failure::TranscriptProjectionFailure;
 
 pub(crate) mod sections;
+
+pub(crate) mod saved_diff;

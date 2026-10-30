@@ -103,11 +103,28 @@ function M.attach(state, delivery, recovery)
   local node_owner = replica.projection or projection.new(retained_source)
   node_owner.source = retained_source
   replica.projection = node_owner
+  local previous_hidden
   local function project_source()
-    local _, mapping = projection.render(node_owner)
+    local rendered, mapping = projection.render(node_owner)
     node_owner.mapping = mapping
-    for _, row in ipairs(source) do row.hidden = not projection.contains(node_owner, row.block, row.position.row) end
+    local projected = {}
+    for _, block in ipairs(rendered.block) do projected[block.id] = block end
+    previous_hidden = {}
+    for _, row in ipairs(source) do
+      previous_hidden[row.id] = row.hidden
+      row.hidden = not projection.contains(node_owner, row.block, row.position.row)
+      row.display_text = nil
+      if not row.hidden then
+        local offset = projection.visible_position(mapping, row.block, row.position.row)
+        local text = projected[row.block].text[offset + 1]
+        local canonical = retained_source.block[row.block].text[row.position.row + 1]
+        if #text > #canonical and text:sub(1, #canonical) == canonical then
+          row.display_text = row.text .. text:sub(#canonical + 1)
+        end
+      end
+    end
     if state.local_comment_view then comments.update(replica.buffer, {}) end
+    previous_hidden = nil
     return true
   end
   state.local_comment_view = nil
@@ -187,7 +204,7 @@ function M.attach(state, delivery, recovery)
         if not excluded[index - 1] then
           local source_row = assert(original[index - 1] or previous, "review source identity is missing")
           local row = vim.deepcopy(source_row)
-          row.text = text
+          row.text = source_row.display_text and source_row.text or text
           replacement[#replacement + 1] = row
           previous = row
         end
@@ -198,10 +215,11 @@ function M.attach(state, delivery, recovery)
         by_id[row.id][#by_id[row.id] + 1] = row
       end
       for _, row in ipairs(source) do
-        if row.hidden then retained[#retained + 1] = row
-        elseif by_id[row.id] then
+        if by_id[row.id] then
           vim.list_extend(retained, by_id[row.id])
           by_id[row.id] = nil
+        elseif row.hidden or previous_hidden and previous_hidden[row.id] then
+          retained[#retained + 1] = row
         end
       end
       for index = #source, 1, -1 do source[index] = nil end

@@ -7,10 +7,10 @@ local original = vim.deepcopy(config.options.keymaps.harness)
 local buffer = vim.api.nvim_create_buf(false, true)
 local ok, failure = xpcall(function()
   local pinned = keymaps.view_hint_entries("harness", commands)
-  assert(#pinned == 1 and pinned[1].id == "help", "top bar must advertise only help")
+  assert(#pinned == 3 and pinned[1].id == "toggle_visibility" and pinned[2].id == "toggle_presentation" and pinned[3].id == "help", "top bar must advertise diff controls and help")
   local context = { { text = "75% left (200K)", group = "ForgeStatusHint" } }
   local function top_bar(status)
-    keymaps.apply_view_winbar(0, "", "harness", commands, status, nil, context)
+    keymaps.apply_view_winbar(0, "", "harness", commands, status, { diff_view = { visibility = "public", presentation = "semantic" } }, context)
     return vim.api.nvim_eval_statusline(vim.wo.winbar, { use_winbar = true, maxwidth = 2000 }).str
   end
   for _, status in ipairs({ "Read", string.rep("Read ", vim.api.nvim_win_get_width(0)),
@@ -18,7 +18,8 @@ local ok, failure = xpcall(function()
     { { text = string.rep("Read ", vim.api.nvim_win_get_width(0)), group = "ForgeHarnessRead" } },
   }) do
     local text = top_bar(status)
-    assert(text:find("75% left (200K) · ? help", 1, true), "context must precede help in wide and compact bars")
+    local context_at, visibility_at, presentation_at, help_at = text:find("75% left (200K)", 1, true), text:find("ov Public", 1, true), text:find("ox Semantic", 1, true), text:find("? help", 1, true)
+    assert(context_at and visibility_at and presentation_at and help_at and context_at < visibility_at and visibility_at < presentation_at and presentation_at < help_at, "context must precede diff controls and help in wide and compact bars")
     assert(vim.wo.winbar:find("%#ForgeStatusHint# · %*", 1, true), "context separator is not gray")
     assert(not text:find("submit", 1, true), "top bar contains additional command hints")
   end

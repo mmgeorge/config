@@ -1,7 +1,8 @@
 //! Document-owned diff controls with atomic publication of prepared presentations.
 
 /// Declaration selection, independent of body presentation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DiffVisibility {
     #[default]
     All,
@@ -9,7 +10,8 @@ pub enum DiffVisibility {
 }
 
 /// Body presentation. Full retains the consumer's existing diff context policy.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DiffPresentation {
     #[default]
     Full,
@@ -17,14 +19,15 @@ pub enum DiffPresentation {
 }
 
 /// Presentations admitted by a document throughout its lifetime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DiffCapabilities {
     Source,
     SemanticOnly,
 }
 
 /// Independent controls published with the corresponding buffer contents.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DiffViewOptions {
     pub visibility: DiffVisibility,
     pub presentation: DiffPresentation,
@@ -105,14 +108,25 @@ impl DiffViewState {
                 };
             }
             DiffViewAction::TogglePresentation => {
-                if self.capabilities == DiffCapabilities::SemanticOnly {
-                    return Err(DiffViewError::UnsupportedPresentation);
-                }
                 options.presentation = match options.presentation {
                     DiffPresentation::Full => DiffPresentation::Semantic,
                     DiffPresentation::Semantic => DiffPresentation::Full,
                 };
             }
+        }
+        self.request_options(options)
+    }
+
+    /// Prepare explicit settings for source views sharing one atomic document update.
+    /// Unsupported presentations and counter exhaustion leave the desired settings unchanged.
+    pub fn request_options(
+        &mut self,
+        options: DiffViewOptions,
+    ) -> Result<DiffViewRequest, DiffViewError> {
+        if self.capabilities == DiffCapabilities::SemanticOnly
+            && options.presentation != DiffPresentation::Semantic
+        {
+            return Err(DiffViewError::UnsupportedPresentation);
         }
         let generation = self
             .requested

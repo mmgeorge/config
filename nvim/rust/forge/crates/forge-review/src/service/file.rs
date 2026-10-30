@@ -48,7 +48,9 @@ impl std::ops::Deref for ReviewFileDelivery {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RetainedFile {
+    pub commit: Option<String>,
     pub identity: ReviewComparisonIdentity,
     pub summary: ReviewFileAnalysis,
     pub diff: AnalysisHandle,
@@ -56,10 +58,134 @@ pub(crate) struct RetainedFile {
     pub new_syntax: Option<SyntaxHandle>,
     pub block: Vec<BufferBlock>,
     pub target: std::collections::BTreeMap<TargetId, super::thread_projection::ReviewTarget>,
-    pub cursor: Option<forge_diff::display::DisplayCursor>,
-    pub presenter: forge_diff::presentation::DiffPresenter,
-    pub next_block: usize,
+    pub source_projection: Option<forge_diff::source_projection::SourceDiffProjection>,
+    pub view_revision: u64,
     pub projected_blocks: usize,
+}
+
+pub(super) enum FileViewChange {
+    Continuation,
+    Declaration { identity: String, expanded: bool },
+    Options(forge_diff::view::DiffViewOptions),
+}
+
+pub(super) async fn prepare_file_view(
+    pool: Arc<forge_diff::workers::AnalysisPool>,
+    mut file: RetainedFile,
+    change: FileViewChange,
+) -> Result<RetainedFile> {
+    let permit = pool
+        .reserve(WorkPriority::Foreground, WorkBudget::new(512 * 1024, None))
+        .map_err(|error| anyhow::anyhow!("PR source projection admission failed: {error:?}"))?;
+    let ticket = permit.ticket();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    permit.submit(move |_| {
+        let result = (|| {
+            match change {
+                FileViewChange::Continuation => {
+                    ensure!(file.summary.more, "review file has no continuation");
+                    project_next(&mut file)?;
+                }
+                FileViewChange::Declaration { identity, expanded } => {
+                    file.source_projection
+                        .as_mut()
+                        .context("source projection is missing")?
+                        .declaration(
+                            &identity,
+                            expanded,
+                            forge_diff::display::ChunkLimits {
+                                rows: 128,
+                                ..Default::default()
+                            },
+                        )?;
+                    project_current(&mut file)?;
+                }
+                FileViewChange::Options(options) => {
+                    let mut projection = file
+                        .source_projection
+                        .as_ref()
+                        .context("source projection is missing")?
+                        .reconfigure(options)?;
+                    if !projection.materialized() {
+                        projection.demand(forge_diff::display::ChunkLimits {
+                            rows: 128,
+                            ..Default::default()
+                        })?;
+                    }
+                    file.source_projection = Some(projection);
+                    project_current(&mut file)?;
+                }
+            }
+            Ok::<_, anyhow::Error>(file)
+        })();
+        let _ = sender.send(result);
+    });
+    let result = receiver.await.context("PR source projection worker ended");
+    ticket.completed().await;
+    result?
+}
+
+pub(super) fn publish_file(
+    document: &mut crate::review::ReviewDocument,
+    mut file: RetainedFile,
+) -> Result<ReviewFileDelivery> {
+    let current = document
+        .section
+        .get(&ReviewSectionKind::Overview)
+        .and_then(|section| section.item.first())
+        .and_then(|item| item.comparison.as_ref());
+    ensure!(
+        current == Some(&file.identity),
+        "PR comparison changed during source projection"
+    );
+    let path = file.summary.path.clone();
+    let previous = document
+        .file
+        .get(&path)
+        .map_or(0, |file| file.projected_blocks);
+    let patch = match document.projection.as_mut() {
+        Some(projection) => file_patch(projection, &mut file, previous)?,
+        None => None,
+    };
+    if let Some(previous) = document.file.get(&path) {
+        for target in previous.target.keys() {
+            document.projection_target.remove(target);
+        }
+    }
+    document.projection_target.extend(
+        file.target
+            .iter()
+            .map(|(id, target)| (id.clone(), target.clone())),
+    );
+    let summary = file.summary.clone();
+    document.file.insert(path, file);
+    document.section_revision = document
+        .section_revision
+        .checked_add(1)
+        .context("review section revision exhausted")?;
+    Ok(ReviewFileDelivery {
+        file: summary,
+        patch,
+    })
+}
+
+pub(super) fn file_patch(
+    projection: &mut forge_buffer::document::BufferDocument,
+    file: &mut RetainedFile,
+    previous: usize,
+) -> Result<Option<forge_buffer::patch::BufferPatch>> {
+    file.projected_blocks = 0;
+    let path = &file.summary.path;
+    let Some(anchor) = projection.block_index(&BlockId(format!("{}:title", section_prefix(path))))
+    else {
+        return Ok(None);
+    };
+    let mut changed = file.block.clone();
+    if file.summary.more {
+        changed.push(continuation_block(path)?);
+    }
+    file.projected_blocks = changed.len();
+    Ok(projection.splice(anchor + 1..anchor + 1 + previous, changed)?)
 }
 
 impl ReviewService {
@@ -67,6 +193,16 @@ impl ReviewService {
         &self,
         id: &DocumentId,
         path: String,
+    ) -> Result<ReviewFileDelivery> {
+        self.change_file_view(id, path, FileViewChange::Continuation)
+            .await
+    }
+
+    pub(super) async fn change_file_view(
+        &self,
+        id: &DocumentId,
+        path: String,
+        change: FileViewChange,
     ) -> Result<ReviewFileDelivery> {
         let owner = self.owner(id)?;
         let pool = self
@@ -78,146 +214,40 @@ impl ReviewService {
             .clone()
             .try_acquire_owned()
             .context("review file admission is full")?;
-        let permit = pool
-            .reserve(WorkPriority::Foreground, WorkBudget::new(512 * 1024, None))
-            .map_err(|error| anyhow::anyhow!("PR row projection admission failed: {error:?}"))?;
-        let mut work = {
-            let mut document = owner.document.lock().expect("review document poisoned");
-            ensure!(
-                !document.file_loading.contains(&path),
-                "review file acquisition is already running"
-            );
-            let file = document
-                .file
-                .get_mut(&path)
-                .context("review file is not acquired")?;
-            ensure!(file.summary.more, "review file has no continuation");
-            let work = RetainedFile {
-                identity: file.identity.clone(),
-                summary: file.summary.clone(),
-                diff: file.diff.clone(),
-                old_syntax: file.old_syntax.clone(),
-                new_syntax: file.new_syntax.clone(),
-                block: Vec::new(),
-                target: std::collections::BTreeMap::new(),
-                cursor: file.cursor.take(),
-                presenter: file.presenter.clone(),
-                next_block: file.next_block,
-                projected_blocks: file.projected_blocks,
-            };
-            ensure!(
-                work.cursor.is_some(),
-                "review file continuation is unavailable"
-            );
-            document.file_loading.insert(path.clone());
-            work
-        };
-        let ticket = permit.ticket();
-        let (worker_sender, worker_receiver) = tokio::sync::oneshot::channel();
-        permit.submit(move |_| {
-            let result = project_next(&mut work).map(|()| work);
-            let _ = worker_sender.send(result);
-        });
-        let rollback = owner.clone();
-        let rollback_path = path.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let spawned = self.spawn(async move {
+        self.spawn(async move {
             let _admission = admission;
-            let result = worker_receiver
-                .await
-                .context("PR continuation worker ended");
-            ticket.completed().await;
-            let result = (|| {
+            let _projection = owner.section_projection.lock().await;
+            let result = async {
+                let (work, revision) = {
+                    let document = owner.document.lock().expect("review document poisoned");
+                    ensure!(
+                        !document.file_loading.contains(&path),
+                        "review file acquisition is already running"
+                    );
+                    let file = document
+                        .file
+                        .get(&path)
+                        .context("review file is not acquired")?;
+                    (file.clone(), file.view_revision)
+                };
+                let work = prepare_file_view(pool, work, change).await?;
                 let mut document = owner.document.lock().expect("review document poisoned");
-                document.file_loading.remove(&path);
-                let result = result.and_then(|result| result);
-                let work = match result {
-                    Ok(work) => work,
-                    Err(failure) => {
-                        if let Some(file) = document.file.get_mut(&path) {
-                            file.summary.more = false;
-                            file.summary.syntax_diagnostic = Some(failure.to_string());
-                        }
-                        return Err(failure);
-                    }
-                };
-                let current = document
-                    .section
-                    .get(&ReviewSectionKind::Overview)
-                    .and_then(|section| section.item.first())
-                    .and_then(|item| item.comparison.as_ref());
                 ensure!(
-                    current == Some(&work.identity),
-                    "PR comparison changed during continuation"
+                    document
+                        .file
+                        .get(&path)
+                        .is_some_and(|file| file.view_revision == revision),
+                    "review source presentation was superseded"
                 );
-                let file = document
-                    .file
-                    .get(&path)
-                    .context("review file disappeared")?;
-                ensure!(
-                    file.identity == work.identity
-                        && file.next_block == work.next_block - work.block.len(),
-                    "review file continuation was superseded"
-                );
-                let projected_blocks = file.projected_blocks;
-                let old_more = file.summary.more;
-                let patch = if projected_blocks > 0 {
-                    let projection = document
-                        .projection
-                        .as_mut()
-                        .context("review file projection disappeared")?;
-                    let start = projection
-                        .block_index(&BlockId(format!("{}:title", section_prefix(&path))))
-                        .context("review file projection anchor disappeared")?
-                        + 1
-                        + projected_blocks
-                        - usize::from(old_more);
-                    let mut changed = work.block.clone();
-                    if work.summary.more {
-                        changed.push(continuation_block(&path)?);
-                    }
-                    projection.edit(start..start + usize::from(old_more), changed)?
-                } else {
-                    None
-                };
-                document.projection_target.extend(
-                    work.target
-                        .iter()
-                        .map(|(id, target)| (id.clone(), target.clone())),
-                );
-                let file = document.file.get_mut(&path).expect("validated review file");
-                file.summary = work.summary;
-                file.cursor = work.cursor;
-                file.presenter = work.presenter;
-                file.next_block = work.next_block;
-                if projected_blocks > 0 {
-                    file.projected_blocks = projected_blocks - usize::from(old_more)
-                        + work.block.len()
-                        + usize::from(file.summary.more);
-                }
-                file.block.extend(work.block);
-                file.target.extend(work.target);
-                let summary = file.summary.clone();
-                document.section_revision = document
-                    .section_revision
-                    .checked_add(1)
-                    .context("review section revision exhausted")?;
-                Ok(ReviewFileDelivery {
-                    file: summary,
-                    patch,
-                })
-            })();
-            let _ = sender.send(result);
-        });
-        if let Err(failure) = spawned {
-            let mut document = rollback.document.lock().expect("review document poisoned");
-            document.file_loading.remove(&rollback_path);
-            if let Some(file) = document.file.get_mut(&rollback_path) {
-                file.summary.more = false;
+                publish_file(&mut document, work)
             }
-            return Err(failure);
-        }
-        receiver.await.context("review continuation task ended")?
+            .await;
+            let _ = sender.send(result);
+        })?;
+        receiver
+            .await
+            .context("review source projection task ended")?
     }
 
     pub async fn read_file(
@@ -335,149 +365,46 @@ impl ReviewService {
                     syntax_diagnostic: None,
                     more: false,
                 };
-                let pool = diff.analysis_pool();
-                let permit = pool
-                    .reserve(
-                        WorkPriority::Foreground,
-                        WorkBudget::new(old.bytes.capacity() + new.bytes.capacity(), None),
-                    )
-                    .map_err(|error| {
-                        anyhow::anyhow!("source validation admission failed: {error:?}")
-                    })?;
-                let ticket = permit.ticket();
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                permit.submit(move |_| {
-                    let pair = (|| {
-                        Ok::<_, anyhow::Error>(SourcePair {
-                            old: SourceVersion::new(old.bytes, Representation::GitCanonical)?,
-                            new: SourceVersion::new(new.bytes, Representation::GitCanonical)?,
-                        })
-                    })();
-                    let _ = sender.send(pair);
-                });
-                let source = receiver.await.context("source validation worker ended");
-                ticket.completed().await;
-                let source = source??;
-                let analysis = diff
-                    .compare(DiffRequest {
-                        source: source.clone(),
-                        priority: WorkPriority::Foreground,
-                    })
-                    .await
-                    .map_err(|error| anyhow::anyhow!("native PR diff failed: {error:?}"))?;
-                let mut result = RetainedFile {
-                    identity: identity.clone(),
-                    summary,
-                    diff: analysis,
-                    old_syntax: None,
-                    new_syntax: None,
-                    block: Vec::new(),
-                    target: std::collections::BTreeMap::new(),
-                    cursor: None,
-                    presenter: forge_diff::presentation::DiffPresenter::new(Default::default()),
-                    next_block: 0,
-                    projected_blocks: 0,
-                };
-                if let Some(language) = SyntaxLanguage::for_path(&path) {
-                    for (source, target) in [
-                        (source.old, &mut result.old_syntax),
-                        (source.new, &mut result.new_syntax),
-                    ] {
-                        match syntax
-                            .analyze(SyntaxRequest {
-                                source,
-                                language,
-                                priority: WorkPriority::Foreground,
-                                deadline: None,
-                            })
-                            .await
-                        {
-                            Ok(handle) => *target = Some(handle),
-                            Err(error) => {
-                                result.summary.syntax_diagnostic =
-                                    Some(format!("native syntax unavailable: {error:?}"))
-                            }
-                        }
-                    }
-                }
-                let permit = pool
-                    .reserve(WorkPriority::Foreground, WorkBudget::new(512 * 1024, None))
-                    .map_err(|error| {
-                        anyhow::anyhow!("PR row projection admission failed: {error:?}")
-                    })?;
-                let ticket = permit.ticket();
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                permit.submit(move |_| {
-                    let projected = project_next(&mut result).map(|()| result);
-                    let _ = sender.send(projected);
-                });
-                let projected = receiver.await.context("PR row projection worker ended");
-                ticket.completed().await;
-                let result = projected??;
-                Ok(result)
+                analyze_file(
+                    &diff, &syntax, identity, summary, old.bytes, new.bytes, None,
+                )
+                .await
             }
             .await;
-            let result = (|| {
+            let _projection = owner.section_projection.lock().await;
+            let result = async {
+                let mut observed = observed?;
+                let options = owner
+                    .document
+                    .lock()
+                    .expect("review document poisoned")
+                    .diff_view
+                    .committed();
+                if observed
+                    .source_projection
+                    .as_ref()
+                    .is_some_and(|projection| projection.options() != options)
+                {
+                    observed = prepare_file_view(
+                        diff.analysis_pool(),
+                        observed,
+                        FileViewChange::Options(options),
+                    )
+                    .await?;
+                }
                 let mut document = owner.document.lock().expect("review document poisoned");
                 document.file_loading.remove(&path);
-                let mut observed = observed?;
-                let current = document
-                    .section
-                    .get(&ReviewSectionKind::Overview)
-                    .and_then(|section| section.item.first())
-                    .and_then(|item| item.comparison.as_ref());
-                ensure!(
-                    current == Some(&identity),
-                    "PR comparison changed during file acquisition"
-                );
-                let previous = document
-                    .file
-                    .get(&path)
-                    .map_or(0, |file| file.projected_blocks);
-                let patch = if let Some(projection) = document.projection.as_mut() {
-                    if let Some(anchor) =
-                        projection.block_index(&BlockId(format!("{}:title", section_prefix(&path))))
-                    {
-                        let mut changed = observed.block.clone();
-                        if observed.summary.more {
-                            changed.push(continuation_block(&path)?);
-                        }
-                        observed.projected_blocks = changed.len();
-                        projection.edit(anchor + 1..anchor + 1 + previous, changed)?
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let previous_targets = document
-                    .file
-                    .get(&path)
-                    .into_iter()
-                    .flat_map(|previous| previous.block.iter())
-                    .flat_map(|block| block.metadata.target.iter())
-                    .map(|target| target.id.clone())
-                    .collect::<Vec<_>>();
-                for target in previous_targets {
-                    document.projection_target.remove(&target);
-                }
-                document.projection_target.extend(
-                    observed
-                        .target
-                        .iter()
-                        .map(|(id, target)| (id.clone(), target.clone())),
-                );
-                let summary = observed.summary.clone();
-                document.file.insert(path, observed);
-                document.section_revision = document
-                    .section_revision
-                    .checked_add(1)
-                    .context("review section revision exhausted")?;
-                Ok(ReviewFileDelivery {
-                    file: summary,
-                    patch,
-                })
-            })();
+                publish_file(&mut document, observed)
+            }
+            .await;
+            if result.is_err() {
+                owner
+                    .document
+                    .lock()
+                    .expect("review document poisoned")
+                    .file_loading
+                    .remove(&path);
+            }
             let _ = sender.send(result);
         });
         if let Err(failure) = spawned {
@@ -493,6 +420,94 @@ impl ReviewService {
     }
 }
 
+pub(super) async fn analyze_file(
+    diff: &Arc<forge_diff::engine::DiffEngine>,
+    syntax: &Arc<forge_diff::syntax::SyntaxEngine>,
+    identity: ReviewComparisonIdentity,
+    summary: ReviewFileAnalysis,
+    old_bytes: Vec<u8>,
+    new_bytes: Vec<u8>,
+    commit: Option<String>,
+) -> Result<RetainedFile> {
+    let path = summary.path.clone();
+    let pool = diff.analysis_pool();
+    let permit = pool
+        .reserve(
+            WorkPriority::Foreground,
+            WorkBudget::new(old_bytes.capacity() + new_bytes.capacity(), None),
+        )
+        .map_err(|error| anyhow::anyhow!("source validation admission failed: {error:?}"))?;
+    let ticket = permit.ticket();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    permit.submit(move |_| {
+        let pair = (|| {
+            Ok::<_, anyhow::Error>(SourcePair {
+                old: SourceVersion::new(old_bytes, Representation::GitCanonical)?,
+                new: SourceVersion::new(new_bytes, Representation::GitCanonical)?,
+            })
+        })();
+        let _ = sender.send(pair);
+    });
+    let source = receiver.await.context("source validation worker ended");
+    ticket.completed().await;
+    let source = source??;
+    let analysis = diff
+        .compare(DiffRequest {
+            source: source.clone(),
+            priority: WorkPriority::Foreground,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("native PR diff failed: {error:?}"))?;
+    let mut result = RetainedFile {
+        commit,
+        identity,
+        summary,
+        diff: analysis,
+        old_syntax: None,
+        new_syntax: None,
+        block: Vec::new(),
+        target: std::collections::BTreeMap::new(),
+        source_projection: None,
+        view_revision: 0,
+        projected_blocks: 0,
+    };
+    if let Some(language) = SyntaxLanguage::for_path(&path) {
+        for (source, target) in [
+            (source.old, &mut result.old_syntax),
+            (source.new, &mut result.new_syntax),
+        ] {
+            match syntax
+                .analyze(SyntaxRequest {
+                    source,
+                    language,
+                    priority: WorkPriority::Foreground,
+                    deadline: None,
+                })
+                .await
+            {
+                Ok(handle) => *target = Some(handle),
+                Err(error) => {
+                    result.summary.syntax_diagnostic =
+                        Some(format!("native syntax unavailable: {error:?}"))
+                }
+            }
+        }
+    }
+    let permit = pool
+        .reserve(WorkPriority::Foreground, WorkBudget::new(512 * 1024, None))
+        .map_err(|error| anyhow::anyhow!("PR row projection admission failed: {error:?}"))?;
+    let ticket = permit.ticket();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    permit.submit(move |_| {
+        let projected = project_next(&mut result).map(|()| result);
+        let _ = sender.send(projected);
+    });
+    let projected = receiver.await.context("PR row projection worker ended");
+    ticket.completed().await;
+    let result = projected??;
+    Ok(result)
+}
+
 pub(crate) fn section_prefix(path: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hash = std::hash::DefaultHasher::new();
@@ -504,78 +519,108 @@ pub(crate) fn continuation_block(path: &str) -> Result<BufferBlock> {
     Ok(BufferBlock {
         id: BlockId(format!("{}:more", section_prefix(path))),
         text: BufferText::from_rows(vec!["Additional diff rows are available"])?,
-        metadata: BlockMetadata::default(),
-    })
-}
-
-fn project_next(file: &mut RetainedFile) -> Result<()> {
-    use forge_diff::display::{ChunkLimits, DisplayCursor, DisplayState};
-    use std::hash::{Hash, Hasher};
-    if file.cursor.is_none() {
-        file.cursor = Some(DisplayCursor::new(file.diff.clone(), 3));
-    }
-    let revision = file.identity.head_commit.clone();
-    let path = file.summary.path.clone();
-    let cursor = file.cursor.as_mut().expect("initialized display cursor");
-    let chunk = cursor.next_rows(ChunkLimits {
-        rows: 128,
-        ..ChunkLimits::default()
-    });
-    let mut hash = std::hash::DefaultHasher::new();
-    file.summary.path.hash(&mut hash);
-    let prefix = format!("file:{:016x}", hash.finish());
-    let mut candidate = Vec::new();
-    for display in &chunk.rows {
-        let group = cursor
-            .group(display.group_index)
-            .context("diff display group is missing")?;
-        if let Some(heading) = file.presenter.begin_hunk(
-            display.group_index,
-            BlockId(format!("{prefix}:group:{}", display.group_index)),
-            group,
-            forge_diff::presentation::HunkHeading::Ranges,
-        )? {
-            candidate.push(heading);
-        }
-        let mut block = file.presenter.rows(
-            BlockId(format!(
-                "{prefix}:row:{}",
-                file.next_block + candidate.len()
-            )),
-            std::slice::from_ref(display),
-            cursor
-                .group(display.group_index)
-                .context("diff display group is missing")?,
-            file.old_syntax.as_ref(),
-            file.new_syntax.as_ref(),
-        )?;
-        if let Some(anchor) = inline_anchor(&revision, &path, display) {
-            let target = TargetId(format!(
-                "{prefix}:inline:{}",
-                file.next_block + candidate.len()
-            ));
-            ensure!(
-                file.target
-                    .insert(
-                        target.clone(),
-                        super::thread_projection::ReviewTarget::InlineComment { anchor },
-                    )
-                    .is_none(),
-                "review inline target identity collision"
-            );
-            block.metadata.target.push(TargetRange {
-                id: target,
+        metadata: BlockMetadata {
+            target: vec![TargetRange {
+                id: TargetId(format!("{}:more", section_prefix(path))),
                 range: TextRange {
                     start: TextPosition { row: 0, column: 0 },
                     end: TextPosition { row: 1, column: 0 },
                 },
+            }],
+            ..Default::default()
+        },
+    })
+}
+
+fn project_next(file: &mut RetainedFile) -> Result<()> {
+    if file.source_projection.is_none() {
+        file.source_projection = Some(forge_diff::source_projection::SourceDiffProjection::new(
+            file.diff.clone(),
+            file.old_syntax.clone(),
+            file.new_syntax.clone(),
+            Default::default(),
+        ));
+    }
+    file.source_projection
+        .as_mut()
+        .expect("initialized source projection")
+        .demand(forge_diff::display::ChunkLimits {
+            rows: 128,
+            ..Default::default()
+        })?;
+    project_current(file)
+}
+
+pub(super) fn project_current(file: &mut RetainedFile) -> Result<()> {
+    use forge_diff::source_projection::SourceDiffElement;
+    use std::hash::{Hash, Hasher};
+    let revision = file.identity.head_commit.clone();
+    let path = file.summary.path.clone();
+    let projection = file
+        .source_projection
+        .as_ref()
+        .context("source projection is missing")?;
+    let mut hash = std::hash::DefaultHasher::new();
+    file.summary.path.hash(&mut hash);
+    let prefix = match &file.commit {
+        Some(commit) => format!("commit:{commit}:file:{:016x}", hash.finish()),
+        None => format!("file:{:016x}", hash.finish()),
+    };
+    let mut target = std::collections::BTreeMap::new();
+    let block = projection.render(&prefix, |element, block| {
+        let action = match element {
+            SourceDiffElement::Hunk(_) => None,
+            SourceDiffElement::Row(display) => file
+                .commit
+                .is_none()
+                .then(|| inline_anchor(&revision, &path, display))
+                .flatten()
+                .map(|anchor| super::thread_projection::ReviewTarget::InlineComment { anchor }),
+            SourceDiffElement::Declaration(signature) => Some(match &file.commit {
+                Some(commit) => super::thread_projection::ReviewTarget::CommitSource {
+                    commit: commit.clone(),
+                    path: path.clone(),
+                    declaration: Some(signature.identity.clone()),
+                },
+                None => super::thread_projection::ReviewTarget::SourceSection {
+                    path: path.clone(),
+                    identity: signature.identity.clone(),
+                },
+            }),
+        };
+        if let Some(action) = action {
+            let id = TargetId(block.id.0.clone());
+            if target.insert(id.clone(), action).is_some() {
+                return Err(forge_buffer::ContractError(
+                    "review source target identity collision",
+                ));
+            }
+            block.metadata.target.push(TargetRange {
+                id,
+                range: TextRange {
+                    start: TextPosition { row: 0, column: 0 },
+                    end: TextPosition {
+                        row: block.text.row_count(),
+                        column: 0,
+                    },
+                },
             });
         }
-        candidate.push(block);
+        Ok(())
+    })?;
+    file.summary.more = projection.more();
+    if file.summary.more && file.commit.is_none() {
+        target.insert(
+            TargetId(format!("{}:more", section_prefix(&path))),
+            super::thread_projection::ReviewTarget::FileMore { path },
+        );
     }
-    file.summary.more = chunk.state == DisplayState::More;
-    file.next_block += candidate.len();
-    file.block.extend(candidate);
+    file.view_revision = file
+        .view_revision
+        .checked_add(1)
+        .context("review source presentation revision exhausted")?;
+    file.block = block;
+    file.target = target;
     Ok(())
 }
 

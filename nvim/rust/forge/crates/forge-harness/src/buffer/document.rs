@@ -271,8 +271,32 @@ impl TranscriptDocument {
             );
             validate_entry(replacement)?;
         }
+        self.replace_entries(entry)
+    }
+
+    pub(super) fn replace_entries(
+        &mut self,
+        entry: Vec<TranscriptEntry>,
+    ) -> Result<Vec<BufferPatch>> {
+        ensure!(
+            self.synchronized,
+            "transcript requires a new canonical snapshot"
+        );
+        let mut identity = HashSet::new();
+        let mut prepared = Vec::with_capacity(entry.len());
+        for entry in entry {
+            ensure!(
+                identity.insert(entry.id.clone()),
+                "duplicate transcript replacement identity"
+            );
+            let index = self
+                .entry_position(&entry.id)
+                .context("transcript replacement owner disappeared")?;
+            validate_entry(&entry)?;
+            prepared.push((index, entry));
+        }
         let mut patch = Vec::new();
-        for (index, entry) in entry.into_iter().enumerate() {
+        for (index, entry) in prepared {
             match self.apply_change(TranscriptChange::Replace { index, entry }) {
                 Ok(Some(applied)) => patch.push(applied),
                 Ok(None) => {}

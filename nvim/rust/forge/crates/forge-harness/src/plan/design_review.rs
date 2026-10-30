@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
-    BlockAnchor, BlockMetadata, BufferBlock, Decoration, FoldRange, TargetRange, TextChunk,
-    TextPosition, TextRange,
+    BlockAnchor, BlockMetadata, BufferBlock, Decoration, TargetRange, TextChunk, TextPosition,
+    TextRange,
 };
 use forge_buffer::identity::{BlockId, EditSequence, FoldId, RegionRevision, TargetId};
 use forge_buffer::text::BufferText;
@@ -776,7 +776,8 @@ fn rows(
                 [file.old_path.as_ref(), file.new_path.as_ref()],
                 &presentation,
                 &display_row,
-            );
+                &file.hunk,
+            )?;
         }
         fold(&mut block, start, &id)?;
         if contextual_path.contains(path) {
@@ -1403,25 +1404,18 @@ fn declaration_folds(
         }) {
             continue;
         }
-        let endpoint = BlockAnchor {
-            block: block[closing].id.clone(),
-            position: TextPosition { row: 1, column: 0 },
-        };
-        let heading_start = Some(BlockAnchor {
-            block: block[heading].id.clone(),
-            position: TextPosition { row: 0, column: 0 },
-        });
         let fold_id = FoldId(format!("{}:declaration", block[opening].id.0));
-        block[opening].metadata.fold.push(FoldRange {
-            collapsed_suffix: Some(suffix),
-            heading_start,
-            id: fold_id,
-            start: TextPosition { row: 0, column: 0 },
-            end: endpoint,
-            closed,
-            collapse_children: false,
-            expand_children: false,
-        });
+        forge_diff::presentation::DiffPresenter::declaration_fold(
+            block,
+            forge_diff::presentation::DeclarationFoldLayout {
+                id: fold_id,
+                heading,
+                opening,
+                closing,
+                closed,
+                summary: suffix,
+            },
+        )?;
         installed.push((opening, closing));
     }
     Ok(())
@@ -1432,7 +1426,66 @@ fn call_folds(
     paths: [Option<&String>; 2],
     presentation: &HashMap<(String, String), std::sync::Arc<super::calls::CallPresentation>>,
     display_row: &HashMap<(String, String, usize), usize>,
-) {
+    hunk: &[super::review_diff::ReviewHunk],
+) -> Result<()> {
+    let mut regions = HashMap::<(bool, usize), HashSet<forge_diff::raw::RawHunkId>>::new();
+    let mut owner = HashMap::<(bool, &str), Vec<usize>>::new();
+    let mut declaration_heading = Vec::<(usize, Option<&str>)>::new();
+    for (old_side, path, side) in [(true, paths[0], "baseline"), (false, paths[1], "proposed")] {
+        let Some(path) = path else { continue };
+        let Some(source) = presentation.get(&(path.clone(), side.into())) else {
+            continue;
+        };
+        for (line, body) in &source.body {
+            let identity = body
+                .owner
+                .rsplit_once('#')
+                .map_or(body.owner.as_str(), |(owner, _)| owner);
+            owner.entry((old_side, identity)).or_default().push(*line);
+            if let Some(position) = display_row.get(&(path.clone(), side.into(), body.heading)) {
+                declaration_heading.push((*position, Some(identity)));
+            }
+        }
+        let callable_heading = source
+            .body
+            .values()
+            .map(|body| body.heading)
+            .collect::<HashSet<_>>();
+        for declaration in source.folds(path)? {
+            if let Some(row) = source.declaration_row.get(&declaration.heading)
+                && !callable_heading.contains(row)
+                && let Some(position) = display_row.get(&(path.clone(), side.into(), *row))
+            {
+                declaration_heading.push((*position, None));
+            }
+        }
+        for row in hunk.iter().flat_map(|hunk| &hunk.row) {
+            let Some(raw) = row.raw_id else { continue };
+            let coordinate = if old_side {
+                row.old_coordinate()
+            } else {
+                row.new_coordinate()
+            };
+            let Some(coordinate) = coordinate else {
+                continue;
+            };
+            if let Some((line, body)) = source.body.range(..coordinate.line).next_back()
+                && coordinate.line < body.end
+            {
+                regions.entry((old_side, *line)).or_default().insert(raw);
+            }
+        }
+    }
+    declaration_heading.sort_unstable();
+    declaration_heading.dedup();
+    let mut next_foreign = vec![declaration_heading.len(); declaration_heading.len()];
+    for index in (0..declaration_heading.len().saturating_sub(1)).rev() {
+        next_foreign[index] = if declaration_heading[index].1 == declaration_heading[index + 1].1 {
+            next_foreign[index + 1]
+        } else {
+            index + 1
+        };
+    }
     let mut installed = HashSet::new();
     for (path, side) in [(paths[1], "proposed"), (paths[0], "baseline")] {
         let Some(path) = path else { continue };
@@ -1445,9 +1498,31 @@ fn call_folds(
             let Some(opening) = display_row.get(&(path.clone(), side.into(), line)).copied() else {
                 continue;
             };
-            let Some(closing) = display_row.get(&(path.clone(), side.into(), last)).copied() else {
+            let Some(mut closing) = display_row.get(&(path.clone(), side.into(), last)).copied()
+            else {
                 continue;
             };
+            let identity = body
+                .owner
+                .rsplit_once('#')
+                .map_or(body.owner.as_str(), |(owner, _)| owner);
+            let mut boundary =
+                declaration_heading.partition_point(|(position, _)| *position <= opening);
+            if declaration_heading
+                .get(boundary)
+                .is_some_and(|(_, owner)| *owner == Some(identity))
+            {
+                boundary = next_foreign[boundary];
+            }
+            if let Some((position, _)) = declaration_heading
+                .get(boundary)
+                .filter(|(position, _)| *position <= closing)
+            {
+                closing = position - 1;
+            }
+            if closing <= opening {
+                continue;
+            }
             if !installed.insert(opening) {
                 continue;
             }
@@ -1460,24 +1535,39 @@ fn call_folds(
                 super::digest(path.as_bytes()),
                 super::digest(body.owner.as_bytes())
             ));
-            block[opening].metadata.fold.push(FoldRange {
-                id,
-                start: TextPosition { row: 0, column: 0 },
-                end: BlockAnchor {
-                    block: block[closing].id.clone(),
-                    position: TextPosition { row: 1, column: 0 },
+            let old_side = side == "baseline";
+            let mut changed = regions.get(&(old_side, line)).cloned().unwrap_or_default();
+            if owner
+                .get(&(old_side, identity))
+                .is_some_and(|positions| positions.len() == 1)
+                && let Some(other) = owner
+                    .get(&(!old_side, identity))
+                    .filter(|positions| positions.len() == 1)
+                && let Some(other) = regions.get(&(!old_side, other[0]))
+            {
+                changed.extend(other);
+            }
+            forge_diff::presentation::DiffPresenter::declaration_fold(
+                block,
+                forge_diff::presentation::DeclarationFoldLayout {
+                    id,
+                    heading,
+                    opening,
+                    closing,
+                    closed: true,
+                    summary: forge_diff::presentation::declaration_body_summary(
+                        changed.len(),
+                        if body.collapsed_suffix.ends_with("end") {
+                            "end"
+                        } else {
+                            "}"
+                        },
+                    ),
                 },
-                heading_start: Some(BlockAnchor {
-                    block: block[heading].id.clone(),
-                    position: TextPosition { row: 0, column: 0 },
-                }),
-                collapsed_suffix: Some(body.collapsed_suffix.into()),
-                closed: true,
-                collapse_children: false,
-                expand_children: false,
-            });
+            )?;
         }
     }
+    Ok(())
 }
 
 fn public_blocks(
@@ -2195,6 +2285,80 @@ mod tests {
     }
 
     #[test]
+    fn public_filter_retains_a_new_function_after_a_documented_baseline_declaration() {
+        let mut design = super::super::DeclarationDesign::default();
+        design.baseline.insert("main.rs".into(), super::super::DeclarationFile {
+            text: "pub fn leaf();\n\npub fn run();\n\npub struct Client {\n  pub count: usize,\n}\n\npub fn update(client: &mut Client);\n\n/// Describes the following declaration.\npub struct Following;\n".into(),
+            source_digest: String::new(),
+        });
+        design
+            .proposed
+            .insert("main.rs".into(), "pub fn reviewed_change();\n".into());
+        design.baseline_calls.insert(
+            "main.rs".into(),
+            ["leaf", "run", "update"]
+                .into_iter()
+                .map(|owner| super::super::FunctionBody {
+                    evidence: None,
+                    owner: owner.into(),
+                    behavior: None,
+                    call: Some(Vec::new()),
+                })
+                .collect(),
+        );
+        design.proposed_calls.insert(
+            "main.rs".into(),
+            vec![super::super::FunctionBody {
+                evidence: None,
+                owner: "reviewed_change".into(),
+                behavior: Some(crate::plan::FunctionBehavior::Algorithm("return".into())),
+                call: None,
+            }],
+        );
+        let mut document =
+            crate::plan::document::test_fixture("new-function-visibility", "Visibility");
+        document.design = Some(design);
+        for (proposed, expected) in [
+            ("pub fn reviewed_change();\n", "pub fn reviewed_change"),
+            (
+                "pub struct NewValue {\n  pub count: usize,\n}\n",
+                "pub struct NewValue",
+            ),
+        ] {
+            let design = document.design.as_mut().unwrap();
+            design.proposed.insert("main.rs".into(), proposed.into());
+            if expected == "pub struct NewValue" {
+                design.proposed_calls.clear();
+            }
+            for public_only in [false, true] {
+                let (block, _) = project(
+                    &document,
+                    &Default::default(),
+                    ReviewAnnotationView {
+                        annotation: &[],
+                        revision: &HashMap::new(),
+                        focused: None,
+                    },
+                    &HashMap::new(),
+                    public_only,
+                    None,
+                    &HashSet::new(),
+                )
+                .unwrap();
+                let block = forge_buffer::collapse::project(block, &HashMap::new()).unwrap();
+                let rows = block
+                    .iter()
+                    .flat_map(|block| block.text.wire_rows())
+                    .collect::<Vec<_>>();
+                assert!(
+                    rows.iter().any(|row| row.contains(expected)),
+                    "public={public_only}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn modified_files_show_bounded_context_until_reference_navigation() {
         let mut document = crate::plan::document::test_fixture("context", "Review changes");
         let mut baseline = String::from("pub struct State {\n");
@@ -2432,7 +2596,7 @@ mod tests {
                             && fold
                                 .collapsed_suffix
                                 .as_ref()
-                                .is_some_and(|suffix| !suffix.contains("[changed]")))
+                                .is_some_and(|suffix| suffix == " … 1 change }"))
                     )
             );
             for block in blocks
