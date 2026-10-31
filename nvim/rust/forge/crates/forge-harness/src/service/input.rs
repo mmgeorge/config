@@ -386,11 +386,11 @@ impl SessionController {
     fn native_goal_selection(&self, backend_session_id: String) -> Result<NativeGoalSelection> {
         use crate::backend::NativeGoalUpdate;
         use crate::plan::PlanExecutionState;
-        use crate::task::TaskWorkflow;
+        use crate::task::WorkflowSnapshot;
         let task = self.task_controller.current()?;
         let update = match task.as_ref() {
             Some(task) => match &task.workflow {
-                TaskWorkflow::Goal { goal } if goal.native => {
+                WorkflowSnapshot::Goal { goal } if goal.native => {
                     let state =
                         if !task.entry_accepted() && goal.state == crate::goal::GoalState::Active {
                             crate::goal::GoalState::Paused
@@ -399,7 +399,7 @@ impl SessionController {
                         };
                     NativeGoalUpdate::from_goal(goal.objective.clone(), state)
                 }
-                TaskWorkflow::Execute { execution } if execution.native => {
+                WorkflowSnapshot::Execute { execution } if execution.native => {
                     let state = match execution.record.state {
                         PlanExecutionState::Active if task.entry_accepted() => {
                             crate::goal::GoalState::Active
@@ -413,15 +413,15 @@ impl SessionController {
                     };
                     NativeGoalUpdate::from_goal(execution.title.clone(), state)
                 }
-                TaskWorkflow::Goal { .. }
-                | TaskWorkflow::Execute { .. }
-                | TaskWorkflow::Plan { .. } => NativeGoalUpdate::Absent,
+                WorkflowSnapshot::Goal { .. }
+                | WorkflowSnapshot::Execute { .. }
+                | WorkflowSnapshot::Plan { .. } => NativeGoalUpdate::Absent,
             },
             None => NativeGoalUpdate::Absent,
         };
         Ok(NativeGoalSelection {
             backend_session_id,
-            revision: task.map(|task| task.revision),
+            revision: task.map(|task| task.revision.clone()),
             update,
         })
     }
@@ -635,6 +635,18 @@ impl SessionController {
         sink: &MessageSender,
         jobs: &mut JoinSet<bool>,
     ) -> Result<Option<InputProgress>> {
+        if self.task_controller.current()?.is_some_and(|task| {
+            task.phase() == crate::task::TaskPhase::Verify
+                && task.status() == crate::task::TaskStatus::Running
+        }) {
+            let Ok(_control) = self.coordinator.control.clone().try_acquire_owned() else {
+                return Ok(Some(InputProgress::Waiting));
+            };
+            let Ok(_execution) = self.coordinator.execution.clone().try_acquire_owned() else {
+                return Ok(Some(InputProgress::WaitExecution));
+            };
+            self.broker.lock().await.refresh_verification_gate().await?;
+        }
         let Some(task) = self.task_controller.current()? else {
             return Ok(None);
         };
@@ -645,8 +657,8 @@ impl SessionController {
         else {
             return Ok(None);
         };
-        if task.status() != crate::task::TaskStatus::Running
-            || work.work != crate::task::TaskContinuationWork::Checks
+        if task.next_action() != crate::task::TaskNextAction::Checks
+            || !work.work.is_checks()
             || work.delivery != crate::task::TaskInputDelivery::Pending
         {
             return Ok(None);
@@ -662,11 +674,6 @@ impl SessionController {
                     InputDelivery::Accepted | InputDelivery::Delivering
                 )
         }) {
-            let mut store = SqliteStore::open(&self.data_root)?;
-            self.task_controller.cancel_continuation(
-                &mut store,
-                SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64,
-            )?;
             return Ok(None);
         }
         if !SqliteStore::read_only(&self.data_root)?
@@ -756,6 +763,9 @@ impl SessionController {
             .await?;
             return Ok(());
         }
+        if task.next_action() != crate::task::TaskNextAction::Model {
+            return Ok(());
+        }
         let (id, text, purpose) = if let Some(entry) = task
             .entry
             .as_ref()
@@ -763,7 +773,7 @@ impl SessionController {
         {
             (
                 &entry.id,
-                &entry.instruction,
+                entry.instruction.as_str(),
                 crate::input::InputPurpose::TaskEntry {
                     revision: task.revision.clone(),
                     id: entry.id.clone(),
@@ -779,7 +789,7 @@ impl SessionController {
             .and_then(|turn| turn.continuation.as_ref().map(|input| (turn, input)))
             .filter(|(_, input)| input.delivery == crate::task::TaskInputDelivery::Pending)
         {
-            if continuation.work == crate::task::TaskContinuationWork::Checks {
+            if continuation.work.is_checks() {
                 return Ok(());
             }
             if !SqliteStore::read_only(&self.data_root)?
@@ -802,7 +812,10 @@ impl SessionController {
             }
             (
                 &continuation.id,
-                &continuation.instruction,
+                continuation
+                    .work
+                    .instruction()
+                    .context("local checks have no provider instruction")?,
                 crate::input::InputPurpose::TaskContinuation {
                     revision: task.revision.clone(),
                     id: continuation.id.clone(),
@@ -813,35 +826,27 @@ impl SessionController {
         } else {
             return Ok(());
         };
-        if snapshot
-            .messages
-            .iter()
-            .any(|message| message.id == id.as_str())
-        {
-            return Ok(());
+        let update = self
+            .coordinator
+            .submissions
+            .reconcile_task_input(InputMessage {
+                id: id.as_str().into(),
+                revision: 0,
+                text: text.to_owned(),
+                purpose,
+                attachments: Vec::new(),
+                config: None,
+                intent: InputIntent::Auto,
+                delivery: InputDelivery::Queued,
+                route: None,
+                reservation: None,
+                submission_id: None,
+                error: None,
+            })?;
+        if let Some(update) = update {
+            self.publish_input(update, sink).await?;
         }
-        let update = self.coordinator.submissions.apply(InputOperation {
-            id: format!("task-input:{}", id.as_str()),
-            control_revision: snapshot.control_revision,
-            after_control: snapshot.control_operation_id,
-            action: InputAction::Submit {
-                message: Box::new(InputMessage {
-                    id: id.as_str().into(),
-                    revision: 0,
-                    text: text.clone(),
-                    purpose,
-                    attachments: Vec::new(),
-                    config: None,
-                    intent: InputIntent::Auto,
-                    delivery: InputDelivery::Queued,
-                    route: None,
-                    reservation: None,
-                    submission_id: None,
-                    error: None,
-                }),
-            },
-        })?;
-        self.publish_input(update, sink).await
+        Ok(())
     }
 
     async fn complete_input_checks(

@@ -431,9 +431,7 @@ impl HarnessInspectionScope {
         result["settings"]["lsp_tools"] = json!(snapshot.desired.lsp_tools.unwrap_or(false));
         result["settings"]["subagent_tools"] =
             json!(snapshot.desired.subagent_tools.unwrap_or(false));
-        result["approval_defaults"] = json!({"work":session.default_approval,"plan":session.plan_approval,
-            "plan_auto_approve_revisions":session.plan_auto_approve_revisions,
-            "approval_timeout":session.approval_timeout,"answer_timeout":session.answer_timeout});
+        result["input_timeouts"] = json!({"approval_timeout":session.approval_timeout,"answer_timeout":session.answer_timeout});
         result["permissions"] = serde_json::to_value(&self.policy.document)?;
         result["locations"] = json!({"config_directory":root,"forge_rust":source.as_ref().map(|root|root.join("rust/forge")),
             "forge_lua":source.as_ref().map(|root|root.join("lua/forge")),

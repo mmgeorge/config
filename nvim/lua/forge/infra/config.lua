@@ -119,6 +119,7 @@
 ---@field help ForgeKeymap
 
 ---@class ForgePickerKeymapConfig
+---@field help ForgeKeymap
 ---@field previous ForgeKeymap
 ---@field next ForgeKeymap
 ---@field select ForgeKeymap
@@ -371,6 +372,7 @@ M.defaults = {
       help = "?",
     },
     picker = {
+      help = "?",
       previous = { "<Up>", "s" },
       next = { "<Down>", "t" },
       select = "<CR>",

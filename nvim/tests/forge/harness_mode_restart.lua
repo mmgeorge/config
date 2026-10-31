@@ -17,7 +17,7 @@ vim.defer_fn = function() end
 local function reset()
   if state.working_timer then state.working_timer:stop() state.working_timer:close() end
   state.working_timer, state.working_started_ns = nil, nil
-  state.session = { id = "permission-transition", approval_mode = "ask", active_task = { revision = "task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }
+  state.session = { id = "permission-transition", approval_mode = "ask", active_task = { revision = "task", kind = "goal", phase = "work", status = "running", goal = { objective = "Fixture goal", state = "active" } } }
 
   state.busy, state.no_checkpoint = true, false
   state.execution_notice, state.host_error, state.task_operation = nil, nil, nil

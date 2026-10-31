@@ -1,6 +1,6 @@
 use super::*;
 use crate::task::command::{ResumeRequest, SessionAction};
-use crate::task::{ActiveTask, TaskChange, TaskWorkflow};
+use crate::task::{Task, TaskChange, WorkflowSnapshot};
 
 pub(crate) struct PreparedTaskChange {
     pub change: TaskChange,
@@ -124,17 +124,17 @@ impl BrokerObserver {
     pub(crate) fn prepare_task_change(
         &self,
         action: &SessionAction,
-        current: Option<&ActiveTask>,
+        current: Option<&Task>,
         goal_max_turns: u32,
         now_ms: i64,
     ) -> Result<PreparedTaskChange> {
         let effects = crate::storage::TaskEffects::default();
-        let change = match action {
+        let mut change = match action {
             SessionAction::PlanAccept { enabled } => TaskChange::SetPlanAcceptance(*enabled),
             SessionAction::NewGoal { text } => {
-                let mut task = ActiveTask::goal(
+                let mut task = Task::goal(
                     text.clone(),
-                    crate::session::continuation::ContinuationBudget::new(goal_max_turns, 2),
+                    crate::session::continuation::ContinuationBudget::new(goal_max_turns, 5),
                     self.native_goal_supported()?,
                     now_ms,
                 );
@@ -178,7 +178,7 @@ impl BrokerObserver {
                 let (task, effects) =
                     self.prepare_execution(&action.to_params()?, goal_max_turns, now_ms)?;
                 return Ok(PreparedTaskChange {
-                    change: TaskChange::Install(Box::new(task)),
+                    change: TaskChange::prepared(current, task),
                     effects,
                 });
             }
@@ -200,7 +200,7 @@ impl BrokerObserver {
             )?,
             SessionAction::CompleteAcceptance { plan_id, digest } => {
                 let task = current.context("session has no active task")?;
-                let TaskWorkflow::Plan { plan } = &task.workflow else {
+                let WorkflowSnapshot::Plan { plan } = &task.workflow else {
                     anyhow::bail!("acceptance requires the current planning task")
                 };
                 let acceptance = plan
@@ -214,7 +214,7 @@ impl BrokerObserver {
                 );
                 let (task,effects)=self.prepare_execution(&json!({"plan_id":plan.artifact.id,"digest":acceptance.review_digest,"saved_source_digest":acceptance.saved_source_digest,"approval_mode":acceptance.approval_mode()?,"comment":acceptance.overall_comment}),goal_max_turns,now_ms)?;
                 return Ok(PreparedTaskChange {
-                    change: TaskChange::Install(Box::new(task)),
+                    change: TaskChange::prepared(current, task),
                     effects,
                 });
             }
@@ -225,25 +225,66 @@ impl BrokerObserver {
                 return self.prepare_review_change(action, current, now_ms);
             }
         };
+        if let TaskChange::Install(task) = &mut change
+            && task.kind() == crate::task::TaskKind::Plan
+        {
+            task.edit(|draft| {
+                let WorkflowSnapshot::Plan { plan } = &mut draft.workflow else {
+                    unreachable!()
+                };
+                plan.artifact.generation.budget =
+                    crate::session::continuation::ContinuationBudget::new(goal_max_turns, 5);
+                Ok(())
+            })?;
+        }
         Ok(PreparedTaskChange { change, effects })
     }
 
-    fn prepare_resume(&self, task: &ActiveTask, request: &ResumeRequest) -> Result<TaskChange> {
-        if matches!(&task.workflow,TaskWorkflow::Plan { plan } if matches!(plan.artifact.state,PlanState::AwaitingInput | PlanState::AwaitingReview))
+    fn prepare_resume(&self, task: &Task, request: &ResumeRequest) -> Result<TaskChange> {
+        if matches!(&task.workflow, WorkflowSnapshot::Execute { execution }
+            if execution.record.pending_revision_reason.is_some())
+        {
+            return Ok(TaskChange::Resume);
+        }
+        if task
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.delivery == crate::task::TaskInputDelivery::Pending)
+            && request.message.is_none()
+            && request.continuation.is_none()
+        {
+            return Ok(TaskChange::Resume);
+        }
+        if matches!(&task.workflow, WorkflowSnapshot::Execute { execution }
+            if execution.record.phase == crate::plan::PlanPhase::Checking)
+        {
+            let store = SqliteStore::read_only(&self.data_root)?;
+            let exchange = store
+                .latest_exchange(&self.session_id)?
+                .context("execution checks require a completed source exchange")?;
+            anyhow::ensure!(exchange.is_finished(), "source exchange is not finalized");
+            return Ok(TaskChange::ResumeWithChecks(crate::task::TaskTurnId {
+                exchange_ordinal: exchange.ordinal,
+                turn_ordinal: exchange.turn.len(),
+            }));
+        }
+        if matches!(&task.workflow,WorkflowSnapshot::Plan { plan } if matches!(plan.artifact.state,PlanState::AwaitingInput | PlanState::AwaitingReview))
             && request.message.is_none()
             && request.continuation.is_none()
         {
             return Ok(TaskChange::Resume);
         }
         let mut instruction = match &task.workflow {
-            TaskWorkflow::Goal { goal } => format!(
+            WorkflowSnapshot::Goal { goal } => format!(
                 "Resume working toward this goal: {}\nContinue until it is complete. Use goal_complete or goal_blocked to report terminal state.",
                 goal.objective
             ),
-            TaskWorkflow::Plan { plan } if plan.artifact.state == PlanState::ConfiguringChecks => {
+            WorkflowSnapshot::Plan { plan }
+                if plan.artifact.state == PlanState::ConfiguringChecks =>
+            {
                 PlanPrompt::checks_setup(&plan.artifact.request)
             }
-            TaskWorkflow::Plan { plan } => {
+            WorkflowSnapshot::Plan { plan } => {
                 let document = self
                     .plan_file
                     .read_working_document(&self.session_id, &plan.artifact.id)?;
@@ -252,7 +293,7 @@ impl BrokerObserver {
                     &document.model_json()?,
                 )
             }
-            TaskWorkflow::Execute { execution } => {
+            WorkflowSnapshot::Execute { execution } => {
                 let mut resumed = execution.clone();
                 crate::task::SessionTaskController::resume_execution(&mut resumed);
                 self.execution_continuation_prompt(&resumed)?
@@ -267,7 +308,7 @@ impl BrokerObserver {
 
     pub(super) fn execution_continuation_prompt(
         &self,
-        execution: &crate::task::ExecutionTask,
+        execution: &crate::task::ExecutionSnapshot,
     ) -> Result<String> {
         let store = SqliteStore::read_only(&self.data_root)?;
         let plan = store
@@ -290,7 +331,7 @@ impl BrokerObserver {
 
     fn prepare_continuation(
         &self,
-        current: &ActiveTask,
+        current: &Task,
         completed: Option<&crate::task::TaskTurnId>,
         now_ms: i64,
     ) -> Result<TaskChange> {
@@ -312,43 +353,40 @@ impl BrokerObserver {
         }) {
             return Ok(TaskChange::Preserve);
         }
-        let (instruction, work) = match &current.workflow {
-            TaskWorkflow::Execute { execution }
+        let work = match &current.workflow {
+            WorkflowSnapshot::Execute { execution }
                 if execution.record.phase == crate::plan::PlanPhase::Checking =>
             {
-                (String::new(), crate::task::TaskContinuationWork::Checks)
+                crate::task::TaskWork::Checks
             }
-            TaskWorkflow::Execute { execution } => (
-                self.execution_continuation_prompt(execution)?,
-                crate::task::TaskContinuationWork::Provider,
-            ),
-            TaskWorkflow::Goal { goal } => (
-                format!("Continue working toward this goal: {}", goal.objective),
-                crate::task::TaskContinuationWork::Provider,
-            ),
-            TaskWorkflow::Plan { .. } => {
+            WorkflowSnapshot::Execute { execution } => crate::task::TaskWork::Provider {
+                instruction: self.execution_continuation_prompt(execution)?,
+            },
+            WorkflowSnapshot::Goal { goal } => crate::task::TaskWork::Provider {
+                instruction: format!("Continue working toward this goal: {}", goal.objective),
+            },
+            WorkflowSnapshot::Plan { .. } => {
                 anyhow::bail!("planning continuation is owned by its terminal turn")
             }
         };
-        let mut task = current.clone();
+        let mut task = current.draft();
         task.updated_at_ms = now_ms;
         task.turn = Some(crate::task::TaskTurn {
             id: completed,
             continuation: Some(crate::task::TaskContinuation {
                 id: crate::task::TaskInputId::fresh(),
-                instruction,
                 reason: "The active task requires another turn".into(),
                 delivery: crate::task::TaskInputDelivery::Pending,
                 work,
             }),
         });
-        Ok(TaskChange::Update(Box::new(task)))
+        Ok(TaskChange::Update(Box::new(Task::try_from(task)?)))
     }
     pub(crate) fn prepare_plan_task(
         &self,
         request: PlanTaskRequest,
         now_ms: i64,
-    ) -> Result<crate::task::ActiveTask> {
+    ) -> Result<crate::task::Task> {
         let prepared = match request {
             PlanTaskRequest::New { objective } => {
                 self.plan_file
@@ -367,8 +405,8 @@ impl BrokerObserver {
                     record.accepted_revision.is_none(),
                     "accepted plan must be forked before editing"
                 );
-                let mut task = crate::task::ActiveTask::plan(record, now_ms);
-                if let crate::task::TaskWorkflow::Plan { plan } = &mut task.workflow
+                let mut task = crate::task::TaskSnapshot::plan(record, now_ms);
+                if let crate::task::WorkflowSnapshot::Plan { plan } = &mut task.workflow
                     && !matches!(
                         plan.artifact.state,
                         PlanState::AwaitingInput | PlanState::AwaitingReview
@@ -395,7 +433,7 @@ impl BrokerObserver {
                     };
                     task.request_entry(instruction, now_ms)?;
                 }
-                return Ok(task);
+                return Task::try_from(task);
             }
             PlanTaskRequest::Fork { plan_id } => {
                 let store = SqliteStore::read_only(&self.data_root)?;
@@ -465,9 +503,9 @@ impl BrokerObserver {
                     .prepare_entry(&self.session_id, request, Some(document), now_ms)?
             }
         };
-        let mut task = crate::task::ActiveTask::plan(prepared.record, now_ms);
+        let mut task = crate::task::TaskSnapshot::plan(prepared.record, now_ms);
         task.request_entry(prepared.instruction, now_ms)?;
-        Ok(task)
+        Task::try_from(task)
     }
 }
 
@@ -478,7 +516,11 @@ mod tests {
     /// Queue active phase guidance from the same workflow state that resume commits.
     #[tokio::test]
     async fn resumed_execution_entry_uses_committed_phase_instead_of_stopped_state() -> Result<()> {
-        for stopped in [PlanExecutionState::Stalled, PlanExecutionState::Paused] {
+        for (stopped, phase) in [
+            (PlanExecutionState::Stalled, crate::plan::PlanPhase::Resolve),
+            (PlanExecutionState::Paused, crate::plan::PlanPhase::Resolve),
+            (PlanExecutionState::Paused, crate::plan::PlanPhase::Checking),
+        ] {
             let workspace = super::super::test::repository();
             let data = tempfile::tempdir()?;
             let mut broker =
@@ -506,23 +548,31 @@ mod tests {
             plan.accepted_revision = Some(1);
             plan.submitted_version = Some(plan.document_version);
             broker.store.save_plan(&plan)?;
+            let exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+                "id":"resume-source", "session_id":broker.session.id,
+                "agent_id":broker.session.primary_agent_id, "ordinal":1,
+                "prompt":"Implementation", "state":"complete",
+                "created_at_ms":1, "completed_at_ms":2,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))?;
+            broker.store.save_exchange(&exchange)?;
             let record: PlanExecutionRecord = serde_json::from_value(json!({
                 "id":"resume-execution", "session_id":broker.session.id,
-                "plan_id":"resume-plan", "state":stopped, "phase":"resolve",
+                "plan_id":"resume-plan", "state":stopped, "phase":phase, "baseline_checkpoint":"captured",
                 "original_revision":1, "revision":1, "generation":7,
                 "findings":["Operator gate failed"], "created_at_ms":1,
                 "lifecycle":[], "progress":crate::plan::execution::SemanticProgress::default(),
-                "verification":[], "revision_history":[], "review_paused":false,
-                "observed_source":{}, "observed_generation":7, "observed_check":[],
+                "verification":[], "revision_history":[], "resume_after_review":false,
+                "observed_source":{}, "observed_document_version":7, "observed_check":[],
             }))?;
-            let mut task = ActiveTask::execute(
+            let mut task = crate::task::TaskSnapshot::execute(
                 "Resume fixture".into(),
                 record,
                 crate::session::continuation::ContinuationBudget::new(20, 2),
                 false,
                 1,
             );
-            let TaskWorkflow::Execute { execution } = &mut task.workflow else {
+            let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
                 unreachable!()
             };
             execution.continuation.observe(false);
@@ -540,7 +590,7 @@ mod tests {
                 .change(
                     &mut broker.store,
                     None,
-                    TaskChange::Install(Box::new(task)),
+                    TaskChange::Install(Box::new(Task::try_from(task)?)),
                     1,
                 )?
                 .unwrap();
@@ -562,6 +612,19 @@ mod tests {
                 )?
                 .unwrap();
             assert_ne!(resumed.revision, installed.revision);
+            if phase == crate::plan::PlanPhase::Checking {
+                assert!(
+                    resumed.entry.is_none(),
+                    "Check must not create a provider entry"
+                );
+                let work = resumed
+                    .turn
+                    .as_ref()
+                    .and_then(|turn| turn.continuation.as_ref())
+                    .context("resumed Check must reserve local work")?;
+                assert_eq!(work.work, crate::task::TaskWork::Checks);
+                continue;
+            }
             let entry = resumed.entry.as_ref().context("resume entry missing")?;
             assert!(
                 entry
@@ -576,7 +639,7 @@ mod tests {
             );
             assert!(!entry.instruction.contains("Execution is Stalled"));
             assert!(!entry.instruction.contains("Execution is Paused"));
-            let TaskWorkflow::Execute { execution } = &resumed.workflow else {
+            let WorkflowSnapshot::Execute { execution } = &resumed.workflow else {
                 unreachable!()
             };
             assert_eq!(execution.record.state, projected.record.state);
@@ -623,7 +686,7 @@ mod tests {
             .change(
                 &mut broker.store,
                 None,
-                TaskChange::Install(Box::new(ActiveTask::goal(
+                TaskChange::Install(Box::new(Task::goal(
                     "Replacement task".into(),
                     Default::default(),
                     false,

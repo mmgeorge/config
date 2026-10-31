@@ -15,7 +15,7 @@ client.request = function(request_specification, callback)
   assert(method == "session.plan.get")
   requests[#requests + 1] = { session_id = session_id, params = params, callback = callback }
 end
-state.session = { id = "browsing", active_task = { revision = "current-task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }
+state.session = { id = "browsing", active_task = { revision = "current-task", kind = "goal", phase = "work", status = "running", goal = { objective = "Fixture goal", state = "active" } } }
 state.active_plan = { id = "current-plan" }
 state.artifact = {
   { id = "failed-plan", title = "Failed attempt", state = "failed", updated_at_ms = 3 },

@@ -7,7 +7,7 @@ async fn ordinary_input_does_not_activate_a_pending_plan_entry() -> Result<()> {
         broker
             .plan_file
             .prepare_entry(&broker.session.id, "Pending plan".into(), None, 1)?;
-    let mut task = crate::task::ActiveTask::plan(prepared.record, 1);
+    let mut task = crate::task::Task::plan(prepared.record, 1)?;
     task.request_entry(prepared.instruction, 1)?;
     let pending = broker
         .task_controller
@@ -33,7 +33,7 @@ async fn ordinary_input_does_not_activate_a_pending_plan_entry() -> Result<()> {
     let current = broker.task_controller.current()?.unwrap();
     assert_eq!(current.revision, pending.revision);
     assert!(!current.entry_accepted());
-    let crate::task::TaskWorkflow::Plan { plan } = current.workflow else {
+    let crate::task::WorkflowSnapshot::Plan { plan } = current.workflow.clone() else {
         unreachable!()
     };
     assert_eq!(plan.artifact.state, crate::plan::PlanState::Generating);

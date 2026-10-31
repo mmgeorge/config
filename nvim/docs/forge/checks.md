@@ -14,7 +14,7 @@ the current session history. Plans containing the older check configuration must
 The permission starts off, applies to this Harness conversation, and survives reopening.
 The winbar appends gray `ce` to the permissions code while enabled, such as
 `rxwxce` or `rxwxaxce`. The same permission is
-available in `/config` under **Checks → Setup**, toggled with Space. Enabling
+available in `/config` under **Workflow → Checks → Setup**, toggled with Space. Enabling
 permission does not run checks, send a prompt, or change which checks are enabled.
 Request configuration changes in ordinary chat, such as "Configure targeted checks
 for this repository." The `harness-checks` skill supplies discovery, schema, and
@@ -42,7 +42,7 @@ category `check`. Source-changing preparation and explicit prerequisites run
 before checks that require their results. Formatting validation does not modify
 the source that was tested.
 
-In `/config`, select **Checks → Automatic → Enabled** and press Space to disable
+In `/config`, select **Workflow → Checks → Automatic → Enabled** and press Space to disable
 or enable completion checks. Tab switches between Enabled and Timing. The setting
 applies immediately, including during active work. Disabling completion checks
 leaves explicit check runs and plan Checking available.
@@ -151,7 +151,7 @@ changes source. Keep those dependencies only when the prerequisite is required.
 
 ## Completion and repair
 
-In `/config` under **Checks → Automatic**, **Enabled** starts off. Space toggles
+In `/config` under **Workflow → Checks → Automatic**, **Enabled** starts off. Space toggles
 it using `●` for enabled and `○` for disabled. Turning it off suppresses automatic
 completion checks. Explicit runs and plan Checking remain available. An already
 running check finishes unless stopped explicitly.

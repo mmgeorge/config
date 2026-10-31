@@ -109,8 +109,8 @@ paths. LFS-only changes produce no generation request.
 
 Commit generation uses a persistent, tool-free **Background session**. Codex and Copilot
 default to `gpt-6-luna` with low thinking, independently of the active chat. `/config`
-provides the **Background** row in **Models** for model, thinking, and supported speed choices, and
-its **Background** row in **Compaction** for automatic compaction and the token threshold. Choices persist across restarts. Gemini is not part
+provides a **Background model** section in **Models** for model, thinking, supported
+speed, automatic compaction, and token threshold choices. Choices persist across restarts. Gemini is not part
 of this workflow. Other AI features retain their existing adapters.
 
 Background **Speed** is independent of Main and applies to subsequent Background
@@ -125,8 +125,8 @@ branches or rewriting history starts another conversation, with the old timeline
 Each request includes the last ten complete Git commit messages for terminology and style.
 
 Background auto-compaction defaults to **128,000 tokens** using the model's default context
-window. Ordinary Harness sessions default to off. Their **Main** row in
-**Compaction** combines the automatic toggle and token threshold in `/config`. Compaction runs after completed turns, with no
+window. Ordinary Harness sessions default to off. Their **Main model** section in
+**Models** includes the Compact toggle and token threshold in `/config`. Compaction runs after completed turns, with no
 idle timer. Missing provider usage cannot trigger compaction. Failed compaction is visible
 and does not discard generated text.
 
@@ -481,32 +481,61 @@ imports before submitting. Attempts during import retain the draft and show a no
 [`lsp` tool](lsp-tools.md) for model-driven code exploration without
 changing interactive plan navigation or starting language servers.
 
-`/config` presents grouped rows for Models, Compaction, Checks, Planning, Execute, Permissions,
-Tools, Display, Provider, and Debug. Use Up/Down to select a row,
-Tab/Shift-Tab to select its fields, Left/Right to change values, Space to toggle
-`●` enabled or `○` disabled, and Enter to edit a number or open a selector.
-Models includes **Ask** for Plan Review questions created with `A`. It defaults
-to the planning model. Choose a model, thinking level, and speed to override it,
-or **Use planning** to clear the override. Answers run in a forked session using
-the same provider and appear below their review questions without entering the
-main timeline.
+`/config` opens five tabs: **Models**, **Workflow**, **Permissions**, **Tools**, and
+**System**. The window occupies the bottom 80% of the host at full width.
+Tab/Shift-Tab cycle through tabs; Up/Down select settings without wrapping.
+Enter activates a setting, Space also toggles booleans, and Left/Right cycle choices.
+Press `?` for the full key help. A fixed two-line area describes the selected setting.
+Category and field selection survive resizing, updates, and returns from child editors.
+
+**Models** contains Main, Ask, and Background model sections. Main and Background
+include their own Compact toggle and threshold: 64k, 128k, 256k, or 512k.
+Ask serves Plan Review questions created with `A` and defaults to the main planning
+model. Turn on **Override** to select a separate model, thinking level, and speed.
+Answers run in a forked session using the same provider and appear below their
+review questions without entering the main timeline.
+
+**Permissions** groups read/write scopes and extra directories under **Access**.
+Its **Tools** subsection contains Mode (Ask, Deny, or Approve) and Approval timeout.
+Ask is the default; Mode changes the same current-session policy as `/ask`, `/deny`,
+and `/allow`. The status suffixes are `dx` for Deny and `ax` for Approve; `rx`
+is a read-access label. **Checks** contains Allow editing, also controlled by
+`/checks edit on/off`.
+The **Sandbox** subsection contains the sandbox toggle and Windows sandbox mode.
+Their descriptions follow the selected value, explaining isolation, setup requirements,
+and provider limits. Forge currently exposes native OS sandboxing only for Codex.
+Windows modes explain Elevated setup, Unelevated restrictions, and MXC compatibility
+with Elevated fallback. Both controls remain editable and are gray for non-Codex providers. Windows mode is also gray while Sandbox is off. Saved preferences remain available after restarting or switching to Codex; runtime access still follows provider capabilities. See the
+[official Windows sandbox documentation](https://learn.chatgpt.com/docs/windows/windows-sandbox)
+for platform requirements.
+Extra-directory settings open a text buffer with one directory per line. Save with
+`:write` or Ctrl-S and press `q` to return; `R` reloads the saved list. Blank lines
+are ignored, duplicate paths collapse to one grant, and every nonblank line must
+name an existing directory. Failed saves retain the draft. Read and write lists
+are independent, and neither changes sandbox settings.
 After saving a question, its answer block shows
 `Generating response · <model> · Thinking: <effort>`. Leaving and returning to the
 block preserves the pending status and the eventual answer. Closing PlanReview
 while an answer is running keeps the review open and explains the pending operation.
 If the buffer is forcibly closed, completed answers remain available after reopening.
-Planning has an approval preference (Keep current, ask, deny, or allow) and an
-Auto-approve default for execution started without an active planning task.
-An active Plan or Execute task uses its own `/plan accept on/off` setting instead.
-Execute has an approval default (ask, deny, or allow) for new
-goals and accepted plans. Neither preference changes filesystem access.
-Tools contains Timeouts and separate Space toggles for Subagents and LSP. Display contains Thoughts, and Debug at the
-end contains Logging. The explanation below the rows follows the focused field. Related settings share
-rows, including model and thinking, automatic compaction and its threshold,
-check shell and timing, access scope and extra directories, and both timeouts.
-Check-editing permission is also available under **Checks → Setup** without
-sending a prompt. Unsupported controls explain their restriction, and provider
-setup and Windows sandbox options appear only where applicable.
+Planning retains the session's current tool-approval mode, configured under
+**Permissions → Tools → Mode**.
+Automatic plan acceptance belongs to the active task and is controlled only by
+`/plan accept on/off`; it has no global configuration setting.
+New sessions start in Ask. Plan → Execute retains the current session and its
+tool-approval mode unless plan acceptance explicitly selects a different mode.
+**Workflow → Questions → Timeout** controls how long Harness waits for your answer
+to an assistant question. On expiry, it selects the recommended or first option,
+or skips questions without options. Plan acceptance never times out.
+**Tools** contains toggles for Subagents, LSP, and Session history.
+Approval and answer timeouts each show one value, such as `10m`. Enter opens an
+inline editor: Up/Down adjust the duration, Enter saves, and Esc cancels. Values
+step through `15s`, `30s`, `45s`, `60s`, then whole minutes from `2m` to `60m`.
+The endpoints do not wrap.
+**System** contains Thoughts under Display and Logging under Debug.
+Use `/checks edit on/off` to control check-authoring permission.
+Unsupported controls explain their restriction, and provider setup and Windows
+sandbox options appear only where applicable.
 
 The model picker's **Context** value uses the provider's explicit context limit.
 For the active model and tier, it uses the live session limit shown in the winbar.
@@ -539,6 +568,19 @@ skill supplies setup guidance. Bare `/checks edit` is not a command.
 The Harness winbar appends `ce` to the permissions code while editing is enabled.
 See [Project checks](checks.md) for
 publication approval, declared inputs, and repository callbacks.
+
+The winbar also shows the selected workflow and phase: `plan · draft`,
+`plan · review`, `exec · implement`, `exec · check`, `exec · resolve`,
+`exec · verify`, or `goal · work`. Pausing preserves that label, such as
+`exec · check · paused`. Resuming Check runs Harness checks locally rather than
+starting a model response. Plan acceptance keeps the same task identity as it
+enters Execute, and planning never enters Verify.
+
+Automatic continuation stops after five consecutive model turns without
+observable progress or the configured total allowance, which defaults to 20 turns.
+Reads and phase changes do not replenish the allowance. Explicit task resume
+starts a new allowance while retaining the phase, accepted artifact, and findings.
+After a host restart, unfinished tasks require explicit resume before work starts.
 
 PlanReview shows declaration changes with nearby context lines and enclosing
 declaration boundaries, using the regular diff grouping rules. Nearby method
@@ -595,17 +637,19 @@ Approving a plan and requesting changes both open an optional-comment popup. Pre
 `Esc` or `Ctrl-C` cancels the decision. Approval comments remain with the accepted
 revision and are included in execution context. A plan changed while its popup is
 open must be reviewed again before the decision can be submitted.
-Accepting with inline comments asks the agent to revise the plan first, then
-enables automatic acceptance for the task and starts or resumes execution after submission.
+Accepting with inline comments asks the agent to revise the plan first. The revised
+submission returns for review unless automatic acceptance is enabled for the task.
 Each comment includes its source context and any question-and-answer thread it
 belongs to. Question-only threads are not sent as change requests. Feedback and revision
 work remain in the same exchange, labeled as requested changes rather than a new plan.
+Every new Plan task starts with automatic acceptance off.
 Use `/plan accept on` or `/plan accept off` at any time during a Plan or Execute task
 to change automatic acceptance without interrupting the agent. The winbar shows
 `Auto-accept: on/off`. Successful full submissions check this task setting; drafts and
 failed submissions never authorize implementation. The setting survives submissions,
 pauses, and restarts until changed or the task ends. Requesting changes leaves it
-unchanged. Turn it off before resubmission when another review is required.
+unchanged, as does accepting inline feedback. Turn it off before resubmission when
+another review is required.
 Save pending annotations before a definition jump that changes the projection.
 `Constructs` lists directly instantiated types in green and factory calls with function highlighting.
 Factories are identified by their owned named return type. `Calls` lists other invocations and

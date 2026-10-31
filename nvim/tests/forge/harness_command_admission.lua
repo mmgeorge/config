@@ -37,6 +37,7 @@ local notifications = require("forge.infra.notifications")
 local warnings = {}
 notifications.warn = function(message) warnings[#warnings + 1] = message end
 state.composer_buf = vim.api.nvim_create_buf(false, true)
+state.session = { id = "command-admission" }
 state.queue = {}
 for _, prompt in ipairs({ "/sess", "/spawn", "/unrecognized extra text", "/workspace/example",
   "/workspace/", "/workspace.name/README", "/sessions-extra", "/checks edit",

@@ -78,7 +78,7 @@ local picker_view = picker._state_for_test()
 assert(vim.iter(picker_view.frame.lines):any(function(line)
   return line:find("gpt-test", 1, true) and line:find("272K", 1, true)
 end), "rendered picker did not show the live capacity")
-assert(context_status.segment(state.session.context_usage)[1].text == "78% left (272K)",
+assert(context_status.segment(state.session.context_usage)[1].text == "78% · 272K",
   "winbar did not show the same capacity as the picker")
 picker.close(false)
 

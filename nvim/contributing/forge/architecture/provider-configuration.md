@@ -10,9 +10,11 @@ Settings that change mid-turn, or credentials copied into provider files, would 
 
 New sessions resolve saved defaults, and resumed sessions keep their own model and tuning. Native forks copy explicit session overrides into an independent layer.
 
+Direct field edits merge into the latest settings layer inside an immediate SQLite transaction. They do not reuse a revision read before another request can commit. Whole-layer replacement retains its expected-revision check. Timeout edits serialize persistence and runtime publication per session without acquiring the active task or broker lock.
+
 ## Resources
 
-`ResourceCatalog` reads MCP definitions from `config_dir/rulesync-global/.rulesync/mcp.json` and the workspace `.rulesync/mcp.json`, and skills from the matching Rulesync skill directories, without prompt bodies or credentials. Each entry carries `Global`, `Workspace`, or `Provider` scope. `/config` also offers an explicit native import. Applying it requires the reviewed fingerprint and preference revision, and imported MCP values keep references into the original file, so Forge never copies literal credentials.
+`ResourceCatalog` reads MCP definitions from `config_dir/rulesync-global/.rulesync/mcp.json` and the workspace `.rulesync/mcp.json`, and skills from the matching Rulesync skill directories, without prompt bodies or credentials. Each entry carries `Global`, `Workspace`, or `Provider` scope. Applying a native import requires the reviewed fingerprint and preference revision, and imported MCP values keep references into the original file, so Forge never copies literal credentials.
 
 A missing credential or stdio command marks only that server unavailable and logs `mcp.start_skipped`. Each provider receives selected resources through an isolated profile:
 

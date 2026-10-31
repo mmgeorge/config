@@ -74,7 +74,6 @@ pub(super) fn initialize(
         }
         initialize_query_indexes(&transaction)?;
         super::tool_output::initialize_positions(&transaction)?;
-        super::migration::migrate(&transaction)?;
         transaction.pragma_update(None, "user_version", VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -252,7 +251,6 @@ pub(super) fn initialize(
     initialize_query_indexes(&transaction)?;
     super::archive::migrate(&transaction, objects)?;
     initialize_commands(&transaction)?;
-    super::migration::migrate(&transaction)?;
     transaction.pragma_update(None, "application_id", APPLICATION)?;
     transaction.pragma_update(None, "user_version", VERSION)?;
     transaction.commit()?;

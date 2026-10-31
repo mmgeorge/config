@@ -35,13 +35,14 @@ require("forge.shared.keymaps").apply_view_winbar = function(_, _, _, _, segment
 end
 controller.render, controller.attach_transcript = function() controller.refresh_winbar() end, function() end
 state.command_set = controller.command_set()
+state.transcript_win = vim.api.nvim_get_current_win()
 state.session = { id = "effort-test", backend = "codex", model = "test", resolved_model = "test", effort = "medium" }
 state.capability = { effort_selection = true, fast_mode = true, ultrafast_mode = true }
 for _, tier in ipairs({ "default", "fast", "ultrafast" }) do
   state.session.service_tier = tier
   controller.refresh_winbar()
   local marker = ({ fast = "󱐌", ultrafast = "󱐋" })[tier]
-  assert(header:find((marker and marker .. " " or "") .. "test medium ·", 1, true), header)
+  assert(header:find((marker and marker .. " " or "") .. "test medium", 1, true), header)
   for _, segment in ipairs(header_segments) do
     if segment.text == marker then
       assert(segment.group == (tier == "ultrafast" and "ForgeHarnessUltrafast" or "ForgeStatusLabel"))
@@ -67,7 +68,7 @@ for _, owner in ipairs({ "configuring_config", "task_config" }) do
       controller.refresh_winbar()
       local _, count = header:gsub("%*", "")
       assert(count == (busy and 1 or 0), "only deferred properties need a marker: " .. header)
-      assert(header:find((pending.model or "test") .. " " .. (pending.effort or "medium") .. (busy and "*" or "") .. " ·", 1, true), header)
+      assert(header:find((pending.model or "test") .. " " .. (pending.effort or "medium") .. (busy and "*" or ""), 1, true), header)
       state.session.model = pending.model or "test"
       state.session.resolved_model = state.session.model
       controller.refresh_winbar()
@@ -144,7 +145,7 @@ assert(state.session.effort == "minimal", "late configuration response overwrote
 transition = {}
 
 state.busy = true
-state.session.active_task = { revision = "goal", kind = "goal", goal = { objective = "Fixture goal", state = "active" } }
+state.session.active_task = { revision = "goal", kind = "goal", phase = "work", status = "running", goal = { objective = "Fixture goal", state = "active" } }
 
 controller.change_effort(1)
 controller.change_effort(1)
@@ -172,6 +173,7 @@ for index = 2, #transition - 1 do
 end
 state.session.effort, state.session.service_tier = "medium", "default"
 state.session.active_task.goal.state = "paused"
+state.session.active_task.status = "paused"
 task.receive(state, { id = latest.params.operation_id, state = "completed" })
 assert(not state.task_config and not state.busy and state.session.effort == "medium")
 assert(not header:find("fast", 1, true))

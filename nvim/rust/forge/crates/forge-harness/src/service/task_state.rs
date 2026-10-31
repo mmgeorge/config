@@ -98,8 +98,8 @@ pub(super) async fn apply_command(
             controller
                 .task_controller
                 .current()?
-                .and_then(|task| match task.workflow {
-                    crate::task::TaskWorkflow::Execute { execution } => Some(execution.record),
+                .and_then(|task| match task.workflow.clone() {
+                    crate::task::WorkflowSnapshot::Execute { execution } => Some(execution.record),
                     _ => None,
                 });
         let payload = if event == "plan_acceptance_started" {

@@ -40,6 +40,101 @@ fn submission_store(root: &std::path::Path) -> Result<Arc<SubmissionStore>> {
     SubmissionStore::open(root, Arc::new(crate::trace::TraceStore::open(root)?))
 }
 
+/// Recover the same pending task entry even when a stale queue item was already discarded.
+#[test]
+fn pending_task_input_rebinds_after_restart_without_losing_its_identity() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let submissions = submission_store(root.path())?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    let InputAction::Submit { message } = queued_operation("entry").action else {
+        unreachable!()
+    };
+    let mut message = *message;
+    let id = crate::task::TaskInputId::fresh();
+    message.id = id.as_str().into();
+    message.purpose = InputPurpose::TaskEntry {
+        revision: crate::task::TaskRevision::fresh(),
+        id: id.clone(),
+        start: crate::exchange::TaskStart {
+            kind: crate::task::TaskKind::Plan,
+            title: "Plan".into(),
+        },
+    };
+    assert!(queue.reconcile_task_input(message.clone())?.is_some());
+    assert!(queue.reconcile_task_input(message.clone())?.is_none());
+    drop(queue);
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    assert!(queue.snapshot()?.suspended);
+    let revision = crate::task::TaskRevision::fresh();
+    message.purpose = InputPurpose::TaskEntry {
+        revision: revision.clone(),
+        id,
+        start: crate::exchange::TaskStart {
+            kind: crate::task::TaskKind::Plan,
+            title: "Plan".into(),
+        },
+    };
+    queue.reconcile_task_input(message.clone())?;
+    let restored = queue.snapshot()?;
+    assert!(
+        restored.suspended,
+        "reconciliation must not implicitly resume the queue"
+    );
+    assert_eq!(restored.messages.len(), 1);
+    assert!(
+        matches!(&restored.messages[0].purpose, InputPurpose::TaskEntry { revision: current, .. } if current == &revision)
+    );
+    queue.delivery(&message.id, None, None, None)?;
+    assert!(queue.snapshot()?.messages.is_empty());
+    queue.reconcile_task_input(message.clone())?;
+    assert_eq!(queue.snapshot()?.messages.len(), 1);
+    assert_eq!(queue.snapshot()?.messages[0].id, message.id);
+    Ok(())
+}
+
+/// Keep uncertain provider deliveries behind reconciliation rather than requeueing them on resume.
+#[test]
+fn task_input_reconciliation_preserves_uncertain_delivery() -> Result<()> {
+    let queue = SessionInputQueue::default();
+    let InputAction::Submit { message } = queued_operation("entry").action else {
+        unreachable!()
+    };
+    let mut message = *message;
+    let id = crate::task::TaskInputId::fresh();
+    message.id = id.as_str().into();
+    message.purpose = InputPurpose::TaskEntry {
+        revision: crate::task::TaskRevision::fresh(),
+        id: id.clone(),
+        start: crate::exchange::TaskStart {
+            kind: crate::task::TaskKind::Goal,
+            title: "Goal".into(),
+        },
+    };
+    queue.reconcile_task_input(message.clone())?;
+    queue.delivery(
+        &message.id,
+        Some(InputDelivery::Unknown),
+        Some("provider-submission".into()),
+        None,
+    )?;
+    message.purpose = InputPurpose::TaskEntry {
+        revision: crate::task::TaskRevision::fresh(),
+        id,
+        start: crate::exchange::TaskStart {
+            kind: crate::task::TaskKind::Goal,
+            title: "Goal".into(),
+        },
+    };
+    assert!(queue.reconcile_task_input(message)?.is_none());
+    let retained = queue.snapshot()?;
+    assert_eq!(retained.messages[0].delivery, InputDelivery::Unknown);
+    assert_eq!(
+        retained.messages[0].submission_id.as_deref(),
+        Some("provider-submission")
+    );
+    Ok(())
+}
+
 /// Preserve drafts and receipts while releasing edit locks owned by a dead editor.
 #[test]
 fn accepted_queue_reopens_suspended_with_order_and_idempotency() -> Result<()> {

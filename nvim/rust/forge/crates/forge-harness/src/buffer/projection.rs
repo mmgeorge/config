@@ -3649,6 +3649,7 @@ mod tests {
     fn task_finished_event_keeps_outcome_without_a_task_owner() {
         let event = SessionEventKind::TaskFinished {
             outcome: crate::task::TaskOutcome {
+                id: crate::task::TaskId::fresh(),
                 kind: crate::task::TaskKind::Goal,
                 title: "Reduce startup time".into(),
                 state: crate::task::TaskOutcomeState::Complete,

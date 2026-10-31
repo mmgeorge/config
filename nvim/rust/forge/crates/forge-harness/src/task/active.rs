@@ -2,13 +2,30 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::goal::GoalState;
-use crate::plan::{PlanExecutionRecord, PlanExecutionState, PlanRecord, PlanState};
+use crate::plan::{PlanExecutionRecord, PlanRecord};
 use crate::session::continuation::ContinuationBudget;
 
 /// Identifies one admitted task contract, independently of exchange and provider identities.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct TaskRevision(String);
+
+/// Identifies one task across phase transitions, workflow changes, and resumes.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct TaskId(String);
+
+impl TaskId {
+    /// Create a distinct identity for a newly installed task.
+    pub fn fresh() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Get the stable serialized task identity.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl TaskRevision {
     pub fn fresh() -> Self {
@@ -22,8 +39,11 @@ impl TaskRevision {
 
 /// Carries the only selected workflow in a session. Transcript entries do not own this state.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ActiveTask {
+pub struct TaskSnapshot {
+    pub id: TaskId,
     pub revision: TaskRevision,
+    /// Fence turn accounting across user control and explicit recovery, but not phase handoffs.
+    pub(crate) observation_revision: TaskRevision,
     /// Accept complete plan submissions until the user disables this task policy.
     pub auto_accept_plan: bool,
     /// Preserve execution choices independently of automatic acceptance.
@@ -34,8 +54,209 @@ pub struct ActiveTask {
     pub entry: Option<TaskEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<TaskTurn>,
+    /// Deduplicate model observations independently of local-work reservation source turns.
+    pub observed_turn: Option<TaskTurnId>,
     #[serde(flatten)]
-    pub workflow: TaskWorkflow,
+    pub workflow: WorkflowSnapshot,
+}
+
+/// Own the only mutable task lifecycle; adapter snapshots expose no mutable borrow.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "StoredTask")]
+pub struct Task {
+    lifecycle: super::state::TaskLifecycle,
+}
+
+/// Validate the persisted lifecycle summary against its complete phase payload.
+#[derive(Deserialize)]
+struct StoredTask {
+    #[serde(flatten)]
+    draft: TaskSnapshot,
+    phase: super::TaskPhase,
+    status: super::TaskStatus,
+}
+
+impl TryFrom<StoredTask> for Task {
+    type Error = anyhow::Error;
+
+    fn try_from(stored: StoredTask) -> Result<Self> {
+        let StoredTask {
+            draft,
+            phase,
+            status,
+        } = stored;
+        let task = Self::try_from(draft)?;
+        anyhow::ensure!(
+            task.phase() == phase && task.status() == status,
+            "persisted task phase or lifecycle contradicts its workflow payload"
+        );
+        Ok(task)
+    }
+}
+
+impl Task {
+    /// Create a goal with its own stable identity and continuation allowance.
+    pub fn goal(
+        objective: String,
+        continuation: ContinuationBudget,
+        native: bool,
+        now_ms: i64,
+    ) -> Self {
+        Self {
+            lifecycle: super::state::TaskLifecycle::from_snapshot(TaskSnapshot::goal(
+                objective,
+                continuation,
+                native,
+                now_ms,
+            )),
+        }
+    }
+
+    /// Create a planning task around its canonical artifact.
+    pub fn plan(artifact: PlanRecord, now_ms: i64) -> Result<Self> {
+        Self::try_from(TaskSnapshot::plan(artifact, now_ms))
+    }
+
+    /// Create an execution task bound to an accepted artifact revision.
+    pub fn execute(
+        title: String,
+        record: PlanExecutionRecord,
+        continuation: ContinuationBudget,
+        native: bool,
+        now_ms: i64,
+    ) -> Result<Self> {
+        Self::try_from(TaskSnapshot::execute(
+            title,
+            record,
+            continuation,
+            native,
+            now_ms,
+        ))
+    }
+
+    /// Get the selected lifecycle without exposing mutation of its payload.
+    pub fn lifecycle(&self) -> &super::state::TaskLifecycle {
+        &self.lifecycle
+    }
+
+    /// Get the phase preserved by active, suspended, and finished tasks.
+    pub fn phase(&self) -> super::state::TaskPhase {
+        self.lifecycle.workflow().phase()
+    }
+
+    /// Get the lifecycle condition from the canonical state.
+    pub fn status(&self) -> super::TaskStatus {
+        self.lifecycle.status()
+    }
+
+    /// Derive the next operation from the committed workflow and lifecycle.
+    pub(crate) fn next_action(&self) -> super::state::TaskNextAction {
+        self.lifecycle.next_action()
+    }
+
+    /// Create an owned adapter draft; edits cannot affect committed state.
+    pub(crate) fn draft(&self) -> TaskSnapshot {
+        self.lifecycle.snapshot().clone()
+    }
+
+    /// Validate a complete candidate before replacing the current task value.
+    pub(crate) fn edit<Output>(
+        &mut self,
+        edit: impl FnOnce(&mut TaskSnapshot) -> Result<Output>,
+    ) -> Result<Output> {
+        let mut draft = self.draft();
+        let output = edit(&mut draft)?;
+        *self = Self::try_from(draft)?;
+        Ok(output)
+    }
+
+    /// Renew control admission while retaining stable task identity and phase.
+    pub fn renew(&mut self, now_ms: i64) {
+        let mut draft = self.draft();
+        draft.renew(now_ms);
+        self.lifecycle = super::state::TaskLifecycle::from_snapshot(draft);
+    }
+
+    /// Reserve a provider entry without exposing task internals.
+    pub(crate) fn request_entry(&mut self, instruction: String, now_ms: i64) -> Result<()> {
+        self.edit(|draft| draft.request_entry(instruction, now_ms))
+    }
+}
+
+impl std::ops::Deref for Task {
+    type Target = TaskSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        self.lifecycle.snapshot()
+    }
+}
+
+impl TryFrom<TaskSnapshot> for Task {
+    type Error = anyhow::Error;
+
+    fn try_from(draft: TaskSnapshot) -> Result<Self> {
+        super::state::validate_snapshot(&draft)?;
+        anyhow::ensure!(!draft.id.as_str().is_empty(), "task identity is required");
+        anyhow::ensure!(
+            !draft.revision.as_str().is_empty(),
+            "task revision is required"
+        );
+        if let Some(entry) = &draft.entry {
+            anyhow::ensure!(
+                !entry.instruction.trim().is_empty(),
+                "provider entry instruction is required"
+            );
+        }
+        if let Some(input) = draft
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.continuation.as_ref())
+        {
+            anyhow::ensure!(
+                input
+                    .work
+                    .instruction()
+                    .is_none_or(|instruction| !instruction.trim().is_empty()),
+                "provider continuation instruction is required"
+            );
+            anyhow::ensure!(
+                input.work != TaskWork::Checks
+                    || matches!(&draft.workflow, WorkflowSnapshot::Execute { execution } if execution.record.phase == crate::plan::PlanPhase::Checking)
+                    || input.delivery != TaskInputDelivery::Pending,
+                "pending local checks require the Check phase"
+            );
+        }
+        Ok(Self {
+            lifecycle: super::state::TaskLifecycle::from_snapshot(draft),
+        })
+    }
+}
+
+impl Serialize for Task {
+    fn serialize<Serializer: serde::Serializer>(
+        &self,
+        serializer: Serializer,
+    ) -> std::result::Result<Serializer::Ok, Serializer::Error> {
+        #[derive(Serialize)]
+        struct TaskView<'task> {
+            #[serde(flatten)]
+            snapshot: &'task TaskSnapshot,
+            phase: super::state::TaskPhase,
+            status: super::TaskStatus,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            suspension_reason: Option<&'task super::state::SuspensionReason>,
+        }
+        TaskView {
+            snapshot: self.lifecycle.snapshot(),
+            phase: self.phase(),
+            status: self.status(),
+            suspension_reason: match &self.lifecycle {
+                super::state::TaskLifecycle::Suspended(task) => Some(task.reason()),
+                _ => None,
+            },
+        }
+        .serialize(serializer)
+    }
 }
 
 /// Identifies a task-generated provider input across delivery retries.
@@ -70,19 +291,32 @@ pub struct TaskTurn {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskContinuation {
     pub id: TaskInputId,
-    pub instruction: String,
     pub reason: String,
     pub delivery: TaskInputDelivery,
-    #[serde(default)]
-    pub work: TaskContinuationWork,
+    pub work: TaskWork,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskContinuationWork {
-    #[default]
-    Provider,
+/// Bind provider instructions to provider work; local checks carry no fake prompt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskWork {
+    Provider { instruction: String },
     Checks,
+}
+
+impl TaskWork {
+    /// Get provider guidance only when this operation admits a provider turn.
+    pub fn instruction(&self) -> Option<&str> {
+        match self {
+            Self::Provider { instruction } => Some(instruction),
+            Self::Checks => None,
+        }
+    }
+
+    /// Identify local work without an independently mutable operation discriminator.
+    pub fn is_checks(&self) -> bool {
+        matches!(self, Self::Checks)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -122,28 +356,30 @@ pub enum TaskInputDelivery {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TaskWorkflow {
-    Goal { goal: GoalTask },
-    Plan { plan: PlanTask },
-    Execute { execution: ExecutionTask },
+pub enum WorkflowSnapshot {
+    Goal { goal: GoalSnapshot },
+    Plan { plan: PlanSnapshot },
+    Execute { execution: ExecutionSnapshot },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct GoalTask {
+pub struct GoalSnapshot {
     pub objective: String,
     pub state: GoalState,
     pub continuation: ContinuationBudget,
     pub native: bool,
+    /// Compare actual workspace content instead of treating tool activity as progress.
+    pub observed_checkpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanTask {
+pub struct PlanSnapshot {
     pub artifact: PlanRecord,
     pub paused: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ExecutionTask {
+pub struct ExecutionSnapshot {
     pub title: String,
     pub record: PlanExecutionRecord,
     pub continuation: ContinuationBudget,
@@ -163,6 +399,7 @@ pub enum TaskDecision {
 /// Retains a terminal task result without retaining a task owner in the transcript.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TaskOutcome {
+    pub id: TaskId,
     pub kind: super::TaskKind,
     pub title: String,
     pub state: TaskOutcomeState,
@@ -179,7 +416,9 @@ pub enum TaskOutcomeState {
 /// Binds a task-specific control call to the contract that admitted it.
 #[derive(Clone, Debug)]
 pub struct TaskPermit {
+    id: TaskId,
     revision: TaskRevision,
+    observation_revision: TaskRevision,
 }
 
 #[derive(Debug)]
@@ -194,19 +433,34 @@ impl std::fmt::Display for StaleTask {
 impl std::error::Error for StaleTask {}
 
 impl TaskPermit {
+    /// Attribute a completed model turn after its own legal phase transition.
+    /// User control rotates this fence, so a late completion cannot affect resumed work.
+    pub(crate) fn validate_observation(&self, task: Option<&Task>) -> Result<()> {
+        if task.is_none_or(|task| {
+            task.id != self.id || task.observation_revision != self.observation_revision
+        }) {
+            return Err(StaleTask.into());
+        }
+        Ok(())
+    }
+
+    /// Get the stable owner when an admitted turn advances its task revision.
+    pub(crate) fn task_id(&self) -> &TaskId {
+        &self.id
+    }
     pub(crate) fn revision(&self) -> &TaskRevision {
         &self.revision
     }
 
-    pub fn validate(&self, task: Option<&ActiveTask>) -> Result<()> {
-        if task.is_none_or(|task| task.revision != self.revision) {
+    pub fn validate(&self, task: Option<&Task>) -> Result<()> {
+        if task.is_none_or(|task| task.id != self.id || task.revision != self.revision) {
             return Err(StaleTask.into());
         }
         Ok(())
     }
 }
 
-impl ActiveTask {
+impl TaskSnapshot {
     pub fn goal(
         objective: String,
         continuation: ContinuationBudget,
@@ -214,19 +468,23 @@ impl ActiveTask {
         now_ms: i64,
     ) -> Self {
         Self {
+            id: TaskId::fresh(),
             revision: TaskRevision::fresh(),
+            observation_revision: TaskRevision::fresh(),
             auto_accept_plan: false,
             plan_execution: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             entry: None,
             turn: None,
-            workflow: TaskWorkflow::Goal {
-                goal: GoalTask {
+            observed_turn: None,
+            workflow: WorkflowSnapshot::Goal {
+                goal: GoalSnapshot {
                     objective,
                     state: GoalState::Active,
                     continuation,
                     native,
+                    observed_checkpoint: None,
                 },
             },
         }
@@ -234,15 +492,18 @@ impl ActiveTask {
 
     pub fn plan(artifact: PlanRecord, now_ms: i64) -> Self {
         Self {
+            id: TaskId::fresh(),
             revision: TaskRevision::fresh(),
+            observation_revision: TaskRevision::fresh(),
             auto_accept_plan: false,
             plan_execution: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             entry: None,
             turn: None,
-            workflow: TaskWorkflow::Plan {
-                plan: PlanTask {
+            observed_turn: None,
+            workflow: WorkflowSnapshot::Plan {
+                plan: PlanSnapshot {
                     artifact,
                     paused: false,
                 },
@@ -258,15 +519,18 @@ impl ActiveTask {
         now_ms: i64,
     ) -> Self {
         Self {
+            id: TaskId::fresh(),
             revision: TaskRevision::fresh(),
+            observation_revision: TaskRevision::fresh(),
             auto_accept_plan: false,
             plan_execution: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             entry: None,
             turn: None,
-            workflow: TaskWorkflow::Execute {
-                execution: ExecutionTask {
+            observed_turn: None,
+            workflow: WorkflowSnapshot::Execute {
+                execution: ExecutionSnapshot {
                     title,
                     record,
                     continuation,
@@ -278,7 +542,9 @@ impl ActiveTask {
 
     pub fn permit(&self) -> TaskPermit {
         TaskPermit {
+            id: self.id.clone(),
             revision: self.revision.clone(),
+            observation_revision: self.observation_revision.clone(),
         }
     }
 
@@ -307,53 +573,28 @@ impl ActiveTask {
 
     pub fn title(&self) -> &str {
         match &self.workflow {
-            TaskWorkflow::Goal { goal } => &goal.objective,
-            TaskWorkflow::Plan { plan } => &plan.artifact.title,
-            TaskWorkflow::Execute { execution } => &execution.title,
+            WorkflowSnapshot::Goal { goal } => &goal.objective,
+            WorkflowSnapshot::Plan { plan } => &plan.artifact.title,
+            WorkflowSnapshot::Execute { execution } => &execution.title,
         }
     }
 
     pub fn kind(&self) -> super::TaskKind {
-        match self.workflow {
-            TaskWorkflow::Goal { .. } => super::TaskKind::Goal,
-            TaskWorkflow::Plan { .. } => super::TaskKind::Plan,
-            TaskWorkflow::Execute { .. } => super::TaskKind::Execute,
+        match self.workflow.clone() {
+            WorkflowSnapshot::Goal { .. } => super::TaskKind::Goal,
+            WorkflowSnapshot::Plan { .. } => super::TaskKind::Plan,
+            WorkflowSnapshot::Execute { .. } => super::TaskKind::Execute,
         }
     }
 
+    /// Get the lifecycle condition represented by this adapter snapshot.
     pub fn status(&self) -> super::TaskStatus {
-        use super::TaskStatus;
-        match &self.workflow {
-            TaskWorkflow::Goal { goal } => match goal.state {
-                GoalState::Active => TaskStatus::Running,
-                GoalState::Paused => TaskStatus::Paused,
-                GoalState::Complete => TaskStatus::Completed,
-                GoalState::Cleared => TaskStatus::Cancelled,
-                _ => TaskStatus::Blocked,
-            },
-            TaskWorkflow::Plan { plan } if plan.paused => TaskStatus::Paused,
-            TaskWorkflow::Plan { plan } => match plan.artifact.state {
-                PlanState::ConfiguringChecks
-                | PlanState::AwaitingInput
-                | PlanState::AwaitingReview => TaskStatus::Waiting,
-                PlanState::Failed => TaskStatus::Failed,
-                PlanState::Cancelled | PlanState::Rejected => TaskStatus::Cancelled,
-                PlanState::Accepted => TaskStatus::Completed,
-                _ => TaskStatus::Running,
-            },
-            TaskWorkflow::Execute { execution } => match execution.record.state {
-                PlanExecutionState::Active => TaskStatus::Running,
-                PlanExecutionState::Complete => TaskStatus::Completed,
-                PlanExecutionState::Paused => TaskStatus::Paused,
-                PlanExecutionState::Cancelled => TaskStatus::Cancelled,
-                _ => TaskStatus::Blocked,
-            },
-        }
+        super::state::snapshot_status(&self.workflow)
     }
 
     pub(crate) fn same_contract(&self, other: &Self) -> bool {
         match (&self.workflow, &other.workflow) {
-            (TaskWorkflow::Goal { goal }, TaskWorkflow::Goal { goal: other }) => {
+            (WorkflowSnapshot::Goal { goal }, WorkflowSnapshot::Goal { goal: other }) => {
                 goal.objective == other.objective
                     && goal.state == other.state
                     && goal.native == other.native
@@ -361,19 +602,22 @@ impl ActiveTask {
                     && goal.continuation.max_consecutive_no_progress
                         == other.continuation.max_consecutive_no_progress
             }
-            (TaskWorkflow::Plan { plan }, TaskWorkflow::Plan { plan: other }) => {
+            (WorkflowSnapshot::Plan { plan }, WorkflowSnapshot::Plan { plan: other }) => {
                 plan.artifact.id == other.artifact.id
                     && plan.artifact.state == other.artifact.state
                     && plan.paused == other.paused
             }
-            (TaskWorkflow::Execute { execution }, TaskWorkflow::Execute { execution: other }) => {
+            (
+                WorkflowSnapshot::Execute { execution },
+                WorkflowSnapshot::Execute { execution: other },
+            ) => {
                 execution.record.id == other.record.id
                     && execution.record.plan_id == other.record.plan_id
                     && execution.record.revision == other.record.revision
                     && execution.record.generation == other.record.generation
                     && execution.record.phase == other.record.phase
                     && execution.record.state == other.record.state
-                    && execution.record.review_paused == other.record.review_paused
+                    && execution.record.resume_after_review == other.record.resume_after_review
             }
             _ => false,
         }
@@ -399,14 +643,13 @@ mod tests {
 
     #[test]
     fn task_replacement_rejects_stale_control_results() {
-        let mut task = ActiveTask::goal("First".into(), ContinuationBudget::default(), false, 1);
+        let mut task = Task::goal("First".into(), ContinuationBudget::default(), false, 1);
         let permit = task.permit();
         permit.validate(Some(&task)).unwrap();
         task.renew(2);
         assert!(permit.validate(Some(&task)).is_err());
         assert!(permit.validate(None).is_err());
-        let replacement =
-            ActiveTask::goal("Second".into(), ContinuationBudget::default(), false, 3);
+        let replacement = Task::goal("Second".into(), ContinuationBudget::default(), false, 3);
         assert!(permit.validate(Some(&replacement)).is_err());
     }
 }

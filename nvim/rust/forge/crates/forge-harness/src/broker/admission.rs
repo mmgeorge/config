@@ -133,18 +133,19 @@ impl HarnessBroker {
             .transpose()?
             .and_then(|record| record.input_message_id);
         let dispatched_task = self.task_controller.current()?.filter(|task| {
-            task.entry_accepted()
-                || task
-                    .entry
-                    .as_ref()
-                    .is_some_and(|entry| Some(entry.id.as_str()) == input_id.as_deref())
+            (task.kind() != crate::task::TaskKind::Execute || mode == PromptMode::ExecutePlan)
+                && (task.entry_accepted()
+                    || task
+                        .entry
+                        .as_ref()
+                        .is_some_and(|entry| Some(entry.id.as_str()) == input_id.as_deref()))
         });
         let dispatched_task_permit = dispatched_task.as_ref().map(|task| task.permit());
         let dispatched_execution_id =
             dispatched_task
                 .as_ref()
                 .and_then(|task| match &task.workflow {
-                    crate::task::TaskWorkflow::Execute { execution } => {
+                    crate::task::WorkflowSnapshot::Execute { execution } => {
                         Some(execution.record.id.clone())
                     }
                     _ => None,
@@ -179,6 +180,7 @@ impl HarnessBroker {
         output.dispatched_entry_id = dispatched_entry_id;
         if output.dispatched_task_permit.is_none()
             && let Some(task) = self.task_controller.current()?
+            && (task.kind() != crate::task::TaskKind::Execute || mode == PromptMode::ExecutePlan)
             && task.entry_accepted()
             && let Some(entry) = &task.entry
             && self

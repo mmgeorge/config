@@ -8,17 +8,29 @@ use crate::{
     storage::{SqliteStore, admission::SessionAdmission},
 };
 
-use super::{ActiveTask, TaskKind, TaskPermit, TaskRevision, TaskStatus, TaskWorkflow};
+use super::{Task, TaskKind, TaskPermit, TaskRevision, TaskStatus, WorkflowSnapshot};
 
 pub(crate) enum TaskChange {
-    Install(Box<ActiveTask>),
-    Update(Box<ActiveTask>),
+    Install(Box<Task>),
+    Update(Box<Task>),
     SetPlanAcceptance(bool),
     Preserve,
     Pause,
     Resume,
     ResumeWithEntry(String),
+    ResumeWithChecks(super::TaskTurnId),
     Clear,
+}
+
+impl TaskChange {
+    /// Keep review revisions within their durable owner; install only a new workflow or identity.
+    pub(crate) fn prepared(current: Option<&Task>, next: Task) -> Self {
+        if current.is_some_and(|current| current.id == next.id && current.kind() == next.kind()) {
+            Self::Update(Box::new(next))
+        } else {
+            Self::Install(Box::new(next))
+        }
+    }
 }
 
 /// Coordinates task mutations against the session's committed admission projection.
@@ -28,19 +40,172 @@ pub(crate) struct SessionTaskController {
 }
 
 impl SessionTaskController {
+    /// Commit a typed observation under the task revision that admitted its operation.
+    pub(crate) fn apply(
+        &self,
+        store: &mut SqliteStore,
+        permit: &TaskPermit,
+        event: super::TaskEvent,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.apply_with_effects(store, permit, event, Default::default(), now_ms)
+    }
+
+    /// Commit a typed observation and dependent artifacts in one transaction.
+    pub(crate) fn apply_with_effects(
+        &self,
+        store: &mut SqliteStore,
+        permit: &TaskPermit,
+        event: super::TaskEvent,
+        effects: crate::storage::TaskEffects,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.update_with_effects(store, permit, now_ms, |task| {
+            Self::apply_event(task, event, now_ms)?;
+            Ok(((), effects))
+        })
+    }
+
+    /// Interpret an event inside the controller-owned candidate update.
+    fn apply_event(
+        task: &mut super::TaskSnapshot,
+        event: super::TaskEvent,
+        now_ms: i64,
+    ) -> Result<()> {
+        match event {
+            super::TaskEvent::PlanArtifactUpdated(artifact) => {
+                let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
+                    anyhow::bail!("plan update requires the current planning task");
+                };
+                ensure!(plan.artifact.id == artifact.id, "planning task changed");
+                ensure!(
+                    artifact.document_version >= plan.artifact.document_version
+                        && artifact.model_revision >= plan.artifact.model_revision,
+                    "planning observation cannot roll back the canonical artifact"
+                );
+                plan.artifact = artifact;
+            }
+            super::TaskEvent::PlanGenerationFailed => {
+                let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
+                    anyhow::bail!("planning failure requires a planning task");
+                };
+                if matches!(
+                    plan.artifact.state,
+                    crate::plan::PlanState::Generating
+                        | crate::plan::PlanState::Revising
+                        | crate::plan::PlanState::AwaitingInput
+                ) {
+                    crate::plan::state_machine::PlanStateMachine::apply(
+                        &mut plan.artifact,
+                        crate::plan::state_machine::PlanEvent::TransitionFailed,
+                        now_ms,
+                    )?;
+                }
+            }
+            super::TaskEvent::ExecutionUpdated(record) => {
+                let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
+                    anyhow::bail!("execution update requires an execution task");
+                };
+                ensure!(
+                    execution.record.state == PlanExecutionState::Active
+                        || execution.record.state == record.state,
+                    "execution observations cannot resume suspended work"
+                );
+                validate_execution_update(&execution.record, &record)?;
+                execution.record = record;
+            }
+            super::TaskEvent::ExecutionBaselineCaptured(checkpoint) => {
+                let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
+                    anyhow::bail!("baseline capture requires an execution task");
+                };
+                ensure!(
+                    execution
+                        .record
+                        .baseline_checkpoint
+                        .as_ref()
+                        .is_none_or(|baseline| baseline == &checkpoint),
+                    "execution baseline cannot change after admission"
+                );
+                execution.record.baseline_checkpoint = Some(checkpoint);
+            }
+            super::TaskEvent::GoalWorkspaceObserved(checkpoint) => {
+                let WorkflowSnapshot::Goal { goal } = &mut task.workflow else {
+                    anyhow::bail!("goal workspace observation requires Goal");
+                };
+                goal.observed_checkpoint = Some(checkpoint);
+            }
+            super::TaskEvent::CheckPreparationFailed(diagnostic) => {
+                let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
+                    anyhow::bail!("check preparation requires an execution task");
+                };
+                ensure!(
+                    execution.record.phase == crate::plan::PlanPhase::Checking
+                        && execution.record.state == PlanExecutionState::Active,
+                    "check preparation requires active Check"
+                );
+                ensure!(
+                    !diagnostic.trim().is_empty(),
+                    "check preparation requires diagnostics"
+                );
+                execution.record.phase = crate::plan::PlanPhase::Resolve;
+                execution.record.findings = vec![diagnostic];
+                execution.record.generation += 1;
+            }
+            super::TaskEvent::VerificationInputsChanged(source) => {
+                let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
+                    anyhow::bail!("verification invalidation requires execution");
+                };
+                ensure!(
+                    execution.record.phase == crate::plan::PlanPhase::Verify
+                        && execution.record.state == PlanExecutionState::Active,
+                    "verification invalidation requires active Verify"
+                );
+                execution.record.phase = crate::plan::PlanPhase::Checking;
+                execution.record.generation += 1;
+                execution.record.findings = vec!["Automated evidence no longer covers the current inputs. Run Check before manual verification.".into()];
+                if task
+                    .entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.delivery == super::TaskInputDelivery::Pending)
+                {
+                    task.entry = None;
+                }
+                task.renew(now_ms);
+                task.turn = Some(super::TaskTurn {
+                    id: source,
+                    continuation: Some(super::TaskContinuation {
+                        id: super::TaskInputId::fresh(),
+                        reason: "Recheck changed verification inputs".into(),
+                        delivery: super::TaskInputDelivery::Pending,
+                        work: super::TaskWork::Checks,
+                    }),
+                });
+            }
+            super::TaskEvent::EntryPreparationFinished => {
+                task.entry
+                    .as_mut()
+                    .context("execution entry disappeared")?
+                    .execution = None;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_plan_answer(
-        task: &mut ActiveTask,
+        task: &mut Task,
         answered: crate::plan::PlanRecord,
     ) -> Result<()> {
-        let TaskWorkflow::Plan { plan } = &mut task.workflow else {
-            anyhow::bail!("answer no longer belongs to the active planning task");
-        };
-        ensure!(
-            plan.artifact.id == answered.id,
-            "answer belongs to a replaced planning task"
-        );
-        plan.artifact = answered;
-        Ok(())
+        task.edit(|task| {
+            let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
+                anyhow::bail!("answer no longer belongs to the active planning task");
+            };
+            ensure!(
+                plan.artifact.id == answered.id,
+                "answer belongs to a replaced planning task"
+            );
+            plan.artifact = answered;
+            Ok(())
+        })
     }
     pub(crate) fn new(admission: Arc<SessionAdmission>) -> Result<Self> {
         let session_id = admission.snapshot()?.session.id.clone();
@@ -50,17 +215,17 @@ impl SessionTaskController {
         })
     }
 
-    pub(crate) fn current(&self) -> Result<Option<ActiveTask>> {
+    pub(crate) fn current(&self) -> Result<Option<Task>> {
         Ok(self.admission.runtime()?.active_task.clone())
     }
 
     /// Applies a task-specific mutation atomically against its admitted contract.
-    pub(crate) fn update<Output>(
+    fn mutate<Output>(
         &self,
         store: &mut SqliteStore,
         permit: &TaskPermit,
         now_ms: i64,
-        change: impl FnOnce(&mut ActiveTask) -> Result<Output>,
+        change: impl FnOnce(&mut super::active::TaskSnapshot) -> Result<Output>,
     ) -> Result<Output> {
         store.commit_task_change(
             &self.session_id,
@@ -69,16 +234,29 @@ impl SessionTaskController {
             |active| {
                 let task = active.as_mut().context("session has no active task")?;
                 permit.validate(Some(task))?;
-                let previous = task.clone();
-                let output = change(task)?;
-                if !task.same_contract(&previous) && task.revision == previous.revision {
-                    task.renew(now_ms);
-                } else {
-                    task.updated_at_ms = now_ms;
-                }
-                Ok(output)
+                task.edit(|draft| {
+                    let previous = draft.clone();
+                    let output = change(draft)?;
+                    if !draft.same_contract(&previous) && draft.revision == previous.revision {
+                        draft.renew(now_ms);
+                    } else {
+                        draft.updated_at_ms = now_ms;
+                    }
+                    Ok(output)
+                })
             },
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update<Output>(
+        &self,
+        store: &mut SqliteStore,
+        permit: &TaskPermit,
+        now_ms: i64,
+        change: impl FnOnce(&mut super::TaskSnapshot) -> Result<Output>,
+    ) -> Result<Output> {
+        self.mutate(store, permit, now_ms, change)
     }
 
     /// Reserves one exact continuation after a finalized turn without replaying a prior reservation.
@@ -95,7 +273,7 @@ impl SessionTaskController {
             !instruction.trim().is_empty(),
             "continuation instruction is required"
         );
-        self.update(store, permit, now_ms, |task| {
+        self.mutate(store, permit, now_ms, |task| {
             ensure!(
                 task.entry_accepted(),
                 "task entry has not been acknowledged"
@@ -108,7 +286,7 @@ impl SessionTaskController {
                 turn.id > completed_turn
                     || turn.id == completed_turn
                         && turn.continuation.as_ref().is_some_and(|input| {
-                            !(input.work == super::TaskContinuationWork::Checks
+                            !(input.work.is_checks()
                                 && input.delivery == super::TaskInputDelivery::Accepted)
                         })
             }) {
@@ -118,10 +296,9 @@ impl SessionTaskController {
                 id: completed_turn,
                 continuation: Some(super::TaskContinuation {
                     id: super::TaskInputId::fresh(),
-                    instruction,
                     reason,
                     delivery: super::TaskInputDelivery::Pending,
-                    work: super::TaskContinuationWork::Provider,
+                    work: super::TaskWork::Provider { instruction },
                 }),
             });
             Ok(true)
@@ -136,13 +313,13 @@ impl SessionTaskController {
         completed_turn: super::TaskTurnId,
         now_ms: i64,
     ) -> Result<bool> {
-        self.update(store, permit, now_ms, |task| {
+        self.mutate(store, permit, now_ms, |task| {
             ensure!(
                 task.entry_accepted(),
                 "task entry has not been acknowledged"
             );
             ensure!(
-                matches!(&task.workflow, TaskWorkflow::Execute { execution }
+                matches!(&task.workflow, WorkflowSnapshot::Execute { execution }
                 if execution.record.state == PlanExecutionState::Active
                     && execution.record.phase == crate::plan::PlanPhase::Checking),
                 "checks require active execution in Checking"
@@ -156,10 +333,9 @@ impl SessionTaskController {
                 id: completed_turn,
                 continuation: Some(super::TaskContinuation {
                     id: super::TaskInputId::fresh(),
-                    instruction: String::new(),
                     reason: "Run the accepted plan's verification checks".into(),
                     delivery: super::TaskInputDelivery::Pending,
-                    work: super::TaskContinuationWork::Checks,
+                    work: super::TaskWork::Checks,
                 }),
             });
             Ok(true)
@@ -167,12 +343,14 @@ impl SessionTaskController {
     }
 
     /// Commits dependent artifacts and task mutation under one revision fence.
-    pub(crate) fn update_with_effects<Output>(
+    pub(super) fn update_with_effects<Output>(
         &self,
         store: &mut SqliteStore,
         permit: &TaskPermit,
         now_ms: i64,
-        change: impl FnOnce(&mut ActiveTask) -> Result<(Output, crate::storage::TaskEffects)>,
+        change: impl FnOnce(
+            &mut super::active::TaskSnapshot,
+        ) -> Result<(Output, crate::storage::TaskEffects)>,
     ) -> Result<Output> {
         store
             .commit_task_effects(
@@ -183,14 +361,16 @@ impl SessionTaskController {
                 |active| {
                     let task = active.as_mut().context("session has no active task")?;
                     permit.validate(Some(task))?;
-                    let previous = task.clone();
-                    let result = change(task)?;
-                    if !task.same_contract(&previous) && task.revision == previous.revision {
-                        task.renew(now_ms);
-                    } else {
-                        task.updated_at_ms = now_ms;
-                    }
-                    Ok(result)
+                    task.edit(|draft| {
+                        let previous = draft.clone();
+                        let result = change(draft)?;
+                        if !draft.same_contract(&previous) && draft.revision == previous.revision {
+                            draft.renew(now_ms);
+                        } else {
+                            draft.updated_at_ms = now_ms;
+                        }
+                        Ok(result)
+                    })
                 },
             )?
             .context("task update unexpectedly reused a command")
@@ -214,7 +394,14 @@ impl SessionTaskController {
                 |active| {
                     let task = active.as_ref().context("session has no active task")?;
                     permit.validate(Some(task))?;
+                    ensure!(
+                        !matches!(state, super::TaskOutcomeState::Complete)
+                            || task.kind() == TaskKind::Goal
+                            || task.status() == TaskStatus::Completed,
+                        "workflow completion requires its terminal gate state"
+                    );
                     let outcome = super::TaskOutcome {
+                        id: task.id.clone(),
                         kind: task.kind(),
                         title: task.title().into(),
                         state,
@@ -253,6 +440,7 @@ impl SessionTaskController {
         );
         ensure!(
             task.status() == TaskStatus::Running
+                && task.next_action() == super::TaskNextAction::Model
                 && matches!(task.kind(), TaskKind::Goal | TaskKind::Execute),
             "goal control requires an active goal. Resume paused or blocked goals explicitly before reporting completion or blockage"
         );
@@ -273,15 +461,17 @@ impl SessionTaskController {
     ) -> Result<bool> {
         let result = store.commit_task_change(&self.session_id, Some(revision), now_ms, |active| {
             let task = active.as_mut().context("session has no active task")?;
-            let Some(entry) = task.entry.as_mut().filter(|entry| &entry.id == id) else {
-                return Ok(false);
-            };
-            if entry.delivery == crate::task::TaskInputDelivery::Accepted {
-                return Ok(true);
-            }
-            entry.delivery = crate::task::TaskInputDelivery::Accepted;
-            task.updated_at_ms = now_ms;
-            Ok(true)
+            task.edit(|task| {
+                let Some(entry) = task.entry.as_mut().filter(|entry| &entry.id == id) else {
+                    return Ok(false);
+                };
+                if entry.delivery == crate::task::TaskInputDelivery::Accepted {
+                    return Ok(true);
+                }
+                entry.delivery = crate::task::TaskInputDelivery::Accepted;
+                task.updated_at_ms = now_ms;
+                Ok(true)
+            })
         });
         match result {
             Err(error) if error.is::<super::StaleTask>() => Ok(false),
@@ -297,117 +487,121 @@ impl SessionTaskController {
         completed_turn: crate::task::TaskTurnId,
         mut evidence: crate::goal::TurnEvidence,
         now_ms: i64,
-    ) -> Result<(super::GoalTask, crate::goal::ContinuationDecision)> {
+    ) -> Result<(super::GoalSnapshot, crate::goal::ContinuationDecision)> {
         store
-            .commit_task_effects(
-                &self.session_id,
-                Some(permit.revision()),
-                now_ms,
-                None,
-                |active| {
-                    let task = active.as_mut().context("session has no active task")?;
-                    permit.validate(Some(task))?;
-                    ensure!(
-                        task.entry_accepted(),
-                        "task entry has not been acknowledged by the provider"
-                    );
-                    if task
-                        .turn
-                        .as_ref()
-                        .is_some_and(|turn| turn.id >= completed_turn)
-                    {
-                        return Ok((
-                            (goal_view(task)?, crate::goal::ContinuationDecision::Stop),
-                            crate::storage::TaskEffects::default(),
-                        ));
-                    }
-                    let previous = task.clone();
-                    let decision = match &mut task.workflow {
-                        TaskWorkflow::Goal { goal } => crate::goal::observe(
-                            &mut goal.state,
-                            &mut goal.continuation,
-                            goal.native,
+            .commit_task_observation(&self.session_id, permit, now_ms, |active| {
+                permit.validate_observation(active.as_ref())?;
+                let mut candidate = active
+                    .as_ref()
+                    .context("session has no active task")?
+                    .draft();
+                let task = &mut candidate;
+                ensure!(
+                    task.entry_accepted(),
+                    "task entry has not been acknowledged by the provider"
+                );
+                if task
+                    .observed_turn
+                    .as_ref()
+                    .is_some_and(|observed| observed >= &completed_turn)
+                {
+                    return Ok((
+                        (goal_view(task)?, crate::goal::ContinuationDecision::Stop),
+                        crate::storage::TaskEffects::default(),
+                    ));
+                }
+                let previous = task.clone();
+                let decision = match &mut task.workflow {
+                    WorkflowSnapshot::Goal { goal } => crate::goal::observe(
+                        &mut goal.state,
+                        &mut goal.continuation,
+                        goal.native,
+                        evidence,
+                    ),
+                    WorkflowSnapshot::Execute { execution } => {
+                        evidence.structured_complete = false;
+                        let mut state = match execution.record.state {
+                            PlanExecutionState::Active => GoalState::Active,
+                            PlanExecutionState::Paused => GoalState::Paused,
+                            PlanExecutionState::Blocked => GoalState::Blocked,
+                            PlanExecutionState::Stalled => GoalState::Stalled,
+                            PlanExecutionState::Complete => GoalState::Complete,
+                            PlanExecutionState::Cancelled => GoalState::Cleared,
+                        };
+                        let decision = crate::goal::observe(
+                            &mut state,
+                            &mut execution.continuation,
+                            false,
                             evidence,
-                        ),
-                        TaskWorkflow::Execute { execution } => {
-                            evidence.structured_complete = false;
-                            let mut state = match execution.record.state {
-                                PlanExecutionState::Active => GoalState::Active,
-                                PlanExecutionState::Paused => GoalState::Paused,
-                                PlanExecutionState::Blocked => GoalState::Blocked,
-                                PlanExecutionState::Stalled => GoalState::Stalled,
-                                PlanExecutionState::Complete => GoalState::Complete,
-                                PlanExecutionState::Cancelled => GoalState::Cleared,
-                            };
-                            let decision = crate::goal::observe(
-                                &mut state,
-                                &mut execution.continuation,
-                                false,
-                                evidence,
-                            );
-                            execution.record.state = match state {
-                                GoalState::Active => PlanExecutionState::Active,
-                                GoalState::Paused => PlanExecutionState::Paused,
-                                GoalState::Complete => PlanExecutionState::Complete,
-                                GoalState::Cleared => PlanExecutionState::Cancelled,
-                                GoalState::Stalled => PlanExecutionState::Stalled,
-                                _ => PlanExecutionState::Blocked,
-                            };
-                            decision
-                        }
-                        TaskWorkflow::Plan { .. } => {
-                            anyhow::bail!("goal evidence requires Goal or Execute")
-                        }
-                    };
-                    let goal = goal_view(task)?;
-                    if task.same_contract(&previous) {
-                        task.updated_at_ms = now_ms;
-                    } else {
-                        task.renew(now_ms);
+                        );
+                        execution.record.state = match state {
+                            GoalState::Active => PlanExecutionState::Active,
+                            GoalState::Paused => PlanExecutionState::Paused,
+                            GoalState::Complete => PlanExecutionState::Complete,
+                            GoalState::Cleared => PlanExecutionState::Cancelled,
+                            GoalState::Stalled => PlanExecutionState::Stalled,
+                            _ => PlanExecutionState::Blocked,
+                        };
+                        decision
                     }
-                    let continuation = match (&task.workflow, decision) {
-                        (
-                            TaskWorkflow::Goal { goal },
-                            crate::goal::ContinuationDecision::Continue
-                            | crate::goal::ContinuationDecision::RetryNoProgress,
-                        ) => Some(super::TaskContinuation {
-                            id: super::TaskInputId::fresh(),
+                    WorkflowSnapshot::Plan { .. } => {
+                        anyhow::bail!("goal evidence requires Goal or Execute")
+                    }
+                };
+                let goal = goal_view(task)?;
+                if task.same_contract(&previous) {
+                    task.updated_at_ms = now_ms;
+                } else {
+                    task.renew(now_ms);
+                }
+                let continuation = match (&task.workflow, decision) {
+                    (
+                        WorkflowSnapshot::Goal { goal },
+                        crate::goal::ContinuationDecision::Continue
+                        | crate::goal::ContinuationDecision::RetryNoProgress,
+                    ) => Some(super::TaskContinuation {
+                        id: super::TaskInputId::fresh(),
+                        work: super::TaskWork::Provider {
                             instruction: if goal.native {
                                 "/goal resume".into()
                             } else {
                                 format!("Continue working toward this goal: {}", goal.objective)
                             },
-                            reason: "The active task requires another turn".into(),
-                            delivery: crate::task::TaskInputDelivery::Pending,
-                            work: super::TaskContinuationWork::Provider,
-                        }),
-                        _ => None,
+                        },
+                        reason: "The active task requires another turn".into(),
+                        delivery: crate::task::TaskInputDelivery::Pending,
+                    }),
+                    _ => None,
+                };
+                task.observed_turn = Some(completed_turn.clone());
+                task.turn = Some(super::TaskTurn {
+                    id: completed_turn,
+                    continuation,
+                });
+                let mut effects = crate::storage::TaskEffects::default();
+                if task.status().terminal() {
+                    let outcome = super::TaskOutcome {
+                        id: task.id.clone(),
+                        kind: task.kind(),
+                        title: task.title().into(),
+                        state: if task.status() == TaskStatus::Completed {
+                            super::TaskOutcomeState::Complete
+                        } else {
+                            super::TaskOutcomeState::Cancelled
+                        },
+                        summary: match task.status() {
+                            TaskStatus::Completed => "Task completed".into(),
+                            _ => "Task cleared".into(),
+                        },
                     };
-                    task.turn = Some(super::TaskTurn {
-                        id: completed_turn,
-                        continuation,
-                    });
-                    let mut effects = crate::storage::TaskEffects::default();
-                    if task.status().terminal() {
-                        let outcome = super::TaskOutcome {
-                            kind: task.kind(),
-                            title: task.title().into(),
-                            state: if task.status() == TaskStatus::Completed {
-                                super::TaskOutcomeState::Complete
-                            } else {
-                                super::TaskOutcomeState::Cancelled
-                            },
-                            summary: match task.status() {
-                                TaskStatus::Completed => "Task completed".into(),
-                                _ => "Task cleared".into(),
-                            },
-                        };
-                        effects = outcome_effect(&self.session_id, task, outcome, now_ms);
-                        *active = None;
-                    }
-                    Ok(((goal, decision), effects))
-                },
-            )?
+                    effects = outcome_effect(&self.session_id, task, outcome, now_ms);
+                    *active = None;
+                }
+                if active.is_some() {
+                    *active = Some(Task::try_from(candidate)?);
+                }
+                Ok(((goal, decision), effects))
+            })?
             .context("turn observation unexpectedly reused a command")
     }
 
@@ -427,18 +621,16 @@ impl SessionTaskController {
             |active| {
                 let task = active.as_mut().context("session has no active task")?;
                 permit.validate(Some(task))?;
+                task.edit(|task| {
                 ensure!(
                     task.entry_accepted(),
                     "plan entry has not been acknowledged"
                 );
-                if task
-                    .turn
-                    .as_ref()
-                    .is_some_and(|turn| turn.id >= completed_turn)
+                if task.observed_turn.as_ref().is_some_and(|observed| observed >= &completed_turn)
                 {
                     return Ok(None);
                 }
-                let TaskWorkflow::Plan { plan } = &mut task.workflow else {
+                let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
                     anyhow::bail!("planning progress requires an active plan");
                 };
                 ensure!(!plan.paused, "planning task is paused");
@@ -451,32 +643,40 @@ impl SessionTaskController {
                 }
                 let budget_allows = plan.artifact.generation.observe(canonical_progress);
                 let generating = matches!(plan.artifact.state,
-                    crate::plan::PlanState::Generating | crate::plan::PlanState::Revising);
+                    crate::plan::PlanState::ConfiguringChecks | crate::plan::PlanState::Generating | crate::plan::PlanState::Revising);
                 if generating && !budget_allows {
-                    crate::plan::state_machine::PlanStateMachine::apply(
+                    if plan.artifact.state == crate::plan::PlanState::ConfiguringChecks {
+                        plan.paused = true;
+                    } else { crate::plan::state_machine::PlanStateMachine::apply(
                         &mut plan.artifact,
                         crate::plan::state_machine::PlanEvent::TransitionFailed,
                         now_ms,
-                    )?;
+                    )?; }
                 }
                 let continuing = generating && budget_allows;
                 let artifact = plan.artifact.clone();
+                let reserved = task.turn.as_ref().filter(|turn| turn.id == completed_turn)
+                    .and_then(|turn| turn.continuation.clone())
+                    .filter(|input| input.delivery == super::TaskInputDelivery::Pending);
+                task.observed_turn = Some(completed_turn.clone());
                 task.turn = Some(super::TaskTurn {
                     id: completed_turn,
-                    continuation: continuing.then(|| super::TaskContinuation {
+                    continuation: if continuing { reserved.or_else(|| Some(super::TaskContinuation {
                         id: super::TaskInputId::fresh(),
-                        instruction: format!(
+                        work: super::TaskWork::Provider { instruction: if artifact.state == crate::plan::PlanState::ConfiguringChecks {
+                            crate::plan::PlanPrompt::checks_setup(&artifact.request)
+                        } else { format!(
                             "Continue the active planning task. The previous turn ended without submitting the plan or asking a question. Edit the proposed declaration files if needed, then call plan_submit. Prose alone does not submit a plan. Use question_ask only for a new open decision, and only when the user's question preferences allow it. Do not repeat answered questions. If a tool keeps failing, report the failure instead of repeating the same rejected request.\n\nPlanning continuation: turn {} of {}.",
                             artifact.generation.budget.turn_count + 1,
                             artifact.generation.budget.max_turn_count,
-                        ),
+                        ) } },
                         reason: "The planning turn ended without submitting a plan".into(),
                         delivery: super::TaskInputDelivery::Pending,
-                        work: super::TaskContinuationWork::Provider,
-                    }),
+                    })) } else { None },
                 });
                 if generating && !budget_allows { task.renew(now_ms); } else { task.updated_at_ms = now_ms; }
                 Ok(Some((artifact, continuing)))
+                })
             },
         )
     }
@@ -491,20 +691,22 @@ impl SessionTaskController {
     ) -> Result<bool> {
         let result = store.commit_task_change(&self.session_id, Some(revision), now_ms, |active| {
             let task = active.as_mut().context("session has no active task")?;
-            let Some(input) = task
-                .turn
-                .as_mut()
-                .and_then(|turn| turn.continuation.as_mut())
-                .filter(|input| &input.id == id)
-            else {
-                return Ok(false);
-            };
-            if input.delivery == crate::task::TaskInputDelivery::Accepted {
-                return Ok(true);
-            }
-            input.delivery = crate::task::TaskInputDelivery::Accepted;
-            task.updated_at_ms = now_ms;
-            Ok(true)
+            task.edit(|task| {
+                let Some(input) = task
+                    .turn
+                    .as_mut()
+                    .and_then(|turn| turn.continuation.as_mut())
+                    .filter(|input| &input.id == id)
+                else {
+                    return Ok(false);
+                };
+                if input.delivery == crate::task::TaskInputDelivery::Accepted {
+                    return Ok(true);
+                }
+                input.delivery = crate::task::TaskInputDelivery::Accepted;
+                task.updated_at_ms = now_ms;
+                Ok(true)
+            })
         });
         match result {
             Err(error) if error.is::<super::StaleTask>() => Ok(false),
@@ -530,12 +732,17 @@ impl SessionTaskController {
             Some(&current.revision),
             now_ms,
             |active| {
-                if let Some(input) = active
-                    .as_mut()
-                    .and_then(|task| task.turn.as_mut())
-                    .and_then(|turn| turn.continuation.as_mut())
-                {
-                    input.delivery = crate::task::TaskInputDelivery::Cancelled;
+                if let Some(task) = active.as_mut() {
+                    task.edit(|task| {
+                        if let Some(input) = task
+                            .turn
+                            .as_mut()
+                            .and_then(|turn| turn.continuation.as_mut())
+                        {
+                            input.delivery = crate::task::TaskInputDelivery::Cancelled;
+                        }
+                        Ok(())
+                    })?;
                 }
                 Ok(())
             },
@@ -564,7 +771,7 @@ impl SessionTaskController {
             .change(
                 &mut store,
                 None,
-                TaskChange::Install(Box::new(ActiveTask::goal(
+                TaskChange::Install(Box::new(Task::goal(
                     "Finish".into(),
                     Default::default(),
                     false,
@@ -582,7 +789,7 @@ impl SessionTaskController {
         expected: Option<&TaskRevision>,
         change: TaskChange,
         now_ms: i64,
-    ) -> Result<Option<ActiveTask>> {
+    ) -> Result<Option<Task>> {
         let retire_questions = matches!(
             &change,
             TaskChange::Install(_) | TaskChange::Clear | TaskChange::ResumeWithEntry(_)
@@ -607,7 +814,7 @@ impl SessionTaskController {
         expected: Option<&TaskRevision>,
         change: TaskChange,
         now_ms: i64,
-    ) -> Result<Option<ActiveTask>> {
+    ) -> Result<Option<Task>> {
         self.command_with_effects(store, receipt, expected, change, Default::default(), now_ms)
     }
 
@@ -619,7 +826,7 @@ impl SessionTaskController {
         change: TaskChange,
         mut effects: crate::storage::TaskEffects,
         now_ms: i64,
-    ) -> Result<Option<ActiveTask>> {
+    ) -> Result<Option<Task>> {
         ensure!(
             receipt.session_id == self.session_id,
             "task command belongs to another session"
@@ -650,16 +857,42 @@ impl SessionTaskController {
 
     /// Resume execution work without changing admission identity or timestamps.
     /// Callers still validate the enclosing task's resume eligibility before committing it.
-    pub(crate) fn resume_execution(execution: &mut super::ExecutionTask) {
+    pub(crate) fn resume_execution(execution: &mut super::ExecutionSnapshot) {
         execution.record.state = PlanExecutionState::Active;
+        if execution.record.pending_revision_reason.is_some() {
+            execution.record.resume_after_review = true;
+        }
         execution.continuation.reset();
     }
 
     fn apply_change(
-        active: &mut Option<ActiveTask>,
+        active: &mut Option<Task>,
         change: TaskChange,
         now_ms: i64,
-    ) -> Result<Option<ActiveTask>> {
+    ) -> Result<Option<Task>> {
+        let invalidate_observation = matches!(
+            &change,
+            TaskChange::Pause
+                | TaskChange::Resume
+                | TaskChange::ResumeWithEntry(_)
+                | TaskChange::ResumeWithChecks(_)
+                | TaskChange::Update(_)
+                | TaskChange::Install(_)
+        );
+        let mut draft = active.as_ref().map(Task::draft);
+        Self::apply_draft_change(&mut draft, change, now_ms)?;
+        if invalidate_observation && let Some(task) = &mut draft {
+            task.observation_revision = TaskRevision::fresh();
+        }
+        *active = draft.map(Task::try_from).transpose()?;
+        Ok(active.clone())
+    }
+
+    fn apply_draft_change(
+        active: &mut Option<super::active::TaskSnapshot>,
+        change: TaskChange,
+        now_ms: i64,
+    ) -> Result<Option<super::active::TaskSnapshot>> {
         match change {
             TaskChange::Preserve => {}
             TaskChange::SetPlanAcceptance(enabled) => {
@@ -669,19 +902,35 @@ impl SessionTaskController {
                 ensure!(
                     matches!(
                         task.workflow,
-                        TaskWorkflow::Plan { .. } | TaskWorkflow::Execute { .. }
+                        WorkflowSnapshot::Plan { .. } | WorkflowSnapshot::Execute { .. }
                     ),
                     "plan acceptance requires a Plan or Execute task"
                 );
                 task.auto_accept_plan = enabled;
                 task.updated_at_ms = now_ms;
             }
-            TaskChange::Update(mut next) => {
+            TaskChange::Update(next) => {
+                let mut next = Box::new(next.draft());
                 let current = active.as_ref().context("session has no active task")?;
+                ensure!(
+                    current.id == next.id,
+                    "task updates cannot replace task identity"
+                );
                 ensure!(
                     current.kind() == next.kind(),
                     "task updates cannot change task kind"
                 );
+                if let (
+                    WorkflowSnapshot::Execute {
+                        execution: previous,
+                    },
+                    WorkflowSnapshot::Execute {
+                        execution: proposed,
+                    },
+                ) = (&current.workflow, &next.workflow)
+                {
+                    validate_execution_update(&previous.record, &proposed.record)?;
+                }
                 if !current.same_contract(&next) {
                     let turn = next.turn.take();
                     next.renew(now_ms);
@@ -692,14 +941,48 @@ impl SessionTaskController {
                 *active = Some(*next);
             }
             TaskChange::ResumeWithEntry(instruction) => {
-                Self::apply_change(active, TaskChange::Resume, now_ms)?;
+                Self::apply_draft_change(active, TaskChange::Resume, now_ms)?;
                 active
                     .as_mut()
                     .context("session has no active task")?
                     .request_entry(instruction, now_ms)?;
             }
-            TaskChange::Install(mut next) => {
+            TaskChange::ResumeWithChecks(completed_turn) => {
+                Self::apply_draft_change(active, TaskChange::Resume, now_ms)?;
+                let task = active.as_mut().context("session has no active task")?;
+                ensure!(
+                    matches!(&task.workflow, WorkflowSnapshot::Execute { execution }
+                        if execution.record.phase == crate::plan::PlanPhase::Checking),
+                    "local check resumption requires Check"
+                );
+                task.turn = Some(super::TaskTurn {
+                    id: completed_turn,
+                    continuation: Some(super::TaskContinuation {
+                        id: super::TaskInputId::fresh(),
+                        reason: "Resume required execution checks".into(),
+                        delivery: super::TaskInputDelivery::Pending,
+                        work: super::TaskWork::Checks,
+                    }),
+                });
+            }
+            TaskChange::Install(next) => {
+                let mut next = Box::new(next.draft());
                 ensure!(!next.status().terminal(), "cannot install a terminal task");
+                if let Some(previous) = active.as_ref().filter(|previous| previous.id == next.id) {
+                    let (WorkflowSnapshot::Plan { plan }, WorkflowSnapshot::Execute { execution }) =
+                        (&previous.workflow, &next.workflow)
+                    else {
+                        anyhow::bail!(
+                            "retaining task identity requires the Plan to Execute handoff"
+                        );
+                    };
+                    ensure!(
+                        plan.artifact.id == execution.record.plan_id
+                            && execution.record.original_revision >= plan.artifact.model_revision
+                            && execution.continuation == plan.artifact.generation.budget,
+                        "workflow handoff must preserve its plan contract and consumed allowance"
+                    );
+                }
                 next.renew(now_ms);
                 *active = Some(*next);
             }
@@ -711,10 +994,11 @@ impl SessionTaskController {
                 let task = active.as_mut().context("session has no active task")?;
                 ensure!(!task.status().terminal(), "cannot pause a terminal task");
                 match &mut task.workflow {
-                    TaskWorkflow::Goal { goal } => goal.state = GoalState::Paused,
-                    TaskWorkflow::Plan { plan } => plan.paused = true,
-                    TaskWorkflow::Execute { execution } => {
-                        execution.record.state = PlanExecutionState::Paused
+                    WorkflowSnapshot::Goal { goal } => goal.state = GoalState::Paused,
+                    WorkflowSnapshot::Plan { plan } => plan.paused = true,
+                    WorkflowSnapshot::Execute { execution } => {
+                        execution.record.state = PlanExecutionState::Paused;
+                        execution.record.resume_after_review = false;
                     }
                 }
                 task.renew(now_ms);
@@ -729,22 +1013,22 @@ impl SessionTaskController {
                     "task is not paused or blocked"
                 );
                 match &mut task.workflow {
-                    TaskWorkflow::Goal { goal } => {
+                    WorkflowSnapshot::Goal { goal } => {
                         goal.state = GoalState::Active;
                         goal.continuation.reset();
                     }
-                    TaskWorkflow::Plan { plan } => {
+                    WorkflowSnapshot::Plan { plan } => {
                         if plan.artifact.state == crate::plan::PlanState::Failed {
-                            plan.artifact.generation.reset();
                             crate::plan::state_machine::PlanStateMachine::apply(
                                 &mut plan.artifact,
                                 crate::plan::state_machine::PlanEvent::RetryRequested,
                                 now_ms,
                             )?;
                         }
+                        plan.artifact.generation.reset();
                         plan.paused = false;
                     }
-                    TaskWorkflow::Execute { execution } => {
+                    WorkflowSnapshot::Execute { execution } => {
                         Self::resume_execution(execution);
                     }
                 }
@@ -755,14 +1039,84 @@ impl SessionTaskController {
     }
 }
 
+/// Reject record proposals that change ownership or bypass the execution transition graph.
+pub(super) fn validate_execution_update(
+    previous: &crate::plan::PlanExecutionRecord,
+    next: &crate::plan::PlanExecutionRecord,
+) -> Result<()> {
+    use crate::plan::PlanPhase;
+    ensure!(
+        previous.id == next.id
+            && previous.session_id == next.session_id
+            && previous.plan_id == next.plan_id
+            && previous.original_revision == next.original_revision,
+        "execution update cannot replace its owning contract"
+    );
+    ensure!(
+        next.generation >= previous.generation,
+        "execution observation is stale"
+    );
+    ensure!(
+        next.revision >= previous.revision,
+        "accepted execution revision cannot move backward"
+    );
+    ensure!(
+        previous.baseline_checkpoint.is_none()
+            || previous.baseline_checkpoint == next.baseline_checkpoint,
+        "execution baseline cannot change after admission"
+    );
+    ensure!(
+        previous.manual_verification == next.manual_verification
+            || previous.revision != next.revision,
+        "manual actions can change only with an accepted contract revision"
+    );
+    if previous.phase != next.phase {
+        let allowed = match previous.phase {
+            PlanPhase::Implement => next.phase == PlanPhase::Checking,
+            PlanPhase::Checking => matches!(next.phase, PlanPhase::Resolve | PlanPhase::Verify),
+            PlanPhase::Resolve => matches!(next.phase, PlanPhase::Checking | PlanPhase::Verify),
+            PlanPhase::Verify => matches!(next.phase, PlanPhase::Resolve | PlanPhase::Checking),
+        };
+        ensure!(
+            allowed,
+            "illegal execution transition: {:?} to {:?}",
+            previous.phase,
+            next.phase
+        );
+    }
+    if next.state == PlanExecutionState::Complete {
+        ensure!(
+            matches!(
+                previous.phase,
+                PlanPhase::Checking | PlanPhase::Verify | PlanPhase::Resolve
+            ),
+            "implementation cannot complete without its verification gates"
+        );
+        super::state::validate_passing_gate(next)?;
+        ensure!(
+            next.manual_verification.is_empty()
+                || previous.phase == PlanPhase::Verify
+                    && next
+                        .verification
+                        .last()
+                        .is_some_and(|evidence| evidence.revision == next.revision
+                            && evidence.report.outcome
+                                == crate::plan::execution::VerificationOutcome::Passed),
+            "completion requires passing evidence for accepted manual actions"
+        );
+    }
+    Ok(())
+}
+
 fn clear_effect(
     session_id: &str,
-    previous: Option<&ActiveTask>,
-    active: Option<&ActiveTask>,
+    previous: Option<&Task>,
+    active: Option<&Task>,
     now_ms: i64,
 ) -> crate::storage::TaskEffects {
     if let Some(task) = previous.filter(|_| active.is_none()) {
         let outcome = super::TaskOutcome {
+            id: task.id.clone(),
             kind: task.kind(),
             title: task.title().into(),
             state: super::TaskOutcomeState::Cancelled,
@@ -776,7 +1130,7 @@ fn clear_effect(
 
 fn outcome_effect(
     session_id: &str,
-    task: &ActiveTask,
+    task: &super::active::TaskSnapshot,
     outcome: super::TaskOutcome,
     now_ms: i64,
 ) -> crate::storage::TaskEffects {
@@ -792,7 +1146,7 @@ fn outcome_effect(
         ..Default::default()
     };
     match &task.workflow {
-        TaskWorkflow::Plan { plan } => {
+        WorkflowSnapshot::Plan { plan } => {
             let mut artifact = plan.artifact.clone();
             artifact.state = match terminal {
                 super::TaskOutcomeState::Complete => crate::plan::PlanState::Accepted,
@@ -801,7 +1155,7 @@ fn outcome_effect(
             artifact.updated_at_ms = now_ms;
             effects.plan.push(artifact);
         }
-        TaskWorkflow::Execute { execution } => {
+        WorkflowSnapshot::Execute { execution } => {
             let mut record = execution.record.clone();
             record.state = match terminal {
                 super::TaskOutcomeState::Complete => PlanExecutionState::Complete,
@@ -810,15 +1164,15 @@ fn outcome_effect(
             record.completed_at_ms = Some(now_ms);
             effects.execution.push(record);
         }
-        TaskWorkflow::Goal { .. } => {}
+        WorkflowSnapshot::Goal { .. } => {}
     }
     effects
 }
 
-fn goal_view(task: &ActiveTask) -> Result<super::GoalTask> {
+fn goal_view(task: &super::active::TaskSnapshot) -> Result<super::GoalSnapshot> {
     Ok(match &task.workflow {
-        TaskWorkflow::Goal { goal } => goal.clone(),
-        TaskWorkflow::Execute { execution } => super::GoalTask {
+        WorkflowSnapshot::Goal { goal } => goal.clone(),
+        WorkflowSnapshot::Execute { execution } => super::GoalSnapshot {
             objective: execution.title.clone(),
             state: match execution.record.state {
                 PlanExecutionState::Active => GoalState::Active,
@@ -830,8 +1184,9 @@ fn goal_view(task: &ActiveTask) -> Result<super::GoalTask> {
             },
             continuation: execution.continuation.clone(),
             native: false,
+            observed_checkpoint: execution.record.observed_checkpoint.clone(),
         },
-        TaskWorkflow::Plan { .. } => anyhow::bail!("goal evidence requires Goal or Execute"),
+        WorkflowSnapshot::Plan { .. } => anyhow::bail!("goal evidence requires Goal or Execute"),
     })
 }
 
@@ -844,7 +1199,7 @@ mod tests {
     fn repeated_task_input_acknowledgements_preserve_first_acceptance() -> Result<()> {
         let (_root, mut store, controller) = SessionTaskController::test_goal();
         let previous = controller.current()?.unwrap();
-        let mut task = ActiveTask::goal(
+        let mut task = Task::goal(
             "Keep first acknowledgement".into(),
             ContinuationBudget::new(20, 2),
             false,
@@ -922,7 +1277,7 @@ mod tests {
     fn task_entry_commit_and_acknowledgement_fence_control_admission() -> Result<()> {
         let (_root, mut store, controller) = SessionTaskController::test_goal();
         let previous = controller.current()?.unwrap();
-        let mut task = ActiveTask::goal("New goal".into(), Default::default(), false, 2);
+        let mut task = Task::goal("New goal".into(), Default::default(), false, 2);
         task.request_entry("Work on the new goal".into(), 2)?;
         let command = super::super::TaskOperation {
             revision: 0,
@@ -961,7 +1316,7 @@ mod tests {
             .unwrap();
         assert_eq!(replay.revision, installed.revision);
         assert_eq!(
-            replay.entry.unwrap().delivery,
+            replay.entry.as_ref().unwrap().delivery,
             crate::task::TaskInputDelivery::Accepted
         );
         let mut conflicting = command.clone();
@@ -1013,7 +1368,7 @@ mod tests {
             .change(
                 &mut store,
                 Some(&previous.revision),
-                TaskChange::Install(Box::new(ActiveTask::plan(artifact, 2))),
+                TaskChange::Install(Box::new(Task::plan(artifact, 2)?)),
                 2,
             )?
             .unwrap();
@@ -1031,7 +1386,7 @@ mod tests {
                 .is_none()
         );
         let saved = controller.current()?.unwrap();
-        let TaskWorkflow::Plan { plan } = &saved.workflow else {
+        let WorkflowSnapshot::Plan { plan } = &saved.workflow else {
             unreachable!()
         };
         assert_eq!(plan.artifact.generation.budget.turn_count, 1);
@@ -1067,7 +1422,7 @@ mod tests {
         let first = controller.current()?.unwrap();
         let input = first.turn.as_ref().unwrap().continuation.as_ref().unwrap();
         assert_eq!(
-            input.instruction,
+            input.work.instruction().unwrap(),
             "Continue working toward this goal: Finish"
         );
         assert_eq!(input.delivery, crate::task::TaskInputDelivery::Pending);
@@ -1104,7 +1459,7 @@ mod tests {
                 .id,
             identity
         );
-        let TaskWorkflow::Goal { goal } = &saved.workflow else {
+        let WorkflowSnapshot::Goal { goal } = &saved.workflow else {
             unreachable!()
         };
         assert_eq!(goal.continuation.turn_count, 1);
@@ -1136,8 +1491,10 @@ mod tests {
                 .current()?
                 .unwrap()
                 .turn
+                .as_ref()
                 .unwrap()
                 .continuation
+                .as_ref()
                 .unwrap()
                 .delivery,
             crate::task::TaskInputDelivery::Cancelled
@@ -1148,8 +1505,10 @@ mod tests {
                 .current()?
                 .unwrap()
                 .turn
+                .as_ref()
                 .unwrap()
                 .continuation
+                .as_ref()
                 .unwrap()
                 .delivery,
             crate::task::TaskInputDelivery::Accepted
@@ -1169,7 +1528,7 @@ mod tests {
                 turn_ordinal: 1,
             },
             crate::goal::TurnEvidence {
-                tool_called: true,
+                workspace_changed: true,
                 ..Default::default()
             },
             2,
@@ -1232,7 +1591,7 @@ mod tests {
             .change(
                 &mut store,
                 Some(permit.revision()),
-                TaskChange::Install(Box::new(ActiveTask::goal(
+                TaskChange::Install(Box::new(Task::goal(
                     "Replacement".into(),
                     Default::default(),
                     false,
@@ -1280,7 +1639,7 @@ mod tests {
             .change(
                 &mut store,
                 None,
-                TaskChange::Install(Box::new(ActiveTask::goal(
+                TaskChange::Install(Box::new(Task::goal(
                     "Finish".into(),
                     ContinuationBudget::default(),
                     false,

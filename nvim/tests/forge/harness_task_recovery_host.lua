@@ -52,7 +52,7 @@ local function transition(session_id, id, action)
 end
 local function await_snapshot(session_id, predicate, message)
   local current, failure, pending
-  await(function()
+  local settled = vim.wait(15000, function()
     if failure then error(failure) end
     if current and predicate(current) then return true end
     if not pending then
@@ -62,7 +62,16 @@ local function await_snapshot(session_id, predicate, message)
       end)
     end
     return false
-  end, message)
+  end, 10)
+  local task = current and current.session.active_task
+  if not settled then
+    local input = request(session_id, "session.input.get", {})
+    for _, message in ipairs(input.messages) do message.text = nil end
+    print(vim.inspect(input))
+  end
+  assert(settled, message .. "\n" .. vim.inspect({ status = current and current.status,
+    task = task and { phase = task.phase, status = task.status, entry = task.entry.delivery,
+      suspension_reason = task.suspension_reason, turn = task.turn } }) .. "\n" .. table.concat(errors, "\n"))
   return current
 end
 local function empty_task(snapshot)
@@ -128,11 +137,18 @@ local success, failure = xpcall(function()
   end
   local recovered = await_snapshot(session_id, function(snapshot)
     local task = snapshot.session.active_task
-    return task and task ~= vim.NIL and task.kind == "plan" and task.entry.delivery == "accepted"
-      and task.plan.artifact.state == "awaiting_review"
-  end, "pending plan entry was not replayed after restart")
+    return task and task ~= vim.NIL and task.kind == "plan" and task.status == "paused"
+      and task.entry.delivery == "pending"
+  end, "restart did not suspend the pending plan entry")
   assert(recovered.session.active_task.entry.id == entry_id)
   assert(recovered.session.active_task.plan.artifact.id == plan_id)
+  assert(#request(session_id, "session.exchange.list", {}) == 2, "restart dispatched provider work before explicit resume")
+  transition(session_id, "resume-recovered-plan", { action = "resume" })
+  recovered = await_snapshot(session_id, function(snapshot)
+    local task = snapshot.session.active_task
+    return task and task ~= vim.NIL and task.entry.delivery == "accepted" and task.phase == "review"
+  end, "explicit resume did not deliver the retained plan entry")
+  assert(recovered.session.active_task.entry.id == entry_id, "resume replaced the retained provider submission identity")
   local history = request(session_id, "session.exchange.list", {})
   assert(#history == 3 and history[1].id == original.id and history[2].id == interrupted.id,
     "restart replaced prior exchanges or delivered the plan entry more than once: " .. vim.inspect(history))
@@ -157,10 +173,11 @@ local success, failure = xpcall(function()
   assert(#final == 3 and final[3].id == plan_exchange_id, "accepted entry replayed on the next restart")
   assert(request(session_id, "session.command.operation.get", { operation_id = "pending-plan" }).state == "completed")
 end, debug.traceback)
+local broker_stderr = client._client.stderr
 client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath
-assert(success and collected, failure or "host was not collected")
+assert(success and collected, (failure or "host was not collected") .. "\n" .. (broker_stderr or ""))
 print("harness_task_recovery_host: passed")
 vim.cmd("qa!")

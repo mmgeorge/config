@@ -806,7 +806,7 @@ async fn child_execution_blocks_automatic_verification_without_mutating_the_goal
         data.path(),
         vec!["Write-Output verified".into()],
         false,
-    );
+    ).await;
     let admission = admit_child_fixture(&mut broker, "verification-child")?;
     assert!(
         broker

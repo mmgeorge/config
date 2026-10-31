@@ -4,11 +4,11 @@ impl BrokerObserver {
     pub(super) fn prepare_review_change(
         &self,
         action: &crate::task::command::SessionAction,
-        current: Option<&crate::task::ActiveTask>,
+        current: Option<&crate::task::Task>,
         now_ms: i64,
     ) -> Result<super::plan_entry::PreparedTaskChange> {
         use crate::task::command::SessionAction;
-        use crate::task::{ActiveTask, TaskChange, TaskWorkflow};
+        use crate::task::{Task, TaskChange, WorkflowSnapshot};
         let review = match action {
             SessionAction::BeginAcceptance { review }
             | SessionAction::CancelAcceptance { review }
@@ -22,8 +22,10 @@ impl BrokerObserver {
             .as_deref()
             .or_else(|| {
                 current.and_then(|task| match &task.workflow {
-                    TaskWorkflow::Plan { plan } => Some(plan.artifact.id.as_str()),
-                    TaskWorkflow::Execute { execution } => Some(execution.record.plan_id.as_str()),
+                    WorkflowSnapshot::Plan { plan } => Some(plan.artifact.id.as_str()),
+                    WorkflowSnapshot::Execute { execution } => {
+                        Some(execution.record.plan_id.as_str())
+                    }
                     _ => None,
                 })
             })
@@ -52,8 +54,8 @@ impl BrokerObserver {
             .latest_exchange(&self.session_id)?
             .as_ref()
             .map(crate::plan::ExchangeAnchor::capture);
-        let mut task = current.cloned();
-        let executing=task.as_ref().is_some_and(|task| matches!(&task.workflow,TaskWorkflow::Execute { execution } if execution.record.plan_id==plan.id && execution.record.pending_revision_reason.is_some()));
+        let mut task = current.map(Task::draft);
+        let executing=task.as_ref().is_some_and(|task| matches!(&task.workflow,WorkflowSnapshot::Execute { execution } if execution.record.plan_id==plan.id && execution.record.pending_revision_reason.is_some()));
         if matches!(action, SessionAction::CancelAcceptance { .. }) {
             anyhow::ensure!(
                 plan.acceptance.is_some(),
@@ -64,7 +66,7 @@ impl BrokerObserver {
         } else if matches!(action, SessionAction::CancelPlan { .. }) {
             if executing {
                 let task = task.as_mut().unwrap();
-                let TaskWorkflow::Execute { execution } = &mut task.workflow else {
+                let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
                     unreachable!()
                 };
                 let accepted = self.plan_file.restore_revision(
@@ -108,7 +110,7 @@ impl BrokerObserver {
                     now_ms,
                 ));
                 effects.plan.push(plan.clone());
-                let clearing=current.is_some_and(|task| matches!(&task.workflow,TaskWorkflow::Plan { plan:active } if active.artifact.id==plan.id));
+                let clearing=current.is_some_and(|task| matches!(&task.workflow,WorkflowSnapshot::Plan { plan:active } if active.artifact.id==plan.id));
                 if clearing
                     && let Some(mut exchange) = store.latest_exchange(&self.session_id)?
                     && exchange.state() == ExchangeState::Running
@@ -152,11 +154,9 @@ impl BrokerObserver {
                 if matches!(action, SessionAction::BeginAcceptance { .. }) {
                     let mut checks =
                         crate::checks::ConfigSnapshot::load(Path::new(&session.workspace))?;
-                    let overrides = self.check_runner.overrides(
-                        current
-                            .and_then(|task| task.entry.as_ref())
-                            .map(|entry| entry.id.as_str()),
-                    )?;
+                    let overrides = self
+                        .check_runner
+                        .overrides(current.map(|task| task.id.as_str()))?;
                     for definition in &mut checks.config.definitions {
                         if let Some(enabled) = overrides.enabled.get(&definition.id) {
                             definition.enabled = *enabled;
@@ -200,13 +200,21 @@ impl BrokerObserver {
                     && review.annotations.is_empty()
                 {
                     let task = task.as_mut().unwrap();
-                    let TaskWorkflow::Execute { execution } = &mut task.workflow else {
+                    let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
                         unreachable!()
                     };
                     plan.accepted_revision = Some(plan.model_revision);
                     plan.accepted_digest = plan.review_digest.clone();
                     plan.state = PlanState::Accepted;
                     execution.record.revision = plan.model_revision;
+                    execution.record.manual_verification = reviewed
+                        .document
+                        .design
+                        .as_ref()
+                        .context("accepted execution design is missing")?
+                        .document
+                        .verification
+                        .clone();
                     execution.record.revision_history.push(
                         crate::plan::execution::ExecutionRevision {
                             revision: plan.model_revision,
@@ -252,10 +260,7 @@ impl BrokerObserver {
                     plan.acceptance = None;
                     if executing {
                         let task = task.as_mut().unwrap();
-                        if matches!(action, SessionAction::BeginAcceptance { .. }) {
-                            task.auto_accept_plan = true;
-                        }
-                        let TaskWorkflow::Execute { execution } = &mut task.workflow else {
+                        let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
                             unreachable!()
                         };
                         execution.record.findings.push(format!(
@@ -273,9 +278,9 @@ impl BrokerObserver {
                         )?;
                     } else {
                         PlanStateMachine::apply(&mut plan, PlanEvent::ChangesRequested, now_ms)?;
-                        plan.generation.reset();
-                        let mut revised=current.filter(|task|matches!(&task.workflow,TaskWorkflow::Plan { plan:active } if active.artifact.id==plan.id)).cloned().unwrap_or_else(||ActiveTask::plan(plan.clone(),now_ms));
-                        if let TaskWorkflow::Plan { plan: active } = &mut revised.workflow {
+                        plan.generation.reset_no_progress();
+                        let mut revised=current.filter(|task|matches!(&task.workflow,WorkflowSnapshot::Plan { plan:active } if active.artifact.id==plan.id)).map(Task::draft).unwrap_or_else(||crate::task::TaskSnapshot::plan(plan.clone(),now_ms));
+                        if let WorkflowSnapshot::Plan { plan: active } = &mut revised.workflow {
                             active.artifact = plan.clone();
                             active.paused = false;
                         }
@@ -301,19 +306,19 @@ impl BrokerObserver {
         }
         effects.plan.push(plan.clone());
         let change = if executing {
-            crate::task::TaskChange::Update(Box::new(task.unwrap()))
+            crate::task::TaskChange::Update(Box::new(Task::try_from(task.unwrap())?))
         } else if matches!(action, SessionAction::CancelAcceptance { .. }) {
-            if let Some(mut task)=task.filter(|task|matches!(&task.workflow,TaskWorkflow::Plan { plan:active } if active.artifact.id==plan.id)) {
-                if let TaskWorkflow::Plan { plan:active }=&mut task.workflow { active.artifact=plan; }
-                TaskChange::Update(Box::new(task))
+            if let Some(mut task)=task.filter(|task|matches!(&task.workflow,WorkflowSnapshot::Plan { plan:active } if active.artifact.id==plan.id)) {
+                if let WorkflowSnapshot::Plan { plan:active }=&mut task.workflow { active.artifact=plan; }
+                TaskChange::Update(Box::new(Task::try_from(task)?))
             } else { TaskChange::Preserve }
         } else {
-            let mut prepared=task.filter(|task|matches!(&task.workflow,TaskWorkflow::Plan { plan:active } if active.artifact.id==plan.id)).unwrap_or_else(||ActiveTask::plan(plan.clone(),now_ms));
-            if let TaskWorkflow::Plan { plan: active } = &mut prepared.workflow {
+            let mut prepared=task.filter(|task|matches!(&task.workflow,WorkflowSnapshot::Plan { plan:active } if active.artifact.id==plan.id)).unwrap_or_else(||crate::task::TaskSnapshot::plan(plan.clone(),now_ms));
+            if let WorkflowSnapshot::Plan { plan: active } = &mut prepared.workflow {
                 active.artifact = plan;
                 active.paused = false;
             }
-            if current.is_some_and(|task|matches!(&task.workflow,TaskWorkflow::Plan { plan:active } if matches!(&prepared.workflow,TaskWorkflow::Plan { plan } if plan.artifact.id==active.artifact.id))) { TaskChange::Update(Box::new(prepared)) } else { TaskChange::Install(Box::new(prepared)) }
+            if current.is_some_and(|task|matches!(&task.workflow,WorkflowSnapshot::Plan { plan:active } if matches!(&prepared.workflow,WorkflowSnapshot::Plan { plan } if plan.artifact.id==active.artifact.id))) { TaskChange::Update(Box::new(Task::try_from(prepared)?)) } else { TaskChange::Install(Box::new(Task::try_from(prepared)?)) }
         };
         Ok(super::plan_entry::PreparedTaskChange { change, effects })
     }
@@ -384,17 +389,17 @@ impl BrokerObserver {
 
     fn finish_review_execution(
         &self,
-        task: &mut crate::task::ActiveTask,
+        task: &mut crate::task::TaskSnapshot,
         plan: &PlanRecord,
         anchor: Option<crate::plan::ExchangeAnchor>,
         title: &str,
         now_ms: i64,
     ) -> Result<()> {
-        let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow else {
+        let crate::task::WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
             anyhow::bail!("review no longer owns an execution task")
         };
-        let resume = execution.record.review_paused;
-        execution.record.review_paused = false;
+        let resume = execution.record.resume_after_review;
+        execution.record.resume_after_review = false;
         if resume {
             execution.record.state = PlanExecutionState::Active;
         }
@@ -440,7 +445,7 @@ impl BrokerObserver {
         params: &Value,
         goal_max_turns: u32,
         now_ms: i64,
-    ) -> Result<(crate::task::ActiveTask, crate::storage::TaskEffects)> {
+    ) -> Result<(crate::task::Task, crate::storage::TaskEffects)> {
         let store = SqliteStore::read_only(&self.data_root)?;
         let mut session = store
             .load_session(&self.session_id)?
@@ -494,11 +499,7 @@ impl BrokerObserver {
             .context("execution requires a semantic plan")?;
         design.check_workspace(Path::new(&session.workspace))?;
         let mut checks = crate::checks::ConfigSnapshot::load(Path::new(&session.workspace))?;
-        let scope = session
-            .active_task
-            .as_ref()
-            .and_then(|task| task.entry.as_ref())
-            .map(|entry| entry.id.as_str());
+        let scope = session.active_task.as_ref().map(|task| task.id.as_str());
         let overrides = self.check_runner.overrides(scope)?;
         for definition in &mut checks.config.definitions {
             if let Some(enabled) = overrides.enabled.get(&definition.id) {
@@ -568,11 +569,10 @@ impl BrokerObserver {
             )?;
             let mut task = match prepared.change {
                 crate::task::TaskChange::Update(task) | crate::task::TaskChange::Install(task) => {
-                    *task
+                    task.draft()
                 }
                 _ => anyhow::bail!("accepted feedback did not produce a revision task"),
             };
-            task.auto_accept_plan = true;
             task.plan_execution = Some(crate::task::PlanExecutionChoice {
                 execution: crate::task::ExecutionEntry {
                     approval_mode,
@@ -581,7 +581,7 @@ impl BrokerObserver {
                 },
                 comment: acceptance.overall_comment.clone(),
             });
-            return Ok((task, prepared.effects));
+            return Ok((crate::task::Task::try_from(task)?, prepared.effects));
         }
         let anchor = store
             .latest_exchange(&session.id)?
@@ -663,6 +663,14 @@ impl BrokerObserver {
             original_revision: plan.model_revision,
             revision: plan.model_revision,
             generation: 0,
+            manual_verification: reviewed
+                .document
+                .design
+                .as_ref()
+                .context("accepted execution design is missing")?
+                .document
+                .verification
+                .clone(),
             planning_backend_session_id: session.backend_session_id.clone(),
             execution_backend_session_id: session.backend_session_id.clone(),
             lifecycle: Vec::new(),
@@ -673,9 +681,10 @@ impl BrokerObserver {
             revision_history: Vec::new(),
             approval_comments: comment.into_iter().collect(),
             pending_revision_reason: None,
-            review_paused: false,
+            resume_after_review: false,
             observed_source: Default::default(),
-            observed_generation: 0,
+            observed_checkpoint: None,
+            observed_document_version: reviewed.document.version,
             observed_check: Default::default(),
             created_at_ms: now_ms,
             completed_at_ms: None,
@@ -688,20 +697,34 @@ impl BrokerObserver {
             ),
             &plan.manual_changes,
         );
-        let mut task = crate::task::ActiveTask::execute(
+        let mut task = crate::task::TaskSnapshot::execute(
             plan.title.clone(),
             execution,
-            crate::session::continuation::ContinuationBudget::new(goal_max_turns, 2),
+            crate::session::continuation::ContinuationBudget::new(goal_max_turns, 5),
             false,
             now_ms,
         );
         let planning_task = session.active_task.as_ref().filter(|task| {
-            matches!(&task.workflow, crate::task::TaskWorkflow::Plan { plan: active }
+            matches!(&task.workflow, crate::task::WorkflowSnapshot::Plan { plan: active }
                 if active.artifact.id == plan.id)
         });
-        task.auto_accept_plan = planning_task
-            .map(|task| task.auto_accept_plan)
-            .unwrap_or(session.plan_auto_approve_revisions);
+        if let Some(planning_task) = planning_task {
+            task.id = planning_task.id.clone();
+            task.created_at_ms = planning_task.created_at_ms;
+            task.observed_turn = planning_task.observed_turn.clone();
+            if let crate::task::WorkflowSnapshot::Plan { plan: active } = &planning_task.workflow
+                && let crate::task::WorkflowSnapshot::Execute { execution } = &mut task.workflow
+            {
+                execution.continuation = active.artifact.generation.budget.clone();
+                if execution.continuation.turn_count >= execution.continuation.max_turn_count
+                    || execution.continuation.consecutive_no_progress
+                        >= execution.continuation.max_consecutive_no_progress
+                {
+                    execution.record.state = PlanExecutionState::Stalled;
+                }
+            }
+        }
+        task.auto_accept_plan = planning_task.is_some_and(|task| task.auto_accept_plan);
         task.plan_execution = planning_task.and_then(|task| task.plan_execution.clone());
         task.request_entry(instruction, now_ms)?;
         task.entry
@@ -713,7 +736,7 @@ impl BrokerObserver {
             compact: session.plan_compact,
         });
         effects.plan.push(plan);
-        Ok((task, effects))
+        Ok((crate::task::Task::try_from(task)?, effects))
     }
 }
 
@@ -724,12 +747,11 @@ mod tests {
 
     /// Retain explicit automatic acceptance until a command disables it during execution.
     #[tokio::test]
-    async fn inline_execution_review_approves_only_its_replacement_revision() -> Result<()> {
+    async fn inline_execution_review_preserves_explicit_task_acceptance_policy() -> Result<()> {
         let workspace = super::super::test::repository();
         let data = tempfile::tempdir()?;
         let mut broker =
             super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        broker.session.plan_auto_approve_revisions = false;
         broker.save_session()?;
         let mut document = crate::plan::test_fixture("review-plan", "Review ownership");
         let mut design = crate::plan::DeclarationDesign::open(workspace.path())?;
@@ -767,11 +789,13 @@ mod tests {
             "session.plan.accept",
             json!({"plan_id":plan.id,"digest":digest,"approval_mode":"ask","plan_compact":false}),
         )?;
+        broker.ensure_execution_baseline().await?;
         let task = broker.task_controller.current()?.unwrap();
         broker
             .task_controller
             .update(&mut broker.store, &task.permit(), 2, |task| {
-                let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow else {
+                let crate::task::WorkflowSnapshot::Execute { execution } = &mut task.workflow
+                else {
                     anyhow::bail!("expected execution");
                 };
                 execution.record.phase = crate::plan::PlanPhase::Resolve;
@@ -829,12 +853,36 @@ mod tests {
                 assert_eq!(submitted.state, PlanState::Accepted);
                 assert_eq!(submitted.accepted_revision, Some(revision));
                 assert!(broker.task_controller.current()?.unwrap().auto_accept_plan);
-                assert!(!broker.session.plan_auto_approve_revisions);
                 continue;
             }
             assert_eq!(submitted.state, PlanState::AwaitingReview);
+            let waiting = broker.task_controller.current()?.unwrap();
+            assert_eq!(waiting.status(), crate::task::TaskStatus::Waiting);
+            assert_eq!(waiting.phase(), crate::task::TaskPhase::Resolve);
+            assert_eq!(waiting.next_action(), crate::task::TaskNextAction::Wait);
             assert!(!broker.task_controller.current()?.unwrap().auto_accept_plan);
             if revision == 5 {
+                broker.task_controller.change(
+                    &mut broker.store,
+                    Some(&waiting.revision),
+                    crate::task::TaskChange::Pause,
+                    10,
+                )?;
+                broker.dispatch_session_command(
+                    "session.plan.acceptance.begin",
+                    json!({"plan_id":plan.id,"digest":submitted.review_digest,"annotations":[]}),
+                )?;
+                let accepted_while_paused = broker.task_controller.current()?.unwrap();
+                assert_eq!(accepted_while_paused.id, waiting.id);
+                assert_eq!(
+                    accepted_while_paused.status(),
+                    crate::task::TaskStatus::Paused,
+                    "review acceptance overrode an explicit user pause"
+                );
+                assert_eq!(
+                    accepted_while_paused.phase(),
+                    crate::task::TaskPhase::Resolve
+                );
                 break;
             }
             let source = broker
@@ -855,7 +903,11 @@ mod tests {
             );
             let pending = broker.store.load_plan(&plan.id)?.unwrap();
             assert_eq!(pending.state, PlanState::Revising);
-            assert!(broker.task_controller.current()?.unwrap().auto_accept_plan);
+            assert!(!broker.task_controller.current()?.unwrap().auto_accept_plan);
+            broker.dispatch_session_command(
+                "session.command.apply",
+                json!({"action":"plan_accept","enabled":true}),
+            )?;
             let execution = broker.current_execution()?.unwrap();
             assert!(
                 execution

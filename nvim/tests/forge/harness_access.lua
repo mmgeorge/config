@@ -1,65 +1,95 @@
-vim.opt.runtimepath:prepend("nvim")
+vim.loader.enable(false)
 local access = require("forge.views.harness.access")
-local picker = require("forge.views.picker")
 local root = vim.fn.tempname()
 assert(vim.fn.mkdir(root, "p") == 1)
-local nested = root .. "/nested"
+local nested = root .. "/nested directory"
 assert(vim.fn.mkdir(nested, "p") == 1)
 local state = { session = { id = "access", workspace = root, access = {
-  sandbox = true, write_access = "workspace", windows_sandbox = "elevated", writable_directory = {},
+  sandbox = true, read_access = "workspace", write_access = "workspace", windows_sandbox = "elevated",
+  readable_directory = { vim.uv.fs_realpath(root) }, writable_directory = {},
 } } }
-local host = { control_win = vim.api.nvim_get_current_win() }
-local input_reply, input_spec, failures, applied, returned = nil, nil, {}, 0, 0
-vim.ui.input = function(spec, reply) input_spec, input_reply = spec, reply end
+local failures, applied, returned = {}, 0, 0
+local pending, deferred
+local original_error = require("forge.infra.notifications").error
 require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end
 local function apply(policy, done)
-  state.session.access = policy
   applied = applied + 1
-  done()
+  if deferred then pending = { policy = policy, done = done } return end
+  state.session.access = policy
+  done(true)
 end
-local function selected(index)
-  local instance = picker._state_for_test()
-  instance.spec.on_confirm({ option = instance.spec.page_list[1].option_list[index] })
+local function edit(editor, value)
+  local anchor = editor.editable.native.anchor.directories
+  vim.api.nvim_buf_set_text(editor.buffer, anchor.start.row, anchor.start.column,
+    anchor.finish.row, anchor.finish.column, vim.split(value, "\n", { plain = true }))
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = editor.buffer })
 end
-access.directories(state, host, apply, function() returned = returned + 1 end, "write")
-selected(1)
-assert(input_spec.completion == "dir")
-input_reply(root .. "/missing")
-assert(#failures == 1 and applied == 0)
-selected(1)
-input_reply(nested)
-assert(applied == 1 and #state.session.access.writable_directory == 1)
-local instance = picker._state_for_test()
-assert(instance.spec.page_list[1].option_list[2].detail == "Already covered")
-instance.spec.action_list[1].callback({ option = instance.spec.page_list[1].option_list[2] })
-assert(picker.is_open("harness-directory-remove"))
-selected(1)
-assert(#state.session.access.writable_directory == 1, "cancel removed the path")
-instance = picker._state_for_test()
-instance.spec.action_list[1].callback({ option = instance.spec.page_list[1].option_list[2] })
-selected(2)
+local function open(operation)
+  return access.directories(state, apply, function() returned = returned + 1 end, operation)
+end
+local original_tab = vim.api.nvim_get_current_tabpage()
+local editor = open("write")
+assert(vim.bo[editor.buffer].buftype == "acwrite")
+assert(vim.api.nvim_get_current_tabpage() ~= original_tab)
+assert(editor:values().directories == "")
+edit(editor, nested .. "\n\n" .. root .. "/missing")
+editor:save()
+assert(applied == 0 and #failures == 1 and failures[1]:find("Line 3:", 1, true))
+assert(editor:dirty() and editor:values().directories:find("missing", 1, true))
+edit(editor, "  " .. nested .. "  \n\n" .. root .. "\n" .. nested)
+vim.api.nvim_exec_autocmds("BufWriteCmd", { buffer = editor.buffer })
+assert(applied == 1 and not editor:dirty())
+assert(vim.deep_equal(state.session.access.writable_directory, { vim.uv.fs_realpath(nested), vim.uv.fs_realpath(root) }))
+assert(vim.deep_equal(state.session.access.readable_directory, { vim.uv.fs_realpath(root) }))
+assert(state.session.access.sandbox and state.session.access.write_access == "workspace")
+editor:close()
+assert(returned == 1 and vim.api.nvim_get_current_tabpage() == original_tab)
+editor = open("write")
+edit(editor, "")
+editor:save()
 assert(applied == 2 and #state.session.access.writable_directory == 0)
-state.session.access.write_access = "full"
-picker.close()
-assert(returned == 1)
-access.directories(state, host, apply, function() end, "write")
-assert(picker._state_for_test().spec.page_list[1].subtitle:find("Already covered", 1, true))
-selected(1)
-state.session = { id = "other" }
-input_reply(nested)
-assert(applied == 2 and not picker.is_open(), "stale input changed another session")
-state.session = { id = "read-access", workspace = root, access = {
-  sandbox = false, read_access = "workspace", write_access = "full",
-  readable_directory = {}, writable_directory = {}, windows_sandbox = "elevated",
-} }
-access.directories(state, host, apply, function() end, "read")
-selected(1)
-assert(input_spec.prompt == "Readable directory: ")
-input_reply(nested)
-assert(applied == 3 and state.session.access.readable_directory[1] == vim.uv.fs_realpath(nested))
+editor:close()
+editor = open("read")
+assert(editor:values().directories == vim.uv.fs_realpath(root))
+edit(editor, nested)
+deferred = true
+editor:save()
+editor:save()
+assert(applied == 3 and editor.pending, "pending writes must not be submitted twice")
+pending.done(false)
+assert(not editor.pending and editor:dirty(), "failed writes must retain the editable draft")
+editor:save()
+edit(editor, root)
+state.session.access = pending.policy
+pending.done(true)
+assert(editor:dirty(), "saving an earlier draft cleared newer edits")
+assert(state.session.access.readable_directory[1] == vim.uv.fs_realpath(nested))
+deferred = false
+editor:save()
+assert(applied == 5 and not editor:dirty())
+assert(state.session.access.readable_directory[1] == vim.uv.fs_realpath(root))
 assert(#state.session.access.writable_directory == 0)
-assert(picker.is_open("harness-readable-directories"))
-picker.close(false)
+editor:close()
+editor = open("read")
+edit(editor, nested)
+state.session = { id = "other" }
+editor:save()
+assert(applied == 5 and editor:dirty(), "stale editor changed another session")
+assert(failures[#failures] == "This session is no longer active.")
+editor:replace({ directories = root })
+editor:close()
+assert(returned == 3, "stale editor reopened the previous session config")
+state.session = { id = "preferences", access = { sandbox = false } }
+state.access_preference = { sandbox = true, windows_sandbox = "mxc", read_access = "full",
+  write_access = "off", readable_directory = {}, writable_directory = {} }
+editor = open("read")
+edit(editor, nested)
+editor:save()
+assert(state.session.access.sandbox and state.session.access.windows_sandbox == "mxc",
+  "directory editing overwrote saved sandbox preferences with effective access")
+assert(state.session.access.read_access == "full" and state.session.access.write_access == "off")
+editor:close()
+require("forge.infra.notifications").error = original_error
 vim.fn.delete(root, "rf")
 print("harness_access: passed")
 vim.cmd("qa!")

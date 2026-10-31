@@ -51,7 +51,8 @@ local success, failure = xpcall(function()
   await(function() return state.presentation and state.presentation.ready end, "Harness startup")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan add a small feature" })
   controller.submit()
-  await(function() return not state.busy and state.active_plan end, "plan submission")
+  await(function() return not state.busy and state.active_plan
+    and state.active_plan.state == "awaiting_review" and state.active_plan.review_digest end, "plan submission")
   require("forge.views.plan_review.native_controller").open(state.active_plan)
   await(function() return state.plan_review and state.plan_review.owner.ready end, "plan review")
   local review = state.plan_review

@@ -115,7 +115,7 @@ fn session_inspection_defaults_filters_config_and_readonly_storage() -> Result<(
         config["items"][0]["locations"]["config_directory"],
         json!(dunce::canonicalize(fixture.workspace.path())?)
     );
-    assert!(config.to_string().contains("plan_auto_approve_revisions"));
+    assert!(!config.to_string().contains("plan_auto_approve_revisions"));
     let messages = fixture.invoke("harness_session_exchange_list", json!({}))?;
     assert_eq!(
         messages["items"][0]["messages"][0]["text"],
@@ -311,8 +311,7 @@ fn session_status_separates_approval_access_and_active_task() -> Result<()> {
     let mut selected = fixture.scope.session.clone();
     selected.approval_mode = crate::session::ApprovalMode::Deny;
     selected.access.write_access = crate::session::WriteScope::Off;
-    selected.default_approval = crate::session::ApprovalMode::Allow;
-    selected.active_task = Some(crate::task::ActiveTask::goal(
+    selected.active_task = Some(crate::task::Task::goal(
         "Inspect".into(),
         Default::default(),
         false,
@@ -332,7 +331,8 @@ fn session_status_separates_approval_access_and_active_task() -> Result<()> {
     assert_eq!(value["items"][0]["access"]["write_access"], "off");
     assert_eq!(value["items"][0]["task"]["kind"], "goal");
     let config: Value = serde_json::from_str(&scope.read("harness_config", json!({}))?)?;
-    assert_eq!(config["items"][0]["approval_defaults"]["work"], "allow");
+    assert!(config["items"][0].get("approval_defaults").is_none());
+    assert!(config["items"][0]["input_timeouts"]["approval_timeout"].is_object());
     Ok(())
 }
 

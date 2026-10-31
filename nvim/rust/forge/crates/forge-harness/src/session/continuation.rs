@@ -46,7 +46,7 @@ impl ContinuationBudget {
 
 impl Default for ContinuationBudget {
     fn default() -> Self {
-        Self::new(20, 2)
+        Self::new(20, 5)
     }
 }
 

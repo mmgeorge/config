@@ -31,7 +31,7 @@ end
 local live = selected("live-integration")
 local mock = selected("mock-integration")
 local ordinary = selected("all")
-assert(#live == 4, "live suite no longer matches the audited provider fixtures")
+assert(#live == 3, "live suite no longer matches the audited provider fixtures")
 assert(vim.list_contains(live, live_fixture))
 assert(vim.list_contains(mock, mock_fixture), "plan regression is not in the mock suite")
 for _, fixture in ipairs(live) do

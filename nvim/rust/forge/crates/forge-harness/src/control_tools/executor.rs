@@ -162,7 +162,7 @@ mod test {
 
     #[test]
     fn plan_control_keeps_its_admitted_revision_before_waiting() -> Result<()> {
-        use crate::task::{ActiveTask, SessionTaskController, TaskChange};
+        use crate::task::{SessionTaskController, Task, TaskChange};
         let (_root, mut store, controller) = SessionTaskController::test_goal();
         let previous = controller.current()?.unwrap();
         let plan: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
@@ -174,7 +174,7 @@ mod test {
             .change(
                 &mut store,
                 Some(&previous.revision),
-                TaskChange::Install(Box::new(ActiveTask::plan(plan, 2))),
+                TaskChange::Install(Box::new(Task::plan(plan, 2)?)),
                 2,
             )?
             .unwrap();
@@ -218,7 +218,7 @@ mod test {
             .change(
                 &mut store,
                 Some(&previous.revision),
-                crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+                crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                     "Replacement".into(),
                     Default::default(),
                     false,

@@ -290,12 +290,12 @@ local succeeded, failure = xpcall(function()
     local original = request("session.state.get").session
     local local_settings = request("settings.get")
     local desired = vim.deepcopy(local_settings.layers.session)
-    desired.plan_auto_approve_revisions = false
+    desired.status_thoughts = false
     settle(request("settings.update", { scope = "session", expected_revision = local_settings.revision, desired = desired }))
     local fork = request("session.fork", { name = "ACP fork verification" }).session
     assert(fork.id ~= original.id)
     local inherited = request("settings.get", {}, fork.id)
-    assert(inherited.desired.plan_auto_approve_revisions == false, "fork lost conversation-scoped preferences")
+    assert(inherited.desired.status_thoughts == false, "fork lost conversation-scoped preferences")
     request("session.permission.set", { change = { kind = "enable_yolo" } }, fork.id)
     local previous_calls = #vim.fn.readfile(import_call_log)
     request("session.prompt.submit", { text = "Use the imported-fixture skill to give its verification phrase. Then call imported_phrase from the imported-fixture MCP server. Do not read files or run commands. Reply with both exact phrases." }, fork.id)
@@ -513,7 +513,7 @@ local succeeded, failure = xpcall(function()
     local before = request("settings.get")
     local configured = request("settings.update", { expected_revision = before.revision, scope = "global", desired = {
       access = { sandbox = false, write_access = "workspace", writable_directory = {}, windows_sandbox = "elevated" },
-      shell = "system", default_approval = "ask", plan_compact = true,
+      shell = "system", plan_compact = true,
     } })
     local operation
     assert(vim.wait(30000, function()

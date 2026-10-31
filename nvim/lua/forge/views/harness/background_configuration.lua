@@ -5,6 +5,7 @@ local client = require("forge.client")
 local picker = require("forge.views.picker")
 local notifications = require("forge.infra.notifications")
 local model_options = require("forge.views.harness.model_options")
+local threshold = require("forge.views.harness.compaction_threshold")
 
 ---@class ForgeBackgroundConfigurationOptions
 ---@field backend string
@@ -92,9 +93,9 @@ function BackgroundConfiguration:fields()
       disabled_reason = catalog_disabled },
     thinking = { id = "background-thinking", kind = "choice", label = "Thinking", value = selected and selected.thinking or "Default",
       disabled_reason = catalog_disabled },
-    compact = { id = "background-compact", kind = "toggle", label = "Automatic", value = policy and policy.enabled == true,
+    compact = { id = "background-compact", kind = "toggle", label = "Compact", value = policy and policy.enabled == true,
       disabled_reason = disabled },
-    threshold = { id = "background-threshold", kind = "input", label = "Threshold", value = tostring(policy and policy.threshold_tokens or 128000),
+    threshold = { id = "background-threshold", kind = "choice", label = "Threshold", value = threshold.label(policy and policy.threshold_tokens or 128000),
       disabled_reason = disabled, muted = not (policy and policy.enabled) },
   }
   local capability = self.options.capability()
@@ -158,7 +159,7 @@ function BackgroundConfiguration:change(id, direction)
     self:save(preferences)
   elseif id == "background-threshold" then
     local preferences = self:preferences()
-    preferences.auto_compaction.threshold_tokens = math.max(1, preferences.auto_compaction.threshold_tokens + direction)
+    preferences.auto_compaction.threshold_tokens = threshold.change(preferences.auto_compaction.threshold_tokens, direction)
     self:save(preferences)
   elseif id == "background-model" and self.model_list and #self.model_list > 0 then
     local position = 1
@@ -205,14 +206,13 @@ function BackgroundConfiguration:open(id)
   end
   if id == "background-compact" or id == "background-speed" then return self:change(id, 1) end
   if id == "background-threshold" then
-    vim.ui.input({ prompt = "Compact at tokens: ", default = tostring(self.snapshot.settings.auto_compaction.threshold_tokens) }, function(value)
-      if not value or not self.options.current() then return end
-      local amount = tonumber(value)
-      if not amount or amount <= 0 or amount % 1 ~= 0 then notifications.error("Enter a positive whole token count", "Background settings") return end
-      local preferences = self:preferences()
-      preferences.auto_compaction.threshold_tokens = amount
-      self:save(preferences)
-    end)
+    threshold.open({ host = self.options.host, value = self.snapshot.settings.auto_compaction.threshold_tokens,
+      on_close = self.options.reopen, on_select = function(value)
+        if not self.options.current() then return end
+        local preferences = self:preferences()
+        preferences.auto_compaction.threshold_tokens = value
+        self:save(preferences, true)
+      end })
     return true
   end
   local options = {}

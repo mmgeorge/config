@@ -134,7 +134,7 @@ fn preserve_withdrawals(table: &str, incoming: &mut Value, stored: &Value) -> Re
 pub(super) fn retire_task_questions(
     transaction: &rusqlite::Transaction<'_>,
     session_id: &str,
-    previous: Option<&crate::task::ActiveTask>,
+    previous: Option<&crate::task::Task>,
     now_ms: i64,
 ) -> Result<()> {
     let reason = "The task was replaced or cleared";
@@ -182,9 +182,11 @@ pub(super) fn retire_task_questions(
         )?;
     }
     let plan_id = previous.and_then(|task| match &task.workflow {
-        crate::task::TaskWorkflow::Plan { plan } => Some(plan.artifact.id.as_str()),
-        crate::task::TaskWorkflow::Execute { execution } => Some(execution.record.plan_id.as_str()),
-        crate::task::TaskWorkflow::Goal { .. } => None,
+        crate::task::WorkflowSnapshot::Plan { plan } => Some(plan.artifact.id.as_str()),
+        crate::task::WorkflowSnapshot::Execute { execution } => {
+            Some(execution.record.plan_id.as_str())
+        }
+        crate::task::WorkflowSnapshot::Goal { .. } => None,
     });
     let Some(plan_id) = plan_id else {
         return Ok(());
@@ -285,10 +287,10 @@ mod tests {
             controller.change(
                 &mut store,
                 Some(&current.revision),
-                crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::plan(
+                crate::task::TaskChange::Install(Box::new(crate::task::Task::plan(
                     plan.clone(),
                     1,
-                ))),
+                )?)),
                 1,
             )?;
             let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
@@ -316,7 +318,7 @@ mod tests {
                 if clear {
                     crate::task::TaskChange::Clear
                 } else {
-                    crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+                    crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                         "Replacement".into(),
                         Default::default(),
                         false,
@@ -471,6 +473,7 @@ mod tests {
         let plan: crate::plan::PlanRecord = serde_json::from_value(json!({
             "id":"plan", "session_id":"session", "request":"Review the change",
             "state":"awaiting_review", "working_path":"", "model_revision":1,
+            "submitted_version":1,
             "user_revision":0, "created_at_ms":1, "updated_at_ms":1,
             "review_digest":"review-digest", "acceptance":acceptance
         }))?;
@@ -478,10 +481,7 @@ mod tests {
         controller.change(
             &mut store,
             Some(&previous.revision),
-            crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::plan(
-                plan.clone(),
-                1,
-            ))),
+            crate::task::TaskChange::Install(Box::new(crate::task::Task::plan(plan.clone(), 1)?)),
             1,
         )?;
         let request = json!({
@@ -632,7 +632,7 @@ impl SqliteStore {
                 super::task::read_record(&transaction, table, &target.id)?
                     .context("answered plan disappeared")?;
             let active: String = transaction.query_row("SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1", [session_id], |row| row.get(0))?;
-            let mut active: crate::task::ActiveTask = super::decode(&active)?;
+            let mut active: crate::task::Task = super::decode(&active)?;
             crate::task::SessionTaskController::apply_plan_answer(&mut active, plan)?;
             transaction.execute("UPDATE session_record SET payload=json_set(payload,'$.session.active_task',json(?2)) WHERE id=?1", params![session_id,super::encode(&active)?])?;
         }

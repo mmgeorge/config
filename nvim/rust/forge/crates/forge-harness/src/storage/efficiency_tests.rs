@@ -222,7 +222,7 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
     owner.save_session(&session)?;
     let projection = owner.session_admission(&session.id)?;
     let mut writer = SqliteStore::open(root.path())?;
-    let task = crate::task::ActiveTask::goal("original".into(), Default::default(), false, 1);
+    let task = crate::task::Task::goal("original".into(), Default::default(), false, 1);
     writer.commit_task_change(&session.id, None, 1, |active| {
         *active = Some(task.clone());
         Ok(())
@@ -232,8 +232,7 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
         "original"
     );
     writer.connection.execute_batch("CREATE TRIGGER fail_task BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'failed task write'); END;")?;
-    let mut replacement =
-        crate::task::ActiveTask::goal("committed".into(), Default::default(), false, 2);
+    let mut replacement = crate::task::Task::goal("committed".into(), Default::default(), false, 2);
     assert!(
         writer
             .commit_task_change(&session.id, Some(&task.revision), 2, |active| {
@@ -266,9 +265,9 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
     assert!(!projection.runtime()?.configuring);
     let plan: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
         "id":"plan","session_id":"session","request":"plan","state":"awaiting_review",
-        "working_path":"","model_revision":1,"user_revision":0,"created_at_ms":0,"updated_at_ms":0
+        "working_path":"","model_revision":1,"submitted_version":1,"review_digest":"submitted","user_revision":0,"created_at_ms":0,"updated_at_ms":0
     }))?;
-    let plan_task = crate::task::ActiveTask::plan(plan.clone(), 3);
+    let plan_task = crate::task::Task::plan(plan.clone(), 3)?;
     writer.commit_task_change(&session.id, Some(&replacement.revision), 3, |active| {
         *active = Some(plan_task.clone());
         Ok(())
@@ -281,48 +280,49 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
     let mut execution: crate::plan::PlanExecutionRecord = serde_json::from_value(
         serde_json::json!({
             "id":"execution","session_id":"session","plan_id":"plan",
-            "state":"active","phase":"implement","original_revision":1,"revision":1,"generation":1,
+            "state":"active","phase":"implement","baseline_checkpoint":"captured","original_revision":1,"revision":1,"generation":1,
             "lifecycle":[],"findings":[],"progress":crate::plan::execution::SemanticProgress::default(),
-            "verification":[],"revision_history":[],"review_paused":false,"observed_source":{},
-            "observed_generation":0,"observed_check":[],"created_at_ms":0
+            "verification":[],"revision_history":[],"resume_after_review":false,"observed_source":{},
+            "observed_document_version":0,"observed_check":[],"created_at_ms":0
         }),
     )?;
-    let execute_task = crate::task::ActiveTask::execute(
+    let execute_task = crate::task::Task::execute(
         "committed".into(),
         execution.clone(),
         Default::default(),
         false,
         4,
-    );
+    )?;
     writer.commit_task_change(&session.id, Some(&replacement.revision), 4, |active| {
         *active = Some(execute_task.clone());
         Ok(())
     })?;
     assert_eq!(
         match &projection.runtime()?.active_task.as_ref().unwrap().workflow {
-            crate::task::TaskWorkflow::Execute { execution } => execution.record.phase,
+            crate::task::WorkflowSnapshot::Execute { execution } => execution.record.phase,
             _ => panic!("expected execution"),
         },
         crate::plan::PlanPhase::Implement
     );
     let (exchange, _) = output_exchange("")?;
     writer.save_exchange(&exchange)?;
-    execution.phase = crate::plan::PlanPhase::Verify;
+    execution.phase = crate::plan::PlanPhase::Checking;
     writer.commit_task_change(&session.id, Some(&execute_task.revision), 5, |active| {
-        let crate::task::TaskWorkflow::Execute { execution: current } =
-            &mut active.as_mut().unwrap().workflow
-        else {
-            unreachable!()
-        };
-        current.record = execution.clone();
-        Ok(())
+        active.as_mut().unwrap().edit(|draft| {
+            let crate::task::WorkflowSnapshot::Execute { execution: current } = &mut draft.workflow
+            else {
+                unreachable!()
+            };
+            current.record = execution.clone();
+            Ok(())
+        })
     })?;
     assert_eq!(
         match &projection.runtime()?.active_task.as_ref().unwrap().workflow {
-            crate::task::TaskWorkflow::Execute { execution } => execution.record.phase,
+            crate::task::WorkflowSnapshot::Execute { execution } => execution.record.phase,
             _ => panic!("expected execution"),
         },
-        crate::plan::PlanPhase::Verify
+        crate::plan::PlanPhase::Checking
     );
     owner.connection.execute_batch("ALTER TABLE task_record RENAME TO hidden_task; ALTER TABLE task_operation RENAME TO hidden_operation;")?;
     assert_eq!(

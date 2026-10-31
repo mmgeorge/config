@@ -19,8 +19,8 @@ function PickerInput.open(parent_win, frame, text, origin)
   local buf, win = popup_window.open({
     relative = "editor",
     row = (tonumber(parent.row) or 0) + (frame.input_start or 1),
-    col = (tonumber(parent.col) or 0) + 2,
-    width = math.max(20, parent.width - 4),
+    col = (tonumber(parent.col) or 0) + (frame.content_column or 0) + 2,
+    width = math.max(20, (frame.content_width or parent.width) - 4),
     height = input_height(frame),
     title = "",
     border = "none",
@@ -44,8 +44,8 @@ function PickerInput.resize(win, parent_win, frame)
   local parent = vim.api.nvim_win_get_config(parent_win)
   local window_config = vim.api.nvim_win_get_config(win)
   window_config.row = (tonumber(parent.row) or 0) + (frame.input_start or 1)
-  window_config.col = (tonumber(parent.col) or 0) + 2
-  window_config.width = math.max(20, parent.width - 4)
+  window_config.col = (tonumber(parent.col) or 0) + (frame.content_column or 0) + 2
+  window_config.width = math.max(20, (frame.content_width or parent.width) - 4)
   window_config.height = input_height(frame)
   vim.api.nvim_win_set_config(win, window_config)
 end

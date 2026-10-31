@@ -48,7 +48,7 @@ local success, failure = xpcall(function()
   advance(1)
   assert(health.notice(state) == nil)
   state.status.kind = "idle"
-  state.session.active_task = { revision = "task", kind = "goal", goal = { state = "active" } }
+  state.session.active_task = { revision = "task", kind = "goal", phase = "work", status = "running", goal = { state = "active" } }
   local queued = {text = "Next message", purpose = {kind = "user"}}
   state.queue = {queued}
   local handoff = health.notice(state)
@@ -60,13 +60,14 @@ local success, failure = xpcall(function()
   assert(health.notice(state) == nil, "taskless chat cancellation must not retain a Working spinner")
   state.queue_paused = false
   assert(health.notice(state).text == "Working", "resuming taskless queued work lost its handoff status")
-  state.session.active_task = { revision = "task", kind = "goal", goal = { state = "active" } }
+  state.session.active_task = { revision = "task", kind = "goal", phase = "work", status = "running", goal = { state = "active" } }
   state.queue_edit = {barrier = queued}
   assert(health.notice(state) == nil, "editing the next message must not imply a handoff")
   state.queue_edit = nil
   state.session.active_task.goal.state = "paused"
+state.session.active_task.status = "paused"
   assert(health.notice(state).text == "Working", "paused task state must not hide explicitly queued user input")
-  state.session.active_task = { revision = "replacement-task", kind = "goal", goal = { state = "active" } }
+  state.session.active_task = { revision = "replacement-task", kind = "goal", phase = "work", status = "running", goal = { state = "active" } }
   assert(health.notice(state).text == "Working", "task replacement hid queued user input")
   state.checks_running = true
   assert(health.notice(state) == nil, "native check progress must remain visible")

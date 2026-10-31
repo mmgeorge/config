@@ -14,7 +14,7 @@ This chapter covers the session lifecycle, from process ownership through input 
 
 ## Terms
 
-A **session** is one durable conversation with its settings and history. An **exchange** covers one admitted request from admission to resolution. A **turn** is one provider invocation inside an exchange, so an exchange can contain several turns. A **task** is a Plan, Execute, or Goal workflow within a session, and a session selects one current task through `current_task_id`.
+A **session** is one durable conversation with its settings and history. An **exchange** covers one admitted request from admission to resolution. A **turn** is one provider invocation inside an exchange, so an exchange can contain several turns. A **task** is the durable owner of a Plan, Execute, or Goal workflow in the session's `active_task` slot. Its `TaskId` survives Plan becoming Execute, while `TaskRevision` changes whenever control admission changes.
 
 ## Process and session ownership
 
@@ -85,17 +85,29 @@ Changing mode interrupts the provider and pauses the exchange, which keeps its r
 
 ## Tasks and recovery
 
-`TaskRecord` holds a task's saved access and approval, phase, status, generation, and attempt, and the task owns its plan through `plan_id`. Read requests never settle tasks or clear waits. Interrupting keeps the selected task, and the next ordinary message resumes a paused task with that message as added instructions.
+`Task` owns a private `TaskLifecycle`: Active, Suspended, or Finished. `WorkflowState` contains a planning, execution, or goal state, and each workflow defines its own phase enum. Plan has Draft and Review, Execute has Implement, Check, Resolve, and Verify, and Goal has only Work. Suspension preserves that phase, and read requests never settle tasks or clear waits.
+
+The controller validates candidate updates before replacing the task and committing its dependent artifacts. Artifact snapshots remain available for the plan, timeline, and transport adapters, but consumers cannot obtain a mutable borrow of the live task. Loading a task also validates its workflow against the serialized phase and lifecycle summary.
+
+Gate phases contain an `ExecutionContract` whose private construction requires an accepted revision and a workspace baseline. Verify additionally requires accepted manual actions and passing automated evidence for that revision. `SuspensionReason` distinguishes user pause, no progress, total turn exhaustion, provider limits, and reported failures while retaining the workflow variant.
+
+Control mutations require the exact `TaskPermit` revision. Completed-turn accounting uses a separate observation fence that survives legal phase handoffs and changes on user control or explicit recovery. This lets a turn consume its allowance after advancing the phase while preventing its late callback from affecting a resumed task. `TaskTurnId` deduplicates observations, and terminal outcomes retain the stable task identity.
+
+`TaskNextAction` derives provider work, local checks, or a wait from the current lifecycle and phase. Durable continuations use a `TaskWork` enum: Provider carries an instruction, and Checks carries no synthetic prompt. A continuation identifies its exact completed source exchange, so a newer chat exchange cannot strand it. Resuming Check reserves local work instead of starting a provider turn.
 
 Workflow changes never enable writing or widen filesystem scope. When a permission change resumes work, Harness tells the model the previous and current approval modes and asks it to inspect interrupted operations before retrying.
 
-Restart recovery keeps committed phases and completion evidence, suspends unfinished attempts, marks unsettled operations outcome-unknown, and never starts a provider automatically. Pause operations recover as cancelled. Failure, disconnect, and unknown outcomes stop automatic queue draining, so queued work cannot run on top of a state nobody has confirmed.
+Restart recovery keeps committed phases and completion evidence, suspends pending entries and continuations, and never starts a provider automatically. Explicit resume reactivates the retained task; a proven pending entry keeps its provider-input identity. Uncertain provider delivery remains governed by the submission journal rather than by the task's phase. Failure, disconnect, and unknown outcomes stop automatic queue draining.
+
+Session format 58, preference format 42, and portable-settings format 3 omit workflow approval defaults. New conversations start in Ask; existing conversations retain their explicit approval mode, including across Plan → Execute. Storage retains older envelopes unchanged and excludes them from current loading; schema setup does not reconstruct obsolete task state. The current task decoder validates phase payloads instead of guessing transitions from an older representation.
 
 After exclusive runtime ownership is acquired, recovery also settles detached background tools inside already-completed exchanges. It preserves the foreground outcome, output, and last observed duration. On a fresh Copilot binding, native history is checked for unmatched tool calls; only a verified incomplete suffix can be truncated, and the retained prefix is checked again before new input is sent. The repaired session's provider prompt cautions that prior actions may have completed and must be inspected before repeating writes. Successful recovery does not emit an editor warning; ambiguous history blocks admission rather than discarding completed work.
 
 ## Plan generation
 
-The broker owns plan generation as one bounded continuation loop for every backend. Each turn applies plan edits to the canonical document, and only three outcomes move forward: a submitted plan, a new unresolved question, or another bounded turn. `ContinuationBudget` provides the budget for both goals and planning, and `PlanGeneration` stops after a turn limit or after consecutive turns without document progress. `/plan retry` resets only that budget.
+The broker owns plan generation as one bounded continuation loop for every backend. Each turn applies plan edits to the canonical document, and only three outcomes move forward: a submitted plan, a new unresolved question, or another bounded turn. `ContinuationBudget` uses a default total allowance of 20 model turns and stops after five consecutive turns without observable progress. Plan acceptance carries consumed allowance into Execute; review revisions do not replenish the total allowance. Explicit resume or retry resets the continuation allowance while retaining task history.
+
+Execution compares saved workspace checkpoints and plan document versions when observing progress. Phase changes, reads, failed edits, and repeated findings do not reset its no-progress count; new completed verification evidence can advance a manual verification attempt. Local check operations and human waits do not consume model turns. The native task summary supplies workflow, phase, and status to the winbar, so Lua does not reconstruct lifecycle state from artifact records.
 
 `PlanStateMachine` validates plan transitions. `PlanQuestionLedger` records answers, skips, and withdrawals by both provider ID and content digest, so a resolved decision cannot reopen when a provider retries with a different ID. Automatic retries and goal continuations admit new exchanges without synthetic user prompts, so each attempt keeps its own metrics.
 

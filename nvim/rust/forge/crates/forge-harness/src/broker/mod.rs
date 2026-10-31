@@ -43,7 +43,7 @@ use crate::plan::{
     ArtifactSummary, PlanAcceptance, PlanElicitation, PlanExecutionLifecycleEvent,
     PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState, PlanFileStore,
     PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer, PlanQuestionResponse,
-    PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState, digest as plan_digest,
+    PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState,
 };
 use crate::protocol::RuntimeMethod;
 use crate::session::{
@@ -170,6 +170,8 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
     pub ask_model: crate::settings::AskModel,
+    /// Saved access choices before provider capability limits are applied.
+    pub access_preference: crate::session::AccessPolicy,
     /// Confirmed access label computed by the authoritative filesystem policy.
     pub access_abbreviation: String,
     pub subagent_tools: bool,
@@ -723,9 +725,6 @@ impl HarnessBroker {
                             plan_compact: preference
                                 .as_ref()
                                 .is_some_and(|value| value.plan_compact),
-                            plan_auto_approve_revisions: preference
-                                .as_ref()
-                                .is_none_or(|value| value.plan_auto_approve_revisions),
                             approval_timeout: Default::default(),
                             answer_timeout: Default::default(),
                             context_window: None,
@@ -740,16 +739,8 @@ impl HarnessBroker {
                             shell: preference
                                 .as_ref()
                                 .map_or(Default::default(), |preference| preference.shell),
-                            approval_mode: preference
-                                .as_ref()
-                                .map_or(ApprovalMode::Ask, |value| value.default_approval),
+                            approval_mode: ApprovalMode::Ask,
                             active_task: None,
-                            default_approval: preference
-                                .as_ref()
-                                .map_or(ApprovalMode::Ask, |value| value.default_approval),
-                            plan_approval: preference
-                                .as_ref()
-                                .and_then(|value| value.plan_approval),
                             created_at_ms: now_ms,
                             updated_at_ms: now_ms,
                             lease_owner: None,
@@ -793,7 +784,6 @@ impl HarnessBroker {
             .apply(&mut session, backend_descriptor.capability.native_compact)?;
         if created_session && request.background.is_none() {
             shared.apply_provider_defaults(&mut session)?;
-            session.approval_mode = session.default_approval;
         }
         if request.background.is_some() {
             session.access.write_access = crate::session::WriteScope::Off;
@@ -1082,8 +1072,8 @@ impl HarnessBroker {
                     .current()
                     .ok()
                     .flatten()
-                    .and_then(|task| match task.workflow {
-                        crate::task::TaskWorkflow::Goal { goal } if goal.native => {
+                    .and_then(|task| match task.workflow.clone() {
+                        crate::task::WorkflowSnapshot::Goal { goal } if goal.native => {
                             Some(goal.objective)
                         }
                         _ => None,
@@ -1384,16 +1374,16 @@ impl HarnessBroker {
                     .map(|id| self.store.load_task_operation(&self.session.id, id))
                     .transpose()?
                     .flatten();
-                let target = self
-                    .task_controller
-                    .current()?
-                    .and_then(|task| match task.workflow {
-                        crate::task::TaskWorkflow::Plan { plan } => plan
-                            .artifact
-                            .acceptance
-                            .map(|acceptance| (plan.artifact.id, acceptance.review_digest)),
-                        _ => None,
-                    });
+                let target =
+                    self.task_controller
+                        .current()?
+                        .and_then(|task| match task.workflow.clone() {
+                            crate::task::WorkflowSnapshot::Plan { plan } => plan
+                                .artifact
+                                .acceptance
+                                .map(|acceptance| (plan.artifact.id, acceptance.review_digest)),
+                            _ => None,
+                        });
                 crate::task::command::SessionCommand::question_continue(
                     &candidate,
                     prior.as_ref(),
@@ -1848,10 +1838,12 @@ impl HarnessBroker {
         Ok(self
             .task_controller
             .current()?
-            .and_then(|task| match task.workflow {
-                crate::task::TaskWorkflow::Plan { plan } => Some(plan.artifact.id),
-                crate::task::TaskWorkflow::Execute { execution } => Some(execution.record.plan_id),
-                crate::task::TaskWorkflow::Goal { .. } => None,
+            .and_then(|task| match task.workflow.clone() {
+                crate::task::WorkflowSnapshot::Plan { plan } => Some(plan.artifact.id),
+                crate::task::WorkflowSnapshot::Execute { execution } => {
+                    Some(execution.record.plan_id)
+                }
+                crate::task::WorkflowSnapshot::Goal { .. } => None,
             }))
     }
 
@@ -1859,20 +1851,13 @@ impl HarnessBroker {
         let current = self.task_controller.current()?;
         if let Some(task) = current.filter(|task| {
             matches!(&task.workflow,
-            crate::task::TaskWorkflow::Plan { plan: active } if active.artifact.id == plan.id)
+            crate::task::WorkflowSnapshot::Plan { plan: active } if active.artifact.id == plan.id)
         }) {
-            self.task_controller.update(
+            self.task_controller.apply(
                 &mut self.store,
                 &task.permit(),
+                crate::task::TaskEvent::PlanArtifactUpdated(plan.clone()),
                 self.clock.now_ms(),
-                |task| {
-                    let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow
-                    else {
-                        return Err(crate::task::StaleTask.into());
-                    };
-                    active.artifact = plan.clone();
-                    Ok(())
-                },
             )
         } else {
             self.store.save_plan(plan)
@@ -1886,10 +1871,15 @@ impl HarnessBroker {
         if task.status() == crate::task::TaskStatus::Paused || !task.entry_accepted() {
             return Ok(PromptMode::Chat);
         }
-        Ok(match task.workflow {
-            crate::task::TaskWorkflow::Goal { .. } => PromptMode::GoalContinuation,
-            crate::task::TaskWorkflow::Execute { .. } => PromptMode::ExecutePlan,
-            crate::task::TaskWorkflow::Plan { plan } => {
+        Ok(match task.workflow.clone() {
+            crate::task::WorkflowSnapshot::Goal { .. } => PromptMode::GoalContinuation,
+            crate::task::WorkflowSnapshot::Execute { .. }
+                if task.next_action() == crate::task::TaskNextAction::Checks =>
+            {
+                PromptMode::Chat
+            }
+            crate::task::WorkflowSnapshot::Execute { .. } => PromptMode::ExecutePlan,
+            crate::task::WorkflowSnapshot::Plan { plan } => {
                 if plan.artifact.state == PlanState::AwaitingReview {
                     PromptMode::PlanDiscussion
                 } else {
@@ -1907,14 +1897,17 @@ impl HarnessBroker {
         let Some(task) = self.task_controller.current()? else {
             return Ok(());
         };
-        let crate::task::TaskWorkflow::Execute { execution } = &task.workflow else {
+        let crate::task::WorkflowSnapshot::Execute { .. } = &task.workflow else {
             return Ok(());
         };
-        if execution.record.state != PlanExecutionState::Active {
+        if matches!(
+            task.next_action(),
+            crate::task::TaskNextAction::Wait | crate::task::TaskNextAction::Finished
+        ) {
             return Ok(());
         }
         let now_ms = self.clock.now_ms();
-        if execution.record.phase == crate::plan::PlanPhase::Checking {
+        if task.next_action() == crate::task::TaskNextAction::Checks {
             self.task_controller.reserve_checks(
                 &mut self.store,
                 &task.permit(),
@@ -1951,10 +1944,7 @@ impl HarnessBroker {
             .continuation
             .as_ref()
             .context("check work was removed")?;
-        anyhow::ensure!(
-            work.work == crate::task::TaskContinuationWork::Checks,
-            "pending work is not checks"
-        );
+        anyhow::ensure!(work.work.is_checks(), "pending work is not checks");
         let source = turn.id.clone();
         let id = work.id.clone();
         let events = self.run_checks().await?;
@@ -1964,7 +1954,7 @@ impl HarnessBroker {
         if current.entry.as_ref().map(|entry| &entry.id)
             != task.entry.as_ref().map(|entry| &entry.id)
             || !matches!((&task.workflow, &current.workflow),
-                (crate::task::TaskWorkflow::Execute { execution: original }, crate::task::TaskWorkflow::Execute { execution: current }) if original.record.id == current.record.id)
+                (crate::task::WorkflowSnapshot::Execute { execution: original }, crate::task::WorkflowSnapshot::Execute { execution: current }) if original.record.id == current.record.id)
         {
             return Ok(events);
         }
@@ -2013,14 +2003,14 @@ impl HarnessBroker {
     ) -> Result<()> {
         let now_ms = self.clock.now_ms();
         let task = if kind == crate::task::TaskKind::Plan {
-            crate::task::ActiveTask::plan(
+            crate::task::Task::plan(
                 self.store
                     .load_plan(&plan_id.context("plan is required")?)?
                     .context("plan is missing")?,
                 now_ms,
-            )
+            )?
         } else {
-            crate::task::ActiveTask::goal(title, Default::default(), false, now_ms)
+            crate::task::Task::goal(title, Default::default(), false, now_ms)
         };
         let current = self.task_controller.current()?;
         self.task_controller.change(
@@ -3300,7 +3290,7 @@ impl HarnessBroker {
                 exchange.revise_plan(self.clock.now_ms())?;
                 self.store.save_exchange(&exchange)?;
             }
-            if let crate::task::TaskWorkflow::Plan { plan } = &task.workflow {
+            if let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow {
                 let mut admission = ExchangeAdmission::chat(text.clone());
                 admission.origin = origin;
                 if plan.artifact.state == PlanState::ConfiguringChecks {
@@ -4382,12 +4372,49 @@ impl HarnessBroker {
         mode: PromptMode,
         admission: Option<ExchangeAdmission>,
     ) -> Result<(Value, Vec<SessionEvent>)> {
+        let setup_task = self.task_controller.current()?.filter(|task| {
+            matches!(&task.workflow, crate::task::WorkflowSnapshot::Plan { plan }
+                if plan.artifact.state == PlanState::ConfiguringChecks)
+        });
+        let setup_digest = setup_task
+            .as_ref()
+            .and_then(|_| {
+                crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).ok()
+            })
+            .map(|snapshot| snapshot.digest);
         let input = BackendInput::from_text(text.clone());
         let result = self
             .run_interaction_input(text, mode, admission, input)
             .await?;
         if mode == PromptMode::Chat {
-            Box::pin(self.advance_configured_plan(result)).await
+            let result = Box::pin(self.advance_configured_plan(result)).await?;
+            if let Some(original) = setup_task
+                && let Some(current) = self.task_controller.current()?
+                && original
+                    .permit()
+                    .validate_observation(Some(&current))
+                    .is_ok()
+                && current.kind() == crate::task::TaskKind::Plan
+            {
+                let after = crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace))
+                    .ok()
+                    .map(|snapshot| snapshot.digest);
+                let exchange = self
+                    .store
+                    .latest_exchange(&self.session.id)?
+                    .context("check setup source disappeared")?;
+                self.task_controller.observe_plan(
+                    &mut self.store,
+                    &current.permit(),
+                    crate::task::TaskTurnId {
+                        exchange_ordinal: exchange.ordinal,
+                        turn_ordinal: exchange.turn.len(),
+                    },
+                    after != setup_digest,
+                    self.clock.now_ms(),
+                )?;
+            }
+            Ok(result)
         } else {
             Ok(result)
         }
@@ -4402,14 +4429,14 @@ impl HarnessBroker {
             .task_controller
             .current()?
             .context("planning requires an active task")?;
-        let crate::task::TaskWorkflow::Plan { plan } = &task.workflow else {
+        let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow else {
             anyhow::bail!("planning requires a Plan task");
         };
         let plan_id = plan.artifact.id.clone();
         let before = self
             .plan_file
             .read_working_document(&self.session.id, &plan_id)?;
-        let before_digest = plan_digest(&serde_json::to_vec(&before)?);
+        let before_version = before.version;
         let discussion = plan.artifact.state == PlanState::AwaitingReview;
         let result = self
             .run_interaction(
@@ -4425,14 +4452,11 @@ impl HarnessBroker {
         let current = self.task_controller.current()?;
         let Some(current) = current.filter(|current| {
             matches!(&current.workflow,
-            crate::task::TaskWorkflow::Plan { plan } if plan.artifact.id == plan_id && !plan.paused)
+            crate::task::WorkflowSnapshot::Plan { plan } if plan.artifact.id == plan_id && !plan.paused)
         }) else {
             return result;
         };
-        if task.permit().validate(Some(&current)).is_err()
-            && !matches!(&current.workflow, crate::task::TaskWorkflow::Plan { plan }
-                if matches!(plan.artifact.state, PlanState::AwaitingReview | PlanState::AwaitingInput))
-        {
+        if task.permit().validate_observation(Some(&current)).is_err() {
             return result;
         }
         let (mut value, mut events) = match result {
@@ -4440,29 +4464,11 @@ impl HarnessBroker {
             Err(error) => {
                 if !error.is::<TurnCancelled>() {
                     let now_ms = self.clock.now_ms();
-                    if let Err(persistence) = self.task_controller.update(
+                    if let Err(persistence) = self.task_controller.apply(
                         &mut self.store,
                         &current.permit(),
+                        crate::task::TaskEvent::PlanGenerationFailed,
                         now_ms,
-                        |task| {
-                            let crate::task::TaskWorkflow::Plan { plan } = &mut task.workflow
-                            else {
-                                anyhow::bail!("plan was replaced")
-                            };
-                            if matches!(
-                                plan.artifact.state,
-                                PlanState::Generating
-                                    | PlanState::Revising
-                                    | PlanState::AwaitingInput
-                            ) {
-                                PlanStateMachine::apply(
-                                    &mut plan.artifact,
-                                    PlanEvent::TransitionFailed,
-                                    now_ms,
-                                )?;
-                            }
-                            Ok(())
-                        },
                     ) && !persistence.is::<crate::task::StaleTask>()
                     {
                         return Err(persistence).context("persist planning failure");
@@ -4471,7 +4477,7 @@ impl HarnessBroker {
                 return Err(error);
             }
         };
-        let crate::task::TaskWorkflow::Plan { plan } = &current.workflow else {
+        let crate::task::WorkflowSnapshot::Plan { plan } = &current.workflow else {
             unreachable!()
         };
         if discussion && plan.artifact.state == PlanState::AwaitingReview {
@@ -4480,7 +4486,7 @@ impl HarnessBroker {
         let after = self
             .plan_file
             .read_working_document(&self.session.id, &plan_id)?;
-        let progress = plan_digest(&serde_json::to_vec(&after)?) != before_digest;
+        let progress = after.version != before_version;
         let mut completed = self
             .store
             .latest_exchange(&self.session.id)?
@@ -4526,6 +4532,11 @@ impl HarnessBroker {
                 json!({"plan":plan,
                 "reason":"planning stopped without submitting the canonical plan"}),
             )?);
+        }
+        if let Some(task) = self.task_controller.current()?
+            && let Some(command) = crate::task::command::SessionCommand::approved_revision(&task)?
+        {
+            events.extend(self.commit_session_command(command)?.1);
         }
         Ok((value, events))
     }
@@ -4853,9 +4864,9 @@ impl HarnessBroker {
         runtime.checkpoint.take();
         let saved = result.and_then(|checkpoint| {
             let task = self.task_controller.current()?.filter(|task| runtime.task_permit.as_ref()
-                .is_some_and(|permit| permit.validate(Some(task)).is_ok()));
+                .is_some_and(|permit| permit.task_id() == &task.id));
             let execution = task.as_ref().and_then(|task| match &task.workflow {
-                crate::task::TaskWorkflow::Execute { execution } => Some(execution),
+                crate::task::WorkflowSnapshot::Execute { execution } => Some(execution),
                 _ => None,
             });
             let queued_owner = if execution.is_none() {
@@ -4863,7 +4874,7 @@ impl HarnessBroker {
             } else {
                 None
             };
-            let task_owner = task.as_ref().map(|task| task.revision.as_str().to_owned());
+            let task_owner = task.as_ref().map(|task| task.id.as_str().to_owned());
             let owner = interaction
                 .check_owner
                 .as_ref()
@@ -4877,14 +4888,10 @@ impl HarnessBroker {
             self.store
                 .save_checkpoint_exchange(&checkpoint, interaction)?;
             if let Some(task) = task
-                && matches!(&task.workflow, crate::task::TaskWorkflow::Execute { execution } if execution.record.baseline_checkpoint.is_none())
+                && matches!(&task.workflow, crate::task::WorkflowSnapshot::Execute { execution } if execution.record.baseline_checkpoint.is_none())
             {
-                self.task_controller.update(&mut self.store, &task.permit(), self.clock.now_ms(), |task| {
-                    if let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow {
-                        execution.record.baseline_checkpoint = Some(checkpoint.id);
-                    }
-                    Ok(())
-                })?;
+                self.task_controller.apply(&mut self.store, &task.permit(),
+                    crate::task::TaskEvent::ExecutionBaselineCaptured(checkpoint.id), self.clock.now_ms())?;
             }
             Ok(())
         });
@@ -6890,7 +6897,7 @@ impl HarnessBroker {
         }
         if let Some(task) = &runtime.active_task {
             match &task.workflow {
-                crate::task::TaskWorkflow::Execute { execution } => {
+                crate::task::WorkflowSnapshot::Execute { execution } => {
                     crate::session::state_machine::ExecutionStatusSnapshot::from(&execution.record)
                         .apply(&mut status)
                 }
@@ -7284,9 +7291,9 @@ impl HarnessBroker {
     #[cfg(test)]
     fn create_goal(&mut self, objective: String, native: bool) -> Result<GoalRecord> {
         let now_ms = self.clock.now_ms();
-        let mut task = crate::task::ActiveTask::goal(
+        let mut task = crate::task::Task::goal(
             objective,
-            crate::session::continuation::ContinuationBudget::new(self.goal_max_turns, 2),
+            crate::session::continuation::ContinuationBudget::new(self.goal_max_turns, 5),
             native,
             now_ms,
         );
@@ -7335,7 +7342,7 @@ impl HarnessBroker {
             Err(error) => return Err(error),
         };
         let goal = GoalRecord {
-            id: task.revision.as_str().into(),
+            id: task.id.as_str().into(),
             session_id: self.session.id.clone(),
             objective: observed.objective,
             state: observed.state,
@@ -7380,13 +7387,13 @@ impl HarnessBroker {
     fn current_goal(&self) -> Result<Option<GoalRecord>> {
         if let Some(task) = self.task_controller.current()? {
             let (objective, state, continuation, native) = match &task.workflow {
-                crate::task::TaskWorkflow::Goal { goal } => (
+                crate::task::WorkflowSnapshot::Goal { goal } => (
                     goal.objective.clone(),
                     goal.state,
                     goal.continuation.clone(),
                     goal.native,
                 ),
-                crate::task::TaskWorkflow::Execute { execution } => (
+                crate::task::WorkflowSnapshot::Execute { execution } => (
                     execution.title.clone(),
                     match execution.record.state {
                         PlanExecutionState::Active => GoalState::Active,
@@ -7399,10 +7406,10 @@ impl HarnessBroker {
                     execution.continuation.clone(),
                     execution.native,
                 ),
-                crate::task::TaskWorkflow::Plan { .. } => return Ok(None),
+                crate::task::WorkflowSnapshot::Plan { .. } => return Ok(None),
             };
             return Ok(Some(GoalRecord {
-                id: task.revision.as_str().into(),
+                id: task.id.as_str().into(),
                 session_id: self.session.id.clone(),
                 objective,
                 state,
@@ -7931,18 +7938,9 @@ impl HarnessBroker {
             params["access"] =
                 serde_json::to_value(settings.desired.access.clone().unwrap_or_default())?;
             params["shell"] = serde_json::to_value(settings.desired.shell.unwrap_or_default())?;
-            params["default_approval"] = serde_json::to_value(
-                settings
-                    .desired
-                    .default_approval
-                    .unwrap_or(ApprovalMode::Ask),
-            )?;
-            params["plan_approval"] = serde_json::to_value(settings.desired.plan_approval)?;
             params["plan_compact"] = json!(
                 settings.desired.plan_compact.unwrap_or(false) && self.capability.native_compact
             );
-            params["plan_auto_approve_revisions"] =
-                json!(settings.desired.plan_auto_approve_revisions.unwrap_or(true));
             params["approval_timeout"] =
                 serde_json::to_value(settings.desired.approval_timeout.unwrap_or_default())?;
             params["answer_timeout"] =
@@ -7988,13 +7986,6 @@ impl HarnessBroker {
         }
         if let Some(value) = params.get("approval_mode") {
             configured.approval_mode = serde_json::from_value(value.clone())?;
-        }
-        if let Some(value) = params.get("default_approval") {
-            let permission: ApprovalMode = serde_json::from_value(value.clone())?;
-            configured.default_approval = permission;
-        }
-        if let Some(value) = params.get("plan_approval") {
-            configured.plan_approval = serde_json::from_value(value.clone())?;
         }
         if let Some(value) = params.get("approval_timeout") {
             configured.approval_timeout =
@@ -8163,12 +8154,6 @@ impl HarnessBroker {
         }
         configured.plan_executor = plan_executor;
         configured.plan_compact = plan_compact;
-        if let Some(enabled) = params
-            .get("plan_auto_approve_revisions")
-            .and_then(Value::as_bool)
-        {
-            configured.plan_auto_approve_revisions = enabled;
-        }
         let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
         let lsp_tools = params.get("lsp_tools").and_then(Value::as_bool);
         let session_tools = params
@@ -8183,8 +8168,8 @@ impl HarnessBroker {
             .is_some_and(|enabled| enabled != self.agent_coordinator.enabled())
             || lsp_tools.is_some_and(|enabled| enabled != self.lsp.enabled(&self.session.id))
             || session_tools.is_some();
-        if let Some(access) = access {
-            configured.access = access;
+        if let Some(access) = &access {
+            configured.access = access.clone();
         }
         configured.access = crate::backend::BackendKind::parse(&configured.backend)?
             .resolve_access(configured.access);
@@ -8235,11 +8220,10 @@ impl HarnessBroker {
                 } else {
                     crate::settings::SettingScope::Global
                 };
-            let mut portable =
-                settings.layer_settings(scope, &self.session.workspace, &self.session.id)?;
+            let mut portable = crate::settings::PortableSettings::default();
             let mut changed = false;
-            if params.get("access").is_some() {
-                portable.access = Some(self.session.access.clone());
+            if let Some(access) = access {
+                portable.access = Some(access);
                 changed = true;
             }
             if params.get("shell").is_some() {
@@ -8254,25 +8238,12 @@ impl HarnessBroker {
                 portable.automatic_checks = Some(value);
                 changed = true;
             }
-            if params.get("default_approval").is_some() {
-                portable.default_approval = Some(self.session.default_approval);
-                changed = true;
-            }
-            if params.get("plan_approval").is_some() {
-                portable.plan_approval = self.session.plan_approval;
-                changed = true;
-            }
             if params.get("auto_compaction").is_some() {
                 portable.auto_compaction = Some(self.session.auto_compaction.clone());
                 changed = true;
             }
             if params.get("plan_compact").is_some() {
                 portable.plan_compact = Some(self.session.plan_compact);
-                changed = true;
-            }
-            if params.get("plan_auto_approve_revisions").is_some() {
-                portable.plan_auto_approve_revisions =
-                    Some(self.session.plan_auto_approve_revisions);
                 changed = true;
             }
             if params.get("approval_timeout").is_some() {
@@ -8300,11 +8271,12 @@ impl HarnessBroker {
                 changed = true;
             }
             let revision = if changed {
-                settings.update(
-                    snapshot.revision,
-                    scope,
-                    &self.session.workspace,
-                    &self.session.id,
+                settings.patch(
+                    crate::settings::SettingTarget {
+                        scope,
+                        workspace: &self.session.workspace,
+                        session: &self.session.id,
+                    },
                     &portable,
                 )?
             } else {
@@ -8818,15 +8790,12 @@ fn preference_for_session(
         access: session.access.clone(),
         shell: session.shell,
 
-        default_approval: session.default_approval,
-        plan_approval: session.plan_approval,
         model: session.model.clone(),
         effort: session.effort.clone(),
         model_setting,
         service_tier: session.service_tier,
         plan_executor: session.plan_executor.clone(),
         plan_compact: session.plan_compact,
-        plan_auto_approve_revisions: session.plan_auto_approve_revisions,
         approval_timeout: session.approval_timeout,
         answer_timeout: session.answer_timeout,
     }
@@ -8894,6 +8863,7 @@ fn default_goal_max_turns() -> u32 {
 
 #[cfg(test)]
 mod test {
+    include!("workflow_test.rs");
     fn completed_message(
         turn: &crate::backend::TurnAddress,
         id: impl Into<String>,
@@ -8914,8 +8884,15 @@ mod test {
     }
 
     fn active_execution(broker: &HarnessBroker) -> crate::plan::PlanExecutionRecord {
-        match broker.task_controller.current().unwrap().unwrap().workflow {
-            crate::task::TaskWorkflow::Execute { execution } => execution.record,
+        match broker
+            .task_controller
+            .current()
+            .unwrap()
+            .unwrap()
+            .workflow
+            .clone()
+        {
+            crate::task::WorkflowSnapshot::Execute { execution } => execution.record,
             _ => panic!("expected an active execution"),
         }
     }
@@ -9288,7 +9265,7 @@ mod test {
         broker
             .task_controller
             .update(&mut broker.store, &active.permit(), 3, |task| {
-                if let crate::task::TaskWorkflow::Goal { goal } = &mut task.workflow {
+                if let crate::task::WorkflowSnapshot::Goal { goal } = &mut task.workflow {
                     goal.state = GoalState::Complete;
                 }
                 Ok(())
@@ -9565,7 +9542,7 @@ mod test {
                     "Cancel after native dispatch".into(),
                 )),
             );
-            let result = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 tokio::join!(execution, cancel)
             })
             .await;
@@ -10110,19 +10087,68 @@ let sink = Some(sink);
         };
         for provider in ["copilot", "claude", "antigravity", "mock", "codex"] {
             broker.session.backend = provider.into();
-            broker.session.access.sandbox = true;
             preferences.apply(&mut broker.session, true).unwrap();
             assert_eq!(broker.session.access.sandbox, provider == "codex");
-            broker
-                .configure_session(json!({"access":crate::session::AccessPolicy::default()}))
-                .await
-                .unwrap();
-            let stored = broker
-                .store
-                .load_session(&broker.session.id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(stored.access.sandbox, provider == "codex");
+            for (enabled, mode) in [
+                (true, crate::session::WindowsSandbox::Mxc),
+                (false, crate::session::WindowsSandbox::Unelevated),
+                (true, crate::session::WindowsSandbox::Elevated),
+            ] {
+                let requested = crate::session::AccessPolicy {
+                    sandbox: enabled,
+                    windows_sandbox: mode,
+                    ..Default::default()
+                };
+                broker
+                    .configure_session(json!({"access":requested,"session_policy":true}))
+                    .await
+                    .unwrap();
+                broker
+                    .apply_configuration(
+                        json!({"change":{"kind":"set_approval","mode":"allow"}}),
+                        configuration::ConfigurationCommand::Permission,
+                    )
+                    .await
+                    .unwrap();
+                for kind in [
+                    "toggle_read_scope",
+                    "toggle_read_scope",
+                    "toggle_write_enabled",
+                    "toggle_write_enabled",
+                    "toggle_write_scope",
+                    "toggle_write_scope",
+                ] {
+                    broker
+                        .apply_configuration(
+                            json!({"change":{"kind":kind}}),
+                            configuration::ConfigurationCommand::Permission,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let snapshot = broker.snapshot().unwrap();
+                assert_eq!(
+                    snapshot.session.access.sandbox,
+                    enabled && provider == "codex"
+                );
+                assert_eq!(snapshot.access_preference, requested);
+                let saved = crate::settings::SettingsStore::read_only(data.path())
+                    .unwrap()
+                    .get(&snapshot.session.workspace, &snapshot.session.id, provider)
+                    .unwrap()
+                    .desired;
+                assert_eq!(saved.access.as_ref(), Some(&requested));
+                let mut restored = snapshot.session.clone();
+                saved.apply(&mut restored, true).unwrap();
+                assert_eq!(restored.access.sandbox, enabled && provider == "codex");
+                assert_eq!(restored.access.windows_sandbox, mode);
+                restored.backend = "codex".into();
+                saved.apply(&mut restored, true).unwrap();
+                assert_eq!(
+                    restored.access.sandbox, enabled,
+                    "selected preference was lost before switching to Codex"
+                );
+            }
         }
         assert!(preferences.access.unwrap().sandbox);
     }
@@ -10163,11 +10189,11 @@ let sink = Some(sink);
         assert_eq!(broker.session.access, stored.access);
         assert!(
             broker
-                .configure_session(json!({"default_approval":"allow","effort":""}))
+                .configure_session(json!({"approval_mode":"allow","effort":""}))
                 .await
                 .is_err()
         );
-        assert_eq!(broker.session.default_approval, ApprovalMode::Ask);
+        assert_eq!(broker.session.approval_mode, ApprovalMode::Allow);
         assert!(broker.configure_session(json!({"access":{"sandbox":true,"write_access":"workspace","writable_directory":["relative"],"windows_sandbox":"elevated"}})).await.is_err());
         assert_eq!(broker.session.access, stored.access);
     }
@@ -10181,7 +10207,13 @@ let sink = Some(sink);
         broker
             .create_task(TaskKind::Goal, "First".into(), None, None)
             .unwrap();
-        let first = broker.task_controller.current().unwrap().unwrap().revision;
+        let first = broker
+            .task_controller
+            .current()
+            .unwrap()
+            .unwrap()
+            .revision
+            .clone();
         broker
             .create_task(TaskKind::Goal, "Second".into(), None, None)
             .unwrap();
@@ -10342,7 +10374,13 @@ let sink = Some(sink);
             created_at_ms: 1,
             resume_after_transition: false,
         };
-        let admitted = broker.task_controller.current().unwrap().unwrap().revision;
+        let admitted = broker
+            .task_controller
+            .current()
+            .unwrap()
+            .unwrap()
+            .revision
+            .clone();
         broker
             .task_controller
             .command(
@@ -10353,7 +10391,13 @@ let sink = Some(sink);
                 1,
             )
             .unwrap();
-        let revision = broker.task_controller.current().unwrap().unwrap().revision;
+        let revision = broker
+            .task_controller
+            .current()
+            .unwrap()
+            .unwrap()
+            .revision
+            .clone();
         broker
             .task_controller
             .command(
@@ -10469,8 +10513,7 @@ let sink = Some(sink);
         Ok(())
     }
 
-    #[cfg(windows)]
-    fn check_fixture(
+    async fn check_fixture(
         repository: &Path,
         data: &Path,
         commands: Vec<String>,
@@ -10529,13 +10572,15 @@ let sink = Some(sink);
             .prepare_entry(&broker.session.id, "Run checks".into(), Some(document), 1)
             .unwrap()
             .record;
-        broker
+        let (_, _, accepted_digest) = broker
             .plan_file
             .submit_document_revision(&broker.session.id, "check-plan", 1, 1)
             .unwrap();
         plan.state = PlanState::Accepted;
         plan.model_revision = 1;
         plan.accepted_revision = Some(1);
+        plan.review_digest = Some(accepted_digest.clone());
+        plan.accepted_digest = Some(accepted_digest);
         plan.submitted_version = Some(plan.document_version);
         broker.store.save_plan(&plan).unwrap();
         std::fs::write(repository.join(".gitignore"), "/target/\n").unwrap();
@@ -10550,21 +10595,31 @@ let sink = Some(sink);
             updated_at_ms: 1,
         };
         broker.save_session().unwrap();
+        let baseline = broker.capture_workspace_checkpoint().await.unwrap();
+        broker.store.save_checkpoint(&baseline).unwrap();
+        std::fs::write(
+            repository.join(".gate-input"),
+            "Exercise the automated gate\n",
+        )
+        .unwrap();
         let execution:PlanExecutionRecord=serde_json::from_value(json!({
+            "baseline_checkpoint":baseline.id,
+            "manual_verification":if manual { vec!["Observe manual result"] } else { Vec::new() },
             "id":"check-execution","session_id":broker.session.id,"plan_id":"check-plan","goal_id":goal.id,
             "state":"active","phase":"checking","original_revision":1,"revision":1,"generation":0,
             "lifecycle":[],"findings":[],"progress":crate::plan::execution::SemanticProgress::default(),
-            "verification":[],"check_runs":[],"revision_history":[],"review_paused":false,
-            "observed_source":{},"observed_generation":0,"observed_check":[],"created_at_ms":1
+            "verification":[],"check_runs":[],"revision_history":[],"resume_after_review":false,
+            "observed_source":{},"observed_document_version":0,"observed_check":[],"created_at_ms":1
         })).unwrap();
         broker.store.save_plan_execution(&execution).unwrap();
-        let task = crate::task::ActiveTask::execute(
+        let task = crate::task::Task::execute(
             "Run checks".into(),
             execution,
             crate::session::continuation::ContinuationBudget::new(20, 2),
             false,
             1,
-        );
+        )
+        .unwrap();
         broker
             .task_controller
             .change(
@@ -10584,7 +10639,8 @@ let sink = Some(sink);
         broker
             .task_controller
             .update(&mut broker.store, &task.permit(), 100, |task| {
-                let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow else {
+                let crate::task::WorkflowSnapshot::Execute { execution } = &mut task.workflow
+                else {
                     anyhow::bail!("check fixture has no selected execution");
                 };
                 anyhow::ensure!(execution.record.id == record.id, "check execution changed");
@@ -10609,7 +10665,8 @@ let sink = Some(sink);
                 "Write-Output 'last check'".into(),
             ],
             true,
-        );
+        )
+        .await;
         broker.run_checks().await.unwrap();
         let execution = broker
             .store
@@ -10641,24 +10698,7 @@ let sink = Some(sink);
     async fn harness_checks_reject_unplanned_public_api_without_manual_verification() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
-        let mut broker = check_fixture(repository.path(), data.path(), Vec::new(), false);
-        let baseline = crate::checkpoint::GitCheckpoint::new(&broker.session.workspace)
-            .capture(
-                &broker.store.objects,
-                &broker.repositories,
-                &broker.session.id,
-                1,
-            )
-            .await
-            .unwrap();
-        broker.store.save_checkpoint(&baseline).unwrap();
-        let mut execution = broker
-            .store
-            .load_plan_execution("check-execution")
-            .unwrap()
-            .unwrap();
-        execution.baseline_checkpoint = Some(baseline.id.clone());
-        update_check_execution(&mut broker, execution);
+        let mut broker = check_fixture(repository.path(), data.path(), Vec::new(), false).await;
         std::fs::write(
             repository.path().join("extra.rs"),
             "pub fn unplanned() {}\n",
@@ -10687,7 +10727,8 @@ let sink = Some(sink);
             data.path(),
             vec!["Write-Output 'passed'".into()],
             true,
-        );
+        )
+        .await;
         broker.run_checks().await.unwrap();
         let execution = broker
             .store
@@ -10714,7 +10755,8 @@ let sink = Some(sink);
             data.path(),
             vec!["Write-Output retained".into()],
             true,
-        );
+        )
+        .await;
         broker.run_checks().await.unwrap();
         let mut execution = broker
             .store
@@ -10769,7 +10811,8 @@ let sink = Some(sink);
             data.path(),
             vec!["Write-Output complete".into()],
             false,
-        );
+        )
+        .await;
         broker.run_checks().await.unwrap();
         let execution = broker
             .store
@@ -10791,7 +10834,7 @@ let sink = Some(sink);
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker=check_fixture(repository.path(),data.path(),vec!["New-Item target -ItemType Directory -Force | Out-Null; Add-Content target/completed.txt first".into(),
-            "Set-Content target/started.txt started; if (-not (Test-Path target/resume.txt)) { Start-Sleep 30 }; Write-Output resumed".into()],true);
+            "Set-Content target/started.txt started; if (-not (Test-Path target/resume.txt)) { Start-Sleep 30 }; Write-Output resumed".into()],true).await;
             let cancellation = broker.turn_cancellation();
             let marker = repository.path().join("target/started.txt");
             let cancel = tokio::spawn(async move {
@@ -10831,7 +10874,7 @@ let sink = Some(sink);
             broker
                 .task_controller
                 .update(&mut broker.store, &task.permit(), 100, |task| {
-                    let crate::task::TaskWorkflow::Execute { execution: active } =
+                    let crate::task::WorkflowSnapshot::Execute { execution: active } =
                         &mut task.workflow
                     else {
                         anyhow::bail!("expected an execution task");
@@ -11273,7 +11316,7 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn task_migration_preserves_plan_and_execution() -> Result<()> {
+    async fn obsolete_task_sessions_remain_hidden_without_reactivation() -> Result<()> {
         for executing in [false, true] {
             let repository = repository();
             let data = tempfile::tempdir()?;
@@ -11290,6 +11333,7 @@ let sink = Some(sink);
             broker
                 .submit_prompt(json!({"text":"/plan add a reusable API"}))
                 .await?;
+            run_plan_to_input_boundary(&mut broker).await?;
             if executing {
                 let plan = broker
                     .snapshot()?
@@ -11306,11 +11350,11 @@ let sink = Some(sink);
                 .load_active_task(&broker.session.id)?
                 .context("task missing before migration")?;
             let plan_id = match &before.workflow {
-                crate::task::TaskWorkflow::Plan { plan } => plan.artifact.id.clone(),
-                crate::task::TaskWorkflow::Execute { execution } => {
+                crate::task::WorkflowSnapshot::Plan { plan } => plan.artifact.id.clone(),
+                crate::task::WorkflowSnapshot::Execute { execution } => {
                     execution.record.plan_id.clone()
                 }
-                crate::task::TaskWorkflow::Goal { .. } => unreachable!(),
+                crate::task::WorkflowSnapshot::Goal { .. } => unreachable!(),
             };
             let title = broker.store.load_plan(&plan_id)?.unwrap().title;
             let session_id = broker.session.id.clone();
@@ -11321,12 +11365,17 @@ let sink = Some(sink);
             drop(connection);
             drop(broker);
             let migrated = SqliteStore::open(data.path())?;
-            let after = migrated
-                .load_active_task(&session_id)?
-                .context("task missing after migration")?;
+            assert!(migrated.load_session(&session_id)?.is_none());
+            assert!(migrated.load_active_task(&session_id).is_err());
+            let connection = rusqlite::Connection::open(&path)?;
+            let version: i64 = connection.query_row(
+                "SELECT json_extract(payload, '$.format_version') FROM session_record WHERE id=?1",
+                [&session_id],
+                |row| row.get(0),
+            )?;
             assert_eq!(
-                serde_json::to_value(&before.workflow)?,
-                serde_json::to_value(&after.workflow)?
+                version, 51,
+                "storage schema setup rewrote an obsolete session"
             );
             assert_eq!(migrated.load_plan(&plan_id)?.unwrap().title, title);
         }
@@ -11490,7 +11539,7 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn semantic_execution_stalls_after_two_read_only_turns_and_resumes_the_same_phase() {
+    async fn semantic_execution_stalls_after_five_read_only_turns_and_resumes_the_same_phase() {
         let repository = repository();
         crate::checks::configure_fixture(repository.path());
         let data = tempfile::tempdir().unwrap();
@@ -11521,39 +11570,53 @@ let sink = Some(sink);
             .submit_prompt(json!({"text":"/plan add a reusable API"}))
             .await
             .unwrap();
+        run_plan_to_input_boundary(&mut broker).await.unwrap();
+        let identity = broker
+            .task_controller
+            .current()
+            .unwrap()
+            .unwrap()
+            .id
+            .clone();
+        let planning_attempt_count = broker
+            .store
+            .list_exchange(&broker.session.id)
+            .unwrap()
+            .len();
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
         broker.backend = Arc::new(NoProgressExecutionBackend);
-        let (_, first) = broker
+        broker
             .dispatch_session_command(
                 "session.plan.accept",
                 json!({"plan_id":plan.id,"approval_mode":"ask"}),
             )
             .unwrap();
-        assert!(
-            first
-                .iter()
-                .any(|event| event.event == "goal_continue_requested")
-        );
-        let (_, second) = broker
-            .dispatch_session_command("session.command.apply", json!({"action":"continue"}))
-            .unwrap();
-        assert!(
-            !second
-                .iter()
-                .any(|event| event.event == "goal_continue_requested")
-        );
+        for turn in 1..=5 {
+            dispatch_pending_task_input(&mut broker).await.unwrap();
+            let current = broker.task_controller.current().unwrap().unwrap();
+            assert_eq!(current.id, identity);
+            assert_eq!(
+                current.status(),
+                if turn < 5 {
+                    crate::task::TaskStatus::Running
+                } else {
+                    crate::task::TaskStatus::Blocked
+                }
+            );
+        }
         let stalled = active_execution(&broker);
         assert_eq!(stalled.state, PlanExecutionState::Stalled);
         assert_eq!(stalled.phase, crate::plan::PlanPhase::Implement);
         assert!(stalled.completed_at_ms.is_none());
-        assert_eq!(broker.active_goal().unwrap().continuation.turn_count, 2);
+        assert_eq!(broker.active_goal().unwrap().continuation.turn_count, 6);
         let attempts = broker
             .store
             .list_exchange(&broker.session.id)
             .unwrap()
             .into_iter()
+            .skip(planning_attempt_count)
             .collect::<Vec<_>>();
-        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts.len(), 5);
         assert_ne!(attempts[0].id, attempts[1].id);
         assert_eq!(attempts[0].state(), ExchangeState::Complete);
         assert!(
@@ -11570,6 +11633,7 @@ let sink = Some(sink);
         broker
             .dispatch_session_command("session.goal.resume", json!({}))
             .unwrap();
+        dispatch_pending_task_input(&mut broker).await.unwrap();
         let resumed = active_execution(&broker);
         assert_eq!(resumed.id, stalled.id);
         assert_eq!(resumed.state, PlanExecutionState::Active);
@@ -12486,16 +12550,19 @@ let sink = Some(sink);
                 )?;
                 let mut plan = prepared.record;
                 plan.state = PlanState::AwaitingReview;
+                plan.model_revision = 1;
+                plan.submitted_version = Some(plan.document_version);
+                plan.review_digest = Some("submitted-review".into());
                 broker.store.save_plan(&plan)?;
-                crate::task::ActiveTask::plan(plan, 1)
+                crate::task::Task::plan(plan, 1)?
             } else {
-                let mut task = crate::task::ActiveTask::goal(
+                let mut task = crate::task::TaskSnapshot::goal(
                     "Preserve the goal".into(),
                     crate::session::continuation::ContinuationBudget::new(12, 3),
                     true,
                     1,
                 );
-                if let crate::task::TaskWorkflow::Goal { goal } = &mut task.workflow {
+                if let crate::task::WorkflowSnapshot::Goal { goal } = &mut task.workflow {
                     goal.state = match status {
                         "running" => GoalState::Active,
                         "paused" => GoalState::Paused,
@@ -12504,7 +12571,7 @@ let sink = Some(sink);
                     };
                     goal.continuation.turn_count = 2;
                 }
-                task
+                crate::task::Task::try_from(task)?
             };
             broker.task_controller.change(
                 &mut broker.store,
@@ -15185,7 +15252,6 @@ let sink = Some(sink);
             effort: "low".into(),
             plan_executor: Default::default(),
             plan_compact: false,
-            plan_auto_approve_revisions: true,
             approval_timeout: Default::default(),
             answer_timeout: Default::default(),
             context_window: None,
@@ -15194,8 +15260,6 @@ let sink = Some(sink);
             shell: Default::default(),
             approval_mode: ApprovalMode::Ask,
             active_task: None,
-            default_approval: ApprovalMode::Ask,
-            plan_approval: None,
             created_at_ms: 0,
             updated_at_ms: 0,
 
@@ -15226,15 +15290,12 @@ let sink = Some(sink);
             Some(HarnessPreference {
                 access: Default::default(),
                 shell: Default::default(),
-                default_approval: ApprovalMode::Ask,
-                plan_approval: None,
                 model: "other-model".into(),
                 effort: "high".into(),
                 model_setting,
                 service_tier: crate::backend::ServiceTier::Standard,
                 plan_executor: Default::default(),
                 plan_compact: false,
-                plan_auto_approve_revisions: true,
                 approval_timeout: Default::default(),
                 answer_timeout: Default::default(),
             }),
@@ -15326,7 +15387,7 @@ let sink = Some(sink);
                 "task continuation was replaced"
             );
             (
-                continuation.instruction.clone(),
+                continuation.work.instruction().unwrap().to_owned(),
                 crate::input::InputPurpose::TaskContinuation {
                     revision: task.revision.clone(),
                     id: continuation.id.clone(),
@@ -15381,7 +15442,7 @@ let sink = Some(sink);
                 .task_controller
                 .current()?
                 .context("planning owner disappeared")?;
-            let crate::task::TaskWorkflow::Plan { plan } = &task.workflow else {
+            let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow else {
                 anyhow::bail!("plan test owner changed")
             };
             if matches!(
@@ -15428,13 +15489,13 @@ let sink = Some(sink);
             );
             broker.task_controller.admit(crate::task::TaskKind::Plan)?;
             broker.input_purpose = crate::input::InputPurpose::TaskContinuation {
-                revision: task.revision,
+                revision: task.revision.clone(),
                 id: continuation.id,
                 completed_turn_id: turn.id.clone(),
                 reason: continuation.reason,
             };
             let result = broker
-                .submit_prompt_inner(json!({"text":continuation.instruction}))
+                .submit_prompt_inner(json!({"text":continuation.work.instruction().unwrap()}))
                 .await;
             broker.input_purpose = crate::input::InputPurpose::User;
             result?;
@@ -17863,7 +17924,7 @@ let sink = Some(sink);
             HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(100)))
                 .unwrap();
         assert_eq!(initial.session.approval_mode, ApprovalMode::Ask);
-        initial.session.approval_mode = ApprovalMode::Ask;
+        initial.session.approval_mode = ApprovalMode::Allow;
         initial.save_session().unwrap();
         let original_id = initial.session.id.clone();
         let mut settings = crate::settings::SettingsStore::open(data.path()).unwrap();
@@ -17877,7 +17938,7 @@ let sink = Some(sink);
                 .unwrap();
         assert_eq!(resumed.session.id, original_id);
         assert_eq!(resumed.session.model, "original-model");
-        assert_eq!(resumed.session.approval_mode, ApprovalMode::Ask);
+        assert_eq!(resumed.session.approval_mode, ApprovalMode::Allow);
         let created = resumed
             .dispatch(Request {
                 id: 1,
@@ -19334,7 +19395,7 @@ let sink = Some(sink);
             .change(
                 &mut broker.store,
                 None,
-                crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+                crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                     "Current task".into(),
                     Default::default(),
                     false,

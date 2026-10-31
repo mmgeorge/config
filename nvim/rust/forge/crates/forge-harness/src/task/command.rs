@@ -139,8 +139,8 @@ pub(crate) struct ResumeRequest {
 
 impl SessionCommand {
     /// Promote a current full submission when the task enables automatic acceptance.
-    pub(crate) fn approved_revision(task: &super::ActiveTask) -> Result<Option<Self>> {
-        let super::TaskWorkflow::Plan { plan } = &task.workflow else {
+    pub(crate) fn approved_revision(task: &super::Task) -> Result<Option<Self>> {
+        let super::WorkflowSnapshot::Plan { plan } = &task.workflow else {
             return Ok(None);
         };
         if !task.auto_accept_plan
@@ -689,7 +689,7 @@ mod tests {
             "state":"revising","working_path":"","document_version":2,
             "model_revision":1,"user_revision":1,"created_at_ms":1,"updated_at_ms":1
         }))?;
-        let mut task = super::super::ActiveTask::plan(record, 1);
+        let mut task = super::super::TaskSnapshot::plan(record, 1);
         task.auto_accept_plan = true;
         task.plan_execution = Some(crate::task::PlanExecutionChoice {
             execution: super::super::ExecutionEntry {
@@ -701,25 +701,37 @@ mod tests {
         });
         task.request_entry("Apply feedback".into(), 1)?;
         task.entry.as_mut().unwrap().delivery = super::super::TaskInputDelivery::Accepted;
-        assert!(SessionCommand::approved_revision(&task)?.is_none());
-        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+        assert!(
+            SessionCommand::approved_revision(&super::super::Task::try_from(task.clone())?)?
+                .is_none()
+        );
+        let super::super::WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
             unreachable!()
         };
         plan.artifact.state = crate::plan::PlanState::AwaitingReview;
         plan.artifact.model_revision = 2;
         plan.artifact.review_digest = Some("revised".into());
-        assert!(SessionCommand::approved_revision(&task)?.is_none());
-        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+        assert!(
+            SessionCommand::approved_revision(&super::super::Task::try_from(task.clone())?)?
+                .is_none(),
+            "a saved review draft requires explicit review before automatic execution"
+        );
+        let super::super::WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
             unreachable!()
         };
         plan.artifact.submitted_version = Some(2);
         plan.paused = true;
-        assert!(SessionCommand::approved_revision(&task)?.is_none());
-        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+        assert!(
+            SessionCommand::approved_revision(&super::super::Task::try_from(task.clone())?)?
+                .is_none()
+        );
+        let super::super::WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
             unreachable!()
         };
         plan.paused = false;
-        let recovered = serde_json::from_value(serde_json::to_value(&task)?)?;
+        let recovered = serde_json::from_value(serde_json::to_value(
+            super::super::Task::try_from(task.clone())?,
+        )?)?;
         let command = SessionCommand::approved_revision(&recovered)?.unwrap();
         assert_eq!(command.action.to_params()?["approval_mode"], "deny");
         assert_eq!(command.action.to_params()?["plan_compact"], true);
@@ -730,19 +742,25 @@ mod tests {
         );
         assert_eq!(
             command.operation_id,
-            SessionCommand::approved_revision(&task)?
+            SessionCommand::approved_revision(&super::super::Task::try_from(task.clone())?)?
                 .unwrap()
                 .operation_id
         );
-        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+        let super::super::WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
             unreachable!()
         };
         plan.artifact.model_revision = 3;
-        assert!(SessionCommand::approved_revision(&task)?.is_some());
+        assert!(
+            SessionCommand::approved_revision(&super::super::Task::try_from(task.clone())?)?
+                .is_some()
+        );
         task.auto_accept_plan = false;
-        assert!(SessionCommand::approved_revision(&task)?.is_none());
+        assert!(
+            SessionCommand::approved_revision(&super::super::Task::try_from(task.clone())?)?
+                .is_none()
+        );
         task.auto_accept_plan = true;
-        let super::super::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+        let super::super::WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
             unreachable!()
         };
         crate::plan::state_machine::PlanStateMachine::apply(
@@ -750,7 +768,10 @@ mod tests {
             crate::plan::state_machine::PlanEvent::Cancelled,
             3,
         )?;
-        assert!(SessionCommand::approved_revision(&task)?.is_none());
+        assert!(
+            SessionCommand::approved_revision(&super::super::Task::try_from(task.clone())?)?
+                .is_none()
+        );
         Ok(())
     }
 

@@ -196,6 +196,8 @@ local function status_text()
   local abbreviation = state.access_abbreviation or "rxw"
   local policy_label = abbreviation .. (({ deny = "dx", allow = "ax" })[approval] or "")
     .. (state.check_editing and "ce" or "")
+    .. (current_task and (current_task.kind == "plan" or current_task.kind == "execute")
+      and current_task.auto_accept_plan and "pa" or "")
   local yolo = abbreviation == "rxwx" and approval == "allow"
     and (active_session.access or {}).sandbox == false
   local configured_model = active_session.model or config.options.harness.model
@@ -203,11 +205,6 @@ local function status_text()
   local effort = selected_setting(state, "effort")
   local selected_model = selected_setting(state, "model")
   if selected_model ~= configured_model then model = selected_model end
-  local busy = state.host_error and "host stopped"
-    or state.cancel_requested and "cancelling"
-    or #(state.pending_submit or {}) > 0 and "submitting"
-    or state.busy and ""
-    or (#state.queue > 0 and ("queued " .. #state.queue) or "")
   local tier = selected_setting(state, "service_tier")
   local speed_icon = ({ fast = "󱐌", ultrafast = "󱐋" })[tier]
   local deferred = state.configuration_completion and state.configuration_completion.deferred
@@ -236,27 +233,14 @@ local function status_text()
     append_status(model_text, "ForgeStatusLabel")
   end
   local selected_run = selected_agent_run(state)
-  append_status(selected_run and (selected_run.nickname or selected_run.definition) or "Main", "ForgeStatusLabel")
+  if selected_run then append_status(selected_run.nickname or selected_run.definition, "ForgeStatusLabel") end
   if state.connection_error then
     append_status(state.connection_error, "ForgeHarnessGoal")
   elseif state.sync_error then
     append_status("State unavailable: " .. state.sync_error, "ForgeHarnessGoal")
-  elseif state.task_operation and workflow_action[state.task_operation.action]
-    and state.task_operation.state ~= "running" then
-    append_status("Task " .. state.task_operation.state, "ForgeHarnessGoal")
   elseif current_task then
-    append_status(current_task.kind, "ForgeHarnessGoal")
-    append_status(task_control.phase(current_task), "ForgeHarnessGoal")
-    if task_control.status(current_task) ~= "running" then append_status(task_control.status(current_task), "ForgeHarnessGoal") end
+    append_status(task_control.label(current_task), "ForgeHarnessGoal")
   end
-  if current_task and (current_task.kind == "plan" or current_task.kind == "execute") then
-    append_status("Auto-accept: " .. (current_task.auto_accept_plan and "on" or "off"), "ForgeHarnessGoal")
-  end
-  local artifact_count = #(state.artifact or {})
-  if artifact_count > 0 then
-    append_status(("%d %s"):format(artifact_count, artifact_count == 1 and "artifact" or "artifacts"), "ForgeStatusLabel")
-  end
-  append_status(busy, "ForgeStatusLabel")
   if state.configuration_error then
     append_status("Settings rejected: " .. state.configuration_error:gsub("%s+", " "), "ForgeHarnessToolFailure")
   end
@@ -269,6 +253,14 @@ function M.refresh_winbar()
   local active_session = not state.initial_snapshot_pending and state.session or nil
   tabline.set_session_name(state.timeline_tab, active_session and active_session.name)
   local right_status = context_status.segment(active_session and active_session.context_usage) or {}
+  local artifact_count = active_session and #(state.artifact or {}) or 0
+  if artifact_count > 0 then
+    if #right_status > 0 then table.insert(right_status, 1, keymaps.winbar_separator) end
+    table.insert(right_status, 1, {
+      text = ("%d %s"):format(artifact_count, artifact_count == 1 and "artefact" or "artefacts"),
+      group = "ForgeStatusLabel",
+    })
+  end
   for _, hint in ipairs(keymaps.view_hint_entries("harness", state.command_set, state, "queue_edit")) do
     if #right_status > 0 then right_status[#right_status + 1] = keymaps.winbar_separator end
     right_status[#right_status + 1] = { text = hint.key, group = "ForgeStatusHintKey" }
@@ -2378,19 +2370,7 @@ function M.configure(next_config, validate_selection, completed)
     if field ~= "approval_timeout" and field ~= "answer_timeout" then timeout_only = false end
   end
   if timeout_only then
-    local session_id = state.session.id
-    client.request({ session_id = session_id, method = "session.input.timeout.configure", params = next_config }, function(result, failure)
-      if failure then
-        report_configuration_error(failure)
-        if completed then completed(false) end
-        return
-      end
-      if state.session.id == session_id then
-        state.session.approval_timeout = result.approval_timeout
-        state.session.answer_timeout = result.answer_timeout
-      end
-      if completed then completed(true) end
-    end)
+    require("forge.views.harness.timeout_configuration").configure(state, next_config, completed, report_configuration_error)
     return
   end
   configure_now(next_config, validate_selection, completed)

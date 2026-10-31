@@ -60,6 +60,21 @@ change("background-speed")
 assert(preferences.models.codex.service_tier == "fast")
 change("background-compact")
 assert(not preferences.auto_compaction.enabled)
+for index, expected in ipairs({ 64000, 128000, 256000, 512000 }) do
+  local instance = picker._state_for_test()
+  for row_index, row in ipairs(instance.spec.page_list[1].option_list) do
+    if row.id == "background-threshold" then instance.state.selected_index_by_page.models = row_index end
+  end
+  picker.update(instance.spec)
+  instance.spec.on_field_action({ field = option("background-threshold") }, "activate", 1)
+  local choice = picker._state_for_test()
+  local rows = choice.spec.page_list[1].option_list
+  assert(#rows == 4 and rows[index].value == expected, "threshold selector omitted a preset")
+  choice.spec.on_confirm({ option = rows[index] })
+  assert(preferences.auto_compaction.threshold_tokens == expected)
+  assert(picker.is_open("harness-config"), "threshold selection did not return to config")
+  assert(option("background-threshold").value == tostring(expected / 1000) .. "k")
+end
 picker._state_for_test().spec.on_field_action({ field = option("background-model") }, "activate", 1)
 local model_picker = picker._state_for_test()
 model_picker.spec.on_confirm({ option = { value = { id = "second-model", picker_reasoning = "high" } } })

@@ -36,17 +36,25 @@ local success, failure = xpcall(function()
   require("forge").setup({ diff_logging = false, harness_logging = false, harness = { backend = "mock" } })
   require("forge.views.harness").open()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
-  assert(state.session.plan_auto_approve_revisions == true)
-  local configured = request("session.configure", { plan_auto_approve_revisions = false })
-  assert(configured.plan_auto_approve_revisions == false)
+  assert(state.session.approval_mode == "ask", "new sessions must start in Ask")
+  controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "allow" } })
+  await(function() return state.session.approval_mode == "allow" and not state.busy end, "Approve mode did not apply")
+  local session_id = state.session.id
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan build the feature" })
   controller.submit()
   await(function() return not state.busy and state.active_plan and state.active_plan.state == "awaiting_review" end, "Plan did not arrive")
+  assert(state.session.active_task.auto_accept_plan == false, "New Plan tasks must require review")
+  assert(state.session.approval_mode == "allow", "entering Plan changed the active permission mode")
+  local task_id = state.session.active_task.id
   local plan = state.active_plan
-  request("session.plan.accept", { plan_id = plan.id, digest = plan.review_digest, approval_mode = "ask" })
+  request("session.plan.accept", { plan_id = plan.id, digest = plan.review_digest })
   await(function() return not state.busy and state.session.active_task
     and state.session.active_task.execution.record.state == "stalled" end, "Mock implementation did not stop at its continuation guard")
   local snapshot = request("session.state.get", {})
+  assert(snapshot.session.id == session_id and snapshot.session.active_task.id == task_id,
+    "Plan to Execute replaced the session or task")
+  assert(snapshot.session.approval_mode == "allow", "Plan to Execute reset the active permission mode")
+  assert(snapshot.session.active_task.auto_accept_plan == false, "Manual acceptance must preserve task policy")
   local execution = snapshot.session.active_task.execution.record
   assert(execution.phase == "implement")
   assert(execution.state == "stalled")

@@ -744,7 +744,7 @@ mod test {
 
     #[tokio::test]
     async fn goal_controls_follow_live_session_authority_and_reject_stale_results() {
-        use crate::task::{ActiveTask, SessionTaskController, TaskChange};
+        use crate::task::{SessionTaskController, Task, TaskChange};
         let (_root, mut store, controller) = SessionTaskController::test_goal();
         let initial = controller.current().unwrap().unwrap();
         controller
@@ -763,7 +763,7 @@ mod test {
             .change(
                 &mut store,
                 None,
-                TaskChange::Install(Box::new(ActiveTask::goal(
+                TaskChange::Install(Box::new(Task::goal(
                     "Promoted goal".into(),
                     Default::default(),
                     false,
@@ -789,7 +789,7 @@ mod test {
             .change(
                 &mut store,
                 Some(&goal.revision),
-                TaskChange::Install(Box::new(ActiveTask::goal(
+                TaskChange::Install(Box::new(Task::goal(
                     "Replacement goal".into(),
                     Default::default(),
                     false,

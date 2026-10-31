@@ -11,6 +11,8 @@ local render = require("forge.views.picker.render")
 local search_input = require("forge.views.picker.search_input")
 local picker_state = require("forge.views.picker.state")
 local picker_window = require("forge.views.picker.window")
+local page_navigation = require("forge.views.picker.page_navigation")
+local field_input = require("forge.views.picker.field_input")
 
 local active = nil
 local install_action_keymaps
@@ -20,11 +22,34 @@ local function valid_window(win)
   return win and vim.api.nvim_win_is_valid(win)
 end
 
----@param spec { height_ratio?: number, fit_content?: boolean }
+local function picker_keys(instance, command)
+  return keymaps.view_keys_for("picker", command, instance.spec.keymaps)
+end
+
+local function close_field_editor(instance)
+  local editor = instance.field_editor
+  if not editor then return end
+  instance.field_editor = nil
+  field_input.close(editor)
+end
+
+local function fixed_dimension(size, ratio)
+  assert(type(ratio) == "number" and ratio > 0 and ratio <= 1,
+    "picker size ratio must be greater than zero and at most one")
+  return math.max(1, math.min(size - 2, math.floor(size * ratio) - 2))
+end
+
+local function window_width(spec, host_width)
+  if spec.width_ratio then return fixed_dimension(host_width, spec.width_ratio) end
+  return spec.size_ratio and fixed_dimension(host_width, spec.size_ratio) or math.max(30, host_width - 2)
+end
+
+---@param spec { size_ratio?: number, height_ratio?: number, fit_content?: boolean }
 ---@param content_height integer
 ---@param host_height integer
 ---@return integer
 local function window_height(spec, content_height, host_height)
+  if spec.size_ratio then return fixed_dimension(host_height, spec.size_ratio) end
   local available = math.max(4, host_height - 2)
   if spec.height_ratio ~= nil then
     assert(type(spec.height_ratio) == "number" and spec.height_ratio > 0 and spec.height_ratio <= 1,
@@ -36,8 +61,8 @@ end
 
 local function title_chunks(instance, width)
   local page = picker_state.page(instance.state, instance.spec)
-  local title = page.title or instance.spec.title or "Select"
-  local counter = #instance.spec.page_list > 1
+  local title = instance.spec.page_navigation and instance.spec.title or page.title or instance.spec.title or "Select"
+  local counter = not instance.spec.page_navigation and #instance.spec.page_list > 1
       and (" %d/%d "):format(instance.state.page_index, #instance.spec.page_list)
     or ""
   local chunks = {
@@ -105,7 +130,7 @@ local function input_footer(instance)
   local input_actions = action_list(instance, true)
   local overridden = {}
   for _, action in ipairs(input_actions) do
-    for _, key in ipairs(action.command and keymaps.view_keys_for("picker", action.command) or { action.key }) do
+    for _, key in ipairs(action.command and picker_keys(instance, action.command) or { action.key }) do
       overridden[key] = true
     end
   end
@@ -114,11 +139,11 @@ local function input_footer(instance)
     { id = "feedback", label = "options" },
     { id = "clear_input", label = "clear" },
   }) do
-    local key = keymaps.view_keys_for("picker", command.id)[1]
+    local key = picker_keys(instance, command.id)[1]
     if key and not overridden[key] then segment_list[#segment_list + 1] = key .. " " .. command.label end
   end
   for _, action in ipairs(input_actions) do
-    local key = action.command and keymaps.view_keys_for("picker", action.command)[1] or action.key
+    local key = action.command and picker_keys(instance, action.command)[1] or action.key
     if key then segment_list[#segment_list + 1] = key .. " " .. (action.label or action.desc or action.id or "action") end
   end
   return table.concat(segment_list, "  ")
@@ -191,7 +216,7 @@ end
 local function notify_selection(instance, force)
   if not instance.spec.on_change then return end
   local context = selection_context(instance)
-  local identity = (context.option and tostring(context.option.id or context.option.value or context.option.label) or "")
+  local identity = context.page.id .. ":" .. (context.option and tostring(context.option.id or context.option.value or context.option.label) or "")
     .. (context.field and (":" .. context.field.id) or "")
   if not force and instance.notified_identity == identity
     and instance.notified_preview_height == context.preview_height then return end
@@ -200,25 +225,122 @@ local function notify_selection(instance, force)
   instance.spec.on_change(context, Picker)
 end
 
+--- Resolve category keys without shadowing row, field, or close commands.
+function Picker._navigation_keys(instance)
+  local reserved = {}
+  local result = vim.tbl_extend("force", {}, instance.spec.keymaps or {}, { page_previous = {}, page_next = {} })
+  local page = picker_state.page(instance.state, instance.spec)
+  if page.search then reserved["/"] = true end
+  local command_list = { "previous", "next", "select", "scroll_previous", "scroll_next", "focus_input", "close", "help" }
+  if not page.field_navigation then command_list[#command_list + 1] = "feedback" end
+  if page.field_navigation then
+    vim.list_extend(command_list, { "next_field", "previous_field", "previous_value", "next_value", "toggle_field" })
+  end
+  for _, command in ipairs(command_list) do
+    for _, key in ipairs(picker_keys(instance, command)) do
+      reserved[vim.api.nvim_replace_termcodes(key, true, true, true)] = true
+    end
+  end
+  for _, command in ipairs({ "page_previous", "page_next" }) do
+    for _, key in ipairs(picker_keys(instance, command)) do
+      local encoded = vim.api.nvim_replace_termcodes(key, true, true, true)
+      if not reserved[encoded] then
+        result[command][#result[command] + 1] = key
+        reserved[encoded] = true
+      end
+    end
+  end
+  return result
+end
+
+--- Build configuration hints from the same effective bindings used by the commands.
+function Picker._navigation_footer(instance)
+  local category = Picker._navigation_keys(instance)
+  local parts = {}
+  local category_keys = vim.list_extend(vim.deepcopy(category.page_previous), category.page_next)
+  if #category_keys > 0 then parts[#parts + 1] = table.concat(category_keys, "/") .. " category" end
+  local page = picker_state.page(instance.state, instance.spec)
+  local multiple_fields = false
+  for _, option in ipairs(page.option_list) do
+    if #(option.fields or {}) > 1 then multiple_fields = true break end
+  end
+  for _, entry in ipairs({
+    { "previous", "row" }, { "next_field", "field" }, { "next_value", "value" },
+    { "toggle_field", "toggle" }, { "select", page.toggle_on_confirm and "toggle/edit" or "edit/open" }, { "close", "close" },
+  }) do
+    local key = picker_keys(instance, entry[1])[1]
+    if key and (entry[1] ~= "next_field" or multiple_fields)
+      and (entry[1] ~= "toggle_field" or not page.toggle_on_confirm) then
+      parts[#parts + 1] = key .. " " .. entry[2]
+    end
+  end
+  return table.concat(parts, "  ")
+end
+
+--- Show the effective Normal-mode bindings, including aliases and caller actions.
+local function show_help(instance)
+  if valid_window(instance.help_win) then
+    vim.api.nvim_set_current_win(instance.help_win)
+    return
+  end
+  local page = picker_state.page(instance.state, instance.spec)
+  local bindings, by_description = {}, {}
+  local confirm_keys = picker_keys(instance, "select")
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(instance.buf, "n")) do
+    local description = mapping.desc
+    if page.toggle_on_confirm and vim.tbl_contains(confirm_keys, mapping.lhs) then
+      description = "Toggle, edit, or open the selected setting"
+    end
+    if description and description ~= "" then
+      local binding = by_description[description]
+      if not binding then
+        binding = { keys = {}, spec = { desc = description } }
+        by_description[description] = binding
+        bindings[#bindings + 1] = binding
+      end
+      binding.keys[#binding.keys + 1] = mapping.lhs == " " and "<Space>" or mapping.lhs
+    end
+  end
+  table.sort(bindings, function(first, second) return first.spec.desc < second.spec.desc end)
+  for _, binding in ipairs(bindings) do table.sort(binding.keys) end
+  instance.help_win = keymaps.show_bindings_help(bindings, (instance.spec.title or page.title or "Picker") .. " help",
+    { zindex = 100, wrap = true })
+end
+
 local function render_view(instance)
   if not (valid_window(instance.win) and vim.api.nvim_buf_is_valid(instance.buf)) then return end
   local page = picker_state.page(instance.state, instance.spec)
   local bounds = layout.host_bounds(instance.spec.host.window_list)
-  local width = math.max(30, bounds.width - 2)
+  local width = window_width(instance.spec, bounds.width)
   local selected = picker_state.selected_index(instance.state, instance.spec)
+  if instance.field_editor then
+    local option = picker_state.selected_option(instance.state, instance.spec)
+    if instance.field_editor.page_id ~= page.id or not option or option.id ~= instance.field_editor.option_id then
+      close_field_editor(instance)
+    end
+  end
   local input_visible = instance.input_visible == true
-  local footer = page.footer
-  if not input_visible then
+  local help_only = instance.spec.hint_mode == "help"
+  local footer = help_only and (table.concat(picker_keys(instance, "help"), "/") .. " help")
+    or instance.spec.page_navigation and Picker._navigation_footer(instance) or page.footer
+  if not input_visible and not help_only then
     for _, action in ipairs(instance.spec.host.action_list or {}) do
       if action.key and action.label then footer = (footer or "") .. "  " .. action.key .. " " .. action.label end
     end
   end
-  local frame = layout.build(page, selected, width, {
+  local available_height = window_height(instance.spec, math.huge, bounds.height)
+  local geometry = page_navigation.measure(instance.spec.page_list, instance.spec.page_navigation, width, available_height)
+  local wrap_footer = instance.spec.page_navigation
+    and vim.fn.strdisplaywidth(footer or "") > geometry.content_width - 4
+  local frame = layout.build(page, selected, geometry.content_width, {
     input_visible = input_visible,
     search_visible = (not page.search or not page.search.start_in_normal
       or instance.search_visible or valid_window(instance.search_win)) == true,
     footer = input_visible and input_footer(instance) or footer,
+    wrap_footer = wrap_footer,
     field_by_option = instance.state.field_by_page[page.id] or {},
+    field_message = instance.field_editor and (instance.field_editor.error
+      or instance.field_editor.pending and "Saving setting…") or nil,
   })
   frame.chosen_index_set = {}
   frame.option_highlight_by_index = {}
@@ -234,36 +356,42 @@ local function render_view(instance)
     end
   end
   frame.input_height = page.input_height or config.options.picker.input_height
-  local height = window_height(instance.spec, #frame.lines, bounds.height)
+  local height = window_height(instance.spec, math.max(#frame.lines + geometry.header_height, geometry.minimum_height), bounds.height)
   local border_footer
-  if #frame.lines > height then
+  if not wrap_footer and (#frame.lines > height - geometry.header_height or instance.spec.page_navigation) then
     border_footer = vim.trim(table.remove(frame.lines, frame.footer_line))
     frame.footer_line = nil
   end
   local previous = instance.frame and instance.frame.page_id == page.id and instance.frame or nil
   local option_offset = previous and previous.selected_index == selected
     and (instance.option_offset or previous.option_offset) or 0
-  frame = layout.viewport(frame, height, previous and previous.viewport_top,
+  frame = layout.viewport(frame, math.max(1, height - geometry.header_height), previous and previous.viewport_top,
     instance.content_offset or (previous and previous.content_offset),
-    option_offset)
+    option_offset, instance.spec.size_ratio ~= nil)
+  frame = page_navigation.compose(frame, geometry, instance.spec.page_list, instance.state.page_index)
   frame.page_id = page.id
   instance.content_offset = nil
   instance.option_offset = nil
   instance.frame = frame
-  if frame.option_scroll_max > 0 then
-    local scroll_keys = vim.list_extend(keymaps.view_keys_for("picker", "scroll_previous"),
-      keymaps.view_keys_for("picker", "scroll_next"))
+  if frame.option_scroll_max > 0 and not help_only then
+    local scroll_keys = vim.list_extend(picker_keys(instance, "scroll_previous"),
+      picker_keys(instance, "scroll_next"))
     border_footer = table.concat(scroll_keys, "/") .. " scroll  " .. (border_footer or footer or "")
   end
-  picker_window.resize(instance.win, instance.spec.host, width, height, title_chunks(instance, width), border_footer)
+  picker_window.resize(instance.win, instance.spec.host, width, height, title_chunks(instance, width), border_footer,
+    instance.spec.placement or (instance.spec.size_ratio and "center" or nil))
   render.apply(instance.buf, frame)
+  if instance.field_editor and not field_input.resize(instance.field_editor, instance.win, frame) then
+    close_field_editor(instance)
+  end
   if valid_window(instance.search_win) then search_input.resize(instance.search_win, instance.win, frame) end
   if valid_window(instance.input_win) then input.resize(instance.input_win, instance.win, frame) end
   popup_window.set_cursor_hidden(instance.win, true)
   popup_window.set_focusable(instance.win, true)
   local selected_range = frame.option_range[selected]
   if selected_range then
-    vim.api.nvim_win_set_cursor(instance.win, { selected_range.first, 0 })
+    vim.api.nvim_win_set_cursor(instance.win, { selected_range.first,
+      frame.body_start_by_line and frame.body_start_by_line[selected_range.first] or 0 })
     vim.api.nvim_win_call(instance.win, function() vim.fn.winrestview({ topline = 1 }) end)
   else
     vim.api.nvim_win_set_cursor(instance.win, { 1, 0 })
@@ -372,7 +500,7 @@ local function open_input(instance, kind)
     instance.state.draft_by_page[page.id] or "",
     instance.origin
   )
-  for _, key in ipairs(keymaps.view_keys_for("picker", "submit_input")) do
+  for _, key in ipairs(picker_keys(instance, "submit_input")) do
     vim.keymap.set({ "n", "i" }, key, function() submit_input(instance) end, {
       buffer = instance.input_buf,
       silent = true,
@@ -380,7 +508,7 @@ local function open_input(instance, kind)
       desc = "Submit picker input",
     })
   end
-  for _, key in ipairs(keymaps.view_keys_for("picker", "focus_input")) do
+  for _, key in ipairs(picker_keys(instance, "focus_input")) do
     vim.keymap.set("n", key, function() focus_picker(instance) end, {
       buffer = instance.input_buf,
       silent = true,
@@ -388,7 +516,7 @@ local function open_input(instance, kind)
       desc = "Return to picker options",
     })
   end
-  for _, key in ipairs(keymaps.view_keys_for("picker", "feedback")) do
+  for _, key in ipairs(picker_keys(instance, "feedback")) do
     vim.keymap.set({ "n", "i" }, key, function()
       after_input_mapping(instance, function() focus_picker(instance) end)
     end, {
@@ -398,7 +526,7 @@ local function open_input(instance, kind)
       desc = "Return to picker options",
     })
   end
-  for _, key in ipairs(keymaps.view_keys_for("picker", "clear_input")) do
+  for _, key in ipairs(picker_keys(instance, "clear_input")) do
     vim.keymap.set({ "n", "i" }, key, function()
       after_input_mapping(instance, function() clear_input(instance) end)
     end, {
@@ -412,15 +540,64 @@ local function open_input(instance, kind)
   focus_input(instance, true)
 end
 
+local function start_field_edit(instance, context)
+  if instance.field_editor then field_input.focus(instance.field_editor) return end
+  local function cancel()
+    if instance ~= active or not instance.field_editor or instance.field_editor.pending then return end
+    close_field_editor(instance)
+    render_view(instance)
+    focus_picker(instance)
+  end
+  local function submit()
+    local editor = instance.field_editor
+    if instance ~= active or not editor or editor.pending then return end
+    local selected = selection_context(instance)
+    if not selected.field or selected.field.id ~= editor.field_id or selected.page.id ~= editor.page_id
+      or selected.option.id ~= editor.option_id then cancel() return end
+    local parsed = field_input.parse(editor, selected.field)
+    editor.error = parsed.error or selected.field.disabled_reason
+    if editor.error then render_view(instance) field_input.focus(editor) return end
+    editor.pending = true
+    vim.cmd("stopinsert")
+    vim.bo[editor.buffer].modifiable = false
+    render_view(instance)
+    local settled = false
+    local function complete(failure)
+      if settled or instance ~= active or instance.field_editor ~= editor then return end
+      settled = true
+      if failure then
+        editor.pending, editor.error = false, failure
+        vim.bo[editor.buffer].modifiable = not editor.choice
+        render_view(instance)
+        field_input.focus(editor)
+      else
+        close_field_editor(instance)
+        render_view(instance)
+        focus_picker(instance)
+      end
+    end
+    local success, failure = pcall(instance.spec.on_field_submit, selected, parsed.value, complete)
+    if not success then complete(tostring(failure)) end
+  end
+  instance.field_editor = field_input.open(instance.win, instance.frame, context, { submit = submit, cancel = cancel })
+end
+
 local function field_action(instance, action, direction)
   local context = selection_context(instance)
   local field, option = context.field, context.option
   if not field or not option then return false end
   if action == "toggle" and field.kind ~= "toggle" then return true end
   if action == "change" and field.kind ~= "choice" and field.kind ~= "input" then return true end
-  if action == "activate" and field.kind == "toggle" then return true end
+  if action == "activate" and field.kind == "toggle" then
+    if not context.page.toggle_on_confirm then return true end
+    action = "toggle"
+  end
   local failure = field.disabled_reason or option.disabled_reason
   if failure then notifications.warn(failure, "Picker") return true end
+  if action == "activate" and field.kind == "input" and instance.spec.on_field_submit then
+    start_field_edit(instance, context)
+    return true
+  end
   if instance.spec.on_field_action then instance.spec.on_field_action(context, action, direction or 1) end
   return true
 end
@@ -454,13 +631,31 @@ local function confirm(instance, with_feedback)
 end
 
 local install_keymaps
+local open_search
 
 local function move_page(instance, delta)
+  local search_focused = valid_window(instance.search_win) and vim.api.nvim_get_current_win() == instance.search_win
+  if valid_window(instance.search_win) then
+    local query = search_input.text(instance.search_buf)
+    if query ~= picker_state.query(instance.state, instance.spec) then
+      picker_state.set_query(instance.state, instance.spec, query)
+    end
+  end
   close_input(instance)
+  close_search(instance)
   clear_modal_keymaps(instance)
   picker_state.move_page(instance.state, instance.spec, delta)
+  instance.search_visible = false
   render_view(instance)
   install_keymaps(instance)
+  local page = picker_state.page(instance.state, instance.spec)
+  if page.search and (not page.search.start_in_normal or search_focused) then
+    instance.search_visible = true
+    render_view(instance)
+    open_search(instance, search_focused or not page.search.start_in_normal)
+  else
+    focus_picker(instance)
+  end
 end
 
 local function move_selection(instance, delta)
@@ -484,23 +679,25 @@ local function install_option_keymaps(instance, buf, preserve)
     for _, key in ipairs((page.search and page.search.choice_keys) or {}) do key_set[key] = true end
   end
   for key in pairs(key_set) do
-    if preserve then preserve_mapping(instance, buf, key) end
-    vim.keymap.set("n", key, function()
-      local page = picker_state.page(instance.state, instance.spec)
-      for option_index, option in ipairs(page.option_list) do
-        if option.key == key then
-          instance.state.selected_index_by_page[page.id] = option_index
-          render_view(instance)
-          if option.confirm_on_key then confirm(instance, false) end
-          return
+    if not (instance.page_key_set and instance.page_key_set[vim.api.nvim_replace_termcodes(key, true, true, true)]) then
+      if preserve then preserve_mapping(instance, buf, key) end
+      vim.keymap.set("n", key, function()
+        local page = picker_state.page(instance.state, instance.spec)
+        for option_index, option in ipairs(page.option_list) do
+          if option.key == key then
+            instance.state.selected_index_by_page[page.id] = option_index
+            render_view(instance)
+            if option.confirm_on_key then confirm(instance, false) end
+            return
+          end
         end
-      end
-    end, {
-      buffer = buf,
-      silent = true,
-      nowait = true,
-      desc = "Select picker option",
-    })
+      end, {
+        buffer = buf,
+        silent = true,
+        nowait = true,
+        desc = "Select picker option",
+      })
+    end
   end
 end
 
@@ -520,26 +717,27 @@ end
 ---@param input_only? boolean
 install_action_keymaps = function(instance, buf, preserve, input_only)
   for _, action in ipairs(action_list(instance, input_only)) do
-    local keys = action.command and keymaps.view_keys_for("picker", action.command) or { action.key }
+    local keys = action.command and picker_keys(instance, action.command) or { action.key }
     for _, key in ipairs(keys) do
-      if preserve then preserve_mapping(instance, buf, key) end
-      vim.keymap.set(action.modes or "n", key, function()
-        if input_only then after_input_mapping(instance, function() run_action(instance, action) end)
-        else run_action(instance, action) end
-      end, {
-        buffer = buf,
-        silent = true,
-        nowait = true,
-        desc = action.desc or action.id or "Picker action",
-      })
+      if input_only or not (instance.page_key_set and instance.page_key_set[vim.api.nvim_replace_termcodes(key, true, true, true)]) then
+        if preserve then preserve_mapping(instance, buf, key) end
+        vim.keymap.set(action.modes or "n", key, function()
+          if input_only then after_input_mapping(instance, function() run_action(instance, action) end)
+          else run_action(instance, action) end
+        end, {
+          buffer = buf,
+          silent = true,
+          nowait = true,
+          desc = action.desc or action.id or "Picker action",
+        })
+      end
     end
   end
 end
 
-local open_search
-
 install_keymaps = function(instance)
   local set = command_set.new()
+  command_set.register(set, "help", function() show_help(instance) end)
   command_set.register(set, "previous", function()
     move_selection(instance, -1)
   end)
@@ -565,12 +763,25 @@ install_keymaps = function(instance)
     command_set.register(set, "next_value", function() field_action(instance, "change", 1) end)
     command_set.register(set, "toggle_field", function() field_action(instance, "toggle") end)
   end
+  local navigation_keys = instance.spec.page_navigation and Picker._navigation_keys(instance) or instance.spec.keymaps
   for _, command_id in ipairs(set.order) do
-    for _, key in ipairs(keymaps.view_keys_for("picker", command_id)) do
+    for _, key in ipairs(keymaps.view_keys_for("picker", command_id, navigation_keys)) do
       preserve_mapping(instance, instance.buf, key)
     end
   end
-  keymaps.setup_view_keymaps(instance.buf, "picker", set)
+  keymaps.setup_view_keymaps(instance.buf, "picker", set, { keymaps = navigation_keys })
+  instance.page_key_set = {}
+  for _, key in ipairs(picker_keys(instance, "help")) do
+    instance.page_key_set[vim.api.nvim_replace_termcodes(key, true, true, true)] = true
+  end
+  if navigation_keys then
+    for _, command in ipairs({ "page_previous", "page_next" }) do
+      local keys = keymaps.view_keys_for("picker", command, navigation_keys)
+      for _, key in ipairs(keys) do
+        instance.page_key_set[vim.api.nvim_replace_termcodes(key, true, true, true)] = true
+      end
+    end
+  end
   if picker_state.page(instance.state, instance.spec).search then
     preserve_mapping(instance, instance.buf, "/")
     vim.keymap.set("n", "/", function()
@@ -591,7 +802,7 @@ end
 ---@param instance table
 local function install_search_keymaps(instance)
   local buf = instance.search_buf
-  for _, key in ipairs(keymaps.view_keys_for("picker", "previous")) do
+  for _, key in ipairs(picker_keys(instance, "previous")) do
     vim.keymap.set("n", key, function() move_selection(instance, -1) end,
       { buffer = buf, silent = true, nowait = true, desc = "Select previous picker option" })
     if key == "<Up>" then
@@ -599,7 +810,7 @@ local function install_search_keymaps(instance)
         { buffer = buf, silent = true, nowait = true, desc = "Select previous picker option" })
     end
   end
-  for _, key in ipairs(keymaps.view_keys_for("picker", "next")) do
+  for _, key in ipairs(picker_keys(instance, "next")) do
     vim.keymap.set("n", key, function() move_selection(instance, 1) end,
       { buffer = buf, silent = true, nowait = true, desc = "Select next picker option" })
     if key == "<Down>" then
@@ -607,11 +818,11 @@ local function install_search_keymaps(instance)
         { buffer = buf, silent = true, nowait = true, desc = "Select next picker option" })
     end
   end
-  for _, key in ipairs(keymaps.view_keys_for("picker", "select")) do
+  for _, key in ipairs(picker_keys(instance, "select")) do
     vim.keymap.set({ "n", "i" }, key, function() confirm(instance, false) end,
       { buffer = buf, silent = true, nowait = true, desc = "Confirm picker option" })
   end
-  for _, key in ipairs(keymaps.view_keys_for("picker", "close")) do
+  for _, key in ipairs(picker_keys(instance, "close")) do
     vim.keymap.set("n", key, function() Picker.close(true) end,
       { buffer = buf, silent = true, nowait = true, desc = "Close picker" })
   end
@@ -662,7 +873,7 @@ open_search = function(instance, focus)
   end
 end
 
----@param spec table
+---@param spec ForgePickerSpec
 function Picker.open(spec)
   Picker.close(true)
   spec.host = spec.host or {}
@@ -672,11 +883,12 @@ function Picker.open(spec)
   assert(vim.api.nvim_win_is_valid(control_win), "picker control window must be valid")
   local state = picker_state.new(spec)
   local bounds = layout.host_bounds(spec.host.window_list)
-  local width = math.max(30, bounds.width - 2)
+  local width = window_width(spec, bounds.width)
   local initial_page = picker_state.page(state, spec)
-  local initial_frame = layout.build(initial_page, picker_state.selected_index(state, spec), width,
+  local geometry = page_navigation.measure(spec.page_list, spec.page_navigation, width, window_height(spec, math.huge, bounds.height))
+  local initial_frame = layout.build(initial_page, picker_state.selected_index(state, spec), geometry.content_width,
     { search_visible = not initial_page.search or not initial_page.search.start_in_normal })
-  local height = window_height(spec, #initial_frame.lines, bounds.height)
+  local height = window_height(spec, math.max(#initial_frame.lines + geometry.header_height, geometry.minimum_height), bounds.height)
   local instance = {
     spec = spec,
     state = state,
@@ -685,7 +897,8 @@ function Picker.open(spec)
     mapping_list = {},
     input_visible = false,
   }
-  instance.buf, instance.win = picker_window.open(spec.host, width, height, title_chunks(instance, width), origin)
+  instance.buf, instance.win = picker_window.open(spec.host, width, height, title_chunks(instance, width), origin,
+    spec.placement or (spec.size_ratio and "center" or nil))
   vim.b[instance.buf].miniclue_disable = true
   active = instance
   update_deadline_timer(instance)
@@ -710,41 +923,24 @@ function Picker.open(spec)
   return instance.buf, instance.win
 end
 
----@param spec table
+---@param spec ForgePickerSpec
 function Picker.update(spec)
   if not active then return end
   local search_focused = valid_window(active.search_win) and vim.api.nvim_get_current_win() == active.search_win
-  local previous_page = picker_state.page(active.state, active.spec)
-  local previous_option = picker_state.selected_option(active.state, active.spec)
-  local previous_option_id = previous_option and tostring(previous_option.id or previous_option.value or "") or nil
+  local help_focused = valid_window(active.help_win) and vim.api.nvim_get_current_win() == active.help_win
+  local editor_focused = active.field_editor and valid_window(active.field_editor.window)
+    and vim.api.nvim_get_current_win() == active.field_editor.window
+  if active.field_editor and spec.owner ~= active.spec.owner then close_field_editor(active) end
+  local previous_page_id = picker_state.page(active.state, active.spec).id
   close_input(active)
+  local snapshot = assert(Picker.capture_state(), "active picker must provide navigation state")
   clear_modal_keymaps(active)
-  local previous_state = active.state
   active.spec = spec
   update_deadline_timer(active)
   local next_state = picker_state.new(spec)
-  if previous_page and spec.initial_page == nil then
-    for page_index, page in ipairs(spec.page_list) do
-      if page.id == previous_page.id then next_state.page_index = page_index break end
-    end
-  end
-  next_state.selected_index_by_page = previous_state.selected_index_by_page
-  next_state.selected_set_by_page = previous_state.selected_set_by_page
-  next_state.field_by_page = previous_state.field_by_page
-  for page_id, draft in pairs(previous_state.draft_by_page) do next_state.draft_by_page[page_id] = draft end
-  for page_id, query in pairs(previous_state.query_by_page) do next_state.query_by_page[page_id] = query end
-  if previous_option_id and previous_page then
-    local next_page = picker_state.page(next_state, spec)
-    if next_page.id == previous_page.id then
-      for option_index, option in ipairs(next_page.option_list) do
-        if tostring(option.id or option.value or "") == previous_option_id then
-          next_state.selected_index_by_page[next_page.id] = option_index
-          break
-        end
-      end
-    end
-  end
+  picker_state.restore(next_state, spec, snapshot)
   active.state = next_state
+  if picker_state.page(next_state, spec).id ~= previous_page_id then close_search(active) end
   active.notified_identity = nil
   render_view(active)
   install_keymaps(active)
@@ -766,6 +962,8 @@ function Picker.update(spec)
     focus_picker(active)
     if spec.initial_input_kind then open_input(active, spec.initial_input_kind) end
   end
+  if help_focused and valid_window(active.help_win) then vim.api.nvim_set_current_win(active.help_win) end
+  if editor_focused and active.field_editor then field_input.focus(active.field_editor) end
 end
 
 ---@param notify? boolean
@@ -777,6 +975,8 @@ function Picker.close(notify)
   active = nil
   vim.api.nvim_clear_autocmds({ group = resize_group })
   clear_modal_keymaps(instance)
+  close_field_editor(instance)
+  popup_window.close(instance.help_win, false)
   close_input(instance)
   close_search(instance)
   popup_window.close(instance.win)
@@ -786,6 +986,17 @@ end
 ---@param owner? string
 function Picker.is_open(owner)
   return active ~= nil and valid_window(active.win) and (not owner or active.spec.owner == owner)
+end
+
+--- Get detached navigation state for a caller that is about to leave this picker.
+---@return ForgePickerResumeState?
+function Picker.capture_state()
+  if not active then return nil end
+  local snapshot = picker_state.capture(active.state, active.spec)
+  local page = picker_state.page(active.state, active.spec)
+  if valid_window(active.input_win) then snapshot.draft_by_page[page.id] = input.text(active.input_buf) end
+  if valid_window(active.search_win) then snapshot.query_by_page[page.id] = search_input.text(active.search_buf) end
+  return snapshot
 end
 
 function Picker._state_for_test()

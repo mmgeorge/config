@@ -50,6 +50,7 @@ function HarnessSnapshot.apply(state, result)
   local previous_session_id = state.session and state.session.id or nil
   local previous_context_usage = state.session and state.session.context_usage or nil
   state.session = result.session
+  state.access_preference = result.access_preference
   state.access_abbreviation = result.access_abbreviation
   if previous_session_id == (result.session and result.session.id or nil)
     and previous_context_usage and not state.session.context_usage

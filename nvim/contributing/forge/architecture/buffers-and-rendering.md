@@ -53,6 +53,77 @@ Status keeps file bodies separately from visible rows. If a generation change di
 
 ## Conventions
 
+The shared picker owns its modal buffer, mappings, input overlays, and cleanup.
+Its optional `page_navigation = "tabs"` presentation uses the same `page_list`
+and per-page selection state as ordinary pickers. `page_navigation.measure`
+reserves two header rows before `layout.build` wraps the page, and
+`page_navigation.compose` adds category text after `layout.viewport` selects
+visible content. Tabs leave the full popup width available to settings. When the
+labels do not fit, the strip retains the active tab and nearby categories, with
+arrows indicating more categories. Navigation still reaches every page. Action
+hints wrap inside narrow popups and remain visible while content scrolls.
+Composition shifts row anchors and preserves content byte offsets, so Unicode
+tab labels do not displace highlights or input overlays.
+
+Configuration uses one row per setting. Its `size_ratio = 0.8` and
+`width_ratio = 1` fix the bordered window to the host's full width and 80% of its
+height, anchored to the bottom-left.
+Short categories pad the list area so
+switching categories does not move the window or its bottom help area.
+Its pages set `field_description_height = 2` to reserve two help
+rows above the key hints. The selected field's description or disabled reason
+wraps within those rows, with an ellipsis for overflow. Empty help still reserves
+the same space, so selection changes do not resize the popup. Configuration preserves
+caller-supplied field descriptions and uses its static description table only as a
+fallback. Sandbox fields compute their text from the current mode, access scope,
+and provider capability on every rebuild. Sandbox preferences use muted styling
+when ineffective and remain editable; their saved value is separate from the
+provider-resolved runtime access policy. Category identity belongs to each row,
+so different tabs can use the same subsection label without misrouting fields. Other field pages
+retain automatically sized focused-field help beneath the list.
+Configuration pages also set `toggle_on_confirm = true`: Enter toggles boolean
+fields and activates other fields. Space retains its generic toggle binding.
+With `hint_mode = "help"`, configuration shows only `? help`. The shared picker
+opens Forge's help popup above the picker and lists its effective buffer bindings,
+including caller overrides and aliases. Closing help preserves selection; closing
+the picker also closes its help window.
+Picker-local `keymaps` overrides keep configuration navigation independent of
+other pickers: Tab and Shift-Tab switch categories, with `[` and `]` as aliases.
+Category navigation wraps at either end, while Up and Down stop at the first and
+last settings rows.
+Approval timeout lives under Permissions → Tools, and question timeout lives under
+Workflow → Questions. Each occupies one field. Their ordered choice editors
+use Up/Down to select `15s`, `30s`, `45s`, `60s`, then whole minutes from `2m`
+through `60m`; the endpoints clamp. Enter saves the selected value, and Escape
+cancels without changing the persisted duration.
+Rapid timeout changes keep one request in flight and merge newer pending values
+per field. Completion never replaces a newer pending edit or updates a different
+session; failures settle their callbacks and allow pending edits to continue.
+
+The picker owns inline editing for input fields through `on_field_submit`.
+Enter opens an editor over the value; Enter submits its draft, and Escape cancels
+before submission. Field metadata supplies numeric bounds or ordered choices.
+Choice editors use Up/Down and do not accept free text. Invalid input and save
+failures retain the draft and use the fixed help area for the error. Saving blocks
+duplicate submission, and completion callbacks are scoped to that editor instance.
+Redraws preserve its buffer; replacing or closing the picker disposes of the editor.
+Compaction thresholds instead use a shared choice picker with 64k, 128k, 256k, and
+512k presets, stored as 64,000, 128,000, 256,000, and 512,000 tokens respectively.
+Main and Background model sections each end with Compact and Threshold settings.
+Ask settings begin with an Override toggle. Turning it on copies the current main
+model and compatible tuning into the existing Ask override; turning it off clears
+that override. While off, Model, Thinking, and Speed display the inherited main
+settings and reject changes.
+
+`PickerState.capture` creates a detached snapshot of page, row, field, query,
+draft, and multi-selection state. `Picker.update` captures immediately before
+replacing the specification, and `PickerState.restore` resolves surviving page
+and row identities against the new content. Callers use `Picker.capture_state`
+at departure to a child editor and supply `resume_state` when reopening. The
+snapshot belongs to the originating picker owner and lasts only for that editor
+interaction. Harness configuration also checks its session and view revision
+before returning, so an old child response cannot replace a newer view.
+
 - **Request guards:** Asynchronous lookups stamp a request ID and discard results that arrive after a newer request.
 - **Test seams:** A function that tests override through `dr()._x` must be called through `dr()._x` everywhere, never through a module-local copy.
 - **Logging:** With Harness logging on, `ui.buffer.patch` times each publication stage separately, and `ui.document.slices` records preparation and commit durations.

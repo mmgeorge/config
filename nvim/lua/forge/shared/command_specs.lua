@@ -104,8 +104,8 @@ M.view_specs = {
     { id = "help", label = "help", desc = "Show form commands", modes = "n", pinned = true },
   },
   harness = {
-    { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = true },
-    { id = "toggle_presentation", label = "presentation", desc = "Toggle Full/Semantic diff presentation", modes = "n", keymap = "diff", pinned = true },
+    { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = false },
+    { id = "toggle_presentation", label = "presentation", desc = "Toggle Full/Semantic diff presentation", modes = "n", keymap = "diff", pinned = false },
     { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
     { id = "submit", label = "submit", desc = "Submit the composer", modes = { "n", "i" }, pinned = false,
       hints = { composer = function() return "submit" end } },
@@ -176,6 +176,7 @@ M.view_specs = {
     { id = "help", label = "help", desc = "Show PlanReview help", modes = "n", pinned = true },
   },
   picker = {
+    { id = "help", label = "help", desc = "Show picker help", modes = "n", pinned = true },
     { id = "previous", label = "previous", desc = "Highlight the previous planning option", modes = "n", pinned = false },
     { id = "next", label = "next", desc = "Highlight the next planning option", modes = "n", pinned = false },
     { id = "select", label = "select", desc = "Select the highlighted planning option", modes = "n", pinned = false },

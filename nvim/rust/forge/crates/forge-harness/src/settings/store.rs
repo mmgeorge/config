@@ -5,7 +5,15 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const SETTINGS_FORMAT_VERSION: u32 = 1;
+const SETTINGS_FORMAT_VERSION: u32 = 3;
+
+enum SettingLayerChange<'setting> {
+    Replace {
+        expected_revision: u64,
+        setting: &'setting PortableSettings,
+    },
+    Patch(&'setting PortableSettings),
+}
 
 #[derive(Deserialize, Serialize)]
 struct SettingsRecord<Payload> {
@@ -76,14 +84,8 @@ pub struct PortableSettings {
     pub automatic_checks: Option<bool>,
     /// Allows the root agent to edit project checks in this conversation.
     pub check_editing: Option<bool>,
-    /// Selects approval handling for ordinary work independently of filesystem access.
-    pub default_approval: Option<crate::session::ApprovalMode>,
-    /// Selects approval handling when planning.
-    pub plan_approval: Option<crate::session::ApprovalMode>,
     /// Selects compaction before accepted plan execution.
     pub plan_compact: Option<bool>,
-    /// Selects automatic review of execution plan revisions.
-    pub plan_auto_approve_revisions: Option<bool>,
     /// Overrides the duration of future approval requests.
     pub approval_timeout: Option<crate::session::InputTimeout>,
     /// Overrides the duration of future question sets.
@@ -129,17 +131,8 @@ impl PortableSettings {
         if overriding.check_editing.is_some() {
             self.check_editing = overriding.check_editing;
         }
-        if overriding.default_approval.is_some() {
-            self.default_approval = overriding.default_approval;
-        }
-        if overriding.plan_approval.is_some() {
-            self.plan_approval = overriding.plan_approval;
-        }
         if overriding.plan_compact.is_some() {
             self.plan_compact = overriding.plan_compact;
-        }
-        if overriding.plan_auto_approve_revisions.is_some() {
-            self.plan_auto_approve_revisions = overriding.plan_auto_approve_revisions;
         }
         if overriding.subagent_tools.is_some() {
             self.subagent_tools = overriding.subagent_tools;
@@ -182,17 +175,8 @@ impl PortableSettings {
             shell.executable()?;
             session.shell = shell;
         }
-        if let Some(permission) = self.default_approval {
-            session.default_approval = permission;
-        }
-        if let Some(permission) = self.plan_approval {
-            session.plan_approval = Some(permission);
-        }
         if let Some(enabled) = self.plan_compact {
             session.plan_compact = enabled && native_compact;
-        }
-        if let Some(enabled) = self.plan_auto_approve_revisions {
-            session.plan_auto_approve_revisions = enabled;
         }
         if let Some(timeout) = self.approval_timeout {
             session.approval_timeout = timeout.validate()?;
@@ -532,16 +516,29 @@ impl SettingsStore {
     ) -> Result<u64> {
         Ok(self
             .write_layer(
-                expected_revision,
+                SettingLayerChange::Replace {
+                    expected_revision,
+                    setting,
+                },
                 crate::settings::SettingTarget {
                     scope,
                     workspace,
                     session,
                 },
-                setting,
                 None,
                 &[],
             )?
+            .revision)
+    }
+
+    /// Merge explicit fields into the latest layer while holding its write transaction.
+    pub(crate) fn patch(
+        &mut self,
+        target: SettingTarget<'_>,
+        setting: &PortableSettings,
+    ) -> Result<u64> {
+        Ok(self
+            .write_layer(SettingLayerChange::Patch(setting), target, None, &[])?
             .revision)
     }
 
@@ -644,9 +641,11 @@ impl SettingsStore {
         request: &Value,
     ) -> Result<SettingsMutation> {
         self.write_layer(
-            expected_revision,
+            SettingLayerChange::Replace {
+                expected_revision,
+                setting,
+            },
             target,
-            setting,
             Some((operation, request)),
             &[],
         )
@@ -687,13 +686,15 @@ impl SettingsStore {
             }
         }
         self.write_layer(
-            expected_revision,
+            SettingLayerChange::Replace {
+                expected_revision,
+                setting: &setting,
+            },
             crate::settings::SettingTarget {
                 scope,
                 workspace,
                 session,
             },
-            &setting,
             Some((operation, request)),
             resource,
         )
@@ -701,9 +702,8 @@ impl SettingsStore {
 
     fn write_layer(
         &mut self,
-        expected_revision: u64,
+        change: SettingLayerChange<'_>,
         target: SettingTarget<'_>,
-        setting: &PortableSettings,
         receipt: Option<(&str, &Value)>,
         imported: &[super::ImportedResource],
     ) -> Result<SettingsMutation> {
@@ -712,21 +712,6 @@ impl SettingsStore {
             workspace,
             session,
         } = target;
-        if let Some(policy) = &setting.auto_compaction {
-            policy.validate(None)?;
-        }
-        if let Some(timeout) = setting.approval_timeout {
-            timeout.validate()?;
-        }
-        if let Some(timeout) = setting.answer_timeout {
-            timeout.validate()?;
-        }
-        if let Some(access) = &setting.access {
-            access.clone().validate()?;
-        }
-        if let Some(shell) = setting.shell {
-            shell.executable()?;
-        }
         let (scope, identity) = match scope {
             SettingScope::Global => ("global", ""),
             SettingScope::Workspace => ("workspace", workspace),
@@ -746,18 +731,46 @@ impl SettingsStore {
             [],
             |row| row.get::<_, i64>(0),
         )?)?;
-        ensure!(
-            revision == expected_revision,
-            "settings revision conflict: expected {expected_revision}, current {revision}"
-        );
+        if let SettingLayerChange::Replace {
+            expected_revision, ..
+        } = change
+        {
+            ensure!(
+                revision == expected_revision,
+                "settings revision conflict: expected {expected_revision}, current {revision}"
+            );
+        }
         let previous = self
             .layer(scope, identity)?
             .map(|payload| SettingsRecord::<PortableSettings>::decode(&payload))
             .transpose()?
             .flatten()
             .unwrap_or_default();
+        let setting = match change {
+            SettingLayerChange::Replace { setting, .. } => setting.clone(),
+            SettingLayerChange::Patch(patch) => {
+                let mut setting = previous.clone();
+                setting.inherit(patch.clone());
+                setting
+            }
+        };
+        if let Some(policy) = &setting.auto_compaction {
+            policy.validate(None)?;
+        }
+        if let Some(timeout) = setting.approval_timeout {
+            timeout.validate()?;
+        }
+        if let Some(timeout) = setting.answer_timeout {
+            timeout.validate()?;
+        }
+        if let Some(access) = &setting.access {
+            access.clone().validate()?;
+        }
+        if let Some(shell) = setting.shell {
+            shell.executable()?;
+        }
         let previous = serde_json::to_value(previous)?;
-        let current = serde_json::to_value(setting)?;
+        let current = serde_json::to_value(&setting)?;
         let mut field: Vec<String> = current
             .as_object()
             .context("settings must be an object")?
@@ -782,7 +795,7 @@ impl SettingsStore {
             }
         }
         transaction.execute("INSERT INTO setting_layer VALUES (?1,?2,?3) ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload",
-            params![scope,identity,SettingsRecord::encode(setting)?])?;
+            params![scope,identity,SettingsRecord::encode(&setting)?])?;
         let next = revision
             .checked_add(1)
             .context("settings revision exhausted")?;
@@ -1051,7 +1064,7 @@ mod test {
     fn incompatible_settings_stay_hidden_across_every_persistence_path() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let mut store = SettingsStore::open(fixture.path())?;
-        let obsolete = r#"{"default_write_permission":"write","plan_permission":"read","status_thoughts":false}"#;
+        let obsolete = r#"{"format_version":2,"payload":{"default_approval":"allow","plan_approval":"deny","status_thoughts":false}}"#;
         for (scope, identity) in [
             ("global", ""),
             ("workspace", "workspace"),
@@ -1072,7 +1085,7 @@ mod test {
         )?;
         store.save_provider(0, "mock", &serde_json::json!({"model":"saved-model"}))?;
         let before = store.get("workspace", "source", "mock")?;
-        assert!(before.desired.default_approval.is_none());
+        assert!(before.desired.check_editing.is_none());
         assert!(before.desired.status_thoughts.is_none());
         assert_eq!(before.provider["model"], "saved-model");
         for scope in [
@@ -1083,7 +1096,7 @@ mod test {
             assert!(
                 store
                     .layer_settings(scope, "workspace", "source")?
-                    .default_approval
+                    .check_editing
                     .is_none()
             );
         }
@@ -1107,7 +1120,7 @@ mod test {
             path: fixture.path().to_string_lossy().into_owned(),
         }])?;
         let current = PortableSettings {
-            default_approval: Some(crate::session::ApprovalMode::Deny),
+            check_editing: Some(true),
             status_thoughts: Some(true),
             ..Default::default()
         };
@@ -1140,10 +1153,7 @@ mod test {
         let store = SettingsStore::open(fixture.path())?;
         for session in ["source", "current-fork"] {
             let settings = store.get("workspace", session, "mock")?;
-            assert_eq!(
-                settings.desired.default_approval,
-                Some(crate::session::ApprovalMode::Deny)
-            );
+            assert_eq!(settings.desired.check_editing, Some(true));
             assert_eq!(settings.desired.status_thoughts, Some(true));
             assert_eq!(settings.desired.access.unwrap().readable_directory.len(), 1);
             assert_eq!(settings.provider["model"], "saved-model");
@@ -1163,10 +1173,7 @@ mod test {
     fn current_settings_decode_failures_remain_visible() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let store = SettingsStore::open(fixture.path())?;
-        for payload in [
-            "{",
-            r#"{"format_version":1,"payload":{"default_approval":"write"}}"#,
-        ] {
+        for payload in ["{", r#"{"format_version":3,"payload":{"shell":"invalid"}}"#] {
             store.connection.execute(
                 "INSERT OR REPLACE INTO setting_layer VALUES ('global','',?1)",
                 [payload],
@@ -1175,13 +1182,13 @@ mod test {
         }
         store.connection.execute(
             "UPDATE setting_layer SET payload=?1",
-            [r#"{"format_version":2,"payload":{"future_setting":true}}"#],
+            [r#"{"format_version":4,"payload":{"future_setting":true}}"#],
         )?;
         assert!(
             store
                 .get("workspace", "session", "mock")?
                 .desired
-                .default_approval
+                .check_editing
                 .is_none()
         );
         Ok(())
@@ -1269,6 +1276,85 @@ mod test {
                 .is_empty()
         );
         Ok(())
+    }
+
+    #[test]
+    fn concurrent_patches_preserve_other_fields_and_replacement_revision_checks() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::open(fixture.path()).unwrap();
+        store
+            .update(
+                0,
+                SettingScope::Global,
+                "workspace",
+                "session",
+                &PortableSettings {
+                    status_thoughts: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut writer_list = Vec::new();
+        for approval in [true, false] {
+            let root = fixture.path().to_path_buf();
+            let ready = ready.clone();
+            writer_list.push(std::thread::spawn(move || {
+                let mut store = SettingsStore::open(&root).unwrap();
+                ready.wait();
+                for amount in 1..=16 {
+                    let timeout = crate::session::InputTimeout {
+                        amount,
+                        unit: crate::session::TimeoutUnit::M,
+                    };
+                    let patch = if approval {
+                        PortableSettings {
+                            approval_timeout: Some(timeout),
+                            ..Default::default()
+                        }
+                    } else {
+                        PortableSettings {
+                            answer_timeout: Some(timeout),
+                            ..Default::default()
+                        }
+                    };
+                    store
+                        .patch(
+                            SettingTarget {
+                                scope: SettingScope::Global,
+                                workspace: "workspace",
+                                session: "session",
+                            },
+                            &patch,
+                        )
+                        .unwrap();
+                }
+            }));
+        }
+        ready.wait();
+        for writer in writer_list {
+            writer.join().unwrap();
+        }
+        let saved = store.get("workspace", "session", "mock").unwrap();
+        assert_eq!(saved.revision, 33);
+        assert_eq!(saved.desired.approval_timeout.unwrap().amount, 16);
+        assert_eq!(saved.desired.answer_timeout.unwrap().amount, 16);
+        assert_eq!(saved.desired.status_thoughts, Some(true));
+        assert!(
+            store
+                .update(
+                    0,
+                    SettingScope::Global,
+                    "workspace",
+                    "session",
+                    &PortableSettings::default()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.get("workspace", "session", "mock").unwrap().revision,
+            saved.revision
+        );
     }
 
     #[test]

@@ -36,7 +36,9 @@ Checks run serially through the shell selected in `/config`. `CheckConfig::order
 
 ## Failure and repair
 
-Failures go to a repair exchange owned by the original task. Repeated failures with unchanged inputs stop repair, and cancelled work with unchanged inputs becomes Blocked instead of retrying. Configuration errors block completion. Source changes during the gate invalidate it. A direct prompt interrupts active checks and waits for process collection, and queued prompts wait for completion.
+Ordinary completion-check failures go to a repair exchange owned by the original request. Repeated failures with unchanged inputs stop repair, and cancelled work with unchanged inputs becomes Blocked instead of retrying. Source changes during the gate invalidate it. A direct prompt interrupts active checks and waits for process collection, and queued prompts wait for completion.
+
+Accepted plan execution owns a separate Check phase. Actionable command, configuration, and execution errors retain their individual diagnostics and enter Resolve; they do not leave an otherwise runnable task suspended in Check. Its durable local reservation survives newer chat exchanges, and explicit resume in Check schedules local work without a provider prompt. Goal retains only its Work phase; this execution state machine adds no Goal check phase.
 
 ## Agent tools
 

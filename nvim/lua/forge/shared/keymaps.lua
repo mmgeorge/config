@@ -97,6 +97,7 @@ function M.bind_commands(buf, group, specs, handlers, options)
   return owner
 end
 
+--- Install registered commands with optional per-command context.keymaps overrides.
 ---@param buf integer
 ---@param group string
 ---@param command_set ForgeViewCommandSet
@@ -114,7 +115,7 @@ function M.setup_view_keymaps(buf, group, command_set, context)
       end
     end
   end
-  M.bind_commands(buf, group, specs, handlers)
+  M.bind_commands(buf, group, specs, handlers, { keymaps = context.keymaps })
 end
 
 ---Render the shared Forge command hints, preserving help and close in narrow windows.
@@ -291,7 +292,10 @@ end
 ---Show registered bindings with the shared Forge help layout.
 ---@param bindings {keys: string[], spec: {desc: string}}[]
 ---@param title string
-function M.show_bindings_help(bindings, title)
+---@param options? {zindex?: integer, wrap?: boolean}
+---@return integer
+function M.show_bindings_help(bindings, title, options)
+  options = options or {}
   local lines, key_width, width = {}, 0, 1
   for _, binding in ipairs(bindings) do
     key_width = math.max(key_width, vim.fn.strdisplaywidth(table.concat(binding.keys, ", ")))
@@ -304,11 +308,12 @@ function M.show_bindings_help(bindings, title)
   end
   local buf, win = popup_window.open({ title = title, relative = "editor",
     width = math.max(1, math.min(width, vim.o.columns - 4)), height = math.max(1, math.min(#lines, vim.o.lines - 4)),
-    filetype = "ForgeHelp" })
+    filetype = "ForgeHelp", zindex = options.zindex, wrap = options.wrap })
   vim.api.nvim_buf_set_lines(buf, 0, -1, true, lines)
   vim.bo[buf].modifiable = false
   vim.keymap.set("n", "q", function() popup_window.close(win) end,
     { buffer = buf, silent = true, nowait = true, desc = "Close help" })
+  return win
 end
 
 return M

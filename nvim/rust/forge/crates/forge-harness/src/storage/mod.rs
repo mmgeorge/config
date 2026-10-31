@@ -3,7 +3,6 @@ mod archive;
 mod current;
 pub(crate) mod inspection;
 pub(crate) mod lifecycle;
-mod migration;
 pub(crate) mod model_pin;
 pub mod objects;
 mod ownership;
@@ -36,8 +35,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 56;
-const PREFERENCE_FORMAT_VERSION: u32 = 41;
+const SESSION_FORMAT_VERSION: u32 = 58;
+const PREFERENCE_FORMAT_VERSION: u32 = 42;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.
 pub fn error_message(error: &anyhow::Error) -> String {
@@ -1330,7 +1329,7 @@ fn validate_session_task_artifacts(
     session: &HarnessSession,
 ) -> Result<()> {
     if let Some(active) = &session.active_task {
-        migration::validate_task(connection, &session.id, active)?;
+        task::validate_task(connection, &session.id, active)?;
     }
     Ok(())
 }
@@ -1879,7 +1878,6 @@ mod test {
             effort: "medium".into(),
             plan_executor: Default::default(),
             plan_compact: false,
-            plan_auto_approve_revisions: true,
             approval_timeout: Default::default(),
             answer_timeout: Default::default(),
             context_window: None,
@@ -1888,8 +1886,6 @@ mod test {
             shell: Default::default(),
             approval_mode: crate::session::ApprovalMode::Ask,
             active_task: None,
-            default_approval: crate::session::ApprovalMode::Ask,
-            plan_approval: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             lease_owner: None,
@@ -2218,15 +2214,12 @@ mod test {
         let preference = HarnessPreference {
             access: Default::default(),
             shell: Default::default(),
-            default_approval: crate::session::ApprovalMode::Ask,
-            plan_approval: None,
             model: "remembered-model".into(),
             effort: "low".into(),
             model_setting: Default::default(),
             service_tier: crate::backend::ServiceTier::Fast,
             plan_executor: Default::default(),
             plan_compact: false,
-            plan_auto_approve_revisions: true,
             approval_timeout: Default::default(),
             answer_timeout: Default::default(),
         };

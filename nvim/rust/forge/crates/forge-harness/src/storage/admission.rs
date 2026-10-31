@@ -50,7 +50,7 @@ struct PublishedAdmission {
 #[derive(Clone, Debug)]
 /// Active lifecycle values published atomically with admission, excluding historical output.
 pub(crate) struct RuntimeSnapshot {
-    pub active_task: Option<crate::task::ActiveTask>,
+    pub active_task: Option<crate::task::Task>,
     pub plan: Option<crate::session::state_machine::PlanStatus>,
     pub configuring: bool,
 }
@@ -227,8 +227,8 @@ impl SqliteStore {
         let session_id = &snapshot.session.id;
         let active_task = self.load_active_task(session_id)?;
         let plan = match active_task.as_ref().map(|task| &task.workflow) {
-            Some(crate::task::TaskWorkflow::Plan { plan }) => Some((&plan.artifact).into()),
-            Some(crate::task::TaskWorkflow::Execute { execution }) => self
+            Some(crate::task::WorkflowSnapshot::Plan { plan }) => Some((&plan.artifact).into()),
+            Some(crate::task::WorkflowSnapshot::Execute { execution }) => self
                 .load_plan(&execution.record.plan_id)?
                 .as_ref()
                 .map(Into::into),
@@ -294,7 +294,7 @@ impl SqliteStore {
             status: task.status(),
         });
         let plan_wait = active.as_ref().is_some_and(|task| match &task.workflow {
-            crate::task::TaskWorkflow::Plan { plan } => {
+            crate::task::WorkflowSnapshot::Plan { plan } => {
                 !plan.paused
                     && (plan.artifact.acceptance.is_some() || plan.artifact.elicitation.is_some())
             }
@@ -323,7 +323,7 @@ mod tests {
     use super::*;
     use crate::{
         session::SessionStore,
-        task::{ActiveTask, TaskStatus},
+        task::{Task, TaskStatus},
     };
 
     #[test]
@@ -338,7 +338,7 @@ mod tests {
             &admission,
             &writer.session_admission(&session.id)?
         ));
-        let mut task = ActiveTask::goal("task".into(), Default::default(), false, 1);
+        let mut task = Task::goal("task".into(), Default::default(), false, 1);
         writer.commit_task_change(&session.id, None, 1, |active| {
             *active = Some(task.clone());
             Ok(())
@@ -349,9 +349,12 @@ mod tests {
         );
         writer.connection.execute_batch("CREATE TRIGGER reject_task BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'failed commit'); END;")?;
         let previous_revision = task.revision.clone();
-        if let crate::task::TaskWorkflow::Goal { goal } = &mut task.workflow {
-            goal.state = crate::goal::GoalState::Paused;
-        }
+        task.edit(|draft| {
+            if let crate::task::WorkflowSnapshot::Goal { goal } = &mut draft.workflow {
+                goal.state = crate::goal::GoalState::Paused;
+            }
+            Ok(())
+        })?;
         task.renew(2);
         assert!(
             writer

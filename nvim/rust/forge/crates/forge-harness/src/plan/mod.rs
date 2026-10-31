@@ -2384,9 +2384,11 @@ mod test {
     }
 
     #[test]
-    fn generation_stalls_after_two_turns_without_canonical_progress() {
+    fn generation_stalls_after_five_turns_without_canonical_progress() {
         let mut generation = PlanGeneration::default();
-        assert!(generation.observe(false));
+        for _ in 1..5 {
+            assert!(generation.observe(false));
+        }
         assert!(!generation.observe(false));
         generation.reset();
         assert!(generation.observe(true));

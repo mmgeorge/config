@@ -16,7 +16,7 @@ client.request = function(request_specification, callback)
 
   assert(host.request(method, parameters, callback), method)
 end
-state.session = { id = "queue-edit", backend = "mock", active_task = { revision = "task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }
+state.session = { id = "queue-edit", backend = "mock", active_task = { revision = "task", kind = "goal", phase = "work", status = "running", goal = { objective = "Fixture goal", state = "active" } } }
 state.queue, state.pending_steer = {}, {}
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 state.presentation = { follow_tail = function() end, capture_prompt = function()

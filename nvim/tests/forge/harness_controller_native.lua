@@ -252,7 +252,8 @@ local success, failure = xpcall(function()
     controller.refresh_winbar()
     local winbar = vim.wo[state.transcript_win].winbar
     local displayed = vim.api.nvim_eval_statusline(winbar, { use_winbar = true, maxwidth = 200 }).str
-    assert(displayed:find("sandbox · " .. speed.text .. " · Main", 1, true), displayed)
+    assert(displayed:find("sandbox · " .. speed.text, 1, true), displayed)
+    assert(not displayed:find(" · Main", 1, true), "main agent label remains in the winbar")
     assert(not displayed:find("+", 1, true), "legacy speed marker remains")
     if speed.icon then
       assert(winbar:find("%#" .. speed.group .. "#" .. speed.icon .. "%*", 1, true), winbar)
@@ -278,7 +279,7 @@ local success, failure = xpcall(function()
     controller.refresh_winbar()
     local displayed = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
       { use_winbar = true, maxwidth = 200 }).str
-    assert(displayed:find("Task submitting", 1, true), "workflow control lost its progress label")
+    assert(not displayed:find("Task submitting", 1, true), "workflow activity remains in the winbar")
   end
   state.task_operation = { action = "configure", state = "failed" }
   state.configuration_error = "fixture rejected"
@@ -403,35 +404,61 @@ local success, failure = xpcall(function()
   assert(vim.wo[state.composer_win].winbar == "", "busy composer restored key hints")
   receive("backend_event", { kind = "execution_state", data = {
     session = { id = "native-controller", backend = "mock", model = "mock", approval_mode = "ask",
-      active_task = { revision = "execution", kind = "execute", execution = {
+      active_task = { revision = "execution", kind = "execute", phase = "implement", status = "running", execution = {
         title = "Implement the design", record = { state = "active", phase = "implement" } } } },
   } }, "native-controller")
   assert(state.busy and state.session.active_task.kind == "execute" and state.session.approval_mode == "ask")
   title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str
-  assert(title:find("execute · implement", 1, true))
+  assert(title:find(" · exec", 1, true))
+  assert(title:find("exec · implement", 1, true), "execution phase disappeared from the winbar")
   assert(not title:find("running", 1, true))
-  for _, enabled in ipairs({ true, false }) do
-    state.session.active_task.auto_accept_plan = enabled
-    controller.refresh_winbar()
-    local displayed = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
-      { use_winbar = true, maxwidth = 200 }).str
-    assert(displayed:find("Auto-accept: " .. (enabled and "on" or "off"), 1, true),
-      "winbar did not follow authoritative task acceptance policy")
+  state.access_abbreviation = "rxwx"
+  for _, check_editing in ipairs({ false, true }) do
+    state.check_editing = check_editing
+    for _, enabled in ipairs({ true, false }) do
+      state.session.active_task.auto_accept_plan = enabled
+      controller.refresh_winbar()
+      local displayed = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+        { use_winbar = true, maxwidth = 200 }).str
+      local policy_label = "rxwx" .. (check_editing and "ce" or "") .. (enabled and "pa" or "")
+      assert(displayed:find(policy_label .. " · ", 1, true),
+        "permission suffix did not follow authoritative task acceptance policy: " .. displayed)
+      assert(not displayed:find("Auto-accept:", 1, true), "separate acceptance field remains in the winbar")
+    end
   end
+  state.access_abbreviation, state.check_editing = "rxw", false
   state.busy = false
   for _, status in ipairs({ "paused", "blocked" }) do
     state.session.active_task.execution.record.state = status
+    state.session.active_task.status = status
     controller.refresh_winbar()
     title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
       { use_winbar = true, maxwidth = 200 }).str
-    assert(title:find("execute · implement · " .. status, 1, true),
-      "active task lifecycle disappeared from the winbar")
+    assert(title:find(" · exec", 1, true), "task disappeared from the winbar")
+    assert(title:find("exec · implement", 1, true), "execution phase disappeared from the winbar")
+    assert(title:find("exec · implement · " .. status, 1, true), "task suspension lost its phase")
   end
   state.session.active_task = nil
   controller.refresh_winbar()
-  assert(not vim.wo[state.transcript_win].winbar:find("Auto-accept:", 1, true),
+  assert(not vim.wo[state.transcript_win].winbar:find("rxwpa", 1, true),
     "clearing the task retained its acceptance indicator")
+  local previous_artifact = state.artifact
+  state.artifact = { { id = "first" }, { id = "second" } }
+  state.session.active_task = { kind = "plan", phase = "draft", status = "running", auto_accept_plan = true,
+    plan = { paused = false, artifact = { title = "Plan fixture", state = "generating" } } }
+  controller.refresh_winbar()
+  local planning_status = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+    { use_winbar = true, maxwidth = 200 }).str
+  assert(planning_status:find("rxwpa · ", 1, true) and planning_status:find(" · plan", 1, true),
+    "plan lost its task type or permission suffix")
+  assert(planning_status:find("plan · draft", 1, true), "planning phase disappeared from the winbar")
+  assert(planning_status:find("2 artefacts", 1, true), "artifact count disappeared from the winbar")
+  local planning_winbar = vim.wo[state.transcript_win].winbar
+  assert(planning_winbar:find("2 artefacts", 1, true) > planning_winbar:find("%=", 1, true),
+    "artifact count remained in the left-aligned status")
+  state.artifact, state.session.active_task = previous_artifact, nil
+  controller.refresh_winbar()
   local original_window = state.transcript_win
   vim.api.nvim_set_current_win(original_window)
   vim.cmd("vsplit")

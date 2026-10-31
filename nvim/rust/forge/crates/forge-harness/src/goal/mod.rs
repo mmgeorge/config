@@ -112,7 +112,7 @@ pub(crate) fn observe(
         *state = GoalState::Blocked;
         return ContinuationDecision::Blocked;
     }
-    let progress = evidence.workspace_changed || evidence.tool_called;
+    let progress = evidence.workspace_changed;
     let may_continue = continuation.observe(progress);
     if !may_continue {
         *state = GoalState::Stalled;
@@ -121,12 +121,7 @@ pub(crate) fn observe(
     if progress {
         return ContinuationDecision::Continue;
     }
-    if continuation.consecutive_no_progress == 1 {
-        ContinuationDecision::RetryNoProgress
-    } else {
-        *state = GoalState::Stalled;
-        ContinuationDecision::Stalled
-    }
+    ContinuationDecision::RetryNoProgress
 }
 
 #[cfg(test)]
@@ -135,9 +130,8 @@ mod test {
 
     #[test]
     fn goal_control_keeps_its_outcome_with_the_admitted_revision() {
-        let previous =
-            crate::task::ActiveTask::goal("Previous".into(), Default::default(), false, 1);
-        let current = crate::task::ActiveTask::goal("Current".into(), Default::default(), false, 2);
+        let previous = crate::task::Task::goal("Previous".into(), Default::default(), false, 1);
+        let current = crate::task::Task::goal("Current".into(), Default::default(), false, 2);
         for termination in [GoalTermination::Complete, GoalTermination::Blocked] {
             let output = crate::backend::BackendOutput {
                 event: Vec::new(),
@@ -186,14 +180,16 @@ mod test {
     }
 
     #[test]
-    fn stalls_after_two_turns_without_tools_or_workspace_change() {
+    fn stalls_after_five_turns_without_observable_progress() {
         let mut record = goal();
+        for turn in 1..5 {
+            assert_eq!(
+                record.observe(TurnEvidence::default(), turn),
+                ContinuationDecision::RetryNoProgress
+            );
+        }
         assert_eq!(
-            record.observe(TurnEvidence::default(), 1),
-            ContinuationDecision::RetryNoProgress
-        );
-        assert_eq!(
-            record.observe(TurnEvidence::default(), 2),
+            record.observe(TurnEvidence::default(), 5),
             ContinuationDecision::Stalled
         );
         assert_eq!(record.state, GoalState::Stalled);
@@ -206,7 +202,7 @@ mod test {
         assert_eq!(
             record.observe(
                 TurnEvidence {
-                    tool_called: true,
+                    workspace_changed: true,
                     ..TurnEvidence::default()
                 },
                 2
@@ -221,7 +217,7 @@ mod test {
         let mut record = goal();
         record.continuation.max_turn_count = 2;
         let progress = TurnEvidence {
-            tool_called: true,
+            workspace_changed: true,
             ..TurnEvidence::default()
         };
         assert_eq!(record.observe(progress, 1), ContinuationDecision::Continue);
@@ -243,7 +239,6 @@ mod test {
             record.native = true;
             let evidence = TurnEvidence {
                 native_state: Some(state),
-                tool_called: true,
                 workspace_changed: true,
                 structured_complete: true,
                 ..TurnEvidence::default()
@@ -264,7 +259,7 @@ mod test {
                 assert_eq!(
                     record.observe(
                         TurnEvidence {
-                            tool_called: true,
+                            workspace_changed: true,
                             ..TurnEvidence::default()
                         },
                         60
@@ -282,7 +277,7 @@ mod test {
             record.observe(
                 TurnEvidence {
                     native_state: Some(GoalState::Cleared),
-                    tool_called: true,
+                    workspace_changed: true,
                     ..TurnEvidence::default()
                 },
                 20

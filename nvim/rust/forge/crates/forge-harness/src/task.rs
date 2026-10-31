@@ -4,15 +4,28 @@ use serde::{Deserialize, Serialize};
 mod active;
 pub(crate) mod command;
 mod controller;
+mod event;
+mod execution;
+pub(crate) use execution::{ExecutionSettlement, ExecutionSettlementKind};
+mod state;
 pub(crate) use active::StaleTask;
+pub(crate) use active::TaskSnapshot;
 pub use active::{
-    ActiveTask, ExecutionEntry, ExecutionTask, GoalTask, PlanExecutionChoice, PlanTask,
-    TaskContinuation, TaskContinuationWork, TaskDecision, TaskEntry, TaskInputDelivery,
-    TaskInputId, TaskOutcome, TaskOutcomeState, TaskPermit, TaskRevision, TaskTurn, TaskTurnId,
-    TaskWorkflow,
+    ExecutionEntry, ExecutionSnapshot, GoalSnapshot, PlanExecutionChoice, PlanSnapshot, Task,
+    TaskContinuation, TaskDecision, TaskEntry, TaskId, TaskInputDelivery, TaskInputId, TaskOutcome,
+    TaskOutcomeState, TaskPermit, TaskRevision, TaskTurn, TaskTurnId, TaskWork, WorkflowSnapshot,
 };
 pub(crate) use controller::SessionTaskController;
 pub(crate) use controller::TaskChange;
+pub(crate) use event::TaskEvent;
+pub(crate) use state::TaskNextAction;
+pub use state::{
+    ExecutionContract, ExecutionState, GoalState, PlanningState, SuspensionReason, TaskLifecycle,
+    TaskPhase, WorkflowState,
+};
+
+#[cfg(test)]
+mod integration_test;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

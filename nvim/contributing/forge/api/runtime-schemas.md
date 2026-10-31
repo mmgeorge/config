@@ -54,6 +54,8 @@ Source: [broker/mod.rs](../../../rust/forge/crates/forge-harness/src/broker/mod.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
     pub ask_model: crate::settings::AskModel,
+    /// Saved access choices before provider capability limits are applied.
+    pub access_preference: crate::session::AccessPolicy,
     /// Confirmed access label computed by the authoritative filesystem policy.
     pub access_abbreviation: String,
     pub subagent_tools: bool,
@@ -247,8 +249,6 @@ pub struct HarnessSession {
     pub plan_executor: PlanExecutor,
     #[serde(default)]
     pub plan_compact: bool,
-    #[serde(default = "auto_approve_revisions")]
-    pub plan_auto_approve_revisions: bool,
     #[serde(default)]
     /// Limits each pending approval independently.
     pub approval_timeout: InputTimeout,
@@ -266,10 +266,6 @@ pub struct HarnessSession {
     pub approval_mode: ApprovalMode,
     #[serde(default)]
     pub active_task: Option<crate::task::ActiveTask>,
-    #[serde(default)]
-    pub default_approval: ApprovalMode,
-    #[serde(default)]
-    pub plan_approval: Option<ApprovalMode>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub lease_owner: Option<String>,
@@ -1583,4 +1579,3 @@ pub enum TranscriptAction {
     },
 }
 ```
-

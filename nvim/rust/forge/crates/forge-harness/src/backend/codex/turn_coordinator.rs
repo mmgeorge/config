@@ -2420,7 +2420,7 @@ mod test {
                                 &mut store,
                                 Some(&current.revision),
                                 crate::task::TaskChange::Install(Box::new(
-                                    crate::task::ActiveTask::goal(
+                                    crate::task::Task::goal(
                                         "New user task".into(),
                                         Default::default(),
                                         true,

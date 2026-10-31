@@ -1,10 +1,42 @@
 local PickerLayout = {}
 
+--- Rendered row interval and optional first-row text styling.
+---@class ForgePickerRowRange
+---@field first integer First one-based rendered row.
+---@field last integer Last one-based rendered row, inclusive.
+---@field spans? ForgePickerColumnSpan[] Byte spans attached to the first row.
+---@field key_end? integer Exclusive byte end of an option shortcut.
+---@field group? string Highlight group for content rows.
+
+--- Page text and geometry shared by the viewport, navigation, renderer, and overlays.
+---@class ForgePickerFrame
+---@field lines string[] Rendered buffer rows.
+---@field header_height integer Number of logical header rows before options.
+---@field body_end integer Last logical body row before input and footer.
+---@field option_range table<integer, ForgePickerRowRange> Visible option row intervals.
+---@field primary_range table<integer, ForgePickerRowRange> Option intervals excluding child rows.
+---@field child_range table<integer, ForgePickerRowRange> Child row intervals.
+---@field section_line integer[] Visible section headings.
+---@field content_range ForgePickerRowRange[] Styled content intervals.
+---@field content_span_list table[] Per-row byte spans.
+---@field selected_index integer Selected option index.
+---@field highlight_selected_line boolean Whether selection receives a background.
+---@field highlight_selected_text boolean Whether selection receives foreground styling.
+---@field search_start? integer Rendered search editor anchor.
+---@field input_start? integer Rendered input editor anchor.
+---@field footer_line? integer Rendered inline footer row when present.
+---@field content_column? integer Zero-based display column of page content.
+---@field content_width? integer Display width allocated to page content.
+---@field body_start_by_line? table<integer, integer> Byte offset of page content on each composed row.
+---@field [string] any Existing viewport, input, selection, and scrolling metadata.
+
 ---@class ForgePickerColumnSpan
 ---@field first integer Zero-based byte offset in the rendered row.
 ---@field last integer Exclusive byte offset in the rendered row.
 ---@field group string
 ---@field priority? integer
+---@field field_id? string Field owning this span.
+---@field edit_start? integer Zero-based byte position of an editable value.
 
 ---@class ForgePickerContent
 ---@field text string
@@ -108,7 +140,7 @@ end
 ---@param page { option_list: table[], wrap_column?: integer, show_item_counter?: boolean, highlight_selected_line?: boolean, highlight_selected_text?: boolean, [string]: any }
 ---@param selected_index integer
 ---@param width integer
----@param options? { input_visible?: boolean, search_visible?: boolean, footer?: string, field_by_option?: table<string, string> }
+---@param options? { input_visible?: boolean, search_visible?: boolean, footer?: string, wrap_footer?: boolean, field_by_option?: table<string, string>, field_message?: string }
 ---@return table
 function PickerLayout.build(page, selected_index, width, options)
   options = options or {}
@@ -198,6 +230,8 @@ function PickerLayout.build(page, selected_index, width, options)
     column_width[widest] = column_width[widest] - 1
     total = total - 1
   end
+  local field_grid = page.field_navigation
+    and require("forge.views.picker.field_layout").measure(page.option_list, usable_width, prefix_width) or {}
   ---@param values string[]
   ---@param prefix string
   ---@param column_segments? table<integer, table[]> Ordered text and highlight tuples for each column.
@@ -224,7 +258,8 @@ function PickerLayout.build(page, selected_index, width, options)
         local start = math.max(source_offset, segment_offset)
         local final = math.min(source_offset + retained, segment_offset + #segment[1])
         if segment[2] and start < final then
-          spans[#spans + 1] = { first = offset + start - source_offset, last = offset + final - source_offset, group = segment[2] }
+          spans[#spans + 1] = { first = offset + start - source_offset, last = offset + final - source_offset, group = segment[2],
+            field_id = segment[3], edit_start = segment[4] and (offset + segment_offset + segment[4] - source_offset) or nil }
         end
         segment_offset = segment_offset + #segment[1]
       end
@@ -266,30 +301,46 @@ function PickerLayout.build(page, selected_index, width, options)
     prefix = prefix .. string.rep(" ", prefix_width - vim.fn.strdisplaywidth(prefix))
     local first = #lines + 1
     local values = option.columns or { option.label or "", option.detail or "" }
-    local row = column_row(values, prefix, option.column_segments, option.column_spans)
+    local row
     if option.wrap_label then
       append(lines, wrap(option.label, usable_width, prefix, string.rep(" ", prefix_width)))
+      row = { text = lines[first], spans = {} }
     elseif option.fields then
-      local cells, height = {}, 1
-      for column, value in ipairs(values) do
-        cells[column] = wrap_cell(value:gsub("%s+$", ""), column_width[column])
-        height = math.max(height, #cells[column])
-      end
-      for fragment_index = 1, height do
-        local fragments, offsets = {}, {}
-        for column in ipairs(values) do
-          local fragment = cells[column][fragment_index]
-          fragments[column], offsets[column] = fragment and fragment.text or "", fragment and fragment.first or 0
+      local grid = field_grid[index]
+      local label_offset = option.inline_fields and 0 or 1
+      local fields_per_row = grid and grid.fields_per_row or #values - label_offset
+      local previous_width = column_width
+      column_width = grid and grid.column_width or column_width
+      for field_offset = 0, #values - label_offset - 1, fields_per_row do
+        local cells, segments, height = {}, {}, 1
+        if label_offset == 1 then
+          cells[1] = wrap_cell(field_offset == 0 and values[1] or "", column_width[1])
+          height = #cells[1]
         end
-        local fragment_row = column_row(fragments, fragment_index == 1 and prefix or string.rep(" ", prefix_width),
-          option.column_segments, nil, offsets)
-        lines[#lines + 1] = fragment_row.text
-        if fragment_index == 1 then row = fragment_row else
-          for _, span in ipairs(fragment_row.spans) do
-            content_span_list[#content_span_list + 1] = vim.tbl_extend("force", span, { line = #lines })
+        for slot = 1, math.min(fields_per_row, #values - label_offset - field_offset) do
+          local source = label_offset + field_offset + slot
+          local column = label_offset + slot
+          cells[column] = wrap_cell(values[source]:gsub("%s+$", ""), column_width[column])
+          segments[column] = option.column_segments and option.column_segments[source]
+          height = math.max(height, #cells[column])
+        end
+        for fragment_index = 1, height do
+          local fragments, offsets = {}, {}
+          for column, cell in ipairs(cells) do
+            local fragment = cell[fragment_index]
+            fragments[column], offsets[column] = fragment and fragment.text or "", fragment and fragment.first or 0
+          end
+          local fragment_row = column_row(fragments, #lines == first - 1 and prefix or string.rep(" ", prefix_width),
+            segments, nil, offsets)
+          lines[#lines + 1] = fragment_row.text
+          if not row then row = fragment_row else
+            for _, span in ipairs(fragment_row.spans) do
+              content_span_list[#content_span_list + 1] = vim.tbl_extend("force", span, { line = #lines })
+            end
           end
         end
       end
+      column_width = previous_width
     elseif page.wrap_column and values[page.wrap_column] then
       local column = page.wrap_column
       for fragment_index, fragment in ipairs(wrap_cell(values[column], column_width[column])) do
@@ -309,14 +360,16 @@ function PickerLayout.build(page, selected_index, width, options)
         end
       end
     else
+      row = column_row(values, prefix, option.column_segments, option.column_spans)
       lines[#lines + 1] = row.text
     end
+    local primary = assert(row, "picker option must render at least one row")
     local primary_last = #lines
     for _, child in ipairs(option.child_line_list or {}) do
       append(lines, wrap(child, usable_width, "    ", "      "))
     end
     option_range[index] = { first = first, last = #lines }
-    primary_range[index] = { first = first, last = primary_last, spans = row.spans, key_end = option.key and (2 + #option.key) }
+    primary_range[index] = { first = first, last = primary_last, spans = primary.spans, key_end = option.key and (2 + #option.key) }
     if primary_last < #lines then child_range[index] = { first = primary_last + 1, last = #lines } end
   end
   if #page.option_list == 0 then append(lines, wrap(page.empty_text or "No matching options.", usable_width, "  ")) end
@@ -329,18 +382,29 @@ function PickerLayout.build(page, selected_index, width, options)
     local reserve = math.max(3, page.input_height or 3)
     for _ = 1, reserve do lines[#lines + 1] = "" end
   end
-  if page.field_navigation then
+  if page.field_navigation and page.field_descriptions ~= false then
     local option = page.option_list[selected_index]
     local selected_id = option and (options.field_by_option or {})[option.id]
     local field = option and option.fields and option.fields[1]
     for _, candidate in ipairs(option and option.fields or {}) do
       if candidate.id == selected_id then field = candidate break end
     end
-    local description = field and (field.disabled_reason or field.description)
-    if description then
+    local description = options.field_message or field and (field.disabled_reason or field.description)
+    if description or page.field_description_height then
       lines[#lines + 1] = ""
       local first = #lines + 1
-      append(lines, wrap(description, usable_width, "  "))
+      local description_lines = wrap(description or "", usable_width, "  ")
+      local height = page.field_description_height or #description_lines
+      for index = 1, height do
+        local line = description_lines[index] or ""
+        if index == height and #description_lines > height then
+          while vim.fn.strdisplaywidth(line .. "…") > usable_width do
+            line = vim.fn.strcharpart(line, 0, vim.fn.strchars(line) - 1)
+          end
+          line = line .. "…"
+        end
+        lines[#lines + 1] = line
+      end
       content_range[#content_range + 1] = { first = first, last = #lines, group = "ForgePickerHint" }
     end
   end
@@ -357,7 +421,12 @@ function PickerLayout.build(page, selected_index, width, options)
     end
     footer = footer .. string.rep(" ", width - 2 - vim.fn.strdisplaywidth(footer) - vim.fn.strdisplaywidth(counter)) .. counter
   end
-  lines[#lines + 1] = footer
+  if options.wrap_footer then
+    append(lines, wrap(footer, usable_width, "  "))
+    content_range[#content_range + 1] = { first = footer_line, last = #lines, group = "ForgePickerHint" }
+  else
+    lines[#lines + 1] = footer
+  end
   return {
     lines = lines,
     header_height = header_height,
@@ -385,8 +454,9 @@ end
 ---@param previous_top? integer
 ---@param content_offset? integer
 ---@param option_offset? integer Offset within a selected option taller than the viewport.
+---@param fill_height? boolean Pad short bodies so the help and footer remain at the bottom.
 ---@return table
-function PickerLayout.viewport(frame, height, previous_top, content_offset, option_offset)
+function PickerLayout.viewport(frame, height, previous_top, content_offset, option_offset, fill_height)
   local header_height = frame.header_height
   local suffix_height = #frame.lines - frame.body_end
   local visible_header_height = header_height
@@ -422,15 +492,23 @@ function PickerLayout.viewport(frame, height, previous_top, content_offset, opti
   end
   top = math.max(header_height + 1, math.min(top, frame.body_end - capacity + 1))
   local last = math.min(frame.body_end, top + capacity - 1)
+  local section_set = {}
+  for _, row in ipairs(frame.section_line) do section_set[row] = true end
+  while last > top and (section_set[last] or frame.lines[last] == "") do last = last - 1 end
   local projected = vim.deepcopy(frame)
   projected.lines = {}
   local row_map = {}
+  local body_rows = 0
   for row, line in ipairs(frame.lines) do
     local hidden_content = content_first and row >= scroll.first and row <= scroll.last
       and (row < content_first or row > content_last)
     if not hidden_content and (row <= header_height or (row >= top and row <= last) or row > frame.body_end) then
       projected.lines[#projected.lines + 1] = line
       row_map[row] = #projected.lines
+      if row > header_height and row <= frame.body_end then body_rows = body_rows + 1 end
+    end
+    if fill_height and row == frame.body_end then
+      for _ = body_rows + 1, capacity do projected.lines[#projected.lines + 1] = "" end
     end
     if content_hint and row == scroll.last then
       projected.lines[#projected.lines + 1] = content_hint

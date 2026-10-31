@@ -55,11 +55,6 @@ pub fn prepare_new_session(
         plan_compact: preference
             .as_ref()
             .map_or(source.plan_compact, |value| value.plan_compact),
-        plan_auto_approve_revisions: preference
-            .as_ref()
-            .map_or(source.plan_auto_approve_revisions, |value| {
-                value.plan_auto_approve_revisions
-            }),
         approval_timeout: source.approval_timeout,
         answer_timeout: source.answer_timeout,
         context_window: preference
@@ -76,12 +71,6 @@ pub fn prepare_new_session(
             .map_or(source.shell, |value| value.shell),
         approval_mode: ApprovalMode::Ask,
         active_task: None,
-        default_approval: preference
-            .as_ref()
-            .map_or(source.default_approval, |value| value.default_approval),
-        plan_approval: preference
-            .as_ref()
-            .map_or(source.plan_approval, |value| value.plan_approval),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
         lease_owner: Some(client_id.to_owned()),
@@ -98,7 +87,6 @@ pub fn prepare_new_session(
         &child.backend,
     )?;
     shared.desired.apply(&mut child, native_compact)?;
-    child.approval_mode = child.default_approval;
     shared.apply_provider_defaults(&mut child)?;
     if child.model == "default" && child.resolved_model.is_none() {
         child.resolved_model =
@@ -125,6 +113,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(broker.session.approval_mode, ApprovalMode::Ask);
+        broker.session.approval_mode = ApprovalMode::Allow;
         broker.session.resolved_model = Some("confirmed-default".into());
         broker.save_session().unwrap();
         let created = prepare_new_session(
@@ -138,6 +128,8 @@ mod tests {
         )
         .unwrap();
         assert_ne!(created.id, broker.session.id);
+        assert_eq!(created.approval_mode, ApprovalMode::Ask);
+        assert_eq!(broker.session.approval_mode, ApprovalMode::Allow);
         assert_eq!(created.model, "default");
         assert_eq!(created.resolved_model.as_deref(), Some("confirmed-default"));
     }

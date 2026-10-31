@@ -6,8 +6,11 @@ local diagnostic = require("forge.views.harness.diagnostic")
 local operation_sequence = 0
 
 ---@class ForgeHarnessActiveTask
+---@field id string
 ---@field kind 'goal'|'plan'|'execute'
 ---@field revision string
+---@field phase 'draft'|'review'|'implement'|'check'|'resolve'|'verify'|'work'
+---@field status string
 ---@field auto_accept_plan boolean
 ---@field goal? {objective:string, state:string}
 ---@field plan? {paused:boolean, artifact:{title:string, state:string}}
@@ -23,25 +26,23 @@ end
 ---@param task ForgeHarnessActiveTask
 ---@return string
 function M.status(task)
-  if task.kind == "plan" then
-    if task.plan.paused then return "paused" end
-    local status = task.plan.artifact.state
-    if status == "awaiting_review" or status == "awaiting_input" or status == "configuring_checks" then return "waiting" end
-    if status == "failed" then return "failed" end
-    if status == "cancelled" or status == "rejected" then return "cancelled" end
-    return status == "accepted" and "completed" or "running"
-  end
-  local status = task.kind == "goal" and task.goal.state or task.execution.record.state
-  return ({ active = "running", paused = "paused", complete = "completed", cleared = "cancelled",
-    cancelled = "cancelled" })[status] or "blocked"
+  return task.status
 end
 
 ---@param task ForgeHarnessActiveTask
 ---@return string
 function M.phase(task)
-  if task.kind == "goal" then return "continue" end
-  if task.kind == "execute" then return task.execution.record.phase end
-  return task.plan.artifact.state
+  return task.phase
+end
+
+---@param task ForgeHarnessActiveTask
+---@return string
+function M.label(task)
+  local workflow = task.kind == "execute" and "exec" or task.kind
+  local label = workflow .. " · " .. M.phase(task)
+  local status = M.status(task)
+  if status ~= "running" and status ~= "waiting" then label = label .. " · " .. status end
+  return label
 end
 
 ---@param task ForgeHarnessActiveTask

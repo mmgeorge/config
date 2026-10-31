@@ -3,7 +3,7 @@ local builder = require("forge.builder")
 local client = require("forge.client")
 local original_ensure = builder.ensure
 local requests = {}
-local snapshot = { session = { id = "active-startup", active_task = { revision = "restored-task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } },
+local snapshot = { session = { id = "active-startup", active_task = { revision = "restored-task", kind = "goal", phase = "work", status = "running", goal = { objective = "Fixture goal", state = "active" } } },
   startup_timing = { phases = { controller_ready_ms = 25 }, broker = { database_open_ms = 4 } } }
 local result, failure, completed
 
@@ -49,7 +49,7 @@ local success, error_message = xpcall(function()
   assert(phases[3].phase == "harness.initialize.requested" and phases[4].phase == "harness.initialize.received")
   assert(phases[4].fields.rust.broker.database_open_ms == 4 and phases[5].phase == "trace.configure.received")
   assert(vim.tbl_contains(requests, "host.trace.configure"), "startup omitted tracing configuration")
-  local allowed = { initialize = true, ["session.initialize"] = true,
+  local allowed = { ["host.initialize"] = true, ["session.initialize"] = true,
     ["host.trace.configure"] = true, ["host.transport.consumed"] = true }
   for _, method in ipairs(requests) do
     assert(allowed[method], "startup sent a session mutation: " .. method)

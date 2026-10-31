@@ -324,6 +324,9 @@ pub struct PlanExecutionRecord {
     pub original_revision: u32,
     pub revision: u32,
     pub generation: u64,
+    /// Freeze accepted manual actions so Verify cannot exist without work to perform.
+    #[serde(default)]
+    pub manual_verification: Vec<String>,
     #[serde(default)]
     pub implementation_report: Option<super::implementation_report::ImplementationReportRef>,
     pub planning_backend_session_id: Option<String>,
@@ -339,9 +342,12 @@ pub struct PlanExecutionRecord {
     /// Carries accepted reviewer notes into initial, resumed, and live review responses.
     pub approval_comments: Vec<String>,
     pub pending_revision_reason: Option<String>,
-    pub review_paused: bool,
+    pub resume_after_review: bool,
     pub observed_source: BTreeMap<String, String>,
-    pub observed_generation: u64,
+    #[serde(default)]
+    pub observed_checkpoint: Option<String>,
+    #[serde(default)]
+    pub observed_document_version: u64,
     pub observed_check: BTreeSet<String>,
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
@@ -355,29 +361,7 @@ impl PlanExecutionRecord {
         progress: SemanticProgress,
         now_ms: i64,
     ) -> Result<()> {
-        ensure!(
-            self.state == PlanExecutionState::Active,
-            "execution is {:?}, not active",
-            self.state
-        );
-        ensure!(
-            request.phase == self.phase && request.revision == self.revision,
-            "stale phase completion: current phase is {:?}, revision {}",
-            self.phase,
-            self.revision
-        );
-        ensure!(
-            !request.summary.trim().is_empty(),
-            "phase completion requires a summary"
-        );
-        ensure!(
-            self.pending_revision_reason.is_none(),
-            "a plan revision awaits review"
-        );
-        ensure!(
-            self.phase != PlanPhase::Checking,
-            "Checking is owned by Harness, not the model"
-        );
+        self.validate_phase_request(&request)?;
         if self.phase != PlanPhase::Verify {
             ensure!(
                 request.verification.is_none(),
@@ -429,6 +413,34 @@ impl PlanExecutionRecord {
         Ok(())
     }
 
+    /// Validate phase identity and ownership before evidence collection or mutation.
+    pub(crate) fn validate_phase_request(&self, request: &PlanPhaseDone) -> Result<()> {
+        ensure!(
+            self.state == PlanExecutionState::Active,
+            "execution is {:?}, not active",
+            self.state
+        );
+        ensure!(
+            request.phase == self.phase && request.revision == self.revision,
+            "stale phase completion: current phase is {:?}, revision {}",
+            self.phase,
+            self.revision
+        );
+        ensure!(
+            !request.summary.trim().is_empty(),
+            "phase completion requires a summary"
+        );
+        ensure!(
+            self.pending_revision_reason.is_none(),
+            "a plan revision awaits review"
+        );
+        ensure!(
+            self.phase != PlanPhase::Checking,
+            "Checking is owned by Harness, not the model"
+        );
+        Ok(())
+    }
+
     /// Describe the committed state and its next legal operation.
     pub fn response(&self) -> Value {
         json!({"phase":self.phase,"status":self.state,"revision":self.revision,
@@ -442,6 +454,9 @@ impl PlanExecutionRecord {
                 "Execution is {:?}. End this turn, and do not continue automatically.",
                 self.state
             );
+        }
+        if self.phase == PlanPhase::Checking {
+            return "Harness runs the declaration and accepted checks locally. No model turn runs in this phase.".into();
         }
         let work = match self.phase {
             PlanPhase::Implement => {
@@ -549,7 +564,7 @@ impl ExecutionControlSender {
             .current()?
             .context("execution task was cleared")?;
         task_permit.validate(Some(&task))?;
-        let crate::task::TaskWorkflow::Execute { execution } = task.workflow else {
+        let crate::task::WorkflowSnapshot::Execute { execution } = task.workflow.clone() else {
             return Err(crate::task::StaleTask.into());
         };
         if execution.record.id != self.execution_id
@@ -611,6 +626,7 @@ mod tests {
             original_revision: 1,
             revision: 1,
             generation: 0,
+            manual_verification: Vec::new(),
             planning_backend_session_id: None,
             execution_backend_session_id: None,
             lifecycle: Vec::new(),
@@ -621,9 +637,10 @@ mod tests {
             revision_history: Vec::new(),
             approval_comments: Vec::new(),
             pending_revision_reason: None,
-            review_paused: false,
+            resume_after_review: false,
             observed_source: BTreeMap::new(),
-            observed_generation: 0,
+            observed_checkpoint: None,
+            observed_document_version: 0,
             observed_check: BTreeSet::new(),
             created_at_ms: 0,
             completed_at_ms: None,
@@ -969,21 +986,21 @@ mod revision_policy_tests {
             "id":"execution","session_id":"session","plan_id":"plan",
             "state":"active","phase":"implement","original_revision":1,"revision":1,"generation":1,
             "lifecycle":[],"findings":[],"progress":SemanticProgress::default(),
-            "verification":[],"revision_history":[],"review_paused":false,"observed_source":{},
-            "observed_generation":0,"observed_check":[],"created_at_ms":0
+            "verification":[],"revision_history":[],"resume_after_review":false,"observed_source":{},
+            "observed_document_version":0,"observed_check":[],"created_at_ms":0
         }))?;
         let previous = controller.current()?.unwrap();
         let task = controller
             .change(
                 &mut store,
                 Some(&previous.revision),
-                crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::execute(
+                crate::task::TaskChange::Install(Box::new(crate::task::Task::execute(
                     "Execute plan".into(),
                     record.clone(),
                     Default::default(),
                     false,
                     2,
-                ))),
+                )?)),
                 2,
             )?
             .unwrap();
@@ -1030,7 +1047,7 @@ mod revision_policy_tests {
         controller.change(
             &mut store,
             Some(&resumed.revision),
-            crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+            crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                 "Replacement".into(),
                 Default::default(),
                 false,

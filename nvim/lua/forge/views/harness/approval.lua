@@ -61,7 +61,7 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@field confirm_on_key? boolean
 ---@field wrap_label? boolean
 
----@class ForgeApprovalPickerPage
+---@class ForgeApprovalPickerPage: ForgePickerPage
 ---@field id string
 ---@field title string
 ---@field subtitle? string
@@ -72,7 +72,7 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@field selected_index? integer
 ---@field footer string
 
----@class ForgeApprovalPickerSpec
+---@class ForgeApprovalPickerSpec: ForgePickerSpec
 ---@field owner string
 ---@field action_list {key: string, modes: string[], desc: string, callback: fun()}[]
 ---@field host {window_list: integer[], control_win: integer}

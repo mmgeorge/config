@@ -2,9 +2,89 @@ local M = {}
 local client = require("forge.client")
 local picker = require("forge.views.picker")
 local duration = require("forge.views.harness.duration")
+local threshold = require("forge.views.harness.compaction_threshold")
 local notifications = require("forge.infra.notifications")
 local log_buffer_by_path = {}
 local log_revision_by_buffer = {}
+
+--- Category ownership for the existing setting sections, in display order.
+local configuration_category_list = {
+  { id = "models", title = "Models" },
+  { id = "workflow", title = "Workflow" },
+  { id = "permissions", title = "Permissions" },
+  { id = "tools", title = "Tools" },
+  { id = "system", title = "System" },
+}
+
+local configuration_field_description = {
+  ["main-model"] = "Used for chat, planning, and execution.",
+  ["main-thinking"] = "How much reasoning the main model uses.",
+  ["main-speed"] = "Service tier for main-model requests.",
+  ["ask-override"] = "By default, Ask uses the main model used for planning. Enable Override to choose separate settings.",
+  ["ask-model"] = "Model used for Ask requests when Override is enabled.",
+  ["ask-thinking"] = "How much reasoning the Ask model uses.",
+  ["ask-speed"] = "Service tier for Ask requests.",
+  ["background-model"] = "Used for background requests.",
+  ["background-thinking"] = "How much reasoning the background model uses.",
+  ["background-speed"] = "Service tier for background-model requests.",
+  ["auto-compact"] = "Summarize older session context as the conversation grows.",
+  ["compact-threshold"] = "Context size in tokens that triggers automatic session compaction.",
+  ["background-compact"] = "Automatically compact context for background requests.",
+  ["background-threshold"] = "Context size in tokens that triggers automatic background compaction.",
+  ["shell"] = "Shell used to run project checks.",
+  ["check-editing"] = "Allow the assistant to edit project checks. Also controlled by /checks edit on/off.",
+  ["automatic-checks"] = "Automatically run configured project checks.",
+  ["check-timing"] = "Run checks between queued work items or after the queue finishes.",
+  ["approval-mode"] = "Tool approval policy: Ask prompts for requests not covered by rules; Deny rejects them; Approve allows them. Explicit deny rules still apply.",
+  ["read-access"] = "Directories the assistant may read.",
+  ["readable-directories"] = "Edit additional readable directories, one directory per line.",
+  ["write-access"] = "Directories the assistant may modify.",
+  ["writable-directories"] = "Edit additional writable directories, one directory per line.",
+  ["approval_timeout"] = "Time allowed for approval. Enter to edit; Up/Down adjust from 15 seconds to 60 minutes.",
+  ["answer_timeout"] = "Time to answer an assistant question before continuing with its recommended or first option. Questions without options are skipped. Plan acceptance never times out.",
+  ["subagent-tools"] = "Allow the assistant to delegate work to subagents.",
+  ["lsp-tools"] = "Allow the assistant to use language-server tools.",
+  ["session-tools"] = "Allow the assistant to search and read session history.",
+  ["status-thoughts"] = "Show model thoughts in the status display.",
+  ["provider"] = "Choose the provider used by this session.",
+  ["provider-setup"] = "Configure or sign in to this provider.",
+  ["logging"] = "Record Harness trace events for debugging.",
+}
+
+--- Partition settings into category pages, keeping only compound values in one row.
+---@param row_list table[]
+---@return ForgePickerPage[]
+local function configuration_pages(row_list)
+  local page_list, page_by_category = {}, {}
+  for _, category in ipairs(configuration_category_list) do
+    local page = {
+      id = category.id, title = category.title, option_list = {},
+      field_navigation = true, field_description_height = 2, highlight_selected_text = false,
+      wrap_selection = false, toggle_on_confirm = true,
+    }
+    page_list[#page_list + 1] = page
+    page_by_category[category.id] = page
+  end
+  for _, row in ipairs(row_list) do
+    local page = assert(page_by_category[row.category], "Configuration row has no category: " .. tostring(row.category))
+    for _, source in ipairs(row.fields) do
+      local field = vim.deepcopy(source)
+      field.description = assert(field.description or configuration_field_description[field.id], "Configuration field requires a description: " .. field.id)
+      if field.join_previous then
+        local previous = assert(page.option_list[#page.option_list], "Compound setting requires a preceding field")
+        previous.fields[#previous.fields + 1] = field
+      else
+        local label = field.label and field.label ~= "Enabled" and field.label or row.label
+        if field.id == "provider-setup" then label = "Provider setup" end
+        field.label = nil
+        page.option_list[#page.option_list + 1] = {
+          id = field.id, section = row.section, label = label, fields = { field },
+        }
+      end
+    end
+  end
+  return page_list
+end
 
 local function cycle(values, value, direction)
   if #values == 0 then return value end
@@ -175,17 +255,20 @@ end
 
 ---@param state ForgeHarnessPresentationState
 ---@param host table
-function M.open(state, host)
+---@param resume_state? ForgePickerResumeState State captured before a child editor opened.
+function M.open(state, host, resume_state)
   if not state.session then return end
   local session_id = state.session.id
   M._revision = (M._revision or 0) + 1
   local owner_revision = M._revision
   request(session_id, "host.trace.status", {}, function(status)
-    if not state.session or state.session.id ~= session_id then return end
+    if M._revision ~= owner_revision or not state.session or state.session.id ~= session_id then return end
     local pending = false
     ---@type table<string, any>
     local active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
       state.task_config or {})
+    active.access = (state.task_config or {}).access or (state.configuring_config or {}).access
+      or state.access_preference or active.access
     active.status_thoughts = state.status_thoughts == true
     active.check_timing = state.check_timing or "after_queue"
     active.automatic_checks = state.automatic_checks == true
@@ -193,12 +276,17 @@ function M.open(state, host)
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
     local build_spec
     local commit
+    local current
+    local return_state = resume_state
+    --- Re-enter only after the owned child closes and the original session remains current.
+    local function reopen()
+      if current() and not picker.is_open() then M.open(state, host, return_state) end
+    end
     ---@type ForgeAskModel
     local ask = vim.deepcopy(state.ask_model or {})
-    local timeout_focus = { approval_timeout = "amount", answer_timeout = "amount" }
     local access = require("forge.views.harness.access")
     local function configure(params, completed)
-      if not state.session or state.session.id ~= session_id then return end
+      if not current() then if completed then completed(false) end return end
       configuration_revision = configuration_revision + 1
       local revision = configuration_revision
       active = vim.tbl_extend("force", active, params)
@@ -206,27 +294,48 @@ function M.open(state, host)
       local previous = session.harness
       session.activate_harness(state)
       require("forge.views.harness.controller").configure(params, false, function(applied)
-        if not state.session or state.session.id ~= session_id then return end
-        if revision ~= configuration_revision then return end
+        if not current() or revision ~= configuration_revision then
+          if completed then completed(false) end
+          return
+        end
         active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
           state.task_config or {})
+        if applied and params.access then state.access_preference = vim.deepcopy(params.access) end
+        active.access = state.access_preference or active.access
         active.status_thoughts = state.status_thoughts == true
         active.check_timing = state.check_timing or "after_queue"
         active.automatic_checks = state.automatic_checks == true
         if applied and params.session_tools ~= nil then active.session_tools = params.session_tools end
         if completed then completed(applied) end
+        if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
+      end)
+      session.activate_harness(previous)
+      if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
+    end
+    local function apply_access(policy, completed)
+      configure({ access = policy }, completed)
+    end
+    local function set_approval_mode(mode)
+      local previous_mode = active.approval_mode or "ask"
+      active.approval_mode, pending = mode, true
+      local session = require("forge.session")
+      local previous = session.harness
+      session.activate_harness(state)
+      require("forge.views.harness.controller").task_transition({
+        action = "permission", change = { kind = "set_approval", mode = mode },
+      }, nil, function(applied)
+        if not current() then return end
+        pending = false
+        active.approval_mode = applied and mode or previous_mode
         if picker.is_open("harness-config") then picker.update(build_spec()) end
       end)
       session.activate_harness(previous)
-      if picker.is_open("harness-config") then picker.update(build_spec()) end
-    end
-    local function apply_access(policy, completed)
-      configure({ access = policy }, function(applied) if applied and completed then completed() end end)
+      if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
     end
     local function configure_ask(selection, completed)
       pending = true
       client.request({ session_id = session_id, method = "session.configure", params = { ask_model = selection } }, function(result, failure)
-        if not state.session or state.session.id ~= session_id then return end
+        if not current() then return end
         pending = false
         if failure then notifications.error(failure, "Ask model")
         else
@@ -234,54 +343,58 @@ function M.open(state, host)
           state.ask_model = vim.deepcopy(ask)
         end
         if completed then completed(failure == nil) end
-        if picker.is_open("harness-config") then picker.update(build_spec()) end
+        if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
       end)
     end
     local function toggle(context, direction)
       if pending or not context.option then return end
       local id = context.option.id
-      if id == "ask-inherit" then configure_ask(vim.empty_dict()) return end
-      if id == "ask-thinking" or id == "ask-speed" then
+      if id == "ask-override" then
+        if ask.model then configure_ask(vim.empty_dict()) return end
+        local models = commit and commit.model_list or {}
+        local model = require("forge.views.harness.model_options").find(models, active.resolved_model or active.model)
+        if not model then notifications.error("The main model is not available in the provider model list", "Ask model") return end
+        local speeds = require("forge.views.harness.model_options").speeds(model, state.capability or {})
+        configure_ask({ model = model.id,
+          effort = vim.tbl_contains(model.reasoning or {}, active.effort) and active.effort or model.default_reasoning,
+          service_tier = vim.tbl_contains(speeds, active.service_tier or "default") and (active.service_tier or "default") or "default" })
+        return
+      end
+      if id == "ask-model" or id == "ask-thinking" or id == "ask-speed" then
         if not ask.model then return end
-        local model = require("forge.views.harness.model_options").find(commit and commit.model_list or {}, ask.model)
+        local models = commit and commit.model_list or {}
+        local model_options = require("forge.views.harness.model_options")
+        local model = model_options.find(models, ask.model)
         local selection = vim.deepcopy(ask)
-        if id == "ask-thinking" then
+        if id == "ask-model" then
+          local model_ids = vim.tbl_map(function(candidate) return candidate.id end, models)
+          selection.model = cycle(model_ids, ask.model, direction)
+          model = model_options.find(models, selection.model)
+          selection.effort = model and (model.default_reasoning or (model.reasoning or {})[1]) or nil
+          local speeds = model_options.speeds(model, state.capability or {})
+          if not vim.tbl_contains(speeds, selection.service_tier or "default") then selection.service_tier = "default" end
+        elseif id == "ask-thinking" then
           selection.effort = cycle(model and model.reasoning or {}, ask.effort, direction)
         else
-          selection.service_tier = cycle(require("forge.views.harness.model_options").speeds(model, state.capability or {}), ask.service_tier or "default", direction)
+          selection.service_tier = cycle(model_options.speeds(model, state.capability or {}), ask.service_tier or "default", direction)
         end
         configure_ask(selection)
         return
       end
       if commit and commit:change(id, direction or 1) then return end
-      if id == "auto-compact" or id == "compact-threshold" then
+      if id == "auto-compact" then
         local policy = vim.deepcopy(active.auto_compaction or { enabled = false, threshold_tokens = 128000 })
-        if id == "auto-compact" then
-          if not (state.capability and state.capability.native_compact) then notifications.error("This provider does not support compaction", "Harness") return end
-          policy.enabled = not policy.enabled
-          configure({ auto_compaction = policy })
-        else
-          vim.ui.input({ prompt = "Compact at tokens: ", default = tostring(policy.threshold_tokens) }, function(value)
-            if not value or not state.session or state.session.id ~= session_id then return end
-            local amount = tonumber(value)
-            if not amount or amount <= 0 or amount % 1 ~= 0 then notifications.error("Enter a positive whole token count", "Harness") return end
-            policy.threshold_tokens = amount
-            configure({ auto_compaction = policy })
-          end)
-        end
+        if not (state.capability and state.capability.native_compact) then notifications.error("This provider does not support compaction", "Harness") return end
+        policy.enabled = not policy.enabled
+        configure({ auto_compaction = policy })
         return
       end
-      if timeout_focus[id] then
-        configure({ [id] = duration.change(duration.value(active[id]), timeout_focus[id], direction or 1) })
+      if id == "approval_timeout" or id == "answer_timeout" then
+        configure({ [id] = duration.change(active[id], direction or 1) })
         return
       end
       if id == "sandbox" or id == "read-access" or id == "write-access" or id == "windows-sandbox" then
         local policy = access.policy(active)
-        local supported = state.capability and state.capability.os_sandbox == true
-        if not supported and (id == "sandbox" or id == "windows-sandbox") then
-          notifications.error("This provider does not expose sandbox configuration", "Harness access")
-          return
-        end
         if id == "sandbox" then policy.sandbox = not policy.sandbox
         elseif id == "read-access" then policy.read_access = policy.read_access == "workspace" and "full" or "workspace"
         elseif id == "write-access" then
@@ -298,27 +411,36 @@ function M.open(state, host)
         apply_access(policy)
         return
       elseif id == "readable-directories" or id == "writable-directories" then
+        return_state = picker.capture_state()
         picker.close(false)
-        access.directories(state, host, apply_access, function() M.open(state, host) end,
+        access.directories(state, apply_access, reopen,
           id == "readable-directories" and "read" or "write")
         return
       end
-      if id == "default-approval" or id == "plan-approval" then
-        local field = id == "default-approval" and "default_approval" or "plan_approval"
-        local values = field == "plan_approval" and { "keep", "ask", "deny", "allow" } or { "ask", "deny", "allow" }
-        local selected = active[field]
-        if not selected or selected == vim.NIL then selected = "keep" end
-        local position = 1
-        for index, value in ipairs(values) do if value == selected then position = index end end
-        local next_value = values[(position - 1 + (direction or 1)) % #values + 1]
-        configure({ [field] = next_value == "keep" and vim.NIL or next_value })
-      elseif id == "shell" then
+      if id == "approval-mode" then
+        set_approval_mode(cycle({ "ask", "deny", "allow" }, active.approval_mode or "ask", direction or 1))
+        return
+      end
+      if id == "shell" then
         local values = { "system" }
         if vim.fn.executable("nu") == 1 then values[#values + 1] = "nushell" end
         local position = active.shell == "nushell" and #values or 1
         configure({ shell = values[(position - 1 + (direction or 1)) % #values + 1] })
-      elseif id == "plan-revisions" then
-        configure({ plan_auto_approve_revisions = active.plan_auto_approve_revisions == false })
+      elseif id == "check-editing" then
+        pending = true
+        client.request({ session_id = session_id, method = "session.check.editing.set",
+          params = { enabled = not state.check_editing } }, function(result, failure)
+          if not current() then return end
+          pending = false
+          if failure then notifications.error(failure, "Harness checks")
+          else
+            state.check_editing = result.check_editing == true
+            if require("forge.session").harness == state then
+              require("forge.views.harness.controller").refresh_winbar()
+            end
+          end
+          if picker.is_open("harness-config") then picker.update(build_spec()) end
+        end)
       elseif id == "subagent-tools" then
         configure({ subagent_tools = (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) ~= true })
       elseif id == "lsp-tools" then
@@ -335,19 +457,17 @@ function M.open(state, host)
         pending = true
         client.request({ method = "host.trace.configure", params = { enabled = not status.enabled } }, function(result, failure)
           pending = false
+          if not current() then return end
           if failure then notifications.error(failure, "Harness logging") return end
           status = result
           M.adopt(status)
-          if picker.is_open("harness-config") then picker.update(build_spec()) end
+          if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
         end)
       end
     end
-    local function current()
+    current = function()
       return M._revision == owner_revision and not state.switching_backend
         and state.session ~= nil and state.session.id == session_id
-    end
-    local function redraw()
-      if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
     end
     local function model_descriptor()
       return require("forge.views.harness.model_options").find(commit and commit.model_list, active.model)
@@ -374,6 +494,18 @@ function M.open(state, host)
       end
     end
     local function activate(id)
+      return_state = picker.capture_state()
+      if id == "compact-threshold" then
+        local policy = active.auto_compaction or { enabled = false, threshold_tokens = 128000 }
+        threshold.open({ host = host, value = policy.threshold_tokens, on_close = reopen,
+          on_select = function(value)
+            if not current() then return end
+            local updated = vim.deepcopy(active.auto_compaction or policy)
+            updated.threshold_tokens = value
+            configure({ auto_compaction = updated }, reopen)
+          end })
+        return
+      end
       if commit and id:match("^background%-") and commit:open(id) then return end
       if id == "ask-model" then
         local models = vim.deepcopy(commit and commit.model_list or {})
@@ -383,10 +515,11 @@ function M.open(state, host)
         picker.close(false)
         require("forge.views.harness.model_picker").open({ host = host, model_list = models,
           backend = active.backend, current_model = ask.model or active.model, is_current = current,
-          on_close = function() if current() then M.open(state, host) end end,
+          on_close = reopen,
           on_confirm = function(value)
+            picker.close(false)
             configure_ask({ model = value.model, effort = value.effort, service_tier = "default" },
-              function() if current() then M.open(state, host) end end)
+              reopen)
           end })
         return
       end
@@ -398,17 +531,15 @@ function M.open(state, host)
         picker.close(false)
         require("forge.views.harness.model_picker").open({ host = host, model_list = models,
           backend = active.backend, current_model = active.model, is_current = current,
-          on_close = function() if current() then M.open(state, host) end end,
+          on_close = reopen,
           on_confirm = function(value)
             picker.close(false)
             local model = require("forge.views.harness.model_options").find(models, value.model)
             local speeds = require("forge.views.harness.model_options").speeds(model, state.capability or {})
             configure({ model = value.model, effort = value.effort, context_window = value.context_window,
               service_tier = vim.tbl_contains(speeds, active.service_tier or "default") and active.service_tier or "default" },
-              function() if current() then M.open(state, host) end end)
+              reopen)
           end })
-      elseif id == "native-import" then
-        require("forge.views.harness.native_import").open(state, host)
       elseif id == "provider-setup" then
         require("forge.views.harness.provider_setup").open({ host = host, session_id = session_id })
       elseif id == "provider" then
@@ -421,7 +552,7 @@ function M.open(state, host)
     end
     build_spec = function()
       local policy = access.policy(active)
-      local supported = state.capability and state.capability.os_sandbox == true
+      local supported = access.supports_sandbox(active, state.capability)
       local background = commit and commit:fields() or {}
       local background_fields = { background.model, background.thinking }
       if background.speed then background_fields[#background_fields + 1] = background.speed end
@@ -435,9 +566,11 @@ function M.open(state, host)
       ---@return ForgePickerField
       local function field(id, kind, value, label, disabled, muted)
         return { id = id, kind = kind, value = value, label = label,
-          disabled_reason = disabled, muted = muted }
+          disabled_reason = disabled, muted = muted,
+          input = kind == "input" and { kind = "choice", values = duration.choices(), initial = duration.selection(active[id]) } or nil }
       end
       local catalog_disabled = not (commit and commit.model_list) and (commit and commit.failure or "Loading models") or nil
+      local ask_disabled = not ask.model and "Enable Override to change Ask settings." or catalog_disabled
       local main = {
         field("main-model", "choice", active.model or "Default", nil,
           not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled),
@@ -449,145 +582,121 @@ function M.open(state, host)
         main[#main + 1] = field("main-speed", "choice", active.service_tier or "default", "Speed")
       end
       local compaction = active.auto_compaction or { enabled = false, threshold_tokens = 128000 }
+      main[#main + 1] = field("auto-compact", "toggle", compaction.enabled, "Compact",
+        not capability.native_compact and "Compaction is unavailable for this provider" or nil)
+      main[#main + 1] = field("compact-threshold", "choice", threshold.label(compaction.threshold_tokens), "Threshold", nil, not compaction.enabled)
+      vim.list_extend(background_fields, { background.compact, background.threshold })
+      local sandbox_description = access.sandbox_description(policy, supported)
       local sandbox = {
         field("sandbox", "toggle", policy.sandbox, "Enabled",
-          not supported and "OS sandbox configuration is unavailable for this provider" or nil),
+          nil, not supported),
       }
+      sandbox[1].description = sandbox_description
       if vim.fn.has("win32") == 1 then
+        local windows_description = access.windows_sandbox_description(policy, supported)
         sandbox[#sandbox + 1] = field("windows-sandbox", "choice", policy.windows_sandbox, "Windows mode",
-          not supported and "OS sandbox configuration is unavailable for this provider" or nil)
+          nil, not supported or not policy.sandbox)
+        sandbox[#sandbox].description = windows_description
       end
-      local approval, answer = duration.value(active.approval_timeout), duration.value(active.answer_timeout)
-      local approval_unit = field("approval_timeout:unit", "choice", approval.unit, nil)
-      local answer_unit = field("answer_timeout:unit", "choice", answer.unit, nil)
-      approval_unit.join_previous, answer_unit.join_previous = true, true
-      local provider_configuration = {
-        field("native-import", "action", "Import…", nil),
-      }
+      local provider_configuration = {}
       if active.backend == "claude" or active.backend == "antigravity" then
         provider_configuration[#provider_configuration + 1] = field("provider-setup", "action", "Provider setup / sign in…", nil)
       end
+      ---@param category string
       ---@param id string
       ---@param section string
       ---@param label string
       ---@param fields ForgePickerField[]
-      ---@param inline_fields? boolean
       ---@return table
-      local function row(id, section, label, fields, inline_fields)
-        return { id = id, section = section, label = label, fields = fields, inline_fields = inline_fields }
+      local function row(category, id, section, label, fields)
+        return { category = category, id = id, section = section, label = label, fields = fields }
       end
       return {
-        owner = "harness-config", host = host, height_ratio = 0.9, fit_content = true,
-        page_list = { {
-          id = "config", title = "Configuration",
-          field_navigation = true, highlight_selected_text = false, compact_sections = true,
-          option_list = {
-            row("main-model", "Models", "Main", main),
-            row("ask-model", "Models", "Ask", {
-              field("ask-model", "choice", ask.model or "Same as planning", nil,
-                not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled),
-              field("ask-thinking", "choice", ask.effort or "Default", "Thinking",
-                not ask.model and "Uses the planning model settings" or catalog_disabled),
-              field("ask-speed", "choice", ask.service_tier or "default", "Speed",
-                not ask.model and "Uses the planning model settings" or catalog_disabled),
-              field("ask-inherit", "action", "Use planning", nil,
-                not ask.model and "Already uses the planning model" or nil),
+        owner = "harness-config", title = "Configuration", host = host, size_ratio = 0.8, width_ratio = 1, placement = "bottom",
+        page_navigation = "tabs", wrap_pages = true, hint_mode = "help", resume_state = resume_state,
+        keymaps = {
+          page_previous = { "<S-Tab>", "[" }, page_next = { "<Tab>", "]" },
+          previous_field = "<C-Left>", next_field = "<C-Right>",
+        },
+        page_list = configuration_pages({
+            row("models", "main-model", "Main model", "Model", main),
+            row("models", "ask-override", "Ask model", "Override", {
+              field("ask-override", "toggle", ask.model ~= nil, "Enabled",
+                not ask.model and (not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled) or nil),
             }),
-            row("background-model", "Models", "Background", background_fields),
-            row("main-compaction", "Compaction", "Main", {
-              field("auto-compact", "toggle", compaction.enabled, "Automatic",
-                not capability.native_compact and "Compaction is unavailable for this provider" or nil),
-              field("compact-threshold", "input", tostring(compaction.threshold_tokens), "Threshold", nil, not compaction.enabled),
+            row("models", "ask-model", "Ask model", "Model", {
+              field("ask-model", "choice", ask.model or active.resolved_model or active.model or "Default", nil,
+                ask_disabled or not capability.model_selection and "Model selection is unavailable for this provider" or nil),
+              field("ask-thinking", "choice", ask.model and (ask.effort or "Default") or (active.effort or "Default"), "Thinking",
+                ask_disabled or not capability.effort_selection and "Reasoning effort selection is unavailable for this provider" or nil),
+              field("ask-speed", "choice", ask.model and (ask.service_tier or "default") or (active.service_tier or "default"), "Speed",
+                ask_disabled),
             }),
-            row("background-compaction", "Compaction", "Background", { background.compact, background.threshold }),
-            row("check-execution", "Checks", "Execution", {
-              field("shell", "choice", active.shell == "nushell" and "Nushell" or "System", "Shell"),
-            }),
-            row("automatic-checks", "Checks", "Automatic", {
+            row("models", "background-model", "Background model", "Model", background_fields),
+            row("workflow", "automatic-checks", "Checks", "Automatic", {
               field("automatic-checks", "toggle", active.automatic_checks == true, "Enabled"),
               field("check-timing", "choice", active.check_timing == "between_work" and "Between queued work" or "After queue", "Timing"),
             }),
-            row("check-editing", "Checks", "Setup", {
-              field("check-editing", "toggle", state.check_editing == true, "Enabled"),
+            row("workflow", "check-execution", "Checks", "Execution", {
+              field("shell", "choice", active.shell == "nushell" and "Nushell" or "System", "Shell"),
             }),
-            row("plan-approval", "Planning", "Approval", {
-              field("plan-approval", "choice", ({ ask = "ask", deny = "deny", allow = "allow" })[active.plan_approval] or "Keep current", nil),
+            row("workflow", "question-timeout", "Questions", "Timeout", {
+              field("answer_timeout", "input", duration.render(active.answer_timeout), nil),
             }),
-            row("plan-revisions", "Planning", "Auto-approve", {
-              field("plan-revisions", "toggle", active.plan_auto_approve_revisions ~= false, "Auto-approve"),
-            }, true),
-            row("execute-approval", "Execute", "Approval", {
-              field("default-approval", "choice", active.default_approval or "ask", nil),
-            }),
-            row("read-access", "Permissions", "Read", {
+            row("permissions", "read-access", "Access", "Read", {
               field("read-access", "choice", policy.read_access, nil),
               field("readable-directories", "action", tostring(#policy.readable_directory) .. "…", "Extra directories"),
             }),
-            row("write-access", "Permissions", "Write", {
+            row("permissions", "write-access", "Access", "Write", {
               field("write-access", "choice", policy.write_access, nil),
               field("writable-directories", "action", tostring(#policy.writable_directory) .. "…", "Extra directories"),
             }),
-            row("sandbox", "Permissions", "Sandbox", sandbox),
-            row("timeouts", "Tools", "Timeouts", {
-              field("approval_timeout:amount", "input", tostring(approval.amount), "Approval"),
-              approval_unit,
-              field("answer_timeout:amount", "input", tostring(answer.amount), "Answer"),
-              answer_unit,
+            row("permissions", "tool-mode", "Tools", "Mode", {
+              field("approval-mode", "choice", ({ ask = "Ask", deny = "Deny", allow = "Approve" })[active.approval_mode] or "Ask", nil),
             }),
-            row("subagent-tools", "Tools", "Subagents", {
-              field("subagent-tools", "toggle", (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true, "Subagents"),
-            }, true),
-            row("lsp-tools", "Tools", "LSP", {
-              field("lsp-tools", "toggle", (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true, "LSP"),
-            }, true),
-            row("session-tools", "Tools", "Session history", {
-              field("session-tools", "toggle", active.session_tools ~= false and (active.session_tools ~= nil or state.session_tools ~= false), "Sessions"),
-            }, true),
-            row("status-thoughts", "Display", "Thoughts", {
-              field("status-thoughts", "toggle", active.status_thoughts == true, "Thoughts"),
-            }, true),
-            row("provider", "Provider", "Connection", {
+            row("permissions", "approval-timeout", "Tools", "Approval timeout", {
+              field("approval_timeout", "input", duration.render(active.approval_timeout), nil),
+            }),
+            row("permissions", "check-editing", "Checks", "Allow editing", {
+              field("check-editing", "toggle", state.check_editing == true, nil),
+            }),
+            row("permissions", "sandbox", "Sandbox", "Sandbox", sandbox),
+            row("tools", "subagent-tools", "Tools", "Subagents", {
+              field("subagent-tools", "toggle", (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true, "Enabled"),
+            }),
+            row("tools", "lsp-tools", "Tools", "LSP", {
+              field("lsp-tools", "toggle", (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true, "Enabled"),
+            }),
+            row("tools", "session-tools", "Tools", "Session history", {
+              field("session-tools", "toggle", active.session_tools ~= false and (active.session_tools ~= nil or state.session_tools ~= false), "Enabled"),
+            }),
+            row("system", "status-thoughts", "Display", "Thoughts", {
+              field("status-thoughts", "toggle", active.status_thoughts == true, "Enabled"),
+            }),
+            row("system", "provider", "Provider", "Connection", {
               field("provider", "action", cli or "Unknown", nil),
             }),
-            row("provider-configuration", "Provider", "Configuration", provider_configuration),
-            row("logging", "Debug", "Logging", {
-              field("logging", "toggle", status.enabled == true, "Logging"),
-            }, true),
-          },
-          footer = "↑↓ row  Tab/S-Tab field  ←→ value  Space toggle  Enter edit/open  q close",
-        } },
+            row("system", "provider-configuration", "Provider", "Configuration", provider_configuration),
+            row("system", "logging", "Debug", "Logging", {
+              field("logging", "toggle", status.enabled == true, "Enabled"),
+            }),
+        }),
+        on_field_submit = function(context, value, complete)
+          if not current() then complete("This session is no longer active.") return end
+          if pending then complete("Another setting is being saved. Try again.") return end
+          local timeout = context.field.id
+          if timeout ~= "approval_timeout" and timeout ~= "answer_timeout" then complete("This setting does not accept text input.") return end
+          configure({ [timeout] = duration.parse(value) }, function(applied)
+            complete(not applied and "Could not save the setting. Press Enter to retry." or nil)
+          end)
+        end,
         on_field_action = function(context, action, direction)
           if not current() or pending then return end
           local id = context.field.id
-          if id == "check-editing" then
-            pending = true
-            client.request({ session_id = session_id, method = "session.check.editing.set", params = { enabled = not state.check_editing } }, function(result, failure)
-              if not current() then return end
-              pending = false
-              if failure then notifications.error(failure, "Harness checks") else state.check_editing = result.check_editing == true end
-              require("forge.views.harness.controller").refresh_winbar()
-              redraw()
-            end)
-            return
-          end
-          local timeout, focus = id:match("^([^:]+):([^:]+)$")
-          if timeout then
-            timeout_focus[timeout] = focus
-            if action == "activate" and focus == "amount" then
-              vim.ui.input({ prompt = (timeout == "approval_timeout" and "Approval" or "Answer") .. " timeout amount (0 disables): ",
-                default = tostring(duration.value(active[timeout]).amount) }, function(text)
-                if not text or not current() then return end
-                local amount = tonumber(text)
-                if not text:match("^%d+$") or not amount or amount > 4294967295 then notifications.error("Enter a whole number from 0 to 4294967295", "Harness timeout") return end
-                local value = duration.value(active[timeout])
-                value.amount = amount
-                configure({ [timeout] = value })
-              end)
-            else toggle({ option = { id = timeout } }, direction) end
-          elseif action == "activate" then activate(id)
+          if action == "activate" then activate(id)
           elseif id == "compact-threshold" then
             local policy = vim.deepcopy(active.auto_compaction or { enabled = false, threshold_tokens = 128000 })
-            policy.threshold_tokens = math.max(1, policy.threshold_tokens + direction)
+            policy.threshold_tokens = threshold.change(policy.threshold_tokens, direction)
             configure({ auto_compaction = policy })
           elseif id:match("^main%-") then change_main(id, direction)
           else toggle({ option = { id = id } }, direction) end
@@ -599,7 +708,7 @@ function M.open(state, host)
       capability = function() return state.capability or {} end,
       current = current,
       changed = function() if commit and picker.is_open("harness-config") then picker.update(build_spec()) end end,
-      reopen = function() M.open(state, host) end,
+      reopen = reopen,
     })
     picker.open(build_spec())
   end)

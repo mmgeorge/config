@@ -222,19 +222,16 @@ impl BrokerObserver {
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
         let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
-        let snapshot = settings.get(&session.workspace, &session.id, &session.backend)?;
-        let mut desired = settings.layer_settings(
-            crate::settings::SettingScope::Session,
-            &session.workspace,
-            &session.id,
-        )?;
-        desired.check_editing = Some(enabled);
-        settings.update(
-            snapshot.revision,
-            crate::settings::SettingScope::Session,
-            &session.workspace,
-            &session.id,
-            &desired,
+        settings.patch(
+            crate::settings::SettingTarget {
+                scope: crate::settings::SettingScope::Session,
+                workspace: &session.workspace,
+                session: &session.id,
+            },
+            &crate::settings::PortableSettings {
+                check_editing: Some(enabled),
+                ..Default::default()
+            },
         )?;
         self.check_editing.store(enabled, Ordering::Release);
         Ok(json!({"check_editing": enabled}))
@@ -312,8 +309,8 @@ impl BrokerObserver {
             self.permission_coordinator.input_timeouts(&session.id)?;
         let task = source_session.active_task.as_ref();
         let active_plan = match task.map(|task| &task.workflow) {
-            Some(crate::task::TaskWorkflow::Plan { plan }) => Some(plan.artifact.clone()),
-            Some(crate::task::TaskWorkflow::Execute { execution }) => {
+            Some(crate::task::WorkflowSnapshot::Plan { plan }) => Some(plan.artifact.clone()),
+            Some(crate::task::WorkflowSnapshot::Execute { execution }) => {
                 store.load_plan(&execution.record.plan_id)?
             }
             _ => None,
@@ -375,7 +372,7 @@ impl BrokerObserver {
         let lifecycle_list = store.list_plan_lifecycle(&source_session.id)?;
         let execution_list = store.list_plan_execution(&source_session.id)?;
         let goal_execution = match task.map(|task| &task.workflow) {
-            Some(crate::task::TaskWorkflow::Execute { execution }) => {
+            Some(crate::task::WorkflowSnapshot::Execute { execution }) => {
                 Some(execution.record.clone())
             }
             _ => None,
@@ -476,6 +473,10 @@ impl BrokerObserver {
             .collect();
         Ok(BrokerSnapshot {
             ask_model,
+            access_preference: settings
+                .access
+                .clone()
+                .unwrap_or_else(|| session.access.clone()),
             access_abbreviation: session.access.abbreviation().into(),
             subagent_tools: self.agent_coordinator.enabled(),
             lsp_tools: self.lsp.enabled(&source_session.id),

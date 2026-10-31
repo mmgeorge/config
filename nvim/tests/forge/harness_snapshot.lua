@@ -15,7 +15,9 @@ local response = vim.json.decode([[{
   "agent": {"run": [], "definition": [], "exchange": []},
   "timeline": [], "timeline_revision": 3, "prompt_history": null
 }]])
+response.access_preference = { sandbox = true, windows_sandbox = "mxc" }
 snapshot.apply(state, response)
+assert(state.access_preference.sandbox and state.access_preference.windows_sandbox == "mxc")
 for _, field in ipairs({ "active_plan", "active_elicitation", "active_wait" }) do
   assert(state[field] == nil, field .. " retained a JSON null")
 end
@@ -24,7 +26,7 @@ assert(state.selected_agent_run_id == nil and state.timeline_revision == 3)
 assert(type(state.capability) == "table" and #state.approval == 0)
 assert(response.goal == vim.NIL and response.session.context_usage == vim.NIL,
   "snapshot projection mutated the transport response")
-response.session.active_task = { revision = "goal", kind = "goal", goal = { state = "paused", objective = "Test" } }
+response.session.active_task = { revision = "goal", kind = "goal", phase = "work", status = "running", goal = { state = "paused", objective = "Test" } }
 response.active_elicitation = { elicitation = { question_set = { id = "new" }, response = vim.NIL } }
 snapshot.apply(state, response)
 assert(state.session.active_task.goal.state == "paused")

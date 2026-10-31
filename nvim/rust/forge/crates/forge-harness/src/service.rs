@@ -603,8 +603,8 @@ impl HarnessService {
                 controller
                     .task_controller
                     .current()?
-                    .and_then(|task| match task.workflow {
-                        crate::task::TaskWorkflow::Plan { plan } => plan
+                    .and_then(|task| match task.workflow.clone() {
+                        crate::task::WorkflowSnapshot::Plan { plan } => plan
                             .artifact
                             .acceptance
                             .map(|acceptance| (plan.artifact.id, acceptance.review_digest)),
@@ -1250,6 +1250,7 @@ struct SessionController {
     data_root: PathBuf,
     observer: Arc<crate::broker::BrokerObserver>,
     timeout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    input_timeout_configuration: Mutex<()>,
     agent_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
     checks: Arc<crate::checks::CheckSupervisor>,
@@ -1475,6 +1476,7 @@ impl SessionController {
             data_root: broker.data_root.clone(),
             observer,
             timeout_task: Mutex::new(None),
+            input_timeout_configuration: Mutex::new(()),
             agent_task: Mutex::new(None),
             agent_coordinator: broker.agent_coordinator(),
             checks: broker.checks(),
@@ -2297,27 +2299,19 @@ async fn route_request(
         let mut settings = crate::settings::SettingsStore::open(
             PathBuf::from(&registry.initialize.data_root).as_path(),
         )?;
-        let snapshot = settings.get(
-            &catalog.workspace,
-            &session_id,
-            &registry.initialize.backend.kind,
-        )?;
-        let mut desired = settings.layer_settings(
-            crate::settings::SettingScope::Global,
-            &catalog.workspace,
-            &session_id,
-        )?;
+        let mut desired = crate::settings::PortableSettings::default();
         if let Some(timing) = timing {
             desired.check_timing = Some(timing);
         }
         if let Some(enabled) = enabled {
             desired.automatic_checks = Some(enabled);
         }
-        settings.update(
-            snapshot.revision,
-            crate::settings::SettingScope::Global,
-            &catalog.workspace,
-            &session_id,
+        settings.patch(
+            crate::settings::SettingTarget {
+                scope: crate::settings::SettingScope::Global,
+                workspace: &catalog.workspace,
+                session: &session_id,
+            },
             &desired,
         )?;
         let desired = settings
@@ -2354,23 +2348,16 @@ async fn route_request(
             let mut settings = crate::settings::SettingsStore::open(
                 PathBuf::from(&registry.initialize.data_root).as_path(),
             )?;
-            let snapshot = settings.get(
-                &catalog.workspace,
-                &session_id,
-                &registry.initialize.backend.kind,
-            )?;
-            let mut desired = settings.layer_settings(
-                crate::settings::SettingScope::Global,
-                &catalog.workspace,
-                &session_id,
-            )?;
-            desired.status_thoughts = Some(enabled);
-            settings.update(
-                snapshot.revision,
-                crate::settings::SettingScope::Global,
-                &catalog.workspace,
-                &session_id,
-                &desired,
+            settings.patch(
+                crate::settings::SettingTarget {
+                    scope: crate::settings::SettingScope::Global,
+                    workspace: &catalog.workspace,
+                    session: &session_id,
+                },
+                &crate::settings::PortableSettings {
+                    status_thoughts: Some(enabled),
+                    ..Default::default()
+                },
             )?;
             let effective = settings
                 .get(
@@ -2406,19 +2393,11 @@ async fn route_request(
     }
     if method == RuntimeMethod::SessionInputTimeoutConfigure {
         let catalog = controller.catalog_request.read().await.clone();
+        let configuration = controller.input_timeout_configuration.lock().await;
         let mut settings = crate::settings::SettingsStore::open(
             PathBuf::from(&registry.initialize.data_root).as_path(),
         )?;
-        let snapshot = settings.get(
-            &catalog.workspace,
-            &session_id,
-            &registry.initialize.backend.kind,
-        )?;
-        let mut desired = settings.layer_settings(
-            crate::settings::SettingScope::Global,
-            &catalog.workspace,
-            &session_id,
-        )?;
+        let mut desired = crate::settings::PortableSettings::default();
         ensure!(
             request
                 .params
@@ -2442,11 +2421,12 @@ async fn route_request(
                     .validate()?,
             );
         }
-        settings.update(
-            snapshot.revision,
-            crate::settings::SettingScope::Global,
-            &catalog.workspace,
-            &session_id,
+        settings.patch(
+            crate::settings::SettingTarget {
+                scope: crate::settings::SettingScope::Global,
+                workspace: &catalog.workspace,
+                session: &session_id,
+            },
             &desired,
         )?;
         let effective = settings
@@ -2461,6 +2441,7 @@ async fn route_request(
         controller
             .permission
             .configure_input_timeouts(&session_id, approval, answer)?;
+        drop(configuration);
         message_sink
             .send_response(Response::success(
                 request.id,
@@ -2540,10 +2521,7 @@ async fn route_request(
             .load_session(&session_id)?
             .context("checks session is missing")?;
         let task = controller.task_controller.current()?;
-        let task_id = task
-            .as_ref()
-            .and_then(|task| task.entry.as_ref())
-            .map(|entry| entry.id.as_str());
+        let task_id = task.as_ref().map(|task| task.id.as_str());
         let result = match operation {
             CheckOperation::List => {
                 let settings = crate::settings::SettingsStore::open(
@@ -5341,6 +5319,74 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_timeout_edits_preserve_both_fields_while_busy() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = Arc::new(service());
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let execution = controller.coordinator.execution.acquire().await?;
+        let broker = controller.broker.lock().await;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let ready = Arc::new(tokio::sync::Barrier::new(3));
+        let mut writer_list = Vec::new();
+        for (offset, field) in [(10, "approval_timeout"), (30, "answer_timeout")] {
+            let service = service.clone();
+            let session_id = session_id.clone();
+            let sink = sink.clone();
+            let ready = ready.clone();
+            writer_list.push(tokio::spawn(async move {
+                ready.wait().await;
+                for amount in 1..=16 {
+                    service
+                        .dispatch(
+                            Some(session_id.clone()),
+                            Request {
+                                id: offset + amount,
+                                method: "session.input.timeout.configure".into(),
+                                params: json!({field:{"amount":amount,"unit":"m"}}),
+                            },
+                            &sink,
+                        )
+                        .await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        ready.wait().await;
+        for writer in writer_list {
+            writer.await??;
+        }
+        for _ in 0..32 {
+            let frame = output
+                .recv()
+                .await?
+                .context("timeout response is missing")?;
+            let response: Value = serde_json::from_slice(frame.bytes())?;
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        let (approval, answer) = controller.permission.input_timeouts(&session_id)?;
+        assert_eq!(approval.amount, 16);
+        assert_eq!(answer.amount, 16);
+        assert!(controller.coordinator.execution.try_acquire().is_err());
+        let saved = crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?
+            .get(&fixture.path().to_string_lossy(), &session_id, "mock")?
+            .desired;
+        assert_eq!(saved.approval_timeout, Some(approval));
+        assert_eq!(saved.answer_timeout, Some(answer));
+        drop(broker);
+        drop(execution);
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn input_timeout_settings_do_not_interrupt_a_busy_session() -> Result<()> {
         let fixture = tempfile::tempdir()?;
@@ -5861,15 +5907,18 @@ mod tests {
         let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
         let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-        let mut task = crate::task::ActiveTask::goal(
+        let mut task = crate::task::Task::goal(
             "Retain the running objective".into(),
             crate::session::continuation::ContinuationBudget::new(20, 2),
             false,
             1,
         );
-        if let crate::task::TaskWorkflow::Goal { goal } = &mut task.workflow {
-            goal.continuation.turn_count = 4;
-        }
+        task.edit(|draft| {
+            if let crate::task::WorkflowSnapshot::Goal { goal } = &mut draft.workflow {
+                goal.continuation.turn_count = 4;
+            }
+            Ok(())
+        })?;
         task.request_entry("Continue the retained objective".into(), 1)?;
         controller.task_controller.change(
             &mut store,
@@ -8199,7 +8248,7 @@ mod tests {
             controller.task_controller.change(
                 &mut store,
                 previous.as_ref().map(|task| &task.revision),
-                crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+                crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                     "Preserve provider ownership".into(),
                     Default::default(),
                     false,
@@ -8252,7 +8301,7 @@ mod tests {
     #[tokio::test]
     async fn task_input_reads_the_current_session_revision() -> Result<()> {
         use crate::input::InputPurpose;
-        use crate::task::{ActiveTask, TaskChange};
+        use crate::task::{Task, TaskChange};
         let fixture = tempfile::tempdir()?;
         let service = service();
         service
@@ -8266,7 +8315,7 @@ mod tests {
             .change(
                 &mut store,
                 None,
-                TaskChange::Install(Box::new(ActiveTask::goal(
+                TaskChange::Install(Box::new(Task::goal(
                     "Finish".into(),
                     Default::default(),
                     false,
@@ -8316,7 +8365,7 @@ mod tests {
             .change(
                 &mut store,
                 Some(&paused.revision),
-                TaskChange::Install(Box::new(ActiveTask::goal(
+                TaskChange::Install(Box::new(Task::goal(
                     "Replacement".into(),
                     Default::default(),
                     false,

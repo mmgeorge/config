@@ -132,14 +132,12 @@ impl HarnessBroker {
             ),
             &document.model_json()?,
         );
-        self.task_controller
-            .update(&mut self.store, &task.permit(), now_ms, |task| {
-                let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow else {
-                    anyhow::bail!("pending plan task changed");
-                };
-                active.artifact = plan;
-                Ok(())
-            })?;
+        self.task_controller.apply(
+            &mut self.store,
+            &task.permit(),
+            crate::task::TaskEvent::PlanArtifactUpdated(plan),
+            now_ms,
+        )?;
         self.check_setup = false;
         let task = self
             .task_controller
@@ -184,12 +182,9 @@ impl HarnessBroker {
             .task_controller
             .current()?
             .filter(|task| !task.status().terminal());
-        let overrides = self.check_runner.overrides(task.as_ref().map(|task| {
-            task.entry
-                .as_ref()
-                .map(|entry| entry.id.as_str())
-                .unwrap_or(task.revision.as_str())
-        }))?;
+        let overrides = self
+            .check_runner
+            .overrides(task.as_ref().map(|task| task.id.as_str()))?;
         for definition in &mut snapshot.config.definitions {
             if let Some(enabled) = overrides.enabled.get(&definition.id) {
                 definition.enabled = *enabled;
@@ -216,18 +211,11 @@ impl HarnessBroker {
             .task_controller
             .current()?
             .context("planning task is missing")?;
-        self.task_controller.update(
+        self.task_controller.apply(
             &mut self.store,
             &task.permit(),
+            crate::task::TaskEvent::PlanArtifactUpdated(plan),
             self.clock.now_ms(),
-            |task| {
-                let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow else {
-                    anyhow::bail!("planning task changed");
-                };
-                anyhow::ensure!(active.artifact.id == plan.id, "planning task changed");
-                active.artifact = plan;
-                Ok(())
-            },
         )?;
         Ok(true)
     }
@@ -242,13 +230,7 @@ impl HarnessBroker {
             .task_controller
             .current()?
             .filter(|task| !task.status().terminal())
-            .map(|task| {
-                task.entry
-                    .as_ref()
-                    .map(|entry| entry.id.as_str())
-                    .unwrap_or(task.revision.as_str())
-                    .to_owned()
-            });
+            .map(|task| task.id.as_str().to_owned());
         let result = match method {
             RuntimeMethod::SessionCheckList => {
                 let settings = crate::settings::SettingsStore::open(&self.data_root)?
@@ -324,14 +306,7 @@ impl HarnessBroker {
             .store
             .load_checkpoint(id)?
             .context("execution baseline checkpoint is missing")?;
-        let current = GitCheckpoint::new(&self.session.workspace)
-            .capture(
-                &self.store.objects,
-                &self.repositories,
-                &self.session.id,
-                self.clock.now_ms(),
-            )
-            .await?;
+        let current = self.capture_workspace_checkpoint().await?;
         Ok(Some(
             baseline
                 .changed_paths(&current)?

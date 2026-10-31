@@ -77,11 +77,16 @@ local success, failure = xpcall(function()
   assert(not rendered:find("Steering: /goal", 1, true), "raw command became literal steering")
   assert(raw_request("session.goal.pause", { operation_id = "raw-host-pause" }).state == "completed")
   assert(vim.wait(5000, function() return task.status(task.current(state)) == "paused" end, 10))
+  local goal_identity = task.current(state).id
+  assert(task.phase(task.current(state)) == "work", "goal pause lost its Work phase")
+  assert(task.label(task.current(state)) == "goal · work · paused")
   assert(raw_request("session.goal.resume", { operation_id = "raw-host-resume" }).state == "completed")
   assert(vim.wait(5000, function()
     local current = task.current(state)
     return current and task.status(current) == "running" and current.entry.delivery == "accepted"
   end, 10))
+  assert(task.current(state).id == goal_identity and task.phase(task.current(state)) == "work",
+    "goal resume changed task identity or introduced an execution phase")
   assert(raw_request("session.goal.clear", { operation_id = "raw-host-clear" }).state == "completed")
   assert(vim.wait(5000, function() return task.current(state) == nil end, 10))
   assert(latest_exchange().id == original.id and latest_exchange().state == "running", "raw control cancelled the held provider")
@@ -96,6 +101,7 @@ local success, failure = xpcall(function()
   wait_settled()
   local plan_task = assert(task.current(state))
   assert(plan_task.kind == "plan" and task.status(plan_task) == "waiting", vim.inspect(plan_task))
+  assert(task.phase(plan_task) == "review", "submitted plan did not expose Review")
   assert(state.session.approval_mode == "ask")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "admitted task did not clear composer")
   for _, approval in ipairs({ "deny", "allow", "ask" }) do
@@ -125,11 +131,14 @@ local success, failure = xpcall(function()
   require("forge.views.picker").close()
   controller.task_transition({ action = "plan", text = "Execute a reviewed declaration design" })
   wait_settled()
-  local executing_plan = task.current(state).plan.artifact.id
+  local accepted_task = task.current(state)
+  local executing_plan = accepted_task.plan.artifact.id
   controller.task_transition({ action = "execute", plan_id = "last" })
   wait_settled()
   assert(task.current(state).execution.record.plan_id == executing_plan and task.current(state).kind == "execute",
     "acceptance lost the saved artifact")
+  assert(task.current(state).id == accepted_task.id and task.current(state).created_at_ms == accepted_task.created_at_ms,
+    "Plan to Execute replaced the durable task identity")
   assert(task.status(task.current(state)) == "blocked" and task.phase(task.current(state)) == "implement",
     "read-only mock execution did not stop at its no-progress boundary: " .. vim.inspect(task.current(state)))
   assert(state.session.approval_mode == "ask" and state.session.access.write_access == "off", "execution widened access")

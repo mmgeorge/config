@@ -12,7 +12,7 @@ client.request = function(request_specification, callback)
   requests[#requests + 1] = { method = method, parameters = parameters, callback = callback }
 end
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
-local state = { session = { id = "optimistic-input", active_task = { revision = "task", kind = "goal", goal = { objective = "Fixture goal", state = "active" } } }, queue = {} }
+local state = { session = { id = "optimistic-input", active_task = { revision = "task", kind = "goal", phase = "work", status = "running", goal = { objective = "Fixture goal", state = "active" } } }, queue = {} }
 local renders = 0
 input.attach(state, function() renders = renders + 1 end)
 assert(requests[1].method == "session.input.get")

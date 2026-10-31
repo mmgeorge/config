@@ -7,7 +7,9 @@ local original = vim.deepcopy(config.options.keymaps.harness)
 local buffer = vim.api.nvim_create_buf(false, true)
 local ok, failure = xpcall(function()
   local pinned = keymaps.view_hint_entries("harness", commands)
-  assert(#pinned == 3 and pinned[1].id == "toggle_visibility" and pinned[2].id == "toggle_presentation" and pinned[3].id == "help", "top bar must advertise diff controls and help")
+  assert(#pinned == 1 and pinned[1].id == "help", "top bar must advertise only help")
+  assert(commands.action_by_id.toggle_visibility and commands.action_by_id.toggle_presentation,
+    "hiding diff hints must preserve the registered commands")
   local context = { { text = "75% left (200K)", group = "ForgeStatusHint" } }
   local function top_bar(status)
     keymaps.apply_view_winbar(0, "", "harness", commands, status, { diff_view = { visibility = "public", presentation = "semantic" } }, context)
@@ -19,7 +21,8 @@ local ok, failure = xpcall(function()
   }) do
     local text = top_bar(status)
     local context_at, visibility_at, presentation_at, help_at = text:find("75% left (200K)", 1, true), text:find("ov Public", 1, true), text:find("ox Semantic", 1, true), text:find("? help", 1, true)
-    assert(context_at and visibility_at and presentation_at and help_at and context_at < visibility_at and visibility_at < presentation_at and presentation_at < help_at, "context must precede diff controls and help in wide and compact bars")
+    assert(context_at and help_at and context_at < help_at, "context must precede help in wide and compact bars")
+    assert(not visibility_at and not presentation_at, "top bar must hide diff control hints")
     assert(vim.wo.winbar:find("%#ForgeStatusHint# · %*", 1, true), "context separator is not gray")
     assert(not text:find("submit", 1, true), "top bar contains additional command hints")
   end

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::task::{ActiveTask, TaskRevision, TaskWorkflow};
+use crate::task::{Task, TaskRevision, WorkflowSnapshot};
 
 use super::SqliteStore;
 
@@ -21,6 +21,60 @@ pub(crate) struct PlanArtifactGuard {
     pub id: String,
     pub document_version: u64,
     pub review_digest: Option<String>,
+}
+
+/// Distinguish an exact mutation contract from attribution across a legal phase handoff.
+enum TaskFence<'permit> {
+    Revision(Option<&'permit TaskRevision>),
+    Observation(&'permit crate::task::TaskPermit),
+}
+
+/// Validate ownership of live task artifacts without interpreting obsolete session formats.
+pub(super) fn validate_task(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    active: &crate::task::Task,
+) -> Result<()> {
+    match &active.workflow {
+        crate::task::WorkflowSnapshot::Goal { .. } => {}
+        crate::task::WorkflowSnapshot::Plan { plan } => {
+            ensure!(
+                plan.artifact.session_id == session_id,
+                "active plan belongs to another session"
+            );
+            let artifact: crate::plan::PlanRecord =
+                super::task::read_record(connection, "plan_record", &plan.artifact.id)?
+                    .context("active plan artifact is missing")?;
+            ensure!(
+                artifact.session_id == session_id,
+                "active plan artifact belongs to another session"
+            );
+        }
+        crate::task::WorkflowSnapshot::Execute { execution } => {
+            ensure!(
+                execution.record.session_id == session_id,
+                "active execution belongs to another session"
+            );
+            let artifact: crate::plan::PlanRecord =
+                super::task::read_record(connection, "plan_record", &execution.record.plan_id)?
+                    .context("active execution plan is missing")?;
+            ensure!(
+                artifact.session_id == session_id,
+                "active execution plan belongs to another session"
+            );
+            let record: crate::plan::PlanExecutionRecord = super::task::read_record(
+                connection,
+                "plan_execution_record",
+                &execution.record.id,
+            )?
+            .context("active execution artifact is missing")?;
+            ensure!(
+                record.session_id == session_id && record.plan_id == artifact.id,
+                "active execution artifact has inconsistent ownership"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl SqliteStore {
@@ -48,7 +102,7 @@ impl SqliteStore {
         self.load_payload("SELECT json_extract(s.payload,'$.session.active_task.execution.record') FROM plan_execution_record p JOIN session_record s ON s.id=p.session_id WHERE p.id=?1 AND json_extract(s.payload,'$.session.active_task.execution.record.id')=p.id", [execution_id])
     }
 
-    pub(crate) fn load_active_task(&self, session_id: &str) -> Result<Option<ActiveTask>> {
+    pub(crate) fn load_active_task(&self, session_id: &str) -> Result<Option<Task>> {
         let payload: Option<String> = self
             .connection
             .query_row(
@@ -67,7 +121,7 @@ impl SqliteStore {
         session_id: &str,
         expected: Option<&TaskRevision>,
         now_ms: i64,
-        change: impl FnOnce(&mut Option<ActiveTask>) -> Result<Output>,
+        change: impl FnOnce(&mut Option<Task>) -> Result<Output>,
     ) -> Result<Output> {
         self.commit_task_effects(session_id, expected, now_ms, None, |task| {
             Ok((change(task)?, TaskEffects::default()))
@@ -81,7 +135,41 @@ impl SqliteStore {
         expected: Option<&TaskRevision>,
         now_ms: i64,
         command: Option<&crate::task::TaskOperation>,
-        change: impl FnOnce(&mut Option<ActiveTask>) -> Result<(Output, TaskEffects)>,
+        change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
+    ) -> Result<Option<Output>> {
+        self.commit_task_effects_fenced(
+            session_id,
+            TaskFence::Revision(expected),
+            now_ms,
+            command,
+            change,
+        )
+    }
+
+    /// Count one admitted turn after its own phase transition without weakening mutation fencing.
+    pub(crate) fn commit_task_observation<Output>(
+        &mut self,
+        session_id: &str,
+        permit: &crate::task::TaskPermit,
+        now_ms: i64,
+        change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
+    ) -> Result<Option<Output>> {
+        self.commit_task_effects_fenced(
+            session_id,
+            TaskFence::Observation(permit),
+            now_ms,
+            None,
+            change,
+        )
+    }
+
+    fn commit_task_effects_fenced<Output>(
+        &mut self,
+        session_id: &str,
+        fence: TaskFence<'_>,
+        now_ms: i64,
+        command: Option<&crate::task::TaskOperation>,
+        change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
     ) -> Result<Option<Output>> {
         let transaction = self
             .connection
@@ -115,10 +203,16 @@ impl SqliteStore {
             )
             .optional()?
             .context("task session is missing or incompatible")?;
-        let mut active: Option<ActiveTask> =
+        let mut active: Option<Task> =
             payload.map(|payload| super::decode(&payload)).transpose()?;
-        if active.as_ref().map(|task| &task.revision) != expected {
-            return Err(crate::task::StaleTask.into());
+        match fence {
+            TaskFence::Revision(expected)
+                if active.as_ref().map(|task| &task.revision) != expected =>
+            {
+                return Err(crate::task::StaleTask.into());
+            }
+            TaskFence::Observation(permit) => permit.validate_observation(active.as_ref())?,
+            TaskFence::Revision(_) => {}
         }
         let previous = active.clone();
         let (output, mut effects) = change(&mut active)?;
@@ -154,21 +248,22 @@ impl SqliteStore {
                 now_ms,
             )?;
         }
-        if let Some(ActiveTask {
-            workflow: TaskWorkflow::Plan { plan },
-            ..
-        }) = &mut active
-        {
-            let mut payload = serde_json::to_value(&plan.artifact)?;
-            payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
-            let preserved = super::question::preserve_answers(
-                &transaction,
-                "plan_record",
-                &plan.artifact.id,
-                super::encode(&payload)?,
-            )?;
-            plan.artifact = super::decode(&preserved)?;
-            effects.plan.push(plan.artifact.clone());
+        if let Some(task) = &mut active {
+            task.edit(|draft| {
+                if let WorkflowSnapshot::Plan { plan } = &mut draft.workflow {
+                    let mut payload = serde_json::to_value(&plan.artifact)?;
+                    payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+                    let preserved = super::question::preserve_answers(
+                        &transaction,
+                        "plan_record",
+                        &plan.artifact.id,
+                        super::encode(&payload)?,
+                    )?;
+                    plan.artifact = super::decode(&preserved)?;
+                    effects.plan.push(plan.artifact.clone());
+                }
+                Ok(())
+            })?;
         }
         for artifact in &effects.plan {
             ensure!(
@@ -189,10 +284,8 @@ impl SqliteStore {
             )?;
             ensure!(written == 1, "plan cannot change its owning session");
         }
-        if let Some(ActiveTask {
-            workflow: TaskWorkflow::Execute { execution },
-            ..
-        }) = &active
+        if let Some(task) = &active
+            && let WorkflowSnapshot::Execute { execution } = &task.workflow
         {
             effects.execution.push(execution.record.clone());
         }
@@ -308,7 +401,7 @@ pub(super) fn recover_active_task(
         [session_id],
         |row| row.get(0),
     )?;
-    let Some(mut active): Option<ActiveTask> =
+    let Some(mut active): Option<Task> =
         payload.map(|payload| super::decode(&payload)).transpose()?
     else {
         return Ok(());
@@ -317,39 +410,24 @@ pub(super) fn recover_active_task(
         connection.execute("UPDATE session_record SET payload=json_set(payload,'$.session.active_task',NULL) WHERE id=?1", [session_id])?;
         return Ok(());
     }
-    if active
-        .entry
-        .as_ref()
-        .is_some_and(|entry| entry.delivery == crate::task::TaskInputDelivery::Pending)
-    {
-        return Ok(());
-    }
-    if let Some(turn) = active.turn.as_ref()
-        && turn
-            .continuation
-            .as_ref()
-            .is_some_and(|input| input.delivery == crate::task::TaskInputDelivery::Pending)
-        && completed_task_turn(connection, session_id, &turn.id)?
-    {
-        return Ok(());
-    }
-    match &mut active.workflow {
-        TaskWorkflow::Goal { goal } => {
+    let mut draft = active.draft();
+    match &mut draft.workflow {
+        WorkflowSnapshot::Goal { goal } => {
             if goal.state == crate::goal::GoalState::Active {
                 goal.state = crate::goal::GoalState::Paused;
             }
         }
-        TaskWorkflow::Plan { plan } => {
-            if matches!(
+        WorkflowSnapshot::Plan { plan } => {
+            if !matches!(
                 plan.artifact.state,
-                crate::plan::PlanState::Generating
-                    | crate::plan::PlanState::Revising
-                    | crate::plan::PlanState::ConfiguringChecks
+                crate::plan::PlanState::Accepted
+                    | crate::plan::PlanState::Cancelled
+                    | crate::plan::PlanState::Rejected
             ) {
                 plan.paused = true;
             }
         }
-        TaskWorkflow::Execute { execution } => {
+        WorkflowSnapshot::Execute { execution } => {
             if execution.record.state == crate::plan::PlanExecutionState::Active {
                 execution.record.state = crate::plan::PlanExecutionState::Paused;
                 execution.record.generation += 1;
@@ -368,8 +446,9 @@ pub(super) fn recover_active_task(
             }
         }
     }
-    active.renew(active.updated_at_ms);
-    if let TaskWorkflow::Execute { execution } = &active.workflow {
+    draft.renew(draft.updated_at_ms);
+    active = Task::try_from(draft)?;
+    if let WorkflowSnapshot::Execute { execution } = &active.workflow {
         let mut payload = serde_json::to_value(&execution.record)?;
         payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
         connection.execute(
@@ -387,8 +466,8 @@ fn completed_task_turn(
     turn: &crate::task::TaskTurnId,
 ) -> Result<bool> {
     let latest: Option<(i64, String, i64)> = connection.query_row(
-        "SELECT ordinal,json_extract(payload,'$.state'),COALESCE(json_array_length(json_extract(payload,'$.turn')),0) FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal DESC LIMIT 1",
-        params![session_id, crate::session::HarnessSession::primary_agent_id(session_id)],
+        "SELECT ordinal,json_extract(payload,'$.state'),COALESCE(json_array_length(json_extract(payload,'$.turn')),0) FROM exchange_record WHERE session_id=?1 AND agent_id=?2 AND ordinal=?3",
+        params![session_id, crate::session::HarnessSession::primary_agent_id(session_id), i64::try_from(turn.exchange_ordinal)?],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).optional()?;
     let Some((ordinal, state, turn_count)) = latest else {
@@ -479,7 +558,7 @@ mod tests {
                 controller.change(
                     &mut store,
                     Some(&original.revision),
-                    crate::task::TaskChange::Install(Box::new(task)),
+                    crate::task::TaskChange::Update(Box::new(task)),
                     2,
                 )?;
             } else {
@@ -507,9 +586,21 @@ mod tests {
             let before = controller.current()?.unwrap();
             store.interrupt_detached_execution("session")?;
             let after = controller.current()?.unwrap();
-            assert_eq!(after.revision, before.revision);
+            assert_ne!(after.revision, before.revision);
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.status(), crate::task::TaskStatus::Paused);
             assert_eq!(after.entry, before.entry);
-            assert_eq!(after.turn, before.turn);
+            assert_eq!(
+                after.turn.as_ref().map(|turn| &turn.id),
+                before.turn.as_ref().map(|turn| &turn.id)
+            );
+            if let Some(input) = after
+                .turn
+                .as_ref()
+                .and_then(|turn| turn.continuation.as_ref())
+            {
+                assert_eq!(input.delivery, crate::task::TaskInputDelivery::Cancelled);
+            }
         }
         Ok(())
     }
@@ -522,7 +613,7 @@ mod tests {
         let files = crate::plan::PlanFileStore::new(root.path(), workspace.path());
         let prepared = files.prepare_entry("session", "Plan the change".into(), None, 2)?;
         let plan_id = prepared.record.id.clone();
-        let mut plan = ActiveTask::plan(prepared.record, 2);
+        let mut plan = Task::plan(prepared.record, 2)?;
         plan.request_entry(prepared.instruction, 2)?;
         let previous = controller.current()?.unwrap();
         store.connection.execute_batch("CREATE TRIGGER fail_plan BEFORE INSERT ON plan_record BEGIN SELECT RAISE(ABORT,'plan unavailable'); END;")?;
@@ -564,7 +655,7 @@ mod tests {
         stale = owner.acquire_session_lease(&stale.id, "owner")?;
         let admission = owner.session_admission(&stale.id)?;
         let mut writer = SqliteStore::open(root.path())?;
-        let task = ActiveTask::goal("Finish".into(), ContinuationBudget::default(), false, 1);
+        let task = Task::goal("Finish".into(), ContinuationBudget::default(), false, 1);
         owner.commit_task_change(&stale.id, None, 1, |active| {
             *active = Some(task.clone());
             Ok(())
@@ -590,7 +681,7 @@ mod tests {
         assert_eq!(saved.effort, "updated-effort");
         assert_eq!(saved.active_task.as_ref().unwrap().revision, task.revision);
 
-        let replacement = ActiveTask::goal(
+        let replacement = Task::goal(
             "Replacement".into(),
             ContinuationBudget::default(),
             false,
@@ -627,7 +718,7 @@ mod tests {
         store.save_session(&session)?;
         let admission = store.session_admission(&session.id)?;
         store.connection.execute_batch("CREATE TRIGGER reject_task BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'failed task commit'); END;")?;
-        let task = ActiveTask::goal("Finish".into(), ContinuationBudget::default(), false, 1);
+        let task = Task::goal("Finish".into(), ContinuationBudget::default(), false, 1);
         assert!(
             store
                 .commit_task_change(&session.id, None, 1, |active| {

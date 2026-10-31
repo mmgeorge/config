@@ -130,7 +130,8 @@ def main [
     return
   }
   if ($test_list | is-empty) { error make {msg: $"No Forge tests match ($filter)"} }
-  let startup = if $minimal { [--headless -i NONE -u NONE --cmd "set rtp^=./nvim" -c "lua vim.loader.enable(false)"] } else {
+  let runtime_literal = $repository_root | path join nvim | str replace --all '\' '/' | to json --raw
+  let startup = if $minimal { [--headless -i NONE -u NONE --cmd $"lua vim.opt.runtimepath:prepend ($runtime_literal)" -c "lua vim.loader.enable(false)"] } else {
     [--headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)"]
   }
   let startup = if $executable == null { $startup } else {

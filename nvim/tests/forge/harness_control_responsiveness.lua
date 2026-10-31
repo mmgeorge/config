@@ -22,7 +22,7 @@ local success, failure = xpcall(function()
     routed[#routed + 1] = table.concat(vim.api.nvim_buf_get_lines(composer, 0, -1, false), "\n")
   end
   controller.drain, history.record = function() end, function() end
-  local controls = { "/config", "/effort", "/effort high", "/model", "/model test", "/model test high", "/read", "/write", "/yolo", "/ask", "/deny", "/allow",
+  local controls = { "/config", "/effort", "/effort high", "/model", "/read", "/write", "/yolo", "/ask", "/deny", "/allow",
     "/fast", "/ultrafast", "/skills", "/mcp", "/checks", "/rename", "/sessions",
     "/task refresh", "/agents on", "/agents edit", "/backend", "/questions" }
   for _, command in ipairs(controls) do
@@ -47,18 +47,20 @@ local success, failure = xpcall(function()
   settings.open(state, { window_list = { state.composer_win }, control_win = state.composer_win })
   local instance = picker._state_for_test()
   local options = {}
-  for _, option in ipairs(instance.spec.page_list[1].option_list) do options[option.id] = option end
-  instance.spec.on_field_action({ field = options["plan-revisions"].fields[1] }, "change", 1)
-  instance.spec.on_field_action({ field = options["execute-approval"].fields[1] }, "change", 1)
+  for _, page in ipairs(instance.spec.page_list) do
+    for _, option in ipairs(page.option_list) do options[option.id] = option end
+  end
+  instance.spec.on_field_action({ field = options["automatic-checks"].fields[1] }, "toggle", 1)
+  instance.spec.on_field_action({ field = options["shell"].fields[1] }, "change", 1)
   assert(#configured == 2, "configuration picker blocked a second edit before acknowledgement")
-  assert(configured[1].params.plan_auto_approve_revisions == false)
-  assert(configured[2].params.default_approval == "deny")
+  assert(configured[1].params.automatic_checks == true)
+  assert(configured[2].params.shell ~= nil)
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true))
   configured[1].completed(false)
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true),
     "configuration displayed pending status after an older completion")
-  state.session.default_approval = "deny"
-  state.session.plan_auto_approve_revisions = false
+  state.session.shell = configured[2].params.shell
+  state.automatic_checks = true
   configured[2].completed(true)
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true))
   picker.close()
@@ -109,13 +111,13 @@ local success, failure = xpcall(function()
     configuration_request[#configuration_request + 1] = { params = action.config, callback = callback }
   end
   local first_applied, second_applied
-  controller.configure({ default_approval = "ask" }, true, function(result) first_applied = result end)
-  controller.configure({ plan_auto_approve_revisions = true }, true, function(result) second_applied = result end)
+  controller.configure({ shell = "system" }, true, function(result) first_applied = result end)
+  controller.configure({ plan_compact = true }, true, function(result) second_applied = result end)
   assert(#configuration_request == 2 and second_applied == nil)
-  state.session.default_approval = "ask"
+  state.session.shell = "system"
   configuration_request[1].callback(true)
   assert(#configuration_request == 2, "Lua delayed an explicit configuration")
-  state.session.plan_auto_approve_revisions = true
+  state.session.plan_compact = true
   configuration_request[2].callback(true)
   assert(first_applied == true and second_applied == true,
     "successive idle configuration edits lost their completion callbacks")

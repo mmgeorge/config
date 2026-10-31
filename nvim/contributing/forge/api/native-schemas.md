@@ -1112,14 +1112,8 @@ pub struct PortableSettings {
     pub automatic_checks: Option<bool>,
     /// Allows the root agent to edit project checks in this conversation.
     pub check_editing: Option<bool>,
-    /// Selects approval handling for ordinary work independently of filesystem access.
-    pub default_approval: Option<crate::session::ApprovalMode>,
-    /// Selects approval handling when planning.
-    pub plan_approval: Option<crate::session::ApprovalMode>,
     /// Selects compaction before accepted plan execution.
     pub plan_compact: Option<bool>,
-    /// Selects automatic review of execution plan revisions.
-    pub plan_auto_approve_revisions: Option<bool>,
     /// Overrides the duration of future approval requests.
     pub approval_timeout: Option<crate::session::InputTimeout>,
     /// Overrides the duration of future question sets.
@@ -1203,4 +1197,3 @@ pub struct WidthProfile {
     pub cell_width: Vec<CellWidthRange>,
 }
 ```
-

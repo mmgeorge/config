@@ -18,8 +18,7 @@ The configuration object accepts the fields below. Omitted fields retain their c
 | `settings_revision` | Unsigned integer matching the current settings revision. Loads the desired settings before applying them and checks the revision again before confirmation. |
 | `access` | [AccessPolicy](native-schemas.md#accesspolicy), validated against the provider's supported sandbox. |
 | `shell` | Supported shell selection. The executable must resolve. |
-| `approval_mode`, `default_approval` | Approval-mode enum. |
-| `plan_approval` | Optional approval-mode enum. Explicit null clears this override. |
+| `approval_mode` | Approval-mode enum for the current session. New sessions start in Ask. |
 | `approval_timeout`, `answer_timeout` | Validated input-timeout objects. |
 | `auto_compaction` | [AutoCompaction](native-schemas.md#autocompaction). Enabling requires native compaction support. |
 | `check_timing` | `after_queue` or `between_work`. |
@@ -31,9 +30,10 @@ The configuration object accepts the fields below. Omitted fields retain their c
 | `plan_executor_enabled` | Boolean. Enabling requires model-selection support. |
 | `plan_executor_model`, `plan_executor_effort` | Nonempty strings validated against the provider catalog. |
 | `plan_compact` | Boolean. Enabling requires native compaction support. |
-| `plan_auto_approve_revisions` | Boolean. |
 | `subagent_tools`, `lsp_tools`, `session_tools`, `status_thoughts` | Boolean feature selections. Tool-registry changes can clean up provider execution. |
 | `session_policy` | Boolean. True chooses the session settings layer for directly persisted configuration. Auto-compaction changes also use that layer. Other direct portable settings use the global layer. |
+
+Portable settings use record format 2. Records from other formats remain hidden without migration; provider-specific model settings use separate storage. Automatic plan acceptance belongs to the active task and is controlled by `/plan accept on/off`, not portable settings.
 
 Configuration can persist preferences and settings, query a provider's model catalog, reconcile provider resources, and clean up execution. It is not a single transaction across the settings database and an external provider. A failure after persistence requires receipt and current-state reconciliation. A successful admission response alone does not establish that application completed.
 

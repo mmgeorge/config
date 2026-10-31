@@ -306,6 +306,66 @@ impl SessionInputQueue {
         }))
     }
 
+    /// Reconcile canonical pending task work after recovery or a revision change.
+    /// Provider submission receipts retain delivery authority for the stable message identity.
+    pub(crate) fn reconcile_task_input(
+        &self,
+        mut message: InputMessage,
+    ) -> Result<Option<InputUpdate>> {
+        let revision = match &message.purpose {
+            InputPurpose::TaskEntry { revision, id, .. }
+            | InputPurpose::TaskContinuation { revision, id, .. } => {
+                ensure!(id.as_str() == message.id, "task input identity changed");
+                revision
+            }
+            InputPurpose::User => anyhow::bail!("task reconciliation requires task input"),
+        };
+        let mut retained = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        let mut state = retained.clone();
+        if let Some(previous) = state
+            .snapshot
+            .messages
+            .iter_mut()
+            .find(|previous| previous.id == message.id)
+        {
+            let previous_revision = match &previous.purpose {
+                InputPurpose::TaskEntry { revision, .. }
+                | InputPurpose::TaskContinuation { revision, .. } => revision,
+                InputPurpose::User => anyhow::bail!("task input collides with user input"),
+            };
+            if previous_revision == revision
+                || matches!(
+                    previous.delivery,
+                    InputDelivery::Delivering | InputDelivery::Accepted | InputDelivery::Unknown
+                )
+            {
+                return Ok(None);
+            }
+            message.revision = previous
+                .revision
+                .checked_add(1)
+                .context("input message revision exhausted")?;
+            message.submission_id = previous.submission_id.clone();
+            *previous = message.clone();
+        } else {
+            message.revision = 1;
+            state.submitted.insert(message.id.clone());
+            state.snapshot.messages.push(message.clone());
+        }
+        let mut update = InputUpdate {
+            upsert: vec![message],
+            ..Default::default()
+        };
+        Self::advance(&mut state.snapshot, &mut update);
+        self.commit(&mut retained, state)?;
+        drop(retained);
+        self.changed.notify_one();
+        Ok(Some(update))
+    }
+
     pub fn apply(&self, operation: InputOperation) -> Result<InputUpdate> {
         ensure!(
             !operation.id.is_empty(),

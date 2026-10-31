@@ -71,6 +71,8 @@ M.empty_diff_rows = {}
 ---@field aborting_plan? boolean
 ---@field cancel_requested boolean
 ---@field session table?
+---@field access_preference? ForgeDirectoryPolicy Saved choices before provider capability limits.
+---@field input_timeout_configuration? ForgeTimeoutConfiguration
 ---@field capability table
 ---@field model_list table[]?
 ---@field model_backend string?

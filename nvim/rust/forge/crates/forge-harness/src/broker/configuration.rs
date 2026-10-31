@@ -16,6 +16,7 @@ impl HarnessBroker {
         let previous_permission = self.session.approval_mode;
         let previous_access = self.session.access.abbreviation();
         let mut access = self.session.access.clone();
+        let mut permission_access = None;
         let mut permission = self.session.approval_mode;
         if command == ConfigurationCommand::Permission {
             let change: crate::task::PermissionChange = serde_json::from_value(
@@ -38,7 +39,26 @@ impl HarnessBroker {
                     crate::backend::BackendKind::parse(&self.session.backend)?.supports_sandbox(),
                 );
             }
-            access = access.validate()?;
+            if matches!(
+                change,
+                crate::task::PermissionChange::ToggleReadScope
+                    | crate::task::PermissionChange::ToggleWriteEnabled
+                    | crate::task::PermissionChange::ToggleWriteScope
+            ) && let Some(preference) =
+                crate::settings::SettingsStore::read_only(&self.data_root)?
+                    .get(
+                        &self.session.workspace,
+                        &self.session.id,
+                        &self.session.backend,
+                    )?
+                    .desired
+                    .access
+            {
+                access.sandbox = preference.sandbox;
+            }
+            if !matches!(change, crate::task::PermissionChange::SetApproval { .. }) {
+                permission_access = Some(access.validate()?);
+            }
         }
         let resume = action
             .get("resume")
@@ -64,10 +84,11 @@ impl HarnessBroker {
                 Box::pin(self.compact_session(true)).await?;
             }
             ConfigurationCommand::Permission => {
-                Box::pin(self.configure_session(
-                    json!({"access": access, "approval_mode": permission, "session_policy": true}),
-                ))
-                .await?;
+                let mut config = json!({"approval_mode": permission, "session_policy": true});
+                if let Some(access) = permission_access {
+                    config["access"] = serde_json::to_value(access)?;
+                }
+                Box::pin(self.configure_session(config)).await?;
             }
         }
         if command == ConfigurationCommand::Configure
@@ -95,10 +116,7 @@ impl HarnessBroker {
             let mut effective = snapshot.desired;
             effective.access = Some(self.session.access.clone());
             effective.shell = Some(self.session.shell);
-            effective.default_approval = Some(self.session.default_approval);
-            effective.plan_approval = self.session.plan_approval;
             effective.plan_compact = Some(self.session.plan_compact);
-            effective.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions);
             effective.approval_timeout = Some(self.session.approval_timeout);
             effective.answer_timeout = Some(self.session.answer_timeout);
             settings.confirm_application(&self.session.id, operation, revision, effective)?;

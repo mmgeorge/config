@@ -403,8 +403,8 @@ mod tests {
             "id":"execution", "session_id":"session", "plan_id":"plan", "goal_id":"goal",
             "state":"active", "phase":"verify", "original_revision":1, "revision":1, "generation":2,
             "baseline_checkpoint":null, "findings":[], "progress":{"matched":[],"missing":[],"different":[],"unverified":[],"warning":[],"source_digest":{}},
-            "verification":[], "revision_history":[], "pending_revision_reason":null, "review_paused":false,
-            "observed_source":{}, "observed_generation":0, "observed_check":[], "created_at_ms":1, "lifecycle":[
+            "verification":[], "revision_history":[], "pending_revision_reason":null, "resume_after_review":false,
+            "observed_source":{}, "observed_document_version":0, "observed_check":[], "created_at_ms":1, "lifecycle":[
                 {"anchor":anchor, "sequence":1,"after_exchange_id":"exchange","occurred_at_ms":10,
                  "kind":"phase","phase":"verify","revision":1,"state":"active","title":"Ready for verification"},
                 {"anchor":anchor, "sequence":2,"after_exchange_id":"exchange","occurred_at_ms":10,

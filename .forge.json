@@ -94,7 +94,6 @@
           "nvim/tests/forge/harness_prompt_history_host.lua",
           "nvim/tests/forge/harness_plan_browsing_host.lua",
           "nvim/tests/forge/harness_package_checks.lua",
-          "nvim/tests/forge/harness_native_import_host.lua",
           "nvim/tests/forge/harness_model_pins_host.lua",
           "nvim/tests/forge/harness_message_folds_host.lua",
           "nvim/tests/forge/harness_markdown_render.lua",

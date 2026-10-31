@@ -1,7 +1,87 @@
 use super::*;
 use crate::checks::{CheckRun, CheckState};
 
+/// Distinguish editable gate inputs from failures in durable storage or execution infrastructure.
+#[derive(Debug)]
+struct CheckPreparationFailure(anyhow::Error);
+
+impl std::fmt::Display for CheckPreparationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "check preparation requires correction: {:#}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for CheckPreparationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+impl CheckPreparationFailure {
+    fn classify(error: anyhow::Error) -> anyhow::Error {
+        if error.chain().any(|cause| cause.is::<std::io::Error>()) {
+            error
+        } else {
+            Self(error).into()
+        }
+    }
+}
+
 impl HarnessBroker {
+    /// Revalidate automated proof before admitting any manual verification turn.
+    pub(crate) async fn refresh_verification_gate(&mut self) -> Result<()> {
+        let Some(task) = self.task_controller.current()? else {
+            return Ok(());
+        };
+        let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow else {
+            return Ok(());
+        };
+        if execution.record.phase != crate::plan::PlanPhase::Verify
+            || execution.record.state != PlanExecutionState::Active
+        {
+            return Ok(());
+        }
+        let document = self.plan_file.read_submitted_document(
+            &self.session.id,
+            &execution.record.plan_id,
+            execution.record.revision,
+        )?;
+        let design = document
+            .design
+            .as_ref()
+            .context("accepted execution design is missing")?;
+        if self
+            .execution_checks_are_current(&execution.record, design)
+            .await?
+        {
+            return Ok(());
+        }
+        let source = match &task.turn {
+            Some(turn) => turn.id.clone(),
+            None => {
+                let exchange = self
+                    .store
+                    .latest_exchange(&self.session.id)?
+                    .context("verification source is missing")?;
+                crate::task::TaskTurnId {
+                    exchange_ordinal: exchange.ordinal,
+                    turn_ordinal: exchange.turn.len(),
+                }
+            }
+        };
+        self.task_controller.apply(
+            &mut self.store,
+            &task.permit(),
+            crate::task::TaskEvent::VerificationInputsChanged(source),
+            self.clock.now_ms(),
+        )?;
+        Ok(())
+    }
+
     /// Executes the accepted gate without admitting a model exchange.
     pub(super) async fn run_checks(&mut self) -> Result<Vec<SessionEvent>> {
         anyhow::ensure!(
@@ -19,6 +99,18 @@ impl HarnessBroker {
                 .is_err()
             {
                 return result;
+            }
+            if error.is::<CheckPreparationFailure>() {
+                self.task_controller.apply(
+                    &mut self.store,
+                    &permit,
+                    crate::task::TaskEvent::CheckPreparationFailed(format!("{error:#}")),
+                    self.clock.now_ms(),
+                )?;
+                let goal = self.active_goal()?;
+                return Ok(vec![
+                    self.event("goal_changed", serde_json::to_value(goal)?)?,
+                ]);
             }
             if let Some(sink) = &self.event_sink {
                 let _ = sink.send_wait(SessionUpdate::CheckFailure { run_id: "automatic-gate".into(), error: format!("Checking could not finish: {error:#}. Enable /checks edit on and request a correction in chat.") }).await;
@@ -79,30 +171,14 @@ impl HarnessBroker {
         let workspace_identity = self.check_workspace_identity().await?;
         let shell = self.session.shell;
         let executable = shell.executable();
-        let environment_digest = crate::plan::digest(&serde_json::to_vec(
-            &std::env::vars_os()
-                .map(|(key, value)| {
-                    (
-                        key.to_string_lossy().into_owned(),
-                        value.to_string_lossy().into_owned(),
-                    )
-                })
-                .collect::<std::collections::BTreeMap<_, _>>(),
-        )?);
-        let task_id = self
-            .task_controller
-            .current()?
-            .and_then(|task| task.entry.map(|entry| entry.id.as_str().to_owned()));
-        let overrides = self.check_runner.overrides(task_id.as_deref())?;
-        let mut snapshot = crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace))?;
-        for definition in &mut snapshot.config.definitions {
-            if let Some(auto) = overrides.auto.get(&definition.id) {
-                definition.auto = *auto;
-            }
-            if let Some(scope) = overrides.scopes.get(&definition.id) {
-                definition.scope = *scope;
-            }
-        }
+        let environment_digest = check_environment_digest()?;
+        let ExecutionCheckSelection {
+            task_id,
+            snapshot,
+            enabled,
+        } = self
+            .execution_check_selection(design)
+            .map_err(CheckPreparationFailure::classify)?;
         let files = self.check_task_files(&execution).await?;
         let cases = design
             .document
@@ -140,35 +216,34 @@ impl HarnessBroker {
                     })
             })
             .collect();
-        let mut enabled = overrides.enabled;
-        for id in &design.document.disabled_checks {
-            enabled.insert(id.clone(), false);
-        }
-        let mut run = self.check_runner.prepare(
-            snapshot,
-            crate::checks::CheckAdmission {
-                owner: {
-                    let exchange = self
-                        .store
-                        .latest_exchange(&self.session.id)?
-                        .context("plan checks require their execution exchange")?;
-                    crate::timeline::TimelineOwner::exchange(&exchange)
+        let mut run = self
+            .check_runner
+            .prepare(
+                snapshot,
+                crate::checks::CheckAdmission {
+                    owner: {
+                        let exchange = self
+                            .store
+                            .latest_exchange(&self.session.id)?
+                            .context("plan checks require their execution exchange")?;
+                        crate::timeline::TimelineOwner::exchange(&exchange)
+                    },
+                    request: crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
+                        include: design.document.checks.clone(),
+                        ..Default::default()
+                    }),
+                    overrides: enabled,
+                    files,
+                    cases: Some(cases),
+                    new_cases: Some(new_cases),
+                    has_scope: true,
+                    shell,
+                    trigger: "Plan execution".into(),
+                    task_id,
+                    revision: execution.revision,
                 },
-                request: crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
-                    include: design.document.checks.clone(),
-                    ..Default::default()
-                }),
-                overrides: enabled,
-                files,
-                cases: Some(cases),
-                new_cases: Some(new_cases),
-                has_scope: true,
-                shell,
-                trigger: "Plan execution".into(),
-                task_id,
-                revision: execution.revision,
-            },
-        )?;
+            )
+            .map_err(CheckPreparationFailure::classify)?;
         run.context.automatic = true;
         run.progress = progress;
         run.workspace_identity = workspace_identity.clone();
@@ -248,7 +323,11 @@ impl HarnessBroker {
             for check in &run.commands {
                 if matches!(
                     check.state,
-                    CheckState::Failed | CheckState::Blocked | CheckState::ConfigurationError
+                    CheckState::Failed
+                        | CheckState::Blocked
+                        | CheckState::ConfigurationError
+                        | CheckState::ExecutionError
+                        | CheckState::Stale
                 ) {
                     execution.findings.push(format!(
                         "{}: {:?}, exit {:?}. {}\nSaved output: {}",
@@ -268,8 +347,7 @@ impl HarnessBroker {
                 }
                 VerificationOutcome::Blocked => {
                     run.state = CheckState::Blocked;
-                    execution.state = PlanExecutionState::Blocked;
-                    goal.state = GoalState::Blocked;
+                    execution.phase = crate::plan::PlanPhase::Resolve;
                 }
                 VerificationOutcome::Passed => {
                     run.state = CheckState::Passed;
@@ -290,7 +368,7 @@ impl HarnessBroker {
             PlanExecutionState::Complete | PlanExecutionState::Blocked
         ) && let Some(mut exchange) = self.store.latest_exchange(&self.session.id)?
         {
-            self.capture_implementation_report(&mut execution, &mut exchange, self.clock.now_ms())
+            self.capture_implementation_report(&mut execution, &mut exchange)
                 .await?;
             self.store.save_exchange(&exchange)?;
         }
@@ -318,23 +396,69 @@ impl HarnessBroker {
         Ok(events)
     }
 
-    async fn check_workspace_identity(&mut self) -> Result<Option<String>> {
-        if self
-            .repositories
-            .open(PathBuf::from(&self.session.workspace))
-            .await?
-            .is_none()
-        {
-            return Ok(None);
+    /// Resolve accepted checks and task overrides identically for execution and reuse.
+    fn execution_check_selection(
+        &self,
+        design: &crate::plan::DeclarationDesign,
+    ) -> Result<ExecutionCheckSelection> {
+        let task_id = self
+            .task_controller
+            .current()?
+            .map(|task| task.id.as_str().to_owned());
+        let overrides = self.check_runner.overrides(task_id.as_deref())?;
+        let mut snapshot = crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace))?;
+        for definition in &mut snapshot.config.definitions {
+            if let Some(auto) = overrides.auto.get(&definition.id) {
+                definition.auto = *auto;
+            }
+            if let Some(scope) = overrides.scopes.get(&definition.id) {
+                definition.scope = *scope;
+            }
         }
-        let snapshot = crate::checkpoint::GitCheckpoint::new(&self.session.workspace)
-            .capture(
-                &self.store.objects,
-                &self.repositories,
-                &self.session.id,
-                self.clock.now_ms(),
-            )
-            .await?;
+        let mut enabled = overrides.enabled;
+        for id in &design.document.disabled_checks {
+            enabled.insert(id.clone(), false);
+        }
+        Ok(ExecutionCheckSelection {
+            task_id,
+            snapshot,
+            enabled,
+        })
+    }
+
+    /// Validate passing evidence against the current contract, inputs, configuration, and shell.
+    pub(super) async fn execution_checks_are_current(
+        &mut self,
+        execution: &PlanExecutionRecord,
+        design: &crate::plan::DeclarationDesign,
+    ) -> Result<bool> {
+        let Some(run) = execution.check_runs.last() else {
+            return Ok(false);
+        };
+        if run.revision != execution.revision
+            || run.state != CheckState::Passed
+            || run.outcome() != crate::plan::execution::VerificationOutcome::Passed
+            || run.shell != self.session.shell
+            || run.executable != self.session.shell.executable().ok()
+            || run.environment_digest != check_environment_digest()?
+        {
+            return Ok(false);
+        }
+        let Some(context) = run.context.as_ref() else {
+            return Ok(false);
+        };
+        let selection = match self.execution_check_selection(design) {
+            Ok(selection) => selection,
+            Err(_) => return Ok(false),
+        };
+        if context.snapshot != selection.snapshot || context.overrides != selection.enabled {
+            return Ok(false);
+        }
+        Ok(self.check_workspace_identity().await? == run.workspace_identity)
+    }
+
+    pub(super) async fn check_workspace_identity(&mut self) -> Result<Option<String>> {
+        let snapshot = self.capture_workspace_checkpoint().await?;
         Ok(Some(crate::plan::digest(&serde_json::to_vec(&(
             &snapshot.tree,
             &snapshot.file,
@@ -354,21 +478,14 @@ impl HarnessBroker {
             .context("execution task is missing")?;
         permit.validate(Some(&task))?;
         anyhow::ensure!(
-            matches!(&task.workflow, crate::task::TaskWorkflow::Execute { execution: active } if active.record.id == execution.id),
+            matches!(&task.workflow, crate::task::WorkflowSnapshot::Execute { execution: active } if active.record.id == execution.id),
             "execution task changed"
         );
-        self.task_controller.update(
+        self.task_controller.apply(
             &mut self.store,
             &task.permit(),
+            crate::task::TaskEvent::ExecutionUpdated(execution.clone()),
             self.clock.now_ms(),
-            |task| {
-                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
-                else {
-                    unreachable!()
-                };
-                active.record = execution.clone();
-                Ok(())
-            },
         )
     }
 
@@ -383,4 +500,24 @@ impl HarnessBroker {
             execution.check_runs.push(run.clone());
         }
     }
+}
+
+struct ExecutionCheckSelection {
+    task_id: Option<String>,
+    snapshot: crate::checks::ConfigSnapshot,
+    enabled: std::collections::BTreeMap<String, bool>,
+}
+
+/// Fingerprint the same shell environment for execution and subsequent evidence validation.
+fn check_environment_digest() -> Result<String> {
+    Ok(crate::plan::digest(&serde_json::to_vec(
+        &std::env::vars_os()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    )?))
 }

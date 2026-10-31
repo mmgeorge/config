@@ -8,6 +8,18 @@ impl HarnessBroker {
         admission: Option<ExchangeAdmission>,
         input: BackendInput,
     ) -> Result<(Value, Vec<SessionEvent>)> {
+        let admitted_task = self
+            .task_controller
+            .current()?
+            .filter(|task| {
+                matches!(
+                    mode,
+                    PromptMode::ExecutePlan | PromptMode::GoalContinuation | PromptMode::Plan
+                ) || task.entry_accepted()
+                    || matches!(&task.workflow, crate::task::WorkflowSnapshot::Plan { plan }
+                        if plan.artifact.state == PlanState::ConfiguringChecks)
+            })
+            .map(|task| task.permit());
         let mut preparation_event = Vec::new();
         if let Some(task) = self.task_controller.current()?
             && let Some(entry) = &task.entry
@@ -47,17 +59,11 @@ impl HarnessBroker {
             }
             self.session.approval_mode = preparation.approval_mode;
             self.save_session()?;
-            self.task_controller.update(
+            self.task_controller.apply(
                 &mut self.store,
                 &task.permit(),
+                crate::task::TaskEvent::EntryPreparationFinished,
                 self.clock.now_ms(),
-                |task| {
-                    task.entry
-                        .as_mut()
-                        .context("execution entry disappeared")?
-                        .execution = None;
-                    Ok(())
-                },
             )?;
         }
         let submission_store = self.submission_store.clone();
@@ -78,19 +84,47 @@ impl HarnessBroker {
         preparation_event.append(&mut event);
         let mut event = preparation_event;
 
-        let output = self
-            .run_admitted_provider(
-                mode,
-                input,
-                submission.clone(),
-                new_runtime,
-                &mut interaction,
-                &mut event,
-            )
-            .await;
+        let admission_result = if mode == PromptMode::ExecutePlan {
+            async {
+                self.collect_active_initial_checkpoint(&mut interaction).await?;
+                self.ensure_execution_baseline().await
+            }.await
+        } else if self.task_controller.current()?.is_some_and(|task|
+            matches!(&task.workflow, crate::task::WorkflowSnapshot::Goal { goal } if goal.observed_checkpoint.is_none())) {
+            self.observe_goal_workspace().await.map(|_| ())
+        } else {
+            Ok(())
+        };
+
+        let output = match admission_result {
+            Ok(()) => {
+                self.run_admitted_provider(
+                    mode,
+                    input,
+                    submission.clone(),
+                    new_runtime,
+                    &mut interaction,
+                    &mut event,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
         let output = match output {
             Ok(output) => output,
             Err(error) => {
+                if let Some(permit) = &admitted_task
+                    && let Some(task) = self.task_controller.current()?
+                    && permit.validate_observation(Some(&task)).is_ok()
+                    && task.status() == crate::task::TaskStatus::Running
+                {
+                    self.task_controller.change(
+                        &mut self.store,
+                        Some(&task.revision),
+                        crate::task::TaskChange::Pause,
+                        self.clock.now_ms(),
+                    )?;
+                }
                 self.trace.record(
                     &self.session.id,
                     "model.failed",
@@ -294,17 +328,17 @@ impl HarnessBroker {
                 self.store.save_plan_lifecycle(&lifecycle)?;
             }
             if let Some(task) = self.task_controller.current()?
-                && matches!(&task.workflow, crate::task::TaskWorkflow::Execute { execution } if execution.record.baseline_checkpoint.is_none())
+                && matches!(&task.workflow, crate::task::WorkflowSnapshot::Execute { execution } if execution.record.baseline_checkpoint.is_none())
             {
                 let checkpoint = interaction.checkpoint_before.clone();
-                self.task_controller
-                    .update(&mut self.store, &task.permit(), now_ms, |task| {
-                        if let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow
-                        {
-                            execution.record.baseline_checkpoint = checkpoint;
-                        }
-                        Ok(())
-                    })?;
+                if let Some(checkpoint) = checkpoint {
+                    self.task_controller.apply(
+                        &mut self.store,
+                        &task.permit(),
+                        crate::task::TaskEvent::ExecutionBaselineCaptured(checkpoint),
+                        now_ms,
+                    )?;
+                }
             }
         }
         interaction.resume(self.clock.now_ms())?;
@@ -466,7 +500,7 @@ impl HarnessBroker {
                     )?;
                     plan.acceptance = None;
                     plan.user_revision += 1;
-                    plan.generation.reset();
+                    plan.generation.reset_no_progress();
                 }
                 plan.document_version = result.version;
                 plan.title = result.document.title;
@@ -487,7 +521,7 @@ impl HarnessBroker {
                     )?;
                     plan.acceptance = None;
                     plan.user_revision += 1;
-                    plan.generation.reset();
+                    plan.generation.reset_no_progress();
                 }
                 plan.document_version = updated.version;
                 plan.title = updated.title;
@@ -759,10 +793,25 @@ impl HarnessBroker {
             interaction.set_awaiting_input(owner.awaiting_input());
         }
         let execution_paused = interaction.awaiting_input();
+        let observed_task = self.task_controller.current()?;
         if mode == PromptMode::ExecutePlan {
             output.evidence.structured_complete = false;
             output.evidence.tool_called = false;
-            output.evidence.workspace_changed = self.observe_plan_progress(&interaction)?;
+            output.evidence.workspace_changed = if output
+                .dispatched_task_permit
+                .as_ref()
+                .is_some_and(|permit| permit.validate_observation(observed_task.as_ref()).is_ok())
+            {
+                self.observe_plan_progress(&interaction).await?
+            } else {
+                false
+            };
+        } else if output
+            .dispatched_task_permit
+            .as_ref()
+            .is_some_and(|permit| permit.validate_observation(observed_task.as_ref()).is_ok())
+        {
+            output.evidence.workspace_changed = self.observe_goal_workspace().await?;
         }
         self.session.updated_at_ms = self.clock.now_ms();
         self.save_session()?;
@@ -771,7 +820,7 @@ impl HarnessBroker {
             exchange_ordinal: interaction.ordinal,
             turn_ordinal: interaction.turn.len(),
         };
-        let continuing = if execution_paused {
+        let continuing = if execution_paused && mode != PromptMode::ExecutePlan {
             false
         } else {
             Box::pin(self.apply_goal_evidence(evidence, permit, completed_turn, &mut event)).await?
@@ -791,14 +840,7 @@ impl HarnessBroker {
         self.store.save_exchange(&interaction)?;
         if !remains_open
             && let Some(task) = self.task_controller.current()?
-            && task.entry.as_ref().map(|entry| &entry.id) == output.dispatched_entry_id.as_ref()
-            && let Some(command) = crate::task::command::SessionCommand::approved_revision(&task)?
-        {
-            event.extend(self.commit_session_command(command)?.1);
-        }
-        if !remains_open
-            && let Some(task) = self.task_controller.current()?
-            && let crate::task::TaskWorkflow::Execute { execution } = &task.workflow
+            && let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow
             && output.dispatched_execution_id.as_deref() == Some(execution.record.id.as_str())
             && task.entry.as_ref().map(|entry| &entry.id) == output.dispatched_entry_id.as_ref()
         {
@@ -851,21 +893,11 @@ impl HarnessBroker {
             task.entry.as_ref().map(|entry| &entry.id) == entry_id,
             "planning task entry changed"
         );
-        self.task_controller.update(
+        self.task_controller.apply(
             &mut self.store,
             &task.permit(),
+            crate::task::TaskEvent::PlanArtifactUpdated(plan.clone()),
             self.clock.now_ms(),
-            |task| {
-                let crate::task::TaskWorkflow::Plan { plan: active } = &mut task.workflow else {
-                    anyhow::bail!("planning task changed");
-                };
-                anyhow::ensure!(
-                    active.artifact.id == plan.id && !active.paused,
-                    "planning task changed"
-                );
-                active.artifact = plan.clone();
-                Ok(())
-            },
         )
     }
 }

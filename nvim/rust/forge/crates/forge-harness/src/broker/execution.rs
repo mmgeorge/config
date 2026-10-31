@@ -1,4 +1,5 @@
 use super::HarnessBroker;
+use crate::checkpoint::GitCheckpoint;
 use crate::exchange::{Exchange, ExchangeNode};
 use crate::goal::{GoalRecord, GoalState};
 use crate::plan::execution::SemanticProgress;
@@ -20,13 +21,97 @@ pub(super) struct ExecutionCapture {
 }
 
 impl HarnessBroker {
+    /// Attribute Goal progress to content changes without adding an execution check phase.
+    pub(super) async fn observe_goal_workspace(&mut self) -> Result<bool> {
+        let Some(task) = self.task_controller.current()? else {
+            return Ok(false);
+        };
+        let crate::task::WorkflowSnapshot::Goal { goal } = &task.workflow else {
+            return Ok(false);
+        };
+        let previous = goal
+            .observed_checkpoint
+            .as_ref()
+            .map(|id| self.store.load_checkpoint(id))
+            .transpose()?
+            .flatten();
+        let checkpoint = self.capture_workspace_checkpoint().await?;
+        let changed = previous
+            .as_ref()
+            .map(|previous| previous.changed_paths(&checkpoint))
+            .transpose()?
+            .is_some_and(|changed| !changed.is_empty());
+        self.store.save_checkpoint(&checkpoint)?;
+        self.task_controller.apply(
+            &mut self.store,
+            &task.permit(),
+            crate::task::TaskEvent::GoalWorkspaceObserved(checkpoint.id),
+            self.clock.now_ms(),
+        )?;
+        Ok(changed)
+    }
+
+    /// Capture execution inputs consistently in repository and ordinary folder workspaces.
+    pub(super) async fn capture_workspace_checkpoint(
+        &mut self,
+    ) -> Result<crate::checkpoint::CheckpointRecord> {
+        if self
+            .repositories
+            .open(PathBuf::from(&self.session.workspace))
+            .await?
+            .is_some()
+        {
+            return GitCheckpoint::new(&self.session.workspace)
+                .capture(
+                    &self.store.objects,
+                    &self.repositories,
+                    &self.session.id,
+                    self.clock.now_ms(),
+                )
+                .await;
+        }
+        let workspace = PathBuf::from(&self.session.workspace);
+        let data_root = self.data_root.clone();
+        let objects = self.store.objects.clone();
+        let session_id = self.session.id.clone();
+        let now_ms = self.clock.now_ms();
+        tokio::task::spawn_blocking(move || {
+            crate::checkpoint::capture_directory(
+                &workspace, &data_root, &objects, session_id, now_ms,
+            )
+        })
+        .await?
+    }
+
+    /// Persist the baseline before the first provider can change execution inputs.
+    pub(crate) async fn ensure_execution_baseline(&mut self) -> Result<()> {
+        let task = self
+            .task_controller
+            .current()?
+            .context("execution task is missing")?;
+        let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow else {
+            anyhow::bail!("execution admission requires Execute");
+        };
+        if execution.record.baseline_checkpoint.is_some() {
+            return Ok(());
+        }
+        let baseline = self.capture_workspace_checkpoint().await?;
+        self.store.save_checkpoint(&baseline)?;
+        self.task_controller.apply(
+            &mut self.store,
+            &task.permit(),
+            crate::task::TaskEvent::ExecutionBaselineCaptured(baseline.id),
+            self.clock.now_ms(),
+        )
+    }
+
     /// Capture the execution record and its update permit from the same selected task revision.
     pub(super) fn capture_execution(&self) -> Result<Option<ExecutionCapture>> {
         let Some(task) = self.task_controller.current()? else {
             return Ok(None);
         };
         let permit = task.permit();
-        let crate::task::TaskWorkflow::Execute { execution } = task.workflow else {
+        let crate::task::WorkflowSnapshot::Execute { execution } = task.workflow.clone() else {
             return Ok(None);
         };
         anyhow::ensure!(
@@ -64,14 +149,7 @@ impl HarnessBroker {
                 .store
                 .load_checkpoint(checkpoint_id)?
                 .context("original execution checkpoint is missing")?;
-            let current = crate::checkpoint::GitCheckpoint::new(&self.session.workspace)
-                .capture(
-                    &self.store.objects,
-                    &self.repositories,
-                    &self.session.id,
-                    self.clock.now_ms(),
-                )
-                .await?;
+            let current = self.capture_workspace_checkpoint().await?;
             for path in initial.changed_paths(&current)? {
                 let path = path.as_str();
                 if forge_diff::syntax::DeclarationOverview::supports(path)
@@ -203,15 +281,12 @@ impl HarnessBroker {
         if execution.baseline_checkpoint.is_none() {
             execution.progress.warning.push(CHECKPOINT_WARNING.into());
         }
-        self.task_controller
-            .update(&mut self.store, &permit, self.clock.now_ms(), |task| {
-                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
-                else {
-                    anyhow::bail!("execution task changed");
-                };
-                active.record = execution.clone();
-                Ok(())
-            })?;
+        self.task_controller.apply(
+            &mut self.store,
+            &permit,
+            crate::task::TaskEvent::ExecutionUpdated(execution.clone()),
+            self.clock.now_ms(),
+        )?;
         Ok(
             json!({"execution_id":execution.id,"phase":execution.phase,"revision":execution.revision,"progress":execution.progress}),
         )
@@ -225,7 +300,7 @@ impl HarnessBroker {
         operation: crate::plan::execution::ExecutionOperation,
         current_interaction: &mut Exchange,
     ) -> Result<Value> {
-        use crate::plan::execution::{ExecutionOperation, ExecutionRevision, SemanticProgress};
+        use crate::plan::execution::{ExecutionOperation, SemanticProgress};
         task_permit.validate(self.task_controller.current()?.as_ref())?;
         let mut proposed_interaction = current_interaction.clone();
         let interaction = &mut proposed_interaction;
@@ -233,6 +308,7 @@ impl HarnessBroker {
             .store
             .load_plan_execution(execution_id)?
             .context("execution is missing")?;
+        let mut revised_manual = Vec::new();
         let mut goal = self.active_goal()?;
         let mut plan = self
             .store
@@ -341,25 +417,15 @@ impl HarnessBroker {
                 plan.state = PlanState::Revising;
                 plan.document_version = document.version;
                 plan.updated_at_ms = now_ms;
-                self.task_controller.update_with_effects(
+                self.task_controller.apply_with_effects(
                     &mut self.store,
                     task_permit,
-                    now_ms,
-                    |task| {
-                        let crate::task::TaskWorkflow::Execute { execution: active } =
-                            &mut task.workflow
-                        else {
-                            anyhow::bail!("execution task changed");
-                        };
-                        active.record = execution.clone();
-                        Ok((
-                            (),
-                            crate::storage::TaskEffects {
-                                plan: vec![plan.clone()],
-                                ..Default::default()
-                            },
-                        ))
+                    crate::task::TaskEvent::ExecutionUpdated(execution.clone()),
+                    crate::storage::TaskEffects {
+                        plan: vec![plan.clone()],
+                        ..Default::default()
                     },
+                    now_ms,
                 )?;
                 return Ok(
                     json!({"result":"draft_saved","version":document.version,"document":document,"execution":execution.response()}),
@@ -389,6 +455,13 @@ impl HarnessBroker {
                 plan.review_digest = Some(digest.clone());
                 plan.document_version = document.version;
                 plan.submitted_version = Some(document.version);
+                revised_manual = document
+                    .design
+                    .as_ref()
+                    .context("execution revision design is missing")?
+                    .document
+                    .verification
+                    .clone();
                 let delta = crate::plan::revision::DeclarationDelta::between(
                     Some(&previous),
                     document
@@ -413,13 +486,13 @@ impl HarnessBroker {
                 });
                 plan.state = PlanState::AwaitingReview;
                 execution.pending_revision_reason = Some(reason);
-                execution.review_paused = true;
-                execution.state = PlanExecutionState::Paused;
-                goal.state = GoalState::Paused;
+                execution.resume_after_review = true;
+                execution.state = PlanExecutionState::Active;
                 title = "Plan revision awaiting review";
                 execution.generation += 1;
             }
             ExecutionOperation::Phase(request) => {
+                execution.validate_phase_request(&request)?;
                 anyhow::ensure!(
                     self.agent_coordinator.active_count() == 0,
                     "child execution must settle before completing a plan phase. Wait for or interrupt active children first"
@@ -446,7 +519,14 @@ impl HarnessBroker {
                     report.validate_checks(&design.document.verification)?;
                 }
                 let verifying = execution.phase == crate::plan::PlanPhase::Verify;
-                let mut progress = if verifying {
+                let resolving = execution.phase == crate::plan::PlanPhase::Resolve;
+                let checks_current = if verifying || resolving {
+                    self.execution_checks_are_current(&execution, &design)
+                        .await?
+                } else {
+                    false
+                };
+                let mut progress = if verifying || resolving {
                     self.scan_execution_conformance(&execution, &design).await?
                 } else {
                     SemanticProgress::default()
@@ -527,7 +607,25 @@ impl HarnessBroker {
                 let declaration_findings = progress.findings();
                 let declaration_changes = progress.declaration_changes.clone();
                 let verifying = execution.phase == crate::plan::PlanPhase::Verify;
-                execution.finish_phase(request, progress, now_ms)?;
+                if verifying && !checks_current {
+                    execution.phase = crate::plan::PlanPhase::Resolve;
+                    execution.findings = vec!["Automated check evidence no longer covers the current workspace, configuration, or execution contract. Resolve the changed inputs and run Check again before completing verification.".into()];
+                    execution.findings.extend(progress.findings());
+                    execution.progress = progress;
+                    execution.generation += 1;
+                } else {
+                    let conforms = progress.conforms();
+                    execution.finish_phase(request, progress, now_ms)?;
+                    if resolving && checks_current && conforms {
+                        execution.findings.clear();
+                        if design.document.verification.is_empty() {
+                            execution.state = PlanExecutionState::Complete;
+                            execution.completed_at_ms = Some(now_ms);
+                        } else {
+                            execution.phase = crate::plan::PlanPhase::Verify;
+                        }
+                    }
+                }
                 if verifying {
                     use crate::plan::execution::VerificationOutcome;
                     let outcome = match (execution.state, execution.phase) {
@@ -570,67 +668,31 @@ impl HarnessBroker {
                 PlanExecutionState::Complete | PlanExecutionState::Blocked
             )
         {
-            self.capture_implementation_report(&mut execution, interaction, now_ms)
+            self.capture_implementation_report(&mut execution, interaction)
                 .await?;
         }
         goal.updated_at_ms = now_ms;
         plan.updated_at_ms = now_ms;
-        self.task_controller
-            .update_with_effects(&mut self.store, task_permit, now_ms, |task| {
-                // Decide acceptance under the same write admission as live policy changes.
-                let title = if !phase_completion && task.auto_accept_plan {
-                    plan.accepted_digest = plan.review_digest.clone();
-                    plan.accepted_revision = Some(plan.model_revision);
-                    plan.state = PlanState::Accepted;
-                    execution.revision = plan.model_revision;
-                    execution.revision_history.push(ExecutionRevision {
-                        revision: execution.revision,
-                        reason: execution
-                            .pending_revision_reason
-                            .take()
-                            .context("submitted revision reason is missing")?,
-                        approval: "automatic".into(),
-                        recorded_at_ms: now_ms,
-                    });
-                    execution.progress = SemanticProgress::default();
-                    execution.review_paused = false;
-                    execution.state = PlanExecutionState::Active;
-                    "Plan revision accepted (auto)"
+        let settled = self.task_controller.settle_execution(
+            &mut self.store,
+            task_permit,
+            crate::task::ExecutionSettlement {
+                record: execution,
+                plan,
+                exchange: interaction.clone(),
+                kind: if phase_completion {
+                    crate::task::ExecutionSettlementKind::PhaseFinished
                 } else {
-                    title
-                };
-                if !phase_completion || execution.state == PlanExecutionState::Complete {
-                    execution.append_lifecycle(
-                        crate::plan::ExchangeAnchor::capture(interaction),
-                        now_ms,
-                        if phase_completion {
-                            PlanExecutionLifecycleEvent::Completed {
-                                title: plan.title.clone(),
-                            }
-                        } else {
-                            PlanExecutionLifecycleEvent::Phase {
-                                title: title.into(),
-                                phase: execution.phase,
-                                revision: plan.model_revision,
-                                state: execution.state,
-                            }
-                        },
-                    );
-                }
-                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
-                else {
-                    anyhow::bail!("execution task changed");
-                };
-                active.record = execution.clone();
-                Ok((
-                    (),
-                    crate::storage::TaskEffects {
-                        plan: vec![plan.clone()],
-                        exchange: vec![interaction.clone()],
-                        ..Default::default()
-                    },
-                ))
-            })?;
+                    crate::task::ExecutionSettlementKind::RevisionSubmitted {
+                        manual_verification: revised_manual,
+                    }
+                },
+                title: title.into(),
+            },
+            now_ms,
+        )?;
+        execution = settled.record;
+        *interaction = settled.exchange;
         if execution.state == PlanExecutionState::Complete {
             let task = self
                 .task_controller
@@ -664,7 +726,6 @@ impl HarnessBroker {
         &mut self,
         execution: &mut PlanExecutionRecord,
         interaction: &mut Exchange,
-        now_ms: i64,
     ) -> Result<()> {
         let original = self.plan_file.read_submitted_document(
             &self.session.id,
@@ -681,16 +742,7 @@ impl HarnessBroker {
             .transpose()?
             .flatten();
         let current = if initial.is_some() {
-            Some(
-                crate::checkpoint::GitCheckpoint::new(&self.session.workspace)
-                    .capture(
-                        &self.store.objects,
-                        &self.repositories,
-                        &self.session.id,
-                        now_ms,
-                    )
-                    .await?,
-            )
+            Some(self.capture_workspace_checkpoint().await?)
         } else {
             None
         };
@@ -798,15 +850,12 @@ impl HarnessBroker {
         );
         self.capture_partial_report(&mut execution, interaction)
             .await;
-        self.task_controller
-            .update(&mut self.store, &permit, self.clock.now_ms(), |task| {
-                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
-                else {
-                    anyhow::bail!("execution task changed");
-                };
-                active.record = execution;
-                Ok(())
-            })
+        self.task_controller.apply(
+            &mut self.store,
+            &permit,
+            crate::task::TaskEvent::ExecutionUpdated(execution),
+            self.clock.now_ms(),
+        )
     }
 
     async fn capture_partial_report(
@@ -815,7 +864,7 @@ impl HarnessBroker {
         interaction: &mut Exchange,
     ) {
         if let Err(error) = self
-            .capture_implementation_report(execution, interaction, self.clock.now_ms())
+            .capture_implementation_report(execution, interaction)
             .await
         {
             let mut report =
@@ -836,7 +885,7 @@ impl HarnessBroker {
         }
     }
 
-    pub(super) fn observe_plan_progress(&mut self, interaction: &Exchange) -> Result<bool> {
+    pub(super) async fn observe_plan_progress(&mut self, interaction: &Exchange) -> Result<bool> {
         let Some(ExecutionCapture {
             permit,
             record: mut execution,
@@ -871,8 +920,27 @@ impl HarnessBroker {
             }
             progress
         };
-        let mut changed = progress.source_digest != execution.observed_source
-            || execution.generation != execution.observed_generation;
+        let mut changed = false;
+        if let Some(checkpoint_id) = execution
+            .observed_checkpoint
+            .as_ref()
+            .or(execution.baseline_checkpoint.as_ref())
+        {
+            let previous = self
+                .store
+                .load_checkpoint(checkpoint_id)?
+                .context("execution progress checkpoint is missing")?;
+            let current = self.capture_workspace_checkpoint().await?;
+            changed = !previous.changed_paths(&current)?.is_empty();
+            self.store.save_checkpoint(&current)?;
+            execution.observed_checkpoint = Some(current.id);
+        }
+        let document_version = self
+            .plan_file
+            .read_working_document(&self.session.id, &execution.plan_id)?
+            .version;
+        changed |= execution.observed_document_version != 0
+            && execution.observed_document_version != document_version;
         if execution.phase == crate::plan::PlanPhase::Verify {
             let source = serde_json::to_string(&progress.source_digest)?;
             for tool in interaction
@@ -880,14 +948,12 @@ impl HarnessBroker {
                 .iter()
                 .flat_map(|turn| interaction.tools_for_turn(turn.id()))
                 .filter(|tool| {
-                    matches!(
-                        tool.state(),
-                        crate::turn::ToolState::Completed | crate::turn::ToolState::Failed
-                    ) && (matches!(tool.kind.as_str(), "command" | "shell" | "execute")
-                        || matches!(
-                            tool.title.split('(').next().unwrap_or("").trim(),
-                            "powershell" | "bash" | "shell" | "exec_command"
-                        ))
+                    matches!(tool.state(), crate::turn::ToolState::Completed)
+                        && (matches!(tool.kind.as_str(), "command" | "shell" | "execute")
+                            || matches!(
+                                tool.title.split('(').next().unwrap_or("").trim(),
+                                "powershell" | "bash" | "shell" | "exec_command"
+                            ))
                 })
             {
                 let identity = crate::plan::digest(
@@ -897,20 +963,17 @@ impl HarnessBroker {
             }
         }
         execution.observed_source = progress.source_digest.clone();
-        execution.observed_generation = execution.generation;
+        execution.observed_document_version = document_version;
         execution.progress = progress;
         if execution.baseline_checkpoint.is_none() {
             execution.progress.warning.push(CHECKPOINT_WARNING.into());
         }
-        self.task_controller
-            .update(&mut self.store, &permit, self.clock.now_ms(), |task| {
-                let crate::task::TaskWorkflow::Execute { execution: active } = &mut task.workflow
-                else {
-                    anyhow::bail!("execution task changed");
-                };
-                active.record = execution.clone();
-                Ok(())
-            })?;
+        self.task_controller.apply(
+            &mut self.store,
+            &permit,
+            crate::task::TaskEvent::ExecutionUpdated(execution.clone()),
+            self.clock.now_ms(),
+        )?;
         Ok(changed)
     }
 

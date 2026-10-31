@@ -222,7 +222,7 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt() -> Resul
         controller.task_controller.change(
             &mut store,
             None,
-            crate::task::TaskChange::Install(Box::new(crate::task::ActiveTask::goal(
+            crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                 "Preserve the held provider".into(),
                 crate::session::continuation::ContinuationBudget::new(20, 2),
                 false,
@@ -663,7 +663,7 @@ async fn plan_replacement_waits_for_turn_boundary_without_cancelling() -> Result
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let current = controller.task_controller.current()?.unwrap();
-                if matches!(&current.workflow, crate::task::TaskWorkflow::Plan { plan }
+                if matches!(&current.workflow, crate::task::WorkflowSnapshot::Plan { plan }
                     if plan.artifact.state == crate::plan::PlanState::AwaitingReview)
                 {
                     break;
@@ -676,7 +676,7 @@ async fn plan_replacement_waits_for_turn_boundary_without_cancelling() -> Result
         .context("replacement plan did not reach review")??;
         let current = controller.task_controller.current()?.unwrap();
         assert!(current.entry_accepted());
-        let crate::task::TaskWorkflow::Plan { plan } = &current.workflow else {
+        let crate::task::WorkflowSnapshot::Plan { plan } = &current.workflow else {
             unreachable!()
         };
         assert_eq!(
@@ -791,7 +791,7 @@ async fn goal_continuation_uses_durable_input_and_yields_to_user_queue() -> Resu
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if controller.task_controller.current()?.is_some_and(|task| {
-                    matches!(task.workflow, crate::task::TaskWorkflow::Goal { goal }
+                    matches!(task.workflow.clone(), crate::task::WorkflowSnapshot::Goal { goal }
                         if goal.state == crate::goal::GoalState::Stalled)
                 }) && controller.coordinator.execution.available_permits() > 0
                 {
@@ -805,7 +805,7 @@ async fn goal_continuation_uses_durable_input_and_yields_to_user_queue() -> Resu
         .context("goal queue did not settle")??;
         let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         let exchanges = store.list_exchange(&session_id)?;
-        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges.len(), 5);
         assert!(
             exchanges
                 .iter()
@@ -828,7 +828,10 @@ async fn goal_continuation_uses_durable_input_and_yields_to_user_queue() -> Resu
             );
         }
         let task = store.load_active_task(&session_id)?.unwrap();
-        assert_eq!(task.turn.unwrap().id.exchange_ordinal, exchanges[1].ordinal);
+        assert_eq!(
+            task.turn.as_ref().unwrap().id.exchange_ordinal,
+            exchanges.last().unwrap().ordinal
+        );
         assert!(!*controller.cancellation.subscribe().borrow());
         service.shutdown(Duration::from_secs(2)).await?;
         drop(sink);
@@ -925,7 +928,7 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
             controller
                 .task_controller
                 .current()
-                .map(|task| task.map(|task| (task.status(), task.turn)))
+                .map(|task| task.map(|task| (task.status(), task.turn.clone())))
         )
     })??;
     assert_eq!(pending.delivery, crate::task::TaskInputDelivery::Pending);
@@ -944,7 +947,7 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
     let registry = recovered_service.registry().await?;
     let controller = registry.resolve(&session_id).await?;
     let task = controller.task_controller.current()?.unwrap();
-    assert_eq!(task.status(), crate::task::TaskStatus::Running);
+    assert_eq!(task.status(), crate::task::TaskStatus::Paused);
     assert_eq!(
         task.turn
             .as_ref()
@@ -953,7 +956,7 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
             .as_ref()
             .unwrap()
             .delivery,
-        crate::task::TaskInputDelivery::Pending
+        crate::task::TaskInputDelivery::Cancelled
     );
     assert_eq!(
         task.turn
@@ -971,10 +974,17 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
     controller.attach_input(&sink).await?;
+    tokio::task::yield_now().await;
+    let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+    assert_eq!(store.list_exchange(&session_id)?.len(), 1, "restart dispatched without explicit resume");
+    recovered_service.dispatch(Some(session_id.clone()), Request {
+        id: 5, method: "session.command.apply".into(),
+        params: json!({"operation_id":"explicit-recovery-resume","action":"resume"}),
+    }, &sink).await?;
     let resumed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if controller.task_controller.current()?.is_some_and(|task| {
-                matches!(task.workflow, crate::task::TaskWorkflow::Goal { goal }
+                matches!(task.workflow.clone(), crate::task::WorkflowSnapshot::Goal { goal }
                     if goal.state == crate::goal::GoalState::Stalled)
             }) && controller.coordinator.execution.available_permits() > 0
             {
@@ -992,17 +1002,17 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
             controller
                 .task_controller
                 .current()
-                .map(|task| task.map(|task| (task.status(), task.turn)))
+                .map(|task| task.map(|task| (task.status(), task.turn.clone())))
         )
     })??;
     let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
     let exchanges = store.list_exchange(&session_id)?;
-    assert_eq!(exchanges.len(), 2);
+    assert_eq!(exchanges.len(), 6);
     assert!(matches!(
-        exchanges[1].origin,
+        exchanges.last().unwrap().origin,
         crate::exchange::ExchangeOrigin::TaskContinuation { .. }
     ));
-    assert_eq!(exchanges[1].prompt, pending.instruction);
+    assert_eq!(exchanges.last().unwrap().prompt, pending.work.instruction().unwrap());
     recovered_service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
     tokio::time::timeout(Duration::from_secs(2), reader).await???;
@@ -1270,7 +1280,7 @@ async fn reviewed_execution_fixture(
     let plan = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(task) = controller.task_controller.current()?
-                && let crate::task::TaskWorkflow::Plan { plan } = task.workflow
+                && let crate::task::WorkflowSnapshot::Plan { plan } = task.workflow.clone()
                 && plan.artifact.state == crate::plan::PlanState::AwaitingReview
                 && controller.coordinator.execution.available_permits() > 0
             {
@@ -1290,11 +1300,14 @@ async fn reviewed_execution_fixture(
 #[tokio::test]
 async fn plan_accept_policy_controls_initial_submission() -> Result<()> {
     use crate::backend::mock_response::MockResponseCommand;
-    for enabled in [true, false] {
+    for policy in ["default", "on", "off"] {
+        let enabled = policy == "on";
         let fixture = tempfile::tempdir()?;
         crate::checks::configure_fixture(fixture.path());
         let service = service();
-        service.open_session(1, initialize(&fixture, "mock")).await?;
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
         let registry = service.registry().await?;
         let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
@@ -1305,42 +1318,91 @@ async fn plan_accept_policy_controls_initial_submission() -> Result<()> {
         });
         controller.attach_input(&sink).await?;
         let control = controller.backend.mock_response_control().unwrap();
-        let hold = control.dispatch(&session_id, MockResponseCommand::Hold {
-            mode: Some(crate::backend::PromptMode::Plan), any_session: false,
-        }).await?;
+        let hold = control
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Hold {
+                    mode: Some(crate::backend::PromptMode::Plan),
+                    any_session: false,
+                },
+            )
+            .await?;
         let hold_id = hold["id"].as_str().unwrap().to_owned();
-        service.dispatch(Some(session_id.clone()), Request {
-            id: 2, method: "session.command.apply".into(),
-            params: json!({"action":"plan","text":"Inspect ownership"}),
-        }, &sink).await?;
-        tokio::time::timeout(Duration::from_secs(5), control.dispatch(
-            &session_id, MockResponseCommand::Wait { id: hold_id.clone() },
-        )).await??;
+        service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 2,
+                    method: "session.command.apply".into(),
+                    params: json!({"action":"plan","text":"Inspect ownership"}),
+                },
+                &sink,
+            )
+            .await?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            control.dispatch(
+                &session_id,
+                MockResponseCommand::Wait {
+                    id: hold_id.clone(),
+                },
+            ),
+        )
+        .await??;
         let before = controller.task_controller.current()?.unwrap();
-        for selected in if enabled { vec![true] } else { vec![true, false] } {
+        assert!(!before.auto_accept_plan, "new Plan tasks must require review");
+        for selected in match policy {
+            "on" => vec![true],
+            "off" => vec![true, false],
+            _ => Vec::new(),
+        } {
             service.dispatch(Some(session_id.clone()), Request {
                 id: 3, method: "session.prompt.submit".into(),
                 params: json!({"text":if selected {"/plan accept on"} else {"/plan accept off"}}),
             }, &sink).await?;
         }
-        assert_eq!(controller.task_controller.current()?.unwrap().revision, before.revision);
-        let next = control.dispatch(&session_id, MockResponseCommand::Hold {
-            mode: Some(crate::backend::PromptMode::ExecutePlan), any_session: false,
-        }).await?;
+        assert_eq!(
+            controller.task_controller.current()?.unwrap().revision,
+            before.revision
+        );
+        let next = control
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Hold {
+                    mode: Some(crate::backend::PromptMode::ExecutePlan),
+                    any_session: false,
+                },
+            )
+            .await?;
         let next_id = next["id"].as_str().unwrap().to_owned();
-        control.dispatch(&session_id, MockResponseCommand::Release { id: hold_id }).await?;
+        control
+            .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
+            .await?;
         if enabled {
-            tokio::time::timeout(Duration::from_secs(5), control.dispatch(
-                &session_id, MockResponseCommand::Wait { id: next_id.clone() },
-            )).await??;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                control.dispatch(
+                    &session_id,
+                    MockResponseCommand::Wait {
+                        id: next_id.clone(),
+                    },
+                ),
+            )
+            .await??;
             let task = controller.task_controller.current()?.unwrap();
             assert!(task.auto_accept_plan);
-            assert!(matches!(task.workflow, crate::task::TaskWorkflow::Execute { .. }));
+            assert_eq!(task.id, before.id, "Plan acceptance replaced the durable task");
+            let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow else { unreachable!() };
+            assert_eq!(execution.continuation.turn_count, 1, "Plan acceptance lost its completed model turn");
+            assert!(matches!(
+                task.workflow.clone(),
+                crate::task::WorkflowSnapshot::Execute { .. }
+            ));
         } else {
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     if let Some(task) = controller.task_controller.current()?
-                        && let crate::task::TaskWorkflow::Plan { plan } = &task.workflow
+                        && let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow
                         && plan.artifact.state == crate::plan::PlanState::AwaitingReview
                         && controller.coordinator.execution.available_permits() > 0
                     {
@@ -1350,9 +1412,12 @@ async fn plan_accept_policy_controls_initial_submission() -> Result<()> {
                     }
                     tokio::task::yield_now().await;
                 }
-            }).await??;
+            })
+            .await??;
         }
-        control.dispatch(&session_id, MockResponseCommand::Cancel { id: next_id }).await?;
+        control
+            .dispatch(&session_id, MockResponseCommand::Cancel { id: next_id })
+            .await?;
         service.shutdown(Duration::from_secs(2)).await?;
         drop(sink);
         tokio::time::timeout(Duration::from_secs(2), reader).await???;
@@ -1364,12 +1429,20 @@ async fn plan_accept_policy_controls_initial_submission() -> Result<()> {
 #[tokio::test]
 async fn accepted_inline_feedback_revises_before_execution_without_changing_policy() -> Result<()> {
     use crate::backend::mock_response::MockResponseCommand;
-    for decision in ["accept-feedback", "accept-empty", "request-changes", "accept-off", "request-on"] {
+    for decision in [
+        "accept-feedback",
+        "accept-empty",
+        "request-changes",
+        "accept-off",
+        "request-on",
+    ] {
         let request_changes = decision.starts_with("request");
         let fixture = tempfile::tempdir()?;
         crate::checks::configure_fixture(fixture.path());
         let service = service();
-        service.open_session(1, initialize(&fixture, "mock")).await?;
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
         let registry = service.registry().await?;
         let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
@@ -1379,18 +1452,15 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
             Ok::<(), anyhow::Error>(())
         });
         controller.attach_input(&sink).await?;
-        service.dispatch(Some(session_id.clone()), Request {
-            id: 30, method: "session.configure".into(),
-            params: json!({"plan_auto_approve_revisions":false}),
-        }, &sink).await?;
-        let selection = reviewed_execution_fixture(&service, &controller, &session_id, &sink).await?;
+        let selection =
+            reviewed_execution_fixture(&service, &controller, &session_id, &sink).await?;
         let plan_id = selection["plan_id"].as_str().unwrap();
         let store = SqliteStore::read_only(&controller.data_root)?;
         let initial = store.load_plan(plan_id)?.unwrap();
         let original_exchange = store.latest_exchange(&session_id)?.unwrap();
-        let source = controller.observer.capture_plan_review(
-            plan_id, initial.review_digest.as_deref().unwrap(),
-        )?;
+        let source = controller
+            .observer
+            .capture_plan_review(plan_id, initial.review_digest.as_deref().unwrap())?;
         let line = source.rendered.navigation.anchor.first().unwrap().line;
         let feedback = "Conversation context:\nPlan question:\nWhy this design?\n\nPlan answer:\nIt preserves ownership.\n\nRequested change:\nClarify the ownership boundary.";
         let annotations = if decision == "accept-empty" {
@@ -1399,9 +1469,15 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
             json!([{"start_line":line,"end_line":line,"body":feedback}])
         };
         let control = controller.backend.mock_response_control().unwrap();
-        let hold = control.dispatch(&session_id, MockResponseCommand::Hold {
-            mode: None, any_session: false,
-        }).await?;
+        let hold = control
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
+            .await?;
         let hold_id = hold["id"].as_str().unwrap().to_owned();
         service.dispatch(Some(session_id.clone()), Request {
             id: 32, method: "session.command.apply".into(),
@@ -1417,26 +1493,53 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
             let mut selected = selection.clone();
             selected["approval_mode"] = json!("ask");
             selected["plan_compact"] = json!(false);
-            service.dispatch(Some(session_id.clone()), Request {
-                id: 33, method: "session.command.apply".into(), params: selected,
-            }, &sink).await?;
+            service
+                .dispatch(
+                    Some(session_id.clone()),
+                    Request {
+                        id: 33,
+                        method: "session.command.apply".into(),
+                        params: selected,
+                    },
+                    &sink,
+                )
+                .await?;
         }
-        let pending = tokio::time::timeout(Duration::from_secs(5), control.dispatch(
-            &session_id, MockResponseCommand::Wait { id: hold_id.clone() },
-        )).await??;
+        let pending = tokio::time::timeout(
+            Duration::from_secs(5),
+            control.dispatch(
+                &session_id,
+                MockResponseCommand::Wait {
+                    id: hold_id.clone(),
+                },
+            ),
+        )
+        .await??;
         let revising = decision != "accept-empty";
-        assert_eq!(pending["mode"], serde_json::to_value(if revising {
-            crate::backend::PromptMode::Plan
-        } else {
-            crate::backend::PromptMode::ExecutePlan
-        })?);
+        assert_eq!(
+            pending["mode"],
+            serde_json::to_value(if revising {
+                crate::backend::PromptMode::Plan
+            } else {
+                crate::backend::PromptMode::ExecutePlan
+            })?
+        );
         if revising {
-            assert_eq!(store.latest_exchange(&session_id)?.unwrap().id, original_exchange.id);
+            assert_eq!(
+                store.latest_exchange(&session_id)?.unwrap().id,
+                original_exchange.id
+            );
             assert!(pending["prompt"].as_str().unwrap().contains(feedback));
             let saved = store.load_plan(plan_id)?.unwrap();
             assert_eq!(saved.state, crate::plan::PlanState::Revising);
             assert_eq!(saved.accepted_revision, None);
-            assert_eq!(controller.task_controller.current()?.unwrap().auto_accept_plan, !request_changes);
+            assert!(
+                !controller
+                    .task_controller
+                    .current()?
+                    .unwrap()
+                    .auto_accept_plan
+            );
             if decision == "accept-off" || decision == "request-on" {
                 let before = controller.task_controller.current()?.unwrap();
                 service.dispatch(Some(session_id.clone()), Request {
@@ -1444,24 +1547,48 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
                     params: json!({"text":if decision == "accept-off" {"/plan accept off"} else {"/plan accept on"}}),
                 }, &sink).await?;
                 let after = controller.task_controller.current()?.unwrap();
-                assert_eq!(before.revision, after.revision, "policy changes must not invalidate provider work");
+                assert_eq!(
+                    before.revision, after.revision,
+                    "policy changes must not invalidate provider work"
+                );
                 assert_eq!(after.auto_accept_plan, decision == "request-on");
             }
-            let next = control.dispatch(&session_id, MockResponseCommand::Hold {
-                mode: Some(crate::backend::PromptMode::ExecutePlan), any_session: false,
-            }).await?;
+            let next = control
+                .dispatch(
+                    &session_id,
+                    MockResponseCommand::Hold {
+                        mode: Some(crate::backend::PromptMode::ExecutePlan),
+                        any_session: false,
+                    },
+                )
+                .await?;
             let next_id = next["id"].as_str().unwrap().to_owned();
-            control.dispatch(&session_id, MockResponseCommand::Release { id: hold_id }).await?;
-            if decision == "accept-feedback" || decision == "request-on" {
-                tokio::time::timeout(Duration::from_secs(5), control.dispatch(
-                    &session_id, MockResponseCommand::Wait { id: next_id.clone() },
-                )).await??;
+            control
+                .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
+                .await?;
+            if decision == "request-on" {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    control.dispatch(
+                        &session_id,
+                        MockResponseCommand::Wait {
+                            id: next_id.clone(),
+                        },
+                    ),
+                )
+                .await??;
                 let accepted = store.load_plan(plan_id)?.unwrap();
                 assert_eq!(accepted.accepted_revision, Some(initial.model_revision + 1));
-                assert!(controller.task_controller.current()?.unwrap().auto_accept_plan);
+                assert!(
+                    controller
+                        .task_controller
+                        .current()?
+                        .unwrap()
+                        .auto_accept_plan
+                );
                 assert!(matches!(
                     controller.task_controller.current()?.unwrap().workflow,
-                    crate::task::TaskWorkflow::Execute { .. }
+                    crate::task::WorkflowSnapshot::Execute { .. }
                 ));
             } else {
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -1471,20 +1598,30 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
                             && controller.coordinator.execution.available_permits() > 0
                         {
                             assert_eq!(plan.accepted_revision, None);
-                            assert!(!controller.task_controller.current()?.unwrap().auto_accept_plan);
+                            assert!(
+                                !controller
+                                    .task_controller
+                                    .current()?
+                                    .unwrap()
+                                    .auto_accept_plan
+                            );
                             break Ok::<(), anyhow::Error>(());
                         }
                         tokio::task::yield_now().await;
                     }
-                }).await??;
+                })
+                .await??;
             }
-            control.dispatch(&session_id, MockResponseCommand::Cancel { id: next_id }).await?;
+            control
+                .dispatch(&session_id, MockResponseCommand::Cancel { id: next_id })
+                .await?;
         } else {
             let accepted = store.load_plan(plan_id)?.unwrap();
             assert_eq!(accepted.accepted_revision, Some(initial.model_revision));
-            control.dispatch(&session_id, MockResponseCommand::Cancel { id: hold_id }).await?;
+            control
+                .dispatch(&session_id, MockResponseCommand::Cancel { id: hold_id })
+                .await?;
         }
-        assert!(!store.load_session(&session_id)?.unwrap().plan_auto_approve_revisions);
         service.shutdown(Duration::from_secs(2)).await?;
         drop(sink);
         tokio::time::timeout(Duration::from_secs(2), reader).await???;
@@ -1585,7 +1722,7 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
             controller
                 .task_controller
                 .update(&mut store, &task.permit(), 10, |task| {
-                    let crate::task::TaskWorkflow::Plan { plan } = &mut task.workflow else {
+                    let crate::task::WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
                         unreachable!()
                     };
                     let acceptance = plan
@@ -1807,7 +1944,7 @@ async fn saved_plan_actions_preserve_held_provider_and_reject_foreign_artifacts(
         )
         .await??;
         let selected = controller.task_controller.current()?.unwrap();
-        let crate::task::TaskWorkflow::Plan { plan } = &selected.workflow else {
+        let crate::task::WorkflowSnapshot::Plan { plan } = &selected.workflow else {
             panic!("saved plan action did not select a Plan task")
         };
         if action == "attach_plan" {
@@ -1920,7 +2057,7 @@ async fn checking_continuation_returns_to_verify_without_provider_exchange() -> 
     controller
         .task_controller
         .update(&mut store, &planning.permit(), 99, |task| {
-            let crate::task::TaskWorkflow::Plan { plan: current } = &mut task.workflow else {
+            let crate::task::WorkflowSnapshot::Plan { plan: current } = &mut task.workflow else {
                 unreachable!()
             };
             current.artifact = plan;
@@ -1933,7 +2070,10 @@ async fn checking_continuation_returns_to_verify_without_provider_exchange() -> 
         fixture.path().join("src/change.rs"),
         "pub fn requested_change() {}\n",
     )?;
-    task.entry.as_mut().unwrap().execution = None;
+    task.edit(|draft| {
+        draft.entry.as_mut().unwrap().execution = None;
+        Ok(())
+    })?;
     let current = controller.task_controller.current()?.unwrap();
     controller.task_controller.change(
         &mut store,
@@ -1951,10 +2091,11 @@ async fn checking_continuation_returns_to_verify_without_provider_exchange() -> 
         &task.entry.as_ref().unwrap().id,
         101,
     )?;
+    controller.broker.lock().await.ensure_execution_baseline().await?;
     controller
         .task_controller
         .update(&mut store, &task.permit(), 102, |task| {
-            let crate::task::TaskWorkflow::Execute { execution } = &mut task.workflow else {
+            let crate::task::WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
                 unreachable!()
             };
             execution.record.phase = crate::plan::PlanPhase::Checking;
@@ -1982,20 +2123,20 @@ async fn checking_continuation_returns_to_verify_without_provider_exchange() -> 
             .as_ref()
             .unwrap()
             .work,
-        crate::task::TaskContinuationWork::Checks
+        crate::task::TaskWork::Checks
     );
     controller.broker.lock().await.run_task_checks().await?;
     let after = controller.task_controller.current()?.unwrap();
     assert!(
-        matches!(&after.workflow, crate::task::TaskWorkflow::Execute { execution }
+        matches!(&after.workflow, crate::task::WorkflowSnapshot::Execute { execution }
         if execution.record.phase == crate::plan::PlanPhase::Verify)
     );
     let continuation = after.turn.as_ref().unwrap().continuation.as_ref().unwrap();
-    assert_eq!(
+    assert!(matches!(
         continuation.work,
-        crate::task::TaskContinuationWork::Provider
-    );
-    assert!(continuation.instruction.contains("Verify"));
+        crate::task::TaskWork::Provider { .. }
+    ));
+    assert!(continuation.work.instruction().unwrap().contains("Verify"));
     assert_eq!(store.list_exchange(&session_id)?.len(), count);
     controller.task_controller.change(
         &mut store,
@@ -2013,7 +2154,7 @@ async fn checking_continuation_returns_to_verify_without_provider_exchange() -> 
 #[tokio::test]
 async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Result<()> {
     use crate::session::SessionStore;
-    use crate::task::{ActiveTask, TaskChange};
+    use crate::task::{Task, TaskChange};
     let fixture = tempfile::tempdir()?;
     let service = service();
     service
@@ -2032,7 +2173,7 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
     let mut session = store.load_session(&session_id)?.unwrap();
     session.backend_session_id = Some("native-thread".into());
     store.save_session(&session)?;
-    let mut task = ActiveTask::goal("Original objective".into(), Default::default(), true, 1);
+    let mut task = Task::goal("Original objective".into(), Default::default(), true, 1);
     task.request_entry("Work toward the original objective".into(), 1)?;
     controller
         .task_controller
@@ -2108,8 +2249,7 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
         },
         Some("Original objective")
     );
-    let mut replacement =
-        ActiveTask::goal("Replacement objective".into(), Default::default(), true, 6);
+    let mut replacement = Task::goal("Replacement objective".into(), Default::default(), true, 6);
     replacement.request_entry("Work toward the replacement objective".into(), 6)?;
     controller.task_controller.change(
         &mut store,
@@ -2207,7 +2347,7 @@ impl crate::backend::Backend for ControlledGoalTransport {
 #[tokio::test]
 async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -> Result<()> {
     use crate::backend::{NativeGoalStatus, NativeGoalUpdate};
-    use crate::task::{ActiveTask, TaskChange, TaskWorkflow};
+    use crate::task::{Task, TaskChange, WorkflowSnapshot};
     let fixture = tempfile::tempdir()?;
     let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
     let mut controller = SessionController::new(broker)?;
@@ -2229,7 +2369,7 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
     controller.task_controller.change(
         &mut store,
         None,
-        TaskChange::Install(Box::new(ActiveTask::goal(
+        TaskChange::Install(Box::new(Task::goal(
             "Retain native goal".into(),
             Default::default(),
             true,
@@ -2288,8 +2428,8 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
         .change(&mut store, Some(&paused.revision), TaskChange::Resume, 3)?;
     for status in [NativeGoalStatus::Active, NativeGoalStatus::Blocked] {
         if status == NativeGoalStatus::Blocked {
-            let mut blocked = controller.task_controller.current()?.unwrap();
-            let TaskWorkflow::Goal { goal } = &mut blocked.workflow else {
+            let mut blocked = controller.task_controller.current()?.unwrap().draft();
+            let WorkflowSnapshot::Goal { goal } = &mut blocked.workflow else {
                 anyhow::bail!("fixture goal was replaced")
             };
             goal.state = crate::goal::GoalState::Blocked;
@@ -2297,7 +2437,7 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
             controller.task_controller.change(
                 &mut store,
                 Some(&revision),
-                TaskChange::Update(Box::new(blocked)),
+                TaskChange::Update(Box::new(Task::try_from(blocked)?)),
                 4,
             )?;
         }
@@ -2330,16 +2470,16 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
             NativeGoalStatus::BudgetLimited,
         ),
     ] {
-        let mut limited = controller.task_controller.current()?.unwrap();
+        let mut limited = controller.task_controller.current()?.unwrap().draft();
         let revision = limited.revision.clone();
-        let TaskWorkflow::Goal { goal } = &mut limited.workflow else {
+        let WorkflowSnapshot::Goal { goal } = &mut limited.workflow else {
             anyhow::bail!("fixture goal was replaced")
         };
         goal.state = state;
         controller.task_controller.change(
             &mut store,
             Some(&revision),
-            TaskChange::Update(Box::new(limited)),
+            TaskChange::Update(Box::new(Task::try_from(limited)?)),
             5,
         )?;
         let reconciliation = controller.reconcile_native_goal(&mut applied);
@@ -2416,6 +2556,7 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
         original_revision: 1,
         revision: 1,
         generation: 0,
+        manual_verification: Vec::new(),
         planning_backend_session_id: None,
         execution_backend_session_id: None,
         lifecycle: Vec::new(),
@@ -2426,9 +2567,10 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
         revision_history: Vec::new(),
         approval_comments: Vec::new(),
         pending_revision_reason: None,
-        review_paused: false,
+        resume_after_review: false,
         observed_source: Default::default(),
-        observed_generation: 0,
+        observed_checkpoint: None,
+        observed_document_version: 0,
         observed_check: Default::default(),
         created_at_ms: 6,
         completed_at_ms: None,
@@ -2437,13 +2579,13 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
     controller.task_controller.change(
         &mut store,
         None,
-        TaskChange::Install(Box::new(ActiveTask::execute(
+        TaskChange::Install(Box::new(Task::execute(
             "Retain native execution".into(),
             execution,
             Default::default(),
             true,
             6,
-        ))),
+        )?)),
         6,
     )?;
     for (state, status) in [
@@ -2460,9 +2602,9 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
             NativeGoalStatus::Active,
         ),
     ] {
-        let mut task = controller.task_controller.current()?.unwrap();
+        let mut task = controller.task_controller.current()?.unwrap().draft();
         let revision = task.revision.clone();
-        let TaskWorkflow::Execute { execution } = &mut task.workflow else {
+        let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
             anyhow::bail!("fixture execution was replaced")
         };
         execution.record.state = state;
@@ -2470,7 +2612,7 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
         controller.task_controller.change(
             &mut store,
             Some(&revision),
-            TaskChange::Update(Box::new(task)),
+            TaskChange::Update(Box::new(Task::try_from(task)?)),
             7,
         )?;
         let reconciliation = controller.reconcile_native_goal(&mut applied);

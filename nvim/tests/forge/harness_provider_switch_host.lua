@@ -42,7 +42,7 @@ local success, failure = xpcall(function()
   local preference = request('settings.get', {})
   local operation = request('settings.update', {
     operation_id = 'provider-transfer', expected_revision = preference.revision, scope = 'global',
-    desired = { shell = 'system', default_approval = 'allow', plan_auto_approve_revisions = false },
+    desired = { shell = 'system', status_thoughts = false },
   })
   assert(vim.wait(10000, function()
     local observed = request('session.command.operation.get', { operation_id = operation.id })
@@ -68,10 +68,9 @@ local success, failure = xpcall(function()
     assert(vim.api.nvim_get_current_tabpage() == source_tab and #vim.api.nvim_list_tabpages() == tab_count)
     assert(session.harness_by_id[session.harness.session.id] == session.harness)
     local transferred = request('settings.get', {})
-    assert(transferred.desired.shell == 'system' and transferred.desired.default_approval == "allow")
-    assert(transferred.desired.plan_auto_approve_revisions == false)
-    assert(session.harness.session.default_approval == "allow")
-    assert(session.harness.session.plan_auto_approve_revisions == false)
+    assert(transferred.desired.shell == 'system')
+    assert(transferred.desired.status_thoughts == false)
+    assert(session.harness.status_thoughts == false)
   end
   require('forge.views.harness.settings').open(session.harness, {
     window_list = { session.harness.transcript_win, session.harness.composer_win },

@@ -87,7 +87,7 @@ async fn plan_cancellation_retires_open_status_and_reopens_idle() -> Result<()> 
 /// Publish goal removal to an existing status document without a provider callback.
 #[tokio::test]
 async fn goal_clear_retires_open_paused_status_without_another_turn() -> Result<()> {
-    use crate::task::{ActiveTask, TaskChange};
+    use crate::task::{Task, TaskChange};
     use forge_buffer::identity::{DocumentId, ViewId};
     use forge_buffer::width::WidthProfile;
 
@@ -100,7 +100,7 @@ async fn goal_clear_retires_open_paused_status_without_another_turn() -> Result<
     let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
     let mut store = SqliteStore::open(&controller.data_root)?;
-    let task = ActiveTask::goal(
+    let task = Task::goal(
         "Retain paused status until cleared".into(),
         Default::default(),
         false,
