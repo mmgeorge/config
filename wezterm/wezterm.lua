@@ -181,6 +181,16 @@ config.keys           = {
     action = action.PasteFrom 'Clipboard',
   },
   {
+    key = '.',
+    mods = 'CTRL',
+    action = action.SendString '\x1b[46;5u',
+  },
+  {
+    key = ',',
+    mods = 'CTRL',
+    action = action.SendString '\x1b[44;5u',
+  },
+  {
     key = 'c',
     mods = 'LEADER',
     action = wezterm.action.SpawnTab 'CurrentPaneDomain',
