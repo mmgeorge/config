@@ -1,5 +1,4 @@
 local M = {}
-local rotation_bytes = 2 * 1024 * 1024
 local redraw_watch = {}
 local redraw_namespace
 local logging_us = 0
@@ -32,7 +31,7 @@ end
 
 local writer = require("forge.infra.jsonl_log").new(function() return M.path() end, function(failure)
   vim.schedule(function() vim.notify("Forge startup log: " .. failure, vim.log.levels.ERROR) end)
-end, rotation_bytes)
+end)
 
 ---@param event string
 ---@param fields? table<string, any> Diagnostic metadata, excluding request bodies and credentials.

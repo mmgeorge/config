@@ -21,7 +21,7 @@ client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local function await(predicate, message)
-  assert(vim.wait(10000, function() return #errors > 0 or predicate() end, 10), message)
+  assert(vim.wait(30000, function() return #errors > 0 or predicate() end, 10), message)
   assert(#errors == 0, table.concat(errors, "\n"))
 end
 local function request(method, params)

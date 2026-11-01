@@ -25,9 +25,10 @@ end
 --- Rotation applies between batches and never splits or truncates an individual record.
 ---@param path fun(): string
 ---@param report fun(failure: string)
----@param rotation_bytes? integer
+---@param rotation_bytes? integer Defaults to 2 MiB, retaining the preceding segment as .1.
 ---@return ForgeJsonlLog
 function M.new(path, report, rotation_bytes)
+  rotation_bytes = rotation_bytes or 2 * 1024 * 1024
   local pending = {}
   local writing, scheduled, resume = false, false, false
   local directory_ready
@@ -72,7 +73,7 @@ function M.new(path, report, rotation_bytes)
       end)
     end
     local function rotate()
-      if not rotation_bytes or resume then open() return end
+      if resume then open() return end
       vim.uv.fs_stat(target, function(failure, stat)
         if failure and not failure:match("^ENOENT:") then fail(failure) return end
         if not stat or stat.size < rotation_bytes then open() return end

@@ -12,6 +12,7 @@ enum BackgroundFinish {
     IdentityLookup,
     ForeignOwner,
     PriorTask,
+    NoisyTimeout,
 }
 
 /// Retain the actual session delivery lane until the simulated native command settles.
@@ -42,7 +43,10 @@ impl BackgroundBackend {
                     outcome: match self.finish {
                         BackgroundFinish::Shutdown
                         | BackgroundFinish::ForeignOwner
-                        | BackgroundFinish::PriorTask => crate::backend::ToolOutcome::Interrupted,
+                        | BackgroundFinish::PriorTask
+                        | BackgroundFinish::NoisyTimeout => {
+                            crate::backend::ToolOutcome::Interrupted
+                        }
                         BackgroundFinish::IdentityLookup => crate::backend::ToolOutcome::Succeeded,
                     },
                 },
@@ -115,12 +119,26 @@ impl Backend for BackgroundBackend {
             .await?;
         }
         let mut observed_scope = scope;
+        if matches!(self.finish, BackgroundFinish::NoisyTimeout) {
+            loop {
+                sink.send_wait(BackendEvent::Tool {
+                    address: address.clone(),
+                    update: crate::backend::ToolUpdate::Output {
+                        update: crate::backend::TextUpdate::Append("still running\n".into()),
+                    },
+                })
+                .await?;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
         match self.finish {
             BackgroundFinish::ForeignOwner => {
                 observed_scope.owner.agent_id = "foreign-child".into()
             }
             BackgroundFinish::PriorTask => observed_scope.exchange_id = "prior-child-task".into(),
-            BackgroundFinish::Shutdown | BackgroundFinish::IdentityLookup => {}
+            BackgroundFinish::Shutdown
+            | BackgroundFinish::IdentityLookup
+            | BackgroundFinish::NoisyTimeout => {}
         }
         let mut observed_address = address;
         observed_address.turn.scope = observed_scope.clone();
@@ -184,6 +202,14 @@ async fn collect_background_child(
     });
     let runtime = AgentRuntime {
         backend: backend.clone(),
+        tool_timeout: if matches!(finish, BackgroundFinish::NoisyTimeout) {
+            crate::session::InputTimeout {
+                amount: 1,
+                unit: crate::session::TimeoutUnit::S,
+            }
+        } else {
+            Default::default()
+        },
         trace,
         submission_store: store,
         permission: crate::backend::approval::PermissionCoordinator::transient(
@@ -245,6 +271,9 @@ async fn collect_background_child(
                             output.is_err() || cleanup_error.is_some(),
                             "invalid session scope was not reported"
                         );
+                    } else if matches!(finish, BackgroundFinish::NoisyTimeout) {
+                        assert!(output.unwrap_err().to_string().contains("timeout"));
+                        assert!(cleanup_error.is_none(), "{cleanup_error:?}");
                     } else {
                         assert!(output.is_ok());
                         assert!(cleanup_error.is_none(), "{cleanup_error:?}");
@@ -323,6 +352,22 @@ fn assert_background_completion(
             .collect::<String>()
     );
     assert_eq!(text, expected);
+}
+
+/// Continuous shell output cannot defer a child deadline or prevent cleanup.
+#[tokio::test]
+async fn noisy_child_tool_timeout_stops_execution_and_cleans_up() -> Result<()> {
+    let events = collect_background_child(BackgroundFinish::NoisyTimeout, 0).await?;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::Tool {
+        update: crate::backend::ToolUpdate::Finished {
+            outcome: crate::backend::ToolOutcome::Failed { diagnostic },
+        }, ..
+    } if diagnostic.code.as_deref() == Some("tool_timeout")))
+    );
+    Ok(())
 }
 
 /// Final native cleanup evidence must reach the child owner before managed completion.
@@ -497,6 +542,7 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         request.submission = Some(submission.clone());
         AgentRuntime {
             backend: Arc::new(ProviderCancelledBackend { boundary }),
+            tool_timeout: Default::default(),
             trace,
             submission_store: store,
             permission: crate::backend::approval::PermissionCoordinator::transient(

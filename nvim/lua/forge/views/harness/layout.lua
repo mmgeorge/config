@@ -77,7 +77,7 @@ function M.configure_transcript_window(win)
   vim.wo[win].winfixheight = false
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
-  vim.wo[win].showbreak = " "
+  vim.wo[win].showbreak = ""
   vim.wo[win].breakindent = true
   vim.wo[win].breakindentopt = "shift:0"
   vim.wo[win].foldmethod = "manual"
@@ -110,7 +110,7 @@ function M.open(timeline_key)
   vim.api.nvim_buf_set_lines(composer_buf, 0, -1, false, { "" })
   vim.wo[composer_win].wrap = true
   vim.wo[composer_win].linebreak = true
-  vim.wo[composer_win].showbreak = " "
+  vim.wo[composer_win].showbreak = ""
   vim.wo[composer_win].smoothscroll = true
   vim.wo[composer_win].winfixheight = true
   input_gutter.apply(composer_win)

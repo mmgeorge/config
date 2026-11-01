@@ -2021,6 +2021,68 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     Ok(())
 }
 
+/// Kill a timed-out shell and stop the remaining check commands with a retained error.
+#[tokio::test]
+async fn shell_timeout_kills_the_process_and_stops_the_check_run() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    save(
+        workspace.path(),
+        vec![
+            definition(
+                "a-slow",
+                "print ready; sleep 30sec; 'orphan' | save orphan.txt",
+            ),
+            definition("b-never", "'unexpected' | save unexpected.txt"),
+        ],
+    );
+    let runner = make_runner(workspace.path(), data.path());
+    let mut settings = crate::settings::SettingsStore::open(data.path())?;
+    settings.patch(
+        crate::settings::SettingTarget {
+            scope: crate::settings::SettingScope::Global,
+            workspace: workspace.path().to_str().unwrap(),
+            session: "checks-test",
+        },
+        &crate::settings::PortableSettings {
+            tool_timeout: Some(crate::session::InputTimeout {
+                amount: 1,
+                unit: crate::session::TimeoutUnit::S,
+            }),
+            ..Default::default()
+        },
+    )?;
+    let request = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
+        RunRequest::All,
+        None,
+        crate::session::CheckShell::Nushell,
+        "Timeout regression".into(),
+    )?;
+    let failure = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        runner.run(request, None, None),
+    )
+    .await?
+    .unwrap_err();
+    assert!(failure.to_string().contains("timeout"));
+    assert!(runner.active()?.is_none());
+    let history = runner.history()?;
+    let run = history.last().unwrap();
+    assert_eq!(run.state, CheckState::ExecutionError);
+    assert!(
+        run.commands[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("timeout")
+    );
+    assert!(run.commands[1].started_at_ms.is_none());
+    assert!(!workspace.path().join("orphan.txt").exists());
+    assert!(!workspace.path().join("unexpected.txt").exists());
+    Ok(())
+}
+
 #[tokio::test]
 async fn provider_turn_cancellation_collects_its_background_checks() -> Result<()> {
     let workspace = tempfile::tempdir()?;

@@ -2,23 +2,23 @@ local fixture=dofile('nvim/tests/forge/support/text_fixture.lua').native()
 local ok,failure=xpcall(function()
   assert(fixture.exec([[return vim.tbl_contains(text_initialize_wire.request.params.terminology,'repo')]]),
     'default wordlist was not included in the profile')
-  for _,term in ipairs({'coroutine','middleware','stdin','rpc','refactor','todo','opt','perf'}) do
+  for _,term in ipairs({'coroutine','middleware','stdin','rpc','refactor','todo','opt','perf','off'}) do
     assert(fixture.exec([[return vim.tbl_contains(text_initialize_wire.request.params.terminology,...)]],{term}),
       'programming term missing from the profile: '..term)
   end
   assert(not fixture.exec([[return vim.tbl_contains(text_initialize_wire.request.params.terminology,'then')]]),
-    'programming dictionary disabled contextual then/than correction')
+    'programming dictionary unexpectedly includes a common English word')
   fixture.exec([[
     local cases={
       {'Please recieve the package.','recieve','receive'},
       {'The update should releive pressure.','releive','relieve'},
       {'Please receive the package.','receive','receive'},
       {'The update should relieve pressure.','relieve','relieve'},
-      {'Read the response form the server.','form','from'},
+      {'Read the response form the server.','form','form'},
       {'Fill out the form before submitting.','form','form'},
-      {'The value is greater then zero.','then','than'},
+      {'The value is greater then zero.','then','then'},
       {'Save the file then exit.','then','then'},
-      {'Do not loose your work.','loose','lose'},
+      {'Do not loose your work.','loose','loose'},
       {'The cable is loose.','loose','loose'},
       {'This should definately fix the issue.','definately','definitely'},
       {'We need to seperate configuration from state.','seperate','separate'},
@@ -26,8 +26,17 @@ local ok,failure=xpcall(function()
       {'Check the dependancies before building.','dependancies','dependencies'},
       {'The service recieved a request.','recieved','received'},
       {'Please recieve','recieve','receive'},
-      {'The value is greater then','then','than'},
+      {'The value is greater then','then','then'},
       {'Fill out the form','form','form'},
+      {'Turn autocorrect off.','off','off'},
+      {'Turn autocorrect off','off','off'},
+      {'Turn autocorrect OFF','OFF','OFF'},
+      {'I answer two questions.','two','two'},
+      {'I answer two','two','two'},
+      {'I answer TWO','TWO','TWO'},
+      {'This is too much.','too','too'},
+      {'Say i’ll','i’ll','I’ll'},
+      {'Say don’t','don’t','don’t'},
     }
     text_dictionary_gate={remaining=#cases,errors={}}
     for index,case in ipairs(cases) do

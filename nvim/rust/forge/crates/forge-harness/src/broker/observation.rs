@@ -11,6 +11,7 @@ pub(crate) struct InputReadiness {
 
 /// Shares durable queries and published transient state without acquiring the execution owner.
 pub(crate) struct BrokerObserver {
+    pub(crate) questions: Arc<crate::question::QuestionController>,
     pub(crate) admission: Arc<crate::storage::admission::SessionAdmission>,
     pub(crate) input_schedule: tokio::sync::watch::Sender<crate::session::InputSchedule>,
     pub(super) lsp: Arc<crate::control_tools::lsp::LspService>,
@@ -305,8 +306,8 @@ impl BrokerObserver {
         let settings = snapshot.desired;
         let check_timing = settings.check_timing.unwrap_or_default();
         let automatic_checks = settings.automatic_checks_enabled();
-        (session.approval_timeout, session.answer_timeout) =
-            self.permission_coordinator.input_timeouts(&session.id)?;
+        session.approval_timeout = self.permission_coordinator.approval_timeout(&session.id)?;
+        session.tool_timeout = settings.tool_timeout.unwrap_or(session.tool_timeout);
         let task = source_session.active_task.as_ref();
         let active_plan = match task.map(|task| &task.workflow) {
             Some(crate::task::WorkflowSnapshot::Plan { plan }) => Some(plan.artifact.clone()),
@@ -322,7 +323,9 @@ impl BrokerObserver {
                 plan_trace_fields(plan),
             );
         }
-        let interaction = store.list_exchange_metadata(&source_session.id)?;
+        let mut interaction = store.list_exchange_metadata(&source_session.id)?;
+        let questions = self.questions.snapshot()?;
+        crate::question::project(&mut interaction, &questions)?;
         let plan_input = active_plan.as_ref().filter(|_| {
             !task
                 .as_ref()
@@ -414,6 +417,26 @@ impl BrokerObserver {
         {
             status = crate::session::state_machine::SessionPhase::Compacting { started_at_ms };
         }
+        if questions.required_pending()
+            && !matches!(status, crate::session::state_machine::SessionPhase::Paused)
+            && !interaction
+                .last()
+                .is_some_and(|exchange| exchange.state() == crate::exchange::ExchangeState::Running)
+        {
+            status = crate::session::state_machine::SessionPhase::AwaitingInput {
+                owner: ElicitationOwner::Interaction,
+                plan_id: active_plan.as_ref().map(|plan| plan.id.clone()),
+                exchange_id: questions
+                    .questions
+                    .iter()
+                    .find(|question| {
+                        question.pending()
+                            && question.requirement
+                                == crate::question::QuestionRequirement::Required
+                    })
+                    .map(|question| question.exchange_id.clone()),
+            };
+        }
         self.trace.record(
             &source_session.id,
             "status_projected",
@@ -472,6 +495,7 @@ impl BrokerObserver {
             })
             .collect();
         Ok(BrokerSnapshot {
+            questions: self.questions.snapshot()?,
             ask_model,
             access_preference: settings
                 .access

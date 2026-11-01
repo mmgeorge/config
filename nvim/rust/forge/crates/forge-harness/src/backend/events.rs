@@ -12,6 +12,7 @@ pub struct BackendEventSink {
     sender: MessageSender,
     delivery: std::sync::Arc<tokio::sync::Mutex<()>>,
     skill: Option<std::sync::Arc<std::sync::Mutex<crate::skill::SkillObserver>>>,
+    watchdog: Option<std::sync::Arc<super::tool_timeout::ToolWatchdog>>,
 }
 
 pub struct BackendEventStream {
@@ -94,6 +95,7 @@ pub fn channel(scope: impl Into<EventScope>) -> (BackendEventSink, BackendEventS
             sender,
             delivery: Default::default(),
             skill: None,
+            watchdog: None,
         },
         BackendEventStream {
             input: EventReceiver {
@@ -108,6 +110,17 @@ pub fn channel(scope: impl Into<EventScope>) -> (BackendEventSink, BackendEventS
 }
 
 impl BackendEventSink {
+    /// Share invocation deadlines across every provider tool event, including shell commands.
+    pub(crate) fn supervise_tools(
+        &self,
+        watchdog: std::sync::Arc<super::tool_timeout::ToolWatchdog>,
+    ) -> Self {
+        Self {
+            watchdog: Some(watchdog),
+            ..self.clone()
+        }
+    }
+
     pub fn scope(&self) -> &EventScope {
         &self.scope
     }
@@ -166,6 +179,11 @@ impl BackendEventSink {
 
     pub async fn send_wait(&self, event: BackendEvent) -> Result<(), EventDeliveryError> {
         self.validate(&event)?;
+        if let Some(watchdog) = &self.watchdog {
+            watchdog
+                .observe(&event)
+                .map_err(EventDeliveryError::transport)?;
+        }
         let _delivery = self.delivery.lock().await;
         let read = if let Some(skill) = &self.skill {
             skill
@@ -218,6 +236,11 @@ impl BackendEventSink {
     #[cfg(test)]
     pub(crate) fn send(&self, event: BackendEvent) -> Result<(), EventDeliveryError> {
         self.validate(&event)?;
+        if let Some(watchdog) = &self.watchdog {
+            watchdog
+                .observe(&event)
+                .map_err(EventDeliveryError::transport)?;
+        }
         self.sender.send(event).map_err(EventDeliveryError::queue)
     }
 

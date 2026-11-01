@@ -15,7 +15,7 @@ const UNIGRAM: &[u8] = include_bytes!("../assets/frequency_dictionary_en_82_765.
 const BIGRAM: &[u8] = include_bytes!("../assets/frequency_bigramdictionary_en_243_342.txt");
 const UNIGRAM_CHECKSUM: &str = "5eb7d9ca29ba3aee23d11b8b3d3aa048d7e94538b468eeffd9e07f76de7d5125";
 const BIGRAM_CHECKSUM: &str = "c7775c2d4d25930146ae07de85c228330f9b8b6a81c3cc8f6fa52e10246e3de8";
-pub(crate) const MODEL_REVISION: &str = "en-US-bigram-3";
+pub(crate) const MODEL_REVISION: &str = "en-US-bigram-4";
 
 /// Own the validated immutable lexical and contextual base shared by terminology profiles.
 pub(crate) struct Model {
@@ -138,7 +138,7 @@ impl Model {
         &self.revision
     }
 
-    /// Evaluate every candidate, including identity, and return only the target replacement.
+    /// Preserve recognized spellings while correcting unknown words and applying explicit rules.
     pub(crate) fn correct(
         &self,
         request: CorrectRequest,
@@ -164,8 +164,8 @@ impl Model {
         }
         let normalized = original.to_lowercase();
         let canonical = normalized.replace('\u{2019}', "'");
-        let protected_contraction =
-            canonical.contains('\'') && self.unigram.contains_key(&canonical);
+        let protected_word =
+            self.unigram.contains_key(&canonical) || terminology.contains(&normalized);
         let mut candidates = self.candidates.get(&normalized).unwrap_or_else(|| {
             let candidates =
                 self.dictionary
@@ -224,7 +224,7 @@ impl Model {
                     count: 0,
                 });
             }
-        } else if protected_contraction {
+        } else if protected_word {
             candidates.retain(|candidate| candidate.term == normalized);
         }
         let start = token::sentence_start(&request.context, request.target.start);
@@ -239,9 +239,6 @@ impl Model {
             })
             .map(|next| next.text.to_lowercase());
         let score = |candidate: &symspell_rs::Suggestion| {
-            if terminology.contains(&normalized) && candidate.term != normalized {
-                return f64::NEG_INFINITY;
-            }
             let lexical = if let Some(left) = &left {
                 self.conditional(left, &candidate.term).ln()
             } else {
@@ -337,7 +334,7 @@ impl Model {
         probability
     }
 
-    /// Weight edit types independently from corpus frequency and retain valid-word identity.
+    /// Weight spelling edits independently from corpus frequency for unknown words.
     fn edit_prior(&self, original: &str, candidate: &str, distance: usize) -> f64 {
         let original_chars: Vec<_> = original.chars().collect();
         let candidate_chars: Vec<_> = candidate.chars().collect();
@@ -362,12 +359,7 @@ impl Model {
         } else {
             6.8
         };
-        (if self.unigram.contains_key(original) {
-            2.5
-        } else {
-            0.0
-        }) + channel
-            + distance.saturating_sub(1) as f64 * 5.0
+        channel + distance.saturating_sub(1) as f64 * 5.0
     }
 }
 
@@ -410,27 +402,39 @@ mod tests {
         }
     }
 
+    /// Keep dictionary words even when neighboring frequencies favor another valid spelling.
     #[test]
-    fn known_word_candidates_include_neighbors() {
-        let candidates = model()
-            .dictionary
-            .lookup("form", Verbosity::All, 2, &None, None, false);
-        assert!(candidates.iter().any(|candidate| candidate.term == "form"));
-        assert!(candidates.iter().any(|candidate| candidate.term == "from"));
+    fn known_words_preserve_spelling_in_complete_sentences_and_typing_prefixes() {
+        for (context, target, expected) in [
+            ("I answer two questions.", "two", "two"),
+            ("I answer two ", "two", "two"),
+            ("I answer TWO ", "TWO", "TWO"),
+            ("Turn autocorrect off.", "off", "off"),
+            ("Turn autocorrect off ", "off", "off"),
+            ("This is too much.", "too", "too"),
+            ("This is too ", "too", "too"),
+            ("Read the response form the server.", "form", "form"),
+            ("The value is greater then ", "then", "then"),
+            ("Do not loose your work.", "loose", "loose"),
+            ("two questions remain.", "two", "Two"),
+        ] {
+            assert_eq!(decide(context, target), expected, "{context}");
+        }
     }
 
+    /// Correct unknown spellings without treating valid-word alternatives as automatic edits.
     #[test]
-    fn contextual_quality_gate() {
+    fn spelling_quality_gate() {
         for (context, target, expected) in [
             ("Please recieve the package.", "recieve", "receive"),
             ("The update should releive pressure.", "releive", "relieve"),
             ("Please receive the package.", "receive", "receive"),
             ("The update should relieve pressure.", "relieve", "relieve"),
-            ("Read the response form the server.", "form", "from"),
+            ("Read the response form the server.", "form", "form"),
             ("Fill out the form before submitting.", "form", "form"),
-            ("The value is greater then zero.", "then", "than"),
+            ("The value is greater then zero.", "then", "then"),
             ("Save the file then exit.", "then", "then"),
-            ("Do not loose your work.", "loose", "lose"),
+            ("Do not loose your work.", "loose", "loose"),
             ("The cable is loose.", "loose", "loose"),
             (
                 "This should definately fix the issue.",
@@ -450,7 +454,7 @@ mod tests {
             ),
             ("The service recieved a request.", "recieved", "received"),
             ("Please recieve", "recieve", "receive"),
-            ("The value is greater then", "then", "than"),
+            ("The value is greater then", "then", "then"),
             ("Fill out the form", "form", "form"),
         ] {
             assert_eq!(decide(context, target), expected, "{context}");

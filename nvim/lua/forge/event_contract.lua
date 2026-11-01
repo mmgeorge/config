@@ -86,6 +86,7 @@ function M.validate(channel, name, payload)
       or expected == "nullable_string" and (value == vim.NIL or type(value) == "string" and #value > 0)
       or expected == "integer" and type(value) == "number" and value >= 0 and value <= 9007199254740991 and value == math.floor(value)
       or expected == "object" and type(value) == "table"
+      or expected == "array" and type(value) == "table" and vim.islist(value)
       or expected == "boolean" and type(value) == "boolean"
     assert(valid, ("Forge %s event %s: %s requires %s"):format(channel, name, path, expected))
   end

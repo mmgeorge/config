@@ -62,11 +62,19 @@ state.configuration_completion = { complete = function(applied)
   assert(not applied, "switching sessions completed an old configuration as successful")
   configuration_completions = configuration_completions + 1
 end }
+state.question_drafts = { choice = { ask = "Explain the tradeoff" } }
+state.question_picker_resume = { page_id = "choice" }
 response.session.id = "replacement-session"
 response.snapshot_revision = 1
 assert(snapshot.apply(state, response))
 assert(not state.configuring and not state.busy and not state.task_operation)
 assert(not state.configuring_config and not state.task_config and not state.configuration_completion)
 assert(configuration_completions == 1, "session replacement did not retire its pending configuration")
+assert(state.question_drafts == nil, "a different session inherited question drafts")
+state.question_drafts = { choice = { ask = "A different question" } }
+response.session.id = "snapshot-test"
+assert(snapshot.apply(state, response))
+assert(state.question_drafts.choice.ask == "Explain the tradeoff", "returning to a session lost its question draft")
+assert(state.question_picker_resume.page_id == "choice")
 package.loaded["forge.lsp.startup"] = original_startup
 print("harness_snapshot: passed")

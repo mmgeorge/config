@@ -36,7 +36,7 @@ Function-body references use three sections: `Calls`, `Constructs`, and `Accesse
 
 Adapters add a control call to durable replay only after its provider request succeeds, so a rejected call stays visible as a failed activity without poisoning a later corrected plan. Lifecycle notifications update the rendered activity but never authorize a mutation, because they can arrive before validation. Names printed in prose or command output never count as control calls. Copilot's concurrent SDK handlers share one asynchronously locked runtime and verify turn ownership after acquiring it.
 
-`question_ask` pauses on one to three structured decisions. In chat, goal, and execution turns, questions persist on the owning `Exchange` instead of `PlanRecord`. If Codex edits a plan but ends without submitting or asking, the backend runs one bounded corrective turn inside the same interaction.
+`question_ask` appends session-owned decisions with an explicit optional or required requirement. Optional questions permit continued work; required questions stop execution without changing the workflow phase. Questions retain their originating exchange and optional task ID. If Codex edits a plan but ends without submitting or asking, the backend runs one bounded corrective turn inside the same interaction.
 
 ## Reference validation
 

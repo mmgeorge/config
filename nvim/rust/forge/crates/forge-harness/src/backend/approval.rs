@@ -131,7 +131,7 @@ impl Drop for PendingRegistration<'_> {
 pub struct PermissionCoordinator {
     pending_map: Mutex<BTreeMap<String, PendingApproval>>,
     store: Arc<RwLock<PermissionStore>>,
-    timeout_by_session: Mutex<BTreeMap<String, (InputTimeout, InputTimeout)>>,
+    timeout_by_session: Mutex<BTreeMap<String, InputTimeout>>,
     feedback_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, String>>,
     feedback_watch:
         Mutex<HashMap<crate::backend::ExecutionOwner, tokio::sync::watch::Sender<bool>>>,
@@ -269,31 +269,12 @@ impl PermissionCoordinator {
         self.timeout_by_session
             .lock()
             .map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
-            .entry(session_id.to_owned())
-            .or_default()
-            .0 = timeout.validate()?;
-        Ok(())
-    }
-
-    /// Publish both future-input settings without touching pending requests.
-    pub fn configure_input_timeouts(
-        &self,
-        session_id: &str,
-        approval: InputTimeout,
-        answer: InputTimeout,
-    ) -> Result<()> {
-        self.timeout_by_session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
-            .insert(
-                session_id.to_owned(),
-                (approval.validate()?, answer.validate()?),
-            );
+            .insert(session_id.to_owned(), timeout.validate()?);
         Ok(())
     }
 
     /// Read the current settings for one session independently of active provider work.
-    pub fn input_timeouts(&self, session_id: &str) -> Result<(InputTimeout, InputTimeout)> {
+    pub fn approval_timeout(&self, session_id: &str) -> Result<InputTimeout> {
         Ok(self
             .timeout_by_session
             .lock()
@@ -677,8 +658,7 @@ impl PermissionCoordinator {
                     .unwrap_or_default(),
             )
             .copied()
-            .unwrap_or_default()
-            .0;
+            .unwrap_or_default();
         let now_ms = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?

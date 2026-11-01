@@ -28,6 +28,9 @@ local ok, failure = xpcall(function()
   answer_progress.payload.effort = nil
   reject(answer_progress)
   reject({ session_id = "session", event = "unregistered", payload = {} })
+  decode({ session_id = "session", event = "questions_changed", payload = { revision = 1, questions = {} } })
+  reject({ session_id = "session", event = "questions_changed", payload = { revision = 1, questions = vim.empty_dict() } })
+  reject({ session_id = "session", event = "questions_changed", payload = { questions = {} } })
   reject({ session_id = "session", event = "backend_event", payload = { kind = "unregistered" } })
   reject({ session_id = "session", event = "document_changed", payload = { session_id = "session", revision = -1 } })
   reject({ session_id = "session", event = "backend_event", payload = {

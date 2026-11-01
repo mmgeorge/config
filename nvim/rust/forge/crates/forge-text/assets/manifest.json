@@ -1,5 +1,5 @@
 {
-  "revision": "en-US-bigram-3",
+  "revision": "en-US-bigram-4",
   "upstream_revision": "62131c2ca5bfd7fe8432e28b17b24dd98d959ee0",
   "assets": [
     {
@@ -15,7 +15,7 @@
   ],
   "model": {
     "interpolation": 0.5,
-    "known_edit_penalty": 2.5,
+    "preserve_recognized_words": true,
     "transposition": 0.5,
     "length_edit": 2.0,
     "vowel_substitution": 1.2,

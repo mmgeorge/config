@@ -88,8 +88,8 @@ end
 local function refresh_winbar(review)
   local plan = review.plan
   local detail = plan.historical_revision and ("Revision " .. plan.historical_revision .. " • historical • read-only")
-    or plan.state == "accepted" and "Accepted plan • read-only projection • C adds comments"
-    or "Awaiting review • C comment • A question • Ctrl-S save / ask"
+    or plan.state == "accepted" and "Accepted plan • read-only projection"
+    or "Awaiting review"
   detail = detail .. " • Showing: " .. (review.public_only and "Public" or "All")
   keymaps.apply_view_winbar(review.win, "PlanReview", "plan_review", review.command_set, detail)
 end

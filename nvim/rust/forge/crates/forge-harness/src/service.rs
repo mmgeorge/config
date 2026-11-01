@@ -576,6 +576,18 @@ impl HarnessService {
         request: &mut Request,
     ) -> Result<()> {
         use session_command::SessionCommand;
+        if matches!(
+            RuntimeMethod::decode(&request.method)?,
+            RuntimeMethod::SessionQuestionAnswer
+                | RuntimeMethod::SessionQuestionAsk
+                | RuntimeMethod::SessionQuestionSkip
+        ) && request.params.get("command").is_some()
+        {
+            let _: crate::question::QuestionCommand =
+                serde_json::from_value(request.params["command"].clone())?;
+            request.method = "session.question.answer".into();
+            return Ok(());
+        }
         let mut candidate = request.clone();
         if candidate.params.get("operation_id").is_none()
             && let Some(id) = candidate
@@ -1238,6 +1250,7 @@ enum SessionObservationIntake {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    questions: Arc<crate::question::QuestionController>,
     provider_startup: Mutex<Option<tokio::task::JoinHandle<()>>>,
     provider_startup_error: std::sync::Mutex<Option<String>>,
     goal_max_turns: u32,
@@ -1464,6 +1477,7 @@ impl SessionController {
         )?);
         broker.input_wakeup = Some(input.changed.clone());
         Ok(Arc::new(Self {
+            questions: broker.questions.clone(),
             provider_startup: Mutex::new(None),
             provider_startup_error: std::sync::Mutex::new(None),
             task_controller: broker.task_controller.clone(),
@@ -2405,9 +2419,9 @@ async fn route_request(
                 .is_some_and(|fields| !fields.is_empty()
                     && fields.keys().all(|field| matches!(
                         field.as_str(),
-                        "approval_timeout" | "answer_timeout"
+                        "approval_timeout" | "tool_timeout"
                     ))),
-            "input timeout configuration accepts only approval_timeout and answer_timeout"
+            "timeout configuration accepts only approval_timeout and tool_timeout"
         );
         if let Some(value) = request.params.get("approval_timeout") {
             desired.approval_timeout = Some(
@@ -2415,10 +2429,10 @@ async fn route_request(
                     .validate()?,
             );
         }
-        if let Some(value) = request.params.get("answer_timeout") {
-            desired.answer_timeout = Some(
+        if let Some(value) = request.params.get("tool_timeout") {
+            desired.tool_timeout = Some(
                 serde_json::from_value::<crate::session::InputTimeout>(value.clone())?
-                    .validate()?,
+                    .require_expiry()?,
             );
         }
         settings.patch(
@@ -2437,15 +2451,15 @@ async fn route_request(
             )?
             .desired;
         let approval = effective.approval_timeout.unwrap_or_default();
-        let answer = effective.answer_timeout.unwrap_or_default();
+        let tool = effective.tool_timeout.unwrap_or_default();
         controller
             .permission
-            .configure_input_timeouts(&session_id, approval, answer)?;
+            .configure_timeout(&session_id, approval)?;
         drop(configuration);
         message_sink
             .send_response(Response::success(
                 request.id,
-                json!({"approval_timeout":approval,"answer_timeout":answer}),
+                json!({"approval_timeout":approval,"tool_timeout":tool}),
             )?)
             .await?;
         return Ok(());
@@ -3756,6 +3770,39 @@ async fn route_control_request(
     trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
     admission: &mut Option<ExecutionPermit>,
 ) -> Result<bool> {
+    if matches!(
+        method,
+        RuntimeMethod::SessionQuestionAnswer
+            | RuntimeMethod::SessionQuestionAsk
+            | RuntimeMethod::SessionQuestionSkip
+    ) && let Some(command) = request.params.get("command")
+    {
+        let command: crate::question::QuestionCommand = serde_json::from_value(command.clone())?;
+        ensure!(
+            matches!(
+                command.action,
+                crate::question::QuestionAction::Answer { .. }
+                    | crate::question::QuestionAction::Clarify { .. }
+                    | crate::question::QuestionAction::Correct { .. }
+                    | crate::question::QuestionAction::Dismiss
+            ),
+            "this question action belongs to the model"
+        );
+        controller.questions.apply(command)?;
+        let snapshot = controller.questions.snapshot()?;
+        message_sink
+            .send_control_response(Response::success(request.id, &snapshot)?)
+            .await?;
+        message_sink
+            .send_event(SessionEvent {
+                session_id: controller.observer.session_id().into(),
+                event: "questions_changed".into(),
+                payload: serde_json::to_value(snapshot)?,
+            })
+            .await?;
+        controller.coordinator.submissions.changed.notify_one();
+        return Ok(true);
+    }
     if matches!(
         method,
         RuntimeMethod::SessionQuestionAnswer | RuntimeMethod::SessionQuestionSkip
@@ -5337,7 +5384,7 @@ mod tests {
         let (sink, mut output) = forge_protocol::outbound::channel();
         let ready = Arc::new(tokio::sync::Barrier::new(3));
         let mut writer_list = Vec::new();
-        for (offset, field) in [(10, "approval_timeout"), (30, "answer_timeout")] {
+        for (offset, field) in [(10, "approval_timeout"), (30, "approval_timeout")] {
             let service = service.clone();
             let session_id = session_id.clone();
             let sink = sink.clone();
@@ -5372,15 +5419,186 @@ mod tests {
             let response: Value = serde_json::from_slice(frame.bytes())?;
             assert!(response.get("error").is_none(), "{response}");
         }
-        let (approval, answer) = controller.permission.input_timeouts(&session_id)?;
+        let approval = controller.permission.approval_timeout(&session_id)?;
         assert_eq!(approval.amount, 16);
-        assert_eq!(answer.amount, 16);
         assert!(controller.coordinator.execution.try_acquire().is_err());
         let saved = crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?
             .get(&fixture.path().to_string_lossy(), &session_id, "mock")?
             .desired;
         assert_eq!(saved.approval_timeout, Some(approval));
-        assert_eq!(saved.answer_timeout, Some(answer));
+        drop(broker);
+        drop(execution);
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn required_chat_questions_enqueue_one_continuation_after_answer_delivery() -> Result<()>
+    {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let controller = service.registry().await?.resolve(&session_id).await?;
+        let execution = controller.coordinator.execution.acquire().await?;
+        let mut broker = controller.broker.lock().await;
+        let result = broker
+            .dispatch(Request {
+                id: 2,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":"Original request awaiting a choice"}),
+            })
+            .await;
+        assert!(result.response.result().is_some());
+        drop(broker);
+        let original = crate::storage::SqliteStore::read_only(&controller.data_root)?
+            .latest_exchange(&session_id)?
+            .unwrap();
+        let ids = controller.questions.ask(
+            "required",
+            &original.id,
+            crate::question::QuestionOrigin::Chat,
+            vec![crate::question::QuestionDraft {
+                header: "Layout".into(),
+                question: "Which layout?".into(),
+                requirement: crate::question::QuestionRequirement::Required,
+                options: Vec::new(),
+            }],
+        )?;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        controller.relay_questions(&sink).await?;
+        assert!(
+            controller
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .is_empty()
+        );
+        controller
+            .questions
+            .apply(crate::question::QuestionCommand {
+                operation_id: "answer-required".into(),
+                question_id: ids[0].clone(),
+                revision: 1,
+                action: crate::question::QuestionAction::Answer {
+                    answer: crate::question::QuestionAnswer::Other {
+                        text: "Tabs".into(),
+                    },
+                },
+            })?;
+        controller.relay_questions(&sink).await?;
+        controller.relay_questions(&sink).await?;
+        let queued = controller.coordinator.submissions.snapshot()?;
+        assert_eq!(queued.messages.len(), 2);
+        assert!(matches!(
+            queued.messages[0].purpose,
+            crate::input::InputPurpose::Question { .. }
+        ));
+        assert!(
+            matches!(&queued.messages[1].purpose, crate::input::InputPurpose::QuestionContinuation { exchange_id } if exchange_id == &original.id)
+        );
+        assert_eq!(queued.messages[1].intent, crate::input::InputIntent::Queue);
+        assert!(queued.messages[1].text.contains(&original.prompt));
+        drop(execution);
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_question_answers_commit_and_relay_while_provider_owns_execution()
+    -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let ids = controller.questions.ask(
+            "ask",
+            "exchange",
+            crate::question::QuestionOrigin::Chat,
+            vec![crate::question::QuestionDraft {
+                header: "Layout".into(),
+                question: "Which layout?".into(),
+                requirement: crate::question::QuestionRequirement::Optional,
+                options: Vec::new(),
+            }],
+        )?;
+        let execution = controller.coordinator.execution.acquire().await?;
+        let broker = controller.broker.lock().await;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        let command = crate::question::QuestionCommand {
+            operation_id: "answer".into(),
+            question_id: ids[0].clone(),
+            revision: 1,
+            action: crate::question::QuestionAction::Answer {
+                answer: crate::question::QuestionAnswer::Other {
+                    text: "Tabs".into(),
+                },
+            },
+        };
+        let mut clarification = Request {
+            id: 3,
+            method: "session.question.ask".into(),
+            params: json!({"command": crate::question::QuestionCommand {
+                operation_id: "clarification".into(),
+                question_id: ids[0].clone(),
+                revision: 1,
+                action: crate::question::QuestionAction::Clarify { text: "Which scope?".into() },
+            }}),
+        };
+        let control = controller.coordinator.control.acquire().await?;
+        service
+            .normalize_request(Some(&session_id), &mut clarification)
+            .await?;
+        assert_eq!(clarification.method, "session.question.answer");
+        assert!(
+            service
+                .prepare(
+                    Some(&session_id),
+                    RuntimeMethod::decode(&clarification.method)?
+                )
+                .await?
+                .is_none()
+        );
+        drop(control);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            service.dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 2,
+                    method: "session.question.answer".into(),
+                    params: json!({"command": command}),
+                },
+                &sink,
+            ),
+        )
+        .await??;
+        assert!(!controller.questions.snapshot()?.questions[0].pending());
+        assert_eq!(controller.questions.outbox()?.len(), 1);
+        controller.relay_questions(&sink).await?;
+        controller.relay_questions(&sink).await?;
+        assert!(controller.questions.outbox()?.is_empty());
+        let queued = controller.coordinator.submissions.snapshot()?;
+        assert_eq!(queued.messages.len(), 1);
+        assert!(matches!(
+            queued.messages[0].purpose,
+            crate::input::InputPurpose::Question { .. }
+        ));
+        assert!(controller.questions_block_work()?);
+        assert!(controller.coordinator.execution.try_acquire().is_err());
         drop(broker);
         drop(execution);
         service.shutdown(Duration::from_secs(2)).await?;
@@ -5403,15 +5621,28 @@ mod tests {
         let execution = controller.coordinator.execution.acquire().await?;
         let broker = controller.broker.lock().await;
         let (sink, _output) = forge_protocol::outbound::channel();
-        tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()), Request {
-            id:2, method:"session.input.timeout.configure".into(),
-            params:json!({"approval_timeout":{"amount":2,"unit":"s"},"answer_timeout":{"amount":0,"unit":"m"}}),
-        }, &sink)).await??;
-        let (approval, answer) = controller.permission.input_timeouts(&session_id)?;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            service.dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 2,
+                    method: "session.input.timeout.configure".into(),
+                    params: json!({"approval_timeout":{"amount":2,"unit":"s"},"tool_timeout":{"amount":3,"unit":"m"}}),
+                },
+                &sink,
+            ),
+        )
+        .await??;
+        let approval = controller.permission.approval_timeout(&session_id)?;
         assert_eq!(approval.amount, 2);
-        assert_eq!(answer.amount, 0);
         assert!(controller.coordinator.execution.try_acquire().is_err());
         assert_eq!(broker.snapshot()?.session.approval_timeout, approval);
+        assert_eq!(broker.snapshot()?.session.tool_timeout.amount, 3);
+        assert_eq!(
+            broker.snapshot()?.session.tool_timeout.unit,
+            crate::session::TimeoutUnit::M
+        );
         drop(broker);
         drop(execution);
         let settings = crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?;
@@ -5419,8 +5650,8 @@ mod tests {
             settings
                 .get(&fixture.path().to_string_lossy(), &session_id, "mock")?
                 .desired
-                .answer_timeout,
-            Some(answer)
+                .approval_timeout,
+            Some(approval)
         );
         service.shutdown(Duration::from_secs(2)).await?;
         Ok(())

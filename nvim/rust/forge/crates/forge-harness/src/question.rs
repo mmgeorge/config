@@ -1,0 +1,1189 @@
+//! Durable user decisions independent of provider exchanges and workflow phases.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Mutex;
+
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+
+const FORMAT_VERSION: u32 = 2;
+
+/// Identify one question without confusing it with an exchange or task.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) struct QuestionId(String);
+
+impl TryFrom<String> for QuestionId {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        ensure!(!value.trim().is_empty(), "question identity is empty");
+        Ok(Self(value))
+    }
+}
+
+impl From<QuestionId> for String {
+    fn from(value: QuestionId) -> Self {
+        value.0
+    }
+}
+
+impl QuestionId {
+    /// Get the transport representation of this identity.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Specify whether unresolved input blocks execution.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QuestionRequirement {
+    Optional,
+    Required,
+}
+
+/// Describe a choice independently of its user-visible label.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct QuestionOption {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) description: String,
+    #[serde(default)]
+    pub(crate) recommended: bool,
+}
+
+/// Describe model input before Harness assigns canonical identities.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct QuestionDraft {
+    pub(crate) header: String,
+    pub(crate) question: String,
+    pub(crate) requirement: QuestionRequirement,
+    #[serde(default)]
+    pub(crate) options: Vec<crate::plan::PlanQuestionOption>,
+}
+
+/// Preserve one immutable version of a question's wording and choices.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct QuestionContent {
+    pub(crate) revision: u64,
+    pub(crate) header: String,
+    pub(crate) question: String,
+    pub(crate) options: Vec<QuestionOption>,
+}
+
+/// Preserve an explicit user answer without treating a recommendation as consent.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum QuestionAnswer {
+    Selected {
+        option_id: String,
+        feedback: Option<String>,
+    },
+    Other {
+        text: String,
+    },
+}
+
+/// Record why a question no longer needs an answer.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum QuestionResolution {
+    Pending,
+    Answered {
+        answer: QuestionAnswer,
+        message_id: String,
+    },
+    Dismissed,
+    Withdrawn {
+        reason: String,
+    },
+    Retired {
+        reason: String,
+    },
+}
+
+/// Distinguish clarification from decisions and later corrections.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QuestionMessageKind {
+    Clarification,
+    Reply,
+    Answer,
+    Correction,
+}
+
+/// Preserve an attributed discussion item and its delivery identity.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct QuestionMessage {
+    pub(crate) id: String,
+    pub(crate) kind: QuestionMessageKind,
+    pub(crate) text: String,
+    pub(crate) reply_to: Option<String>,
+}
+
+/// Retain a question across exchanges while keeping its original task attribution.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct QuestionRecord {
+    pub(crate) id: QuestionId,
+    pub(crate) exchange_id: String,
+    pub(crate) task_id: Option<String>,
+    pub(crate) phase: Option<crate::task::TaskPhase>,
+    pub(crate) requirement: QuestionRequirement,
+    pub(crate) content: QuestionContent,
+    pub(crate) previous: Vec<QuestionContent>,
+    pub(crate) resolution: QuestionResolution,
+    pub(crate) discussion: Vec<QuestionMessage>,
+}
+
+impl QuestionRecord {
+    /// Check whether this question still needs a decision.
+    pub(crate) fn pending(&self) -> bool {
+        matches!(self.resolution, QuestionResolution::Pending)
+    }
+}
+
+/// Publish the authoritative question list independently of transient execution state.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct QuestionSnapshot {
+    pub(crate) revision: u64,
+    pub(crate) questions: Vec<QuestionRecord>,
+}
+
+impl QuestionSnapshot {
+    /// Preserve the turn's required-input stop even after a fast answer resolves the gate.
+    pub(crate) fn required_in_exchange(&self, exchange_id: &str) -> bool {
+        self.questions.iter().any(|question| {
+            question.exchange_id == exchange_id
+                && question.requirement == QuestionRequirement::Required
+        })
+    }
+
+    /// Check the required-input gate without interpreting optional questions as waits.
+    pub(crate) fn required_pending(&self) -> bool {
+        self.questions.iter().any(|question| {
+            question.pending() && question.requirement == QuestionRequirement::Required
+        })
+    }
+}
+
+/// Address one revision and make duplicate mutations safely repeatable.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct QuestionCommand {
+    pub(crate) operation_id: String,
+    pub(crate) question_id: QuestionId,
+    pub(crate) revision: u64,
+    pub(crate) action: QuestionAction,
+}
+
+/// Limit each mutation to its meaningful payload.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum QuestionAction {
+    Answer { answer: QuestionAnswer },
+    Clarify { text: String },
+    Correct { text: String },
+    Dismiss,
+    Reply { message_id: String, text: String },
+    Revise { draft: QuestionDraft },
+    Withdraw { reason: String },
+}
+
+/// Retain user input until the independent input journal acknowledges admission.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct QuestionOutbox {
+    pub(crate) id: String,
+    pub(crate) question_id: QuestionId,
+    pub(crate) task_id: Option<String>,
+    pub(crate) kind: QuestionMessageKind,
+    pub(crate) text: String,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct QuestionState {
+    snapshot: QuestionSnapshot,
+    outbox: Vec<QuestionOutbox>,
+    operations: BTreeMap<String, String>,
+    chat_continuation: BTreeMap<String, ChatContinuation>,
+}
+
+/// Retain one automatic continuation for an interrupted chat request.
+#[derive(Deserialize, Serialize)]
+enum ChatContinuation {
+    Waiting,
+    Admitted,
+    Completed,
+    Cancelled,
+}
+
+/// Distinguish work that can resume from a read-only question discussion.
+pub(crate) enum QuestionOrigin<'task> {
+    Chat,
+    Task(&'task crate::task::Task),
+    Discussion(Option<&'task crate::task::Task>),
+}
+
+impl QuestionOrigin<'_> {
+    /// Get task attribution without granting discussion a continuation.
+    fn task(&self) -> Option<&crate::task::Task> {
+        match self {
+            Self::Chat => None,
+            Self::Task(task) => Some(task),
+            Self::Discussion(task) => *task,
+        }
+    }
+}
+
+/// Serialize question changes in their own transaction, without an execution lock.
+pub(crate) struct QuestionController {
+    connection: Mutex<Connection>,
+    session_id: String,
+    pub(crate) changed: tokio::sync::watch::Sender<u64>,
+}
+
+impl QuestionController {
+    /// Create a controller using the session database's durable SQLite policy.
+    pub(crate) fn open(root: &Path, session_id: &str) -> Result<Self> {
+        let connection = Connection::open(root.join("harness.sqlite3"))?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS session_question_state(session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE,format_version INTEGER NOT NULL,payload TEXT NOT NULL);")?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            session_id: session_id.into(),
+            changed: tokio::sync::watch::channel(0).0,
+        })
+    }
+
+    /// Get current durable questions, including answers and discussion history.
+    pub(crate) fn snapshot(&self) -> Result<QuestionSnapshot> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        Ok(self.load(&connection)?.snapshot)
+    }
+
+    /// Get user messages that have not yet entered the input journal.
+    pub(crate) fn outbox(&self) -> Result<Vec<QuestionOutbox>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        Ok(self.load(&connection)?.outbox)
+    }
+
+    /// Acknowledge durable input admission; provider delivery remains independently tracked.
+    pub(crate) fn admitted(&self, id: &str) -> Result<()> {
+        self.update(|state| {
+            state.outbox.retain(|message| message.id != id);
+            Ok(())
+        })
+    }
+
+    /// Get interrupted chat requests whose required decisions are all resolved.
+    pub(crate) fn ready_chat_continuations(&self) -> Result<Vec<String>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let state = self.load(&connection)?;
+        if state.snapshot.required_pending() || !state.outbox.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(state
+            .chat_continuation
+            .iter()
+            .filter(|(_, continuation)| matches!(continuation, ChatContinuation::Waiting))
+            .map(|(exchange_id, _)| exchange_id.clone())
+            .collect())
+    }
+
+    /// Acknowledge durable admission without replaying the chat continuation after restart.
+    pub(crate) fn chat_continuation_admitted(&self, exchange_id: &str) -> Result<()> {
+        self.update(|state| {
+            let continuation = state
+                .chat_continuation
+                .get_mut(exchange_id)
+                .context("chat continuation is missing")?;
+            *continuation = ChatContinuation::Admitted;
+            Ok(())
+        })
+    }
+
+    /// Keep completed work distinct from a queued continuation that cancellation can revoke.
+    pub(crate) fn chat_continuation_completed(&self, exchange_id: &str) -> Result<()> {
+        self.update(|state| {
+            let continuation = state
+                .chat_continuation
+                .get_mut(exchange_id)
+                .context("chat continuation is missing")?;
+            *continuation = ChatContinuation::Completed;
+            Ok(())
+        })
+    }
+
+    /// Reject already queued work after its owning chat request was cancelled.
+    pub(crate) fn chat_continuation_is_current(&self, exchange_id: &str) -> Result<bool> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        Ok(matches!(
+            self.load(&connection)?.chat_continuation.get(exchange_id),
+            Some(ChatContinuation::Waiting | ChatContinuation::Admitted)
+        ))
+    }
+
+    /// Retire unfinished chat questions while retaining questions from completed work.
+    pub(crate) fn cancel_chat(&self, active_exchange: Option<&str>) -> Result<()> {
+        self.update(|state| {
+            let mut cancelled = std::collections::BTreeSet::new();
+            for (exchange_id, continuation) in &mut state.chat_continuation {
+                if matches!(
+                    continuation,
+                    ChatContinuation::Waiting | ChatContinuation::Admitted
+                ) {
+                    cancelled.insert(exchange_id.clone());
+                    *continuation = ChatContinuation::Cancelled;
+                }
+            }
+            if let Some(exchange_id) = active_exchange {
+                cancelled.insert(exchange_id.to_owned());
+            }
+            let mut retired = std::collections::BTreeSet::new();
+            for question in &mut state.snapshot.questions {
+                if question.task_id.is_none() && cancelled.contains(&question.exchange_id) {
+                    retired.insert(question.id.as_str().to_owned());
+                    if question.pending() {
+                        question.resolution = QuestionResolution::Retired {
+                            reason: "The owning chat request was cancelled".into(),
+                        };
+                    }
+                }
+            }
+            state
+                .outbox
+                .retain(|message| !retired.contains(message.question_id.as_str()));
+            Ok(())
+        })
+    }
+
+    /// Append questions atomically before acknowledging the model tool call.
+    pub(crate) fn ask(
+        &self,
+        operation_id: &str,
+        exchange_id: &str,
+        origin: QuestionOrigin<'_>,
+        drafts: Vec<QuestionDraft>,
+    ) -> Result<Vec<QuestionId>> {
+        ensure!(
+            !operation_id.trim().is_empty() && !exchange_id.trim().is_empty(),
+            "question operation and exchange identities are required"
+        );
+        ensure!(!drafts.is_empty(), "at least one question is required");
+        let continues_chat = matches!(origin, QuestionOrigin::Chat);
+        let task = origin.task();
+        let request = serde_json::to_string(&(exchange_id, continues_chat, &drafts))?;
+        self.update_guarded(task, |state| {
+            if let Some(previous) = state.operations.get(operation_id) {
+                ensure!(
+                    previous == &request,
+                    "question operation identity was reused"
+                );
+                return Ok(state
+                    .snapshot
+                    .questions
+                    .iter()
+                    .filter(|question| {
+                        question.id.0.starts_with(&format!(
+                            "{}:",
+                            crate::plan::digest(operation_id.as_bytes())
+                        ))
+                    })
+                    .map(|question| question.id.clone())
+                    .collect());
+            }
+            let mut ids = Vec::new();
+            for (index, draft) in drafts.into_iter().enumerate() {
+                let id = QuestionId::try_from(format!(
+                    "{}:{index}",
+                    crate::plan::digest(operation_id.as_bytes())
+                ))?;
+                let requirement = draft.requirement;
+                let content = content(draft, 1)?;
+                if continues_chat && requirement == QuestionRequirement::Required {
+                    state
+                        .chat_continuation
+                        .entry(exchange_id.into())
+                        .or_insert(ChatContinuation::Waiting);
+                }
+                ids.push(id.clone());
+                state.snapshot.questions.push(QuestionRecord {
+                    id,
+                    exchange_id: exchange_id.into(),
+                    task_id: task.map(|task| task.id.as_str().into()),
+                    phase: task.map(crate::task::Task::phase),
+                    requirement,
+                    content,
+                    previous: Vec::new(),
+                    resolution: QuestionResolution::Pending,
+                    discussion: Vec::new(),
+                });
+            }
+            state.operations.insert(operation_id.into(), request);
+            Ok(ids)
+        })
+    }
+
+    /// Commit an explicit decision or discussion item together with its delivery intent.
+    pub(crate) fn apply(&self, command: QuestionCommand) -> Result<QuestionSnapshot> {
+        ensure!(
+            !command.operation_id.trim().is_empty(),
+            "question operation identity is required"
+        );
+        let encoded = serde_json::to_string(&command)?;
+        self.update(|state| {
+            if let Some(previous) = state.operations.get(&command.operation_id) {
+                ensure!(previous == &encoded, "question operation identity was reused");
+                return Ok(state.snapshot.clone());
+            }
+            let question = state.snapshot.questions.iter_mut().find(|question| question.id == command.question_id).context("question does not belong to this session")?;
+            ensure!(question.content.revision == command.revision, "question changed; review its current choices before submitting");
+            ensure!(!matches!(question.resolution, QuestionResolution::Retired { .. }), "question belongs to a retired task");
+            let message_id = command.operation_id.clone();
+            let mut outbound = None;
+            match command.action {
+                QuestionAction::Answer { answer } => {
+                    ensure!(question.pending(), "question already resolved; send a correction instead");
+                    let text = answer_text(&question.content, &answer)?;
+                    question.resolution = QuestionResolution::Answered { answer, message_id: message_id.clone() };
+                    outbound = Some((QuestionMessageKind::Answer, text));
+                }
+                QuestionAction::Clarify { text } => {
+                    ensure!(question.pending(), "question is no longer pending");
+                    ensure!(!text.trim().is_empty(), "clarification is empty");
+                    outbound = Some((QuestionMessageKind::Clarification, text));
+                }
+                QuestionAction::Correct { text } => {
+                    ensure!(matches!(question.resolution, QuestionResolution::Answered { .. }), "only an answered question accepts a correction");
+                    ensure!(!text.trim().is_empty(), "correction is empty");
+                    outbound = Some((QuestionMessageKind::Correction, text));
+                }
+                QuestionAction::Dismiss => {
+                    ensure!(question.pending(), "question is no longer pending");
+                    ensure!(question.requirement == QuestionRequirement::Optional, "required questions cannot be dismissed");
+                    question.resolution = QuestionResolution::Dismissed;
+                }
+                QuestionAction::Reply { message_id: parent, text } => {
+                    ensure!(!text.trim().is_empty(), "clarification reply is empty");
+                    ensure!(question.discussion.iter().any(|message| message.id == parent && message.kind == QuestionMessageKind::Clarification), "clarification message not found");
+                    question.discussion.push(QuestionMessage { id: message_id.clone(), kind: QuestionMessageKind::Reply, text, reply_to: Some(parent) });
+                }
+                QuestionAction::Revise { draft } => {
+                    ensure!(question.pending(), "resolved questions cannot be revised");
+                    ensure!(draft.requirement == question.requirement, "question requirement cannot change during revision");
+                    let next = content(draft, question.content.revision.checked_add(1).context("question revision exhausted")?)?;
+                    question.previous.push(std::mem::replace(&mut question.content, next));
+                }
+                QuestionAction::Withdraw { reason } => {
+                    ensure!(question.pending(), "question is no longer pending");
+                    ensure!(!reason.trim().is_empty(), "withdrawal reason is required");
+                    question.resolution = QuestionResolution::Withdrawn { reason };
+                }
+            }
+            if let Some((kind, text)) = outbound {
+                question.discussion.push(QuestionMessage { id: message_id.clone(), kind, text: text.clone(), reply_to: None });
+                let instruction = if kind == QuestionMessageKind::Clarification { "This is a read-only question discussion. Explain this question with question_reply, targeting the clarification message ID. Leave the question unanswered. Honor any explicit constraint in the user's text. Do not perform the original work; Harness owns its continuation." } else { "This is a read-only question discussion. Acknowledge this explicit user response. Do not perform the original work or resume a paused task; Harness owns eligible work continuation." };
+                let rendered = format!("Harness question {} revision {}\n{}\nChoices: {}\nUser {:?} (message {}): {}\n{}", question.id.as_str(), question.content.revision, question.content.question, serde_json::to_string(&question.content.options)?, kind, message_id, text, instruction);
+                state.outbox.push(QuestionOutbox { id: message_id, question_id: question.id.clone(), task_id: question.task_id.clone(), kind, text: rendered });
+            }
+            state.operations.insert(command.operation_id, encoded);
+            Ok(state.snapshot.clone())
+        })?;
+        self.snapshot()
+    }
+
+    fn load(&self, connection: &Connection) -> Result<QuestionState> {
+        let encoded: Option<String> = connection.query_row("SELECT payload FROM session_question_state WHERE session_id=?1 AND format_version=?2", params![self.session_id, FORMAT_VERSION], |row| row.get(0)).optional()?;
+        let state: QuestionState = encoded
+            .map(|encoded| serde_json::from_str(&encoded).map_err(anyhow::Error::from))
+            .transpose()?
+            .unwrap_or_default();
+        let mut identities = std::collections::BTreeSet::new();
+        for question in &state.snapshot.questions {
+            ensure!(
+                identities.insert(question.id.as_str()),
+                "duplicate persisted question identity"
+            );
+            ensure!(
+                !question.exchange_id.is_empty()
+                    && question.content.revision > 0
+                    && !question.content.header.trim().is_empty()
+                    && !question.content.question.trim().is_empty(),
+                "invalid persisted question content"
+            );
+            let mut options = std::collections::BTreeSet::new();
+            for option in &question.content.options {
+                ensure!(
+                    !option.id.is_empty()
+                        && !option.label.trim().is_empty()
+                        && options.insert(&option.id),
+                    "invalid persisted question choice"
+                );
+            }
+            if let QuestionResolution::Answered { answer, .. } = &question.resolution {
+                answer_text(&question.content, answer)?;
+            }
+            ensure!(
+                !matches!(question.resolution, QuestionResolution::Dismissed)
+                    || question.requirement == QuestionRequirement::Optional,
+                "required question was dismissed"
+            );
+        }
+        Ok(state)
+    }
+
+    fn update<Output>(
+        &self,
+        change: impl FnOnce(&mut QuestionState) -> Result<Output>,
+    ) -> Result<Output> {
+        self.update_guarded(None, change)
+    }
+
+    fn update_guarded<Output>(
+        &self,
+        task: Option<&crate::task::Task>,
+        change: impl FnOnce(&mut QuestionState) -> Result<Output>,
+    ) -> Result<Output> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(task) = task {
+            let current: Option<(String, String)> = transaction.query_row(
+                "SELECT json_extract(payload,'$.session.active_task.id'), json_extract(payload,'$.session.active_task.revision') FROM session_record WHERE id=?1 AND json_type(payload,'$.session.active_task')='object'",
+                [&self.session_id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+            ensure!(
+                current
+                    .as_ref()
+                    .is_some_and(|(id, revision)| id == task.id.as_str()
+                        && revision == task.revision.as_str()),
+                "question task changed before persistence"
+            );
+        }
+        let mut state = self.load(&transaction)?;
+        let result = change(&mut state)?;
+        state.snapshot.revision = state
+            .snapshot
+            .revision
+            .checked_add(1)
+            .context("question snapshot revision exhausted")?;
+        transaction.execute("INSERT INTO session_question_state(session_id,format_version,payload) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET format_version=excluded.format_version,payload=excluded.payload", params![self.session_id, FORMAT_VERSION, serde_json::to_string(&state)?])?;
+        transaction.commit()?;
+        self.changed.send_replace(state.snapshot.revision);
+        Ok(result)
+    }
+}
+
+fn content(draft: QuestionDraft, revision: u64) -> Result<QuestionContent> {
+    ensure!(
+        !draft.header.trim().is_empty() && !draft.question.trim().is_empty(),
+        "question heading and text are required"
+    );
+    let mut options = Vec::new();
+    for (index, option) in draft.options.into_iter().enumerate() {
+        ensure!(!option.label.trim().is_empty(), "choice label is empty");
+        options.push(QuestionOption {
+            id: format!("{revision}:{index}"),
+            label: option.label,
+            description: option.description,
+            recommended: option.recommended,
+        });
+    }
+    Ok(QuestionContent {
+        revision,
+        header: draft.header,
+        question: draft.question,
+        options,
+    })
+}
+
+fn answer_text(content: &QuestionContent, answer: &QuestionAnswer) -> Result<String> {
+    match answer {
+        QuestionAnswer::Selected {
+            option_id,
+            feedback,
+        } => {
+            let option = content
+                .options
+                .iter()
+                .find(|option| &option.id == option_id)
+                .context("selected choice does not belong to this question revision")?;
+            Ok(format!(
+                "{}{}",
+                option.label,
+                feedback
+                    .as_ref()
+                    .map(|text| format!("\n{text}"))
+                    .unwrap_or_default()
+            ))
+        }
+        QuestionAnswer::Other { text } => {
+            ensure!(!text.trim().is_empty(), "answer is empty");
+            Ok(text.clone())
+        }
+    }
+}
+
+/// Retire a replaced task's questions in the same transaction as its lifecycle transition.
+pub(crate) fn retire_task(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    let exists: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_question_state')", [], |row| row.get(0))?;
+    if !exists {
+        return Ok(());
+    }
+    let payload: Option<String> = transaction
+        .query_row(
+            "SELECT payload FROM session_question_state WHERE session_id=?1 AND format_version=?2",
+            params![session_id, FORMAT_VERSION],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    let mut state: QuestionState = serde_json::from_str(&payload)?;
+    for question in &mut state.snapshot.questions {
+        if question.task_id.as_deref() == Some(task_id) && question.pending() {
+            question.resolution = QuestionResolution::Retired {
+                reason: "The owning task was cancelled, cleared, or replaced".into(),
+            };
+        }
+    }
+    state
+        .outbox
+        .retain(|message| message.task_id.as_deref() != Some(task_id));
+    state.snapshot.revision = state
+        .snapshot
+        .revision
+        .checked_add(1)
+        .context("question snapshot revision exhausted")?;
+    transaction.execute(
+        "UPDATE session_question_state SET payload=?2 WHERE session_id=?1",
+        params![session_id, serde_json::to_string(&state)?],
+    )?;
+    Ok(())
+}
+
+/// Project retained questions into their originating exchange without changing stored exchanges.
+pub(crate) fn project(
+    exchanges: &mut [crate::exchange::Exchange],
+    snapshot: &QuestionSnapshot,
+) -> Result<()> {
+    for question in &snapshot.questions {
+        let Some(exchange) = exchanges
+            .iter_mut()
+            .find(|exchange| exchange.id == question.exchange_id)
+        else {
+            continue;
+        };
+        let mut text = question.content.question.clone();
+        for message in &question.discussion {
+            let author = match message.kind {
+                QuestionMessageKind::Clarification => "You asked",
+                QuestionMessageKind::Reply => "Explanation",
+                QuestionMessageKind::Answer => "You answered",
+                QuestionMessageKind::Correction => "You corrected",
+            };
+            text.push_str(&format!("\n\n{author}: {}", message.text));
+        }
+        let answer = match &question.resolution {
+            QuestionResolution::Pending => None,
+            QuestionResolution::Answered { answer, .. } => {
+                Some(answer_text(&question.content, answer)?)
+            }
+            QuestionResolution::Dismissed => Some("Dismissed by user".into()),
+            QuestionResolution::Withdrawn { reason } | QuestionResolution::Retired { reason } => {
+                Some(reason.clone())
+            }
+        };
+        exchange
+            .node_list
+            .push(crate::exchange::ExchangeNode::QuestionPresented {
+                id: format!("question:{}", question.id.as_str()),
+                question: crate::plan::PlanQuestionSet {
+                    id: question.id.as_str().into(),
+                    questions: vec![crate::plan::PlanQuestion {
+                        id: question.id.as_str().into(),
+                        header: format!(
+                            "{}{}",
+                            question.content.header,
+                            if question.requirement == QuestionRequirement::Required {
+                                " · Required"
+                            } else {
+                                ""
+                            }
+                        ),
+                        question: text,
+                        options: question
+                            .content
+                            .options
+                            .iter()
+                            .map(|option| crate::plan::PlanQuestionOption {
+                                recommended: option.recommended,
+                                label: option.label.clone(),
+                                description: option.description.clone(),
+                            })
+                            .collect(),
+                        allow_freeform: true,
+                    }],
+                },
+                answer,
+            });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft(requirement: QuestionRequirement) -> QuestionDraft {
+        QuestionDraft {
+            header: "Layout".into(),
+            question: "Which layout?".into(),
+            requirement,
+            options: vec![crate::plan::PlanQuestionOption {
+                recommended: true,
+                label: "Tabs".into(),
+                description: "Compact navigation".into(),
+            }],
+        }
+    }
+
+    fn command(id: &QuestionId, operation: &str, action: QuestionAction) -> QuestionCommand {
+        QuestionCommand {
+            operation_id: operation.into(),
+            question_id: id.clone(),
+            revision: 1,
+            action,
+        }
+    }
+
+    #[test]
+    fn chat_continuation_waits_for_required_answers_and_is_admitted_once() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let ids = controller.ask(
+            "mixed",
+            "original-request",
+            QuestionOrigin::Chat,
+            vec![
+                draft(QuestionRequirement::Required),
+                draft(QuestionRequirement::Optional),
+            ],
+        )?;
+        assert!(controller.ready_chat_continuations()?.is_empty());
+        controller.apply(command(
+            &ids[0],
+            "required-answer",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Tabs".into(),
+                },
+            },
+        ))?;
+        assert!(
+            controller.ready_chat_continuations()?.is_empty(),
+            "answer must enter the delivery journal first"
+        );
+        controller.admitted("required-answer")?;
+        assert_eq!(
+            controller.ready_chat_continuations()?,
+            vec!["original-request"]
+        );
+        controller.chat_continuation_admitted("original-request")?;
+        let restored = QuestionController::open(root.path(), "session")?;
+        assert!(restored.ready_chat_continuations()?.is_empty());
+        restored.chat_continuation_completed("original-request")?;
+        restored.cancel_chat(None)?;
+        assert!(
+            restored.snapshot()?.questions[1].pending(),
+            "cancellation retired a completed request's optional question"
+        );
+        restored.apply(command(
+            &ids[1],
+            "late-optional",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Compact".into(),
+                },
+            },
+        ))?;
+        restored.admitted("late-optional")?;
+        assert!(
+            restored.ready_chat_continuations()?.is_empty(),
+            "late optional answer must not resume completed work"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_chat_retires_questions_and_revokes_queued_continuation() -> Result<()> {
+        for admitted in [false, true] {
+            let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+            let controller = QuestionController::open(root.path(), "session")?;
+            controller.ask(
+                "cancelled",
+                "request",
+                QuestionOrigin::Chat,
+                vec![
+                    draft(QuestionRequirement::Required),
+                    draft(QuestionRequirement::Optional),
+                ],
+            )?;
+            if admitted {
+                controller.chat_continuation_admitted("request")?;
+            }
+            assert!(controller.chat_continuation_is_current("request")?);
+            controller.cancel_chat(None)?;
+            let restored = QuestionController::open(root.path(), "session")?;
+            assert!(!restored.chat_continuation_is_current("request")?);
+            assert!(restored.ready_chat_continuations()?.is_empty());
+            assert!(
+                restored
+                    .snapshot()?
+                    .questions
+                    .iter()
+                    .all(|question| matches!(
+                        question.resolution,
+                        QuestionResolution::Retired { .. }
+                    ))
+            );
+            restored.ask(
+                "active-optional",
+                "active",
+                QuestionOrigin::Chat,
+                vec![draft(QuestionRequirement::Optional)],
+            )?;
+            restored.cancel_chat(Some("active"))?;
+            assert!(
+                restored
+                    .snapshot()?
+                    .questions
+                    .iter()
+                    .all(|question| !question.pending())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_and_discussion_questions_do_not_create_chat_continuations() -> Result<()> {
+        let (root, _store, tasks) = crate::task::SessionTaskController::test_goal();
+        let task = tasks.current()?.unwrap();
+        let controller = QuestionController::open(root.path(), "session")?;
+        for (operation, origin) in [
+            ("discussion", QuestionOrigin::Discussion(None)),
+            ("task", QuestionOrigin::Task(&task)),
+        ] {
+            let id = controller
+                .ask(
+                    operation,
+                    operation,
+                    origin,
+                    vec![draft(QuestionRequirement::Required)],
+                )?
+                .remove(0);
+            let answer_operation = format!("answer-{operation}");
+            controller.apply(command(
+                &id,
+                &answer_operation,
+                QuestionAction::Answer {
+                    answer: QuestionAnswer::Other {
+                        text: "Tabs".into(),
+                    },
+                },
+            ))?;
+            controller.admitted(&answer_operation)?;
+            assert!(controller.ready_chat_continuations()?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn optional_questions_append_and_survive_exchange_and_connection_end() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let first = QuestionController::open(root.path(), "session")?;
+        let ids = first.ask(
+            "first",
+            "exchange-one",
+            QuestionOrigin::Chat,
+            vec![draft(QuestionRequirement::Optional)],
+        )?;
+        first.ask(
+            "second",
+            "exchange-two",
+            QuestionOrigin::Chat,
+            vec![draft(QuestionRequirement::Optional)],
+        )?;
+        drop(first);
+        let restored = QuestionController::open(root.path(), "session")?;
+        assert_eq!(restored.snapshot()?.questions.len(), 2);
+        assert!(!restored.snapshot()?.required_pending());
+        restored.apply(command(
+            &ids[0],
+            "answer",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Selected {
+                    option_id: "1:0".into(),
+                    feedback: None,
+                },
+            },
+        ))?;
+        assert_eq!(
+            restored
+                .snapshot()?
+                .questions
+                .iter()
+                .filter(|question| question.pending())
+                .count(),
+            1
+        );
+        assert_eq!(restored.outbox()?.len(), 1);
+        assert_eq!(
+            restored.snapshot()?.questions[0].exchange_id,
+            "exchange-one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn required_gate_survives_partial_answers_and_rejects_dismissal() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let ids = controller.ask(
+            "ask",
+            "exchange",
+            QuestionOrigin::Chat,
+            vec![
+                draft(QuestionRequirement::Required),
+                draft(QuestionRequirement::Required),
+            ],
+        )?;
+        assert!(
+            controller
+                .apply(command(&ids[0], "dismiss", QuestionAction::Dismiss))
+                .is_err()
+        );
+        controller.apply(command(
+            &ids[0],
+            "answer",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Tabs".into(),
+                },
+            },
+        ))?;
+        assert!(controller.snapshot()?.required_pending());
+        controller.apply(command(
+            &ids[1],
+            "withdraw",
+            QuestionAction::Withdraw {
+                reason: "Existing interface determines this choice".into(),
+            },
+        ))?;
+        assert!(!controller.snapshot()?.required_pending());
+        assert!(controller.snapshot()?.required_in_exchange("exchange"));
+        assert!(
+            !controller
+                .snapshot()?
+                .required_in_exchange("other-exchange")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clarification_does_not_answer_and_revision_rejects_stale_choices_atomically() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let id = controller
+            .ask(
+                "ask",
+                "exchange",
+                QuestionOrigin::Chat,
+                vec![draft(QuestionRequirement::Optional)],
+            )?
+            .remove(0);
+        controller.apply(command(
+            &id,
+            "clarify",
+            QuestionAction::Clarify {
+                text: "Does this change existing sessions?".into(),
+            },
+        ))?;
+        controller.apply(command(
+            &id,
+            "reply",
+            QuestionAction::Reply {
+                message_id: "clarify".into(),
+                text: "Only new sessions change.".into(),
+            },
+        ))?;
+        assert!(controller.snapshot()?.questions[0].pending());
+        let mut revised = draft(QuestionRequirement::Optional);
+        revised.options[0].label = "Sidebar".into();
+        controller.apply(command(
+            &id,
+            "revise",
+            QuestionAction::Revise { draft: revised },
+        ))?;
+        let before = serde_json::to_value(controller.snapshot()?)?;
+        assert!(
+            controller
+                .apply(command(
+                    &id,
+                    "stale",
+                    QuestionAction::Answer {
+                        answer: QuestionAnswer::Selected {
+                            option_id: "1:0".into(),
+                            feedback: None
+                        }
+                    }
+                ))
+                .is_err()
+        );
+        assert_eq!(before, serde_json::to_value(controller.snapshot()?)?);
+        assert_eq!(controller.snapshot()?.questions[0].discussion.len(), 2);
+        assert_eq!(controller.outbox()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn idempotent_answers_preserve_outbox_until_admission() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let first = QuestionController::open(root.path(), "session")?;
+        let second = QuestionController::open(root.path(), "session")?;
+        let id = first
+            .ask(
+                "ask",
+                "exchange",
+                QuestionOrigin::Chat,
+                vec![draft(QuestionRequirement::Optional)],
+            )?
+            .remove(0);
+        let answer = command(
+            &id,
+            "answer",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Tabs".into(),
+                },
+            },
+        );
+        first.apply(answer.clone())?;
+        second.apply(answer)?;
+        assert_eq!(second.outbox()?.len(), 1);
+        first.admitted("answer")?;
+        assert!(second.outbox()?.is_empty());
+        assert!(matches!(
+            second.snapshot()?.questions[0].resolution,
+            QuestionResolution::Answered { .. }
+        ));
+        second.apply(command(
+            &id,
+            "correction",
+            QuestionAction::Correct {
+                text: "Use a sidebar instead".into(),
+            },
+        ))?;
+        assert_eq!(second.snapshot()?.questions[0].discussion.len(), 2);
+        assert!(matches!(
+            second.snapshot()?.questions[0].resolution,
+            QuestionResolution::Answered { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn task_replacement_retires_questions_but_normal_completion_does_not() -> Result<()> {
+        let (root, mut store, tasks) = crate::task::SessionTaskController::test_goal();
+        let task = tasks.current()?.unwrap();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let id = controller
+            .ask(
+                "task-question",
+                "exchange",
+                QuestionOrigin::Task(&task),
+                vec![draft(QuestionRequirement::Required)],
+            )?
+            .remove(0);
+        assert!(controller.snapshot()?.required_pending());
+        tasks.change(
+            &mut store,
+            Some(&task.revision),
+            crate::task::TaskChange::Clear,
+            2,
+        )?;
+        assert!(!controller.snapshot()?.required_pending());
+        assert!(matches!(
+            controller.snapshot()?.questions[0].resolution,
+            QuestionResolution::Retired { .. }
+        ));
+        assert!(
+            controller
+                .apply(command(
+                    &id,
+                    "late",
+                    QuestionAction::Answer {
+                        answer: QuestionAnswer::Other {
+                            text: "Late answer".into()
+                        }
+                    }
+                ))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_task_keeps_optional_question_and_accepts_a_late_answer() -> Result<()> {
+        let (root, mut store, tasks) = crate::task::SessionTaskController::test_goal();
+        let task = tasks.current()?.unwrap();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let id = controller
+            .ask(
+                "question",
+                "exchange",
+                QuestionOrigin::Task(&task),
+                vec![draft(QuestionRequirement::Optional)],
+            )?
+            .remove(0);
+        tasks.finish(
+            &mut store,
+            &task.permit(),
+            crate::task::TaskOutcomeState::Complete,
+            "Done".into(),
+            2,
+        )?;
+        assert!(tasks.current()?.is_none());
+        assert!(controller.snapshot()?.questions[0].pending());
+        controller.apply(command(
+            &id,
+            "late-answer",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Tabs".into(),
+                },
+            },
+        ))?;
+        assert_eq!(controller.outbox()?.len(), 1);
+        Ok(())
+    }
+}

@@ -50,6 +50,7 @@ enum ExpectedType {
     NullableString,
     Integer,
     Object,
+    Array,
     Boolean,
 }
 
@@ -133,6 +134,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     ExpectedType::NullableString => "nullable_string",
                     ExpectedType::Integer => "integer",
                     ExpectedType::Object => "object",
+                    ExpectedType::Array => "array",
                     ExpectedType::Boolean => "boolean",
                 };
                 let accepts = match expected {
@@ -146,6 +148,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "|value| value.as_u64().is_some_and(|number| number < (1 << 53))"
                     }
                     ExpectedType::Object => "Value::is_object",
+                    ExpectedType::Array => "Value::is_array",
                     ExpectedType::Boolean => "Value::is_boolean",
                 };
                 writeln!(

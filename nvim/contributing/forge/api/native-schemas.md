@@ -1116,8 +1116,8 @@ pub struct PortableSettings {
     pub plan_compact: Option<bool>,
     /// Overrides the duration of future approval requests.
     pub approval_timeout: Option<crate::session::InputTimeout>,
-    /// Overrides the duration of future question sets.
-    pub answer_timeout: Option<crate::session::InputTimeout>,
+    /// Limits each tool invocation and shell command; defaults to ten minutes.
+    pub tool_timeout: Option<crate::session::InputTimeout>,
     /// Enables the root's model-facing child tools without restricting manual admission.
     pub subagent_tools: Option<bool>,
     /// Enables read-only tools backed by the connected editor language servers.

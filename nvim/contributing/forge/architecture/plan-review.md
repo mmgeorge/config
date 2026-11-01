@@ -12,6 +12,11 @@ Declaration comparisons first match unique Tree-sitter callable owners, then run
 
 ## Navigation
 
+The PlanReview winbar shows review state, visibility, and only the `? help`
+shortcut. Keep individual bindings such as `ov`, comment, save, and acceptance
+commands in the help popup; do not add shortcut lists to the winbar or its status
+text. The help popup reads the registered commands and configured bindings.
+
 `.` and `open` resolve the selected token through saved Tree-sitter coordinates. A target inside the plan is revealed in PlanReview, opening folds and restoring omitted context. A target outside the plan opens its real source buffer.
 
 Source-backed definitions use an already-running project language server on demand. Rust supplies the real path, digest, position, and filetype, Lua loads the file into a hidden buffer and requests `textDocument/definition` without autostarting a server, and Rust validates the document, revision, view, and digest before mapping the result. Requests have a five-second deadline, discard superseded results, and are never cached. No generated source, stub project, or dependency download is involved.
@@ -46,4 +51,4 @@ After submission, a prompt for the selected waiting Plan task becomes a plan dis
 
 A question-only turn saves `PlanElicitation` under an `AwaitingInput` plan and opens the shared picker across the bottom of the Harness surface. Provider choices default to the keys in `picker.choice_keys`. After the final answer, a review page lists every answer before the provider resumes.
 
-Answer and skip requests update only the durable elicitation. Later prompts run read-only follow-ups, where the provider may keep the questions, replace them through `question_ask`, record an explicit user answer through `question_answer`, or remove them through `question_withdraw` when no decision remains. A model recommendation never counts as an answer. Revisions keep only answers that remain valid, and missing answers become best-judgment decisions only when the user explicitly continues.
+Ordinary questions use the session question controller. Each confirmed answer commits independently and enters the input journal. Clarification remains pending and receives an attributed `question_reply`; `question_revise` changes only a pending question and fences stale choices. The model may withdraw a question with a reason, but cannot record a user answer. Plan acceptance retains its own explicit confirmation gate.

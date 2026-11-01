@@ -123,6 +123,22 @@ struct CheckProcess {
     collected: bool,
 }
 
+/// Stops a check run when a shell command exceeds its captured execution deadline.
+#[derive(Debug)]
+struct CommandTimeout(std::time::Duration);
+
+impl std::fmt::Display for CommandTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Shell command exceeded its {} second timeout; check execution stopped",
+            self.0.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for CommandTimeout {}
+
 impl CheckProcess {
     async fn wait(&mut self) -> Result<(std::process::ExitStatus, bool)> {
         let result = (&mut self.worker)
@@ -1090,6 +1106,9 @@ impl CheckSupervisor {
                 )
                 .await
             {
+                if error.is::<CommandTimeout>() {
+                    return Err(error);
+                }
                 run.commands[index].state = if cancelled.requested.load(Ordering::Acquire)
                     || external_cancelled.is_some_and(|value| value.load(Ordering::Acquire))
                 {
@@ -1295,9 +1314,17 @@ impl CheckSupervisor {
             .current_dir(directory)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        let timeout = crate::settings::SettingsStore::open(&self.data_root)?
+            .get(&self.workspace.to_string_lossy(), &self.session_id, "")?
+            .desired
+            .tool_timeout
+            .unwrap_or_default()
+            .require_expiry()?
+            .duration();
         let mut child = crate::process::spawn_owned(command)
             .map_err(super::failure::CheckFailure::launch)
             .context("start configured check")?;
+        let deadline = tokio::time::Instant::now() + timeout;
         let input = if scoped {
             Some(
                 child
@@ -1352,90 +1379,107 @@ impl CheckSupervisor {
             stop: Some(stop),
             collected: false,
         };
-        let result: Result<()> = async {
-        let mut output = tokio::fs::File::create(&run.commands[index].output).await?;
-        let mut stdout_file = tokio::fs::File::create(&run.commands[index].stdout).await?;
-        let mut stderr_file = tokio::fs::File::create(&run.commands[index].stderr).await?;
-        let mut stdout_buffer = [0u8; 8192];
-        let mut stderr_buffer = [0u8; 8192];
-        let mut stdout_done = false;
-        let mut stderr_done = false;
-        let mut status = None;
-        let mut killed = false;
-        let mut input_done = !scoped;
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
-        while !stdout_done || !stderr_done || status.is_none() || !input_done {
-            tokio::select! {
-                result = &mut input_delivery, if !input_done => {
-                    input_done = true;
-                    if !killed {result.context("deliver scoped selectors")?;}
-                },
-                result = stdout.read(&mut stdout_buffer), if !stdout_done => {
-                    let bytes = result?; stdout_done = bytes == 0;
-                    if bytes > 0 { stdout_file.write_all(&stdout_buffer[..bytes]).await?; output.write_all(&stdout_buffer[..bytes]).await?;
-                        run.commands[index].output_bytes += bytes as u64; append_preview(&mut run.commands[index].preview, &stdout_buffer[..bytes]); }
-                },
-                result = stderr.read(&mut stderr_buffer), if !stderr_done => {
-                    let bytes = result?; stderr_done = bytes == 0;
-                    if bytes > 0 { stderr_file.write_all(&stderr_buffer[..bytes]).await?; output.write_all(&stderr_buffer[..bytes]).await?;
-                        run.commands[index].output_bytes += bytes as u64; append_preview(&mut run.commands[index].preview, &stderr_buffer[..bytes]); }
-                },
-                result = process.wait(), if status.is_none() => {
-                    let (completed, interrupted) = result?;
-                    status = Some(completed);
-                    killed = interrupted;
-                },
-                _ = ticker.tick() => {
-                    output.flush().await?;
-                    self.update(&run.clone().into_record(), sink)?;
-                    publication.update(&run.clone().into_record());
-                },
+        let result = async {
+            let mut output = tokio::fs::File::create(&run.commands[index].output).await?;
+            let mut stdout_file = tokio::fs::File::create(&run.commands[index].stdout).await?;
+            let mut stderr_file = tokio::fs::File::create(&run.commands[index].stderr).await?;
+            let mut stdout_buffer = [0u8; 8192];
+            let mut stderr_buffer = [0u8; 8192];
+            let mut stdout_done = false;
+            let mut stderr_done = false;
+            let mut status = None;
+            let mut killed = false;
+            let mut input_done = !scoped;
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+            while !stdout_done || !stderr_done || status.is_none() || !input_done {
+                tokio::select! {
+                    result = &mut input_delivery, if !input_done => {
+                        input_done = true;
+                        if !killed {result.context("deliver scoped selectors")?;}
+                    },
+                    result = stdout.read(&mut stdout_buffer), if !stdout_done => {
+                        let bytes = result?; stdout_done = bytes == 0;
+                        if bytes > 0 { stdout_file.write_all(&stdout_buffer[..bytes]).await?; output.write_all(&stdout_buffer[..bytes]).await?;
+                            run.commands[index].output_bytes += bytes as u64; append_preview(&mut run.commands[index].preview, &stdout_buffer[..bytes]); }
+                    },
+                    result = stderr.read(&mut stderr_buffer), if !stderr_done => {
+                        let bytes = result?; stderr_done = bytes == 0;
+                        if bytes > 0 { stderr_file.write_all(&stderr_buffer[..bytes]).await?; output.write_all(&stderr_buffer[..bytes]).await?;
+                            run.commands[index].output_bytes += bytes as u64; append_preview(&mut run.commands[index].preview, &stderr_buffer[..bytes]); }
+                    },
+                    result = process.wait(), if status.is_none() => {
+                        let (completed, interrupted) = result?;
+                        status = Some(completed);
+                        killed = interrupted;
+                    },
+                    _ = ticker.tick() => {
+                        output.flush().await?;
+                        self.update(&run.clone().into_record(), sink)?;
+                        publication.update(&run.clone().into_record());
+                    },
+                }
             }
-        }
-        output.flush().await?;
-        stdout_file.flush().await?;
-        stderr_file.flush().await?;
-        let status = status.context("check process status missing")?;
-        run.commands[index].exit_code = status.code();
-        run.commands[index].state = if killed {
-            CheckState::Interrupted
-        } else if status.success() {
-            CheckState::Passed
-        } else {
-            CheckState::Failed
+            output.flush().await?;
+            stdout_file.flush().await?;
+            stderr_file.flush().await?;
+            let status = status.context("check process status missing")?;
+            run.commands[index].exit_code = status.code();
+            run.commands[index].state = if killed {
+                CheckState::Interrupted
+            } else if status.success() {
+                CheckState::Passed
+            } else {
+                CheckState::Failed
+            };
+            if scoped && !killed && status.success() {
+                let receipt = (|| -> Result<CheckReceipt> {
+                    let source = std::fs::read(&context.receipt).context(
+                        "scoped check did not produce a selection receipt; fix its definition",
+                    )?;
+                    let mut receipt: CheckReceipt =
+                        serde_json::from_slice(&source).context("invalid selection receipt")?;
+                    receipt.validate_request(&context.selection)?;
+                    Ok(receipt)
+                })()
+                .map_err(|error| {
+                    super::failure::CheckFailure::classified(CheckState::ConfigurationError, error)
+                })?;
+                context.resolved = Some(receipt.selection);
+            } else if !scoped && !killed && status.success() {
+                context.resolved = Some(context.selection.clone());
+            }
+            run.commands[index].context = context;
+            let command = run.commands[index].clone().into_record();
+            run.commands[index].report =
+                tokio::task::spawn_blocking(move || super::report::collect(&command))
+                    .await
+                    .context("collect check result report")?;
+            if let Some(report) = &run.commands[index].report {
+                if let Some(error) = &report.error {
+                    return Err(super::failure::CheckFailure::classified(
+                        CheckState::ConfigurationError,
+                        anyhow::anyhow!("{error}"),
+                    ));
+                }
+                if run.commands[index].state == CheckState::Passed
+                    && report.result.iter().any(|result| {
+                        !matches!(
+                            result.state,
+                            super::CheckResultState::Passed | super::CheckResultState::Skipped
+                        )
+                    })
+                {
+                    return Err(super::failure::CheckFailure::classified(
+                        CheckState::Failed,
+                        anyhow::anyhow!("callback reported a failed result"),
+                    ));
+                }
+            }
+            Ok(())
         };
-        if scoped && !killed && status.success() {
-            let receipt = (|| -> Result<CheckReceipt> {
-                let source = std::fs::read(&context.receipt)
-                    .context("scoped check did not produce a selection receipt; fix its definition")?;
-                let mut receipt: CheckReceipt = serde_json::from_slice(&source).context("invalid selection receipt")?;
-                receipt.validate_request(&context.selection)?;
-                Ok(receipt)
-            })().map_err(|error| super::failure::CheckFailure::classified(CheckState::ConfigurationError, error))?;
-            context.resolved = Some(receipt.selection);
-        } else if !scoped && !killed && status.success() {
-            context.resolved = Some(context.selection.clone());
-        }
-        run.commands[index].context = context;
-        let command = run.commands[index].clone().into_record();
-        run.commands[index].report = tokio::task::spawn_blocking(move || super::report::collect(&command))
-            .await.context("collect check result report")?;
-        if let Some(report) = &run.commands[index].report {
-            if let Some(error) = &report.error {
-                return Err(super::failure::CheckFailure::classified(
-                    CheckState::ConfigurationError, anyhow::anyhow!("{error}")
-                ));
-            }
-            if run.commands[index].state == CheckState::Passed
-                && report.result.iter().any(|result| !matches!(result.state, super::CheckResultState::Passed | super::CheckResultState::Skipped))
-            {
-                return Err(super::failure::CheckFailure::classified(
-                    CheckState::Failed, anyhow::anyhow!("callback reported a failed result")
-                ));
-            }
-        }
-        Ok(())
-        }.await;
+        let result = tokio::time::timeout_at(deadline, result)
+            .await
+            .unwrap_or_else(|_| Err(CommandTimeout(timeout).into()));
         if result.is_err() {
             process.stop().await?;
         }

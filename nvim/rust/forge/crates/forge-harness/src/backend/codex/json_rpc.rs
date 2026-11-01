@@ -796,6 +796,17 @@ impl CodexJsonRpc {
                 return Ok(message);
             }
             let executor = self.request_executor.clone();
+            if method == "item/tool/call" && !rejects_question_resolution {
+                self.normalization
+                    .normalize(
+                        &message,
+                        output,
+                        self.event_sink.as_ref(),
+                        &self.workspace,
+                        false,
+                    )
+                    .await?;
+            }
             let request = message.clone();
             let approval = method != "item/tool/call";
             let ordered = if approval {

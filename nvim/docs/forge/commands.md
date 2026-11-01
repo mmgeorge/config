@@ -27,6 +27,12 @@ history tools. Configuration inspection and the `harness-sessions` skill remain
 available when history is off. Session-specific reads default to the current
 session. Unfiltered listing/search considers all accessible sessions.
 
+`harness_session_log` reads at most 100 entries per page by default. Its optional
+positive integer `limit` selects another page size. Follow `next_cursor` with the
+same arguments to continue chronologically through the captured log; the reader
+excludes later appends. Large entries can span response fragments without losing
+content. The first request reads only its batch, not the entire retained log.
+
 ## Git review
 
 | Command | Arguments | Behavior |
@@ -496,7 +502,8 @@ Answers run in a forked session using the same provider and appear below their
 review questions without entering the main timeline.
 
 **Permissions** groups read/write scopes and extra directories under **Access**.
-Its **Tools** subsection contains Mode (Ask, Deny, or Approve) and Approval timeout.
+Its **Tools** subsection contains Mode (Ask, Deny, or Approve), Approval timeout,
+and Tool / shell timeout.
 Ask is the default; Mode changes the same current-session policy as `/ask`, `/deny`,
 and `/allow`. The status suffixes are `dx` for Deny and `ax` for Approve; `rx`
 is a read-access label. **Checks** contains Allow editing, also controlled by
@@ -524,11 +531,14 @@ Automatic plan acceptance belongs to the active task and is controlled only by
 `/plan accept on/off`; it has no global configuration setting.
 New sessions start in Ask. Plan → Execute retains the current session and its
 tool-approval mode unless plan acceptance explicitly selects a different mode.
-**Workflow → Questions → Timeout** controls how long Harness waits for your answer
-to an assistant question. On expiry, it selects the recommended or first option,
-or skips questions without options. Plan acceptance never times out.
+Questions have no timeout. Optional questions remain available while work continues;
+questions marked **Required** pause work until answered or withdrawn. Open them with
+`oe` or `/questions`; Tab and Shift-Tab switch questions. Enter submits one answer
+immediately, and **Ask…** requests clarification without answering. Closing the
+picker retains pending questions and drafts. Questions survive completed exchanges;
+`H` in the picker includes answered history and allows explicit corrections.
 **Tools** contains toggles for Subagents, LSP, and Session history.
-Approval and answer timeouts each show one value, such as `10m`. Enter opens an
+Both timeout settings show one value, such as `10m`. Enter opens an
 inline editor: Up/Down adjust the duration, Enter saves, and Esc cancels. Values
 step through `15s`, `30s`, `45s`, `60s`, then whole minutes from `2m` to `60m`.
 The endpoints do not wrap.
@@ -543,23 +553,30 @@ Copilot tiers without an explicit numeric limit display their identifier, such a
 `long_context`, until the provider reports their active capacity. Billing thresholds
 and output allowances do not increase the displayed context size.
 
-Input timeouts run independently of the picker. An idle session has no periodic
-timeout check. Changing a timeout affects future questions and approvals without
+Tool / shell timeout defaults to **10 minutes** for each invocation. It covers
+Harness tools, provider tools, shell commands, child-agent tools, and background
+shell commands. Output and progress do not extend a deadline. Expiry records an
+error and stops execution; it does not retry the command. Check commands use the
+same policy and stop the remaining check run on expiry. Changing this setting
+applies to subsequent provider turns and newly started check commands. A running
+invocation retains its captured deadline.
+
+Approval timeouts run independently of the picker. An idle session has no periodic
+timeout check. Changing a timeout affects future approvals without
 extending an existing deadline. Ordinary submitted messages update the display
 immediately, then Harness starts, steers, or queues them according to the actual
 execution state. Queue editing remains local while an asynchronous reservation
 protects the message from delivery. Failed operations retain drafts and show their
 diagnostic separately from task status and review actions.
 
-Question-picker clarifications use the same delivery path. A timeout that resumes
-planning before the clarification arrives therefore does not reject the message
-merely because execution is occupied.
+Question-picker answers and clarifications use the same durable delivery path.
+Saving them does not wait for provider execution. Clarification leaves the question
+pending and runs a read-only discussion; required work resumes only after every
+required question resolves and its answer has been delivered.
 
-Queued messages and unfinished queue operations stay in session memory, not in
-the shared history database. Restarting the host clears its runnable queue. A surviving
-editor retains unresolved content with a recovery notice and does not resend it.
-Provider-delivery evidence remains saved independently so an uncertain send is
-not automatically duplicated.
+Queued messages and operation receipts persist in the session's input journal.
+Restart recovery suspends unfinished delivery and reconciles provider evidence;
+it does not automatically duplicate an uncertain send.
 
 `/checks` opens project checks. `/checks edit on` and
 `/checks edit off` toggle check-editing permission without sending a prompt.

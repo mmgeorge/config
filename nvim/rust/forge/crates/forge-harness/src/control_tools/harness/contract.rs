@@ -57,8 +57,14 @@ pub(crate) fn definitions() -> Vec<ControlToolDefinition> {
         ),
         (
             "harness_session_log",
-            "Read retained diagnostic metadata for a session, including rotated logs. Omit session_id for current. Logs exclude raw prompts, credentials, private reasoning and provider transport bodies. Missing logs are explicit. Follow next_cursor without rereading filesystem logs.",
-            vec![session()],
+            "Read retained diagnostic metadata for a session, including rotated logs, in chronological order. Omit session_id for current. Each request reads at most limit entries (default 100); the response byte budget may deliver fewer. Logs exclude raw prompts, credentials, private reasoning and provider transport bodies. Missing logs are explicit. Follow next_cursor with the same arguments to read the next page; later appends are excluded.",
+            vec![
+                session(),
+                (
+                    "limit",
+                    json!({"type":"integer","minimum":1,"default":100,"description":"Maximum log entries per page; defaults to 100. Follow next_cursor for the remaining entries."}),
+                ),
+            ],
             vec![],
         ),
         (

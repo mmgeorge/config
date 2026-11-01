@@ -136,4 +136,25 @@ mod tests {
         event.payload = json!({"kind":"execution_state","data":{"session":{"id":"session"}}});
         assert!(serde_json::to_string(&Message::Event(event)).is_ok());
     }
+
+    #[test]
+    fn question_snapshot_requires_revision_and_question_array() {
+        assert!(
+            validate(
+                "session",
+                "questions_changed",
+                &json!({"revision":1,"questions":[]})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                "session",
+                "questions_changed",
+                &json!({"revision":1,"questions":{}})
+            )
+            .is_err()
+        );
+        assert!(validate("session", "questions_changed", &json!({"questions":[]})).is_err());
+    }
 }

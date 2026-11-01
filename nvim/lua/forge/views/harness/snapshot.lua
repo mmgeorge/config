@@ -21,6 +21,18 @@ function HarnessSnapshot.apply(state, result)
     and (result.snapshot_revision or 0) < (state.snapshot_revision or 0) then return false end
   local session_changed = state.session and result.session and state.session.id ~= result.session.id
   if session_changed or state.runtime_epoch and state.runtime_epoch ~= result.runtime_epoch then
+    state.questions = nil
+    if session_changed then
+      if require("forge.views.picker").is_open("questions") then require("forge.views.picker").close(false) end
+      state.question_view_by_session = state.question_view_by_session or {}
+      state.question_view_by_session[state.session.id] = {
+        drafts = state.question_drafts, resume = state.question_picker_resume, history = state.question_show_history,
+      }
+      local question_view = state.question_view_by_session[result.session.id] or {}
+      state.question_drafts, state.question_picker_resume = question_view.drafts, question_view.resume
+      state.question_show_history = question_view.history
+      state.question_saving, state.question_failure = nil, nil
+    end
     local configuration = state.configuration_completion
     state.configuration_completion, state.configuring_config, state.task_config = nil, nil, nil
     state.configuring, state.configuration_debounce, state.pending_config = false, nil, nil
@@ -81,6 +93,7 @@ function HarnessSnapshot.apply(state, result)
   state.no_checkpoint = result.no_checkpoint == true
   state.restore_recovery = result.restore_recovery
   state.active_plan = result.active_plan
+  require("forge.views.harness.questions").receive(state, result.questions)
   if result.active_elicitation and result.active_elicitation ~= vim.NIL then
     require("forge.views.harness.question_presentation").receive(state, result.active_elicitation, true)
   else

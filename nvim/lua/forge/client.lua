@@ -465,7 +465,12 @@ local function host_dispatch_message(message, timing)
   end
   if message.event then
     local event_snapshot = client.snapshot_by_id[message.session_id]
-    if event_snapshot and (message.event == "plan_question" or message.event == "plan_question_updated") then
+    if event_snapshot and message.event == "questions_changed" then
+      local previous = event_snapshot.questions
+      if not previous or (message.payload.revision or 0) >= (previous.revision or 0) then
+        event_snapshot.questions = vim.deepcopy(message.payload)
+      end
+    elseif event_snapshot and (message.event == "plan_question" or message.event == "plan_question_updated") then
       local plan = message.payload and message.payload.plan
         event_snapshot.active_plan = plan and vim.deepcopy(plan) or nil
     elseif event_snapshot and (message.event == "question" or message.event == "question_updated") then

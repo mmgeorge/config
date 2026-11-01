@@ -1,47 +1,108 @@
+use super::logs::LogSnapshot;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::BTreeSet;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 
 const PAGE_BYTES: usize = 24 * 1024;
 
 /// Retains an immutable result independently of later database writes and log rotation.
 pub(super) struct InspectionPage {
-    file: tempfile::NamedTempFile,
+    file: BufWriter<tempfile::NamedTempFile>,
+    log: Option<LogPages>,
     pub(super) identity: String,
     pub(super) workspace: Vec<String>,
 }
 
+/// Owns unread log segments and immutable boundaries of batches already captured.
+struct LogPages {
+    snapshot: LogSnapshot,
+    limit: NonZeroUsize,
+    boundaries: BTreeSet<u64>,
+}
+
 impl InspectionPage {
+    /// Create a buffered snapshot without issuing one file write per JSON token.
     pub(super) fn new(identity: String) -> Result<Self> {
         Ok(Self {
-            file: tempfile::NamedTempFile::new()?,
+            file: BufWriter::new(tempfile::NamedTempFile::new()?),
+            log: None,
             identity,
             workspace: Vec::new(),
         })
     }
 
+    /// Retain the log reader so each cursor request captures only its next batch.
+    pub(super) fn attach_log(&mut self, snapshot: LogSnapshot, limit: NonZeroUsize) {
+        self.log = Some(LogPages {
+            snapshot,
+            limit,
+            boundaries: BTreeSet::new(),
+        });
+    }
+
+    /// Append one complete record without truncating its contents.
     pub(super) fn push(&mut self, value: Value) -> Result<()> {
-        serde_json::to_writer(self.file.as_file_mut(), &value)?;
+        serde_json::to_writer(&mut self.file, &value)?;
         self.file.write_all(b"\n")?;
         Ok(())
     }
 
-    pub(super) fn read(&mut self, offset: u64) -> Result<Value> {
-        let length = self.file.as_file().metadata()?.len();
+    /// Flush the snapshot before reading a complete page or a Unicode-safe fragment.
+    pub(super) fn read(
+        &mut self,
+        offset: u64,
+        mut check_active: impl FnMut() -> Result<()>,
+    ) -> Result<Value> {
+        self.file.flush()?;
+        let mut length = self.file.get_ref().as_file().metadata()?.len();
         ensure!(offset <= length, "inspection cursor exceeds snapshot");
+        if offset == length
+            && let Some(log) = &mut self.log
+        {
+            self.file.seek(SeekFrom::End(0))?;
+            for _ in 0..log.limit.get() {
+                let Some(record) = log.snapshot.next(&mut check_active)? else {
+                    break;
+                };
+                serde_json::to_writer(&mut self.file, &crate::trace::inspection_record(&record))?;
+                self.file.write_all(b"\n")?;
+            }
+            self.file.flush()?;
+            length = self.file.get_ref().as_file().metadata()?.len();
+            log.boundaries.insert(length);
+        }
+        let unread = self
+            .log
+            .as_ref()
+            .is_some_and(|log| log.snapshot.has_remaining());
+        let end = self
+            .log
+            .as_ref()
+            .and_then(|log| {
+                log.boundaries
+                    .range((
+                        std::ops::Bound::Excluded(offset),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .copied()
+            })
+            .unwrap_or(length);
+        let file = self.file.get_mut();
         let continuing = if offset > 0 {
-            self.file.seek(SeekFrom::Start(offset - 1))?;
+            file.seek(SeekFrom::Start(offset - 1))?;
             let mut previous = [0];
-            self.file.read_exact(&mut previous)?;
+            file.read_exact(&mut previous)?;
             previous[0] != b'\n'
         } else {
             false
         };
-        self.file.seek(SeekFrom::Start(offset))?;
+        file.seek(SeekFrom::Start(offset))?;
         let mut bytes = Vec::new();
-        self.file
-            .as_file_mut()
-            .take((PAGE_BYTES + 4) as u64)
+        file.as_file_mut()
+            .take(u64::try_from(PAGE_BYTES + 4)?.min(end - offset))
             .read_to_end(&mut bytes)?;
         let mut end = bytes.len().min(PAGE_BYTES);
         while std::str::from_utf8(&bytes[..end]).is_err() {
@@ -59,7 +120,7 @@ impl InspectionPage {
             return Ok(
                 json!({"fragment":&text[..fragment_end],"encoding":"json-record",
                 "record_complete":text[..fragment_end].ends_with('\n'),
-                "next_offset":(next < length).then_some(next)}),
+                "next_offset":(next < length || unread).then_some(next)}),
             );
         }
         let mut items = Vec::new();
@@ -71,6 +132,6 @@ impl InspectionPage {
             items.push(serde_json::from_str::<Value>(line)?);
             position += line.len() as u64;
         }
-        Ok(json!({"items":items,"next_offset":(position < length).then_some(position)}))
+        Ok(json!({"items":items,"next_offset":(position < length || unread).then_some(position)}))
     }
 }

@@ -56,7 +56,7 @@ pub fn prepare_new_session(
             .as_ref()
             .map_or(source.plan_compact, |value| value.plan_compact),
         approval_timeout: source.approval_timeout,
-        answer_timeout: source.answer_timeout,
+        tool_timeout: source.tool_timeout,
         context_window: preference
             .as_ref()
             .and_then(|value| value.model_setting.get(&value.model))

@@ -273,13 +273,45 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "question_ask",
-                description: "Pause any Harness turn and present one to three interactive user questions. Use this for explicit requests for multiple-choice questions as well as planning decisions.",
+                description: "Ask persistent questions. Set each requirement to optional to continue work, or required to stop work immediately until answered or withdrawn. Never treat a recommended choice as user consent.",
                 input_schema: plan_question_input_schema(),
             },
             ControlToolDefinition {
-                name: "question_answer",
-                description: "Record an answer only when the user explicitly and unambiguously answers one currently pending Harness question. Never call this while continuing a planning-feedback turn because Harness already consumed those answers.",
-                input_schema: question_answer_input_schema(),
+                name: "question_reply",
+                description: "Reply to an explicit clarification message on a Harness question. This explains the question without resolving it.",
+                input_schema: strict_object_input_schema(
+                    vec![
+                        ("operation_id", string_schema()),
+                        ("question_id", string_schema()),
+                        ("revision", json!({"type":"integer","minimum":1})),
+                        ("message_id", string_schema()),
+                        ("text", string_schema()),
+                    ],
+                    &[
+                        "operation_id",
+                        "question_id",
+                        "revision",
+                        "message_id",
+                        "text",
+                    ],
+                ),
+            },
+            ControlToolDefinition {
+                name: "question_revise",
+                description: "Revise a pending question's wording or choices while preserving its requirement and discussion. Do not revise an answered question.",
+                input_schema: strict_object_input_schema(
+                    vec![
+                        ("operation_id", string_schema()),
+                        ("question_id", string_schema()),
+                        ("revision", json!({"type":"integer","minimum":1})),
+                        (
+                            "draft",
+                            plan_question_input_schema()["properties"]["questions"]["items"]
+                                .clone(),
+                        ),
+                    ],
+                    &["operation_id", "question_id", "revision", "draft"],
+                ),
             },
             ControlToolDefinition {
                 name: "question_withdraw",
@@ -520,7 +552,11 @@ impl ControlToolInvocation {
         let scoped = self.name.starts_with("plan_")
             || matches!(
                 self.name.as_str(),
-                "design_patch" | "question_ask" | "question_answer" | "question_withdraw"
+                "design_patch"
+                    | "question_ask"
+                    | "question_reply"
+                    | "question_revise"
+                    | "question_withdraw"
             );
         let kind = match mode {
             crate::backend::PromptMode::Plan | crate::backend::PromptMode::PlanDiscussion
@@ -646,7 +682,8 @@ pub fn apply_invocation(
     Ok(())
 }
 
-fn validate_arguments(invocation: &ControlToolInvocation) -> Result<()> {
+/// Validate the advertised schema without applying legacy completion semantics.
+pub(crate) fn validate_arguments(invocation: &ControlToolInvocation) -> Result<()> {
     let validator_map = CONTROL_TOOL_VALIDATOR_MAP.get_or_init(|| {
         ControlToolRegistry
             .definition_list()
@@ -762,18 +799,16 @@ pub fn plan_question_input_schema() -> Value {
             "questions": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 3,
                 "items": {
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
                         "header": { "type": "string" },
+                        "requirement": { "type": "string", "enum": ["optional", "required"] },
                         "question": { "type": "string" },
                         "options": {
                             "type": "array",
-                            "minItems": 2,
-                            "maxItems": 3,
-                            "items": {
+                                        "items": {
                                 "type": "object",
                                 "properties": {
                                     "label": { "type": "string" },
@@ -786,12 +821,12 @@ pub fn plan_question_input_schema() -> Value {
                         },
                         "allow_freeform": { "type": "boolean" }
                     },
-                    "required": ["header", "question", "options"],
+                    "required": ["header", "question", "requirement", "options"],
                     "additionalProperties": false
                 }
             }
         },
-        "required": ["questions"],
+        "required": ["id", "questions"],
         "additionalProperties": false
     })
 }
@@ -821,7 +856,15 @@ pub fn question_answer_input_schema() -> Value {
 
 /// Build the structured-input contract for removing a resolved decision boundary.
 pub fn question_withdraw_input_schema() -> Value {
-    strict_object_input_schema(vec![("reason", string_schema())], &["reason"])
+    strict_object_input_schema(
+        vec![
+            ("operation_id", string_schema()),
+            ("question_id", string_schema()),
+            ("revision", json!({"type":"integer","minimum":1})),
+            ("reason", string_schema()),
+        ],
+        &["operation_id", "question_id", "revision", "reason"],
+    )
 }
 
 /// Run the Harness control-tool MCP server over JSONL stdio.

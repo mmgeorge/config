@@ -50,7 +50,7 @@ User request:
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not call question_answer or question_withdraw for them. Apply the answers with design_patch edits, settle any remaining decision according to the user's question preferences, then call plan_submit with the exact plan ID and version.
+            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not answer or withdraw those resolved questions. Apply the answers with design_patch edits, settle any remaining decision according to the user's question preferences, then call plan_submit with the exact plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -157,14 +157,9 @@ fn mutable_elicitation_prompt(
 
 The permission for this turn controls repository access. Answer the user's reply directly, using the repository when it helps. {workflow_boundary}
 
-After answering, choose exactly one outcome:
+Use question_reply to attach an explanation to a clarification message. Use question_revise to update one pending question, and question_withdraw only when its decision no longer affects the work. Use question_ask to append a new decision, with an explicit optional or required requirement. Keep existing questions and stable identities rather than replacing the entire set.
 
-1. Keep: make no tool call when the current questions and options still matter and are still valid.
-2. Answer: call question_answer only when the user clearly answers a pending question. Discussion, tentative wording, or your own preference is not an answer.
-3. Replace: call question_ask with the complete revised question set when the user asks for changes or the reply changes which questions or options matter. Keep a question's ID only when its meaning is unchanged. End the turn after replacing.
-4. Withdraw: call question_withdraw when no decision remains for the user, with a short reason based on an explicit instruction, a delegated choice, repository evidence, or a settled requirement. End the turn after withdrawing.
-
-Never pick an option because you recommend it, keep a question that no longer affects the implementation, or withdraw a question to avoid asking. "Choose for me" delegates the decision and can settle the question. Tentative language such as "I'm leaning toward" does not. When only part of the set changes, replace the whole set, keeping unchanged questions and their IDs, and include any new decision that has come up. After any tool call, let Harness present or resume the next step.
+Only Harness records explicit user answers. Never choose an option on the user's behalf or treat a recommendation as consent. Tentative language such as "I'm leaning toward" is not an answer. This discussion does not resume work; Harness owns the continuation after required decisions resolve.
 {planning_context}
 Pending elicitation:
 {elicitation_json}
@@ -199,7 +194,7 @@ mod test {
         assert!(draft.ends_with(request));
         assert!(feedback.contains(request));
         assert!(feedback.ends_with(answer));
-        assert!(feedback.contains("Do not call question_answer"));
+        assert!(feedback.contains("Do not answer or withdraw those resolved questions"));
         assert!(revision.contains(document_json));
         assert!(revision.contains(annotation_json));
         assert!(revision.contains("Keep file ownership distinct"));
@@ -267,7 +262,9 @@ mod test {
     fn clarification_preserves_the_pending_decision_boundary() {
         let prompt = PlanPrompt::clarification("Refactor", "{\"question\":\"Migration?\"}", "Why?");
         assert!(prompt.contains("open decisions that can change"));
-        assert!(prompt.contains("question_answer"));
+        assert!(prompt.contains("question_reply"));
+        assert!(prompt.contains("question_revise"));
+        assert!(!prompt.contains("question_answer"));
         assert!(prompt.contains("question_ask"));
         assert!(prompt.contains("question_withdraw"));
         assert!(prompt.contains("Tentative language"));
@@ -281,6 +278,6 @@ mod test {
         assert!(prompt.contains("Do not continue the original request"));
         assert!(!prompt.contains("Original planning request"));
         assert!(!prompt.contains("Harness Plan task"));
-        assert!(prompt.contains("question_answer"));
+        assert!(prompt.contains("Only Harness records explicit user answers"));
     }
 }

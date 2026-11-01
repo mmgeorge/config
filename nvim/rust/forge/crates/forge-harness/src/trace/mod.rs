@@ -375,6 +375,7 @@ impl TraceStore {
         }
     }
 
+    /// Rotate owned files by renaming so active readers keep their original segments.
     fn record_detail(&self, session_id: &str, event: &str, payload: &Value) -> Result<()> {
         let path = self.session_path(session_id);
         fs::create_dir_all(path.parent().unwrap())?;
@@ -394,6 +395,11 @@ impl TraceStore {
             .metadata()
             .is_ok_and(|metadata| metadata.len() + line.len() as u64 + 1 > MAX_TRACE_BYTES)
         {
+            match fs::remove_file(path.with_extension("jsonl.3")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             for generation in (1..=3).rev() {
                 let source = if generation == 1 {
                     path.clone()
@@ -401,11 +407,12 @@ impl TraceStore {
                     path.with_extension(format!("jsonl.{}", generation - 1))
                 };
                 let destination = path.with_extension(format!("jsonl.{generation}"));
-                if source.exists() {
-                    fs::copy(source, destination)?;
+                match fs::rename(source, destination) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
                 }
             }
-            File::create(&path)?;
         }
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         file.write_all(&line)?;
@@ -490,8 +497,10 @@ mod test {
         assert!(!reopened.configure_default(true).unwrap().enabled);
     }
 
+    /// Keep open reader handles on the old segment while the writer creates its successor.
     #[test]
     fn detailed_log_rotates_without_silently_erasing_the_previous_segment() {
+        use std::io::{BufRead, BufReader};
         let directory = tempdir().unwrap();
         let trace = TraceStore::open(directory.path()).unwrap();
         trace.configure(true).unwrap();
@@ -503,7 +512,12 @@ mod test {
             .unwrap()
             .set_len(super::MAX_TRACE_BYTES)
             .unwrap();
+        let reader = std::fs::File::open(&path).unwrap();
         trace.record("session", "second", json!({}));
+        assert_eq!(reader.metadata().unwrap().len(), super::MAX_TRACE_BYTES);
+        let mut first = String::new();
+        BufReader::new(reader).read_line(&mut first).unwrap();
+        assert!(first.contains("first"));
         assert!(std::fs::read_to_string(&path).unwrap().contains("second"));
         assert!(path.with_extension("jsonl.1").exists());
         assert!(path.metadata().unwrap().len() < 1024);

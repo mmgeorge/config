@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const SETTINGS_FORMAT_VERSION: u32 = 3;
+const SETTINGS_FORMAT_VERSION: u32 = 4;
 
 enum SettingLayerChange<'setting> {
     Replace {
@@ -88,8 +88,8 @@ pub struct PortableSettings {
     pub plan_compact: Option<bool>,
     /// Overrides the duration of future approval requests.
     pub approval_timeout: Option<crate::session::InputTimeout>,
-    /// Overrides the duration of future question sets.
-    pub answer_timeout: Option<crate::session::InputTimeout>,
+    /// Limits each tool invocation and shell command; defaults to ten minutes.
+    pub tool_timeout: Option<crate::session::InputTimeout>,
     /// Enables the root's model-facing child tools without restricting manual admission.
     pub subagent_tools: Option<bool>,
     /// Enables read-only tools backed by the connected editor language servers.
@@ -149,8 +149,8 @@ impl PortableSettings {
         if overriding.approval_timeout.is_some() {
             self.approval_timeout = overriding.approval_timeout;
         }
-        if overriding.answer_timeout.is_some() {
-            self.answer_timeout = overriding.answer_timeout;
+        if overriding.tool_timeout.is_some() {
+            self.tool_timeout = overriding.tool_timeout;
         }
         self.skill.extend(overriding.skill);
         self.mcp.extend(overriding.mcp);
@@ -181,8 +181,8 @@ impl PortableSettings {
         if let Some(timeout) = self.approval_timeout {
             session.approval_timeout = timeout.validate()?;
         }
-        if let Some(timeout) = self.answer_timeout {
-            session.answer_timeout = timeout.validate()?;
+        if let Some(timeout) = self.tool_timeout {
+            session.tool_timeout = timeout.require_expiry()?;
         }
         Ok(())
     }
@@ -760,8 +760,8 @@ impl SettingsStore {
         if let Some(timeout) = setting.approval_timeout {
             timeout.validate()?;
         }
-        if let Some(timeout) = setting.answer_timeout {
-            timeout.validate()?;
+        if let Some(timeout) = setting.tool_timeout {
+            timeout.require_expiry()?;
         }
         if let Some(access) = &setting.access {
             access.clone().validate()?;
@@ -1173,7 +1173,7 @@ mod test {
     fn current_settings_decode_failures_remain_visible() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let store = SettingsStore::open(fixture.path())?;
-        for payload in ["{", r#"{"format_version":3,"payload":{"shell":"invalid"}}"#] {
+        for payload in ["{", r#"{"format_version":4,"payload":{"shell":"invalid"}}"#] {
             store.connection.execute(
                 "INSERT OR REPLACE INTO setting_layer VALUES ('global','',?1)",
                 [payload],
@@ -1182,7 +1182,7 @@ mod test {
         }
         store.connection.execute(
             "UPDATE setting_layer SET payload=?1",
-            [r#"{"format_version":4,"payload":{"future_setting":true}}"#],
+            [r#"{"format_version":5,"payload":{"future_setting":true}}"#],
         )?;
         assert!(
             store
@@ -1314,7 +1314,7 @@ mod test {
                         }
                     } else {
                         PortableSettings {
-                            answer_timeout: Some(timeout),
+                            session_tools: Some(amount % 2 == 0),
                             ..Default::default()
                         }
                     };
@@ -1338,7 +1338,7 @@ mod test {
         let saved = store.get("workspace", "session", "mock").unwrap();
         assert_eq!(saved.revision, 33);
         assert_eq!(saved.desired.approval_timeout.unwrap().amount, 16);
-        assert_eq!(saved.desired.answer_timeout.unwrap().amount, 16);
+        assert_eq!(saved.desired.session_tools, Some(true));
         assert_eq!(saved.desired.status_thoughts, Some(true));
         assert!(
             store

@@ -42,6 +42,7 @@ pub use contract::*;
 mod message;
 pub use message::{MessageClassification, MessageId, MessageRole, MessageUpdate};
 mod tool_status;
+pub(crate) mod tool_timeout;
 pub use tool_status::{
     TextUpdate, ToolDiagnostic, ToolInvocation, ToolOutcome, ToolStatus, ToolUpdate,
 };

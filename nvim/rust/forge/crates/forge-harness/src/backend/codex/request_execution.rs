@@ -4,7 +4,7 @@ use crate::backend::approval::{ApprovalResolution, PermissionCoordinator, protec
 use crate::backend::{BackendCompletion, BackendEventSink, ExecutionOwner};
 use crate::control_tools::{
     ControlToolExecutor, ControlToolInvocation, ControlTurnContext, apply_invocation,
-    control_tool_failure_json,
+    control_tool_failure_json, validate_arguments,
 };
 use crate::plan::{PlanDocument, render_plan};
 use crate::session::ApprovalMode;
@@ -190,8 +190,7 @@ impl RequestExecutor {
                 let params = message.get("params").unwrap_or(message);
                 if let Some(invocation) = control_invocation(method, params)? {
                     let validation_started_at = Instant::now();
-                    let mut decoded_output = BackendCompletion::default();
-                    if let Err(error) = apply_invocation(&invocation, &mut decoded_output) {
+                    if let Err(error) = validate_arguments(&invocation) {
                         let failure_json = control_tool_failure_json(
                             &invocation,
                             &error,
@@ -228,9 +227,7 @@ impl RequestExecutor {
                         );
                     }
                     let execution_started_at = Instant::now();
-                    let execution_message = match self
-                        .execute_control_invocation(&invocation, decoded_output)
-                        .await
+                    let execution_message = match self.execute_control_invocation(&invocation).await
                     {
                         Ok(message) => message,
                         Err(error) => {
@@ -315,7 +312,6 @@ impl RequestExecutor {
     async fn execute_control_invocation(
         &mut self,
         invocation: &ControlToolInvocation,
-        mut output: BackendCompletion,
     ) -> Result<Option<String>> {
         if let Some(runtime) = self.control_runtime.as_ref() {
             let outcome = runtime.execute(invocation.clone()).await?;
@@ -326,6 +322,8 @@ impl RequestExecutor {
             self.replay_invocation = result.invocation;
             return Ok(Some(result.message));
         }
+        let mut output = BackendCompletion::default();
+        apply_invocation(invocation, &mut output)?;
         match invocation.name.as_str() {
             name if crate::control_tools::is_agent_tool(name) => {
                 anyhow::bail!("agent tools require an authenticated active root turn");
@@ -522,6 +520,93 @@ impl ExecutedRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn persistent_question_tools_reach_the_canonical_runtime() -> Result<()> {
+        use crate::question::*;
+        let (root, _store, task_controller) = crate::task::SessionTaskController::test_goal();
+        let questions = Arc::new(QuestionController::open(root.path(), "session")?);
+        let mut executor = RequestExecutor::new(
+            root.path().to_string_lossy().into_owned(),
+            ApprovalMode::Ask,
+            PermissionCoordinator::transient(root.path())?,
+            None,
+            Arc::new(TraceStore::open(root.path())?),
+            "session".into(),
+        );
+        let mut context = ControlTurnContext::inactive(crate::backend::PromptMode::Chat);
+        context.questions = Some(questions.clone());
+        context.question_exchange_id = Some("discussion".into());
+        context.question_discussion = true;
+        context.task_controller = Some(task_controller);
+        executor.configure(context);
+        let execute = |tool: &str, arguments: Value| {
+            json!({
+                "id":1, "method":"item/tool/call", "params":{
+                    "threadId":"thread", "turnId":"turn", "callId":tool,
+                    "tool":tool, "arguments":arguments,
+                },
+            })
+        };
+        let draft = json!({"header":"Layout", "question":"Which layout?", "requirement":"required", "options":[]});
+        let result = executor
+            .execute(
+                execute(
+                    "question_ask",
+                    json!({"id":"ask", "questions":[draft.clone()]}),
+                ),
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(
+            result.response["result"]["success"], true,
+            "{}",
+            result.response
+        );
+        let question_id = questions.snapshot()?.questions[0].id.clone();
+        questions.apply(QuestionCommand {
+            operation_id: "clarify".into(),
+            question_id: question_id.clone(),
+            revision: 1,
+            action: QuestionAction::Clarify {
+                text: "What does it affect?".into(),
+            },
+        })?;
+        for (tool, arguments) in [
+            (
+                "question_reply",
+                json!({"operation_id":"reply", "question_id":question_id, "revision":1, "message_id":"clarify", "text":"Only new sessions."}),
+            ),
+            (
+                "question_revise",
+                json!({"operation_id":"revise", "question_id":question_id, "revision":1, "draft":draft}),
+            ),
+            (
+                "question_withdraw",
+                json!({"operation_id":"withdraw", "question_id":question_id, "revision":2, "reason":"No longer needed"}),
+            ),
+        ] {
+            let result = executor
+                .execute(execute(tool, arguments), Instant::now())
+                .await;
+            assert_eq!(
+                result.response["result"]["success"], true,
+                "{tool}: {}",
+                result.response
+            );
+            assert!(
+                result.invocation.is_none(),
+                "persisted question mutation must not replay into BackendCompletion"
+            );
+        }
+        let snapshot = questions.snapshot()?;
+        assert_eq!(snapshot.questions[0].discussion.len(), 2);
+        assert!(matches!(
+            snapshot.questions[0].resolution,
+            QuestionResolution::Withdrawn { .. }
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn goal_result_replay_preserves_the_admitted_task_revision() -> Result<()> {

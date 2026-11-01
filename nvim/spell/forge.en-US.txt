@@ -1,6 +1,7 @@
 # Personal vocabulary shared by Forge autocorrect and Harper.
 # One word per line. Blank lines and lines beginning with # are ignored.
 ok
+off
 repo
 todo
 opt
@@ -19,3 +20,5 @@ cwd
 codex
 
 winbar
+
+llm

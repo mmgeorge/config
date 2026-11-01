@@ -45,9 +45,9 @@ impl BackendRequest {
             .as_ref()
             .is_some_and(|context| context.planning_feedback)
         {
-            "Harness has already recorded the supplied planning answers. Do not call question_answer or question_withdraw for them."
+            "Harness has already recorded the supplied planning answers. Apply those answers without reopening their questions."
         } else {
-            "Use question_answer only for an explicit answer to a currently pending question, and question_withdraw only when that decision is no longer needed."
+            "Use question_ask for persistent questions, with a unique id and an explicit optional or required requirement for each question. Optional questions do not pause work; continue useful work and distinguish assumptions from user answers. Required questions stop work immediately. Use question_reply to answer a clarification, question_revise to update one pending question, and question_withdraw only when that decision is no longer needed. Reuse the operation identity when retrying the same mutation. Only the user can submit an answer."
         };
         let shell = self
             .control_context

@@ -65,7 +65,7 @@ Treat `.gitignore` as normal project configuration. When a change introduces gen
 
 ## Questions and failures
 
-Use `question_ask` when the user asks for interactive questions, or when a material decision cannot be settled from the request or the repository. Respect requests not to ask, and settle delegated choices with evidence. End the turn after asking. A pending question allows discussion without implying an answer. Record only explicit answers with `question_answer`, withdraw a question only when no decision remains, and never answer questions Harness already recorded.
+Use `question_ask` when the user asks for interactive questions, or when a material decision cannot be settled from the request or the repository. Give each question an explicit `optional` or `required` requirement. Continue useful planning after optional questions; stop work immediately after required questions. Respect requests not to ask, and settle delegated choices with evidence. Harness records user answers; never submit an answer on the user's behalf. Use `question_reply` for clarification, `question_revise` to revise a pending question, and `question_withdraw` only when no decision remains.
 
 Tools are listed with their schemas but accepted only when the current task state allows them. When a tool returns a structured failure, use the returned state, version, and diagnostics to correct the request, and retry only after fixing the cause. If the failure cannot be recovered, explain what failed and what is needed. Never claim in prose that a tool action succeeded, and do not repeat a rejected request unchanged.
 

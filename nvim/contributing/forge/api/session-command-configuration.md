@@ -19,7 +19,8 @@ The configuration object accepts the fields below. Omitted fields retain their c
 | `access` | [AccessPolicy](native-schemas.md#accesspolicy), validated against the provider's supported sandbox. |
 | `shell` | Supported shell selection. The executable must resolve. |
 | `approval_mode` | Approval-mode enum for the current session. New sessions start in Ask. |
-| `approval_timeout`, `answer_timeout` | Validated input-timeout objects. |
+| `approval_timeout` | Validated input-timeout objects. |
+| `tool_timeout` | A validated timeout object with a positive `amount`; defaults to ten minutes per tool or shell invocation. |
 | `auto_compaction` | [AutoCompaction](native-schemas.md#autocompaction). Enabling requires native compaction support. |
 | `check_timing` | `after_queue` or `between_work`. |
 | `automatic_checks` | Boolean. |

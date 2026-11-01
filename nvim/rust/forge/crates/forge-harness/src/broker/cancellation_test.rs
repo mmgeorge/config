@@ -10,11 +10,13 @@ use std::sync::atomic::AtomicUsize;
 enum ProviderFailure {
     Cancelled,
     SimilarMessage,
+    Stalled,
 }
 
 struct CancelledNativeBackend {
     failure: ProviderFailure,
     calls: AtomicUsize,
+    cancellations: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -45,6 +47,7 @@ impl Backend for CancelledNativeBackend {
 
     /// Leave the adapter reusable after cancelled execution.
     async fn cancel_session(&self, _: &str) -> Result<()> {
+        self.cancellations.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -115,11 +118,6 @@ impl Backend for CancelledNativeBackend {
                 },
             },
             ToolUpdate::Started,
-            ToolUpdate::Finished {
-                outcome: ToolOutcome::Denied {
-                    reason: "workspace policy".into(),
-                },
-            },
         ] {
             sink.send_wait(BackendEvent::Tool {
                 address: address.clone(),
@@ -127,9 +125,31 @@ impl Backend for CancelledNativeBackend {
             })
             .await?;
         }
+        if matches!(self.failure, ProviderFailure::Stalled) {
+            loop {
+                sink.send_wait(BackendEvent::Tool {
+                    address: address.clone(),
+                    update: ToolUpdate::Output {
+                        update: crate::backend::TextUpdate::Append("still running\n".into()),
+                    },
+                })
+                .await?;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        sink.send_wait(BackendEvent::Tool {
+            address,
+            update: ToolUpdate::Finished {
+                outcome: ToolOutcome::Denied {
+                    reason: "workspace policy".into(),
+                },
+            },
+        })
+        .await?;
         let outcome = match self.failure {
             ProviderFailure::Cancelled => TurnOutcome::Cancelled,
             ProviderFailure::SimilarMessage => TurnOutcome::Failed,
+            ProviderFailure::Stalled => unreachable!("stalled provider never completes"),
         };
         sink.send_wait(BackendEvent::Turn {
             address: turn,
@@ -145,6 +165,7 @@ impl Backend for CancelledNativeBackend {
                 code: Some("provider_failure".into()),
                 message: "provider execution cancelled".into(),
             },
+            ProviderFailure::Stalled => unreachable!("stalled provider never completes"),
         })
     }
 }
@@ -161,16 +182,34 @@ async fn provider_failure_named_cancelled_remains_failed() -> Result<()> {
     assert_native_failure(ProviderFailure::SimilarMessage).await
 }
 
+/// Stop a noisy shell command at its deadline, persist failure, and keep the next prompt usable.
+#[tokio::test]
+async fn shell_timeout_stops_execution_without_replaying_the_command() -> Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        assert_native_failure(ProviderFailure::Stalled),
+    )
+    .await?
+}
+
 /// Exercise public dispatch, persisted exchange history, and reuse through the real broker.
 async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     let repository = super::test::repository();
     let data = tempfile::tempdir()?;
     let mut broker = super::test::planning_question_broker(repository.path(), data.path(), false);
+    if matches!(failure, ProviderFailure::Stalled) {
+        broker.session.tool_timeout = crate::session::InputTimeout {
+            amount: 1,
+            unit: crate::session::TimeoutUnit::S,
+        };
+    }
     let backend = Arc::new(CancelledNativeBackend {
         failure,
         calls: AtomicUsize::new(0),
+        cancellations: AtomicUsize::new(0),
     });
     broker.backend = backend.clone();
+    broker.turn_cancellation.arm(true);
     let result = broker
         .dispatch(Request {
             id: 1,
@@ -180,11 +219,12 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
         .await;
     let expected = match failure {
         ProviderFailure::Cancelled => ExchangeState::Cancelled,
-        ProviderFailure::SimilarMessage => ExchangeState::Failed,
+        ProviderFailure::SimilarMessage | ProviderFailure::Stalled => ExchangeState::Failed,
     };
     let expected_code = match failure {
         ProviderFailure::Cancelled => "turn_cancelled",
         ProviderFailure::SimilarMessage => "request_failed",
+        ProviderFailure::Stalled => "tool_timeout",
     };
     assert_eq!(
         result.response.error().context("fixture should fail")?.code,
@@ -203,7 +243,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     assert!(exchange.finalization_error.is_none());
     let expected_turn = match failure {
         ProviderFailure::Cancelled => TurnOutcome::Cancelled,
-        ProviderFailure::SimilarMessage => TurnOutcome::Failed,
+        ProviderFailure::SimilarMessage | ProviderFailure::Stalled => TurnOutcome::Failed,
     };
     assert_eq!(
         exchange.turn[0].state(),
@@ -217,7 +257,12 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
         .context("denied native tool disappeared")?
         .1;
     assert_eq!(tool.id, "denied-native-command");
-    assert_eq!(tool.state(), ToolState::Denied);
+    if matches!(failure, ProviderFailure::Stalled) {
+        assert_eq!(tool.state(), ToolState::Failed);
+        assert!(backend.cancellations.load(Ordering::SeqCst) > 0);
+    } else {
+        assert_eq!(tool.state(), ToolState::Denied);
+    }
     assert!(
         broker
             .snapshot()?
@@ -225,6 +270,8 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
             .iter()
             .any(|entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == &exchange.id))
     );
+    // Service admission rearms cancellation only after the previous execution settles.
+    broker.turn_cancellation.arm(true);
     let recovered = broker
         .dispatch(Request {
             id: 2,

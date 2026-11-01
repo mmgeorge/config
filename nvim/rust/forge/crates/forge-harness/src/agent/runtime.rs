@@ -9,6 +9,8 @@ use crate::backend::{Backend, BackendCompletion, BackendEvent, BackendRequest, E
 /// Runs one child turn without retaining a broker, storage, or presentation lock.
 pub struct AgentRuntime {
     pub backend: Arc<dyn Backend>,
+    /// Applies the root session's deadline to each child tool and shell invocation.
+    pub(crate) tool_timeout: crate::session::InputTimeout,
     /// Shared diagnostics for provider retry attempts and cancellation.
     pub(crate) trace: Arc<crate::trace::TraceStore>,
     /// Persistent submission journal shared by the child execution owner.
@@ -33,6 +35,10 @@ impl AgentRuntime {
         // Subscribe before dispatch so retained child observations keep their original owner.
         let scope = crate::backend::InvocationScope::new(owner.clone(), self.task_id.clone());
         let (event_sink, event_stream) = crate::backend::events::channel(scope.clone());
+        let watchdog = Arc::new(crate::backend::tool_timeout::ToolWatchdog::new(
+            self.tool_timeout,
+        )?);
+        let event_sink = event_sink.supervise_tools(watchdog.clone());
         let (session_events, subscription_error) =
             match self.backend.session_event_stream(owner.clone()).await {
                 Ok(stream) => (stream, None),
@@ -62,6 +68,20 @@ impl AgentRuntime {
                 if cancelled {break Err(anyhow::anyhow!("child task interrupted before dispatch"));}
                 tokio::select! {
                     biased;
+                    expired = watchdog.expired() => {
+                        let expired = expired?.context("tool watchdog ended during child execution")?;
+                        self.publish(&owner, BackendEvent::Tool {
+                            address: expired.address.clone(),
+                            update: crate::backend::ToolUpdate::Finished {
+                                outcome: crate::backend::ToolOutcome::Failed {
+                                    diagnostic: crate::backend::ToolDiagnostic {
+                                        code: Some("tool_timeout".into()), message: expired.to_string(),
+                                    },
+                                },
+                            },
+                        }).await?;
+                        break Err(expired.into());
+                    }
                     changed = self.cancellation.changed() => {
                         changed.context("child cancellation owner closed")?;
                         if *self.cancellation.borrow_and_update() {
@@ -71,6 +91,7 @@ impl AgentRuntime {
                     }
                     event = events.next(), if events.is_open() => {
                         if let Some(event) = event? {
+                            watchdog.observe(&event)?;
                             self.publish(&owner, event).await?;
                         }
                     }

@@ -234,6 +234,12 @@ local function status_text()
   end
   local selected_run = selected_agent_run(state)
   if selected_run then append_status(selected_run.nickname or selected_run.definition, "ForgeStatusLabel") end
+  local question_count, required_count = require("forge.views.harness.questions").count(state)
+  if question_count > 0 then
+    local text = required_count > 0 and ("waiting · %d required question%s need%s an answer"):format(required_count, required_count == 1 and "" or "s", required_count == 1 and "s" or "")
+      or (question_count == 1 and "1 question needs an answer" or ("%d questions need answers"):format(question_count))
+    append_status(text, "ForgeStatusLabel")
+  end
   if state.connection_error then
     append_status(state.connection_error, "ForgeHarnessGoal")
   elseif state.sync_error then
@@ -645,6 +651,17 @@ local function on_event(event, payload)
     else
       error("Unhandled Harness backend event: " .. tostring(payload.kind))
     end
+  elseif event == "questions_changed" then
+    local questions = require("forge.views.harness.questions")
+    local _, previous_required = questions.count(state)
+    questions.receive(state, payload)
+    local _, required_count = questions.count(state)
+    if required_count > previous_required and not require("forge.views.picker").is_open()
+      and vim.api.nvim_get_current_win() == state.transcript_win then
+      questions.open(state, picker_host(state))
+    end
+    M.refresh_winbar()
+    synchronize_state()
   elseif event == "question" then
     if not question_presentation.receive(state, payload, true) then return end
     if question_presentation.should_present(state) then
@@ -913,6 +930,10 @@ function M.reopen_question()
     M.present_approval(true)
     return
   end
+  if state.questions and #(state.questions.questions or {}) > 0 then
+    require("forge.views.harness.questions").open(state, picker_host(state))
+    return
+  end
   if not (state.active_elicitation and state.active_elicitation.elicitation) then
     notifications.warn("No Harness approval or question awaits feedback", "ForgeHarness")
     return
@@ -1068,6 +1089,14 @@ function M.open_timeline_entry()
   state.presentation.activate(function(action, captured)
     if state.presentation.open_output(action, captured) then return end
     if action.kind == "question" then
+      for _, question in ipairs((state.questions or {}).questions or {}) do
+        if question.id == action.question_set_id then
+          state.question_show_history = question.resolution.kind ~= "pending"
+          state.question_picker_resume = nil
+          require("forge.views.harness.questions").open(state, picker_host(state), question.id)
+          return
+        end
+      end
       local elicitation = state.active_elicitation and state.active_elicitation.elicitation
       if elicitation and elicitation.question_set and elicitation.question_set.id == action.question_set_id then
         M.present_plan_question(true)
@@ -1704,7 +1733,7 @@ function M.submit()
   end
   if text == "/questions" then
     set_composer_text(state.composer_buf, "")
-    M.present_plan_question(true)
+    M.reopen_question()
     return
   end
   local agent_tools_action = text:match("^/agents%s+(%S+)%s*$")
@@ -2367,7 +2396,7 @@ function M.configure(next_config, validate_selection, completed)
   end
   local timeout_only = next(next_config) ~= nil
   for field in pairs(next_config) do
-    if field ~= "approval_timeout" and field ~= "answer_timeout" then timeout_only = false end
+    if field ~= "approval_timeout" and field ~= "tool_timeout" then timeout_only = false end
   end
   if timeout_only then
     require("forge.views.harness.timeout_configuration").configure(state, next_config, completed, report_configuration_error)

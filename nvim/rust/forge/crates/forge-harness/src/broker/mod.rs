@@ -169,6 +169,7 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
 /// Represents the complete client-visible state for one active session.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
+    pub(crate) questions: crate::question::QuestionSnapshot,
     pub ask_model: crate::settings::AskModel,
     /// Saved access choices before provider capability limits are applied.
     pub access_preference: crate::session::AccessPolicy,
@@ -544,6 +545,9 @@ impl ExchangeAdmission {
 
 /// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
 pub struct HarnessBroker {
+    question_model: Option<crate::settings::AskModel>,
+    question_discussion: bool,
+    pub(crate) questions: Arc<crate::question::QuestionController>,
     pub(crate) task_controller: Arc<crate::task::SessionTaskController>,
     context_usage_fresh: bool,
     pub(crate) lsp: Arc<crate::control_tools::lsp::LspService>,
@@ -726,7 +730,7 @@ impl HarnessBroker {
                                 .as_ref()
                                 .is_some_and(|value| value.plan_compact),
                             approval_timeout: Default::default(),
-                            answer_timeout: Default::default(),
+                            tool_timeout: Default::default(),
                             context_window: None,
                             service_tier: preference
                                 .as_ref()
@@ -792,11 +796,7 @@ impl HarnessBroker {
             session.resolved_model =
                 store.latest_resolved_default_model(&session.workspace, &session.backend)?;
         }
-        permission_coordinator.configure_input_timeouts(
-            &session.id,
-            session.approval_timeout,
-            session.answer_timeout,
-        )?;
+        permission_coordinator.configure_timeout(&session.id, session.approval_timeout)?;
         startup_timing.insert(
             "settings_applied_ms",
             startup_started.elapsed().as_secs_f64() * 1000.0,
@@ -876,7 +876,12 @@ impl HarnessBroker {
             trace.clone(),
         )?;
         let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace));
+        let questions = Arc::new(crate::question::QuestionController::open(
+            &data_root,
+            &session.id,
+        )?);
         let observer = Arc::new(observation::BrokerObserver {
+            questions: questions.clone(),
             admission: store.session_admission(&session.id)?,
             input_schedule: tokio::sync::watch::channel(Default::default()).0,
             lsp: runtime.lsp.clone(),
@@ -909,6 +914,9 @@ impl HarnessBroker {
             startup_started.elapsed().as_secs_f64() * 1000.0,
         );
         let mut broker = Self {
+            question_model: None,
+            question_discussion: false,
+            questions,
             task_controller: Arc::new(crate::task::SessionTaskController::new(
                 observer.admission.clone(),
             )?),
@@ -1066,6 +1074,12 @@ impl HarnessBroker {
                 .ok()
         });
         Some(crate::control_tools::ControlTurnContext {
+            questions: Some(self.questions.clone()),
+            question_exchange_id: self
+                .exchange_runtime
+                .as_ref()
+                .map(|runtime| runtime.exchange_id.clone()),
+            question_discussion: self.question_discussion,
             task_controller: Some(self.task_controller.clone()),
             native_goal: if mode == PromptMode::GoalContinuation {
                 self.task_controller
@@ -1512,6 +1526,8 @@ impl HarnessBroker {
                     "not_admitted"
                 } else if error.downcast_ref::<TurnCancelled>().is_some() {
                     "turn_cancelled"
+                } else if error.is::<crate::backend::tool_timeout::ToolTimeout>() {
+                    "tool_timeout"
                 } else {
                     "request_failed"
                 };
@@ -2670,6 +2686,15 @@ impl HarnessBroker {
                 .insert(admission.agent.id.clone(), backend.clone());
             Ok(crate::agent::AgentRuntime {
                 backend,
+                tool_timeout: crate::settings::SettingsStore::read_only(&self.data_root)?
+                    .get(
+                        &self.session.workspace,
+                        &self.session.id,
+                        &self.session.backend,
+                    )?
+                    .desired
+                    .tool_timeout
+                    .unwrap_or(self.session.tool_timeout),
                 trace: self.trace.clone(),
                 submission_store: self.submission_store.clone(),
                 permission: self.permission_coordinator.clone(),
@@ -3246,6 +3271,81 @@ impl HarnessBroker {
             self.check_runner.active()?.is_none(),
             "wait for or cancel the active check run before starting source work"
         );
+        if matches!(purpose, crate::input::InputPurpose::Question { .. })
+            || self.questions.snapshot()?.required_pending()
+        {
+            let selection = crate::settings::SettingsStore::read_only(&self.data_root)?
+                .get(
+                    &self.session.workspace,
+                    &self.session.id,
+                    &self.session.backend,
+                )?
+                .ask_model()?;
+            let catalog = if selection.model.is_some() {
+                self.backend
+                    .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+                    .await?
+            } else {
+                Vec::new()
+            };
+            self.question_model = Some(selection.resolve(&self.session, &catalog)?);
+            let previous_model = self.session.resolved_model.clone();
+            let previous_usage = self.session.context_usage.clone();
+            self.question_discussion = true;
+            let visible_text = if let crate::input::InputPurpose::Question {
+                question_id,
+                message_kind,
+                ..
+            } = &purpose
+            {
+                let snapshot = self.questions.snapshot()?;
+                let question = snapshot
+                    .questions
+                    .iter()
+                    .find(|question| &question.id == question_id)
+                    .context("question discussion source is missing")?;
+                let label = match message_kind {
+                    crate::question::QuestionMessageKind::Clarification => "Clarification",
+                    crate::question::QuestionMessageKind::Answer => "Answer",
+                    crate::question::QuestionMessageKind::Correction => "Correction",
+                    crate::question::QuestionMessageKind::Reply => "Reply",
+                };
+                format!("{label}: {}", question.content.header)
+            } else {
+                text.clone()
+            };
+            let result = self
+                .run_interaction_input(
+                    visible_text.clone(),
+                    PromptMode::Chat,
+                    Some(ExchangeAdmission::chat(visible_text)),
+                    BackendInput::from_text(text),
+                )
+                .await;
+            self.question_discussion = false;
+            self.question_model = None;
+            self.session.resolved_model = previous_model;
+            self.session.context_usage = previous_usage;
+            self.save_session()?;
+            return result;
+        }
+        if let crate::input::InputPurpose::QuestionContinuation { exchange_id } = &purpose {
+            anyhow::ensure!(
+                self.task_controller.current()?.is_none(),
+                "question continuation cannot replace an active task"
+            );
+            let result = self
+                .run_interaction(
+                    text.clone(),
+                    PromptMode::Chat,
+                    Some(ExchangeAdmission::chat(text)),
+                )
+                .await;
+            if result.is_ok() {
+                self.questions.chat_continuation_completed(exchange_id)?;
+            }
+            return result;
+        }
         if !matches!(purpose, crate::input::InputPurpose::User) {
             let (revision, origin) = match purpose {
                 crate::input::InputPurpose::TaskEntry {
@@ -3260,7 +3360,11 @@ impl HarnessBroker {
                     revision,
                     crate::exchange::ExchangeOrigin::task_continuation(reason),
                 ),
-                crate::input::InputPurpose::User => unreachable!(),
+                crate::input::InputPurpose::User
+                | crate::input::InputPurpose::Question { .. }
+                | crate::input::InputPurpose::QuestionContinuation { .. } => {
+                    unreachable!()
+                }
             };
             let task = self
                 .task_controller
@@ -4274,70 +4378,6 @@ impl HarnessBroker {
         if self.turn_cancellation.requested.load(Ordering::Acquire) {
             return Ok(None);
         }
-        let mut plan = if self.active_plan_awaits_input()? {
-            Some(self.active_elicitation_plan()?)
-        } else {
-            None
-        };
-        let mut interaction = if plan.is_none() {
-            self.find_active_interaction_elicitation()?
-        } else {
-            None
-        };
-        let owner = plan
-            .as_ref()
-            .map(|plan| format!("plan:{}", plan.id))
-            .or_else(|| {
-                interaction
-                    .as_ref()
-                    .map(|exchange| format!("exchange:{}", exchange.id))
-            });
-        let elicitation = plan
-            .as_mut()
-            .and_then(|plan| plan.elicitation.as_mut())
-            .or_else(|| {
-                interaction
-                    .as_mut()
-                    .and_then(|exchange| exchange.elicitation_mut())
-            });
-        if let Some(elicitation) = elicitation {
-            if let Some(deadline) = &elicitation.deadline {
-                let owner = owner.as_deref().expect("active input owner");
-                let identity = format!(
-                    "{owner}:{}:{}",
-                    elicitation.question_set.id, deadline.expires_at_ms
-                );
-                if active_deadline
-                    .as_ref()
-                    .is_none_or(|(current, _)| current != &identity)
-                {
-                    let mut deadline = deadline.clone();
-                    deadline.restore(self.clock.now_ms());
-                    *active_deadline = Some((identity, deadline));
-                }
-                if active_deadline
-                    .as_ref()
-                    .is_some_and(|(_, deadline)| deadline.expired(self.clock.now_ms()))
-                {
-                    elicitation.expire()?;
-                    if let Some(plan) = &plan {
-                        self.publish_plan(plan)?;
-                    }
-                    if let Some(interaction) = &interaction {
-                        self.store.save_exchange(interaction)?;
-                    }
-                    *active_deadline = None;
-                    return Ok(Some(Request {
-                        id: 0,
-                        method: "session.question.continue".into(),
-                        params: json!({}),
-                    }));
-                }
-            } else {
-                *active_deadline = None;
-            }
-            return Ok(None);
-        }
         *active_deadline = None;
         let owner = crate::backend::ExecutionOwner::root(&self.session.id);
         if !self.active_plan_has_acceptance()?
@@ -4386,7 +4426,7 @@ impl HarnessBroker {
         let result = self
             .run_interaction_input(text, mode, admission, input)
             .await?;
-        if mode == PromptMode::Chat {
+        if mode == PromptMode::Chat && !self.question_discussion {
             let result = Box::pin(self.advance_configured_plan(result)).await?;
             if let Some(original) = setup_task
                 && let Some(current) = self.task_controller.current()?
@@ -4481,6 +4521,15 @@ impl HarnessBroker {
             unreachable!()
         };
         if discussion && plan.artifact.state == PlanState::AwaitingReview {
+            return Ok((value, events));
+        }
+        let question_snapshot = self.questions.snapshot()?;
+        if question_snapshot.required_pending()
+            || self
+                .store
+                .latest_exchange(&self.session.id)?
+                .is_some_and(|exchange| question_snapshot.required_in_exchange(&exchange.id))
+        {
             return Ok((value, events));
         }
         let after = self
@@ -5387,6 +5436,22 @@ impl HarnessBroker {
         let scope = crate::backend::InvocationScope::new(request.owner()?, interaction.id.clone());
         let (backend_event_sink, mut backend_event_stream) =
             crate::backend::events::channel(scope.clone());
+        let tool_timeout = crate::settings::SettingsStore::read_only(&self.data_root)?
+            .get(
+                &self.session.workspace,
+                &self.session.id,
+                &self.session.backend,
+            )?
+            .desired
+            .tool_timeout
+            .unwrap_or(self.session.tool_timeout);
+        let tool_watchdog = Arc::new(crate::backend::tool_timeout::ToolWatchdog::new(
+            tool_timeout,
+        )?);
+        self.observer
+            .session_events
+            .watch_tools(&scope, &tool_watchdog)?;
+        let backend_event_sink = backend_event_sink.supervise_tools(tool_watchdog.clone());
         let (execution_sender, mut execution_receiver) =
             tokio::sync::mpsc::channel::<crate::plan::execution::ExecutionControl>(1);
         let execution = self
@@ -5449,6 +5514,7 @@ impl HarnessBroker {
             crate::plan::revision_review::RevisionReviewWait,
         )> = None;
         let delivery_sink = self.event_sink.clone();
+        let mut question_changes = self.questions.changed.subscribe();
         let mut provider_task = tokio::task::JoinSet::new();
         // Provider polling starts at a task boundary instead of inside the host dispatch stack.
         provider_task.spawn(async move {
@@ -5481,6 +5547,39 @@ impl HarnessBroker {
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => break Err(anyhow::Error::new(TurnCancelled)),
+                    expired = tool_watchdog.expired() => {
+                        let expired = expired?.context("tool watchdog ended during foreground execution")?;
+                        cancellation.requested.store(true, Ordering::Release);
+                        let message = expired.to_string();
+                        self.process_backend_event(&mut runtime, interaction, BackendEvent::Tool {
+                            address: expired.address.clone(),
+                            update: crate::backend::ToolUpdate::Finished {
+                                outcome: crate::backend::ToolOutcome::Failed {
+                                    diagnostic: crate::backend::ToolDiagnostic {
+                                        code: Some("tool_timeout".into()), message,
+                                    },
+                                },
+                            },
+                        }, event).await?;
+                        break Err(anyhow::Error::new(expired));
+                    }
+                    changed = question_changes.changed(), if !self.question_discussion => {
+                        changed.context("question controller closed during execution")?;
+                        if self.questions.snapshot()?.required_in_exchange(&interaction.id) {
+                            let backend_session_id = self.backend.active_session_id_for(&self.session.id).await
+                                .or_else(|| self.session.backend_session_id.clone());
+                            self.backend.cleanup_execution(&self.session.id).await
+                                .context("stop execution for required questions")?;
+                            // The controller owns this deliberate stop; it is not evidence of task completion.
+                            let completion = crate::backend::BackendCompletion {
+                                backend_session_id,
+                                provider_checkpoint_id: self.session.provider_checkpoint_id.clone(),
+                                capability: self.capability.clone(),
+                                ..Default::default()
+                            };
+                            break Ok(completion);
+                        }
+                    }
 
                     result = async {
                         match runtime.checkpoint.as_mut() {
@@ -5785,6 +5884,9 @@ impl HarnessBroker {
             checkpoint_failed
                 || error.downcast_ref::<TurnCancelled>().is_some()
                 || error
+                    .downcast_ref::<crate::backend::tool_timeout::ToolTimeout>()
+                    .is_some()
+                || error
                     .downcast_ref::<crate::backend::events::EventDeliveryError>()
                     .is_some()
         }) && let Err(error) = self.backend.cancel_session(&self.session.id).await
@@ -5792,6 +5894,13 @@ impl HarnessBroker {
             outcome = Err(error).context("stop cancelled backend transport");
         }
         self.exchange_runtime = Some(runtime);
+        if outcome.is_ok() {
+            self.observer.session_events.monitor_background(
+                scope,
+                tool_watchdog,
+                self.backend.clone(),
+            )?;
+        }
         outcome
     }
 
@@ -5833,6 +5942,9 @@ impl HarnessBroker {
     /// Retry finalization without submitting provider input or replaying tool execution.
     async fn cancel_settled_execution(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut event = Vec::new();
+        if self.task_controller.current()?.is_none() {
+            self.questions.cancel_chat(None)?;
+        }
         if self
             .current_goal()?
             .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
@@ -7943,8 +8055,9 @@ impl HarnessBroker {
             );
             params["approval_timeout"] =
                 serde_json::to_value(settings.desired.approval_timeout.unwrap_or_default())?;
-            params["answer_timeout"] =
-                serde_json::to_value(settings.desired.answer_timeout.unwrap_or_default())?;
+            params["tool_timeout"] =
+                serde_json::to_value(settings.desired.tool_timeout.unwrap_or_default())?;
+
             let desired = serde_json::to_value(&settings.desired)?;
             for (key, value) in desired.as_object().context("settings must be an object")? {
                 if !value.is_null() && key != "skill" && key != "mcp" && key != "plan_compact" {
@@ -7971,9 +8084,9 @@ impl HarnessBroker {
             );
             configured.auto_compaction = policy;
         }
-        (configured.approval_timeout, configured.answer_timeout) = self
+        configured.approval_timeout = self
             .permission_coordinator
-            .input_timeouts(&self.session.id)?;
+            .approval_timeout(&self.session.id)?;
         let access = params
             .get("access")
             .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
@@ -7992,10 +8105,10 @@ impl HarnessBroker {
                 serde_json::from_value::<crate::session::InputTimeout>(value.clone())?
                     .validate()?;
         }
-        if let Some(value) = params.get("answer_timeout") {
-            configured.answer_timeout =
+        if let Some(value) = params.get("tool_timeout") {
+            configured.tool_timeout =
                 serde_json::from_value::<crate::session::InputTimeout>(value.clone())?
-                    .validate()?;
+                    .require_expiry()?;
         }
         let requested_service_tier = params
             .get("service_tier")
@@ -8189,17 +8302,11 @@ impl HarnessBroker {
                 .await?;
         }
         let previous = std::mem::replace(&mut self.session, configured);
-        self.permission_coordinator.configure_input_timeouts(
-            &self.session.id,
-            self.session.approval_timeout,
-            self.session.answer_timeout,
-        )?;
+        self.permission_coordinator
+            .configure_timeout(&self.session.id, self.session.approval_timeout)?;
         if let Err(error) = self.save_session() {
-            self.permission_coordinator.configure_input_timeouts(
-                &previous.id,
-                previous.approval_timeout,
-                previous.answer_timeout,
-            )?;
+            self.permission_coordinator
+                .configure_timeout(&previous.id, previous.approval_timeout)?;
             self.session = previous;
             return Err(error);
         }
@@ -8250,8 +8357,8 @@ impl HarnessBroker {
                 portable.approval_timeout = Some(self.session.approval_timeout);
                 changed = true;
             }
-            if params.get("answer_timeout").is_some() {
-                portable.answer_timeout = Some(self.session.answer_timeout);
+            if params.get("tool_timeout").is_some() {
+                portable.tool_timeout = Some(self.session.tool_timeout);
                 changed = true;
             }
             if let Some(enabled) = subagent_tools {
@@ -8619,7 +8726,7 @@ impl HarnessBroker {
     }
 
     fn backend_request(&self, input: BackendInput, mode: PromptMode) -> BackendRequest {
-        BackendRequest {
+        let mut request = BackendRequest {
             execution_owner: None,
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
@@ -8637,7 +8744,15 @@ impl HarnessBroker {
             effort: self.session.effort.clone(),
             context_window: self.session.context_window.clone(),
             service_tier: self.session.service_tier,
-            access: self.session.access.clone(),
+            access: {
+                let mut access = self.session.access.clone();
+                if self.question_discussion {
+                    access.sandbox = true;
+                    access.write_access = crate::session::WriteScope::Off;
+                    access.writable_directory.clear();
+                }
+                access
+            },
             approval_mode: self.session.approval_mode,
             backend_session_id: self.session.backend_session_id.clone(),
             submission: None,
@@ -8647,7 +8762,17 @@ impl HarnessBroker {
             } else {
                 mode
             }),
+        };
+        if let Some(selection) = &self.question_model {
+            request.model = selection
+                .model
+                .clone()
+                .unwrap_or_else(|| self.session.model.clone());
+            request.effort = selection.effort.clone().unwrap_or_default();
+            request.service_tier = selection.service_tier.unwrap_or_default();
+            request.context_window = None;
         }
+        request
     }
 
     fn event(&self, name: &str, payload: Value) -> Result<SessionEvent> {
@@ -8659,9 +8784,9 @@ impl HarnessBroker {
     }
 
     fn save_session(&mut self) -> Result<()> {
-        (self.session.approval_timeout, self.session.answer_timeout) = self
+        self.session.approval_timeout = self
             .permission_coordinator
-            .input_timeouts(&self.session.id)?;
+            .approval_timeout(&self.session.id)?;
         let now_ms = self.clock.now_ms();
         self.session.acquire_lease(&self.client_id)?;
         self.session.updated_at_ms = now_ms;
@@ -8797,7 +8922,7 @@ fn preference_for_session(
         plan_executor: session.plan_executor.clone(),
         plan_compact: session.plan_compact,
         approval_timeout: session.approval_timeout,
-        answer_timeout: session.answer_timeout,
+        tool_timeout: session.tool_timeout,
     }
 }
 
@@ -15253,7 +15378,7 @@ let sink = Some(sink);
             plan_executor: Default::default(),
             plan_compact: false,
             approval_timeout: Default::default(),
-            answer_timeout: Default::default(),
+            tool_timeout: Default::default(),
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: Default::default(),
@@ -15297,7 +15422,7 @@ let sink = Some(sink);
                 plan_executor: Default::default(),
                 plan_compact: false,
                 approval_timeout: Default::default(),
-                answer_timeout: Default::default(),
+                tool_timeout: Default::default(),
             }),
         );
         assert_eq!(preference.model_setting.len(), 2);
@@ -15541,6 +15666,83 @@ let sink = Some(sink);
             fail_withdrawal_continuation: false,
         });
         broker
+    }
+
+    #[test]
+    fn question_discussion_is_read_only_without_changing_session_access() {
+        let repository = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.session.access.sandbox = false;
+        broker.session.access.write_access = crate::session::WriteScope::Full;
+        broker.question_discussion = true;
+        let request = broker.backend_request(
+            BackendInput::from_text("Explain this choice"),
+            PromptMode::Chat,
+        );
+        assert!(request.access.sandbox);
+        assert_eq!(request.access.write_access, crate::session::WriteScope::Off);
+        assert!(request.access.writable_directory.is_empty());
+        assert!(!broker.session.access.sandbox);
+        assert_eq!(
+            broker.session.access.write_access,
+            crate::session::WriteScope::Full
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_question_discussion_starts_after_completed_exchange() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.backend = Arc::from(crate::backend::build(
+            BackendLaunch {
+                kind: "mock".into(),
+                command: vec!["mock".into()],
+            },
+            broker.permission_coordinator.clone(),
+            broker.trace.clone(),
+            broker.data_root.clone(),
+        )?);
+        broker
+            .submit_prompt(json!({"text":"Original request"}))
+            .await?;
+        let original = broker.store.latest_exchange(&broker.session.id)?.unwrap();
+        let ids = broker.questions.ask(
+            "ask-after-completion",
+            &original.id,
+            crate::question::QuestionOrigin::Chat,
+            vec![crate::question::QuestionDraft {
+                header: "Layout".into(),
+                question: "Which layout?".into(),
+                requirement: crate::question::QuestionRequirement::Optional,
+                options: Vec::new(),
+            }],
+        )?;
+        for message_kind in [
+            crate::question::QuestionMessageKind::Clarification,
+            crate::question::QuestionMessageKind::Answer,
+        ] {
+            broker.input_purpose = crate::input::InputPurpose::Question {
+                question_id: ids[0].clone(),
+                task_id: None,
+                message_kind,
+            };
+            broker
+                .submit_prompt(json!({"text":"Internal question delivery context"}))
+                .await?;
+            let discussion = broker.store.latest_exchange(&broker.session.id)?.unwrap();
+            assert_ne!(discussion.id, original.id);
+            assert!(discussion.prompt.ends_with(": Layout"));
+            assert!(
+                !discussion
+                    .prompt
+                    .contains("Internal question delivery context")
+            );
+        }
+        assert!(broker.questions.snapshot()?.questions[0].pending());
+        assert!(!broker.question_discussion);
+        Ok(())
     }
 
     #[tokio::test]

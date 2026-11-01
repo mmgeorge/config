@@ -240,6 +240,16 @@ impl SqliteStore {
                 });
         let retire_questions =
             effects.retire_questions || entry_changed || previous.is_some() && active.is_none();
+        let completed = effects.event.iter().any(|event| matches!(&event.detail,
+            crate::timeline::SessionEventKind::TaskFinished { outcome } if matches!(outcome.state, crate::task::TaskOutcomeState::Complete)));
+        if !completed
+            && let Some(previous) = previous.as_ref()
+            && active.as_ref().is_none_or(|current| {
+                current.id != previous.id || current.status() == crate::task::TaskStatus::Cancelled
+            })
+        {
+            crate::question::retire_task(&transaction, session_id, previous.id.as_str())?;
+        }
         if retire_questions {
             super::question::retire_task_questions(
                 &transaction,

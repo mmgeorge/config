@@ -6,7 +6,9 @@ The test machine ran Windows 11 Pro build 26300 on an AMD Ryzen 9 9900X, with Ne
 
 ## Accuracy
 
-The frozen model passes all 18 development occurrences. The separate 32-occurrence held-out set corrected 15 of 16 errors and preserved all 16 correct controls, and `You may loose the connection` stays a missed correction. These small samples catch regressions, and they do not establish general grammatical accuracy. The [evaluation record](../../rust/forge/crates/forge-text/evaluation/README.md) holds the harness, outputs, asset provenance, and frozen parameters.
+The historical `en-US-bigram-3` model passed all 18 development occurrences. The separate 32-occurrence held-out set corrected 15 of 16 errors and preserved all 16 correct controls, while `You may loose the connection` stayed a missed correction. These small samples did not establish general grammatical accuracy. The [evaluation record](../../rust/forge/crates/forge-text/evaluation/README.md) preserves that harness and its outputs.
+
+The current `en-US-bigram-4` model preserves recognized English and configured vocabulary words. Production model and host fixtures exercise `two`, `too`, and `off`, full sentences and typing prefixes, and the explicit contraction and capitalization rules. Contextual substitutions such as `form` to `from`, `then` to `than`, and `loose` to `lose` are no longer automatic corrections.
 
 ## Latency
 
@@ -49,6 +51,6 @@ Rust tests run with `cargo test --profile dev --locked -p forge-text --lib <exac
 
 ## Known limits
 
-The model can miss contextual errors. Disabling `text_correction.enabled` cancels pending work and restores owned mappings without changing existing text.
+The model deliberately leaves contextual errors unchanged when the original word is recognized. Unknown spellings still use frequency-based suggestions, so their automatic corrections can be wrong. Disabling `text_correction.enabled` cancels pending work and restores owned mappings without changing existing text.
 
 The Backspace fallback must follow the original mapping's `replace_keycodes` flag. Converting an expression mapping's result a second time produced the `word<80>kb` corruption that `text_backspace_encoding` now covers.

@@ -34,6 +34,20 @@ Settings, permission, model, resource, and compaction changes go through one coo
 
 `forge.replica` keeps confirmed state, optimistic intents, and editor drafts apart. A reply removes only its matching intent and rebuilds the view over the newest confirmed state. Snapshots are scoped to their conversation, host generation, runtime epoch, and revision, so an older snapshot cannot replace newer state. A revision gap keeps the previous view until replacement state arrives. Failed state reads stay visible and retry after one, two, and four seconds.
 
+## Tool execution deadlines
+
+`BackendEventSink` supplies tool lifecycle events to `ToolWatchdog`, which captures
+each invocation's deadline once. The root broker and `AgentRuntime` stop provider
+execution when the earliest unfinished tool expires and retain the timeout as a
+failure. Output, title changes, and replayed start events cannot extend a deadline.
+
+The `tool_timeout` setting defaults to ten minutes and applies to shell commands as
+well as tool calls. `SessionEventInbox` retains watchdogs for confirmed background
+commands after foreground completion and routes their later terminal events to the
+original watchdog. `CheckSupervisor` applies the same setting to each subprocess,
+collects the terminated process tree, and stops the run on timeout. The `/config`
+timeout endpoint saves this policy without interrupting the current provider turn.
+
 ## Durable storage
 
 SQLite runs in WAL mode with FULL synchronization at `stdpath("data")/forge/harness/harness.sqlite3`. File content lives in a SHA-256 object store, and plans keep canonical JSON and Markdown under `plans/`. Mutating transactions take write admission before reading their baselines. If the five-second busy timeout runs out, the operation fails visibly and provider work is not replayed. The Harness and settings databases each keep a version in `PRAGMA user_version`, and a newer unsupported schema is left untouched.
@@ -99,13 +113,13 @@ Workflow changes never enable writing or widen filesystem scope. When a permissi
 
 Restart recovery keeps committed phases and completion evidence, suspends pending entries and continuations, and never starts a provider automatically. Explicit resume reactivates the retained task; a proven pending entry keeps its provider-input identity. Uncertain provider delivery remains governed by the submission journal rather than by the task's phase. Failure, disconnect, and unknown outcomes stop automatic queue draining.
 
-Session format 58, preference format 42, and portable-settings format 3 omit workflow approval defaults. New conversations start in Ask; existing conversations retain their explicit approval mode, including across Plan → Execute. Storage retains older envelopes unchanged and excludes them from current loading; schema setup does not reconstruct obsolete task state. The current task decoder validates phase payloads instead of guessing transitions from an older representation.
+Session format 59, preference format 43, and portable-settings format 4 omit workflow approval defaults. New conversations start in Ask; existing conversations retain their explicit approval mode, including across Plan → Execute. Storage retains older envelopes unchanged and excludes them from current loading; schema setup does not reconstruct obsolete task state. The current task decoder validates phase payloads instead of guessing transitions from an older representation.
 
 After exclusive runtime ownership is acquired, recovery also settles detached background tools inside already-completed exchanges. It preserves the foreground outcome, output, and last observed duration. On a fresh Copilot binding, native history is checked for unmatched tool calls; only a verified incomplete suffix can be truncated, and the retained prefix is checked again before new input is sent. The repaired session's provider prompt cautions that prior actions may have completed and must be inspected before repeating writes. Successful recovery does not emit an editor warning; ambiguous history blocks admission rather than discarding completed work.
 
 ## Plan generation
 
-The broker owns plan generation as one bounded continuation loop for every backend. Each turn applies plan edits to the canonical document, and only three outcomes move forward: a submitted plan, a new unresolved question, or another bounded turn. `ContinuationBudget` uses a default total allowance of 20 model turns and stops after five consecutive turns without observable progress. Plan acceptance carries consumed allowance into Execute; review revisions do not replenish the total allowance. Explicit resume or retry resets the continuation allowance while retaining task history.
+The broker owns plan generation as one bounded continuation loop for every backend. Each turn applies plan edits to the canonical document and either submits the plan or reserves another bounded turn. Required questions stop execution while preserving the continuation; optional questions leave that loop running. A required-question stop does not count as a failed progress attempt, even when the user answers before the turn finishes settling. `ContinuationBudget` uses a default total allowance of 20 model turns and stops after five consecutive turns without observable progress. Plan acceptance carries consumed allowance into Execute; review revisions do not replenish the total allowance. Explicit resume or retry resets the continuation allowance while retaining task history.
 
 Execution compares saved workspace checkpoints and plan document versions when observing progress. Phase changes, reads, failed edits, and repeated findings do not reset its no-progress count; new completed verification evidence can advance a manual verification attempt. Local check operations and human waits do not consume model turns. The native task summary supplies workflow, phase, and status to the winbar, so Lua does not reconstruct lifecycle state from artifact records.
 
@@ -124,3 +138,34 @@ Provider usage normalizes into durable `ContextUsage`. `AutoCompaction` is a per
 ## Out of scope
 
 Harness adds providers only through the typed `Backend` contract and never scrapes terminals. The broker runs per Neovim process, so controlling a session from another editor would need a shared daemon with stronger lease coordination. Provider-local hooks and command policies can still reject a tool under Harness Allow, because backend-native policy stays authoritative outside the Harness protocol.
+
+
+## Question ownership
+
+`QuestionController` stores each session's questions, resolution, discussion,
+operation receipts, and pending outbox in `session_question_state` in
+`harness.sqlite3`. Creation and answer/outbox persistence occur before publication,
+without the broker's execution lock. Independent SQLite connections serialize
+mutations with immediate transactions.
+
+The input worker transfers each outbox entry into the existing input journal using
+a stable operation ID, then acknowledges that transfer. Provider acknowledgment
+remains owned by the submission journal. A crash before transfer repeats admission;
+a crash after admission reuses its receipt. Unknown provider delivery requires
+reconciliation and never authorizes blind replay.
+
+Optional questions do not gate tasks. Required questions stop active provider work
+through the shared cleanup boundary and block automatic input and checks. Answers
+and clarification can run discussion-only turns with writes disabled; task
+continuation waits for required resolution and outstanding answer delivery.
+Exchange completion retains questions. Task cancellation/replacement retires its
+pending questions, and late answers cannot target the replacement task.
+
+A required question in plain chat retains one continuation for its original
+exchange. Once required decisions resolve, the input worker admits user responses
+first and then queues that continuation through the same journal. It cannot steer
+into a read-only discussion turn or replay after acknowledgment. An optional
+answer never creates a continuation for completed work. Each idle question delivery
+admits a new discussion exchange instead of reopening the completed source exchange.
+Cancellation revokes unfinished chat continuations and retires their pending
+questions; optional questions from normally completed work remain answerable.

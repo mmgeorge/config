@@ -1,4 +1,5 @@
 local M = {}
+local rotation_bytes = 2 * 1024 * 1024
 
 local path
 local timer
@@ -26,11 +27,18 @@ end
 local function write(event, fields)
   if not path then return end
   local success, failure = pcall(function()
-    vim.fn.writefile({ vim.json.encode({
+    local record = vim.json.encode({
       time = os.date("!%Y-%m-%dT%H:%M:%SZ"),
       monotonic_ns = tostring(vim.uv.hrtime()),
       pid = vim.fn.getpid(), event = event, fields = fields or context(),
-    }) }, path, "a")
+    })
+    local stat, stat_failure = vim.uv.fs_stat(path)
+    if stat_failure and not stat_failure:match("^ENOENT:") then error(stat_failure) end
+    if stat and stat.size > 0 and stat.size + #record + 1 > rotation_bytes then
+      local renamed, rename_failure = vim.uv.fs_rename(path, path .. ".1")
+      if not renamed then error(rename_failure) end
+    end
+    vim.fn.writefile({ record }, path, "a")
   end)
   if not success and not reporting_failure then
     reporting_failure = true
@@ -58,7 +66,7 @@ local function observe_notifications()
 end
 
 --- Installs diagnostic observers once without changing command or exit behavior.
---- Writes one JSONL file per process under stdpath("log")/sessions.
+--- Rotates each process's JSONL at 2 MiB under stdpath("log")/sessions, keeping one prior segment.
 ---@return string? path Diagnostic file, or nil when directory creation fails.
 function M.setup()
   if path then return path end

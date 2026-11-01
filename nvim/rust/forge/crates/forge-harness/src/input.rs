@@ -42,6 +42,14 @@ pub enum InputDelivery {
 pub enum InputPurpose {
     #[default]
     User,
+    Question {
+        question_id: crate::question::QuestionId,
+        task_id: Option<String>,
+        message_kind: crate::question::QuestionMessageKind,
+    },
+    QuestionContinuation {
+        exchange_id: String,
+    },
     TaskEntry {
         revision: crate::task::TaskRevision,
         id: crate::task::TaskInputId,
@@ -318,7 +326,11 @@ impl SessionInputQueue {
                 ensure!(id.as_str() == message.id, "task input identity changed");
                 revision
             }
-            InputPurpose::User => anyhow::bail!("task reconciliation requires task input"),
+            InputPurpose::User
+            | InputPurpose::Question { .. }
+            | InputPurpose::QuestionContinuation { .. } => {
+                anyhow::bail!("task reconciliation requires task input")
+            }
         };
         let mut retained = self
             .state
@@ -334,7 +346,11 @@ impl SessionInputQueue {
             let previous_revision = match &previous.purpose {
                 InputPurpose::TaskEntry { revision, .. }
                 | InputPurpose::TaskContinuation { revision, .. } => revision,
-                InputPurpose::User => anyhow::bail!("task input collides with user input"),
+                InputPurpose::User
+                | InputPurpose::Question { .. }
+                | InputPurpose::QuestionContinuation { .. } => {
+                    anyhow::bail!("task input collides with user input")
+                }
             };
             if previous_revision == revision
                 || matches!(

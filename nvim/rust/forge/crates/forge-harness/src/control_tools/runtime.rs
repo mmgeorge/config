@@ -9,6 +9,9 @@ use std::sync::Arc;
 /// Carries the broker-owned control state visible to one provider turn.
 #[derive(Clone)]
 pub struct ControlTurnContext {
+    pub(crate) questions: Option<Arc<crate::question::QuestionController>>,
+    pub(crate) question_exchange_id: Option<String>,
+    pub(crate) question_discussion: bool,
     pub(crate) task_controller: Option<Arc<crate::task::SessionTaskController>>,
     pub(crate) task_permit: Option<crate::task::TaskPermit>,
     pub(crate) native_goal: Option<String>,
@@ -56,6 +59,9 @@ impl ControlTurnContext {
     /// Build an inert context for backend calls without broker state.
     pub fn inactive(mode: PromptMode) -> Self {
         Self {
+            questions: None,
+            question_exchange_id: None,
+            question_discussion: false,
             task_controller: None,
             task_permit: None,
             native_goal: None,
@@ -115,6 +121,119 @@ impl ControlToolRuntime {
         &mut self,
         mut invocation: ControlToolInvocation,
     ) -> Result<ControlToolResult> {
+        if self.context.question_discussion {
+            anyhow::ensure!(
+                matches!(
+                    invocation.name.as_str(),
+                    "question_ask"
+                        | "question_reply"
+                        | "question_revise"
+                        | "question_withdraw"
+                        | "plan_read"
+                ) || super::harness::is_tool(&invocation.name)
+                    || super::lsp::is_tool(&invocation.name),
+                "question discussion cannot change task state or workspace content"
+            );
+        }
+        if let Some(controller) = self.context.questions.as_ref()
+            && controller.snapshot()?.required_pending()
+            && !self.context.question_discussion
+        {
+            anyhow::ensure!(
+                matches!(
+                    invocation.name.as_str(),
+                    "question_reply" | "question_revise" | "question_withdraw"
+                ),
+                "required questions must be resolved before continuing task work"
+            );
+        }
+        if matches!(
+            invocation.name.as_str(),
+            "question_ask" | "question_reply" | "question_revise" | "question_withdraw"
+        ) && let Some(controller) = self.context.questions.as_ref()
+        {
+            super::validate_arguments(&invocation)?;
+            let task = if let Some(permit) = self.context.task_permit.as_ref() {
+                let task = self
+                    .context
+                    .task_controller
+                    .as_ref()
+                    .context("question task owner is missing")?
+                    .current()?;
+                permit.validate(task.as_ref())?;
+                task
+            } else {
+                None
+            };
+            if invocation.name == "question_ask" {
+                let drafts: Vec<crate::question::QuestionDraft> =
+                    serde_json::from_value(invocation.arguments["questions"].clone())?;
+                let required = drafts.iter().any(|draft| {
+                    draft.requirement == crate::question::QuestionRequirement::Required
+                });
+                let ids = controller.ask(
+                    invocation.arguments["id"]
+                        .as_str()
+                        .context("question operation id required")?,
+                    self.context
+                        .question_exchange_id
+                        .as_deref()
+                        .context("question has no originating exchange")?,
+                    if self.context.question_discussion {
+                        crate::question::QuestionOrigin::Discussion(task.as_ref())
+                    } else {
+                        task.as_ref().map_or(
+                            crate::question::QuestionOrigin::Chat,
+                            crate::question::QuestionOrigin::Task,
+                        )
+                    },
+                    drafts,
+                )?;
+                self.terminal |= required;
+                return Ok(ControlToolResult { invocation: None, message: serde_json::json!({"question_ids":ids,"required":required,"instruction":if required { "Required questions accepted. Stop task work until answered or withdrawn." } else { "Questions saved. Continue useful work; recommendations are not user answers." }}).to_string() });
+            }
+            let action = match invocation.name.as_str() {
+                "question_reply" => crate::question::QuestionAction::Reply {
+                    message_id: invocation.arguments["message_id"]
+                        .as_str()
+                        .context("clarification message identity required")?
+                        .into(),
+                    text: invocation.arguments["text"]
+                        .as_str()
+                        .context("reply text required")?
+                        .into(),
+                },
+                "question_revise" => crate::question::QuestionAction::Revise {
+                    draft: serde_json::from_value(invocation.arguments["draft"].clone())?,
+                },
+                "question_withdraw" => crate::question::QuestionAction::Withdraw {
+                    reason: invocation.arguments["reason"]
+                        .as_str()
+                        .context("withdrawal reason required")?
+                        .into(),
+                },
+                _ => unreachable!(),
+            };
+            let snapshot = controller.apply(crate::question::QuestionCommand {
+                operation_id: invocation.arguments["operation_id"]
+                    .as_str()
+                    .context("question operation id required")?
+                    .into(),
+                question_id: invocation.arguments["question_id"]
+                    .as_str()
+                    .context("question identity required")?
+                    .to_owned()
+                    .try_into()?,
+                revision: invocation.arguments["revision"]
+                    .as_u64()
+                    .context("question revision required")?,
+                action,
+            })?;
+            return Ok(ControlToolResult {
+                invocation: None,
+                message: serde_json::to_string(&snapshot)?,
+            });
+        }
         let adding_checks = invocation.name == "plan_checks_add";
         if adding_checks {
             super::validate_arguments(&invocation)?;
@@ -740,6 +859,48 @@ fn read_design(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[tokio::test]
+    async fn persistent_questions_append_without_terminating_each_workflow() -> Result<()> {
+        for mode in [
+            PromptMode::Chat,
+            PromptMode::Plan,
+            PromptMode::ExecutePlan,
+            PromptMode::GoalContinuation,
+        ] {
+            let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+            let controller = Arc::new(crate::question::QuestionController::open(
+                root.path(),
+                "session",
+            )?);
+            let mut context = ControlTurnContext::inactive(mode);
+            context.questions = Some(controller.clone());
+            context.question_exchange_id = Some("exchange".into());
+            let mut runtime = ControlToolRuntime::new(context);
+            for operation in ["first", "second"] {
+                runtime.invoke(ControlToolInvocation { task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
+                    "id": operation, "questions": [{"header":"Layout", "question":"Choose a layout", "requirement":"optional", "options":[]}]
+                }) }).await?;
+                assert!(!runtime.terminal);
+            }
+            assert_eq!(controller.snapshot()?.questions.len(), 2);
+            runtime.invoke(ControlToolInvocation { task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
+                "id":"required", "questions":[{"header":"Target", "question":"Choose the target", "requirement":"required", "options":[]}]
+            }) }).await?;
+            assert!(runtime.terminal);
+            assert!(controller.snapshot()?.required_pending());
+            let failure = runtime
+                .invoke(ControlToolInvocation {
+                    task_permit: None,
+                    name: "goal_complete".into(),
+                    arguments: serde_json::json!({"summary":"not allowed"}),
+                })
+                .await
+                .unwrap_err();
+            assert!(failure.to_string().contains("required questions"));
+        }
+        Ok(())
+    }
     use serde_json::json;
 
     #[tokio::test]
@@ -945,6 +1106,9 @@ mod test {
         let workspace = tempfile::tempdir().unwrap().keep();
         crate::checks::configure_fixture(&workspace);
         ControlTurnContext {
+            questions: None,
+            question_exchange_id: None,
+            question_discussion: false,
             native_goal: None,
             submission_cancelled: None,
             checkpoint: None,

@@ -8,11 +8,12 @@ function M.word_character(character)
   return class==2 or class>=256
 end
 
----The English dictionary accepts ASCII spelling candidates without transliteration.
+---Admit English letters and contraction apostrophes without transliterating other alphabets.
 ---@param word string
 ---@return boolean
 function M.supports_english_correction(word)
-  return word:find("[A-Za-z]")~=nil and word:find("[^A-Za-z']")==nil
+  local spelling = word:gsub("’", "'")
+  return spelling:find("[A-Za-z]")~=nil and spelling:find("[^A-Za-z']")==nil
 end
 
 ---@param text string

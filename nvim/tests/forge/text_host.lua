@@ -12,12 +12,12 @@ local ok,failure=xpcall(function()
   fixture.exec([[
     local client=require('forge.client')
     local request={method='text.correct',params={profile=text_ready.profile,profile_revision=text_ready.profile_revision,
-      occurrence='wire-example',context='The value is greater then zero.',target={start=21,['end']=25},protected={}}}
+      occurrence='wire-example',context='Please recieve',target={start=7,['end']=14},protected={}}}
     client.request(request,function(result,error) text_wire={request=request,result=result,error=error} end)
   ]])
   assert(vim.wait(2000,function()return fixture.exec('return text_wire~=nil')end,10))
   local wire=fixture.exec('return text_wire')
-  assert(wire.result and wire.result.replacement=='than',vim.inspect(wire))
+  assert(wire.result and wire.result.replacement=='receive',vim.inspect(wire))
   fixture.exec([[
     local request={method='text.correct',params={profile=text_ready.profile,profile_revision=text_ready.profile_revision,
       occurrence='unchanged-example',context='Please receive',target={start=7,['end']=14},protected={}}}

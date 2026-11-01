@@ -28,7 +28,7 @@ pub enum TimeoutUnit {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Configures one input deadline. Zero disables expiry.
+/// Configures an operation deadline. Input waits may disable expiry with zero.
 pub struct InputTimeout {
     /// Holds a nonnegative whole count, with zero disabling expiry.
     pub amount: u32,
@@ -37,6 +37,16 @@ pub struct InputTimeout {
 }
 
 impl InputTimeout {
+    /// Reject disabled expiry for tool and shell execution.
+    pub fn require_expiry(self) -> Result<Self> {
+        self.validate()?;
+        ensure!(
+            self.amount > 0,
+            "tool and shell timeout must be greater than zero"
+        );
+        Ok(self)
+    }
+
     /// Validate the duration before saving it or creating a runtime timer.
     pub fn validate(self) -> Result<Self> {
         let duration = self.duration();
@@ -159,6 +169,23 @@ impl InputSchedule {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Keep tool deadlines enabled even though approval waits support disabling expiry.
+    #[test]
+    fn tool_timeout_requires_expiry_and_defaults_to_ten_minutes() {
+        assert_eq!(
+            InputTimeout::default().require_expiry().unwrap().duration(),
+            Duration::from_secs(600)
+        );
+        assert!(
+            InputTimeout {
+                amount: 0,
+                unit: TimeoutUnit::S
+            }
+            .require_expiry()
+            .is_err()
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn input_schedule_keeps_monotonic_deadlines_and_invalidates_replaced_owners() {

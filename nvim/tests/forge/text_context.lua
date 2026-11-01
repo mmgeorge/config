@@ -57,8 +57,8 @@ local target=assert(quoted_prose:find('recieve',1,true))-1
 for _,range in ipairs(prose.protected(quoted_prose)) do
   assert(not (range.start<=target and range['end']>=target+7),'ordinary quoted prose was protected')
 end
-for _,word in ipairs({"recieve", "don't", "UPPER"}) do assert(prose.supports_english_correction(word),word) end
-for _,word in ipairs({'Ω','日本語','café','café','don’t','recіeve',"''"}) do
+for _,word in ipairs({"recieve", "don't", "don’t", "i’ll", "UPPER"}) do assert(prose.supports_english_correction(word),word) end
+for _,word in ipairs({'Ω','日本語','café','café','recіeve',"''"}) do
   assert(not prose.supports_english_correction(word),'unsupported English candidate: '..word)
 end
 local lines={}

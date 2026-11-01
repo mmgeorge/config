@@ -132,6 +132,9 @@ impl HarnessBroker {
                 );
                 let cancelled = error.downcast_ref::<TurnCancelled>().is_some();
                 if cancelled && !self.turn_cancellation.restart.load(Ordering::Acquire) {
+                    if admitted_task.is_none() && !self.question_discussion {
+                        self.questions.cancel_chat(Some(&interaction.id))?;
+                    }
                     submission.cancel()?;
                 }
                 if self
@@ -692,13 +695,7 @@ impl HarnessBroker {
                     match plan.elicitation.as_mut() {
                         Some(elicitation) => elicitation.replace_question_set(question.clone()),
                         None => {
-                            let mut elicitation = PlanElicitation::new(question.clone());
-                            elicitation.start_timeout(
-                                self.permission_coordinator
-                                    .input_timeouts(&self.session.id)?
-                                    .1,
-                                self.clock.now_ms(),
-                            )?;
+                            let elicitation = PlanElicitation::new(question.clone());
                             plan.elicitation = Some(elicitation);
                         }
                     }
@@ -758,13 +755,7 @@ impl HarnessBroker {
                 }
                 if !self.replace_active_elicitation(question.clone(), &mut event)? {
                     interaction.set_awaiting_input(true);
-                    let mut elicitation = PlanElicitation::new(question.clone());
-                    elicitation.start_timeout(
-                        self.permission_coordinator
-                            .input_timeouts(&self.session.id)?
-                            .1,
-                        self.clock.now_ms(),
-                    )?;
+                    let elicitation = PlanElicitation::new(question.clone());
                     interaction.set_elicitation(Some(elicitation));
                     self.store.save_exchange(&interaction)?;
                     event.push(self.event(
@@ -792,7 +783,12 @@ impl HarnessBroker {
             interaction.set_elicitation(owner.elicitation().cloned());
             interaction.set_awaiting_input(owner.awaiting_input());
         }
-        let execution_paused = interaction.awaiting_input();
+        let question_snapshot = self.questions.snapshot()?;
+        let required_question_stop =
+            question_snapshot.required_in_exchange(&interaction.id) && !self.question_discussion;
+        let execution_paused = interaction.awaiting_input()
+            || question_snapshot.required_pending()
+            || required_question_stop;
         let observed_task = self.task_controller.current()?;
         if mode == PromptMode::ExecutePlan {
             output.evidence.structured_complete = false;
@@ -820,7 +816,20 @@ impl HarnessBroker {
             exchange_ordinal: interaction.ordinal,
             turn_ordinal: interaction.turn.len(),
         };
-        let continuing = if execution_paused && mode != PromptMode::ExecutePlan {
+        if required_question_stop
+            && let Some(task) = self.task_controller.current()?
+            && task.status() == crate::task::TaskStatus::Running
+            && task.entry_accepted()
+        {
+            if task.kind() == crate::task::TaskKind::Execute {
+                self.reserve_execution_continuation(completed_turn.clone())?;
+            } else {
+                self.task_controller.reserve_continuation(&mut self.store, &task.permit(), completed_turn.clone(),
+                    "Continue the current task at its preserved phase using the recorded user answers. Do not repeat resolved questions.".into(),
+                    "Continue after required questions are resolved".into(), self.clock.now_ms())?;
+            }
+        }
+        let continuing = if execution_paused || self.question_discussion {
             false
         } else {
             Box::pin(self.apply_goal_evidence(evidence, permit, completed_turn, &mut event)).await?

@@ -351,6 +351,7 @@
       "route *": "allow",
       "rustc --version": "allow",
       "rustup component list --installed": "allow",
+      "rustup show": "allow",
       "rustup show active-toolchain": "allow",
       "rustup toolchain list": "allow",
       "scutil": "allow",

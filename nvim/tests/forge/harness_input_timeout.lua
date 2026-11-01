@@ -31,7 +31,7 @@ local timer = instance.timer
 picker.close(false)
 assert(timer:is_closing(), "picker timer leaked")
 
-local configured = { id = "timeout-settings", backend = "mock", approval_timeout = { amount = 10, unit = "m" }, answer_timeout = { amount = 10, unit = "m" } }
+local configured = { id = "timeout-settings", backend = "mock", approval_timeout = { amount = 10, unit = "m" } }
 local state = { session = configured }
 local original_request, original_configure = client.request, controller.configure
 local saved = 0
@@ -96,7 +96,6 @@ end
 assert(saved == 0, "stepping saved before confirmation")
 press(editor.buffer, "<CR>")
 assert(saved == 1 and configured.approval_timeout.amount == 15 and configured.approval_timeout.unit == "s")
-assert(configured.answer_timeout.amount == 10 and configured.answer_timeout.unit == "m")
 editor = edit("approval_timeout")
 local choices = duration.choices()
 assert(#choices == 63)
@@ -108,13 +107,14 @@ press(editor.buffer, "<Up>")
 assert(shown(editor) == "60m", "maximum wrapped or exceeded 60 minutes")
 press(editor.buffer, "<CR>")
 assert(saved == 2 and configured.approval_timeout.amount == 60 and configured.approval_timeout.unit == "m")
-editor = edit("answer_timeout")
+configured.approval_timeout = { amount = 10, unit = "m" }
+settings.open(state, host)
+editor = edit("approval_timeout")
 press(editor.buffer, "<Down>")
 press(editor.buffer, "<CR>")
-assert(saved == 3 and configured.answer_timeout.amount == 9 and configured.answer_timeout.unit == "m")
-assert(configured.approval_timeout.amount == 60)
+assert(saved == 3 and configured.approval_timeout.amount == 9 and configured.approval_timeout.unit == "m")
 deferred = true
-editor = edit("answer_timeout")
+editor = edit("approval_timeout")
 press(editor.buffer, "<Down>")
 assert(shown(editor) == "8m")
 press(editor.buffer, "<CR>")
@@ -127,7 +127,14 @@ press(editor.buffer, "<Down>")
 assert(shown(editor) == "7m")
 press(editor.buffer, "<CR>")
 pending_save(true)
-assert(saved == 5 and configured.answer_timeout.amount == 7 and not picker._state_for_test().field_editor)
+assert(saved == 5 and configured.approval_timeout.amount == 7 and not picker._state_for_test().field_editor)
+deferred = false
+editor = edit("tool_timeout")
+assert(shown(editor) == "10m", "tool and shell timeout did not default to ten minutes")
+press(editor.buffer, "<Up>")
+press(editor.buffer, "<CR>")
+assert(saved == 6 and configured.tool_timeout.amount == 11 and configured.tool_timeout.unit == "m",
+  "tool and shell deadline was not saved through the timeout editor")
 for index, choice in ipairs(choices) do
   local value = duration.parse(choice)
   assert(duration.render(value) == choice)
@@ -141,7 +148,7 @@ picker.close(false)
 client.request, controller.configure = original_request, original_configure
 local timeout_configuration = require("forge.views.harness.timeout_configuration")
 local timeout_state = { session = { id = "ordered-timeouts", approval_timeout = { amount = 10, unit = "m" },
-  answer_timeout = { amount = 10, unit = "m" } } }
+  status_thoughts = true } }
 local requests, completions, failures = {}, {}, {}
 client.request = function(request, callback) requests[#requests + 1] = { request = request, callback = callback } end
 local function configure_timeout(values)
@@ -150,23 +157,23 @@ local function configure_timeout(values)
 end
 configure_timeout({ approval_timeout = { amount = 11, unit = "m" } })
 configure_timeout({ approval_timeout = { amount = 12, unit = "m" } })
-configure_timeout({ answer_timeout = { amount = 9, unit = "m" } })
+configure_timeout({ approval_timeout = { amount = 14, unit = "m" } })
 configure_timeout({ approval_timeout = { amount = 13, unit = "m" } })
 assert(#requests == 1, "rapid edits sent concurrent timeout writes")
-requests[1].callback({ approval_timeout = { amount = 11, unit = "m" }, answer_timeout = { amount = 10, unit = "m" } })
+requests[1].callback({ approval_timeout = { amount = 11, unit = "m" } })
 assert(#requests == 2 and requests[2].request.params.approval_timeout.amount == 13
-  and requests[2].request.params.answer_timeout.amount == 9, "pending edits lost the newest value of either field")
+  , "pending edits lost the newest value")
 assert(timeout_state.session.approval_timeout.amount == 10, "older response replaced a pending edit")
-requests[2].callback({ approval_timeout = { amount = 13, unit = "m" }, answer_timeout = { amount = 9, unit = "m" } })
-assert(timeout_state.session.approval_timeout.amount == 13 and timeout_state.session.answer_timeout.amount == 9)
+requests[2].callback({ approval_timeout = { amount = 13, unit = "m" } })
+assert(timeout_state.session.approval_timeout.amount == 13 and timeout_state.session.status_thoughts == true)
 assert(#completions == 4 and not vim.tbl_contains(completions, false))
 configure_timeout({ approval_timeout = { amount = 14, unit = "m" } })
 configure_timeout({ approval_timeout = { amount = 15, unit = "m" } })
 requests[3].callback(nil, "write failed")
 assert(#failures == 1 and completions[5] == false and #requests == 4, "a failed write stranded pending edits")
-requests[4].callback({ approval_timeout = { amount = 15, unit = "m" }, answer_timeout = { amount = 1, unit = "m" } })
-assert(timeout_state.session.approval_timeout.amount == 15 and timeout_state.session.answer_timeout.amount == 9,
-  "single-field response overwrote the other timeout")
+requests[4].callback({ approval_timeout = { amount = 15, unit = "m" }, status_thoughts = false })
+assert(timeout_state.session.approval_timeout.amount == 15 and timeout_state.session.status_thoughts == true,
+  "timeout response overwrote another setting")
 configure_timeout({ approval_timeout = { amount = 16, unit = "m" } })
 configure_timeout({ approval_timeout = { amount = 17, unit = "m" } })
 timeout_state.session = { id = "replacement-session", approval_timeout = { amount = 10, unit = "m" } }

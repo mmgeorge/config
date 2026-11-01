@@ -1,5 +1,5 @@
 {
-  "version": 30,
+  "version": 31,
   "node": {
     "kind": [
       "exchange",
@@ -23,6 +23,13 @@
     ]
   },
   "session": {
+    "questions_changed": {
+      "route": "handle",
+      "required": {
+        "revision": "integer",
+        "questions": "array"
+      }
+    },
     "input_changed": {
       "route": "handle",
       "required": {

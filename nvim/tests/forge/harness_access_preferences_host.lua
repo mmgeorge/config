@@ -99,14 +99,13 @@ local success, failure = xpcall(function()
       "approval mode overwrote saved sandbox preference or effective access")
   end
   for _ = 1, 3 do change("approval_timeout", "<Right>") end
-  for _ = 1, 2 do change("answer_timeout", "<Right>") end
   await(function()
     return not state.input_timeout_configuration.in_flight
-      and state.session.approval_timeout.amount == 13 and state.session.answer_timeout.amount == 12
+      and state.session.approval_timeout.amount == 13
   end, "rapid timeout edits did not retain both final values")
-  assert(field("approval_timeout").value.value == "13m" and field("answer_timeout").value.value == "12m")
+  assert(field("approval_timeout").value.value == "13m")
   local selected = request("settings.get", {})
-  assert(selected.desired.approval_timeout.amount == 13 and selected.desired.answer_timeout.amount == 12)
+  assert(selected.desired.approval_timeout.amount == 13)
   assert(selected.desired.access.sandbox and not state.session.access.sandbox)
   assert(request("session.task.get", {}) == nil, "configuration started a task")
   picker.close(false)

@@ -1,4 +1,5 @@
 mod contract;
+mod logs;
 mod page;
 #[cfg(test)]
 mod tests;
@@ -15,11 +16,12 @@ use crate::storage::inspection::SessionReader;
 use crate::turn::{MessageDelivery, MessageKind, TurnItem};
 use anyhow::{Context, Result, ensure};
 pub(super) use contract::definitions;
+use logs::LogSnapshot;
 use page::InspectionPage;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -68,6 +70,7 @@ struct Inspection {
     turn_id: Option<String>,
     fields: Option<Vec<String>>,
     cursor: Option<String>,
+    limit: Option<NonZeroUsize>,
 }
 
 impl HarnessInspectionScope {
@@ -102,11 +105,18 @@ impl HarnessInspectionScope {
         self.enabled
     }
 
-    fn check(&self, name: &str) -> Result<()> {
+    /// Reject work after cancellation or release of the owning interaction.
+    fn check_active(&self) -> Result<()> {
         ensure!(
             self.active.load(Ordering::Acquire) && !self.cancelled.load(Ordering::Acquire),
             "Harness inspection belongs to an inactive interaction"
         );
+        Ok(())
+    }
+
+    /// Revalidate live settings before admitting a read or publishing its result.
+    fn check(&self, name: &str) -> Result<()> {
+        self.check_active()?;
         if name != "harness_config" {
             ensure!(
                 SettingsStore::read_only(&self.data_root)?
@@ -156,6 +166,10 @@ impl HarnessInspectionScope {
     fn read(&self, name: &str, mut arguments: Value) -> Result<String> {
         self.check(name)?;
         let input: Inspection = serde_json::from_value(arguments.clone())?;
+        ensure!(
+            name == "harness_session_log" || input.limit.is_none(),
+            "limit is only supported for session logs"
+        );
         if name == "harness_session_search" {
             ensure!(
                 input
@@ -190,7 +204,11 @@ impl HarnessInspectionScope {
                 );
             }
             self.check(name)?;
-            return self.page_response(id, page, offset);
+            let result = self.page_response(id, page, offset);
+            if result.is_err() {
+                pages.remove(id);
+            }
+            return result;
         }
         let mut page = InspectionPage::new(identity)?;
         let reader = SessionReader::open(&self.data_root)?;
@@ -358,7 +376,7 @@ impl HarnessInspectionScope {
                         }
                     }
                 }
-                "harness_session_log" => self.logs(&session, &mut page)?,
+                "harness_session_log" => self.logs(&session, &mut page, input.limit)?,
                 _ => anyhow::bail!("unknown Harness inspection tool"),
             }
         }
@@ -381,7 +399,8 @@ impl HarnessInspectionScope {
     }
 
     fn page_response(&self, id: &str, page: &mut InspectionPage, offset: u64) -> Result<String> {
-        let mut value = page.read(offset)?;
+        let mut value = page.read(offset, || self.check_active())?;
+        self.check_active()?;
         let next = value
             .as_object_mut()
             .unwrap()
@@ -431,7 +450,7 @@ impl HarnessInspectionScope {
         result["settings"]["lsp_tools"] = json!(snapshot.desired.lsp_tools.unwrap_or(false));
         result["settings"]["subagent_tools"] =
             json!(snapshot.desired.subagent_tools.unwrap_or(false));
-        result["input_timeouts"] = json!({"approval_timeout":session.approval_timeout,"answer_timeout":session.answer_timeout});
+        result["input_timeouts"] = json!({"approval_timeout":session.approval_timeout,"tool_timeout":snapshot.desired.tool_timeout.unwrap_or(session.tool_timeout)});
         result["permissions"] = serde_json::to_value(&self.policy.document)?;
         result["locations"] = json!({"config_directory":root,"forge_rust":source.as_ref().map(|root|root.join("rust/forge")),
             "forge_lua":source.as_ref().map(|root|root.join("lua/forge")),
@@ -442,30 +461,20 @@ impl HarnessInspectionScope {
         Ok(result)
     }
 
-    fn logs(&self, session: &HarnessSession, page: &mut InspectionPage) -> Result<()> {
+    /// Retain finite log segments for incremental reads of at most the requested entry count.
+    fn logs(
+        &self,
+        session: &HarnessSession,
+        page: &mut InspectionPage,
+        limit: Option<NonZeroUsize>,
+    ) -> Result<()> {
         let current = PathBuf::from(self.trace.session_status(&session.id).path);
-        let mut found = false;
-        for path in (1..=3)
-            .rev()
-            .map(|generation| current.with_extension(format!("jsonl.{generation}")))
-            .chain([current.clone()])
-        {
-            let file = match std::fs::File::open(&path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error).context("open session log"),
-            };
-            found = true;
-            for line in BufReader::new(file).lines() {
-                self.check("harness_session_log")?;
-                let record: Value =
-                    crate::codec::from_str(&line?).context("decode session log record")?;
-                // Raw provider transports can contain private reasoning and embedded credentials.
-                // Expose the diagnostic metadata allowlist, not those transport bodies.
-                page.push(crate::trace::inspection_record(&record))?;
-            }
-        }
-        if !found {
+        if let Some(snapshot) = LogSnapshot::open(&current)? {
+            page.attach_log(
+                snapshot,
+                limit.unwrap_or(NonZeroUsize::new(100).expect("default log page size is positive")),
+            );
+        } else {
             page.push(json!({"session_id":session.id,"unavailable":"logs","reason":"No retained session log"}))?;
         }
         Ok(())

@@ -160,9 +160,9 @@ pub struct HarnessSession {
     #[serde(default)]
     /// Limits each pending approval independently.
     pub approval_timeout: InputTimeout,
+    /// Limits each tool invocation and shell command independently.
     #[serde(default)]
-    /// Limits one complete question set.
-    pub answer_timeout: InputTimeout,
+    pub tool_timeout: InputTimeout,
     #[serde(default)]
     pub context_window: Option<String>,
     #[serde(default)]
@@ -205,9 +205,9 @@ pub struct HarnessPreference {
     #[serde(default)]
     /// Limits each pending approval independently.
     pub approval_timeout: InputTimeout,
+    /// Limits each tool invocation and shell command independently.
     #[serde(default)]
-    /// Limits one complete question set.
-    pub answer_timeout: InputTimeout,
+    pub tool_timeout: InputTimeout,
 }
 
 /// Selects the model used after a plan is accepted.

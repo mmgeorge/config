@@ -41,7 +41,7 @@ local configuration_field_description = {
   ["write-access"] = "Directories the assistant may modify.",
   ["writable-directories"] = "Edit additional writable directories, one directory per line.",
   ["approval_timeout"] = "Time allowed for approval. Enter to edit; Up/Down adjust from 15 seconds to 60 minutes.",
-  ["answer_timeout"] = "Time to answer an assistant question before continuing with its recommended or first option. Questions without options are skipped. Plan acceptance never times out.",
+  ["tool_timeout"] = "Deadline for each tool call and shell command. Expiry stops execution with an error. Enter to edit.",
   ["subagent-tools"] = "Allow the assistant to delegate work to subagents.",
   ["lsp-tools"] = "Allow the assistant to use language-server tools.",
   ["session-tools"] = "Allow the assistant to search and read session history.",
@@ -389,7 +389,7 @@ function M.open(state, host, resume_state)
         configure({ auto_compaction = policy })
         return
       end
-      if id == "approval_timeout" or id == "answer_timeout" then
+      if id == "approval_timeout" or id == "tool_timeout" then
         configure({ [id] = duration.change(active[id], direction or 1) })
         return
       end
@@ -640,9 +640,6 @@ function M.open(state, host, resume_state)
             row("workflow", "check-execution", "Checks", "Execution", {
               field("shell", "choice", active.shell == "nushell" and "Nushell" or "System", "Shell"),
             }),
-            row("workflow", "question-timeout", "Questions", "Timeout", {
-              field("answer_timeout", "input", duration.render(active.answer_timeout), nil),
-            }),
             row("permissions", "read-access", "Access", "Read", {
               field("read-access", "choice", policy.read_access, nil),
               field("readable-directories", "action", tostring(#policy.readable_directory) .. "…", "Extra directories"),
@@ -656,6 +653,9 @@ function M.open(state, host, resume_state)
             }),
             row("permissions", "approval-timeout", "Tools", "Approval timeout", {
               field("approval_timeout", "input", duration.render(active.approval_timeout), nil),
+            }),
+            row("permissions", "tool-timeout", "Tools", "Tool / shell timeout", {
+              field("tool_timeout", "input", duration.render(active.tool_timeout), nil),
             }),
             row("permissions", "check-editing", "Checks", "Allow editing", {
               field("check-editing", "toggle", state.check_editing == true, nil),
@@ -685,7 +685,7 @@ function M.open(state, host, resume_state)
           if not current() then complete("This session is no longer active.") return end
           if pending then complete("Another setting is being saved. Try again.") return end
           local timeout = context.field.id
-          if timeout ~= "approval_timeout" and timeout ~= "answer_timeout" then complete("This setting does not accept text input.") return end
+          if timeout ~= "approval_timeout" and timeout ~= "tool_timeout" then complete("This setting does not accept text input.") return end
           configure({ [timeout] = duration.parse(value) }, function(applied)
             complete(not applied and "Could not save the setting. Press Enter to retry." or nil)
           end)

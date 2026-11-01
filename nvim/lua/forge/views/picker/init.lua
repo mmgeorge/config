@@ -177,6 +177,7 @@ local function close_input(instance)
   if instance.input_buf and vim.api.nvim_buf_is_valid(instance.input_buf) then
     local page = picker_state.page(instance.state, instance.spec)
     instance.state.draft_by_page[page.id] = input.text(instance.input_buf)
+    if instance.spec.save_input_draft then instance.spec.save_input_draft(page.id, instance.input_kind or "feedback", input.text(instance.input_buf)) end
   end
   popup_window.close(instance.input_win, false)
   instance.input_buf = nil
@@ -432,6 +433,7 @@ local function submit_input(instance)
     return
   end
   instance.state.draft_by_page[page.id] = text
+  if instance.spec.save_input_draft then instance.spec.save_input_draft(page.id, instance.input_kind or "feedback", text) end
   finish(instance, { page = page, option = option, text = text, input_kind = instance.input_kind })
 end
 
@@ -487,6 +489,10 @@ local function open_input(instance, kind)
   local page = picker_state.page(instance.state, instance.spec)
   if not page.allow_input then return end
   if valid_window(instance.input_win) then
+    if instance.input_kind ~= kind and instance.spec.read_input_draft then
+      if instance.spec.save_input_draft then instance.spec.save_input_draft(page.id, instance.input_kind or "feedback", input.text(instance.input_buf)) end
+      vim.api.nvim_buf_set_lines(instance.input_buf, 0, -1, false, vim.split(instance.spec.read_input_draft(page.id, kind or "feedback") or "", "\n", { plain = true }))
+    end
     instance.input_kind = kind
     focus_input(instance, true)
     return
@@ -497,7 +503,7 @@ local function open_input(instance, kind)
   instance.input_buf, instance.input_win = input.open(
     instance.win,
     instance.frame,
-    instance.state.draft_by_page[page.id] or "",
+    instance.spec.read_input_draft and instance.spec.read_input_draft(page.id, kind or "feedback") or instance.state.draft_by_page[page.id] or "",
     instance.origin
   )
   for _, key in ipairs(picker_keys(instance, "submit_input")) do
@@ -926,14 +932,18 @@ end
 ---@param spec ForgePickerSpec
 function Picker.update(spec)
   if not active then return end
+  local input_focused = spec.preserve_input and valid_window(active.input_win)
+    and vim.api.nvim_get_current_win() == active.input_win
+  local previous_input_kind = active.input_kind
+  local previous_input_cursor = input_focused and vim.api.nvim_win_get_cursor(active.input_win) or nil
   local search_focused = valid_window(active.search_win) and vim.api.nvim_get_current_win() == active.search_win
   local help_focused = valid_window(active.help_win) and vim.api.nvim_get_current_win() == active.help_win
   local editor_focused = active.field_editor and valid_window(active.field_editor.window)
     and vim.api.nvim_get_current_win() == active.field_editor.window
   if active.field_editor and spec.owner ~= active.spec.owner then close_field_editor(active) end
   local previous_page_id = picker_state.page(active.state, active.spec).id
-  close_input(active)
   local snapshot = assert(Picker.capture_state(), "active picker must provide navigation state")
+  close_input(active)
   clear_modal_keymaps(active)
   active.spec = spec
   update_deadline_timer(active)
@@ -964,12 +974,21 @@ function Picker.update(spec)
   end
   if help_focused and valid_window(active.help_win) then vim.api.nvim_set_current_win(active.help_win) end
   if editor_focused and active.field_editor then field_input.focus(active.field_editor) end
+  if input_focused and picker_state.page(active.state, active.spec).id == previous_page_id then
+    open_input(active, previous_input_kind)
+    if previous_input_cursor and valid_window(active.input_win) then
+      local row = math.min(previous_input_cursor[1], vim.api.nvim_buf_line_count(active.input_buf))
+      local line = vim.api.nvim_buf_get_lines(active.input_buf, row - 1, row, false)[1] or ""
+      vim.api.nvim_win_set_cursor(active.input_win, { row, math.min(previous_input_cursor[2], #line) })
+    end
+  end
 end
 
 ---@param notify? boolean
 function Picker.close(notify)
   local instance = active
   if not instance then return end
+  local resume = Picker.capture_state()
   if instance.timer then instance.timer:stop() instance.timer:close() instance.timer = nil end
   set_picker_cursor_hidden(instance, false)
   active = nil
@@ -980,7 +999,7 @@ function Picker.close(notify)
   close_input(instance)
   close_search(instance)
   popup_window.close(instance.win)
-  if notify ~= false and instance.spec.on_close then instance.spec.on_close() end
+  if notify ~= false and instance.spec.on_close then instance.spec.on_close(resume) end
 end
 
 ---@param owner? string
@@ -994,7 +1013,10 @@ function Picker.capture_state()
   if not active then return nil end
   local snapshot = picker_state.capture(active.state, active.spec)
   local page = picker_state.page(active.state, active.spec)
-  if valid_window(active.input_win) then snapshot.draft_by_page[page.id] = input.text(active.input_buf) end
+  if valid_window(active.input_win) then
+    snapshot.draft_by_page[page.id] = input.text(active.input_buf)
+    if active.spec.save_input_draft then active.spec.save_input_draft(page.id, active.input_kind or "feedback", input.text(active.input_buf)) end
+  end
   if valid_window(active.search_win) then snapshot.query_by_page[page.id] = search_input.text(active.search_buf) end
   return snapshot
 end

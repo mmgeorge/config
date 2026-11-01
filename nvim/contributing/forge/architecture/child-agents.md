@@ -29,3 +29,13 @@ Child approvals cancel only that child's requests on interruption. Root cancella
 The root interaction exposes `harness_config` and seven `harness_session_*` tools through `control_tools/harness`, and the `harness-sessions` skill documents them. The portable `session_tools` setting is on by default, and turning it off removes the history tools but keeps `harness_config`.
 
 Inspection uses read-only SQLite connections without migrations or leases. Reading another session requires authorization against its workspace, and that session's saved permissions never authorize the caller. Results go to a private temporary snapshot with opaque continuations, and page budgets bound each delivery, not the total size. Log inspection exposes only allowlisted diagnostic metadata, never prompts, credentials, or private reasoning.
+
+The log reader captures each retained segment's byte length and keeps its open file
+handle. Each request decodes at most `limit` entries, defaulting to 100; continuations
+consume the next batch without scanning the full log first. The existing response
+byte budget may split a batch or a large Unicode record across multiple responses.
+Completed batches retain their boundaries so replaying a cursor returns the same page.
+Concurrent appends stay outside the captured extent, and rotation renames files so
+readers retain their original segments. Cancellation is checked between records;
+live settings and read authority are rechecked before publication. Truncation or a
+decode failure invalidates the cursor and fails explicitly instead of skipping entries.

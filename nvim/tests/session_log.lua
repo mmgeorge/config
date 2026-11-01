@@ -35,6 +35,15 @@ for _, line in ipairs(vim.fn.readfile(path)) do
 end
 assert(notification_found)
 assert(#vim.fn.glob(directory .. "/sessions/*", false, true) == 1)
+local oversized = string.rep("preserved error ", 150000)
+vim.notify(oversized, vim.log.levels.ERROR)
+vim.notify("after first rotation", vim.log.levels.ERROR)
+assert(vim.json.decode(vim.fn.readfile(path .. ".1")[1]).fields.message == oversized)
+assert(vim.json.decode(vim.fn.readfile(path)[1]).fields.message == "after first rotation")
+vim.notify(oversized, vim.log.levels.ERROR)
+vim.notify("after second rotation", vim.log.levels.ERROR)
+assert(vim.json.decode(vim.fn.readfile(path .. ".1")[1]).fields.message == oversized)
+assert(vim.json.decode(vim.fn.readfile(path)[1]).fields.message == "after second rotation")
 local original_writefile = vim.fn.writefile
 vim.fn.writefile = function() error("simulated diagnostic write failure") end
 assert(vim.notify("failure remains visible", vim.log.levels.ERROR) == "forwarded")

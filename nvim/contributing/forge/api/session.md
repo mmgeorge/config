@@ -715,9 +715,9 @@ Update session input/approval timeout policy.
 
 ### Contract
 
-Accepts a nonempty object containing only `approval_timeout` and/or `answer_timeout`. Each supplied value is [InputTimeout](runtime-schemas.md#inputtimeout): integer `amount` from zero through the unsigned 32-bit range and `unit` equal to `"s"`, `"m"`, or `"h"`. Zero disables expiry. Omitted fields retain their saved setting. Null, unknown fields, and durations outside the platform timer range fail.
+Accepts a nonempty object containing `approval_timeout`, `tool_timeout`, or both. Each supplied value is [InputTimeout](runtime-schemas.md#inputtimeout): integer `amount` and `unit` equal to `"s"`, `"m"`, or `"h"`. Zero disables approval expiry, but `tool_timeout` requires a positive amount. Omitted fields retain their saved setting. Null, unknown fields, and durations outside the platform timer range fail.
 
-Returns both effective timeout values. This saves the supplied fields in global settings using the captured settings revision, then updates this session's permission coordinator. Concurrent settings changes can reject the write. It can run during provider work and does not send a prompt or emit request progress. Existing deadlines retain the semantics of their captured timer state.
+Returns both effective timeout values. This saves the supplied fields in global settings, then updates this session's permission coordinator for approval expiry. It can run during provider work without submitting a prompt. Provider turns and check subprocesses capture the tool policy when starting; existing deadlines retain their captured timer state.
 
 ## `session.list`
 
@@ -1185,7 +1185,14 @@ Commit an answer to a pending question.
 
 ### Contract
 
-Requires `question_id` and a typed [PlanQuestionResponse](runtime-schemas.md#planquestionresponse). For durable UI answers, also supply `operation_id` and `target` ([QuestionTarget](runtime-schemas.md#questiontarget)); optional `answer_order` is a `[writer, sequence]` pair. The target captures owner kind, owner ID, question-set ID, and revision. Returns `{ "operation_id": ..., "active_elicitation": ... }` after the answer transaction commits, then publishes `question_updated`. Exact replay returns the retained receipt; identity reuse with different content fails. Older answers from the same writer do not overwrite a newer sequence. The legacy no-target path returns a full session snapshot after answering the current elicitation. It does not continue provider work. Missing/stale owners, invalid choices, and persistence failures remain errors.
+For ordinary questions, supply `command` with `operation_id`, `question_id`,
+`revision`, and `action`. An answer action is `{kind:"answer",answer:{kind:"selected",
+option_id,feedback?}}` or `{kind:"answer",answer:{kind:"other",text}}`. The transaction
+returns the current question snapshot and publishes `questions_changed`. The same
+operation may be retried with identical content. Stale revisions and invalid choices
+fail without changing the question. The committed answer enters the durable input
+journal independently of this response. Plan acceptance continues to use its captured
+`target` and explicit acceptance confirmation.
 
 ## `session.question.ask`
 
@@ -1201,7 +1208,11 @@ Submit a question through the session's question workflow.
 
 ### Contract
 
-Requires `question_id` and nonempty `text`. The ID must identify the pending question or its containing set. This records clarification input under that elicitation and runs a provider clarification turn, returning [BrokerSnapshot](runtime-schemas.md#brokersnapshot) after settlement. It can update or withdraw questions and, when no decision remains, consume the clarification and continue. It does not accept clarification against plan-acceptance choices. Missing ownership, mismatched questions, active-work admission, and provider failures remain explicit.
+For ordinary questions, supply the same `command` envelope with
+`action:{kind:"clarify",text}`. This saves and queues a clarification immediately;
+it does not resolve the question. The model attaches its explanation through
+`question_reply`. `action:{kind:"correct",text}` appends an explicit correction to
+an answered question. Paused and completed tasks are not resumed by discussion.
 
 ## `session.question.continue`
 
@@ -1233,7 +1244,10 @@ Skip an explicitly targeted pending question.
 
 ### Contract
 
-Requires `question_id`; the durable form also supplies `operation_id` and the captured [QuestionTarget](runtime-schemas.md#questiontarget). It follows [session.question.answer](#sessionquestionanswer) with response `{ "kind": "skipped" }`, returning the same receipt/elicitation shape and event. Skipping commits an explicit answer state; it does not implicitly continue the provider. A question that disallows skipping or a stale owner/revision fails.
+For ordinary questions, use `command` with `action:{kind:"dismiss"}`. Only
+pending optional questions can be dismissed. Required questions can be answered,
+clarified, or explicitly withdrawn by the model; closing their picker leaves the
+gate active.
 
 ## `session.rename`
 
@@ -1362,4 +1376,3 @@ Steer active execution through the coordinator.
 ### Contract
 
 Requires nonempty `text`, optional root `target`, and optional attachment input in the same shape as [session.prompt.submit](#sessionpromptsubmit). The service resolves attachments and persists a steering submission before delivering through the active parent-input boundary or provider-native steering. Returns `{ "steered": true, "delivery": "direct" }` when delivery is accepted. This is not a new completed exchange. Wrong target, missing attachment, unavailable steering, or provider rejection fails. A submitted goal/plan command should use the canonical task action rather than being treated as literal steering text.
-

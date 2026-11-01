@@ -91,8 +91,7 @@ Picker-local `keymaps` overrides keep configuration navigation independent of
 other pickers: Tab and Shift-Tab switch categories, with `[` and `]` as aliases.
 Category navigation wraps at either end, while Up and Down stop at the first and
 last settings rows.
-Approval timeout lives under Permissions → Tools, and question timeout lives under
-Workflow → Questions. Each occupies one field. Their ordered choice editors
+Approval timeout lives under Permissions → Tools and occupies one field. Its ordered choice editor
 use Up/Down to select `15s`, `30s`, `45s`, `60s`, then whole minutes from `2m`
 through `60m`; the endpoints clamp. Enter saves the selected value, and Escape
 cancels without changing the persisted duration.
@@ -127,3 +126,17 @@ before returning, so an old child response cannot replace a newer view.
 - **Request guards:** Asynchronous lookups stamp a request ID and discard results that arrive after a newer request.
 - **Test seams:** A function that tests override through `dr()._x` must be called through `dr()._x` everywhere, never through a module-local copy.
 - **Logging:** With Harness logging on, `ui.buffer.patch` times each publication stage separately, and `ui.document.slices` records preparation and commit durations.
+
+
+## Persistent questions
+
+The question picker consumes the session-owned question snapshot rather than the
+single plan-acceptance elicitation. Optional arrivals update the count without
+opening a window. Required arrivals may open it once in the focused transcript;
+closing the picker does not remove the required gate. Both headings and tabs show
+`Required`, and the body explains why work is waiting.
+
+Each confirmation saves one answer. The shared picker retains page identity,
+freeform input focus, cursor, and independent clarification/answer drafts across
+updates. `Ask…` appends a clarification; `H` includes resolved history. Plan
+acceptance retains its separate submission behavior.

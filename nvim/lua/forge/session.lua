@@ -72,6 +72,13 @@ M.empty_diff_rows = {}
 ---@field cancel_requested boolean
 ---@field session table?
 ---@field access_preference? ForgeDirectoryPolicy Saved choices before provider capability limits.
+---@field questions? ForgeQuestionView
+---@field question_drafts? table<string, table<string, string>>
+---@field question_view_by_session? table<string, table>
+---@field question_picker_resume? ForgePickerResumeState
+---@field question_show_history? boolean
+---@field question_saving? table<string, string>
+---@field question_failure? string
 ---@field input_timeout_configuration? ForgeTimeoutConfiguration
 ---@field capability table
 ---@field model_list table[]?

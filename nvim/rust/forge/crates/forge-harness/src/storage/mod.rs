@@ -35,8 +35,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 58;
-const PREFERENCE_FORMAT_VERSION: u32 = 42;
+const SESSION_FORMAT_VERSION: u32 = 59;
+const PREFERENCE_FORMAT_VERSION: u32 = 43;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.
 pub fn error_message(error: &anyhow::Error) -> String {
@@ -1879,7 +1879,7 @@ mod test {
             plan_executor: Default::default(),
             plan_compact: false,
             approval_timeout: Default::default(),
-            answer_timeout: Default::default(),
+            tool_timeout: Default::default(),
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: Default::default(),
@@ -2221,7 +2221,7 @@ mod test {
             plan_executor: Default::default(),
             plan_compact: false,
             approval_timeout: Default::default(),
-            answer_timeout: Default::default(),
+            tool_timeout: Default::default(),
         };
         store
             .save_preference("D:/work", "codex", &preference)

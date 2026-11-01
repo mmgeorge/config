@@ -20,6 +20,7 @@ pub mod permissions;
 pub mod plan;
 pub(crate) mod process;
 pub mod protocol;
+pub(crate) mod question;
 pub mod service;
 pub mod session;
 pub mod settings;

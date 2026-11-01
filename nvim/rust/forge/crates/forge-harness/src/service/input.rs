@@ -16,6 +16,124 @@ pub(super) struct NativeGoalSelection {
 }
 
 impl SessionController {
+    /// Keep automatic work behind both the required gate and committed answers awaiting delivery.
+    pub(super) fn questions_block_work(&self) -> Result<bool> {
+        Ok(self.questions.snapshot()?.required_pending()
+            || !self.questions.outbox()?.is_empty()
+            || self
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .iter()
+                .any(|message| {
+                    matches!(
+                        message.purpose,
+                        crate::input::InputPurpose::Question { .. }
+                            | crate::input::InputPurpose::QuestionContinuation { .. }
+                    ) && message.delivery != InputDelivery::Accepted
+                }))
+    }
+    /// Relay committed question messages through the existing durable delivery journal.
+    pub(super) async fn relay_questions(&self, sink: &MessageSender) -> Result<()> {
+        let _control = self.coordinator.control.acquire().await?;
+        for message in self.questions.outbox()? {
+            self.trace.record(
+                self.observer.session_id(),
+                "question.delivery.admitting",
+                json!({"question_id":message.question_id,"message_id":message.id}),
+            );
+            let input = self.coordinator.submissions.snapshot()?;
+            let operation = InputOperation {
+                id: format!("question:{}", message.id),
+                control_revision: input.control_revision,
+                after_control: input.control_operation_id,
+                action: InputAction::Submit {
+                    message: Box::new(InputMessage {
+                        id: message.id.clone(),
+                        revision: 0,
+                        text: message.text,
+                        purpose: crate::input::InputPurpose::Question {
+                            question_id: message.question_id,
+                            task_id: message.task_id,
+                            message_kind: message.kind,
+                        },
+                        attachments: Vec::new(),
+                        config: None,
+                        intent: InputIntent::Auto,
+                        delivery: InputDelivery::Queued,
+                        route: None,
+                        reservation: None,
+                        submission_id: None,
+                        error: None,
+                    }),
+                },
+            };
+            let update = match self.coordinator.submissions.operation(&operation.id)? {
+                Some(update) => update,
+                None => self.coordinator.submissions.apply(operation)?,
+            };
+            ensure!(
+                update.error.is_none(),
+                "question input admission failed: {:?}",
+                update.error
+            );
+            self.questions.admitted(&message.id)?;
+            self.publish_input(update, sink).await?;
+        }
+        for exchange_id in self.questions.ready_chat_continuations()? {
+            let original = crate::storage::SqliteStore::read_only(&self.data_root)?
+                .load_exchange(&exchange_id)?
+                .context("question continuation lost its original request")?;
+            let input = self.coordinator.submissions.snapshot()?;
+            let id = format!("question-continuation:{exchange_id}");
+            let operation = InputOperation {
+                id: id.clone(),
+                control_revision: input.control_revision,
+                after_control: input.control_operation_id,
+                action: InputAction::Submit {
+                    message: Box::new(InputMessage {
+                        id,
+                        revision: 0,
+                        text: format!(
+                            "Continue the original request using the recorded user answers. Do not repeat resolved questions.\n\nOriginal request:\n{}",
+                            original.prompt
+                        ),
+                        purpose: crate::input::InputPurpose::QuestionContinuation {
+                            exchange_id: exchange_id.clone(),
+                        },
+                        attachments: Vec::new(),
+                        config: None,
+                        intent: InputIntent::Queue,
+                        delivery: InputDelivery::Queued,
+                        route: None,
+                        reservation: None,
+                        submission_id: None,
+                        error: None,
+                    }),
+                },
+            };
+            let update = match self.coordinator.submissions.operation(&operation.id)? {
+                Some(update) => update,
+                None => self.coordinator.submissions.apply(operation)?,
+            };
+            ensure!(
+                update.error.is_none(),
+                "question continuation admission failed: {:?}",
+                update.error
+            );
+            self.questions.chat_continuation_admitted(&exchange_id)?;
+            self.publish_input(update, sink).await?;
+        }
+        sink.send_event(SessionEvent {
+            session_id: self.observer.session_id().into(),
+            event: "questions_changed".into(),
+            payload: serde_json::to_value(self.questions.snapshot()?)?,
+        })
+        .await?;
+        Ok(())
+    }
+
     pub(super) fn publish_input_pending(&self) -> Result<()> {
         let (revision, pending) = self.coordinator.submissions.has_pending()?;
         self.observer.completion_queue.update(revision, pending)
@@ -228,6 +346,7 @@ impl SessionController {
         let owner = Arc::downgrade(self);
         let input = self.coordinator.submissions.clone();
         let admission_changed = self.observer.admission.changed.clone();
+        let mut question_changed = self.questions.changed.subscribe();
         let sink = sink.clone();
         *task = Some(tokio::spawn(async move {
             let mut jobs = JoinSet::new();
@@ -248,6 +367,9 @@ impl SessionController {
                 let native_result = controller
                     .reconcile_native_goal(&mut native_goal_selection)
                     .await;
+                if let Err(error) = controller.relay_questions(&sink).await {
+                    let _ = sink.send_event(SessionEvent { session_id: controller.observer.session_id().into(), event: "backend_event".into(), payload: json!({"kind":"error","text":format!("Question delivery failed: {error:#}")}) }).await;
+                }
                 let native_retry = native_result.is_err();
                 if let Err(error) = &native_result {
                     if !native_error_reported {
@@ -286,6 +408,7 @@ impl SessionController {
                     _ = tokio::time::sleep(Duration::from_secs(1)), if native_retry => {},
                     _ = notified => {},
                     _ = state_changed => {},
+                    _ = question_changed.changed() => {},
                     result = jobs.join_next_with_id(), if !jobs.is_empty() => {
                         match result {
                             Some(Ok((id, was_steering))) => {
@@ -388,20 +511,22 @@ impl SessionController {
         use crate::plan::PlanExecutionState;
         use crate::task::WorkflowSnapshot;
         let task = self.task_controller.current()?;
+        let question_gate = self.questions_block_work()?;
         let update = match task.as_ref() {
             Some(task) => match &task.workflow {
                 WorkflowSnapshot::Goal { goal } if goal.native => {
-                    let state =
-                        if !task.entry_accepted() && goal.state == crate::goal::GoalState::Active {
-                            crate::goal::GoalState::Paused
-                        } else {
-                            goal.state
-                        };
+                    let state = if (!task.entry_accepted() || question_gate)
+                        && goal.state == crate::goal::GoalState::Active
+                    {
+                        crate::goal::GoalState::Paused
+                    } else {
+                        goal.state
+                    };
                     NativeGoalUpdate::from_goal(goal.objective.clone(), state)
                 }
                 WorkflowSnapshot::Execute { execution } if execution.native => {
                     let state = match execution.record.state {
-                        PlanExecutionState::Active if task.entry_accepted() => {
+                        PlanExecutionState::Active if task.entry_accepted() && !question_gate => {
                             crate::goal::GoalState::Active
                         }
                         PlanExecutionState::Active
@@ -438,7 +563,11 @@ impl SessionController {
         }
         self.enqueue_task_input(sink).await?;
         let input = self.coordinator.submissions.snapshot()?;
-        if input.suspended {
+        if input.suspended
+            && !input.messages.iter().any(|message| {
+                matches!(message.purpose, crate::input::InputPurpose::Question { .. })
+            })
+        {
             return Ok(InputProgress::Waiting);
         }
         let Ok(control) = self.coordinator.control.clone().try_acquire_owned() else {
@@ -476,6 +605,43 @@ impl SessionController {
             })
             .unwrap_or(0);
         let mut message = pending.remove(selected);
+        if matches!(
+            message.purpose,
+            crate::input::InputPurpose::QuestionContinuation { .. }
+        ) && self.questions.snapshot()?.required_pending()
+        {
+            return Ok(InputProgress::Waiting);
+        }
+        if input.suspended
+            && !matches!(message.purpose, crate::input::InputPurpose::Question { .. })
+        {
+            if let Some(position) = pending.iter().position(|message| {
+                matches!(message.purpose, crate::input::InputPurpose::Question { .. })
+            }) {
+                message = pending.remove(position);
+            } else {
+                return Ok(InputProgress::Waiting);
+            }
+        }
+        if self.questions_block_work()?
+            && matches!(
+                message.purpose,
+                crate::input::InputPurpose::TaskEntry { .. }
+                    | crate::input::InputPurpose::TaskContinuation { .. }
+            )
+        {
+            if let Some(position) = pending.iter().position(|message| {
+                !matches!(
+                    message.purpose,
+                    crate::input::InputPurpose::TaskEntry { .. }
+                        | crate::input::InputPurpose::TaskContinuation { .. }
+                )
+            }) {
+                message = pending.remove(position);
+            } else {
+                return Ok(InputProgress::Waiting);
+            }
+        }
         let mut command = crate::task::command::SessionCommand::queued_input(&message)?;
         let admission = self.coordinator.execution.clone().try_acquire_owned().ok();
         let steering_available = admission.is_none()
@@ -579,8 +745,16 @@ impl SessionController {
                 crate::input::InputPurpose::TaskEntry { start, .. } => {
                     self.backend.supports_task_steering(start.kind)
                 }
-                crate::input::InputPurpose::TaskContinuation { .. } => false,
+                crate::input::InputPurpose::TaskContinuation { .. }
+                | crate::input::InputPurpose::QuestionContinuation { .. } => false,
                 crate::input::InputPurpose::User => true,
+                crate::input::InputPurpose::Question { task_id, .. } => {
+                    self.task_controller
+                        .current()?
+                        .as_ref()
+                        .map(|task| task.id.as_str())
+                        == task_id.as_deref()
+                }
             };
         if admission.is_none() && !steer {
             return Ok(InputProgress::WaitExecution);
@@ -635,6 +809,9 @@ impl SessionController {
         sink: &MessageSender,
         jobs: &mut JoinSet<bool>,
     ) -> Result<Option<InputProgress>> {
+        if self.questions_block_work()? {
+            return Ok(None);
+        }
         if self.task_controller.current()?.is_some_and(|task| {
             task.phase() == crate::task::TaskPhase::Verify
                 && task.status() == crate::task::TaskStatus::Running
@@ -715,6 +892,9 @@ impl SessionController {
     }
 
     async fn enqueue_task_input(&self, sink: &MessageSender) -> Result<()> {
+        if self.questions_block_work()? {
+            return Ok(());
+        }
         let Some(task) = self.task_controller.current()? else {
             return Ok(());
         };
@@ -945,6 +1125,28 @@ impl SessionController {
     ) -> Result<bool> {
         let (revision, may_wait) = match purpose {
             crate::input::InputPurpose::User => return Ok(true),
+            crate::input::InputPurpose::QuestionContinuation { exchange_id } => {
+                return Ok(self.task_controller.current()?.is_none()
+                    && self.questions.chat_continuation_is_current(exchange_id)?
+                    && self.questions.snapshot()?.questions.iter().any(|question| {
+                        question.exchange_id == *exchange_id
+                            && question.requirement
+                                == crate::question::QuestionRequirement::Required
+                            && !matches!(
+                                question.resolution,
+                                crate::question::QuestionResolution::Retired { .. }
+                            )
+                    }));
+            }
+            crate::input::InputPurpose::Question { question_id, .. } => {
+                return Ok(self.questions.snapshot()?.questions.iter().any(|question| {
+                    &question.id == question_id
+                        && !matches!(
+                            question.resolution,
+                            crate::question::QuestionResolution::Retired { .. }
+                        )
+                }));
+            }
             crate::input::InputPurpose::TaskEntry { revision, .. } => (revision, true),
             crate::input::InputPurpose::TaskContinuation { revision, .. } => (revision, false),
         };
@@ -1080,7 +1282,8 @@ impl SessionController {
             .await?;
             return Ok(());
         }
-        if self.coordinator.submissions.snapshot()?.suspended
+        if (self.coordinator.submissions.snapshot()?.suspended
+            && !matches!(message.purpose, crate::input::InputPurpose::Question { .. }))
             || *self.cancellation.subscribe().borrow()
         {
             submission.cancel()?;

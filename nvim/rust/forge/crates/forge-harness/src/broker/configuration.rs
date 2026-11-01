@@ -118,7 +118,7 @@ impl HarnessBroker {
             effective.shell = Some(self.session.shell);
             effective.plan_compact = Some(self.session.plan_compact);
             effective.approval_timeout = Some(self.session.approval_timeout);
-            effective.answer_timeout = Some(self.session.answer_timeout);
+            effective.tool_timeout = Some(self.session.tool_timeout);
             settings.confirm_application(&self.session.id, operation, revision, effective)?;
         }
         if command == ConfigurationCommand::Configure {
