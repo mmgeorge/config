@@ -241,6 +241,7 @@ mod test {
 
     fn file_tool(id: &str, status: &str, file: Vec<ProviderFileChange>) -> ToolCall {
         ToolCall {
+            command_shell: None,
             started_at_ms: None,
             completed_at_ms: None,
             checklist_item_id: None,
@@ -319,6 +320,7 @@ mod test {
             }],
         );
         let command = ToolCall {
+            command_shell: None,
             started_at_ms: None,
             completed_at_ms: None,
             checklist_item_id: None,

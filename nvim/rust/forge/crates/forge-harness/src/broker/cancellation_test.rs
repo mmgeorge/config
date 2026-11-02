@@ -112,6 +112,7 @@ impl crate::provider::ProviderAdapter for CancelledNativeProvider {
         for update in [
             ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     name: "shell".into(),
                     title: "Denied native command".into(),

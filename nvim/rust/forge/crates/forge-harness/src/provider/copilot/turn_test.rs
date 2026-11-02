@@ -1380,7 +1380,8 @@ fn fixture() -> Result<(tempfile::TempDir, CopilotProvider, ProviderRequest)> {
         execution_owner: Some(ExecutionOwner::root("copilot-cancel")),
         harness_session_id: "copilot-cancel".into(),
         workspace: fixture.path().to_string_lossy().into_owned(),
-        access: ProviderKind::Copilot.resolve_access(crate::session::AccessPolicy::default()),
+        access: crate::provider::registered_capability(ProviderKind::Copilot)
+            .resolve_access(crate::session::AccessPolicy::default()),
         approval_mode: ApprovalMode::Ask,
         provider_session_id: None,
     });
@@ -1738,11 +1739,11 @@ async fn copilot_submission_reconciliation_excludes_known_messages_and_ambiguous
             provider.trace.clone(),
         )?;
         let submission = journal.prepare(&request, ProviderKind::Copilot)?;
-        submission.sending(crate::provider::submission::SubmissionTarget::Copilot {
-            session_id: "retained-native".into(),
-            cursor: "before-send".into(),
-            prompt: "same text".into(),
-        })?;
+        submission.sending(crate::provider::submission::SubmissionTarget::native(
+            "copilot",
+            "retained-native",
+            serde_json::json!({"cursor":"before-send","prompt":"same text"}),
+        ))?;
         let (client_read, mut server_write) = tokio::io::duplex(65536);
         let (client_write, mut server_read) = tokio::io::duplex(65536);
         provider

@@ -73,7 +73,7 @@ async fn file_tool_failures_and_read_only_diffs_never_claim_workspace_changes() 
             "bash",
             json!({"command":"git diff"}),
             true,
-            ToolActivityKind::ToolCall,
+            ToolActivityKind::Command,
         ),
         (
             "str_replace_editor",
@@ -201,7 +201,7 @@ fn compaction_retains_summary_failure_and_identity_across_replays() -> anyhow::R
     );
     let usage = replayed.result.compaction_tokens_used.unwrap();
     assert_eq!(usage.cached_input, Some(0));
-    assert_eq!(usage.billing.unwrap().total_nano_aiu, Some(1.5));
+    assert_eq!(usage.billing.unwrap().measurements[0].value, "1.5");
     let orphan = forge_providers::copilot::decode::decode_compaction(
         &event("session.compaction_complete", json!({"success":true})),
         "root",

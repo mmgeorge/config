@@ -101,7 +101,11 @@ controller.task_transition = function(action, _, completed)
   completed(true)
 end
 local success, failure = xpcall(function()
-  state = { session = configured_session, capability = { model_selection = true, effort_selection = true, fast_mode = true, ultrafast_mode = true, native_compact = true, os_sandbox = true }, busy = true }
+  state = { session = configured_session, capability = { model_selection = true, effort_selection = true, fast_mode = true, ultrafast_mode = true, native_compact = true, os_sandbox = true, integration = { isolation_modes = {
+    { id = "elevated", description = "Setup needs admin approval" },
+    { id = "unelevated", description = "Restricted token; denied-read paths are unsupported" },
+    { id = "mxc", description = "Microsoft Execution Containers on compatible Windows 11. Falls back to Elevated" },
+  } } }, busy = true }
   local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
   settings.open(state, host)
   local instance = picker._state_for_test()
@@ -341,7 +345,7 @@ local success, failure = xpcall(function()
   assert(approval_row.section == "Tools" and approval_page == "permissions")
   assert(not pcall(find, "answer_timeout"), "optional questions must not have an answer timeout")
   local enabled_description = find("sandbox").fields[1].description
-  assert(enabled_description:find("Network access is enabled", 1, true))
+  assert(enabled_description:find("implementation guarantees", 1, true))
   key("sandbox", "<CR>")
   assert(configured_session.access.sandbox == false)
   local disabled_description = find("sandbox").fields[1].description
@@ -349,29 +353,29 @@ local success, failure = xpcall(function()
   assert(table.concat(picker._state_for_test().frame.lines, " "):find("without OS sandbox", 1, true),
     "sandbox option description did not reach the rendered help area")
   if vim.fn.has("win32") == 1 then
-    local windows_row, windows_field = find("windows-sandbox")
+    local windows_row, windows_field = find("isolation-mode")
     assert(windows_field.muted and not windows_field.disabled_reason and not windows_field.description:find("Inactive", 1, true))
-    local _, spans = require("forge.views.picker.field").columns(windows_row, "windows-sandbox", true)
+    local _, spans = require("forge.views.picker.field").columns(windows_row, "isolation-mode", true)
     assert(spans[2][1][2] == "ForgePickerHint", "disabled Windows mode is not gray when focused")
-    local saved_mode = configured_session.access.windows_sandbox
-    key("windows-sandbox", "<Right>")
-    assert(configured_session.access.windows_sandbox ~= saved_mode, "muted Windows mode could not be changed")
-    assert(find("windows-sandbox").fields[1].muted, "changing the saved mode enabled an inactive control")
-    key("windows-sandbox", "<Left>")
+    local saved_mode = configured_session.access.isolation_mode
+    key("isolation-mode", "<Right>")
+    assert(configured_session.access.isolation_mode ~= saved_mode, "muted Windows mode could not be changed")
+    assert(find("isolation-mode").fields[1].muted, "changing the saved mode enabled an inactive control")
+    key("isolation-mode", "<Left>")
     key("sandbox", "<CR>")
-    assert(not find("windows-sandbox").fields[1].muted)
-    key("windows-sandbox", "<Right>")
-    local unelevated_description = find("windows-sandbox").fields[1].description
+    assert(not find("isolation-mode").fields[1].muted)
+    key("isolation-mode", "<Right>")
+    local unelevated_description = find("isolation-mode").fields[1].description
     assert(unelevated_description:find("Restricted token", 1, true) and unelevated_description:find("denied-read paths", 1, true))
-    key("windows-sandbox", "<Right>")
-    local mxc_description = find("windows-sandbox").fields[1].description
+    key("isolation-mode", "<Right>")
+    local mxc_description = find("isolation-mode").fields[1].description
     assert(mxc_description:find("Microsoft Execution Containers", 1, true)
       and mxc_description:find("compatible Windows 11", 1, true)
       and mxc_description:find("Falls back to Elevated", 1, true))
     assert(table.concat(picker._state_for_test().frame.lines, " "):find("Microsoft Execution Containers", 1, true),
       "Windows mode changes did not refresh the rendered description")
-    key("windows-sandbox", "<Right>")
-    assert(find("windows-sandbox").fields[1].description:find("Setup needs admin approval", 1, true))
+    key("isolation-mode", "<Right>")
+    assert(find("isolation-mode").fields[1].description:find("Setup needs admin approval", 1, true))
     key("sandbox", "<CR>")
   end
   key("write-access", "<Right>")
@@ -420,7 +424,7 @@ local success, failure = xpcall(function()
   assert(find("readable-directories").section == "Access")
   assert(find("writable-directories").section == "Access")
   assert(find("sandbox").section == "Sandbox")
-  if vim.fn.has("win32") == 1 then assert(find("windows-sandbox").section == "Sandbox") end
+  if vim.fn.has("win32") == 1 then assert(find("isolation-mode").section == "Sandbox") end
   key("provider", "<Left>")
   assert(picker.is_open("harness-config"), "Left opened an action")
   picker.close()
@@ -429,11 +433,11 @@ local success, failure = xpcall(function()
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
   local _, sandbox = find("sandbox")
   assert(sandbox.muted and not sandbox.disabled_reason, "unsupported sandbox must remain editable and muted")
-  assert(sandbox.description:find("only with Codex", 1, true))
+  assert(sandbox.description:find("does not declare enforced isolation", 1, true))
   if vim.fn.has("win32") == 1 then
-    local _, windows_mode = find("windows-sandbox")
+    local _, windows_mode = find("isolation-mode")
     assert(windows_mode.muted and not windows_mode.disabled_reason
-      and windows_mode.description:find("Codex on Windows only", 1, true))
+      and windows_mode.description:find("unavailable for this provider", 1, true))
   end
   local failure_message
   local original_warn = require("forge.infra.notifications").warn
@@ -455,9 +459,9 @@ local success, failure = xpcall(function()
   picker.close()
   for _, provider in ipairs({ "copilot", "claude", "antigravity", "mock" }) do
     configured_session.provider = provider
-    state.capability.os_sandbox = true
+    state.capability.os_sandbox = false
     settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
-    for _, id in ipairs(vim.fn.has("win32") == 1 and { "sandbox", "windows-sandbox" } or { "sandbox" }) do
+    for _, id in ipairs(vim.fn.has("win32") == 1 and { "sandbox", "isolation-mode" } or { "sandbox" }) do
       local row, field = find(id)
       assert(field.muted and not field.disabled_reason, provider .. " did not keep " .. id .. " editable and muted")
       local _, spans = require("forge.views.picker.field").columns(row, id, true)

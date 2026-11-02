@@ -255,6 +255,7 @@ mod tests {
             },
             update: ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     title: "inspect".into(),
                     name: "inspect".into(),
                     kind: ToolActivityKind::Command,
@@ -326,6 +327,7 @@ mod tests {
             &address,
             "earlier",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 name: "earlier".into(),
                 title: "earlier".into(),
@@ -355,6 +357,7 @@ mod tests {
                 &address,
                 &format!("command-{index}"),
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     name: "inspect".into(),
                     title: format!("inspect {index}"),
@@ -374,6 +377,7 @@ mod tests {
             &address,
             "write",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::FileChange,
                 name: "edit".into(),
                 title: "edit".into(),
@@ -504,6 +508,7 @@ mod tests {
                     &address,
                     "later",
                     ToolInvocation {
+                        semantics: Default::default(),
                         kind: ToolActivityKind::Command,
                         name: "later".into(),
                         title: "later".into(),

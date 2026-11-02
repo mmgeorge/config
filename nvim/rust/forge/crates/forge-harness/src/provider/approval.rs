@@ -120,13 +120,13 @@ impl PermissionCoordinator {
         request: &crate::provider::ProviderRequest,
         provider: crate::provider::ProviderKind,
     ) -> Result<crate::skill::SkillExecution> {
-        let (provider, target) = match provider {
-            crate::provider::ProviderKind::Codex => ("codex", "codexcli"),
-            crate::provider::ProviderKind::Copilot => ("copilot", "copilotcli"),
-            crate::provider::ProviderKind::Claude => ("claude", "claudecode"),
-            crate::provider::ProviderKind::Antigravity => ("antigravity", "antigravity-cli"),
-            _ => ("mock", "mock"),
-        };
+        let declaration = super::registered_capability(provider);
+        let target = declaration
+            .integration
+            .resource_target
+            .as_deref()
+            .context("provider has no managed resource target")?;
+        let provider = crate::agent::provider_name(provider);
         let selected = if request.mode == crate::provider::PromptMode::Background {
             Vec::new()
         } else if let Some(root) = root {

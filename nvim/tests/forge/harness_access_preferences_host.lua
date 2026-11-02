@@ -73,11 +73,7 @@ local success, failure = xpcall(function()
   picker.close(false)
   open_settings()
   assert(field("sandbox").value.value and field("sandbox").value.muted, "reopening lost the selected preference")
-  if vim.fn.has("win32") == 1 then
-    assert(field("windows-sandbox").value.muted)
-    change("windows-sandbox", "<Right>")
-    await(function() return state.access_preference.windows_sandbox == "unelevated" end, "muted Windows mode did not save")
-  end
+  assert(not pcall(field, "isolation-mode"), "Mock must not invent provider isolation modes")
   change("readable-directories", "<CR>")
   await(function() return vim.bo.buftype == "acwrite" end, "directory editor did not open")
   local directory_buffer = vim.api.nvim_get_current_buf()

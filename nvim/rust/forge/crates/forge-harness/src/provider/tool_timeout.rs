@@ -220,6 +220,7 @@ mod tests {
             address: address(id),
             update: ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     kind,
                     name: id.into(),
                     title: id.into(),

@@ -8,17 +8,11 @@ pub struct ContextUsage {
 }
 
 impl ContextUsage {
-    const CODEX_BASELINE_TOKENS: u64 = 12_000;
-
-    pub fn codex(used: u64, size: u64) -> Option<Self> {
-        Self::with_baseline(used, size, Self::CODEX_BASELINE_TOKENS)
-    }
-
     pub fn reported(used: u64, size: u64) -> Option<Self> {
         Self::with_baseline(used, size, 0)
     }
 
-    fn with_baseline(used: u64, size: u64, baseline: u64) -> Option<Self> {
+    pub fn with_baseline(used: u64, size: u64, baseline: u64) -> Option<Self> {
         let effective_size = size.checked_sub(baseline)?;
         if effective_size == 0 {
             return None;

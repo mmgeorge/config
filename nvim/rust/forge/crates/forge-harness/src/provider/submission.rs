@@ -39,7 +39,7 @@ pub use forge_provider_api::submission::SubmissionTarget;
 pub struct SubmissionRecord {
     #[serde(default)]
     pub input_message_id: Option<String>,
-    /// Host-generated UUID, also used as Codex's client user message ID.
+    /// Host-generated UUID, also used for native input correlation.
     pub id: String,
     /// Original request, including typed input and durable attachment references.
     pub request: ProviderRequest,
@@ -742,12 +742,9 @@ impl Submission {
                     handle.accepted(receipt)?;
                     if request.provider_session_id.is_none() {
                         request.provider_session_id = match &pending.delivery {
-                            SubmissionState::Sending {
-                                target: SubmissionTarget::Codex { thread_id },
-                            } => Some(thread_id.clone()),
-                            SubmissionState::Sending {
-                                target: SubmissionTarget::Copilot { session_id, .. },
-                            } => Some(session_id.clone()),
+                            SubmissionState::Sending { target } => {
+                                target.conversation_id().map(str::to_owned)
+                            }
                             _ => None,
                         };
                     }
@@ -799,9 +796,7 @@ mod tests {
         assert!(first.begin_steering().is_err());
         let second_flight = second.begin_steering()?;
         let third_flight = third.begin_steering()?;
-        let target = SubmissionTarget::Codex {
-            thread_id: "thread".into(),
-        };
+        let target = SubmissionTarget::native("codex", "thread", serde_json::json!({}));
         first.sending(target.clone())?;
         second.sending(target.clone())?;
         second.accepted("second accepted first".into())?;
@@ -883,9 +878,11 @@ mod tests {
         let mut acceptance = alias.acceptance();
         submission
             .persist(|submission| {
-                submission.sending(SubmissionTarget::Codex {
-                    thread_id: "thread".into(),
-                })
+                submission.sending(SubmissionTarget::native(
+                    "codex",
+                    "thread",
+                    serde_json::json!({}),
+                ))
             })
             .await?;
         store.connection.lock().unwrap().execute_batch("CREATE TRIGGER fail_accept BEFORE UPDATE ON submission WHEN json_extract(NEW.payload,'$.delivery.state')='accepted' BEGIN SELECT RAISE(ABORT,'accept failed'); END;")?;
@@ -956,7 +953,13 @@ mod tests {
             ProviderDescriptor {
                 kind: ProviderKind::Codex,
                 label: "submission fixture".into(),
-                capability: Default::default(),
+                capability: crate::provider::ProviderCapability {
+                    integration: crate::provider::ProviderIntegration {
+                        tracked_submission: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             }
         }
         async fn has_active_turn(&self, _: &str) -> bool {
@@ -988,9 +991,11 @@ mod tests {
                     anyhow::bail!("provider startup failed");
                 }
                 let submission = request.submission.as_ref().unwrap();
-                submission.sending(SubmissionTarget::Codex {
-                    thread_id: "native-thread".into(),
-                })?;
+                submission.sending(SubmissionTarget::native(
+                    "codex",
+                    "native-thread",
+                    serde_json::json!({}),
+                ))?;
                 self.send_count.fetch_add(1, Ordering::SeqCst);
                 self.input.lock().unwrap().push(request.clone());
                 if self.lose_ack.swap(false, Ordering::SeqCst) {
@@ -1095,9 +1100,11 @@ mod tests {
         assert_eq!(prepared.record()?.delivery, SubmissionState::Cancelled);
         let dispatched =
             store.prepare(&request("dispatched"), super::super::ProviderKind::Codex)?;
-        dispatched.sending(SubmissionTarget::Codex {
-            thread_id: "thread".into(),
-        })?;
+        dispatched.sending(SubmissionTarget::native(
+            "codex",
+            "thread",
+            serde_json::json!({}),
+        ))?;
         dispatched.cancel()?;
         assert!(matches!(
             dispatched.record()?.delivery,
@@ -1132,9 +1139,11 @@ mod tests {
             activation.store(true, Ordering::SeqCst);
             Ok(())
         })?;
-        first.sending(SubmissionTarget::Codex {
-            thread_id: "thread".into(),
-        })?;
+        first.sending(SubmissionTarget::native(
+            "codex",
+            "thread",
+            serde_json::json!({}),
+        ))?;
         first.accepted("receipt".into())?;
         assert!(*accepted.borrow() && activated.load(Ordering::SeqCst));
         let duplicate = store.prepare_record(
@@ -1256,9 +1265,11 @@ mod tests {
         let next = store.prepare(&request("second"), super::super::ProviderKind::Codex)?;
         let mut combined = request("second");
         next.recover(&ReceiptProvider::new(), &mut combined).await?;
-        next.sending(SubmissionTarget::Codex {
-            thread_id: "thread".into(),
-        })?;
+        next.sending(SubmissionTarget::native(
+            "codex",
+            "thread",
+            serde_json::json!({}),
+        ))?;
         store.connection.lock().unwrap().execute_batch(&format!(
             "CREATE TRIGGER fail_ack BEFORE UPDATE ON submission WHEN NEW.id='{}' BEGIN SELECT RAISE(ABORT,'disk commit failure'); END;", original.id()))?;
         assert!(next.accepted("ack".into()).is_err());
@@ -1299,9 +1310,11 @@ mod tests {
             input.recovered_input,
             vec![ProviderInput::from_text("earlier")]
         );
-        current.sending(SubmissionTarget::Codex {
-            thread_id: "thread".into(),
-        })?;
+        current.sending(SubmissionTarget::native(
+            "codex",
+            "thread",
+            serde_json::json!({}),
+        ))?;
         current.accepted("ack".into())?;
         assert!(matches!(
             earlier.record()?.delivery,
@@ -1340,7 +1353,8 @@ mod tests {
         let mut input = request("latest");
         next.recover(&ReceiptProvider::new(), &mut input).await?;
         assert_eq!(input.recovered_input, vec![original.input]);
-        let native = crate::attachment::copilot_input("context", &input.input_attachments())?;
+        let native =
+            crate::provider::copilot::attachments::input("context", &input.input_attachments())?;
         let files = native.attachments;
         assert_eq!(std::fs::read(&files[0].path)?, bytes);
         Ok(())
@@ -1352,9 +1366,11 @@ mod tests {
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace)?;
         let original = store.prepare(&request("accepted"), ProviderKind::Codex)?;
-        original.sending(SubmissionTarget::Codex {
-            thread_id: "thread".into(),
-        })?;
+        original.sending(SubmissionTarget::native(
+            "codex",
+            "thread",
+            serde_json::json!({}),
+        ))?;
         original.accepted("native ack".into())?;
         original.failed("stream timed out".into())?;
         let next = store.prepare(&request("latest"), ProviderKind::Codex)?;

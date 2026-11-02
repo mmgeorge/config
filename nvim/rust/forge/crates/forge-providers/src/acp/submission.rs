@@ -64,10 +64,11 @@ impl AcpConnection {
                 })?
                 .to_owned();
             if let Some(submission) = submission.as_ref() {
-                let target = SubmissionTarget::Acp {
-                    session_id: session_id.clone(),
-                    method: method.into(),
-                };
+                let target = SubmissionTarget::native(
+                    "acp",
+                    session_id.clone(),
+                    serde_json::json!({"method":method}),
+                );
                 submission.clone().record_sending(target).await?;
             }
             let response = self.request(method, parameter).await?;

@@ -67,7 +67,7 @@ impl AcpProvider {
         tools: Option<Vec<crate::tools::ControlToolDefinition>>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Arc<AcpSession>> {
-        self.kind.validate_access(&request.access)?;
+        crate::provider::registered_capability(self.kind).validate_access(&request.access)?;
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             return Err(crate::broker::TurnCancelled.into());
         }
@@ -438,34 +438,15 @@ impl crate::provider::ProviderAdapter for AcpProvider {
         Ok(manifest)
     }
     fn descriptor(&self) -> ProviderDescriptor {
-        let claude = self.kind == ProviderKind::Claude;
         ProviderDescriptor {
             kind: self.kind,
-            label: if claude { "Claude Code" } else { "Antigravity" }.into(),
-            capability: ProviderCapability {
-                native_fork: claude,
-                native_compact: claude,
-                native_steer: claude,
-                model_selection: true,
-                effort_selection: claude,
-                permission_control: true,
-                catalog: CatalogCapability {
-                    skill: true,
-                    mcp: true,
-                    live_mcp_mutation: false,
-                },
-                approval_mode_list: vec![
-                    ApprovalMode::Ask,
-                    ApprovalMode::Deny,
-                    ApprovalMode::Allow,
-                ],
-                compaction: CompactionCapability {
-                    lifecycle: claude,
-                    summary: claude,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+            label: if self.kind == ProviderKind::Claude {
+                "Claude Code"
+            } else {
+                "Antigravity"
+            }
+            .into(),
+            capability: capability(self.kind),
         }
     }
 
@@ -666,9 +647,12 @@ impl crate::provider::ProviderAdapter for AcpProvider {
                 format!("{}\n\n{}", request.system_message(), text)
             };
             let image_supported = session.native.supports_images();
-            let prompt =
-                crate::attachment::acp_input(prompt, &request.input_attachments(), image_supported)
-                    .await?;
+            let prompt = crate::provider::acp::attachments::input(
+                prompt,
+                &request.input_attachments(),
+                image_supported,
+            )
+            .await?;
             session
                 .permission
                 .configure(
@@ -922,9 +906,12 @@ impl crate::provider::ProviderAdapter for AcpProvider {
             "ACP agent did not advertise steering support"
         );
         let image_supported = session.native.supports_images();
-        let prompt =
-            crate::attachment::acp_input(text.to_owned(), input.attachments(), image_supported)
-                .await?;
+        let prompt = crate::provider::acp::attachments::input(
+            text.to_owned(),
+            input.attachments(),
+            image_supported,
+        )
+        .await?;
         let submission = input.submission();
         session
             .native
@@ -1000,6 +987,56 @@ fn find_option<'catalog>(catalog: &'catalog Value, category: &str) -> Option<&'c
         .find(|option| option["category"] == category || option["id"] == category)
 }
 
+/// Declare integration support and limitations before native runtime discovery.
+pub(crate) fn capability(kind: ProviderKind) -> ProviderCapability {
+    let claude = kind == ProviderKind::Claude;
+    ProviderCapability {
+        integration: super::super::ProviderIntegration {
+            runtime_setup: true,
+            authentication: true,
+            tracked_submission: true,
+            native_agent_suppression: claude,
+            resource_target: Some(
+                if claude {
+                    "claudecode"
+                } else {
+                    "antigravity-cli"
+                }
+                .into(),
+            ),
+            limitations: if claude {
+                vec![]
+            } else {
+                vec![
+ forge_provider_api::capability::FeatureLimitation { id: "file_diff".into(), support: forge_provider_api::capability::Support::Limited, reason: "Edit tools can complete without structured diffs; checkpoint review remains available".into() },
+ forge_provider_api::capability::FeatureLimitation { id: "approval_rules".into(), support: forge_provider_api::capability::Support::Limited, reason: "Enterprise terminal policy may execute without approval callbacks".into() },
+ forge_provider_api::capability::FeatureLimitation { id: "skill_catalog".into(), support: forge_provider_api::capability::Support::Limited, reason: "Project-native skills cannot be excluded by this integration".into() },
+ forge_provider_api::capability::FeatureLimitation { id: "skill_mutation".into(), support: forge_provider_api::capability::Support::Limited, reason: "Project-native skills cannot be excluded by this integration".into() },
+]
+            },
+            ..Default::default()
+        },
+        native_fork: claude,
+        native_compact: claude,
+        native_steer: claude,
+        model_selection: true,
+        effort_selection: claude,
+        permission_control: true,
+        catalog: CatalogCapability {
+            skill: true,
+            mcp: true,
+            live_mcp_mutation: false,
+        },
+        approval_mode_list: vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow],
+        compaction: CompactionCapability {
+            lifecycle: claude,
+            summary: claude,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1038,7 +1075,8 @@ mod test {
                 execution_owner: None,
                 harness_session_id: "preparing".into(),
                 workspace: fixture.path().to_string_lossy().into_owned(),
-                access: kind.resolve_access(Default::default()),
+                access: crate::provider::registered_capability(kind)
+                    .resolve_access(Default::default()),
                 approval_mode: ApprovalMode::Ask,
                 provider_session_id: None,
             };

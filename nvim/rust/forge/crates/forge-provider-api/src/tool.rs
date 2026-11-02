@@ -3,6 +3,9 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolInvocation {
+    /// Adapter-normalized operation metadata; raw arguments are inspection-only.
+    #[serde(default)]
+    pub semantics: ToolSemantics,
     pub kind: ToolActivityKind,
     pub name: String,
     pub title: String,
@@ -201,4 +204,21 @@ impl ToolInvocation {
                 | "privatekey"
         )
     }
+}
+
+/// Carries the operation meaning without requiring native tool-name or argument parsing.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolSemantics {
+    #[default]
+    Other,
+    Command {
+        text: String,
+        shell: Option<String>,
+        directory: Option<String>,
+    },
+    Read {
+        paths: Vec<String>,
+        directory: Option<String>,
+    },
 }

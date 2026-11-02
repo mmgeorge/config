@@ -410,6 +410,7 @@ impl TimelineRenderer<'_> {
             }
         );
         let heading = crate::turn::ToolCall {
+            command_shell: None,
             id: call_id.to_string(),
             kind: "check".into(),
             title: title.clone(),
@@ -447,6 +448,7 @@ impl TimelineRenderer<'_> {
             BlockId(format!("{call_id}:tool")),
             TargetId(format!("{call_id}:tool")),
             crate::buffer::transcript::ToolHeading {
+                shell: None,
                 kind: "check",
                 elapsed_ms: elapsed,
                 failed,

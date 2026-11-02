@@ -1243,6 +1243,7 @@ mod test {
             },
             update: ToolUpdate::Requested {
                 invocation: crate::provider::ToolInvocation {
+                    semantics: Default::default(),
                     kind: crate::provider::ToolActivityKind::Command,
                     name: "probe".into(),
                     title: "Probe".into(),
@@ -1274,6 +1275,7 @@ mod test {
             address.tool_id = "second".into();
             *update = ToolUpdate::Requested {
                 invocation: crate::provider::ToolInvocation {
+                    semantics: Default::default(),
                     kind: crate::provider::ToolActivityKind::Command,
                     name: "probe".into(),
                     title: "Probe".into(),
@@ -1500,6 +1502,7 @@ mod test {
             &address,
             "change",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: crate::provider::ToolActivityKind::FileChange,
                 name: "edit".into(),
                 title: "edit".into(),

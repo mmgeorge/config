@@ -5340,12 +5340,14 @@ impl HarnessBroker {
         request: &ProviderCatalogRequest,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        let target = match self.session.provider.as_str() {
-            "codex" => "codexcli",
-            "copilot" => "copilotcli",
-            "claude" => "claudecode",
-            "antigravity" => "antigravity-cli",
-            _ => return Ok(()),
+        let declaration = self.provider.descriptor();
+        let Some(target) = declaration
+            .capability
+            .integration
+            .resource_target
+            .as_deref()
+        else {
+            return Ok(());
         };
         let resources = crate::settings::SessionResources::load(
             &self.data_root,
@@ -8288,8 +8290,10 @@ impl HarnessBroker {
         if let Some(access) = &access {
             configured.access = access.clone();
         }
-        configured.access = crate::provider::ProviderKind::parse(&configured.provider)?
-            .resolve_access(configured.access);
+        configured.access = crate::provider::registered_capability(
+            crate::provider::ProviderKind::parse(&configured.provider)?,
+        )
+        .resolve_access(configured.access);
         if let Some(selection) = resource_selection {
             self.provider
                 .reconcile_settings(
@@ -10150,13 +10154,13 @@ let sink = Some(sink);
             preferences.apply(&mut broker.session, true).unwrap();
             assert_eq!(broker.session.access.sandbox, provider == "codex");
             for (enabled, mode) in [
-                (true, crate::session::WindowsSandbox::Mxc),
-                (false, crate::session::WindowsSandbox::Unelevated),
-                (true, crate::session::WindowsSandbox::Elevated),
+                (true, Some("mxc".to_owned())),
+                (false, Some("unelevated".to_owned())),
+                (true, Some("elevated".to_owned())),
             ] {
                 let requested = crate::session::AccessPolicy {
                     sandbox: enabled,
-                    windows_sandbox: mode,
+                    isolation_mode: mode.clone(),
                     ..Default::default()
                 };
                 broker
@@ -10201,7 +10205,7 @@ let sink = Some(sink);
                 let mut restored = snapshot.session.clone();
                 saved.apply(&mut restored, true).unwrap();
                 assert_eq!(restored.access.sandbox, enabled && provider == "codex");
-                assert_eq!(restored.access.windows_sandbox, mode);
+                assert_eq!(restored.access.isolation_mode, mode);
                 restored.provider = "codex".into();
                 saved.apply(&mut restored, true).unwrap();
                 assert_eq!(
@@ -10254,7 +10258,7 @@ let sink = Some(sink);
                 .is_err()
         );
         assert_eq!(broker.session.approval_mode, ApprovalMode::Allow);
-        assert!(broker.configure_session(json!({"access":{"sandbox":true,"write_access":"workspace","writable_directory":["relative"],"windows_sandbox":"elevated"}})).await.is_err());
+        assert!(broker.configure_session(json!({"access":{"sandbox":true,"write_access":"workspace","writable_directory":["relative"],"isolation_mode":"elevated"}})).await.is_err());
         assert_eq!(broker.session.access, stored.access);
     }
 
@@ -11812,7 +11816,7 @@ let sink = Some(sink);
                     .unwrap()
                     .send_wait(crate::provider::test_support::tool(
             &address.clone(), id.clone(),
-            crate::provider::ToolInvocation { kind: crate::provider::ToolActivityKind::Command, name: "fixture".into(),
+            crate::provider::ToolInvocation { semantics: Default::default(), kind: crate::provider::ToolActivityKind::Command, name: "fixture".into(),
                 title: "Observe fixture".into(), arguments: serde_json::Value::Null },
             crate::turn::test_support::tool_updates(crate::provider::ToolStatus::Succeeded, Some(
                                 if turn == 1 {
@@ -14453,6 +14457,7 @@ let sink = Some(sink);
                         &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "provider-file-change".into(),
                         crate::provider::ToolInvocation {
+                            semantics: Default::default(),
                             kind: crate::provider::ToolActivityKind::FileChange,
                             name: "fixture".into(),
                             title: "file changes".into(),
@@ -14468,6 +14473,7 @@ let sink = Some(sink);
                         &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "nested-command".into(),
                         crate::provider::ToolInvocation {
+                            semantics: Default::default(),
                             kind: crate::provider::ToolActivityKind::Command,
                             name: "fixture".into(),
                             title: "create nested module".into(),
@@ -14491,6 +14497,7 @@ let sink = Some(sink);
                         &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "provider-file-change".into(),
                         crate::provider::ToolInvocation {
+                            semantics: Default::default(),
                             kind: crate::provider::ToolActivityKind::FileChange,
                             name: "fixture".into(),
                             title: "file changes".into(),
@@ -14516,6 +14523,7 @@ let sink = Some(sink);
                         &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "nested-command".into(),
                         crate::provider::ToolInvocation {
+                            semantics: Default::default(),
                             kind: crate::provider::ToolActivityKind::Command,
                             name: "fixture".into(),
                             title: "create nested module".into(),
@@ -15487,6 +15495,7 @@ let sink = Some(sink);
         for update in [
             ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     name: "exec".into(),
                     title: "Background command".into(),
@@ -15587,6 +15596,7 @@ let sink = Some(sink);
             (
                 ToolUpdate::Requested {
                     invocation: ToolInvocation {
+                        semantics: Default::default(),
                         kind: ToolActivityKind::ToolCall,
                         name: "webSearch".into(),
                         title: "Web Search".into(),
@@ -15785,6 +15795,7 @@ let sink = Some(sink);
             &address,
             "tool".into(),
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 name: "inspect".into(),
                 title: "inspect".into(),
@@ -18902,6 +18913,7 @@ let sink = Some(sink);
             for update in [
                 crate::provider::ToolUpdate::Requested {
                     invocation: crate::provider::ToolInvocation {
+                        semantics: Default::default(),
                         kind: crate::provider::ToolActivityKind::FileChange,
                         name: "edit".into(),
                         title: "file changes".into(),

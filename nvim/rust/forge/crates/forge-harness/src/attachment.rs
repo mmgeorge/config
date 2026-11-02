@@ -1,8 +1,11 @@
 use crate::storage::objects::ObjectStore;
 use anyhow::{Context, Result, ensure};
+#[cfg(test)]
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -152,7 +155,28 @@ impl Attachment {
 }
 
 impl InputAttachment {
-    fn opening(&self) -> Result<String> {
+    /// Get the admitted content type.
+    pub(crate) fn media_type(&self) -> &str {
+        &self.attachment.media_type
+    }
+    /// Get the original display filename.
+    pub(crate) fn name(&self) -> &str {
+        &self.attachment.name
+    }
+    /// Get the explicit composer label.
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+    /// Resolve the retained file without reading prompt text.
+    pub(crate) fn path(&self) -> Result<PathBuf> {
+        self.attachment.path(&self.root)
+    }
+    /// Read the complete admitted object for an adapter encoder.
+    pub(crate) fn bytes(&self) -> Result<Vec<u8>> {
+        ObjectStore::open(&self.root)?.get(&self.attachment.object_id)
+    }
+
+    pub(crate) fn opening(&self) -> Result<String> {
         let tag = if self.attachment.media_type.starts_with("image/") {
             "image"
         } else {
@@ -165,14 +189,14 @@ impl InputAttachment {
             escape(&self.attachment.media_type)
         ))
     }
-    fn closing(&self) -> &'static str {
+    pub(crate) fn closing(&self) -> &'static str {
         if self.attachment.media_type.starts_with("image/") {
             "</image>"
         } else {
             "</file>"
         }
     }
-    fn file_context(&self) -> Result<String> {
+    pub(crate) fn file_context(&self) -> Result<String> {
         Ok(format!(
             "{}\nUse file-reading tools to inspect the complete retained file.\n{}",
             self.opening()?,
@@ -181,7 +205,7 @@ impl InputAttachment {
     }
 }
 
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('<', "&lt;")
@@ -251,80 +275,13 @@ fn media_type(source: &Path) -> Result<String> {
     .into())
 }
 
-/// Build native Codex image items and literal prompt text from already admitted files.
-pub(crate) async fn codex_input(text: String, selected: &[InputAttachment]) -> Result<Vec<Value>> {
-    let mut input = Vec::new();
-    for selected in selected {
-        if selected.attachment.media_type.starts_with("image/") {
-            input.push(json!({"type":"text", "text":selected.opening()?}));
-            input.push(
-                json!({"type":"localImage", "path":selected.attachment.path(&selected.root)?}),
-            );
-            input.push(json!({"type":"text", "text":selected.closing()}));
-        } else {
-            input.push(json!({"type":"text", "text":selected.file_context()?}));
-        }
-    }
-    input.push(json!({"type":"text", "text":text}));
-    Ok(input)
-}
-
-/// Encode explicit ACP images off-thread without interpreting the prompt.
-pub(crate) async fn acp_input(
-    text: String,
-    selected: &[InputAttachment],
-    image_supported: bool,
-) -> Result<Vec<Value>> {
-    if selected.is_empty() {
-        return Ok(vec![json!({"type":"text", "text":text})]);
-    }
-    let selected = selected.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let mut input = Vec::new();
-        for selected in selected {
-            if selected.attachment.media_type.starts_with("image/") {
-                ensure!(image_supported, "this agent does not support image attachments");
-                input.push(json!({"type":"text", "text":selected.opening()?}));
-                let bytes = ObjectStore::open(&selected.root)?.get(&selected.attachment.object_id)?;
-                input.push(json!({"type":"image", "mimeType":selected.attachment.media_type, "data":base64::engine::general_purpose::STANDARD.encode(bytes)}));
-                input.push(json!({"type":"text", "text":selected.closing()}));
-            } else { input.push(json!({"type":"text", "text":selected.file_context()?})); }
-        }
-        input.push(json!({"type":"text", "text":text}));
-        Ok(input)
-    }).await.context("attachment preparation worker failed")?
-}
-
-/// Bind native Copilot files to the same explicit labels used in the literal prompt.
-pub(crate) fn copilot_input(
-    text: &str,
-    selected: &[InputAttachment],
-) -> Result<forge_provider_api::input::MessageInput> {
-    use forge_provider_api::input::{FileAttachment, MessageInput};
-    let mut prompt = String::new();
-    let mut attachments = Vec::new();
-    for selected in selected {
-        prompt.push_str(&format!(
-            "{}\nNative attachment: {}\n{}\n\n",
-            selected.opening()?,
-            escape(&selected.attachment.name),
-            selected.closing()
-        ));
-        attachments.push(FileAttachment {
-            path: selected.attachment.path(&selected.root)?,
-            display_name: format!("{} {}", selected.label, selected.attachment.name),
-        });
-    }
-    prompt.push_str(text);
-    Ok(MessageInput {
-        prompt,
-        attachments,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{
+        acp::attachments::input as acp_input, codex::attachments::input as codex_input,
+        copilot::attachments::input as copilot_input,
+    };
     #[tokio::test]
     async fn literal_text_never_loads_or_creates_attachments() -> Result<()> {
         let text = format!(

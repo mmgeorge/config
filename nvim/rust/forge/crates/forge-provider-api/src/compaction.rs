@@ -37,56 +37,41 @@ pub struct CompactionCapability {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 /// Retains reported token categories for the compaction model request.
 pub struct CompactionUsage {
-    /// Provider billing totals and token categories when included in the native event.
-    #[serde(alias = "copilotUsage")]
+    /// Provider-reported billing measurements, when available.
     pub billing: Option<CompactionCost>,
     /// Submitted prompt tokens.
-    #[serde(alias = "inputTokens")]
     pub input: Option<u64>,
     /// Generated tokens.
-    #[serde(alias = "outputTokens")]
     pub output: Option<u64>,
     /// Prompt tokens served from cache.
-    #[serde(alias = "cacheReadTokens")]
     pub cached_input: Option<u64>,
     /// Prompt tokens written to cache.
     pub cache_write_tokens: Option<u64>,
     /// Provider-measured compaction request duration.
-    #[serde(alias = "duration")]
     pub duration_ms: Option<u64>,
     /// Model used for the compaction request.
     pub model: Option<String>,
 }
 
+/// Retains labeled, explicitly denominated provider billing observations.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
-/// Retains provider billing evidence in its reported AI-unit denomination.
 pub struct CompactionCost {
-    /// Provider-reported request cost in nano-AI units.
-    pub total_nano_aiu: Option<f64>,
-    /// Provider billing categories, absent when no itemized cost was reported.
-    pub token_details: Option<Vec<CompactionTokenCost>>,
+    pub measurements: Vec<ReportedMeasurement>,
+}
+
+/// Preserves a provider-reported measurement without converting currency or precision.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReportedMeasurement {
+    pub label: String,
+    pub value: String,
+    pub unit: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
-/// Retains one billing category without deriving monetary prices.
-pub struct CompactionTokenCost {
-    /// Number of tokens in one billing batch.
-    pub batch_size: Option<u64>,
-    /// Reported cost of one batch.
-    pub cost_per_batch: Option<u64>,
-    /// Token count charged to the category.
-    pub token_count: Option<u64>,
-    /// Provider billing category name.
-    pub token_type: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 /// Retains reported context composition after compaction.
 pub struct CompactionContext {
     /// Total retained tokens.
@@ -104,7 +89,7 @@ pub struct CompactionContext {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 /// Retains provider results and observed context usage without inventing absent values.
 pub struct CompactionResult {
     /// Context meter tokens captured when compaction starts.

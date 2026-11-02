@@ -96,8 +96,8 @@ function M.open(options)
     end
     local status = phase
     if not busy and runtime then
-      local details = { runtime.available and "ACP adapter ready" or "ACP adapter is not installed" }
-      if runtime.provider_version then details[#details + 1] = "Claude Code " .. runtime.provider_version end
+      local details = { runtime.available and "Provider runtime ready" or "Provider runtime is not installed" }
+      if runtime.provider_version then details[#details + 1] = "Provider version " .. runtime.provider_version end
       if runtime.adapter_version then details[#details + 1] = "Adapter " .. runtime.adapter_version end
       if runtime.version_error then details[#details + 1] = runtime.version_error end
       status = table.concat(details, " · ")

@@ -15,9 +15,9 @@ local response = vim.json.decode([[{
   "agent": {"run": [], "definition": [], "exchange": []},
   "timeline": [], "timeline_revision": 3, "prompt_history": null
 }]])
-response.access_preference = { sandbox = true, windows_sandbox = "mxc" }
+response.access_preference = { sandbox = true, isolation_mode = "mxc" }
 snapshot.apply(state, response)
-assert(state.access_preference.sandbox and state.access_preference.windows_sandbox == "mxc")
+assert(state.access_preference.sandbox and state.access_preference.isolation_mode == "mxc")
 for _, field in ipairs({ "active_plan", "active_elicitation", "active_wait" }) do
   assert(state[field] == nil, field .. " retained a JSON null")
 end

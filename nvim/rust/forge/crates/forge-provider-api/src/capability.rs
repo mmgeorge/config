@@ -1,7 +1,7 @@
 use crate::{ProviderDescriptor, ProviderKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Distinguishes supported behavior from provider limitations.
 pub enum Support {
@@ -31,7 +31,7 @@ pub struct Capability {
     /// Describes the configuration application boundary.
     pub application: &'static str,
     /// Explains the observable restriction or guarantee.
-    pub reason: &'static str,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -61,7 +61,7 @@ impl CapabilityManifest {
         let flags = &descriptor.capability;
         let mut capability = Vec::new();
         let mut add =
-            |id, group, label, required, implementation, supported, application, reason| {
+            |id, group, label, required, implementation, supported, application, reason: &str| {
                 capability.push(Capability {
                     id,
                     group,
@@ -74,7 +74,7 @@ impl CapabilityManifest {
                         Support::Unsupported
                     },
                     application,
-                    reason,
+                    reason: reason.to_owned(),
                 });
             };
         for (id, label) in [
@@ -227,9 +227,9 @@ impl CapabilityManifest {
             "Enforce OS sandbox",
             false,
             "provider",
-            descriptor.kind.supports_sandbox(),
+            flags.os_sandbox,
             "session_restart",
-            "Only allowlisted providers enable OS isolation. Other providers resolve sandbox preferences to disabled",
+            "Only integrations that declare enforced OS isolation enable this control",
         );
         add(
             "background_terminals",
@@ -257,10 +257,7 @@ impl CapabilityManifest {
             "Terminate one background terminal",
             false,
             "provider",
-            matches!(
-                descriptor.kind,
-                ProviderKind::Codex | ProviderKind::Copilot | ProviderKind::Mock
-            ),
+            flags.integration.terminal_termination,
             "immediate",
             "Root cancellation remains available without independent terminal controls",
         );
@@ -270,16 +267,21 @@ impl CapabilityManifest {
             "Generate isolated recap and session name",
             false,
             "provider",
-            matches!(
-                descriptor.kind,
-                ProviderKind::Codex | ProviderKind::Copilot | ProviderKind::Mock
-            ),
+            flags.integration.isolated_generation,
             "immediate",
             "Generation must not append to the main provider conversation",
         );
-        for (id, label) in [
-            ("runtime_setup", "Install supported provider runtime"),
-            ("authentication", "Sign in from Forge"),
+        for (id, label, supported) in [
+            (
+                "runtime_setup",
+                "Install supported provider runtime",
+                flags.integration.runtime_setup,
+            ),
+            (
+                "authentication",
+                "Sign in from Forge",
+                flags.integration.authentication,
+            ),
         ] {
             add(
                 id,
@@ -287,12 +289,9 @@ impl CapabilityManifest {
                 label,
                 false,
                 "forge",
-                matches!(
-                    descriptor.kind,
-                    ProviderKind::Claude | ProviderKind::Antigravity
-                ),
+                supported,
                 "idle",
-                "ACP setup uses provider-advertised sign-in methods and preserves native credentials",
+                "Uses provider-advertised setup and sign-in methods, preserving native credentials",
             );
         }
         for (id, label) in [
@@ -353,13 +352,9 @@ impl CapabilityManifest {
             "Disable provider-native agent tools",
             false,
             "provider",
-            descriptor.kind != ProviderKind::Antigravity,
+            flags.integration.native_agent_suppression,
             "session_restart",
-            if descriptor.kind == ProviderKind::Antigravity {
-                "Antigravity ACP exposes no native-agent suppression control. Native events cannot create Harness children"
-            } else {
-                "Provider-native agent tools are disabled for session creation and resumption"
-            },
+            "Requires an integration that can disable provider-native delegation",
         );
         add(
             "skill_mutation",
@@ -395,9 +390,17 @@ impl CapabilityManifest {
             },
             "Forge persists desired selection independently of native provider configuration",
         );
-        for (id, label) in [
-            ("mcp_runtime_status", "Inspect MCP connection status"),
-            ("mcp_tool_catalog", "Browse MCP tool definitions"),
+        for (id, label, supported) in [
+            (
+                "mcp_runtime_status",
+                "Inspect MCP connection status",
+                flags.integration.mcp_runtime_status,
+            ),
+            (
+                "mcp_tool_catalog",
+                "Browse MCP tool definitions",
+                flags.integration.mcp_tool_catalog,
+            ),
         ] {
             add(
                 id,
@@ -405,33 +408,10 @@ impl CapabilityManifest {
                 label,
                 false,
                 "provider",
-                flags.catalog.mcp
-                    && matches!(
-                        descriptor.kind,
-                        ProviderKind::Codex | ProviderKind::Copilot | ProviderKind::Mock
-                    ),
+                flags.catalog.mcp && supported,
                 "immediate",
-                "ACP accepts configured servers but does not expose their readiness or tool inventory",
+                "Requires provider observation of server readiness or tool inventory",
             );
-        }
-        if descriptor.kind == ProviderKind::Antigravity {
-            for entry in &mut capability {
-                match entry.id {
-                    "file_diff" => {
-                        entry.support = Support::Limited;
-                        entry.reason = "Antigravity edit tools can complete without structured diff content. Forge checkpoint review remains available";
-                    }
-                    "approval_rules" if flags.permission_control => {
-                        entry.support = Support::Limited;
-                        entry.reason = "Forge evaluates received approval requests. Antigravity enterprise terminal policy can execute without an ACP callback";
-                    }
-                    "skill_catalog" | "skill_mutation" if flags.catalog.skill => {
-                        entry.support = Support::Limited;
-                        entry.reason = "Forge controls profile skills. Excluding a project-native skill is rejected because ACP does not expose that control";
-                    }
-                    _ => {}
-                }
-            }
         }
         capability.push(Capability {
             id: "filesystem_access",
@@ -441,8 +421,20 @@ impl CapabilityManifest {
             implementation: "forge",
             support: Support::Limited,
             application: "execution_restart",
-            reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions. Codex does not enforce the selected read scope as OS read confinement",
+            reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions".into(),
         });
+        for limitation in &flags.integration.limitations {
+            if let Some(entry) = capability
+                .iter_mut()
+                .find(|entry| entry.id == limitation.id)
+            {
+                if matches!(entry.support, Support::Unsupported) {
+                    continue;
+                }
+                entry.support = limitation.support.clone();
+                entry.reason = limitation.reason.clone();
+            }
+        }
         Self {
             provider: descriptor.kind,
             label: descriptor.label,
@@ -473,37 +465,50 @@ mod test {
     use super::*;
 
     #[test]
-    fn antigravity_reports_policy_and_skill_limits_before_runtime_discovery() {
-        for provider in [ProviderKind::Claude, ProviderKind::Antigravity] {
+    fn declarations_control_support_without_provider_identity() {
+        for provider in [
+            ProviderKind::Codex,
+            ProviderKind::Copilot,
+            ProviderKind::Claude,
+            ProviderKind::Antigravity,
+            ProviderKind::Mock,
+        ] {
             let manifest = CapabilityManifest::from_descriptor(ProviderDescriptor {
                 kind: provider,
                 label: "test".into(),
-                capability: super::super::ProviderCapability {
-                    permission_control: true,
-                    catalog: super::super::catalog::CatalogCapability {
-                        skill: true,
+                capability: crate::ProviderCapability {
+                    integration: crate::model::ProviderIntegration {
+                        runtime_setup: true,
+                        limitations: vec![FeatureLimitation {
+                            id: "file_diff".into(),
+                            support: Support::Limited,
+                            reason: "fixture restriction".into(),
+                        }],
                         ..Default::default()
                     },
                     ..Default::default()
                 },
             });
-            for id in [
-                "approval_rules",
-                "skill_catalog",
-                "skill_mutation",
-                "file_diff",
-            ] {
-                let entry = manifest
+            let find = |id| {
+                manifest
                     .capability
                     .iter()
                     .find(|entry| entry.id == id)
-                    .unwrap();
-                assert!(matches!(
-                    (&entry.support, provider),
-                    (Support::Limited, ProviderKind::Antigravity)
-                        | (Support::Supported, ProviderKind::Claude)
-                ));
-            }
+                    .unwrap()
+            };
+            assert!(matches!(find("runtime_setup").support, Support::Supported));
+            assert!(matches!(find("os_sandbox").support, Support::Unsupported));
+            assert!(matches!(find("recap").support, Support::Unsupported));
+            assert!(matches!(find("file_diff").support, Support::Limited));
+            assert_eq!(find("file_diff").reason, "fixture restriction");
         }
     }
+}
+
+/// Records a restriction supplied by the integration that owns the operation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FeatureLimitation {
+    pub id: String,
+    pub support: Support,
+    pub reason: String,
 }

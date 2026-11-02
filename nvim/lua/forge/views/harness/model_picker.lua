@@ -129,7 +129,7 @@ end
 ---@class ForgeHarnessModelPickerOptions
 ---@field host table
 ---@field model_list ForgeHarnessModel[]
----@field provider? string
+---@field provider string
 ---@field current_model? string
 ---@field is_current? fun(): boolean
 ---@field on_close? fun()
@@ -138,7 +138,7 @@ end
 ---@param options ForgeHarnessModelPickerOptions
 function ModelPicker.open(options)
   local source_model_list = vim.deepcopy(options.model_list)
-  local provider = options.provider or "codex"
+  local provider = assert(options.provider, "model picker requires provider identity")
   local pinned_id_set = model_pins.get(provider) or {}
   local model_list = model_order.order(source_model_list, provider, pinned_id_set)
   lifetime = lifetime + 1

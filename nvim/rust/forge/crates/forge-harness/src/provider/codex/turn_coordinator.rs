@@ -605,7 +605,9 @@ impl<'a> CodexTurnCoordinator<'a> {
         // Prepare the next turn without borrowing command authority from its predecessor.
         let mut request = self.request.clone();
         request.submission = submission;
-        let input = crate::attachment::codex_input(text, self.request.input.attachments()).await?;
+        let input =
+            crate::provider::codex::attachments::input(text, self.request.input.attachments())
+                .await?;
         let (turn, provider_started, observed_message_list) = self
             .provider
             .start_turn(
@@ -695,8 +697,11 @@ impl<'a> CodexTurnCoordinator<'a> {
         pending_command: &mut HashMap<u64, SteerCommand>,
     ) {
         let input = if command.operation == ActiveTurnOperation::Steer {
-            match crate::attachment::codex_input(steering_prompt(&command), &command.attachments)
-                .await
+            match crate::provider::codex::attachments::input(
+                steering_prompt(&command),
+                &command.attachments,
+            )
+            .await
             {
                 Ok(input) => Some(input),
                 Err(error) => {
@@ -751,9 +756,11 @@ impl<'a> CodexTurnCoordinator<'a> {
         }
         if let Some(submission) = &command.submission {
             params["clientUserMessageId"] = json!(submission.id());
-            let target = super::super::submission::SubmissionTarget::Codex {
-                thread_id: thread_id.into(),
-            };
+            let target = super::super::submission::SubmissionTarget::native(
+                "codex",
+                thread_id,
+                serde_json::json!({}),
+            );
             if let Err(error) = submission
                 .persist(move |submission| submission.sending(target))
                 .await

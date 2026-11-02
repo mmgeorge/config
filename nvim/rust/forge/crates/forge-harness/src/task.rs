@@ -216,7 +216,7 @@ mod test {
                             assert_eq!(access.sandbox, was_yolo && sandbox_supported);
                             assert_eq!(access.readable_directory, original.readable_directory);
                             assert_eq!(access.writable_directory, original.writable_directory);
-                            assert_eq!(access.windows_sandbox, original.windows_sandbox);
+                            assert_eq!(access.isolation_mode, original.isolation_mode);
                         }
                     }
                 }
@@ -292,7 +292,7 @@ mod test {
                     assert_eq!(access.abbreviation(), "rxwx");
                     assert_eq!(mode, ApprovalMode::Allow);
                     assert!(!access.sandbox);
-                    assert_eq!(access.windows_sandbox, original.windows_sandbox);
+                    assert_eq!(access.isolation_mode, original.isolation_mode);
                 }
             }
         }

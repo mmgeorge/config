@@ -1475,6 +1475,7 @@ fn toggle_inline_output(
         heading_id,
         previous_heading.metadata.target[0].id.clone(),
         crate::buffer::transcript::ToolHeading {
+            shell: call.command_shell.as_deref(),
             kind: &call.kind,
             elapsed_ms: call.elapsed_ms(now),
             failed: call.failed,
@@ -2351,6 +2352,7 @@ mod tests {
                 &address,
                 tool_id,
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     name: "inspect".into(),
                     arguments: serde_json::json!({}),
@@ -2400,6 +2402,7 @@ mod tests {
             &address,
             "third",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 name: "inspect".into(),
                 arguments: serde_json::json!({}),
@@ -3694,6 +3697,7 @@ mod tests {
             &address,
             "owned-tool",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 title: "Read owned output".into(),
                 name: "read".into(),
@@ -4212,6 +4216,7 @@ mod tests {
                 &address,
                 &format!("write-{batch}"),
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::FileChange,
                     title: "file changes".into(),
                     name: "edit".into(),
@@ -4298,6 +4303,7 @@ mod tests {
                 &address,
                 &format!("inspect-{batch}"),
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     title: "Inspect file".into(),
                     name: "inspect".into(),
@@ -5121,6 +5127,7 @@ mod tests {
             &address,
             "latest",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 title: "Latest parallel tool".into(),
                 name: "latest".into(),
@@ -5222,6 +5229,7 @@ mod tests {
             &address,
             "third",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 title: "Third parallel tool".into(),
                 name: "third".into(),
@@ -5718,6 +5726,7 @@ mod tests {
             &address,
             "tool",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 title: "Read output".into(),
                 name: "read".into(),

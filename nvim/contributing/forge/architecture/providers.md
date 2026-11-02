@@ -12,7 +12,7 @@ The provider boundary spans three crates. `forge-provider-api` defines normalize
 
 `ProviderTools`, `ProviderPermissions`, `InputReceipt`, `ProviderTrace`, and `TurnControl` are callback boundaries into the host. Native code asks for a tool result, permission decision, or committed receipt without acquiring Harness storage or task state. `forge-shell` separately owns shell parsing and process primitives used by the policy layer and native runtimes.
 
-`CapabilityManifest` records each operation's support, ownership, and runtime availability, and `/capabilities` displays it. Unsupported optional operations return typed errors, and cancellation and identity queries carry the Harness session ID, so they cannot affect another conversation.
+`ProviderCapability.integration` declares optional operations, resource targets, isolation choices, and implementation limitations in each adapter. The compiled-in registry resolves those declarations for consumers that have not started a session. `CapabilityManifest` records each operation's support, ownership, and runtime availability, and `/capabilities` displays it. Unsupported optional operations return typed errors, and cancellation and identity queries carry the Harness session ID, so they cannot affect another conversation.
 
 ## Sessions
 
@@ -30,7 +30,7 @@ Codex keeps the phase from `item/started` for matching deltas and snapshots. ACP
 
 ## Tools
 
-Tool requests, input fragments, executions, output, reported changes, and outcomes are separate typed updates correlated by one scoped tool identity, so late output cannot move a tool or restart its execution.
+Tool requests, input fragments, executions, output, reported changes, and outcomes are separate typed updates correlated by one scoped tool identity, so late output cannot move a tool or restart its execution. Each adapter also supplies `ToolSemantics`: a command with its shell and working directory, explicit read targets, or an unclassified operation. Skill attribution consumes that metadata and waits for successful completion. The broker and renderer never infer an operation from a native tool name or argument schema.
 
 Codex classifies activity by top-level item type. Before titles enter durable state, the transport replaces values under credential-like keys, such as `token`, `api_key`, `password`, and `authorization`, with `[REDACTED]`. Shell headings summarize simple reads and searches after decoding the launcher, and the durable command never changes. ACP tool updates merge by tool-call identity, and structured diff content becomes a `ProviderChangeSet` without reading the workspace. Antigravity edits can complete without diff content, so `/capabilities` marks its file diffs as limited. Reported edits never replace checkpoint-based **Workspace changes**.
 
@@ -79,8 +79,16 @@ Provider restart reloads the same native conversation, and failing to load it fa
 
 All three approval modes keep identical native callback setup, and Harness applies Ask, Deny, or Allow after saved rules and reported-file checks. Native operations without callbacks stay outside that boundary. Antigravity enterprise terminal policy can run commands without a callback, so its approval capability is limited. After a Copilot denial, completion requires a later final answer or Harness handoff, and provider idle without either fails the exchange.
 
-`ProviderKind::supports_sandbox` allows the OS sandbox only for Codex, and child providers that cannot enforce the root's sandbox are rejected. Each provider's native delegation is disabled, so delegation goes through managed Harness agents.
+OS isolation is enabled only by an adapter's explicit `os_sandbox` declaration. Codex currently declares support and supplies its Windows isolation modes; the shared access policy retains only an optional opaque `isolation_mode`. Unsupported providers resolve isolation to disabled, and declared mode selections are validated before native execution. Native-agent suppression is a separate capability: integrations that cannot enforce it report that limitation.
 
 ## Test provider
 
 `provider/mock_response.rs` stores session-scoped, one-response holds. The `session.provider.mock_response` route works without the broker execution lock, so a test can control a response while its real turn owns that lock. [Editor tests](../editor-tests.md#control-provider-timing) shows how to use it.
+
+## Catalog and accounting normalization
+
+Adapters publish reasoning choices in ascending effort order and supply model catalog order. The picker only applies user pins; shared text generation selects the first advertised effort without recognizing native names. Background generation requires a declared capability and validates model choices at the provider boundary.
+
+Usage reports explicitly mark context-only accounting adjustments. Exchange metrics deduplicate those reports and update their cursor without counting them as model calls. Codex selects its context baseline in its decoder. Compaction decoding converts native fields and billing categories to normalized fields and labeled measurements with explicit units; presentation does not assume a billing currency.
+
+Native attachment encoders and resource-profile recipes live under the corresponding Harness adapter. The shared attachment and profile owners retain object access, containment checks, link cleanup, and lease lifetimes.

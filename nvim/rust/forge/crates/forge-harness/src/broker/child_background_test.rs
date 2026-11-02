@@ -128,6 +128,7 @@ impl crate::provider::ProviderAdapter for ChildBackgroundProvider {
             for update in [
                 crate::provider::ToolUpdate::Requested {
                     invocation: crate::provider::ToolInvocation {
+                        semantics: Default::default(),
                         kind: crate::provider::ToolActivityKind::Command,
                         name: "background-command".into(),
                         title: "Original child background command".into(),

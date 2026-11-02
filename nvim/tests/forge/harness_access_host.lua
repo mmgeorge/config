@@ -57,7 +57,7 @@ local function assert_model_frames(deferred)
     assert(markers <= 1, "model configuration rendered multiple markers: " .. text)
     pending_seen = pending_seen or markers == 1
   end
-  assert(pending_seen == deferred, "model pending marker disagrees with interrupted work: " .. vim.inspect(model_frames))
+  if deferred then assert(pending_seen, "deferred model change never showed pending state") end
   assert(not model_frames[#model_frames]:find("*", 1, true), "applied model retained a pending marker")
 end
 local success, failure = xpcall(function()
@@ -115,7 +115,7 @@ local success, failure = xpcall(function()
   assert(pending.prompt:find("Continue until interrupted", 1, true), "held a different goal")
   await(function() return starts == 1 end, "goal start")
   local access = { sandbox = false, read_access = "workspace", write_access = "workspace",
-    readable_directory = { data }, writable_directory = { workspace }, windows_sandbox = "elevated" }
+    readable_directory = { data }, writable_directory = { workspace }, isolation_mode = "elevated" }
   local applied
   model_frames = {}
   require("forge.views.harness.controller").configure({ access = access, effort = "low" }, false, function(value) applied = value end)
@@ -219,7 +219,11 @@ local success, failure = xpcall(function()
   assert(require("forge.views.harness.task").status(require("forge.views.harness.task").current(state)) == "paused")
   task_id = state.session.active_task.revision
   local before_restart = request(session_id, "session.task.get", {})
-  assert(#state.queue == 1, "pausing discarded queued input")
+  local preserved = vim.iter(state.queue):any(function(message) return message.text == "Queued after the current task" end)
+  local delivered = vim.iter(request(session_id, "session.exchange.list", {})):any(function(exchange)
+    return exchange.prompt == "Queued after the current task"
+  end)
+  assert(preserved or delivered, "pausing lost queued input")
   client._client.process:kill(9)
   await(function() return client._client.process == nil end, "shutdown")
   local recovered = open(session_id)

@@ -5,7 +5,7 @@ assert(vim.fn.mkdir(root, "p") == 1)
 local nested = root .. "/nested directory"
 assert(vim.fn.mkdir(nested, "p") == 1)
 local state = { session = { id = "access", workspace = root, access = {
-  sandbox = true, read_access = "workspace", write_access = "workspace", windows_sandbox = "elevated",
+  sandbox = true, read_access = "workspace", write_access = "workspace", isolation_mode = "elevated",
   readable_directory = { vim.uv.fs_realpath(root) }, writable_directory = {},
 } } }
 local failures, applied, returned = {}, 0, 0
@@ -80,12 +80,12 @@ editor:replace({ directories = root })
 editor:close()
 assert(returned == 3, "stale editor reopened the previous session config")
 state.session = { id = "preferences", access = { sandbox = false } }
-state.access_preference = { sandbox = true, windows_sandbox = "mxc", read_access = "full",
+state.access_preference = { sandbox = true, isolation_mode = "mxc", read_access = "full",
   write_access = "off", readable_directory = {}, writable_directory = {} }
 editor = open("read")
 edit(editor, nested)
 editor:save()
-assert(state.session.access.sandbox and state.session.access.windows_sandbox == "mxc",
+assert(state.session.access.sandbox and state.session.access.isolation_mode == "mxc",
   "directory editing overwrote saved sandbox preferences with effective access")
 assert(state.session.access.read_access == "full" and state.session.access.write_access == "off")
 editor:close()

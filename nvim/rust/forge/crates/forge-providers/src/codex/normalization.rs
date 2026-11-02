@@ -647,12 +647,13 @@ impl CodexNormalization {
                         events.push(ProviderEvent::Tool {
                             address: address.clone(),
                             update: ToolUpdate::Requested {
-                                invocation: ToolInvocation {
+                                invocation: crate::codex::normalize_invocation(ToolInvocation {
+                                    semantics: Default::default(),
                                     kind: snapshot.kind,
                                     name: snapshot.name,
                                     title: snapshot.title.clone(),
                                     arguments: snapshot.arguments,
-                                },
+                                }),
                             },
                         });
                     } else if native.title != snapshot.title

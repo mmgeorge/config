@@ -39,10 +39,12 @@ impl CopilotClient {
             if models.is_empty() {
                 Ok(vec![default_model_descriptor()])
             } else {
-                Ok(models
+                let mut models: Vec<_> = models
                     .into_iter()
                     .map(super::catalog::model_descriptor)
-                    .collect())
+                    .collect();
+                super::catalog::order_models(&mut models);
+                Ok(models)
             }
         }
         .await;
@@ -658,11 +660,7 @@ impl CopilotSession {
                     .context("capture Copilot steering history boundary")?;
                 receipt
                     .clone()
-                    .record_sending(SubmissionTarget::Copilot {
-                        session_id: self.id(),
-                        cursor: history.cursor,
-                        prompt: message.prompt.clone(),
-                    })
+                    .record_sending(SubmissionTarget::native("copilot", self.id(), serde_json::json!({"cursor":history.cursor,"prompt":message.prompt.clone()})))
                     .await?;
             }
             let accepted = self

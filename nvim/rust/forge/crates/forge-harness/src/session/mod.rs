@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 mod shell;
 mod timeout;
-pub use forge_provider_api::access::{AccessPolicy, DirectoryScope, WindowsSandbox, WriteScope};
+pub use forge_provider_api::access::{AccessPolicy, DirectoryScope, WriteScope};
 pub use shell::CheckShell;
 pub(crate) use timeout::InputSchedule;
 pub use timeout::{InputDeadline, InputTimeout, ResolutionSource, TimeoutUnit};
@@ -213,10 +213,11 @@ mod context_usage_test {
 
     #[test]
     fn normalizes_codex_context_against_the_reserved_baseline() {
-        let usage = ContextUsage::codex(275_000, 353_000).expect("valid Codex usage");
+        let usage =
+            ContextUsage::with_baseline(275_000, 353_000, 12_000).expect("valid Codex usage");
         assert_eq!(usage.remaining_percent, 23);
         assert_eq!(usage.size, 353_000);
-        assert!(ContextUsage::codex(1, 12_000).is_none());
+        assert!(ContextUsage::with_baseline(1, 12_000, 12_000).is_none());
     }
 
     #[test]

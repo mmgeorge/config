@@ -63,11 +63,14 @@ local function model_command(text)
   if not model then return nil end
   local effort, prompt = remainder:match("^(%S+)%s*(.*)$")
   if effort then
-    local known = vim.tbl_contains({ "default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" }, effort)
+    local known, resolved = effort == "default", false
     for _, candidate in ipairs(session.harness.model_list or {}) do
-      known = known or vim.tbl_contains(candidate.reasoning or {}, effort)
+      if candidate.id == model or (model == "default" and candidate.is_default) then
+        resolved = true
+        known = known or vim.tbl_contains(candidate.reasoning or {}, effort)
+      end
     end
-    if not known then return nil, nil, "Unknown reasoning effort: " .. effort end
+    if resolved and not known then return nil, nil, "Unknown reasoning effort: " .. effort end
   end
   return { model = model, effort = effort }, prompt or ""
 end

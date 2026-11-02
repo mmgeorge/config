@@ -50,7 +50,7 @@ local succeeded, failure = xpcall(function()
   assert(vim.wait(15000, function() return state.session or #errors > 0 end, 10), "host startup timed out")
   assert(state.session, table.concat(errors, "\n"))
   request("session.configure", { access = { sandbox = false, write_access = "workspace",
-    writable_directory = {}, windows_sandbox = "elevated" } })
+    writable_directory = {}, isolation_mode = "elevated" } })
   request("host.trace.configure", { enabled = true })
   local source = bundle .. "/SKILL.md"
   local read = vim.fn.has("win32") == 1 and ("Get-Content -LiteralPath '" .. source .. "'")

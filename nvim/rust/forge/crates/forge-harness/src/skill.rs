@@ -4,6 +4,7 @@ use crate::permissions::shell::CommandShell;
 use crate::provider::{ExecutionOwner, ProviderEvent, ProviderEventSink};
 use crate::settings::SkillResource;
 use anyhow::{Context, Result};
+#[cfg(test)]
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -131,60 +132,29 @@ impl SkillAccess {
         else {
             return Vec::new();
         };
-        let input = &invocation.arguments;
-        let input = if let Some(encoded) = input.as_str() {
-            serde_json::from_str(encoded).unwrap_or(Value::Null)
-        } else {
-            input.clone()
+        let (path, directory) = match &invocation.semantics {
+            forge_provider_api::tool::ToolSemantics::Command {
+                text,
+                shell,
+                directory,
+            } => {
+                let shell = shell
+                    .as_deref()
+                    .map(CommandShell::from_executable)
+                    .unwrap_or_default();
+                let parsed = normalize_command_in(text, shell);
+                let path = if parsed.failure.is_none() {
+                    parsed.invocation_list.iter().flat_map(read_paths).collect()
+                } else {
+                    Vec::new()
+                };
+                (path, directory.as_deref())
+            }
+            forge_provider_api::tool::ToolSemantics::Read { paths, directory } => {
+                (paths.clone(), directory.as_deref())
+            }
+            forge_provider_api::tool::ToolSemantics::Other => return Vec::new(),
         };
-        let directory = string_at(&input, &["/cwd", "/workdir"]);
-        let command = string_at(&input, &["/command", "/commandLine", "/CommandLine"]);
-        let mut path = Vec::new();
-        if let Some(command) = command {
-            let shell = string_at(&input, &["/shell"])
-                .map(CommandShell::from_executable)
-                .unwrap_or_default();
-            let parsed = normalize_command_in(command, shell);
-            if parsed.failure.is_none() {
-                for invocation in &parsed.invocation_list {
-                    path.extend(read_paths(invocation));
-                }
-            }
-        } else {
-            let name = invocation
-                .name
-                .split('(')
-                .next()
-                .unwrap_or(&invocation.name)
-                .trim()
-                .to_ascii_lowercase();
-            let read = matches!(
-                name.as_str(),
-                "read" | "read_file" | "readfile" | "view" | "view_file" | "viewfile"
-            );
-            if read {
-                if let Some(value) = string_at(
-                    &input,
-                    &[
-                        "/path",
-                        "/file_path",
-                        "/filePath",
-                        "/absolute_path",
-                        "/AbsolutePath",
-                        "/TargetFile",
-                    ],
-                ) {
-                    path.push(value.to_owned());
-                } else if let Some(locations) = input.get("locations").and_then(Value::as_array) {
-                    path.extend(
-                        locations
-                            .iter()
-                            .filter_map(|location| location["path"].as_str())
-                            .map(str::to_owned),
-                    );
-                }
-            }
-        }
         path.into_iter()
             .filter_map(|path| {
                 let path = self.resolve(&path, directory)?;
@@ -261,11 +231,6 @@ struct SelectedSkill {
     resource: SkillResource,
     source: PathBuf,
     directory: PathBuf,
-}
-
-fn string_at<'value>(value: &'value Value, path: &[&str]) -> Option<&'value str> {
-    path.iter()
-        .find_map(|path| value.pointer(path).and_then(Value::as_str))
 }
 
 fn executable_name(command: &str) -> String {
@@ -414,12 +379,13 @@ mod tests {
         event(
             id,
             ToolUpdate::Requested {
-                invocation: ToolInvocation {
+                invocation: forge_providers::copilot::normalize_invocation(ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::ToolCall,
                     name: name.into(),
                     title: name.into(),
                     arguments,
-                },
+                }),
             },
         )
     }
@@ -617,6 +583,10 @@ mod tests {
                     address: address.clone(),
                     update: ToolUpdate::Requested {
                         invocation: ToolInvocation {
+                            semantics: forge_provider_api::tool::ToolSemantics::Read {
+                                paths: vec![bundle.join("SKILL.md").display().to_string()],
+                                directory: None,
+                            },
                             kind: ToolActivityKind::ToolCall,
                             name: "read".into(),
                             title: "Read".into(),

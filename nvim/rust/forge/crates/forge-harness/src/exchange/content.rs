@@ -625,6 +625,7 @@ mod tests {
             },
             update: ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     name: "inspect".into(),
                     title: "inspect".into(),
@@ -677,6 +678,7 @@ mod tests {
             },
             update: ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     title: "inspect".into(),
                     name: "inspect".into(),
                     kind: ToolActivityKind::Command,
@@ -788,6 +790,7 @@ mod tests {
             },
             update: ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     title: "inspect".into(),
                     name: "inspect".into(),
                     kind: ToolActivityKind::Command,
@@ -935,6 +938,7 @@ mod tests {
             address.tool_id = "failed-call".into();
             *update = ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     name: "check".into(),
                     title: "check".into(),

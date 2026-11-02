@@ -152,7 +152,7 @@ impl HarnessService {
             workspace: workspace.to_owned(),
             access: provider
                 .descriptor()
-                .kind
+                .capability
                 .resolve_access(crate::session::AccessPolicy {
                     write_access: crate::session::WriteScope::Off,
                     ..Default::default()
@@ -2977,7 +2977,10 @@ fn admit_task_intent(
         change.apply(
             &mut access,
             &mut approval,
-            crate::provider::ProviderKind::parse(&session.provider)?.supports_sandbox(),
+            crate::provider::registered_capability(crate::provider::ProviderKind::parse(
+                &session.provider,
+            )?)
+            .supports_sandbox(),
         );
         Some(crate::task::PermissionSelection {
             sandbox: access.sandbox,
@@ -6652,7 +6655,9 @@ mod tests {
             &json!({"attachments":[selection]}),
         )
         .await?;
-        let input = crate::attachment::codex_input("Inspect [Image #3]".into(), &selected).await?;
+        let input =
+            crate::provider::codex::attachments::input("Inspect [Image #3]".into(), &selected)
+                .await?;
         assert_eq!(input[1]["type"], "localImage");
         assert_eq!(std::fs::read(input[1]["path"].as_str().unwrap())?, bytes);
         assert!(controller.broker.try_lock().is_err());

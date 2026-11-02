@@ -34,10 +34,13 @@ pub fn decode_compaction(
     } else {
         false
     };
-    let mut result: CompactionResult =
-        serde_json::from_value(event.data.clone()).map_err(|error| ProviderError::Protocol {
-            message: format!("Invalid Copilot compaction: {error}"),
-        })?;
+    let mut result: CompactionResult = serde_json::from_value::<
+        super::compaction_metrics::NativeCompactionResult,
+    >(event.data.clone())
+    .map(Into::into)
+    .map_err(|error| ProviderError::Protocol {
+        message: format!("Invalid Copilot compaction: {error}"),
+    })?;
     if !complete {
         let mut context = CompactionContext {
             conversation_tokens: result.conversation_tokens.take(),

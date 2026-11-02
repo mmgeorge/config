@@ -187,6 +187,7 @@ fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
         &address,
         "call",
         ToolInvocation {
+            semantics: Default::default(),
             kind: ToolActivityKind::Command,
             name: "read".into(),
             title: "read".into(),

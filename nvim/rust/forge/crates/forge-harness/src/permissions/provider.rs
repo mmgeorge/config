@@ -56,7 +56,7 @@ impl ProviderPermissionContext {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?;
         let session_directory = state.session_directory.take();
         *state = PermissionState {
             task_authority: None,
@@ -77,7 +77,7 @@ impl ProviderPermissionContext {
     pub(crate) fn set_session_directory(&self, directory: Option<SessionDirectory>) -> Result<()> {
         self.state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?
             .session_directory = directory;
         Ok(())
     }
@@ -90,7 +90,7 @@ impl ProviderPermissionContext {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?;
         state.checkpoint = context.and_then(|context| context.checkpoint.clone());
         state.task_authority = context.and_then(crate::tools::TaskAuthority::capture);
         Ok(())
@@ -101,7 +101,7 @@ impl ProviderPermissionContext {
         Ok(self
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?
             .cancelled)
     }
 
@@ -110,7 +110,7 @@ impl ProviderPermissionContext {
     pub(crate) fn cancel(&self) -> Result<()> {
         self.state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?
             .cancelled = true;
         Ok(())
     }
@@ -123,7 +123,7 @@ impl ProviderPermissions for ProviderPermissionContext {
             .state
             .lock()
             .map(|state| state.checkpoint.clone())
-            .map_err(|_| anyhow::anyhow!("Copilot checkpoint context lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("provider checkpoint context lock poisoned"))?;
         match checkpoint {
             Some(gate) => gate.wait().await.map_err(ProviderError::from),
             None => Ok(()),

@@ -1006,7 +1006,7 @@ pub struct PermissionSelection {
 
 ## AccessPolicy
 
-Decoder source: [nvim/rust/forge/crates/forge-harness/src/session/access.rs](../../../rust/forge/crates/forge-harness/src/session/access.rs).
+Decoder source: [nvim/rust/forge/crates/forge-provider-api/src/access.rs](../../../rust/forge/crates/forge-provider-api/src/access.rs).
 
 ```rust
 /// Controls file authorization and provider isolation independently of approval mode.
@@ -1020,13 +1020,14 @@ pub struct AccessPolicy {
     #[serde(default)]
     pub readable_directory: Vec<String>,
     pub writable_directory: Vec<String>,
-    pub windows_sandbox: WindowsSandbox,
+    #[serde(default)]
+    pub isolation_mode: Option<String>,
 }
 ```
 
 ## DirectoryScope
 
-Decoder source: [nvim/rust/forge/crates/forge-harness/src/session/access.rs](../../../rust/forge/crates/forge-harness/src/session/access.rs).
+Decoder source: [nvim/rust/forge/crates/forge-provider-api/src/access.rs](../../../rust/forge/crates/forge-provider-api/src/access.rs).
 
 ```rust
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1040,7 +1041,7 @@ pub enum DirectoryScope {
 
 ## WriteScope
 
-Decoder source: [nvim/rust/forge/crates/forge-harness/src/session/access.rs](../../../rust/forge/crates/forge-harness/src/session/access.rs).
+Decoder source: [nvim/rust/forge/crates/forge-provider-api/src/access.rs](../../../rust/forge/crates/forge-provider-api/src/access.rs).
 
 ```rust
 /// Selects write authorization independently of read scope and approval handling.

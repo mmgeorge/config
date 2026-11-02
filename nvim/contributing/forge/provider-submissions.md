@@ -17,6 +17,12 @@ Live steering waits for the native lane to accept or reject the input. The broke
 | `Accepted` | A native response or positively correlated history proves acceptance. The input is never replayed. |
 | `Cancelled` | The user cancelled, so automatic recovery skips the input. |
 
+## Recovery checkpoints
+
+A `Sending` record retains an opaque conversation identity and a versioned adapter checkpoint. The journal does not decode native thread, cursor, or prompt fields. Only the owning adapter recognizes the checkpoint format and exact version, then checks native history for positive acceptance evidence. Unknown versions remain uncertain and cannot authorize replay. Once reconciliation succeeds, the journal can restore the normalized conversation identity without matching a provider-specific variant.
+
+Tracking and local acceptance are explicit integration capabilities. Mock declares local acceptance at its own boundary; real adapters declare tracking before dispatch. Adding a provider does not require a journal allowlist change.
+
 ## Acceptance evidence
 
 A successful local write is not evidence of acceptance. Each adapter relies on what its protocol documents:
@@ -67,7 +73,7 @@ Test the write-before-acknowledge crash, acknowledgment commit failure, expired 
 This covers the classifiers, journal, and adapter boundaries. ACP tests use simulated peers and need Node.js, without provider credentials:
 
 ```nu
-cargo test --profile dev --locked -p forge-harness --lib backend:: -- --test-threads=1
+cargo test --profile dev --locked -p forge-harness --lib provider:: -- --test-threads=1
 ```
 
 After rebuilding, run `nvim/tests/forge/harness_acp_submission_host.lua` in fresh headless Neovim processes, with `vim.g.forge_acp_fixture_kind` set to `"claude"` and `"antigravity"`, and `vim.g.forge_acp_fixture_lost_ack` set to `false` and `true`. It asserts that uncertain delivery blocks the next native send and keeps the original error.

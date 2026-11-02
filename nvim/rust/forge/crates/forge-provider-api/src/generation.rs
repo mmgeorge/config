@@ -30,19 +30,7 @@ pub trait TextValidator: Send + Sync {
     fn validate(&self, text: &str) -> Result<String, ProviderError>;
 }
 
-/// Select the lowest advertised reasoning level independently of catalog order.
+/// Select the lowest advertised reasoning level from the adapter-normalized ascending catalog.
 pub fn lowest_effort(model: &ProviderModel) -> Result<Option<String>, ProviderError> {
-    if model.reasoning.is_empty() {
-        return Ok(None);
-    }
-    let order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-    let selected = order
-        .iter()
-        .find(|effort| model.reasoning.iter().any(|value| value == **effort));
-    match selected {
-        Some(effort) => Ok(Some((*effort).to_owned())),
-        None => Err(ProviderError::Rejected {
-            message: format!("Model {} has no recognized thinking level", model.id),
-        }),
-    }
+    Ok(model.reasoning.first().cloned())
 }

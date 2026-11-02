@@ -1055,6 +1055,7 @@ mod test {
             &address,
             "patch",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::FileChange,
                 name: "patch".into(),
                 arguments: serde_json::json!({}),

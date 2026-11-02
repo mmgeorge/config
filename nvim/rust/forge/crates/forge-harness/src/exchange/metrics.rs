@@ -164,11 +164,7 @@ impl ExchangeMetrics {
         }) {
             return None;
         }
-        // Codex context-window adjustments change totals without a billable model call.
-        if update.usage.input == Some(0)
-            && update.usage.output == Some(0)
-            && update.cumulative_total.is_some_and(|total| total > 0)
-        {
+        if update.context_adjustment {
             return None;
         }
         self.request_count = self.request_count.saturating_add(1);
@@ -237,6 +233,7 @@ mod test {
             output: Some(30),
         };
         UsageUpdate {
+            context_adjustment: false,
             id: id.into(),
             usage: usage.clone(),
             cumulative: total.map(|input| TokenUsage {
@@ -330,6 +327,7 @@ mod test {
             .unwrap();
         let mut synthetic = report("compact", 0, Some(500));
         synthetic.usage.output = Some(0);
+        synthetic.context_adjustment = true;
         assert!(
             metrics
                 .usage(&address("parent", "one"), synthetic)

@@ -19,26 +19,6 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    /// Report OS sandbox support from the provider allowlist.
-    pub fn supports_sandbox(self) -> bool {
-        matches!(self, Self::Codex)
-    }
-
-    /// Resolve requested isolation for the selected provider without changing shared preferences.
-    pub fn resolve_access(self, mut access: AccessPolicy) -> AccessPolicy {
-        access.sandbox &= self.supports_sandbox();
-        access
-    }
-
-    /// Reject OS isolation requests that this provider cannot enforce.
-    pub fn validate_access(self, access: &AccessPolicy) -> Result<()> {
-        anyhow::ensure!(
-            !access.sandbox || self.supports_sandbox(),
-            "This provider cannot enforce Forge's OS sandbox"
-        );
-        Ok(())
-    }
-
     /// Parse one persisted provider name into the supported provider set.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
@@ -63,6 +43,9 @@ pub struct ProviderDescriptor {
 /// Represents provider features that control visible Harness actions.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProviderCapability {
+    /// Integration-owned support declarations consumed without provider identity switches.
+    #[serde(default)]
+    pub integration: ProviderIntegration,
     #[serde(default)]
     /// Enables OS isolation controls only for providers on the sandbox allowlist.
     pub os_sandbox: bool,
@@ -137,6 +120,7 @@ pub struct ProviderModel {
     #[serde(default)]
     /// Service tiers explicitly advertised for this model.
     pub service_tiers: Vec<ServiceTier>,
+    /// Reasoning choices in ascending effort order, normalized by the adapter.
     pub reasoning: Vec<String>,
     pub default_reasoning: Option<String>,
     pub selected_reasoning: Option<String>,
@@ -147,4 +131,63 @@ pub struct ProviderModel {
     pub description: Option<String>,
     #[serde(default)]
     pub is_default: bool,
+}
+
+/// Declares optional operations and implementation-specific explanations.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ProviderIntegration {
+    pub background_generation: bool,
+    pub isolated_generation: bool,
+    pub terminal_termination: bool,
+    pub runtime_setup: bool,
+    pub authentication: bool,
+    pub native_agent_suppression: bool,
+    pub mcp_runtime_status: bool,
+    pub mcp_tool_catalog: bool,
+    pub tracked_submission: bool,
+    pub local_acceptance: bool,
+    pub resource_target: Option<String>,
+    pub isolation_modes: Vec<IsolationMode>,
+    pub limitations: Vec<crate::capability::FeatureLimitation>,
+}
+
+impl ProviderCapability {
+    /// Report the integration's declared OS isolation support.
+    pub fn supports_sandbox(&self) -> bool {
+        self.os_sandbox
+    }
+
+    /// Resolve requested isolation for the selected provider without changing shared preferences.
+    pub fn resolve_access(&self, mut access: AccessPolicy) -> AccessPolicy {
+        access.sandbox &= self.supports_sandbox();
+        access
+    }
+
+    /// Reject OS isolation requests that this provider cannot enforce.
+    pub fn validate_access(&self, access: &AccessPolicy) -> Result<()> {
+        anyhow::ensure!(
+            !access.sandbox || self.supports_sandbox(),
+            "This provider cannot enforce Forge's OS sandbox"
+        );
+        if access.sandbox
+            && let Some(mode) = &access.isolation_mode
+        {
+            anyhow::ensure!(
+                self.integration
+                    .isolation_modes
+                    .iter()
+                    .any(|choice| &choice.id == mode),
+                "Unsupported isolation mode: {mode}"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Describes an implementation-owned isolation choice and its actual guarantees.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IsolationMode {
+    pub id: String,
+    pub label: String,
+    pub description: String,
 }

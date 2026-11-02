@@ -217,9 +217,11 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
             };
             let submission = submissions.prepare(&request, crate::provider::ProviderKind::Codex)?;
             if matches!(boundary, DispatchCut::Sending | DispatchCut::Accepted) {
-                submission.sending(SubmissionTarget::Codex {
-                    thread_id: "thread".into(),
-                })?;
+                submission.sending(SubmissionTarget::native(
+                    "codex",
+                    "thread",
+                    serde_json::json!({}),
+                ))?;
             }
             if matches!(boundary, DispatchCut::Accepted) {
                 submission.accepted("receipt".into())?;

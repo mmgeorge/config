@@ -313,7 +313,12 @@ impl crate::provider::ProviderAdapter for BoundarySteeringProvider {
         crate::provider::ProviderDescriptor {
             kind: crate::provider::ProviderKind::Codex,
             label: "Boundary steering fixture".into(),
-            capability: crate::provider::mock_capability(),
+            capability: {
+                let mut capability = crate::provider::mock_capability();
+                capability.integration.tracked_submission = true;
+                capability.integration.local_acceptance = false;
+                capability
+            },
         }
     }
 
@@ -357,9 +362,7 @@ impl crate::provider::ProviderAdapter for BoundarySteeringProvider {
                     .submission
                     .as_ref()
                     .context("missing tracked submission")?;
-                submission.sending(crate::provider::submission::SubmissionTarget::Codex {
-                    thread_id: "boundary-thread".into(),
-                })?;
+                submission.sending(crate::provider::submission::SubmissionTarget::native("codex", "boundary-thread", serde_json::json!({})))?;
                 submission.accepted("boundary provider receipt".into())?;
                 if continuation {
                     self.continuation_release.acquire().await?.forget();
@@ -572,9 +575,7 @@ impl crate::provider::ProviderAdapter for SlowSteeringProvider {
         self.steering_started.add_permits(1);
         self.steering_release.acquire().await?.forget();
         let submission = input.submission().context("steering lost its journal")?;
-        submission.sending(crate::provider::submission::SubmissionTarget::Codex {
-            thread_id: "boundary-thread".into(),
-        })?;
+        submission.sending(crate::provider::submission::SubmissionTarget::native("codex", "boundary-thread", serde_json::json!({})))?;
         submission.accepted("native steering receipt".into())?;
         Ok(())
     }

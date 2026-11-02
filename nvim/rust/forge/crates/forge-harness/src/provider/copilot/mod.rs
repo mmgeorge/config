@@ -1,3 +1,5 @@
+pub(crate) mod attachments;
+mod profile;
 use crate::permissions::{
     provider::ProviderPermissionContext, session_directory::SessionDirectory,
 };
@@ -134,7 +136,7 @@ impl CopilotProvider {
         request: &ProviderRequest,
         reuse: CopilotSessionReuse,
     ) -> Result<SharedCopilotSession> {
-        ProviderKind::Copilot.validate_access(&request.access)?;
+        capability().validate_access(&request.access)?;
         let key = request.runtime_key()?;
         let client = async {
             let client = self.client(&request.workspace).await?;
@@ -316,9 +318,20 @@ impl CopilotProvider {
     }
 }
 
-fn capability() -> ProviderCapability {
+pub(super) fn capability() -> ProviderCapability {
     ProviderCapability {
-        os_sandbox: ProviderKind::Copilot.supports_sandbox(),
+        integration: super::ProviderIntegration {
+            background_generation: true,
+            isolated_generation: true,
+            terminal_termination: true,
+            native_agent_suppression: true,
+            mcp_runtime_status: true,
+            mcp_tool_catalog: true,
+            tracked_submission: true,
+            resource_target: Some("copilotcli".into()),
+            ..Default::default()
+        },
+        os_sandbox: false,
         native_fork: true,
         native_compact: true,
         compaction: super::CompactionCapability {
@@ -354,19 +367,20 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         submission: &super::submission::SubmissionRecord,
         known_receipts: &std::collections::HashSet<String>,
     ) -> Result<Option<String>> {
-        let super::submission::SubmissionState::Sending {
-            target:
-                super::submission::SubmissionTarget::Copilot {
-                    session_id,
-                    cursor,
-                    prompt,
-                },
-        } = &submission.delivery
-        else {
+        let super::submission::SubmissionState::Sending { target } = &submission.delivery else {
             return Ok(None);
         };
+        let Some((session_id, checkpoint)) = target.native_checkpoint("copilot", 1) else {
+            return Ok(None);
+        };
+        let cursor = checkpoint["cursor"]
+            .as_str()
+            .context("Copilot recovery checkpoint omitted cursor")?;
+        let prompt = checkpoint["prompt"]
+            .as_str()
+            .context("Copilot recovery checkpoint omitted prompt")?;
         let mut request = submission.request.clone();
-        request.provider_session_id = Some(session_id.clone());
+        request.provider_session_id = Some(session_id.to_owned());
         let session = self
             .session(&request, CopilotSessionReuse::Compatible)
             .await?;
@@ -542,7 +556,7 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
                     recovered: request.recovered_input.iter().map(Into::into).collect(),
                     instructions: request.interaction_contract(),
                     repair_caution: repair.map(|repair| repair.caution().to_owned()),
-                    attachments: crate::attachment::copilot_input(
+                    attachments: crate::provider::copilot::attachments::input(
                         "",
                         &request.input_attachments(),
                     )?,
@@ -774,7 +788,7 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
 
     async fn steer_session(&self, session_id: &str, input: super::SteeringInput) -> Result<()> {
         let text = input.text().to_owned();
-        let message = crate::attachment::copilot_input(&text, input.attachments())?;
+        let message = crate::provider::copilot::attachments::input(&text, input.attachments())?;
         self.trace
             .record(session_id, "copilot.session.steer", json!({"text":text}));
         let session = self

@@ -3,22 +3,58 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Identify the native history boundary committed before input is sent.
+/// Store versioned, adapter-owned recovery evidence without exposing native variants.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "provider", rename_all = "snake_case")]
+#[serde(tag = "tracking", rename_all = "snake_case")]
 pub enum SubmissionTarget {
-    /// Correlate a Codex client message with its thread.
-    Codex { thread_id: String },
-    /// Retain the Copilot history cursor preceding this exact rendered prompt.
-    Copilot {
-        session_id: String,
-        cursor: String,
-        prompt: String,
+    Native {
+        format: String,
+        version: u32,
+        conversation_id: String,
+        checkpoint: serde_json::Value,
     },
-    /// Retain an ACP request whose protocol has no client-assigned message ID.
-    Acp { session_id: String, method: String },
-    /// Identify a provider without native history reconciliation.
     Untracked,
+}
+
+impl SubmissionTarget {
+    /// Capture an adapter's exact current checkpoint before uncertain delivery begins.
+    pub fn native(
+        format: &str,
+        conversation_id: impl Into<String>,
+        checkpoint: serde_json::Value,
+    ) -> Self {
+        Self::Native {
+            format: format.into(),
+            version: 1,
+            conversation_id: conversation_id.into(),
+            checkpoint,
+        }
+    }
+    /// Read evidence only when the adapter recognizes its exact checkpoint version.
+    pub fn native_checkpoint(
+        &self,
+        expected: &str,
+        version: u32,
+    ) -> Option<(&str, &serde_json::Value)> {
+        match self {
+            Self::Native {
+                format,
+                version: stored,
+                conversation_id,
+                checkpoint,
+            } if format == expected && *stored == version => Some((conversation_id, checkpoint)),
+            Self::Native { .. } | Self::Untracked => None,
+        }
+    }
+    /// Get the opaque conversation identity after the adapter confirms acceptance.
+    pub fn conversation_id(&self) -> Option<&str> {
+        match self {
+            Self::Native {
+                conversation_id, ..
+            } => Some(conversation_id),
+            Self::Untracked => None,
+        }
+    }
 }
 
 /// Commit host-owned delivery evidence around a native provider send.
@@ -39,4 +75,24 @@ pub trait InputReceipt: Send + Sync {
 
     /// Record a failure without treating missing acknowledgment as rejection.
     async fn record_failure(self: Arc<Self>, message: String) -> Result<(), ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recovery_requires_the_adapters_exact_checkpoint_version() {
+        let target = SubmissionTarget::native(
+            "fixture",
+            "opaque-conversation",
+            serde_json::json!({"cursor":"before-send"}),
+        );
+        assert_eq!(target.conversation_id(), Some("opaque-conversation"));
+        assert!(target.native_checkpoint("another-adapter", 1).is_none());
+        assert!(target.native_checkpoint("fixture", 2).is_none());
+        assert_eq!(
+            target.native_checkpoint("fixture", 1).unwrap().1["cursor"],
+            "before-send"
+        );
+    }
 }

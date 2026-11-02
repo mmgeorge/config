@@ -169,8 +169,10 @@ impl PortableSettings {
         if let Some(access) = &self.access {
             session.access = access.clone().validate()?;
         }
-        session.access = crate::provider::ProviderKind::parse(&session.provider)?
-            .resolve_access(session.access.clone());
+        session.access = crate::provider::registered_capability(
+            crate::provider::ProviderKind::parse(&session.provider)?,
+        )
+        .resolve_access(session.access.clone());
         if let Some(shell) = self.shell {
             shell.executable()?;
             session.shell = shell;

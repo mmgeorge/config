@@ -247,6 +247,7 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
             &address,
             "inspect",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 name: "inspect".into(),
                 title: "Inspect files".into(),

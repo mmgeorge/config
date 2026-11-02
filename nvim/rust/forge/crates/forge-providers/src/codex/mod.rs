@@ -13,3 +13,6 @@ pub mod approval;
 pub mod catalog;
 
 pub mod protocol;
+
+mod tool_semantics;
+pub use tool_semantics::normalize_invocation;

@@ -13,7 +13,8 @@ pub struct AccessPolicy {
     #[serde(default)]
     pub readable_directory: Vec<String>,
     pub writable_directory: Vec<String>,
-    pub windows_sandbox: WindowsSandbox,
+    #[serde(default)]
+    pub isolation_mode: Option<String>,
 }
 
 impl Default for AccessPolicy {
@@ -24,7 +25,7 @@ impl Default for AccessPolicy {
             write_access: WriteScope::Workspace,
             readable_directory: Vec::new(),
             writable_directory: Vec::new(),
-            windows_sandbox: WindowsSandbox::Elevated,
+            isolation_mode: None,
         }
     }
 }
@@ -48,15 +49,6 @@ pub enum WriteScope {
     Workspace,
     /// Authorize writes across the filesystem.
     Full,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WindowsSandbox {
-    #[default]
-    Elevated,
-    Unelevated,
-    Mxc,
 }
 
 impl AccessPolicy {

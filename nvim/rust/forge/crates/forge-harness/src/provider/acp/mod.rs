@@ -1,3 +1,5 @@
+pub(crate) mod attachments;
+mod profile;
 use forge_providers::acp::children;
 mod provider;
 use forge_providers::acp::runtime;
@@ -9,3 +11,5 @@ mod session_test;
 mod submission_test;
 mod transport;
 pub(crate) use provider::AcpProvider;
+
+pub(super) use provider::capability;

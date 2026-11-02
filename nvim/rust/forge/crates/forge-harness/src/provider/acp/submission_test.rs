@@ -78,7 +78,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
             effort: String::new(),
             context_window: None,
             service_tier: Default::default(),
-            access: kind.resolve_access(Default::default()),
+            access: crate::provider::registered_capability(kind).resolve_access(Default::default()),
             approval_mode: ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
@@ -184,7 +184,7 @@ async fn acp_prompt_response_controls_acceptance_for_both_providers() -> Result<
                 assert!(matches!(
                     record.delivery,
                     SubmissionState::Accepted {
-                        target: Some(SubmissionTarget::Acp { .. }),
+                        target: Some(SubmissionTarget::Native { .. }),
                         ..
                     }
                 ));
@@ -193,7 +193,7 @@ async fn acp_prompt_response_controls_acceptance_for_both_providers() -> Result<
                 assert!(matches!(
                     record.delivery,
                     SubmissionState::Sending {
-                        target: SubmissionTarget::Acp { .. }
+                        target: SubmissionTarget::Native { .. }
                     }
                 ));
                 assert!(record.error.is_some());

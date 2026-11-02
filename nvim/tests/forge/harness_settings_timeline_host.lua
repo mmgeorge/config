@@ -46,11 +46,17 @@ assert(not table.concat(snapshot.lines, "\n"):find("Settings completed", 1, true
 local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
 assert(not text:find("Settings completed", 1, true), "Completed settings appeared in the transcript")
 local function request(method, params)
-  local complete, value, failure
-  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, diagnostic)
-    complete, value, failure = true, result, diagnostic
-  end)
-  wait(function() return complete end, method .. " did not complete")
+  local value, failure, detail
+  local deadline = vim.uv.hrtime() + 10e9
+  repeat
+    local completed = false
+    client.request({ session_id = state.session.id, method = method, params = params or {} }, function(result, request_error, request_detail)
+      value, failure, detail, completed = result, request_error, request_detail, true
+    end)
+    wait(function() return completed end, method .. " did not complete")
+    if method ~= "session.prompt.submit" or not detail or detail.code ~= "not_admitted" then break end
+    vim.wait(20, function() return false end, 10)
+  until vim.uv.hrtime() >= deadline
   assert(not failure, method .. ": " .. tostring(failure))
   return value
 end
@@ -82,8 +88,8 @@ end
 local config = query("harness_config").items[1]
 assert(config.session_id == state.session.id)
 assert(config.settings.session_tools == true)
-assert(config.locations.forge_rust:find("/nvim/rust/forge", 1, true))
-assert(config.locations.settings_database:find(data, 1, true))
+assert(config.locations.forge_rust:gsub("\\", "/"):find("/nvim/rust/forge", 1, true))
+assert(vim.fs.normalize(config.locations.settings_database):find(vim.fs.normalize(data), 1, true))
 local current = query("harness_session_status").items[1]
 assert(current.session_id == state.session.id and current.approval_mode == "ask")
 assert(current.observation == "authenticated_turn_start")
@@ -123,17 +129,20 @@ require("forge.views.harness.settings").open(state, {
 wait(function() return picker.is_open("harness-config") end, "configuration picker did not open")
 local function history_field()
   local instance = picker._state_for_test()
-  for index, option in ipairs(instance.spec.page_list[1].option_list) do
-    for _, field in ipairs(option.fields or {}) do
-      if field.id == "session-tools" then return instance, option, field, index end
+  for page_index, page in ipairs(instance.spec.page_list) do
+    for index, option in ipairs(page.option_list) do
+      for _, field in ipairs(option.fields or {}) do
+        if field.id == "session-tools" then return instance, option, field, index, page_index, page.id end
+      end
     end
   end
   error("Session history field is missing")
 end
 local function toggle_history()
-  local instance, option, field, index = history_field()
-  instance.state.selected_index_by_page.config = index
-  instance.state.field_by_page.config = { [option.id] = field.id }
+  local instance, option, field, index, page_index, page_id = history_field()
+  instance.state.page_index = page_index
+  instance.state.selected_index_by_page[page_id] = index
+  instance.state.field_by_page[page_id] = { [option.id] = field.id }
   picker.update(instance.spec)
   local mapping = vim.api.nvim_buf_call(instance.buf, function() return vim.fn.maparg(" ", "n", false, true) end)
   assert(mapping.callback, "Session history has no Space mapping")

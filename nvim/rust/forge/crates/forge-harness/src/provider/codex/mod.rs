@@ -1,4 +1,5 @@
 pub(crate) mod approval;
+pub(crate) mod attachments;
 use crate::provider::ProviderAdapter as _;
 use crate::provider::approval::PermissionCoordinator;
 use crate::provider::steering::{ActiveSteering, SteeringLane};
@@ -96,9 +97,24 @@ enum CodexTurnState {
     Completed,
 }
 
-fn capability() -> ProviderCapability {
+pub(super) fn capability() -> ProviderCapability {
     ProviderCapability {
-        os_sandbox: ProviderKind::Codex.supports_sandbox(),
+        integration: super::ProviderIntegration {
+            background_generation: true, isolated_generation: true, terminal_termination: true,
+            native_agent_suppression: true, mcp_runtime_status: true, mcp_tool_catalog: true,
+            limitations: vec![forge_provider_api::capability::FeatureLimitation {
+                id: "filesystem_access".into(), support: forge_provider_api::capability::Support::Limited,
+                reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions. The selected read scope is not enforced as OS read confinement.".into(),
+            }],
+            isolation_modes: vec![
+                super::IsolationMode { id: "elevated".into(), label: "Elevated".into(), description: "Dedicated low-privilege users and filesystem ACLs. Setup needs admin approval; sandboxed commands do not run as administrator.".into() },
+                super::IsolationMode { id: "unelevated".into(), label: "Unelevated".into(), description: "Restricted token for the current user without admin setup. Weaker network isolation; denied-read paths are unsupported.".into() },
+                super::IsolationMode { id: "mxc".into(), label: "MXC".into(), description: "Prefer Microsoft Execution Containers where supported; falls back to Elevated. Child processes stop when the command exits.".into() },
+            ],
+            tracked_submission: true, resource_target: Some("codexcli".into()),
+            ..Default::default()
+        },
+        os_sandbox: true,
         native_fork: true,
         native_compact: true,
         compaction: super::CompactionCapability {
@@ -404,6 +420,7 @@ impl CodexProvider {
         output: &mut ProviderOutput,
         event_sink: Option<ProviderEventSink>,
     ) -> Result<Arc<Mutex<CodexConnection>>> {
+        capability().validate_access(&request.access)?;
         let runtime_key = request.runtime_key()?;
         self.background.stop(&runtime_key).await?;
         let background_sink = self.background.sink(&runtime_key).await;
@@ -523,6 +540,7 @@ impl CodexProvider {
         &self,
         request: &ProviderCatalogRequest,
     ) -> Result<(CodexJsonRpc, ProviderOutput)> {
+        capability().validate_access(&request.access)?;
         let provider_request = Self::catalog_provider_request(request);
         let mut output = ProviderOutput::default();
         let mut process = self
@@ -858,9 +876,11 @@ impl CodexProvider {
         params["summary"] = json!("concise");
         if let Some(submission) = submission {
             params["clientUserMessageId"] = json!(submission.id());
-            submission.sending(super::submission::SubmissionTarget::Codex {
-                thread_id: thread_id.to_owned(),
-            })?;
+            submission.sending(super::submission::SubmissionTarget::native(
+                "codex",
+                thread_id.to_owned(),
+                serde_json::json!({}),
+            ))?;
         }
         let request_id = process.send_request("turn/start", params).await?;
         self.active_turn_by_session.lock().await.insert(
@@ -956,6 +976,7 @@ impl crate::provider::ProviderAdapter for CodexProvider {
     type Host = crate::provider::HarnessProviderHost;
     /// Initialize or reuse a native thread without suspending its retained background delivery.
     async fn initialize_session(&self, mut request: ProviderRequest) -> Result<Option<String>> {
+        capability().validate_access(&request.access)?;
         let runtime_key = request.runtime_key()?;
         let _startup = self.startup_guard(runtime_key.clone()).await;
         let mut output = ProviderOutput::default();
@@ -1003,14 +1024,14 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         submission: &super::submission::SubmissionRecord,
         _known_receipts: &std::collections::HashSet<String>,
     ) -> Result<Option<String>> {
-        let super::submission::SubmissionState::Sending {
-            target: super::submission::SubmissionTarget::Codex { thread_id },
-        } = &submission.delivery
-        else {
+        let super::submission::SubmissionState::Sending { target } = &submission.delivery else {
+            return Ok(None);
+        };
+        let Some((thread_id, _)) = target.native_checkpoint("codex", 1) else {
             return Ok(None);
         };
         let mut request = Self::catalog_from_request(&submission.request);
-        request.provider_session_id = Some(thread_id.clone());
+        request.provider_session_id = Some(thread_id.to_owned());
         let (mut process, mut output) = self.catalog_process(&request).await?;
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
@@ -1293,6 +1314,7 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         mut request: ProviderRequest,
         event_sink: ProviderEventSink,
     ) -> std::result::Result<crate::provider::ProviderCompletion, super::ProviderError> {
+        capability().validate_access(&request.access)?;
         if request.owner().map_err(super::ProviderError::from)?
             != event_sink.invocation_scope()?.owner
         {
@@ -1447,7 +1469,7 @@ impl crate::provider::ProviderAdapter for CodexProvider {
                 .collect::<Vec<_>>();
             prompt = request.recovered_text(&prompt, &recovered);
             let mut input =
-                crate::attachment::codex_input(prompt, &request.input_attachments()).await?;
+                crate::provider::codex::attachments::input(prompt, &request.input_attachments()).await?;
             for name in request
                 .recovered_input
                 .iter()

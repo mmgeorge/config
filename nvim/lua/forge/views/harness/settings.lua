@@ -273,7 +273,7 @@ function M.open(state, host, resume_state)
     active.check_timing = state.check_timing or "after_queue"
     active.automatic_checks = state.automatic_checks == true
     local configuration_revision = 0
-    local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.provider] or active.provider
+    local cli = active.provider_label or active.provider
     local build_spec
     local commit
     local current
@@ -393,7 +393,7 @@ function M.open(state, host, resume_state)
         configure({ [id] = duration.change(active[id], direction or 1) })
         return
       end
-      if id == "sandbox" or id == "read-access" or id == "write-access" or id == "windows-sandbox" then
+      if id == "sandbox" or id == "read-access" or id == "write-access" or id == "isolation-mode" then
         local policy = access.policy(active)
         if id == "sandbox" then policy.sandbox = not policy.sandbox
         elseif id == "read-access" then policy.read_access = policy.read_access == "workspace" and "full" or "workspace"
@@ -403,10 +403,11 @@ function M.open(state, host, resume_state)
           for index, value in ipairs(values) do if value == policy.write_access then position = index end end
           policy.write_access = values[(position - 1 + (direction or 1)) % #values + 1]
         else
-          local values = { "elevated", "unelevated", "mxc" }
+          local values = vim.tbl_map(function(mode) return mode.id end, ((state.capability or {}).integration or {}).isolation_modes or {})
+          if #values == 0 then return end
           local position = 1
-          for index, value in ipairs(values) do if value == policy.windows_sandbox then position = index end end
-          policy.windows_sandbox = values[(position - 1 + (direction or 1)) % #values + 1]
+          for index, value in ipairs(values) do if value == policy.isolation_mode then position = index end end
+          policy.isolation_mode = values[(position - 1 + (direction or 1)) % #values + 1]
         end
         apply_access(policy)
         return
@@ -592,14 +593,14 @@ function M.open(state, host, resume_state)
           nil, not supported),
       }
       sandbox[1].description = sandbox_description
-      if vim.fn.has("win32") == 1 then
-        local windows_description = access.windows_sandbox_description(policy, supported)
-        sandbox[#sandbox + 1] = field("windows-sandbox", "choice", policy.windows_sandbox, "Windows mode",
+      if vim.fn.has("win32") == 1 and #((capability.integration or {}).isolation_modes or {}) > 0 then
+        local windows_description = access.isolation_mode_description(policy, supported, capability)
+        sandbox[#sandbox + 1] = field("isolation-mode", "choice", policy.isolation_mode or "default", "Isolation mode",
           nil, not supported or not policy.sandbox)
         sandbox[#sandbox].description = windows_description
       end
       local provider_configuration = {}
-      if active.provider == "claude" or active.provider == "antigravity" then
+      if capability.integration and (capability.integration.runtime_setup or capability.integration.authentication) then
         provider_configuration[#provider_configuration + 1] = field("provider-setup", "action", "Provider setup / sign in…", nil)
       end
       ---@param category string

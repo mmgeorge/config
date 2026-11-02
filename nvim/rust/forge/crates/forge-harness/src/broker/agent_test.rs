@@ -345,6 +345,7 @@ fn child_tool(output: String, status: crate::provider::ToolStatus) -> Vec<Provid
         &child_address(),
         "same-provider-call".into(),
         crate::provider::ToolInvocation {
+            semantics: Default::default(),
             kind: crate::provider::ToolActivityKind::Command,
             name: "inspect".into(),
             title: "Inspect compilation diagnostics".into(),

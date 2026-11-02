@@ -1657,6 +1657,7 @@ mod test {
             &address,
             "call",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 name: "read".into(),
                 title: "read".into(),

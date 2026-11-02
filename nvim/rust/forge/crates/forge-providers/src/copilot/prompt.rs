@@ -107,11 +107,7 @@ pub async fn run(
             if let Some(submission) = &options.receipt {
                 submission
                     .clone()
-                    .record_sending(SubmissionTarget::Copilot {
-                        session_id: session.id().to_string(),
-                        cursor: history.cursor,
-                        prompt: message.prompt.clone(),
-                    })
+                    .record_sending(SubmissionTarget::native("copilot", session.id().to_string(), serde_json::json!({"cursor":history.cursor,"prompt":message.prompt.clone()})))
                     .await?;
             }
             control.before_send().await?;
@@ -151,7 +147,15 @@ pub async fn run(
                     {
                         provider_aborted |= provider_event.data.get("aborted").and_then(Value::as_bool) == Some(true);
                     }
-                    trace.record(&options.correlation_id, "copilot.session.event", serde_json::to_value(&provider_event).context("serialize Copilot event trace")?);
+                    let mut trace_payload = serde_json::to_value(&provider_event).context("serialize Copilot event trace")?;
+                    if let Some(fields) = trace_payload.get_mut("data").and_then(Value::as_object_mut) {
+                        for (native, normalized) in [("toolCallId", "tool_call_id"), ("requestId", "request_id"), ("turnId", "turn_id")] {
+                            if let Some(value) = fields.remove(native) {
+                                fields.insert(normalized.into(), value);
+                            }
+                        }
+                    }
+                    trace.record(&options.correlation_id, "copilot.session.event", trace_payload);
                     if completes_exchange(&provider_event) {
                         if !execution_turn_stopped && (provider_aborted || provider_event.data.get("aborted").and_then(Value::as_bool) == Some(true)) {
                             decoder.finish_failure(forge_provider_api::turn::TurnOutcome::Cancelled, sink).await?;

@@ -169,7 +169,7 @@ local succeeded, failure = xpcall(function()
     print("ACP data root: " .. data)
   end
   request("session.configure", { access = { sandbox = false, write_access = "workspace",
-    writable_directory = {}, windows_sandbox = "elevated" } })
+    writable_directory = {}, isolation_mode = "elevated" } })
   if vim.g.forge_acp_test_auth then
     request("session.provider.authenticate", { method = vim.g.forge_acp_test_auth })
   end
@@ -512,7 +512,7 @@ local succeeded, failure = xpcall(function()
   if vim.g.forge_acp_test_matrix then
     local before = request("settings.get")
     local configured = request("settings.update", { expected_revision = before.revision, scope = "global", desired = {
-      access = { sandbox = false, write_access = "workspace", writable_directory = {}, windows_sandbox = "elevated" },
+      access = { sandbox = false, write_access = "workspace", writable_directory = {}, isolation_mode = "elevated" },
       shell = "system", plan_compact = true,
     } })
     local operation

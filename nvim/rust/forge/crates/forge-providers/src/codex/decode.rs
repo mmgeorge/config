@@ -209,7 +209,7 @@ pub fn context_usage(params: &Value) -> Option<ContextUsage> {
             .get("modelContextWindow")
             .or_else(|| token_usage.get("model_context_window"))
             .and_then(Value::as_u64)?;
-        return ContextUsage::codex(used, size);
+        return ContextUsage::with_baseline(used, size, 12_000);
     }
     let update = params.get("update").unwrap_or(params);
     let used = update.get("used").and_then(Value::as_u64)?;
@@ -262,6 +262,9 @@ pub fn usage_update(params: &Value) -> Option<forge_provider_api::usage::UsageUp
     let cumulative_total = pointer_u64(total, &["/totalTokens", "/total_tokens"]);
     let id = serde_json::to_string(&(cumulative_total, &cumulative)).ok()?;
     Some(UsageUpdate {
+        context_adjustment: usage.input == Some(0)
+            && usage.output == Some(0)
+            && cumulative_total.is_some_and(|total| total > 0),
         id,
         usage,
         cumulative: Some(cumulative),

@@ -55,12 +55,13 @@ mod test {
             &mut exchange,
             &address,
             "edit",
-            ToolInvocation {
+            forge_providers::copilot::normalize_invocation(ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::FileChange,
                 name: "edit".into(),
                 title: "edit".into(),
                 arguments: serde_json::Value::Null,
-            },
+            }),
             [
                 ToolUpdate::Changes { changes },
                 ToolUpdate::Finished {
@@ -134,12 +135,13 @@ mod test {
                 &mut exchange,
                 &address,
                 "edit",
-                ToolInvocation {
+                forge_providers::copilot::normalize_invocation(ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::FileChange,
                     name: "apply_patch".into(),
                     title: "apply_patch".into(),
                     arguments: serde_json::Value::Null,
-                },
+                }),
                 [
                     ToolUpdate::Output {
                         update: TextUpdate::Replace(source),

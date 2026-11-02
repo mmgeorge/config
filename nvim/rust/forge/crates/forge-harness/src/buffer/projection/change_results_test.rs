@@ -201,6 +201,7 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
             &address,
             &format!("write-{index}"),
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::FileChange,
                 name: "edit".into(),
                 title: "edit".into(),

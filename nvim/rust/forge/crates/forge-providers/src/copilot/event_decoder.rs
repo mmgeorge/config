@@ -358,6 +358,7 @@ impl CopilotEventDecoder {
             }
             "assistant.usage" => {
                 let update = forge_provider_api::usage::UsageUpdate {
+                    context_adjustment: false,
                     id: super::decode::string_field(&event.data, &["apiCallId"])
                         .unwrap_or_else(|| event.id.clone()),
                     usage: forge_provider_api::usage::TokenUsage {
@@ -606,7 +607,8 @@ impl CopilotEventDecoder {
                     arguments.get("command").and_then(Value::as_str),
                     Some("str_replace" | "create" | "insert" | "undo_edit")
                 );
-        let invocation = ToolInvocation {
+        let invocation = crate::copilot::normalize_invocation(ToolInvocation {
+            semantics: Default::default(),
             kind: if file_tool {
                 ToolActivityKind::FileChange
             } else {
@@ -615,7 +617,7 @@ impl CopilotEventDecoder {
             title: ToolInvocation::call_title(&name, &arguments).unwrap_or_else(|| name.clone()),
             name,
             arguments,
-        };
+        });
         let address = ToolAddress {
             turn: self.address(thread)?,
             tool_id: id.into(),

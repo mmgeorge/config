@@ -30,15 +30,17 @@ impl Preferences {
                 !provider.trim().is_empty() && !choice.model.trim().is_empty(),
                 "Background model cannot be empty"
             );
+            let kind = forge_harness::provider::ProviderKind::parse(provider)?;
             ensure!(
-                provider != "gemini",
-                "Background sessions require a Harness provider"
+                forge_harness::provider::registered_capability(kind)
+                    .integration
+                    .background_generation,
+                "This provider does not support Background sessions"
             );
             if let Some(thinking) = &choice.thinking {
                 ensure!(
-                    ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-                        .contains(&thinking.as_str()),
-                    "Invalid Background thinking setting"
+                    !thinking.trim().is_empty(),
+                    "Background thinking setting cannot be empty"
                 );
             }
         }

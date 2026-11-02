@@ -148,16 +148,11 @@ async fn submit(
     };
     submission.recover(provider, request).await?;
     request.submission = Some(submission.clone());
-    let tracked = matches!(
-        provider.descriptor().kind,
-        super::ProviderKind::Codex
-            | super::ProviderKind::Copilot
-            | super::ProviderKind::Claude
-            | super::ProviderKind::Antigravity
-    );
+    let integration = provider.descriptor().capability.integration;
+    let tracked = integration.tracked_submission;
     if !tracked {
         submission.sending(super::submission::SubmissionTarget::Untracked)?;
-        if provider.descriptor().kind == super::ProviderKind::Mock {
+        if integration.local_acceptance {
             submission.accepted("local mock admission".into())?;
         }
     }

@@ -213,6 +213,7 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
     for update in [
         ToolUpdate::Requested {
             invocation: ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 name: "exec".into(),
                 title: "Background command".into(),

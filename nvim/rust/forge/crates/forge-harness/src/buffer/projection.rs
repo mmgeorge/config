@@ -476,11 +476,14 @@ pub(super) fn timing_blocks(
                                 .max(1);
                             blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
                                 previous,
-                                &tool.kind,
-                                tool.elapsed_ms(now_ms),
-                                tool.failed,
-                                &tool.title,
-                                false,
+                                crate::buffer::transcript::ToolHeading {
+                                    kind: &tool.kind,
+                                    elapsed_ms: tool.elapsed_ms(now_ms),
+                                    failed: tool.failed,
+                                    title: &tool.title,
+                                    expanded: false,
+                                    shell: tool.command_shell.as_deref(),
+                                },
                             )?);
                         }
                     } else {
@@ -520,11 +523,14 @@ pub(super) fn timing_blocks(
                     .max(1);
                 blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
                     previous,
-                    &tool.kind,
-                    tool.elapsed_ms(now_ms),
-                    tool.failed,
-                    &tool.title,
-                    expanded.get(&format!("{call_id}:tool")) == Some(&true),
+                    crate::buffer::transcript::ToolHeading {
+                        kind: &tool.kind,
+                        elapsed_ms: tool.elapsed_ms(now_ms),
+                        failed: tool.failed,
+                        title: &tool.title,
+                        expanded: expanded.get(&format!("{call_id}:tool")) == Some(&true),
+                        shell: tool.command_shell.as_deref(),
+                    },
                 )?);
             }
             let Some(previous) = document.block(&BlockId(id.into())) else {
@@ -2220,20 +2226,11 @@ impl TimelineRenderer<'_> {
         }
         if let Some(usage) = &compaction.result.compaction_tokens_used {
             if let Some(cost) = &usage.billing {
-                if let Some(total) = cost.total_nano_aiu {
-                    details.push(format!("Provider cost: {total} nano-AI units"));
-                }
-                for category in cost.token_details.as_deref().unwrap_or_default() {
-                    let name = category.token_type.as_deref().unwrap_or("unspecified");
-                    if let Some(count) = category.token_count {
-                        details.push(format!("Billed {name} tokens: {count}"));
-                    }
-                    if let Some(count) = category.batch_size {
-                        details.push(format!("Billing {name} batch size: {count}"));
-                    }
-                    if let Some(count) = category.cost_per_batch {
-                        details.push(format!("Billing {name} cost per batch: {count}"));
-                    }
+                for measure in &cost.measurements {
+                    details.push(format!(
+                        "{}: {} {}",
+                        measure.label, measure.value, measure.unit
+                    ));
                 }
             }
             if let Some(model) = &usage.model {
@@ -2738,6 +2735,7 @@ impl TimelineRenderer<'_> {
             BlockId(id),
             target.clone(),
             crate::buffer::transcript::ToolHeading {
+                shell: tool.command_shell.as_deref(),
                 kind: &tool.kind,
                 elapsed_ms: tool.elapsed_ms(self.now_ms),
                 failed: tool.failed,
@@ -4170,6 +4168,7 @@ mod tests {
                     &address,
                     &format!("lookup-{tool_count}"),
                     ToolInvocation {
+                        semantics: Default::default(),
                         kind: ToolActivityKind::Command,
                         name: "lookup".into(),
                         title: format!("lookup_{tool_count}"),
@@ -4615,6 +4614,7 @@ mod tests {
                 &address,
                 id,
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     name: "question_ask".into(),
                     title: "question_ask".into(),
@@ -4998,6 +4998,7 @@ mod tests {
                         &address,
                         if ordinal == 1 { &repeated_id } else { name },
                         ToolInvocation {
+                            semantics: Default::default(),
                             title: name.into(),
                             name: name.into(),
                             arguments: json!({}),
@@ -5031,6 +5032,7 @@ mod tests {
                     &address,
                     &repeated_id,
                     ToolInvocation {
+                        semantics: Default::default(),
                         title: boundary.into(),
                         name: boundary.into(),
                         arguments: json!({}),
@@ -5187,6 +5189,7 @@ mod tests {
                 &address,
                 id,
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind,
                     name: id.into(),
                     title: if file_change {
@@ -5403,6 +5406,7 @@ mod tests {
                 &address,
                 &format!("tool-{index}"),
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: if index % 2 == 0 {
                         ToolActivityKind::Command
                     } else {
@@ -5633,6 +5637,7 @@ mod tests {
                 &address,
                 "shared-call",
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     name: "inspect".into(),
                     arguments: json!({}),
@@ -5807,6 +5812,7 @@ mod tests {
             &address,
             "shared-call",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::Command,
                 name: "inspect".into(),
                 arguments: json!({}),
@@ -5912,6 +5918,7 @@ mod tests {
                     &address,
                     &format!("call-{count}"),
                     ToolInvocation {
+                        semantics: Default::default(),
                         kind: ToolActivityKind::Command,
                         name: "inspect".into(),
                         arguments: json!({}),
@@ -6291,6 +6298,7 @@ mod tests {
             &address,
             "call",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::ToolCall,
                 name: "child".into(),
                 arguments: json!({}),
@@ -6315,6 +6323,7 @@ mod tests {
             &address,
             "spawn-call",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::ToolCall,
                 name: "agent_spawn".into(),
                 arguments: json!({}),
@@ -6648,6 +6657,7 @@ mod tests {
                 &address,
                 "failed-spawn-call",
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::ToolCall,
                     name: "agent_spawn".into(),
                     arguments: json!({}),
@@ -6846,6 +6856,7 @@ mod tests {
             &address,
             "call",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::FileChange,
                 title: "inspect".into(),
                 name: "inspect".into(),
@@ -6897,6 +6908,7 @@ mod tests {
             &address,
             "interrupted-edit",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::FileChange,
                 title: "file changes".into(),
                 name: "edit".into(),
@@ -7773,6 +7785,7 @@ mod tests {
                 &address,
                 &format!("exact-{index}"),
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::Command,
                     name: "checks_run".into(),
                     title: format!("checks_run exact test {index}"),
@@ -7910,6 +7923,7 @@ mod tests {
                     &address,
                     &format!("write-{index}"),
                     ToolInvocation {
+                        semantics: Default::default(),
                         kind: ToolActivityKind::FileChange,
                         title: "file changes".into(),
                         name: "edit".into(),
@@ -8022,6 +8036,7 @@ mod tests {
                 &address,
                 &format!("write-{index}"),
                 ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::FileChange,
                     title: "file changes".into(),
                     name: "edit".into(),
@@ -8582,6 +8597,7 @@ mod tests {
                 &address,
                 id,
                 crate::provider::ToolInvocation {
+                    semantics: Default::default(),
                     kind: crate::provider::ToolActivityKind::FileChange,
                     name: "edit".into(),
                     title: "Edit".into(),
@@ -8664,6 +8680,7 @@ mod tests {
                 &address,
                 &index.to_string(),
                 crate::provider::ToolInvocation {
+                    semantics: Default::default(),
                     kind: crate::provider::ToolActivityKind::ToolCall,
                     name: "inspect".into(),
                     title: "inspect".into(),
@@ -8758,6 +8775,7 @@ mod tests {
             &address,
             "tool",
             ToolInvocation {
+                semantics: Default::default(),
                 kind: ToolActivityKind::ToolCall,
                 name: "test".into(),
                 title: "cargo test".into(),
@@ -8856,6 +8874,7 @@ mod tests {
         event = ProviderEvent::Usage {
             address,
             update: UsageUpdate {
+                context_adjustment: false,
                 id: "call".into(),
                 usage: TokenUsage {
                     input: Some(76000),
@@ -8913,6 +8932,7 @@ mod tests {
         let mut event = ProviderEvent::Usage {
             address,
             update: crate::provider::usage::UsageUpdate {
+                context_adjustment: false,
                 id: "first".into(),
                 usage: crate::provider::usage::TokenUsage {
                     input: Some(1000),
@@ -8982,6 +9002,7 @@ mod tests {
             let event = ProviderEvent::Usage {
                 address: address.clone(),
                 update: crate::provider::usage::UsageUpdate {
+                    context_adjustment: false,
                     id: "first".into(),
                     usage: serde_json::from_value(usage).unwrap(),
                     cumulative: None,

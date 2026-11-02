@@ -27,6 +27,9 @@ pub struct ToolCall {
     pub id: String,
     pub kind: String,
     pub title: String,
+    #[serde(default)]
+    /// Retain the adapter-selected shell for command rendering across platforms.
+    pub command_shell: Option<String>,
     pub output: super::ToolOutputText,
     pub status: String,
     pub failed: bool,
@@ -217,6 +220,10 @@ impl ToolStore {
             id: id.to_owned(),
             kind: tool_kind(execution.invocation.kind),
             title: execution.invocation.title.clone(),
+            command_shell: match &execution.invocation.semantics {
+                forge_provider_api::tool::ToolSemantics::Command { shell, .. } => shell.clone(),
+                _ => None,
+            },
             output: super::ToolOutputText::default(),
             status: "running".into(),
             failed: false,
@@ -350,6 +357,7 @@ mod tests {
                 &address,
                 &ToolUpdate::Requested {
                     invocation: ToolInvocation {
+                        semantics: Default::default(),
                         kind: crate::provider::ToolActivityKind::Command,
                         name: "exec".into(),
                         title: "Background command".into(),
@@ -425,6 +433,7 @@ mod tests {
             tool_id: "call".into(),
         };
         let invocation = ToolInvocation {
+            semantics: Default::default(),
             kind: crate::provider::ToolActivityKind::ToolCall,
             name: "web_search".into(),
             title: "Web Search".into(),
@@ -525,6 +534,7 @@ mod tests {
             &address,
             &ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     kind: crate::provider::ToolActivityKind::Command,
                     name: "inspect".into(),
                     title: "Inspect files".into(),
@@ -633,6 +643,7 @@ mod tests {
             &address,
             &ToolUpdate::Requested {
                 invocation: ToolInvocation {
+                    semantics: Default::default(),
                     kind: crate::provider::ToolActivityKind::Command,
                     name: "inspect".into(),
                     title: "Inspect files".into(),

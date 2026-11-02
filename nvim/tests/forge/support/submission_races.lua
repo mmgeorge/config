@@ -244,9 +244,17 @@ return function(context)
     local secondary_id = context.request("session.new", { name = "Independent submission lane" }).session.id
     local secondary = context.mock.hold(secondary_id, "chat")
     local secondary_finished, secondary_error
-    original_request({ session_id = secondary_id, method = "session.prompt.submit", params = { text = "Independent secondary request" } }, function(_, diagnostic)
-      secondary_finished, secondary_error = true, diagnostic
-    end)
+    local secondary_deadline = vim.uv.hrtime() + 10e9
+    local function submit_secondary()
+      original_request({ session_id = secondary_id, method = "session.prompt.submit", params = { text = "Independent secondary request" } }, function(_, diagnostic, detail)
+        if detail and detail.code == "not_admitted" and vim.uv.hrtime() < secondary_deadline then
+          vim.defer_fn(submit_secondary, 10)
+          return
+        end
+        secondary_finished, secondary_error = true, diagnostic
+      end)
+    end
+    submit_secondary()
     assert(secondary:wait().prompt == "Independent secondary request")
     secondary:release()
     await(function() return secondary_finished end, "another session waited for the primary response")

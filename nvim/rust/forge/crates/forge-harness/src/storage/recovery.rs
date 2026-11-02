@@ -237,6 +237,7 @@ mod tests {
                 id,
                 ToolUpdate::Requested {
                     invocation: ToolInvocation {
+                        semantics: Default::default(),
                         kind: ToolActivityKind::Command,
                         name: "exec".into(),
                         title: id.into(),

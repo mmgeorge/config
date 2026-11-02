@@ -36,8 +36,10 @@ impl HarnessBroker {
                 change.apply(
                     &mut access,
                     &mut permission,
-                    crate::provider::ProviderKind::parse(&self.session.provider)?
-                        .supports_sandbox(),
+                    crate::provider::registered_capability(crate::provider::ProviderKind::parse(
+                        &self.session.provider,
+                    )?)
+                    .supports_sandbox(),
                 );
             }
             if matches!(

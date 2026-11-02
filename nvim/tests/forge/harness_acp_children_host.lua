@@ -57,11 +57,17 @@ require("forge.views.harness.controller").resolve_runtime_model = function() end
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local function request(method, params)
-  local result, failure, completed
-  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, request_error)
-    result, failure, completed = value, request_error, true
-  end)
-  assert(vim.wait(10000, function() return completed end, 10), method .. " timed out")
+  local result, failure, detail
+  local deadline = vim.uv.hrtime() + 10e9
+  repeat
+    local completed = false
+    client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(state.session).id or nil }, function(value, request_error, request_detail)
+      result, failure, detail, completed = value, request_error, request_detail, true
+    end)
+    assert(vim.wait(10000, function() return completed end, 10), method .. " timed out")
+    if method ~= "session.prompt.submit" or not detail or detail.code ~= "not_admitted" then break end
+    vim.wait(20, function() return false end, 10)
+  until vim.uv.hrtime() >= deadline
   assert(not failure, method .. ": " .. tostring(failure))
   return result
 end
@@ -71,27 +77,23 @@ local success, failure = xpcall(function()
     providers = { claude = { command = { "node", peer }, label = "Fixture ACP", selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.ready and state.session end, 10))
-  request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {}, windows_sandbox = "elevated" } })
+  request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {}, isolation_mode = "elevated" } })
   request("session.provider.model.list")
   request("session.permission.set", { change = { kind = "enable_yolo" } })
   request("session.prompt.submit", { text = "Read the simulated ACP child updates" })
   local snapshot = request("session.state.get")
-  local child, nested, unfinished, unfinished_nested
-  for _, agent in pairs(snapshot.agent.run or {}) do
-    if agent.provider_thread_id == "child" then child = agent end
-    if agent.provider_thread_id == "nested" then nested = agent end
-    if agent.provider_thread_id == "unfinished" then unfinished = agent end
-    if agent.provider_thread_id == "unfinished-nested" then unfinished_nested = agent end
-  end
-  assert(child and nested, "ACP child identities were not retained: " .. vim.inspect(snapshot.agent))
-  assert(snapshot.agent.summary[child.id].state == "complete" and snapshot.agent.summary[child.id].tool_count == 1)
-  assert(snapshot.agent.summary[nested.id].state == "complete" and snapshot.agent.summary[nested.id].tool_count == 0)
-  assert(unfinished and unfinished_nested, "unfinished child identities were not retained")
-  assert(snapshot.agent.summary[unfinished.id].state == "interrupted")
-  assert(snapshot.agent.summary[unfinished_nested.id].state == "interrupted")
+  assert(vim.tbl_isempty(snapshot.agent.run or {}), "native notifications created Harness-owned agents")
   local main = request("session.exchange.list")
   assert(#main == 1 and main[1].state == "complete")
-  assert(main[1].turn[1].tool.item["shared-tool-id"].title == "Root check", "child tool fields leaked across session identity")
+  local function stored_tool(value)
+    if type(value) ~= "table" then return nil end
+    if value.id == "shared-tool-id" and value.title then return value end
+    for _, child in pairs(value) do
+      local found = stored_tool(child)
+      if found then return found end
+    end
+  end
+  assert(assert(stored_tool(main[1]), "root tool was not retained").title == "Root check", "child tool fields leaked across session identity")
   local root_text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(vim.wait(5000, function()
     root_text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
@@ -99,52 +101,6 @@ local success, failure = xpcall(function()
   end, 10), root_text)
   assert(not root_text:find("CHILD_CONTENT_VERIFIED", 1, true) and not root_text:find("NESTED_CONTENT_VERIFIED", 1, true)
     and not root_text:find("LATE_CHILD_CONTENT", 1, true) and not root_text:find("UNOWNED_CONTENT", 1, true), root_text)
-  local function select(run, marker)
-    assert(vim.wait(5000, function() return state.presentation and state.presentation.ready end, 10))
-    state.presentation.select_agent(run.id)
-    local text
-    assert(vim.wait(5000, function()
-      text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-      return state.presentation.timeline_key == run.id and text:find(marker, 1, true)
-    end, 10), tostring(text))
-    assert(not text:find("ROOT_CONTENT_VERIFIED", 1, true) and not text:find("LATE_CHILD_CONTENT", 1, true))
-    return text
-  end
-  local child_text = select(child, "CHILD_CONTENT_VERIFIED")
-  assert(not child_text:find("NESTED_CONTENT_VERIFIED", 1, true))
-  vim.api.nvim_set_current_win(state.transcript_win)
-  for row, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-    if line:find("Ran 1 tool", 1, true) then
-      vim.api.nvim_win_set_cursor(state.transcript_win, { row, 0 })
-      assert(state.presentation.toggle_heading(state.transcript_win))
-      break
-    end
-  end
-  assert(vim.wait(5000, function()
-    child_text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-    return child_text:find("Child check", 1, true)
-  end, 10), child_text)
-  for row, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-    local column = line:find("Child check", 1, true)
-    if column then vim.api.nvim_win_set_cursor(state.transcript_win, { row, column - 1 }) break end
-  end
-  local activated
-  state.presentation.activate(function(action, captured)
-    assert(action.kind == "tool", vim.inspect(action))
-    activated = state.presentation.open_output(action, captured)
-  end)
-  assert(vim.wait(5000, function() return activated end, 10), "child tool action was unavailable: " .. child_text .. "\n" .. table.concat(errors, "\n"))
-  local output = state.presentation.output[#state.presentation.output]
-  assert(vim.wait(5000, function() return output.ready end, 10), "child tool output was unavailable")
-  local output_text
-  assert(vim.wait(5000, function()
-    output_text = table.concat(vim.api.nvim_buf_get_lines(output.replica.buffer, 0, -1, false), "\n")
-    return output_text:find("CHILD_COMMAND_OUTPUT", 1, true)
-  end, 10), tostring(output_text))
-  assert(not output_text:find("ROOT_COMMAND_OUTPUT", 1, true), output_text)
-  output.close()
-  local nested_text = select(nested, "NESTED_CONTENT_VERIFIED")
-  assert(not nested_text:find("CHILD_CONTENT_VERIFIED", 1, true))
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)
 client.host_stop()
@@ -155,5 +111,5 @@ if not success or not collected then
   io.stderr:write(tostring(failure or "host was not collected"), "\n")
   vim.cmd("cquit 1")
 end
-print("harness_acp_children_host: passed (simulated ACP peer, real host, nested ownership, completion, output persistence)")
+print("harness_acp_children_host: passed (simulated ACP peer, real host, native child isolation, root completion, tool ownership)")
 vim.cmd("qa!")

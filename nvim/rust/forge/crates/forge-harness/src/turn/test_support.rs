@@ -179,6 +179,7 @@ impl TestTurn {
                 &address,
                 &ToolUpdate::Requested {
                     invocation: ToolInvocation {
+                        semantics: Default::default(),
                         kind: crate::provider::ToolActivityKind::ToolCall,
                         name: id.into(),
                         title: id.into(),

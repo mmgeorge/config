@@ -267,7 +267,7 @@ pub fn parse_model_catalog(result: &Value) -> Vec<ProviderModel> {
                     .get("defaultReasoningEffort")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                reasoning: effort,
+                reasoning: ordered_efforts(effort),
                 selected_reasoning: None,
                 context_window: Vec::new(),
                 default_context_window: None,
@@ -382,4 +382,18 @@ mod tests {
         assert_eq!(catalog[0].status, McpStatus::Failed);
         assert_eq!(catalog[0].tool_error.as_deref(), Some("Discovery failed"));
     }
+}
+
+/// Order this provider's native effort vocabulary before publishing its model catalog.
+fn ordered_efforts(mut choices: Vec<String>) -> Vec<String> {
+    let order = [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ];
+    choices.sort_by_key(|value| {
+        order
+            .iter()
+            .position(|item| *item == value)
+            .unwrap_or(order.len())
+    });
+    choices
 }

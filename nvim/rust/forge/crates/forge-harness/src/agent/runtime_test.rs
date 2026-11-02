@@ -101,6 +101,7 @@ impl crate::provider::ProviderAdapter for BackgroundProvider {
         for update in [
             crate::provider::ToolUpdate::Requested {
                 invocation: crate::provider::ToolInvocation {
+                    semantics: Default::default(),
                     kind: crate::provider::ToolActivityKind::Command,
                     name: "exec".into(),
                     title: "Background command".into(),
@@ -455,7 +456,12 @@ impl crate::provider::ProviderAdapter for ProviderCancelledProvider {
         ProviderDescriptor {
             kind: ProviderKind::Codex,
             label: "cancelled child".into(),
-            capability: crate::provider::mock_capability(),
+            capability: {
+                let mut capability = crate::provider::mock_capability();
+                capability.integration.tracked_submission = true;
+                capability.integration.local_acceptance = false;
+                capability
+            },
         }
     }
     /// Complete fixture cleanup without resources.
@@ -488,15 +494,19 @@ impl crate::provider::ProviderAdapter for ProviderCancelledProvider {
         match self.boundary {
             SubmissionBoundary::Prepared => {}
             SubmissionBoundary::Sending => submission
-                .sending(SubmissionTarget::Codex {
-                    thread_id: "thread".into(),
-                })
+                .sending(SubmissionTarget::native(
+                    "codex",
+                    "thread",
+                    serde_json::json!({}),
+                ))
                 .map_err(ProviderError::from)?,
             SubmissionBoundary::Accepted => {
                 submission
-                    .sending(SubmissionTarget::Codex {
-                        thread_id: "thread".into(),
-                    })
+                    .sending(SubmissionTarget::native(
+                        "codex",
+                        "thread",
+                        serde_json::json!({}),
+                    ))
                     .map_err(ProviderError::from)?;
                 submission
                     .accepted("accepted".into())

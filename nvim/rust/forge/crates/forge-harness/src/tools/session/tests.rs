@@ -274,11 +274,11 @@ fn log_metadata_excludes_private_content_and_reports_absence() -> Result<()> {
     let native = crate::trace::inspection_record(&json!({
         "event":"copilot.session.event",
         "payload":{"type":"tool.execution_complete","data":{
-            "toolCallId":"call","success":true,"arguments":"credential","reasoningText":"private"
+            "tool_call_id":"call","success":true,"arguments":"credential","reasoningText":"private"
         }}
     }));
     assert_eq!(native["payload"]["type"], "tool.execution_complete");
-    assert_eq!(native["payload"]["data"]["toolCallId"], "call");
+    assert_eq!(native["payload"]["data"]["tool_call_id"], "call");
     assert_eq!(native["payload"]["data"]["success"], true);
     assert!(!native.to_string().contains("credential") && !native.to_string().contains("private"));
     let method = "diagnostic".repeat(300);
@@ -593,6 +593,7 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
         &address,
         "reused",
         ToolInvocation {
+            semantics: Default::default(),
             kind: ToolActivityKind::ToolCall,
             name: "inspect".into(),
             title: "inspect".into(),

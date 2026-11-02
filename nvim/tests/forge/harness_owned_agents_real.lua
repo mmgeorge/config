@@ -84,7 +84,7 @@ local succeeded,failure = xpcall(function()
   assert(vim.wait(30000,function() return state.session or #errors>0 end,10),"startup timeout")
   assert(state.session,table.concat(errors,"\n"))
   request("host.trace.configure",{enabled=true})
-  request("session.configure",{access={sandbox=false,write_access="workspace",writable_directory={},windows_sandbox="elevated"}})
+  request("session.configure",{access={sandbox=false,write_access="workspace",writable_directory={},isolation_mode="elevated"}})
   errors = {}
   local root_model = model_for(provider,vim.g.forge_agent_test_model)
   if root_model then request("session.configure",{model=root_model}) end

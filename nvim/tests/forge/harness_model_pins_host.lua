@@ -1,4 +1,5 @@
-vim.opt.runtimepath:prepend("nvim")
+local script_path = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")
+vim.opt.runtimepath:prepend(vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(script_path))))
 vim.loader.enable(false)
 
 local stage = arg[1]

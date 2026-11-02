@@ -1,25 +1,19 @@
 local M = {}
 
-local windows_sandbox_description = {
-  elevated = "Dedicated low-privilege users and filesystem ACLs. Setup needs admin approval; sandboxed commands do not run as administrator.",
-  unelevated = "Restricted token for your current user, without admin setup. Weaker network isolation than Elevated; denied-read paths are unsupported.",
-  mxc = "Prefer Microsoft Execution Containers on compatible Windows 11; no admin setup. Falls back to Elevated if unavailable. Child processes stop when the command exits.",
-}
-
 ---@class ForgeDirectoryPolicy
 ---@field sandbox boolean
 ---@field read_access "workspace"|"full"
 ---@field write_access "off"|"workspace"|"full"
 ---@field readable_directory string[]
 ---@field writable_directory string[]
----@field windows_sandbox "elevated"|"unelevated"|"mxc"
+---@field isolation_mode? string
 
 ---@param session {access?: ForgeDirectoryPolicy}
 ---@return ForgeDirectoryPolicy
 function M.policy(session)
   return vim.tbl_deep_extend("force", {
     sandbox = true, read_access = "full", write_access = "workspace",
-    readable_directory = {}, writable_directory = {}, windows_sandbox = "elevated",
+    readable_directory = {}, writable_directory = {},
   }, vim.deepcopy(session.access or {}))
 end
 
@@ -27,7 +21,7 @@ end
 ---@param capability? {os_sandbox?: boolean}
 ---@return boolean
 function M.supports_sandbox(session, capability)
-  return session.provider == "codex" and capability ~= nil and capability.os_sandbox == true
+  return capability ~= nil and capability.os_sandbox == true
 end
 
 ---@param policy ForgeDirectoryPolicy
@@ -35,7 +29,7 @@ end
 ---@return string
 function M.sandbox_description(policy, supported)
   if not supported then
-    return "OS sandbox unavailable: Forge supports native isolation only with Codex. File-access rules and approval checks still apply to tool requests."
+    return "OS sandbox unavailable: The selected provider does not declare enforced isolation. File-access rules and approval checks still apply to tool requests."
   end
   if not policy.sandbox then
     return "Off: commands run without OS sandbox isolation. Tool permissions and approvals still apply, but cannot contain unrestricted commands."
@@ -43,16 +37,19 @@ function M.sandbox_description(policy, supported)
   local boundary = policy.write_access == "off" and "commands have read-only filesystem access"
     or policy.write_access == "full" and "writes are allowed throughout the filesystem"
     or "writes stay in the workspace and extra write directories"
-  return "Codex OS sandbox on: " .. boundary .. ". Network access is enabled; approval rules are separate."
+  return "OS sandbox on: " .. boundary .. ". Approval rules are separate; implementation guarantees are described by the selected isolation mode."
 end
 
 ---@param policy ForgeDirectoryPolicy
 ---@param supported boolean
 ---@return string
-function M.windows_sandbox_description(policy, supported)
-  local description = "Codex on Windows only. " .. assert(windows_sandbox_description[policy.windows_sandbox])
-  if not supported then return "Windows mode unavailable for this provider. " .. description end
-  return description
+function M.isolation_mode_description(policy, supported, capability)
+  if not supported then return "Isolation modes are unavailable for this provider." end
+  local modes = capability and capability.integration and capability.integration.isolation_modes or {}
+  for _, mode in ipairs(modes) do
+    if mode.id == policy.isolation_mode or not policy.isolation_mode then return mode.description end
+  end
+  return "Select a provider-advertised isolation mode."
 end
 
 ---@param state {session: {id: string, workspace: string, access?: ForgeDirectoryPolicy}, access_preference?: ForgeDirectoryPolicy}

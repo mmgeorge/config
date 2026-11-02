@@ -84,7 +84,8 @@ impl AgentProviderFactory {
         request.effort = "default".into();
         request.provider_session_id = None;
         request.control_context = None;
-        request.access = provider.resolve_access(request.access);
+        request.access =
+            crate::provider::registered_capability(provider).resolve_access(request.access);
         let provider = self.build(provider)?;
         let capability = provider.descriptor().capability;
         let model = tokio::time::timeout(
@@ -162,16 +163,10 @@ impl AgentProviderFactory {
                 None
             },
             service_tier,
-            access: provider.resolve_access(root.access.clone()),
+            access: crate::provider::registered_capability(provider)
+                .resolve_access(root.access.clone()),
             approval_mode,
         };
-        ensure!(
-            service_tier == crate::provider::ServiceTier::Standard
-                || matches!(provider, ProviderKind::Codex | ProviderKind::Mock),
-            "profile {} requests a speed tier unsupported by {}",
-            selection.profile,
-            provider_name(provider)
-        );
         if profile.model != "inherit" || profile.reasoning_effort != "inherit" || !same_provider {
             ensure!(
                 same_provider || profile.model != "inherit" || root.model != "default",
@@ -257,7 +252,8 @@ impl AgentProviderFactory {
             effort: selection.reasoning_effort.clone(),
             context_window: selection.context_window.clone(),
             service_tier: selection.service_tier,
-            access: selection.provider.resolve_access(root.access.clone()),
+            access: crate::provider::registered_capability(selection.provider)
+                .resolve_access(root.access.clone()),
             approval_mode: narrow_permission(root.approval_mode, selection.approval_mode),
             provider_session_id: agent.provider_thread_id.clone(),
             submission: None,

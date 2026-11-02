@@ -283,6 +283,7 @@ impl ToolOutputView {
     /// Retains source heading fields without copying the saved output or change tree.
     pub(super) fn heading(&mut self, call: &crate::turn::ToolCall) {
         self.heading = Some(crate::turn::ToolCall {
+            command_shell: None,
             started_at_ms: call.started_at_ms,
             completed_at_ms: call.completed_at_ms,
             checklist_item_id: None,

@@ -414,6 +414,7 @@ impl AcpSessionState {
                 };
                 if let Some(id) = message["uuid"].as_str() {
                     let update = forge_provider_api::usage::UsageUpdate {
+                        context_adjustment: false,
                         id: id.into(),
                         usage: usage.clone(),
                         cumulative: None,
@@ -538,7 +539,8 @@ impl AcpSessionState {
                     ToolStatus::parse(status).map_err(|error| ProviderError::Protocol {
                         message: format!("{error:#}"),
                     })?;
-                let invocation = ToolInvocation {
+                let invocation = crate::acp::normalize_invocation(ToolInvocation {
+                    semantics: Default::default(),
                     kind: match update["kind"].as_str() {
                         Some("edit" | "delete" | "move") => ToolActivityKind::FileChange,
                         Some("execute") => ToolActivityKind::Command,
@@ -547,7 +549,7 @@ impl AcpSessionState {
                     title: update["title"].as_str().unwrap_or("Tool").into(),
                     name: update["title"].as_str().unwrap_or("Tool").into(),
                     arguments: update.get("rawInput").cloned().unwrap_or(Value::Null),
-                };
+                });
                 if first || invocation_changed {
                     self.emit(ProviderEvent::Tool {
                         address: address.clone(),

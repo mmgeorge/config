@@ -239,19 +239,19 @@ mod tests {
     #[test]
     fn session_name_selects_lowest_supported_effort_without_changing_model() {
         let mut model: super::super::ProviderModel = serde_json::from_value(serde_json::json!({
-            "id":"selected", "reasoning":["high", "medium", "low"], "context_window":[], "vision":false
+            "id":"selected", "reasoning":["low", "medium", "high"], "context_window":[], "vision":false
         })).unwrap();
         assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("low"));
-        model.reasoning.push("minimal".into());
+        model.reasoning.insert(0, "minimal".into());
         assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("minimal"));
-        model.reasoning.push("none".into());
+        model.reasoning.insert(0, "none".into());
         assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("none"));
         model.reasoning = vec!["medium".into()];
         assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("medium"));
         model.reasoning.clear();
         assert_eq!(lowest_effort(&model).unwrap(), None);
         model.reasoning.push("unknown".into());
-        assert!(lowest_effort(&model).is_err());
+        assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("unknown"));
     }
 
     #[test]

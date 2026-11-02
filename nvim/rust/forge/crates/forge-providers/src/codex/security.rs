@@ -1,4 +1,4 @@
-use forge_provider_api::access::{AccessPolicy, WindowsSandbox};
+use forge_provider_api::access::AccessPolicy;
 use forge_provider_api::approval::ApprovalMode;
 use serde_json::{Value, json};
 
@@ -38,11 +38,12 @@ impl<'a> CodexSecurity<'a> {
         config["sandbox_workspace_write.network_access"] = json!(true);
         config["sandbox_workspace_write.exclude_tmpdir_env_var"] = json!(true);
         config["sandbox_workspace_write.exclude_slash_tmp"] = json!(true);
-        config["windows.sandbox"] = json!(match self.access.windows_sandbox {
-            WindowsSandbox::Elevated | WindowsSandbox::Mxc => "elevated",
-            WindowsSandbox::Unelevated => "unelevated",
+        config["windows.sandbox"] = json!(match self.access.isolation_mode.as_deref() {
+            Some("unelevated") => "unelevated",
+            None | Some("elevated" | "mxc") => "elevated",
+            Some(_) => "elevated",
         });
-        config["features.prefer_mxc"] = json!(self.access.windows_sandbox == WindowsSandbox::Mxc);
+        config["features.prefer_mxc"] = json!(self.access.isolation_mode.as_deref() == Some("mxc"));
     }
 
     /// Override the turn policy using fields accepted by the app-server API.

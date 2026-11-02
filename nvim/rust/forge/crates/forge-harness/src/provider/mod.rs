@@ -1,10 +1,10 @@
-mod acp;
+pub(crate) mod acp;
 pub mod approval;
 mod catalog;
 pub(crate) use catalog::select_model_settings;
 pub use compaction::{
     Compaction, CompactionCapability, CompactionContext, CompactionCost, CompactionResult,
-    CompactionState, CompactionTokenCost, CompactionUsage,
+    CompactionState, CompactionUsage,
 };
 pub use forge_provider_api::compaction;
 pub type ProviderCompactionRequest =

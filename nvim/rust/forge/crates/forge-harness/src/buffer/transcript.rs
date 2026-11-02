@@ -21,6 +21,7 @@ pub struct TranscriptRenderer<'profile> {
 #[derive(Clone, Copy)]
 pub struct ToolHeading<'call> {
     pub kind: &'call str,
+    pub shell: Option<&'call str>,
     pub elapsed_ms: Option<u64>,
     pub failed: bool,
     pub title: &'call str,
@@ -159,25 +160,16 @@ impl<'profile> TranscriptRenderer<'profile> {
         }
         Ok(block)
     }
+    /// Refresh an existing tool heading while preserving its presentation identity.
     pub(super) fn refresh_tool_heading(
         &self,
         previous: &BufferBlock,
-        kind: &str,
-        elapsed_ms: Option<u64>,
-        failed: bool,
-        title: &str,
-        expanded: bool,
+        heading: ToolHeading<'_>,
     ) -> Result<BufferBlock> {
         let mut block = self.tool_header(
             previous.id.clone(),
             previous.metadata.target[0].id.clone(),
-            crate::buffer::transcript::ToolHeading {
-                kind,
-                elapsed_ms,
-                failed,
-                title,
-                expanded,
-            },
+            heading,
         )?;
         block.metadata.layout = previous.metadata.layout.clone();
         block.metadata.fold = previous.metadata.fold.clone();
@@ -425,6 +417,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         output: &ToolOutputPreview<'_>,
     ) -> Result<BufferBlock> {
         let ToolHeading {
+            shell,
             kind,
             elapsed_ms,
             failed,
@@ -434,7 +427,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         id.validate()?;
         target.validate()?;
         let duration = tool_duration(elapsed_ms);
-        let mut row = vec![tool_heading(self.profile, kind, title, &duration)?];
+        let mut row = vec![tool_heading(self.profile, kind, title, &duration, shell)?];
         let title_rows = row.len();
         if expanded {
             row.extend(tool_source_rows(self.profile, kind, title)?);
@@ -457,12 +450,7 @@ impl<'profile> TranscriptRenderer<'profile> {
                 ..BlockMetadata::default()
             },
         };
-        let heading_kind = if kind == "tool_call" && shell_tool_display(title).is_some() {
-            "command"
-        } else {
-            kind
-        };
-        decorate_tool_heading(&mut block, title_rows, heading_kind, failed);
+        decorate_tool_heading(&mut block, title_rows, kind, failed);
         Self::heading_marker(&mut block, "Normal");
         if block.text.row_count() > title_rows {
             block.metadata.decoration.push(Decoration {
@@ -574,47 +562,22 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
         .collect())
 }
 
-fn shell_tool_display(title: &str) -> Option<crate::permissions::command::CommandDisplay> {
-    use crate::permissions::shell::CommandShell;
-
-    let (name, arguments) = title.split_once('(')?;
-    let name = name.rsplit('.').next()?;
-    let shell = match name {
-        "bash" => CommandShell::Bash,
-        "powershell" => CommandShell::PowerShell,
-        "shell" | "exec_command" | "run_shell_command" => CommandShell::default(),
-        _ => return None,
-    };
-    let arguments: serde_json::Value = serde_json::from_str(arguments.strip_suffix(')')?).ok()?;
-    let command = arguments
-        .get("command")
-        .or_else(|| arguments.get("cmd"))?
-        .as_str()
-        .filter(|command| !command.trim().is_empty())?;
-    let shell = arguments
-        .get("shell")
-        .and_then(serde_json::Value::as_str)
-        .map_or(shell, CommandShell::from_executable);
-    Some(crate::permissions::command::display_command(command, shell))
-}
-
 /// Formats a bounded display title without changing the retained provider call.
-fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str) -> Result<String> {
-    let display = if kind == "tool_call" {
-        shell_tool_display(title)
-    } else {
-        matches!(kind, "command" | "check").then(|| {
-            crate::permissions::command::display_command(
-                title,
-                crate::permissions::shell::CommandShell::default(),
-            )
-        })
-    };
-    let kind = if kind == "tool_call" && display.is_some() {
-        "command"
-    } else {
-        kind
-    };
+fn tool_heading(
+    profile: &WidthProfile,
+    kind: &str,
+    title: &str,
+    duration: &str,
+    shell: Option<&str>,
+) -> Result<String> {
+    let display = matches!(kind, "command" | "check").then(|| {
+        crate::permissions::command::display_command(
+            title,
+            shell
+                .map(crate::permissions::shell::CommandShell::from_executable)
+                .unwrap_or_default(),
+        )
+    });
     let summary = if kind == "command" {
         display.as_ref().and_then(|display| display.summary())
     } else {
@@ -864,6 +827,7 @@ mod test {
                 BlockId("check:tool".into()),
                 TargetId("check:tool".into()),
                 crate::buffer::transcript::ToolHeading {
+                    shell: None,
                     kind: "check",
                     elapsed_ms: Some(102_000),
                     failed: false,
@@ -875,11 +839,14 @@ mod test {
             for elapsed in [102_000, 103_000] {
                 block = renderer.refresh_tool_heading(
                     &block,
-                    "check",
-                    Some(elapsed),
-                    false,
-                    "cargo test --locked --lib controls::tests · Running",
-                    expanded,
+                    crate::buffer::transcript::ToolHeading {
+                        kind: "check",
+                        elapsed_ms: Some(elapsed),
+                        failed: false,
+                        title: "cargo test --locked --lib controls::tests · Running",
+                        expanded: expanded,
+                        shell: None,
+                    },
                 )?;
                 let heading = block.text.row(0).unwrap();
                 let mut visible = heading.to_owned();
@@ -951,6 +918,7 @@ mod test {
             BlockId("tool".into()),
             TargetId("tool".into()),
             crate::buffer::transcript::ToolHeading {
+                shell: None,
                 kind: "tool_call",
                 elapsed_ms: Some(2000),
                 failed: false,
@@ -997,6 +965,7 @@ mod test {
                     BlockId("tool".into()),
                     TargetId("tool".into()),
                     crate::buffer::transcript::ToolHeading {
+                        shell: None,
                         kind: "tool_call",
                         elapsed_ms: Some(2000),
                         failed: true,
@@ -1071,6 +1040,7 @@ mod test {
                     BlockId("tool:duration".into()),
                     TargetId("expand:duration".into()),
                     crate::buffer::transcript::ToolHeading {
+                        shell: None,
                         kind: "command",
                         elapsed_ms: Some(elapsed_ms),
                         failed: false,
@@ -1104,6 +1074,7 @@ mod test {
             BlockId("tool".into()),
             TargetId("tool".into()),
             crate::buffer::transcript::ToolHeading {
+                shell: None,
                 kind: "tool_call",
                 elapsed_ms: Some(300),
                 failed: false,
@@ -1114,11 +1085,14 @@ mod test {
         assert_eq!(heading.text.row(0), Some("•  0.3s inspect({})"));
         let expanded = TranscriptRenderer::new(&profile)?.refresh_tool_heading(
             &heading,
-            "tool_call",
-            Some(300),
-            false,
-            "inspect({})",
-            true,
+            crate::buffer::transcript::ToolHeading {
+                kind: "tool_call",
+                elapsed_ms: Some(300),
+                failed: false,
+                title: "inspect({})",
+                expanded: true,
+                shell: None,
+            },
         )?;
         assert_eq!(expanded.text.row(0), heading.text.row(0));
         assert_eq!(expanded.text.row_count(), 1);
@@ -1201,6 +1175,7 @@ mod test {
                     BlockId("tool".into()),
                     TargetId("tool".into()),
                     crate::buffer::transcript::ToolHeading {
+                        shell: None,
                         kind,
                         elapsed_ms: Some(400),
                         failed: false,
@@ -1210,11 +1185,14 @@ mod test {
                 )?;
                 let expanded = renderer.refresh_tool_heading(
                     &collapsed,
-                    kind,
-                    Some(400),
-                    false,
-                    title,
-                    true,
+                    crate::buffer::transcript::ToolHeading {
+                        kind: kind,
+                        elapsed_ms: Some(400),
+                        failed: false,
+                        title: title,
+                        expanded: true,
+                        shell: None,
+                    },
                 )?;
                 assert_eq!(collapsed.text.row_count(), 1);
                 assert_eq!(expanded.text, collapsed.text);
@@ -1244,6 +1222,7 @@ mod test {
             ("nu -c 'open --raw src/main.rs'", "Read · src/main.rs · raw"),
         ] {
             let heading = crate::turn::ToolCall {
+                command_shell: None,
                 id: "shell".into(),
                 kind: "command".into(),
                 title: source.into(),
@@ -1264,10 +1243,11 @@ mod test {
                 BlockId("shell".into()),
                 TargetId("shell".into()),
                 crate::buffer::transcript::ToolHeading {
+                    shell: None,
                     kind: "command",
                     elapsed_ms: Some(100),
                     failed: false,
-                    title: source,
+                    title: expected,
                     expanded: false,
                 },
             )?;
@@ -1286,7 +1266,7 @@ mod test {
             body.validate()?;
         }
         assert_eq!(
-            tool_heading(&profile, "command", "rg -n TODO src", "1s")?,
+            tool_heading(&profile, "command", "rg -n TODO src", "1s", None)?,
             "• 1s rg -n TODO src"
         );
         Ok(())
@@ -1325,14 +1305,29 @@ mod test {
                 "Read · src/main.rs · raw",
             ),
         ] {
+            let (name, arguments) = source.split_once('(').unwrap();
+            let arguments = serde_json::from_str(arguments.strip_suffix(')').unwrap()).unwrap();
+            let invocation =
+                forge_providers::copilot::normalize_invocation(crate::provider::ToolInvocation {
+                    semantics: Default::default(),
+                    kind: crate::provider::ToolActivityKind::ToolCall,
+                    name: name.into(),
+                    title: source.into(),
+                    arguments,
+                });
+            let shell = match &invocation.semantics {
+                forge_provider_api::tool::ToolSemantics::Command { shell, .. } => shell.as_deref(),
+                _ => None,
+            };
             let running = renderer.tool_header(
                 BlockId("shell".into()),
                 TargetId("shell".into()),
                 crate::buffer::transcript::ToolHeading {
-                    kind: "tool_call",
+                    shell,
+                    kind: "command",
                     elapsed_ms: Some(100),
                     failed: false,
-                    title: source,
+                    title: &invocation.title,
                     expanded: false,
                 },
             )?;
@@ -1356,11 +1351,14 @@ mod test {
             );
             let completed = renderer.refresh_tool_heading(
                 &running,
-                "tool_call",
-                Some(100),
-                false,
-                source,
-                false,
+                crate::buffer::transcript::ToolHeading {
+                    kind: "command",
+                    elapsed_ms: Some(100),
+                    failed: false,
+                    title: &invocation.title,
+                    expanded: false,
+                    shell: shell,
+                },
             )?;
             assert_eq!(completed.text, running.text);
             let expanded_source = tool_source_rows(&profile, "tool_call", source)?.join("\n");
@@ -1386,9 +1384,8 @@ mod test {
             r#"bash({"command":"rg"#,
             "bash",
         ] {
-            assert!(shell_tool_display(source).is_none(), "{source}");
             assert_eq!(
-                tool_heading(&profile, "tool_call", source, "0.1s")?,
+                tool_heading(&profile, "tool_call", source, "0.1s", None)?,
                 format!("• 0.1s {source}")
             );
         }
@@ -1405,6 +1402,7 @@ mod test {
         let source =
             r#"fixture.inspect({"path":"src/deeply/nested/module.rs","offset":123,"limit":456})"#;
         let call = crate::turn::ToolCall {
+            command_shell: None,
             id: "call".into(),
             kind: "tool_call".into(),
             title: source.into(),
@@ -1423,6 +1421,7 @@ mod test {
             BlockId("call".into()),
             TargetId("call".into()),
             crate::buffer::transcript::ToolHeading {
+                shell: None,
                 kind: "tool_call",
                 elapsed_ms: Some(100),
                 failed: false,
@@ -1462,12 +1461,13 @@ mod test {
                 &profile,
                 "command",
                 r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#,
-                "2s"
+                "2s",
+                None
             )?,
             "• 2s git status --short"
         );
         assert_eq!(
-            tool_heading(&profile, "command", "bash -lc 'cargo test'", "2s")?,
+            tool_heading(&profile, "command", "bash -lc 'cargo test'", "2s", None)?,
             "• 2s cargo test"
         );
         assert_eq!(
@@ -1479,7 +1479,7 @@ mod test {
             "build.ps1"
         );
         let call = r#"sem.sem_context({"entity_name":"ServiceBusSender","file_path":"service-bus-queue.ts","fresh":true})"#;
-        let heading = tool_heading(&profile, "tool_call", call, "2s")?;
+        let heading = tool_heading(&profile, "tool_call", call, "2s", None)?;
         assert!(heading.starts_with("• 2s sem.sem_context({"));
         assert!(heading.ends_with("…\"})"), "{heading}");
         assert!(profile.cells(&heading, 0)? <= profile.columns);
@@ -1495,6 +1495,7 @@ mod test {
             BlockId("tool:1".into()),
             TargetId("expand:1".into()),
             crate::buffer::transcript::ToolHeading {
+                shell: None,
                 kind: "command",
                 elapsed_ms: Some(2000),
                 failed: false,
@@ -1544,6 +1545,7 @@ mod test {
             BlockId("tool:empty".into()),
             TargetId("expand:empty".into()),
             crate::buffer::transcript::ToolHeading {
+                shell: None,
                 kind: "command",
                 elapsed_ms: Some(2000),
                 failed: false,
@@ -1579,6 +1581,7 @@ mod test {
             BlockId("active:tool".into()),
             TargetId("active:tool".into()),
             crate::buffer::transcript::ToolHeading {
+                shell: None,
                 kind: "tool_call",
                 elapsed_ms: Some(2000),
                 failed: true,
@@ -1640,6 +1643,7 @@ mod test {
                 BlockId("wrapped:tool".into()),
                 TargetId("wrapped:tool".into()),
                 crate::buffer::transcript::ToolHeading {
+                    shell: None,
                     kind: "command",
                     elapsed_ms: Some(10),
                     failed: false,

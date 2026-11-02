@@ -354,17 +354,13 @@ impl BackgroundManager {
             !request.config.model.trim().is_empty(),
             "Background model cannot be empty"
         );
-        if let Some(effort) = &request.config.reasoning_effort {
-            ensure!(
-                ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-                    .contains(&effort.as_str()),
-                "Invalid Background thinking setting"
-            );
-        }
-        request.config.auto_compaction.validate(None)?;
         ensure!(
-            ["codex", "copilot", "mock"].contains(&request.config.provider.kind.as_str()),
-            "This Harness provider does not support tool-free persistent Background sessions"
+            crate::provider::registered_capability(crate::provider::ProviderKind::parse(
+                &request.config.provider.kind
+            )?)
+            .integration
+            .background_generation,
+            "This provider does not support tool-free persistent Background sessions"
         );
         let directory = request.config.data_root.join("background-owner");
         fs::create_dir_all(&directory)?;
@@ -429,7 +425,7 @@ impl BackgroundManager {
         let initialize: InitializeRequest = serde_json::from_value(json!({
             "data_root":request.config.data_root, "workspace":request.context.workspace,
             "client_id":format!("background-{}", uuid::Uuid::new_v4()), "provider":request.config.provider,
-            "model":request.config.model, "effort":request.config.reasoning_effort.as_deref().unwrap_or("low"),
+            "model":request.config.model, "effort":request.config.reasoning_effort.as_deref().unwrap_or("default"),
             "session_id":session_id, "background":identity,
             "new_session_name":if reason.is_empty() { None } else { Some("Background") }
         }))?;

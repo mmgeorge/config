@@ -501,6 +501,7 @@ impl crate::provider::ProviderAdapter for MockProvider {
                 sink.send_wait(ProviderEvent::Tool {
                     address: address.clone(),
                     update: ToolUpdate::Requested { invocation: ToolInvocation {
+                        semantics: Default::default(),
                         kind: ToolActivityKind::ToolCall,
                         name: name.clone(),
                         title: name.clone(),
@@ -726,6 +727,7 @@ impl crate::provider::ProviderAdapter for MockProvider {
                 sink.send_wait(ProviderEvent::Tool {
                     address: address.clone(),
                     update: ToolUpdate::Requested { invocation: ToolInvocation {
+                    semantics: Default::default(),
                     kind: ToolActivityKind::ToolCall,
                     name: "mock-probe".into(),
                     title: "mock-probe".into(),
@@ -1261,7 +1263,18 @@ pub(crate) fn mock_plan_document_from_prompt(prompt: &str) -> Option<crate::plan
 /// Describe the synthetic provider used by isolated Harness workflow fixtures.
 pub(crate) fn mock_capability() -> ProviderCapability {
     ProviderCapability {
-        os_sandbox: ProviderKind::Mock.supports_sandbox(),
+        integration: ProviderIntegration {
+            background_generation: true,
+            isolated_generation: true,
+            terminal_termination: true,
+            native_agent_suppression: true,
+            mcp_runtime_status: true,
+            mcp_tool_catalog: true,
+            local_acceptance: true,
+            resource_target: Some("mock".into()),
+            ..Default::default()
+        },
+        os_sandbox: false,
         native_fork: true,
         native_compact: true,
         compaction: CompactionCapability {
@@ -1282,6 +1295,16 @@ pub(crate) fn mock_capability() -> ProviderCapability {
         approval_mode_list: vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow],
         agent: AgentCapability::default(),
         catalog: CatalogCapability::default(),
+    }
+}
+
+/// Resolve declared capabilities at the compiled-in provider registration boundary.
+pub fn registered_capability(kind: ProviderKind) -> ProviderCapability {
+    match kind {
+        ProviderKind::Codex => codex::capability(),
+        ProviderKind::Copilot => copilot::capability(),
+        ProviderKind::Claude | ProviderKind::Antigravity => acp::capability(kind),
+        ProviderKind::Mock => mock_capability(),
     }
 }
 
@@ -1320,22 +1343,32 @@ mod test {
             super::ProviderKind::Mock,
         ] {
             let requested = crate::session::AccessPolicy::default();
-            let effective = provider.resolve_access(requested.clone());
+            let effective =
+                crate::provider::registered_capability(provider).resolve_access(requested.clone());
             assert_eq!(
-                provider.supports_sandbox(),
+                crate::provider::registered_capability(provider).supports_sandbox(),
                 provider == super::ProviderKind::Codex
             );
-            assert_eq!(effective.sandbox, provider.supports_sandbox());
+            assert_eq!(
+                effective.sandbox,
+                crate::provider::registered_capability(provider).supports_sandbox()
+            );
             assert!(requested.sandbox);
             assert_eq!(effective.write_access, requested.write_access);
             assert_eq!(effective.writable_directory, requested.writable_directory);
-            assert_eq!(effective.windows_sandbox, requested.windows_sandbox);
-            provider.validate_access(&effective).unwrap();
+            assert_eq!(effective.isolation_mode, requested.isolation_mode);
+            crate::provider::registered_capability(provider)
+                .validate_access(&effective)
+                .unwrap();
             let disabled = crate::session::AccessPolicy {
                 sandbox: false,
                 ..requested
             };
-            assert!(!provider.resolve_access(disabled).sandbox);
+            assert!(
+                !crate::provider::registered_capability(provider)
+                    .resolve_access(disabled)
+                    .sandbox
+            );
         }
     }
 

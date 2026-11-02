@@ -17,6 +17,7 @@ fn output_exchange(text: &str) -> Result<(Exchange, ProviderEvent)> {
         &address,
         "call",
         ToolInvocation {
+            semantics: Default::default(),
             kind: ToolActivityKind::Command,
             name: "read".into(),
             title: "read".into(),

@@ -949,11 +949,7 @@ impl HarnessBroker {
                 .flat_map(|turn| interaction.tools_for_turn(turn.id()))
                 .filter(|tool| {
                     matches!(tool.state(), crate::turn::ToolState::Completed)
-                        && (matches!(tool.kind.as_str(), "command" | "shell" | "execute")
-                            || matches!(
-                                tool.title.split('(').next().unwrap_or("").trim(),
-                                "powershell" | "bash" | "shell" | "exec_command"
-                            ))
+                        && tool.kind == "command"
                 })
             {
                 let identity = crate::plan::digest(
