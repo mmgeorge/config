@@ -10,7 +10,7 @@ use forge_git::content::{ContentRequest, ContentResult, ContentSource, WorktreeC
 use forge_git::repository::RepositoryState;
 use forge_git::snapshot::{ChangeKind, PathState};
 use forge_git::store::RepositoryStore;
-use forge_harness::backend::TextGeneration;
+use forge_harness::provider::TextGeneration;
 
 use super::excerpt::ChangedFile;
 use super::{Comparison, GenerationRequest, excerpt};
@@ -302,7 +302,7 @@ pub async fn collect(
         };
         let limit = request.max_bytes.unwrap_or_else(|| {
             excerpt::MAX_INPUT_BYTES.saturating_sub(
-                forge_harness::backend::BACKGROUND_SYSTEM_MESSAGE.len()
+                forge_harness::provider::BACKGROUND_SYSTEM_MESSAGE.len()
                     + TextGeneration::CommitMessage.background_input("").len()
                     + header.len(),
             )

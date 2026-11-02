@@ -32,7 +32,7 @@ function M.request(snapshot, preferences, callback)
   local generation, failure = client.generation_get_config()
   if not generation then callback(nil, failure) return end
   local baseline = defaults()
-  baseline.models[generation.backend.kind] = baseline.models[generation.backend.kind]
+  baseline.models[generation.provider.kind] = baseline.models[generation.provider.kind]
     or { model = generation.model, thinking = generation.reasoning_effort, service_tier = generation.service_tier }
   client.request({ method = "background.settings", params = {
     data_root = generation.data_root, defaults = baseline,
@@ -50,10 +50,10 @@ function M.request(snapshot, preferences, callback)
 end
 
 ---@param snapshot ForgeBackgroundSettings
----@param backend string
+---@param provider string
 ---@return ForgeBackgroundModel
-function M.model(snapshot, backend)
-  return assert(snapshot.settings.models[backend],
+function M.model(snapshot, provider)
+  return assert(snapshot.settings.models[provider],
     "Background settings omitted the selected provider model")
 end
 

@@ -1,7 +1,7 @@
 vim.opt.runtimepath:prepend("nvim")
 vim.loader.enable(false)
 vim.o.columns = 130
-require("forge").setup({ harness = { backend = "mock" } })
+require("forge").setup({ harness = { provider = "mock" } })
 local picker = require("forge.views.picker")
 local approval = require("forge.views.harness.approval")
 local settings = require("forge.views.harness.settings")
@@ -31,7 +31,7 @@ local timer = instance.timer
 picker.close(false)
 assert(timer:is_closing(), "picker timer leaked")
 
-local configured = { id = "timeout-settings", backend = "mock", approval_timeout = { amount = 10, unit = "m" } }
+local configured = { id = "timeout-settings", provider = "mock", approval_timeout = { amount = 10, unit = "m" } }
 local state = { session = configured }
 local original_request, original_configure = client.request, controller.configure
 local saved = 0

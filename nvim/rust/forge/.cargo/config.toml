@@ -3,3 +3,5 @@ rustflags = ["-Zthreads=8"]
 
 [target.'cfg(all(target_os = "windows", target_env = "msvc"))']
 linker = "rust-lld"
+# Target rustflags replace build.rustflags, so retain the parallel frontend here.
+rustflags = ["-Zthreads=8", "-C", "link-arg=/DEBUG:NONE"]

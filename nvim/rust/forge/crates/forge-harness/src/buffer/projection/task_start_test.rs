@@ -1,6 +1,6 @@
 use super::*;
-use crate::backend::{ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
 use crate::exchange::{ExchangeOrigin, TaskStart};
+use crate::provider::{ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
 use crate::timeline::{SessionEventRecord, TimelineEvent, TimelineOwner};
 use serde_json::json;
 
@@ -221,7 +221,7 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
         let commentary = crate::turn::test_support::message(
             &address,
             "commentary",
-            Some(crate::backend::MessageRole::Commentary),
+            Some(crate::provider::MessageRole::Commentary),
             "Inspecting startup",
         );
         if !before_commentary {

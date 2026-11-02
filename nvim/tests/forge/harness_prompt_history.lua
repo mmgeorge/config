@@ -1,6 +1,6 @@
 vim.loader.enable(false)
 local state = require("forge.session").harness
-state.session = { id = "history-session", backend = "mock" }
+state.session = { id = "history-session", provider = "mock" }
 local history = require("forge.views.harness.prompt_history")
 local attachment = require("forge.views.harness.attachment")
 local snapshot = require("forge.views.harness.snapshot")

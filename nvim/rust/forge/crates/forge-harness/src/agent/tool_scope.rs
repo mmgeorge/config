@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{AgentCoordinator, AgentOperation, AgentRequest, AgentSource};
-use crate::backend::ExecutionOwner;
+use crate::provider::ExecutionOwner;
 
 /// Binds model tool authority to one authenticated root turn and parent exchange.
 pub struct AgentToolScope {

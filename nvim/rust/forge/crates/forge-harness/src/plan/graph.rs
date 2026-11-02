@@ -544,8 +544,8 @@ mod test {
     #[test]
     fn keeps_contract_targets_and_shared_concrete_entities_at_the_root() {
         let mut document = test_fixture("plan", "Overview");
-        let mut backend = entity("backend", "Backend", EntityKind::Trait);
-        backend.members = vec![member("load", None, &[], Some("ContractOutput"))];
+        let mut provider = entity("provider", "Provider", EntityKind::Trait);
+        provider.members = vec![member("load", None, &[], Some("ContractOutput"))];
         let contract_output = entity("contract_output", "ContractOutput", EntityKind::Struct);
         let shared_cache = entity("shared_cache", "SharedCache", EntityKind::Cache);
         let mut first_user = entity("first_user", "FirstUser", EntityKind::Struct);
@@ -553,7 +553,7 @@ mod test {
         let mut second_user = entity("second_user", "SecondUser", EntityKind::Struct);
         second_user.members = vec![member("cache", Some("&SharedCache"), &[], None)];
         document.entity_changes = vec![
-            backend,
+            provider,
             contract_output,
             shared_cache,
             first_user,
@@ -562,7 +562,7 @@ mod test {
 
         let graph = PlanGraph::new(&document);
 
-        assert_eq!(graph.presentation_parent("Backend"), None);
+        assert_eq!(graph.presentation_parent("Provider"), None);
         assert_eq!(graph.presentation_parent("ContractOutput"), None);
         assert_eq!(graph.presentation_parent("SharedCache"), None);
     }

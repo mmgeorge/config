@@ -20,7 +20,7 @@ local task = require("forge.views.harness.task")
 local errors, starts = {}, 0
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 client.session_events_subscribe(function(event, payload)
-  if event == "backend_event" and payload.kind == "execution_state" then starts = starts + 1 end
+  if event == "provider_event" and payload.kind == "execution_state" then starts = starts + 1 end
 end)
 local function await(predicate, message)
   assert(vim.wait(10000, function() return #errors > 0 or predicate() end, 10),
@@ -30,7 +30,7 @@ local function await(predicate, message)
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "blocking" } } } } })
+  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "blocking" } } } } })
   require("forge").open_harness()
   await(function() return state.ready and state.session end, "Harness did not open")
 

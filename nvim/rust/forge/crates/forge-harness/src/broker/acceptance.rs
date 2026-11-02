@@ -532,7 +532,7 @@ impl BrokerObserver {
         );
         if session.plan_compact {
             anyhow::ensure!(
-                metadata.capability.native_compact && session.backend_session_id.is_some(),
+                metadata.capability.native_compact && session.provider_session_id.is_some(),
                 "current session cannot compact before execution"
             );
         }
@@ -671,8 +671,8 @@ impl BrokerObserver {
                 .document
                 .verification
                 .clone(),
-            planning_backend_session_id: session.backend_session_id.clone(),
-            execution_backend_session_id: session.backend_session_id.clone(),
+            planning_provider_session_id: session.provider_session_id.clone(),
+            execution_provider_session_id: session.provider_session_id.clone(),
             lifecycle: Vec::new(),
             findings: Vec::new(),
             progress: Default::default(),

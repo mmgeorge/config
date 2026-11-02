@@ -1,6 +1,6 @@
 ---@module 'blink.cmp'
 ---@class ForgeHarnessCommandSource
----@field model_backend string?
+---@field model_provider string?
 ---@field model_list table[]?
 ---@field model_callback_list (fun(model_list: table[], failure: string?))[]
 local CommandSource = {}
@@ -18,7 +18,7 @@ local command_list = {
   { label = "/checks edit on", detail = "Enable check editing without sending a prompt" },
   { label = "/checks edit off", detail = "Disable check editing without sending a prompt" },
   { label = "/config", detail = "Configure Harness settings" },
-  { label = "/capabilities", detail = "Inspect supported and unsupported backend capabilities" },
+  { label = "/capabilities", detail = "Inspect supported and unsupported provider capabilities" },
   { label = "/log", detail = "Open the current session debug log" },
   { label = "/log open", detail = "Open the current session debug log" },
   { label = "/log on", detail = "Enable persistent Harness logging" },
@@ -45,7 +45,7 @@ local command_list = {
   { label = "/plan cancel", detail = "Cancel the active plan" },
   { label = "/sessions", detail = "Search, preview, resume, or delete a Harness session" },
   { label = "/undo", detail = "Roll back to an interaction and restore its prompt" },
-  { label = "/backend", detail = "Switch the Harness CLI backend" },
+  { label = "/provider", detail = "Switch the Harness CLI provider" },
   { label = "/skills", detail = "Browse and configure provider skills", capability = "skill_catalog" },
   { label = "/mcp", detail = "Browse and configure MCP servers", capability = "mcp_catalog" },
   { label = "/questions", detail = "Reopen pending planning questions" },
@@ -66,9 +66,9 @@ local command_list = {
   { label = "/fork", detail = "Fork the current session with provider-owned context", capability = "native_fork" },
   { label = "/rename", detail = "Generate a short session name, or set an explicit name" },
   { label = "/effort", detail = "Select reasoning effort", capability = "effort_selection" },
-  { label = "/model", detail = "Select the backend model", capability = "model_selection" },
-  { label = "/fast", detail = "Toggle backend fast mode", capability = "fast_mode" },
-  { label = "/ultrafast", detail = "Toggle backend ultrafast mode", capability = "ultrafast_mode" },
+  { label = "/model", detail = "Select the provider model", capability = "model_selection" },
+  { label = "/fast", detail = "Toggle provider fast mode", capability = "fast_mode" },
+  { label = "/ultrafast", detail = "Toggle provider ultrafast mode", capability = "ultrafast_mode" },
 }
 
 ---@param text string
@@ -119,7 +119,7 @@ end
 ---@return ForgeHarnessCommandSource
 function CommandSource.new()
   return setmetatable({
-    model_backend = nil,
+    model_provider = nil,
     model_list = nil,
     model_callback_list = {},
   }, { __index = CommandSource })
@@ -179,7 +179,7 @@ end
 
 ---@param callback fun(model_list: table[])
 function CommandSource:request_model_list(callback)
-  local backend = session.harness.session and session.harness.session.backend or "active"
+  local provider = session.harness.session and session.harness.session.provider or "active"
   local state = session.harness
   local session_id = state.session and state.session.id
   local function deliver(model_list, model_error)
@@ -191,18 +191,18 @@ function CommandSource:request_model_list(callback)
         return
       end
       if session.harness ~= state or not state.session or state.session.id ~= session_id
-        or state.session.backend ~= backend then callback({}) return end
-      callback(model_order.order(model_list, backend, pinned_id_set))
+        or state.session.provider ~= provider then callback({}) return end
+      callback(model_order.order(model_list, provider, pinned_id_set))
     end
-    local pinned_id_set = model_pins.get(backend)
-    if pinned_id_set then ordered(pinned_id_set) else model_pins.refresh(backend, ordered) end
+    local pinned_id_set = model_pins.get(provider)
+    if pinned_id_set then ordered(pinned_id_set) else model_pins.refresh(provider, ordered) end
   end
-  if session.harness.model_backend == backend and type(session.harness.model_list) == "table" then
+  if session.harness.model_provider == provider and type(session.harness.model_list) == "table" then
     deliver(session.harness.model_list)
     return
   end
-  if self.model_backend ~= backend then
-    self.model_backend = backend
+  if self.model_provider ~= provider then
+    self.model_provider = provider
     self.model_list = nil
     self.model_callback_list = {}
   end
@@ -221,12 +221,12 @@ function CommandSource:request_model_list(callback)
       for _, pending_callback in ipairs(callback_list) do pending_callback({}, request_error) end
       return
     end
-    if session.harness ~= state or not state.session or state.session.id ~= session_id or state.session.backend ~= backend then
+    if session.harness ~= state or not state.session or state.session.id ~= session_id or state.session.provider ~= provider then
       for _, pending_callback in ipairs(callback_list) do pending_callback({}, "stale model catalog") end
       return
     end
     self.model_list = type(model_list) == "table" and model_list or {}
-    session.harness.model_backend = backend
+    session.harness.model_provider = provider
     session.harness.model_list = vim.deepcopy(self.model_list)
     for _, pending_callback in ipairs(callback_list) do pending_callback(self.model_list) end
   end)
@@ -336,7 +336,7 @@ function CommandSource:get_completions(_, callback)
       for index, model in ipairs(model_list or {}) do
         model_completion_list[#model_completion_list + 1] = value_completion(
           model.id,
-          model.description or model.label or "Backend model",
+          model.description or model.label or "Provider model",
           row,
           model_start - 1,
           cursor_column

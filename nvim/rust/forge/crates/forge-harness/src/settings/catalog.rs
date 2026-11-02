@@ -1,4 +1,4 @@
-use crate::backend::ResourceScope;
+use crate::provider::ResourceScope;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -489,7 +489,7 @@ mod test {
                 .unwrap();
         assert_eq!(skill.len(), 1);
         assert_eq!(skill[0].name, "harness-checks");
-        assert_eq!(skill[0].scope, Some(crate::backend::ResourceScope::Global));
+        assert_eq!(skill[0].scope, Some(crate::provider::ResourceScope::Global));
         assert!(skill[0].user_invocable);
         assert!(skill[0].description.contains("check_definition_edit"));
         for target in ["codexcli", "copilotcli", "claudecode", "antigravity-cli"] {

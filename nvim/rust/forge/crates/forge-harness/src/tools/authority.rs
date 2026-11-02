@@ -44,7 +44,7 @@ mod test {
         let (_root, mut store, controller) = SessionTaskController::test_goal();
         let task = controller.current()?.unwrap();
         let mut context = super::super::ControlTurnContext::inactive(
-            crate::backend::PromptMode::GoalContinuation,
+            crate::provider::PromptMode::GoalContinuation,
         );
         context.task_controller = Some(controller.clone());
         context.task_permit = Some(task.permit());

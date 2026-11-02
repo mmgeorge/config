@@ -6,7 +6,7 @@ This chapter follows a plan from authoring through acceptance and execution. [Pl
 
 ## Prompts
 
-Three files define what the model is told. `plan/prompts/planning.md` introduces semantic structure and the authoring workflow; the planning tools describe file patch syntax and overview fields. `plan/prompts/system.md` introduces the Harness environment. `backend/prompt.rs` adds the current permission and interaction purpose for each request.
+Three files define what the model is told. `plan/prompts/planning.md` introduces semantic structure and the authoring workflow; the planning tools describe file patch syntax and overview fields. `plan/prompts/system.md` introduces the Harness environment. `provider/prompt.rs` adds the current permission and interaction purpose for each request.
 
 ## Plan documents
 

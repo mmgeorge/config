@@ -27,7 +27,7 @@ pub fn transient_observation_failure(failure: &anyhow::Error) -> bool {
     failure.chain().any(|cause| {
         matches!(
             cause.to_string().as_str(),
-            "status backend changed during observation"
+            "status provider changed during observation"
                 | "status changed during observation"
                 | "worktree metadata changed during observation"
                 | "rename origin changed during observation"
@@ -85,7 +85,7 @@ pub struct RepositorySnapshot {
     pub worktree: crate::WorktreeId,
     pub head: crate::snapshot::HeadState,
     pub index: crate::snapshot::IndexStamp,
-    pub backend: crate::reader::StatusBackend,
+    pub provider: crate::reader::StatusProvider,
     pub path: Vec<crate::snapshot::ObservedPath>,
     pub timing: ObservationTiming,
 }
@@ -204,7 +204,7 @@ impl RepositoryState {
                         worktree: snapshot.worktree,
                         head: snapshot.head,
                         index: snapshot.index,
-                        backend: snapshot.backend,
+                        provider: snapshot.provider,
                         path: snapshot.path,
                     },
                 })?;
@@ -315,7 +315,7 @@ impl RepositoryState {
                             .context("snapshot lost worktree identity")?,
                         head: collected.head,
                         index: collected.index,
-                        backend: collected.backend,
+                        provider: collected.provider,
                         path: collected.path,
                         timing: collected.timing,
                     })
@@ -393,7 +393,7 @@ pub struct RepositoryRead<Output> {
 mod tests {
     use super::*;
     use crate::{
-        reader::StatusBackend,
+        reader::StatusProvider,
         snapshot::{HeadState, IndexStamp},
         test_support::git,
     };
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn observation_retry_classifies_only_concurrent_repository_changes() {
         for message in [
-            "status backend changed during observation",
+            "status provider changed during observation",
             "status changed during observation",
             "worktree metadata changed during observation",
             "rename origin changed during observation",
@@ -578,7 +578,7 @@ mod tests {
                     index: None,
                     shared: Vec::new(),
                 },
-                backend: StatusBackend::Gix,
+                provider: StatusProvider::Gix,
                 path: Vec::new(),
             },
         }

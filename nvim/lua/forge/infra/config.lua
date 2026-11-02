@@ -146,7 +146,7 @@
 ---@field plan_review ForgePlanReviewKeymapConfig
 ---@field picker ForgePickerKeymapConfig
 
----@class ForgeHarnessBackendConfig
+---@class ForgeHarnessProviderConfig
 ---@field command string[]
 ---@field label string
 ---@field detail string
@@ -154,7 +154,7 @@
 
 ---@class ForgeHarnessConfig
 ---@field config_dir? string
----@field backend "codex"|"copilot"|"mock"
+---@field provider "codex"|"copilot"|"mock"
 ---@field model string
 ---@field effort string
 ---@field buffer_name string
@@ -163,7 +163,7 @@
 ---@field composer_max_height integer
 ---@field goal_max_turns integer
 ---@field non_git_write_confirm boolean
----@field backends table<string, ForgeHarnessBackendConfig>
+---@field providers table<string, ForgeHarnessProviderConfig>
 
 ---@class ForgePickerConfig
 ---@field choice_keys string[]
@@ -229,7 +229,7 @@ M.defaults = {
   walkthrough_inventory = "sem",
   branch_prefix = "matt9222/",
   harness = {
-    backend = "codex",
+    provider = "codex",
     model = "default",
     effort = "medium",
     buffer_name = "ForgeHarness",
@@ -238,7 +238,7 @@ M.defaults = {
     composer_max_height = 12,
     goal_max_turns = 20,
     non_git_write_confirm = true,
-    backends = {
+    providers = {
       codex = {
         command = { "codex", "app-server" },
         label = "Codex CLI",
@@ -262,7 +262,7 @@ M.defaults = {
       mock = {
         command = { "mock" },
         label = "Mock",
-        detail = "Harness test backend",
+        detail = "Harness test provider",
         selectable = false,
       },
     },
@@ -400,6 +400,13 @@ M.options = vim.deepcopy(M.defaults)
 ---@param opts? ForgeConfig
 ---@return ForgeConfig
 function M.setup(opts)
+  if opts and type(opts.harness) == "table" then
+    opts = vim.deepcopy(opts)
+    opts.harness.provider = opts.harness.provider or opts.harness.backend
+    opts.harness.providers = opts.harness.providers or opts.harness.backends
+    opts.harness.backend = nil
+    opts.harness.backends = nil
+  end
   local function merge(default, override)
     if override == nil then return vim.deepcopy(default) end
     if type(default) ~= "table" or type(override) ~= "table" then return vim.deepcopy(override) end
@@ -455,8 +462,8 @@ function M.setup(opts)
   if options.walkthrough_inventory ~= "sem" and options.walkthrough_inventory ~= false then
     error('walkthrough_inventory must be "sem" or false')
   end
-  if not options.harness.backends[options.harness.backend] then
-    error("harness.backend must name a configured harness backend")
+  if not options.harness.providers[options.harness.provider] then
+    error("harness.provider must name a configured harness provider")
   end
   local question_key_set = {}
   for _, key in ipairs(options.picker.choice_keys or {}) do
@@ -468,7 +475,7 @@ function M.setup(opts)
   end
   if vim.tbl_isempty(question_key_set) then error("picker.choice_keys cannot be empty") end
   M.options = options
-  M.harness_backend_explicit = opts ~= nil and opts.harness ~= nil and opts.harness.backend ~= nil
+  M.harness_provider_explicit = opts ~= nil and opts.harness ~= nil and opts.harness.provider ~= nil
   return M.options
 end
 

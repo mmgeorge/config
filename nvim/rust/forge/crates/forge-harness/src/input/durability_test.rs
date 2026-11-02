@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::submission::{SubmissionStore, SubmissionTarget};
+use crate::provider::submission::{SubmissionStore, SubmissionTarget};
 
 #[derive(Clone, Copy, Debug)]
 enum DispatchCut {
@@ -198,24 +198,24 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
             .claim("message", 1, InputRoute::Turn)?
             .context("claim failed")?;
         if !matches!(boundary, DispatchCut::NoSubmission) {
-            let request = crate::backend::BackendRequest {
+            let request = crate::provider::ProviderRequest {
                 execution_owner: None,
                 harness_session_id: "session".into(),
                 workspace: "workspace".into(),
-                input: crate::backend::BackendInput::from_text("draft message"),
-                mode: crate::backend::PromptMode::Chat,
+                input: crate::provider::ProviderInput::from_text("draft message"),
+                mode: crate::provider::PromptMode::Chat,
                 model: "fixture".into(),
                 effort: "low".into(),
                 context_window: None,
                 service_tier: Default::default(),
                 access: Default::default(),
                 approval_mode: crate::session::ApprovalMode::Ask,
-                backend_session_id: None,
+                provider_session_id: None,
                 submission: None,
                 recovered_input: Vec::new(),
                 control_context: None,
             };
-            let submission = submissions.prepare(&request, crate::backend::BackendKind::Codex)?;
+            let submission = submissions.prepare(&request, crate::provider::ProviderKind::Codex)?;
             if matches!(boundary, DispatchCut::Sending | DispatchCut::Accepted) {
                 submission.sending(SubmissionTarget::Codex {
                     thread_id: "thread".into(),

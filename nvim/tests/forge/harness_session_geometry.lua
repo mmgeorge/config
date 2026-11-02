@@ -52,7 +52,7 @@ local function create_session(id)
   state.ready = true
   queue_by_session[id] = { { id = id .. "-queued", revision = 1, text = id .. " queued input", attachments = {},
     purpose = { kind = "user" }, intent = "queue", delivery = "queued" } }
-  navigation.complete_pending(pending, { session = { id = id, backend = "mock", model = "mock", approval_mode = "ask" } })
+  navigation.complete_pending(pending, { session = { id = id, provider = "mock", model = "mock", approval_mode = "ask" } })
   settled(state)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { id .. " draft", "λ" })
   return state

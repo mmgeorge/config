@@ -24,7 +24,7 @@ local function turn_content(id, text, duration_ms)
 end
 
 local ok, failure = pcall(function()
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   local renderer = require("forge.render.harness.interaction_tree")
   local result = renderer.build({ {
     kind = "plan_execution",

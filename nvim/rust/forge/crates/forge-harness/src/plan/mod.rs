@@ -392,11 +392,11 @@ pub struct PlanAcceptance {
 }
 
 impl PlanAcceptance {
-    /// Build acceptance questions from the execution modes exposed by the active backend.
+    /// Build acceptance questions from the execution modes exposed by the active provider.
     pub fn new(review_digest: String, approval_mode_list: &[ApprovalMode]) -> Result<Self> {
         anyhow::ensure!(
             !approval_mode_list.is_empty(),
-            "the active backend exposes no execution mode"
+            "the active provider exposes no execution mode"
         );
         let mut question_list = Vec::new();
         if !approval_mode_list.is_empty() {

@@ -36,7 +36,8 @@ impl HarnessBroker {
                 change.apply(
                     &mut access,
                     &mut permission,
-                    crate::backend::BackendKind::parse(&self.session.backend)?.supports_sandbox(),
+                    crate::provider::ProviderKind::parse(&self.session.provider)?
+                        .supports_sandbox(),
                 );
             }
             if matches!(
@@ -49,7 +50,7 @@ impl HarnessBroker {
                     .get(
                         &self.session.workspace,
                         &self.session.id,
-                        &self.session.backend,
+                        &self.session.provider,
                     )?
                     .desired
                     .access
@@ -107,7 +108,7 @@ impl HarnessBroker {
             let snapshot = settings.get(
                 &self.session.workspace,
                 &self.session.id,
-                &self.session.backend,
+                &self.session.provider,
             )?;
             anyhow::ensure!(
                 snapshot.revision == revision,
@@ -122,7 +123,7 @@ impl HarnessBroker {
             settings.confirm_application(&self.session.id, operation, revision, effective)?;
         }
         if command == ConfigurationCommand::Configure {
-            let request = self.backend_catalog_request();
+            let request = self.provider_catalog_request();
             self.notify_unavailable_mcp(&request, &mut Vec::new())
                 .await?;
         }
@@ -131,7 +132,7 @@ impl HarnessBroker {
                 session: Box::new(self.session_view()?),
                 access_abbreviation: self.session.access.abbreviation().into(),
                 operation_id: self.active_operation_id.clone(),
-                catalog: Box::new(self.backend_catalog_request()),
+                catalog: Box::new(self.provider_catalog_request()),
             },
             &mut Vec::new(),
         )

@@ -1,6 +1,6 @@
-use forge_harness::backend::BackendLaunch;
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::permissions::store::PermissionStore;
+use forge_harness::provider::ProviderLaunch;
 use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
 use serde_json::json;
@@ -34,7 +34,7 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
     );
     let broker = HarnessBroker::initialize(InitializeRequest {
         background: None,
-        backend_launch_by_provider: Default::default(),
+        provider_launch_by_provider: Default::default(),
         config_dir: None,
         data_root: temporary.path().join("data").to_string_lossy().into_owned(),
         permission_file: Some(
@@ -46,7 +46,7 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
         ),
         workspace: workspace.to_string_lossy().into_owned(),
         client_id: "permission-test".into(),
-        backend: BackendLaunch {
+        provider: ProviderLaunch {
             kind: "mock".into(),
             command: vec!["mock".into()],
         },

@@ -1,7 +1,7 @@
 --- Collects authoritative path-scoped Git status and preview metadata for status rendering,
 --- keeping every replacement source in one atomic snapshot.
 
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 local git_data = require("forge.git.git_data")
 local paths = require("forge.infra.paths")
 local untracked_read_limit = 16
@@ -331,11 +331,11 @@ local function snapshot_command_by_source(root, path_list)
   }
   append_path_list(status_command, path_list)
 
-  local unstaged_command = git_backend.git_diff_command(root, { "--diff-filter=MRC" })
+  local unstaged_command = git_provider.git_diff_command(root, { "--diff-filter=MRC" })
   table.insert(unstaged_command, 2, "--no-optional-locks")
   append_path_list(unstaged_command, path_list)
 
-  local staged_command = git_backend.git_diff_command(root, { "--cached", "--diff-filter=MRC" })
+  local staged_command = git_provider.git_diff_command(root, { "--cached", "--diff-filter=MRC" })
   table.insert(staged_command, 2, "--no-optional-locks")
   append_path_list(staged_command, path_list)
 
@@ -868,7 +868,7 @@ local function command_failure(source, command, result)
   local stdout = tostring(result.stdout or "")
   local stderr = tostring(result.stderr or "")
   local output = tostring(result.output or "")
-  if output == "" then output = git_backend.system_output(stdout, stderr) end
+  if output == "" then output = git_provider.system_output(stdout, stderr) end
   local message = vim.trim(stderr)
   if message == "" then message = vim.trim(output) end
   if message == "" then message = ("git exited with code %d"):format(result.code or -1) end
@@ -975,7 +975,7 @@ function M.collect_async(root, path_list, callback)
     "unstaged_added_numstat",
     "staged_added_numstat",
   }) do
-    git_backend.system_text_async(command_by_source[source], nil, function(result)
+    git_provider.system_text_async(command_by_source[source], nil, function(result)
       finish(source, result)
     end)
   end

@@ -20,7 +20,7 @@ pub(super) fn definition() -> ControlToolDefinition {
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    output: crate::backend::BackendCompletion,
+    output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     runtime.require_readable_plan()?;
     let document = runtime
@@ -68,7 +68,7 @@ struct ExecutionOverview<'a> {
 /// Decode the tool's replayable completion fields.
 pub(super) fn record(
     invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::backend::BackendCompletion,
+    output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
     output.plan_read = invocation
         .arguments

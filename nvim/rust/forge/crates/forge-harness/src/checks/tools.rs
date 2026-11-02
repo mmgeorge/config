@@ -1,6 +1,6 @@
 use super::{CheckConfig, CheckSupervisor, ConfigSnapshot, RunRequest};
 use crate::{
-    backend::{BackendEventSink, PromptMode},
+    provider::{PromptMode, ProviderEventSink},
     session::{ApprovalMode, CheckShell},
 };
 use anyhow::{Context, Result, ensure};
@@ -51,13 +51,13 @@ pub(crate) struct ConfigureChecks {
 pub(crate) struct CheckToolScope {
     runner: Arc<CheckSupervisor>,
     data_root: PathBuf,
-    backend: String,
+    provider: String,
     task_id: Option<String>,
     shell: CheckShell,
     mode: PromptMode,
     permission: ApprovalMode,
-    permissions: Arc<crate::backend::approval::PermissionCoordinator>,
-    scope: crate::backend::InvocationScope,
+    permissions: Arc<crate::provider::approval::PermissionCoordinator>,
+    scope: crate::provider::InvocationScope,
     editing: Arc<AtomicBool>,
     setup: bool,
     can_run: bool,
@@ -68,21 +68,21 @@ pub(crate) struct CheckToolScope {
 
 #[derive(Clone)]
 struct CheckDelivery {
-    authorization: BackendEventSink,
+    authorization: ProviderEventSink,
     lifecycle: Option<crate::broker::publication::SessionUpdateSink>,
 }
 
 /// Binds check operations to the live root turn and its setup/write authority.
 pub(crate) struct CheckAuthority {
     pub data_root: PathBuf,
-    pub backend: String,
+    pub provider: String,
     pub task_id: Option<String>,
     pub shell: CheckShell,
     pub mode: PromptMode,
     pub permission: ApprovalMode,
-    pub permissions: Arc<crate::backend::approval::PermissionCoordinator>,
-    pub scope: crate::backend::InvocationScope,
-    pub authorization_sink: BackendEventSink,
+    pub permissions: Arc<crate::provider::approval::PermissionCoordinator>,
+    pub scope: crate::provider::InvocationScope,
+    pub authorization_sink: ProviderEventSink,
     pub editing: Arc<AtomicBool>,
     pub setup: bool,
     pub can_run: bool,
@@ -119,7 +119,7 @@ impl CheckToolScope {
     ) -> (Arc<Self>, CheckToolLease) {
         let CheckAuthority {
             data_root,
-            backend,
+            provider,
             task_id,
             shell,
             mode,
@@ -137,7 +137,7 @@ impl CheckToolScope {
         let scope = Arc::new(Self {
             runner,
             data_root,
-            backend,
+            provider,
             task_id,
             shell,
             mode,
@@ -177,7 +177,7 @@ impl CheckToolScope {
                     .get(
                         &self.runner.workspace.to_string_lossy(),
                         self.scope.owner.session_id.as_str(),
-                        &self.backend,
+                        &self.provider,
                     )?
                     .desired;
                 let mut definitions = super::response::definitions(&self.runner.workspace)?;
@@ -270,7 +270,7 @@ impl CheckToolScope {
                         )
                         .await?;
                     ensure!(
-                        resolution == crate::backend::approval::ApprovalResolution::AllowOnce,
+                        resolution == crate::provider::approval::ApprovalResolution::AllowOnce,
                         "check configuration update was not approved"
                     );
                 }
@@ -360,7 +360,7 @@ impl CheckToolScope {
         &self,
         mode: ApprovalMode,
         target_list: Vec<crate::permissions::matcher::PermissionTarget>,
-        authorization: &BackendEventSink,
+        authorization: &ProviderEventSink,
     ) -> Result<()> {
         if target_list.is_empty() {
             return Ok(());
@@ -382,9 +382,9 @@ impl CheckToolScope {
         ensure!(
             matches!(
                 resolution,
-                crate::backend::approval::ApprovalResolution::AllowOnce
-                    | crate::backend::approval::ApprovalResolution::AllowExact
-                    | crate::backend::approval::ApprovalResolution::AllowBroad
+                crate::provider::approval::ApprovalResolution::AllowOnce
+                    | crate::provider::approval::ApprovalResolution::AllowExact
+                    | crate::provider::approval::ApprovalResolution::AllowBroad
             ),
             "check operation was not authorized"
         );

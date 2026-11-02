@@ -41,8 +41,8 @@ impl ResourceProfile {
         Ok(profile)
     }
 
-    fn create(root: &Path, backend: &str) -> Result<Self> {
-        let root = root.join("provider-runtime").join(backend);
+    fn create(root: &Path, provider: &str) -> Result<Self> {
+        let root = root.join("provider-runtime").join(provider);
         std::fs::create_dir_all(&root)?;
         let directory = tempfile::Builder::new()
             .prefix("session-")

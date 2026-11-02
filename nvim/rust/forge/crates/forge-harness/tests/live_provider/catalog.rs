@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use forge_harness::backend::approval::PermissionCoordinator;
-use forge_harness::backend::codex::CodexBackend;
-use forge_harness::backend::copilot::CopilotBackend;
-use forge_harness::backend::{Backend, BackendInput, McpStatus};
+use forge_harness::provider::ProviderAdapter as _;
+use forge_harness::provider::approval::PermissionCoordinator;
+use forge_harness::provider::codex::CodexProvider;
+use forge_harness::provider::copilot::CopilotProvider;
+use forge_harness::provider::{McpStatus, ProviderInput};
 use forge_harness::trace::TraceStore;
 use serde_json::json;
 use std::sync::Arc;
@@ -12,13 +13,13 @@ use std::time::Duration;
 #[ignore = "requires installed authenticated Codex and configured MCP servers"]
 async fn live_mcp_catalog() {
     let workspace = tempfile::tempdir().unwrap();
-    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        backend.mcp_list(super::catalog_request(workspace.path(), "mcp-catalog-test")),
+        provider.mcp_list(super::catalog_request(workspace.path(), "mcp-catalog-test")),
     )
     .await;
-    backend.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
     result.expect("MCP inventory exceeded 30 seconds").unwrap();
 }
 
@@ -26,23 +27,23 @@ async fn live_mcp_catalog() {
 #[ignore = "requires the pinned authenticated Copilot CLI to list models without a model turn"]
 async fn default_cli_resolution_starts_and_collects_without_a_session() {
     let workspace = tempfile::tempdir().unwrap();
-    let backend = CopilotBackend::new(Vec::new()).unwrap();
+    let provider = CopilotProvider::new(Vec::new()).unwrap();
     let request = super::catalog_request(workspace.path(), "copilot-startup");
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        backend.model_list(super::prompt_request(&request)),
+        provider.model_list(super::prompt_request(&request)),
     )
     .await;
-    backend.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
     assert!(
         !result
             .expect("Copilot model list timed out")
             .unwrap()
             .is_empty()
     );
-    assert_eq!(backend.client_start_count(), 1);
+    assert_eq!(provider.client_start_count(), 1);
     assert!(
-        backend
+        provider
             .active_session_id_for(&request.harness_session_id)
             .await
             .is_none(),
@@ -88,7 +89,7 @@ end
     forge_harness::settings::SettingsStore::open(fixture.path())?
         .configure_catalog(fixture.path())?;
     let workspace = fixture.path().to_string_lossy().into_owned();
-    let backend = CodexBackend::new_with_permission_coordinator(
+    let provider = CodexProvider::new_with_permission_coordinator(
         vec!["codex".into(), "app-server".into()],
         PermissionCoordinator::transient(&workspace)?,
         Arc::new(TraceStore::open(fixture.path())?),
@@ -96,7 +97,7 @@ end
     )?;
     let mut request = super::catalog_request(fixture.path(), "mcp-terminal-smoke");
     let mut settings = forge_harness::settings::SettingsStore::open(fixture.path())?;
-    let configuration = backend.mcp_configuration(request.clone()).await?;
+    let configuration = provider.mcp_configuration(request.clone()).await?;
     let snapshot = settings.get(&request.workspace, &request.harness_session_id, "codex")?;
     let mut desired = snapshot.desired;
     let missing = configuration
@@ -117,19 +118,24 @@ end
     )?;
     drop(settings);
     let outcome = tokio::time::timeout(Duration::from_secs(60), async {
-        backend
+        provider
             .reconcile_settings(request.clone(), &desired)
             .await?;
         let mut prompt = super::prompt_request(&request);
-        prompt.input = BackendInput::from_text("Reply OK. Do not use tools or change files.");
+        prompt.input = ProviderInput::from_text("Reply OK. Do not use tools or change files.");
         prompt.effort = "low".into();
         anyhow::ensure!(
-            !backend.model_list(prompt.clone()).await?.is_empty(),
+            !provider.model_list(prompt.clone()).await?.is_empty(),
             "model catalog missing"
         );
-        request.backend_session_id = backend.prompt(prompt).await?.completion.backend_session_id;
+        request.provider_session_id = provider
+            .prompt(prompt)
+            .await?
+            .completion
+            .native
+            .provider_session_id;
         for _ in 0..2 {
-            let servers = backend.mcp_list(request.clone()).await?;
+            let servers = provider.mcp_list(request.clone()).await?;
             let unavailable = servers
                 .iter()
                 .find(|server| server.name == "missing")
@@ -158,15 +164,15 @@ end
                 server.tools.iter().any(|tool| tool.name == "ready"),
                 "fixture tool missing"
             );
-            backend.background_terminals(request.clone()).await?;
-            backend
+            provider.background_terminals(request.clone()).await?;
+            provider
                 .reconcile_settings(request.clone(), &Default::default())
                 .await?;
         }
         Ok::<_, anyhow::Error>(())
     })
     .await;
-    backend.shutdown().await?;
+    provider.shutdown().await?;
     outcome.context("live MCP smoke test timed out")??;
     Ok(())
 }

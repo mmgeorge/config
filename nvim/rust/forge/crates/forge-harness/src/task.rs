@@ -106,18 +106,6 @@ pub struct PermissionSelection {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-/// Identifies the workflow independently of its permission boundary.
-pub enum TaskKind {
-    /// Creates a reviewable design.
-    Plan,
-    /// Implements an accepted design through its verification gates.
-    Execute,
-    /// Continues toward an explicit objective.
-    Goal,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 /// Records whether a workflow can admit another attempt.
 pub enum TaskStatus {
     /// Persisted before its first attempt starts.
@@ -310,3 +298,5 @@ mod test {
         }
     }
 }
+
+pub use forge_provider_api::input::TaskKind;

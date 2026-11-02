@@ -1,10 +1,10 @@
 use super::*;
 use crate::{
-    backend::{BackendEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolUpdate},
     exchange::{Exchange, ExchangeState},
+    provider::{ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolUpdate},
 };
 
-fn output_exchange(text: &str) -> Result<(Exchange, BackendEvent)> {
+fn output_exchange(text: &str) -> Result<(Exchange, ProviderEvent)> {
     let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
         "id":"output","session_id":"session","agent_id":"session:agent:primary","ordinal":1,
         "prompt":"run","kind":"chat","state":"running","turn":[],"node_list":[],"created_at_ms":1,
@@ -25,8 +25,8 @@ fn output_exchange(text: &str) -> Result<(Exchange, BackendEvent)> {
         [ToolUpdate::Started],
         2,
     )?;
-    let event = BackendEvent::Tool {
-        address: crate::backend::ToolAddress {
+    let event = ProviderEvent::Tool {
+        address: crate::provider::ToolAddress {
             turn: address,
             tool_id: "call".into(),
         },
@@ -60,7 +60,7 @@ fn output_saves_pages_and_migration_preserve_content_without_history_reads() -> 
     store
         .connection
         .execute_batch("DROP TRIGGER no_output_rewrite")?;
-    if let BackendEvent::Tool { update, .. } = &mut event {
+    if let ProviderEvent::Tool { update, .. } = &mut event {
         *update = ToolUpdate::Output {
             update: TextUpdate::Append("追加🙂".into()),
         };
@@ -343,7 +343,7 @@ fn legacy_empty_output_can_append_after_migration() -> Result<()> {
     store.connection.execute_batch("DELETE FROM tool_output_owner; UPDATE exchange_record SET payload=json_remove(payload,'$.tool_output_format'); PRAGMA user_version=0;")?;
     drop(store);
     let mut store = SqliteStore::open(root.path())?;
-    if let BackendEvent::Tool { update, .. } = &mut event {
+    if let ProviderEvent::Tool { update, .. } = &mut event {
         *update = ToolUpdate::Output {
             update: TextUpdate::Append("first λ".into()),
         };

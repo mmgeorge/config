@@ -16,7 +16,7 @@ use crate::{
 pub struct RevisionId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RevisionBackend {
+pub enum RevisionProvider {
     Gix,
 }
 
@@ -26,7 +26,7 @@ pub struct RevisionCandidates {
     pub revision: RevisionId,
     pub generation: RepositoryGeneration,
     pub storage: GitStorageId,
-    pub backend: RevisionBackend,
+    pub provider: RevisionProvider,
     pub reference_digest: String,
     pub values: Vec<Vec<u8>>,
     pub retained_bytes: usize,
@@ -87,7 +87,7 @@ impl RepositoryState {
                         revision: request.revision,
                         generation: request.generation,
                         storage: worker.identity.storage.clone(),
-                        backend: RevisionBackend::Gix,
+                        provider: RevisionProvider::Gix,
                         reference_digest: format!("{:064x}", request.revision.0),
                         values: candidates.values,
                         retained_bytes: candidates.retained_bytes,
@@ -447,7 +447,7 @@ mod tests {
                 revision: request.revision,
                 generation: request.generation,
                 storage: repository.identity.storage.clone(),
-                backend: RevisionBackend::Gix,
+                provider: RevisionProvider::Gix,
                 reference_digest: format!("{:064x}", request.revision.0),
                 values: Vec::new(),
                 retained_bytes: 0,

@@ -96,7 +96,7 @@ local ok, failure = xpcall(function()
   assert(table.concat(write_order, ",") == "host.initialize,host.transport.consumed,repository.status.document,host.transport.consumed",
     "first application request bypassed initialization response credit")
   client._host_reset_for_test()
-  require("forge").setup({ harness = { backend = "mock" }, harness_logging = false })
+  require("forge").setup({ harness = { provider = "mock" }, harness_logging = false })
   builder.ensure = function(done) done({ ok = true, path = "admission-fixture" }) end
   client._host_set_launcher_for_test(function(_, options)
     return {

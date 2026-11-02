@@ -29,7 +29,7 @@ end
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = true,
-    harness_log_path = data .. "/ui-perf.log", harness = { backend = "mock" } })
+    harness_log_path = data .. "/ui-perf.log", harness = { provider = "mock" } })
   require("forge.views.harness").open()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan build the feature" })

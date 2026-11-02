@@ -31,7 +31,7 @@ pub(crate) fn is_tool(name: &str) -> bool {
 pub(in crate::tools) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    output: crate::backend::BackendCompletion,
+    output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     match invocation.name.as_str() {
         super::spawn::NAME => super::spawn::execute(runtime, invocation, output).await,
@@ -48,7 +48,7 @@ pub(in crate::tools) async fn execute(
 /// Record agents completion fields for provider-neutral replay.
 pub(in crate::tools) fn record(
     invocation: &crate::tools::ControlToolInvocation,
-    _output: &mut crate::backend::BackendCompletion,
+    _output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
     let _ = invocation;
     Ok(())

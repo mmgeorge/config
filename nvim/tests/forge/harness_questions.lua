@@ -2,7 +2,7 @@ vim.opt.runtimepath:prepend("nvim")
 vim.loader.enable(false)
 vim.o.columns = 120
 vim.o.lines = 45
-require("forge").setup({ harness = { backend = "mock" } })
+require("forge").setup({ harness = { provider = "mock" } })
 local questions = require("forge.views.harness.questions")
 local picker = require("forge.views.picker")
 local client = require("forge.client")

@@ -129,7 +129,7 @@ end
 ---@class ForgeHarnessModelPickerOptions
 ---@field host table
 ---@field model_list ForgeHarnessModel[]
----@field backend? string
+---@field provider? string
 ---@field current_model? string
 ---@field is_current? fun(): boolean
 ---@field on_close? fun()
@@ -138,9 +138,9 @@ end
 ---@param options ForgeHarnessModelPickerOptions
 function ModelPicker.open(options)
   local source_model_list = vim.deepcopy(options.model_list)
-  local backend = options.backend or "codex"
-  local pinned_id_set = model_pins.get(backend) or {}
-  local model_list = model_order.order(source_model_list, backend, pinned_id_set)
+  local provider = options.provider or "codex"
+  local pinned_id_set = model_pins.get(provider) or {}
+  local model_list = model_order.order(source_model_list, provider, pinned_id_set)
   lifetime = lifetime + 1
   local owner = "harness-model-" .. lifetime
   local function is_current()
@@ -234,11 +234,11 @@ function ModelPicker.open(options)
           if not is_current() then return end
           local model = find_model(model_list, selected_model_id)
           if not model then return end
-          model_pins.set(backend, model.id, not pinned_id_set[model.id], function(next_pin_set, failure)
+          model_pins.set(provider, model.id, not pinned_id_set[model.id], function(next_pin_set, failure)
             if failure then notifications.error("Failed to pin Harness model: " .. failure, "Harness model") return end
             if not is_current() then return end
             pinned_id_set = next_pin_set or {}
-            model_list = model_order.order(source_model_list, backend, pinned_id_set)
+            model_list = model_order.order(source_model_list, provider, pinned_id_set)
             api.update(build_spec())
           end)
         end,

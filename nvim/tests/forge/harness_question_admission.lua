@@ -13,7 +13,7 @@ require("forge.views.harness.agent_picker").refresh = function() end
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 require("forge.views.harness.prompt_history").record = function() end
 question.open = function(_, callbacks) picker = callbacks end
-state.session = { id = "question-input", backend = "mock", model = "mock", approval_mode = "ask" }
+state.session = { id = "question-input", provider = "mock", model = "mock", approval_mode = "ask" }
 state.queue = {}
 state.active_elicitation = { owner = "interaction", exchange_id = "exchange",
   elicitation = { question_set = { id = "set", questions = {

@@ -41,7 +41,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event(crate::backend::TurnUpdate::Started { started_at_ms: 1 }),
+            child_event(crate::provider::TurnUpdate::Started { started_at_ms: 1 }),
             &mut event,
         )
         .await?;
@@ -49,7 +49,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_tool("policy denied".into(), crate::backend::ToolStatus::Denied),
+            child_tool("policy denied".into(), crate::provider::ToolStatus::Denied),
             &mut event,
         )
         .await?;
@@ -60,7 +60,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
             ExchangeState::Cancelled,
         ),
         ChildCompletionFailure::SimilarProviderMessage => (
-            Err(anyhow::Error::new(crate::backend::BackendError::Provider {
+            Err(anyhow::Error::new(crate::provider::ProviderError::Provider {
                 code: None,
                 message: "provider execution cancelled".into(),
             })),
@@ -83,7 +83,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event(crate::backend::TurnUpdate::Finished {
+            child_event(crate::provider::TurnUpdate::Finished {
                 outcome: turn_outcome,
                 completed_at_ms: 2,
             }),

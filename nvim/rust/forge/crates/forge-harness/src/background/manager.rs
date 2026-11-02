@@ -24,7 +24,7 @@ pub struct BackgroundRequest {
     /// Request cancellation retained through admission and provider cleanup.
     pub cancellation: super::CancellationToken,
     /// Current response contract, independent of the conversation's preceding task.
-    pub purpose: crate::backend::TextGeneration,
+    pub purpose: crate::provider::TextGeneration,
     /// Explicit provider settings, independent of the selected chat.
     pub config: TextGenerationConfig,
     /// Repository and history captured with the current diff.
@@ -167,8 +167,8 @@ impl BackgroundManager {
             }
         });
         let mut session_event_stream = match runtime
-            .backend_handle()
-            .session_event_stream(crate::backend::ExecutionOwner::root(&session_id))
+            .provider_handle()
+            .session_event_stream(crate::provider::ExecutionOwner::root(&session_id))
             .await
         {
             Ok(stream) => stream,
@@ -187,7 +187,7 @@ impl BackgroundManager {
                 store.get(
                     &request.context.workspace,
                     &session_id,
-                    &request.config.backend.kind,
+                    &request.config.provider.kind,
                 )
             })
             .map(|snapshot| {
@@ -257,7 +257,7 @@ impl BackgroundManager {
         let mut native_compaction_observed = false;
         if let Some(stream) = &mut session_event_stream {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            let mut pending: Option<crate::backend::Compaction> = None;
+            let mut pending: Option<crate::provider::Compaction> = None;
             loop {
                 let until = if pending.is_some() {
                     deadline
@@ -266,13 +266,14 @@ impl BackgroundManager {
                 };
                 match tokio::time::timeout_at(until, stream.recv()).await {
                     Ok(Ok(Some(event))) => {
-                        if let crate::backend::BackendEvent::Compaction {
-                            update: compaction, ..
+                        if let crate::provider::ProviderEvent::Compaction {
+                            update: compaction,
+                            ..
                         } = &event
                         {
                             native_compaction_observed = true;
                             pending =
-                                if compaction.state == crate::backend::CompactionState::Running {
+                                if compaction.state == crate::provider::CompactionState::Running {
                                     Some(*compaction.clone())
                                 } else {
                                     None
@@ -289,13 +290,13 @@ impl BackgroundManager {
                     }
                     _ => {
                         if let Some(mut compaction) = pending.take() {
-                            compaction.state = crate::backend::CompactionState::Unconfirmed;
+                            compaction.state = crate::provider::CompactionState::Unconfirmed;
                             compaction.result.error =
                                 Some("Provider compaction completion was not confirmed".into());
                             let _ = broker.observe_session_event(
-                                crate::backend::BackendEvent::Compaction {
-                                    scope: crate::backend::EventScope::SessionOperation {
-                                        owner: crate::backend::ExecutionOwner::root(&session_id),
+                                crate::provider::ProviderEvent::Compaction {
+                                    scope: crate::provider::EventScope::SessionOperation {
+                                        owner: crate::provider::ExecutionOwner::root(&session_id),
                                         operation_id: compaction.id.clone(),
                                     },
                                     update: Box::new(compaction),
@@ -325,7 +326,7 @@ impl BackgroundManager {
             )
             .await;
         }
-        if let Err(error) = runtime.backend_handle().shutdown().await {
+        if let Err(error) = runtime.provider_handle().shutdown().await {
             let _ = broker.background_failure("provider_cleanup", format!("{error:#}"));
             report(
                 &request.delivery,
@@ -362,7 +363,7 @@ impl BackgroundManager {
         }
         request.config.auto_compaction.validate(None)?;
         ensure!(
-            ["codex", "copilot", "mock"].contains(&request.config.backend.kind.as_str()),
+            ["codex", "copilot", "mock"].contains(&request.config.provider.kind.as_str()),
             "This Harness provider does not support tool-free persistent Background sessions"
         );
         let directory = request.config.data_root.join("background-owner");
@@ -386,7 +387,7 @@ impl BackgroundManager {
         let reason = match &previous {
             None => "First Background request",
             Some(previous)
-                if previous.backend != request.config.backend.kind
+                if previous.provider != request.config.provider.kind
                     || previous.model != request.config.model =>
             {
                 "Background provider or model changed"
@@ -427,7 +428,7 @@ impl BackgroundManager {
         };
         let initialize: InitializeRequest = serde_json::from_value(json!({
             "data_root":request.config.data_root, "workspace":request.context.workspace,
-            "client_id":format!("background-{}", uuid::Uuid::new_v4()), "backend":request.config.backend,
+            "client_id":format!("background-{}", uuid::Uuid::new_v4()), "provider":request.config.provider,
             "model":request.config.model, "effort":request.config.reasoning_effort.as_deref().unwrap_or("low"),
             "session_id":session_id, "background":identity,
             "new_session_name":if reason.is_empty() { None } else { Some("Background") }
@@ -486,7 +487,7 @@ impl BackgroundManager {
             return Ok(json!({"sessions":sessions,"session":null}));
         };
         let mut settings = crate::settings::SettingsStore::open(&query.data_root)?;
-        let mut snapshot = settings.get(&selected.workspace, &selected.id, &selected.backend)?;
+        let mut snapshot = settings.get(&selected.workspace, &selected.id, &selected.provider)?;
         if let Some(policy) = query.auto_compaction {
             policy.validate(selected.context_usage.as_ref())?;
             let mut layer = settings.layer_settings(
@@ -504,7 +505,7 @@ impl BackgroundManager {
                 &selected.id,
                 &layer,
             )?;
-            snapshot = settings.get(&selected.workspace, &selected.id, &selected.backend)?;
+            snapshot = settings.get(&selected.workspace, &selected.id, &selected.provider)?;
         }
         let plan_file = crate::plan::PlanFileStore::new(&query.data_root, &selected.workspace);
         let session_events = store.list_session_event(&selected.id)?;
@@ -610,9 +611,9 @@ mod tests {
         let cancellation = super::super::CancellationToken::new();
         let request = BackgroundRequest {
             cancellation: cancellation.clone(),
-            purpose: crate::backend::TextGeneration::CommitMessage,
+            purpose: crate::provider::TextGeneration::CommitMessage,
             config: TextGenerationConfig {
-                backend: crate::backend::BackendLaunch {
+                provider: crate::provider::ProviderLaunch {
                     kind: "mock".into(),
                     command: vec![],
                 },

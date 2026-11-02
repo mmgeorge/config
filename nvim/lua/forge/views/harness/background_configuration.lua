@@ -8,7 +8,7 @@ local model_options = require("forge.views.harness.model_options")
 local threshold = require("forge.views.harness.compaction_threshold")
 
 ---@class ForgeBackgroundConfigurationOptions
----@field backend string
+---@field provider string
 ---@field session_id string
 ---@field host table
 ---@field capability fun(): table
@@ -55,7 +55,7 @@ end
 
 function BackgroundConfiguration:load_models()
   if not self.snapshot then return end
-  local key = self.options.backend
+  local key = self.options.provider
   if self.catalog_key == key then return end
   self.catalog_key, self.model_list = key, nil
   self.revision = self.revision + 1
@@ -75,7 +75,7 @@ end
 
 function BackgroundConfiguration:model()
   if not self.snapshot then return end
-  return store.model(self.snapshot, self.options.backend)
+  return store.model(self.snapshot, self.options.provider)
 end
 
 function BackgroundConfiguration:descriptor()
@@ -139,7 +139,7 @@ end
 
 function BackgroundConfiguration:select_model(model, thinking, back)
   local preferences = self:preferences()
-  local key = self.options.backend
+  local key = self.options.provider
   preferences.models[key] = preferences.models[key] or {}
   preferences.models[key].model = model
   preferences.models[key].thinking = thinking
@@ -176,7 +176,7 @@ function BackgroundConfiguration:change(id, direction)
     local values = self:speed_values()
     if #values == 1 then return true end
     local preferences = self:preferences()
-    local choice = preferences.models[self.options.backend]
+    local choice = preferences.models[self.options.provider]
     local position = math.max(1, vim.fn.index(values, choice.service_tier or "default") + 1)
     choice.service_tier = values[(position - 1 + direction) % #values + 1]
     self:save(preferences)
@@ -196,7 +196,7 @@ function BackgroundConfiguration:open(id)
     end
     picker.close(false)
     require("forge.views.harness.model_picker").open({ host = self.options.host, model_list = models,
-      backend = self.options.backend,
+      provider = self.options.provider,
       current_model = self:model().model, is_current = self.options.current, on_close = self.options.reopen,
       on_confirm = function(value)
         picker.close(false)

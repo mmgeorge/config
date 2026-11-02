@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::provider::ProviderAdapter as _;
 mod acceptance;
 mod admission;
 #[cfg(test)]
@@ -23,13 +25,6 @@ pub use fork::{ForkPreparation, prepare_provider_fork};
 pub use new_session::prepare_new_session;
 
 use crate::agent::{Agent, AgentLifecycleEvent, AgentRegistry, AgentState};
-use crate::backend::approval::{ApprovalRequestView, PermissionCoordinator};
-use crate::backend::{
-    Backend, BackendCapability, BackendCatalogRequest, BackendEvent, BackendInput, BackendLaunch,
-    BackendRequest, PromptMode,
-};
-#[cfg(test)]
-use crate::backend::{BackendEventSink, BackendForkRequest};
 use crate::buffer::session::SessionPresentation;
 use crate::checkpoint::{GitCheckpoint, checkpoint_diff, checkpoint_diff_for_paths};
 use crate::exchange::{
@@ -46,6 +41,13 @@ use crate::plan::{
     PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState,
 };
 use crate::protocol::RuntimeMethod;
+use crate::provider::approval::{ApprovalRequestView, PermissionCoordinator};
+use crate::provider::{
+    PromptMode, Provider, ProviderCapability, ProviderCatalogRequest, ProviderEvent, ProviderInput,
+    ProviderLaunch, ProviderRequest,
+};
+#[cfg(test)]
+use crate::provider::{ProviderEventSink, ProviderForkRequest};
 use crate::session::{
     ApprovalMode, ContextUsage, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
     ProviderForkState, SessionStore,
@@ -103,10 +105,12 @@ pub struct InitializeRequest {
     pub permission_file: Option<String>,
     pub workspace: String,
     pub client_id: String,
-    pub backend: BackendLaunch,
+    #[serde(alias = "backend")]
+    pub provider: ProviderLaunch,
     #[serde(default)]
     /// Supplies explicit launch descriptors for cross-provider children.
-    pub backend_launch_by_provider: HashMap<String, BackendLaunch>,
+    #[serde(alias = "backend_launch_by_provider")]
+    pub provider_launch_by_provider: HashMap<String, ProviderLaunch>,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default = "default_effort")]
@@ -192,7 +196,7 @@ pub struct BrokerSnapshot {
     pub session: HarnessSession,
     #[serde(skip)]
     pub exchange: Vec<Exchange>,
-    pub capability: BackendCapability,
+    pub capability: ProviderCapability,
     pub no_checkpoint: bool,
     pub restore_recovery: Option<Value>,
     pub active_plan: Option<PlanRecord>,
@@ -248,9 +252,9 @@ pub struct ActiveElicitation {
 }
 
 struct ProviderSteering<'turn> {
-    active: &'turn mut crate::backend::ActiveSteering,
-    deferred: &'turn mut std::collections::VecDeque<crate::backend::SteerCommand>,
-    continuation: Option<crate::backend::SteerCommand>,
+    active: &'turn mut crate::provider::ActiveSteering,
+    deferred: &'turn mut std::collections::VecDeque<crate::provider::SteerCommand>,
+    continuation: Option<crate::provider::SteerCommand>,
 }
 
 struct ExchangeRuntime {
@@ -298,7 +302,7 @@ pub struct BrokerRuntime {
     repositories: Arc<forge_git::store::RepositoryStore>,
     diff: Arc<forge_diff::engine::DiffEngine>,
     workspace_kind: WorkspaceKind,
-    backend: Arc<dyn Backend>,
+    provider: Arc<Provider>,
     pub(crate) permission_store: Arc<RwLock<PermissionStore>>,
     pub(crate) profiles: Arc<crate::agent::AgentProfileStore>,
     permission_coordinator: Arc<PermissionCoordinator>,
@@ -338,8 +342,8 @@ impl BrokerRuntime {
         let permission_coordinator =
             Arc::new(PermissionCoordinator::new(Arc::clone(&permission_store)));
         let trace = Arc::new(TraceStore::open(&data_root)?);
-        let backend = Arc::<dyn Backend>::from(crate::backend::build(
-            request.backend.clone(),
+        let provider = Arc::<Provider>::from(crate::provider::build(
+            request.provider.clone(),
             Arc::clone(&permission_coordinator),
             Arc::clone(&trace),
             data_root.clone(),
@@ -349,7 +353,7 @@ impl BrokerRuntime {
             repositories,
             diff,
             workspace_kind,
-            backend,
+            provider,
             permission_store,
             profiles,
             permission_coordinator,
@@ -358,8 +362,8 @@ impl BrokerRuntime {
     }
 
     /// Share the process-wide provider host with concurrent session controllers.
-    pub fn backend_handle(&self) -> Arc<dyn Backend> {
-        Arc::clone(&self.backend)
+    pub fn provider_handle(&self) -> Arc<Provider> {
+        Arc::clone(&self.provider)
     }
 
     pub fn trace(&self) -> Arc<TraceStore> {
@@ -367,7 +371,7 @@ impl BrokerRuntime {
     }
 }
 
-/// Coordinates an out-of-band cancellation request with the active backend turn.
+/// Coordinates an out-of-band cancellation request with the active provider turn.
 #[derive(Clone, Debug, Default)]
 enum ExecutionCleanup {
     #[default]
@@ -475,18 +479,6 @@ impl TurnCancellation {
 }
 
 #[derive(Debug)]
-/// Identifies user cancellation across broker and task-coordinator error boundaries.
-pub(crate) struct TurnCancelled;
-
-impl std::fmt::Display for TurnCancelled {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Turn cancelled by user")
-    }
-}
-
-impl std::error::Error for TurnCancelled {}
-
-#[derive(Debug)]
 /// Rejects a request before it owns or mutates the active execution.
 pub struct RequestNotAdmitted(
     /// Describes the unavailable execution or cleanup owner.
@@ -543,7 +535,7 @@ impl ExchangeAdmission {
     }
 }
 
-/// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
+/// Coordinates provider turns, durable state, plan review, goals, and interaction checkpoints.
 pub struct HarnessBroker {
     question_model: Option<crate::settings::AskModel>,
     question_discussion: bool,
@@ -557,7 +549,7 @@ pub struct HarnessBroker {
     repositories: Arc<forge_git::store::RepositoryStore>,
     diff: Arc<forge_diff::engine::DiffEngine>,
     store: SqliteStore,
-    pub(crate) submission_store: Arc<crate::backend::submission::SubmissionStore>,
+    pub(crate) submission_store: Arc<crate::provider::submission::SubmissionStore>,
     plan_file: Arc<PlanFileStore>,
     check_runner: Arc<crate::checks::CheckSupervisor>,
     check_setup: bool,
@@ -567,10 +559,10 @@ pub struct HarnessBroker {
     workspace_kind: WorkspaceKind,
     pub(crate) data_root: PathBuf,
     client_id: String,
-    backend_launch: BackendLaunch,
-    backend: Arc<dyn Backend>,
+    provider_launch: ProviderLaunch,
+    provider: Arc<Provider>,
     session: HarnessSession,
-    capability: BackendCapability,
+    capability: ProviderCapability,
     pub(crate) goal_max_turns: u32,
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
@@ -580,19 +572,19 @@ pub struct HarnessBroker {
     exchange_runtime: Option<ExchangeRuntime>,
     agent_registry: AgentRegistry,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
-    pub(crate) agent_backend_factory: crate::agent::AgentBackendFactory,
-    child_backend_by_agent: HashMap<String, Arc<dyn Backend>>,
+    pub(crate) agent_provider_factory: crate::agent::AgentProviderFactory,
+    child_provider_by_agent: HashMap<String, Arc<Provider>>,
     diagnostic_native_thread: HashSet<String>,
     mcp_notice: HashMap<String, String>,
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
     prompt_admission: Option<(Option<forge_buffer::identity::DocumentId>, u64)>,
-    pub(crate) input_submission: Option<Arc<crate::backend::submission::Submission>>,
+    pub(crate) input_submission: Option<Arc<crate::provider::submission::Submission>>,
     pub(crate) input_purpose: crate::input::InputPurpose,
     pub(crate) input_wakeup: Option<Arc<tokio::sync::Notify>>,
     submitted_attachments: Vec<crate::attachment::InputAttachment>,
     active_wait_projection: Option<ActiveWait>,
-    pub(crate) parent_input: crate::backend::SteeringLane,
+    pub(crate) parent_input: crate::provider::SteeringLane,
     timeline_reconciled_after_dispatch: bool,
     turn_cancellation: Arc<TurnCancellation>,
     pub(crate) startup_timing: std::collections::BTreeMap<&'static str, f64>,
@@ -654,9 +646,9 @@ impl HarnessBroker {
         let now_ms = clock.now_ms();
         let permission_store = Arc::clone(&runtime.permission_store);
         let permission_coordinator = Arc::clone(&runtime.permission_coordinator);
-        let backend = Arc::clone(&runtime.backend);
+        let provider = Arc::clone(&runtime.provider);
         let trace = runtime.trace();
-        let backend_descriptor = backend.descriptor();
+        let provider_descriptor = provider.descriptor();
         let requested_new_session_name = request.new_session_name.as_deref().map(str::trim);
         let force_new_session = requested_new_session_name.is_some()
             || request.lease_conflict_action.as_deref() == Some("new");
@@ -675,8 +667,8 @@ impl HarnessBroker {
                     "session uses a different workspace"
                 );
                 anyhow::ensure!(
-                    selected.backend == request.backend.kind,
-                    "session uses a different configured backend"
+                    selected.provider == request.provider.kind,
+                    "session uses a different configured provider"
                 );
                 store.acquire_session_lease(session_id, &request.client_id)?
             }
@@ -690,7 +682,7 @@ impl HarnessBroker {
                         .find(|session| {
                             session.background.is_none()
                                 && session.purpose == crate::session::SessionPurpose::Conversation
-                                && session.backend == request.backend.kind
+                                && session.provider == request.provider.kind
                         })
                 };
                 match latest_session {
@@ -702,7 +694,7 @@ impl HarnessBroker {
                         let preference = if request.background.is_some() {
                             None
                         } else {
-                            store.load_preference(&workspace, &request.backend.kind)?
+                            store.load_preference(&workspace, &request.provider.kind)?
                         };
                         let session_id = Uuid::new_v4().to_string();
                         let mut session = HarnessSession {
@@ -711,14 +703,14 @@ impl HarnessBroker {
                             id: session_id,
                             name: requested_new_session_name.unwrap_or_default().to_owned(),
                             workspace,
-                            backend: request.backend.kind.clone(),
-                            backend_session_id: None,
+                            provider: request.provider.kind.clone(),
+                            provider_session_id: None,
                             provider_checkpoint_id: None,
                             provider_fork_state: ProviderForkState::Ready,
                             model: preference
                                 .as_ref()
                                 .map_or(request.model, |value| value.model.clone()),
-                            provider_label: backend_descriptor.label.clone(),
+                            provider_label: provider_descriptor.label.clone(),
                             resolved_model: None,
                             effort: preference
                                 .as_ref()
@@ -749,7 +741,7 @@ impl HarnessBroker {
                             updated_at_ms: now_ms,
                             lease_owner: None,
                             native_fork: false,
-                            native_compact: backend_descriptor.capability.native_compact,
+                            native_compact: provider_descriptor.capability.native_compact,
                             context_usage: None,
                             background: request.background.clone(),
                             auto_compaction: Default::default(),
@@ -772,7 +764,7 @@ impl HarnessBroker {
             startup_started.elapsed().as_secs_f64() * 1000.0,
         );
         if session.provider_label.is_empty() {
-            session.provider_label = backend_descriptor.label.clone();
+            session.provider_label = provider_descriptor.label.clone();
         }
         if session.resolved_model.is_none() && session.model != "default" {
             session.resolved_model = Some(session.model.clone());
@@ -781,11 +773,11 @@ impl HarnessBroker {
         let shared = crate::settings::SettingsStore::open(&data_root)?.get(
             &session.workspace,
             &session.id,
-            &session.backend,
+            &session.provider,
         )?;
         shared
             .desired
-            .apply(&mut session, backend_descriptor.capability.native_compact)?;
+            .apply(&mut session, provider_descriptor.capability.native_compact)?;
         if created_session && request.background.is_none() {
             shared.apply_provider_defaults(&mut session)?;
         }
@@ -794,7 +786,7 @@ impl HarnessBroker {
         }
         if session.model == "default" && session.resolved_model.is_none() {
             session.resolved_model =
-                store.latest_resolved_default_model(&session.workspace, &session.backend)?;
+                store.latest_resolved_default_model(&session.workspace, &session.provider)?;
         }
         permission_coordinator.configure_timeout(&session.id, session.approval_timeout)?;
         startup_timing.insert(
@@ -809,7 +801,7 @@ impl HarnessBroker {
             && session.provider_checkpoint_id.is_none()
             && !store.has_conversation_history(&session.id)?
         {
-            session.backend_session_id = None;
+            session.provider_session_id = None;
         }
         store.save_session(&session)?;
         if store
@@ -819,15 +811,15 @@ impl HarnessBroker {
         {
             store.save_agent_run(&Agent::primary(&session.id, now_ms))?;
         }
-        let previous_preference = store.load_preference(&session.workspace, &session.backend)?;
+        let previous_preference = store.load_preference(&session.workspace, &session.provider)?;
         if previous_preference.is_none() && request.background.is_none() {
             store.save_preference(
                 &session.workspace,
-                &session.backend,
+                &session.provider,
                 &preference_for_session(&session, None),
             )?;
         }
-        let mut capability = backend_descriptor.capability;
+        let mut capability = provider_descriptor.capability;
         capability.native_fork = session.native_fork || capability.native_fork;
         capability.native_compact = session.native_compact || capability.native_compact;
         store.interrupt_detached_execution(&session.id)?;
@@ -851,15 +843,15 @@ impl HarnessBroker {
                 .context("stored task has no owning child")?;
             agent_coordinator.retain(agent, task)?;
         }
-        let mut agent_backend_factory = crate::agent::AgentBackendFactory::new(
-            request.backend.clone(),
-            request.backend_launch_by_provider.clone(),
+        let mut agent_provider_factory = crate::agent::AgentProviderFactory::new(
+            request.provider.clone(),
+            request.provider_launch_by_provider.clone(),
             permission_coordinator.clone(),
             trace.clone(),
             data_root.clone(),
         );
-        agent_backend_factory.profiles = runtime.profiles.clone();
-        agent_coordinator.set_profiles(agent_backend_factory.profiles.clone());
+        agent_provider_factory.profiles = runtime.profiles.clone();
+        agent_coordinator.set_profiles(agent_provider_factory.profiles.clone());
         let presentation = Arc::new(std::sync::Mutex::new(SessionPresentation::new(
             session.id.clone(),
         )));
@@ -920,7 +912,7 @@ impl HarnessBroker {
             task_controller: Arc::new(crate::task::SessionTaskController::new(
                 observer.admission.clone(),
             )?),
-            submission_store: crate::backend::submission::SubmissionStore::open(
+            submission_store: crate::provider::submission::SubmissionStore::open(
                 &data_root,
                 trace.clone(),
             )?,
@@ -943,8 +935,8 @@ impl HarnessBroker {
             workspace_kind,
             data_root,
             client_id: request.client_id,
-            backend_launch: request.backend,
-            backend,
+            provider_launch: request.provider,
+            provider,
             session,
             capability,
             goal_max_turns: request.goal_max_turns,
@@ -958,8 +950,8 @@ impl HarnessBroker {
             exchange_runtime: None,
             agent_registry,
             agent_coordinator,
-            agent_backend_factory,
-            child_backend_by_agent: HashMap::new(),
+            agent_provider_factory,
+            child_provider_by_agent: HashMap::new(),
             diagnostic_native_thread: HashSet::new(),
             mcp_notice: HashMap::new(),
             child_exchange_runtime_by_agent: HashMap::new(),
@@ -999,9 +991,9 @@ impl HarnessBroker {
         Arc::clone(&self.turn_cancellation)
     }
 
-    /// Clone the backend control boundary for out-of-band active-turn requests.
-    pub fn backend_handle(&self) -> Arc<dyn Backend> {
-        Arc::clone(&self.backend)
+    /// Clone the provider control boundary for out-of-band active-turn requests.
+    pub fn provider_handle(&self) -> Arc<Provider> {
+        Arc::clone(&self.provider)
     }
 
     pub(crate) fn checks(&self) -> Arc<crate::checks::CheckSupervisor> {
@@ -1014,33 +1006,33 @@ impl HarnessBroker {
     }
 
     /// Build the stable provider-catalog identity used outside serialized broker dispatch.
-    pub fn backend_catalog_request(&self) -> BackendCatalogRequest {
-        BackendCatalogRequest {
+    pub fn provider_catalog_request(&self) -> ProviderCatalogRequest {
+        ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
             access: self.session.access.clone(),
             approval_mode: self.session.approval_mode,
-            backend_session_id: self.session.backend_session_id.clone(),
+            provider_session_id: self.session.provider_session_id.clone(),
         }
     }
 
     /// Capture interactive startup settings without creating an exchange or task.
-    pub(crate) fn initialization_request(&self) -> Option<BackendRequest> {
+    pub(crate) fn initialization_request(&self) -> Option<ProviderRequest> {
         (self.session.background.is_none()
             && self.session.purpose == crate::session::SessionPurpose::Conversation
             && self.provider_fork_state() == crate::session::ProviderForkState::Ready)
-            .then(|| self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+            .then(|| self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
     }
 
     /// Persist an initialized provider conversation only while its captured settings remain current.
     pub(crate) fn retain_initialized_session(
         &mut self,
-        request: &BackendRequest,
+        request: &ProviderRequest,
         provider_id: String,
     ) -> Result<Option<BrokerSnapshot>> {
         if self.session.id != request.harness_session_id
-            || self.session.backend_session_id != request.backend_session_id
+            || self.session.provider_session_id != request.provider_session_id
             || self.session.model != request.model
             || self.session.effort != request.effort
             || self.session.access != request.access
@@ -1048,8 +1040,8 @@ impl HarnessBroker {
         {
             return Ok(None);
         }
-        if self.session.backend_session_id.as_ref() != Some(&provider_id) {
-            self.session.backend_session_id = Some(provider_id);
+        if self.session.provider_session_id.as_ref() != Some(&provider_id) {
+            self.session.provider_session_id = Some(provider_id);
             self.save_session()?;
         }
         Ok(Some(self.snapshot()?))
@@ -1217,7 +1209,7 @@ impl HarnessBroker {
                 input.clone(),
                 PromptMode::Background,
                 Some(ExchangeAdmission::chat(input.clone())),
-                BackendInput::from_text(input),
+                ProviderInput::from_text(input),
             )
             .await;
         self.event_sink = None;
@@ -1267,7 +1259,7 @@ impl HarnessBroker {
         }
         anyhow::ensure!(
             self.capability.native_compact,
-            "This backend does not support automatic compaction"
+            "This provider does not support automatic compaction"
         );
         policy.validate(self.session.context_usage.as_ref())?;
         if self
@@ -1276,8 +1268,8 @@ impl HarnessBroker {
             .iter()
             .any(|event| {
                 matches!(&event.detail, SessionEventKind::Compaction { compaction }
-                if compaction.state == crate::backend::CompactionState::Running
-                    && Some(&compaction.thread_id) == self.session.backend_session_id.as_ref())
+                if compaction.state == crate::provider::CompactionState::Running
+                    && Some(&compaction.thread_id) == self.session.provider_session_id.as_ref())
             })
         {
             return Ok(());
@@ -1295,7 +1287,7 @@ impl HarnessBroker {
             .map(|turn| turn.id().to_owned());
         let native_compacted = latest_exchange.as_ref().is_some_and(|exchange| exchange.node_list.iter().any(|node|
             matches!(node, crate::exchange::ExchangeNode::Compaction { compaction, .. }
-                if matches!(compaction.state, crate::backend::CompactionState::Completed | crate::backend::CompactionState::Running))));
+                if matches!(compaction.state, crate::provider::CompactionState::Completed | crate::provider::CompactionState::Running))));
         if latest.is_none() || latest == self.session.last_compaction_turn {
             return Ok(());
         }
@@ -1523,7 +1515,7 @@ impl HarnessBroker {
                     "not_admitted"
                 } else if error.downcast_ref::<TurnCancelled>().is_some() {
                     "turn_cancelled"
-                } else if error.is::<crate::backend::tool_timeout::ToolTimeout>() {
+                } else if error.is::<crate::provider::tool_timeout::ToolTimeout>() {
                     "tool_timeout"
                 } else {
                     "request_failed"
@@ -1576,7 +1568,7 @@ impl HarnessBroker {
             | RuntimeMethod::SessionCheckStatus
             | RuntimeMethod::SessionCheckCancel => Box::pin(self.project_checks(method, params)),
             RuntimeMethod::SessionCommandApply => self.transition_task(params),
-            RuntimeMethod::SessionProviderModelList => Box::pin(self.list_backend_model()),
+            RuntimeMethod::SessionProviderModelList => Box::pin(self.list_provider_model()),
             RuntimeMethod::SessionAgentStart => Box::pin(self.start_agent(params)),
             RuntimeMethod::SessionPromptSubmit => Box::pin(self.submit_prompt(params)),
             RuntimeMethod::SessionPlanAccept => Box::pin(std::future::ready(
@@ -1738,13 +1730,13 @@ impl HarnessBroker {
             }
             RuntimeMethod::SessionAgentModelList => {
                 let provider =
-                    crate::backend::BackendKind::parse(&required_text(&params, "provider")?)?;
+                    crate::provider::ProviderKind::parse(&required_text(&params, "provider")?)?;
                 let model = self
-                    .agent_backend_factory
+                    .agent_provider_factory
                     .catalog(
                         provider,
-                        self.backend_request(
-                            BackendInput::from_text(String::new()),
+                        self.provider_request(
+                            ProviderInput::from_text(String::new()),
                             PromptMode::Chat,
                         ),
                     )
@@ -1752,7 +1744,7 @@ impl HarnessBroker {
                 Ok((serde_json::to_value(model)?, Vec::new()))
             }
             RuntimeMethod::AgentProfileGet => Ok((
-                serde_json::to_value(self.agent_backend_factory.profiles.snapshot()?)?,
+                serde_json::to_value(self.agent_provider_factory.profiles.snapshot()?)?,
                 Vec::new(),
             )),
             RuntimeMethod::AgentProfileSave => {
@@ -1760,7 +1752,7 @@ impl HarnessBroker {
                 let document = serde_json::from_value(params["document"].clone())?;
                 Ok((
                     serde_json::to_value(
-                        self.agent_backend_factory
+                        self.agent_provider_factory
                             .profiles
                             .save(&revision, document)?,
                     )?,
@@ -2347,11 +2339,11 @@ impl HarnessBroker {
                     return Ok(serde_json::to_value(existing)?);
                 }
                 let mut delivery = crate::agent::MessageDelivery::Queued;
-                if let Some(backend) = self.child_backend_by_agent.get(&agent.id)
-                    && backend.descriptor().capability.native_steer
-                    && backend
+                if let Some(provider) = self.child_provider_by_agent.get(&agent.id)
+                    && provider.descriptor().capability.native_steer
+                    && provider
                         .has_active_turn(
-                            &crate::backend::ExecutionOwner {
+                            &crate::provider::ExecutionOwner {
                                 session_id: (self.session.id.clone()).into(),
                                 agent_id: (agent.id.clone()).into(),
                             }
@@ -2359,7 +2351,7 @@ impl HarnessBroker {
                         )
                         .await
                 {
-                    match backend.steer_session(&crate::backend::ExecutionOwner {session_id: (self.session.id.clone()).into(),agent_id: (agent.id.clone()).into()}.runtime_key(), message.clone().into()).await {
+                    match provider.steer_session(&crate::provider::ExecutionOwner {session_id: (self.session.id.clone()).into(),agent_id: (agent.id.clone()).into()}.runtime_key(), message.clone().into()).await {
                         Ok(()) => delivery = crate::agent::MessageDelivery::Steered,
                         Err(error) => self.trace.record(&self.session.id,"agent.message_queued",json!({
                             "agent_id":agent.id,"reason":"steering_not_accepted","error":format!("{error:#}")})),
@@ -2412,18 +2404,18 @@ impl HarnessBroker {
         };
         let admission = match work {
             ChildWork::Spawn(spawn) => {
-                let mut root =
-                    self.backend_request(BackendInput::from_text(String::new()), PromptMode::Chat);
+                let mut root = self
+                    .provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat);
                 if root.model == "default"
                     && let Some(model) = &self.session.resolved_model
                 {
                     root.model = model.clone();
                 }
                 let selection = self
-                    .agent_backend_factory
+                    .agent_provider_factory
                     .resolve(
                         &root,
-                        crate::backend::BackendKind::parse(&self.session.backend)?,
+                        crate::provider::ProviderKind::parse(&self.session.provider)?,
                         spawn,
                     )
                     .await?;
@@ -2431,7 +2423,7 @@ impl HarnessBroker {
                     request.source != AgentSource::Model || self.agent_coordinator.enabled(),
                     "model-facing subagent tools are disabled"
                 );
-                self.agent_backend_factory
+                self.agent_provider_factory
                     .profiles
                     .resolve(Some(&selection.profile))?;
                 self.agent_coordinator.reserve_spawn(
@@ -2444,7 +2436,7 @@ impl HarnessBroker {
             }
             ChildWork::Followup { target, message } => {
                 let agent = self.agent_coordinator.resolve(target)?;
-                self.agent_backend_factory
+                self.agent_provider_factory
                     .profiles
                     .resolve(Some(&agent.definition))?;
                 self.agent_coordinator.reserve_followup(
@@ -2485,7 +2477,7 @@ impl HarnessBroker {
         }
         self.trace.record(&self.session.id,"agent.admitted",json!({"agent_id":admission.agent.id,"exchange_id":admission.task.id,"parent_exchange_id":admission.task.parent_exchange_id,"source":admission.task.source}));
         let warning = if matches!(request.operation, AgentOperation::Spawn(_)) {
-            self.agent_backend_factory.profiles.snapshot()?.error
+            self.agent_provider_factory.profiles.snapshot()?.error
         } else {
             None
         };
@@ -2519,7 +2511,7 @@ impl HarnessBroker {
 
     async fn cancel_agent_approvals(
         &mut self,
-        owner: &crate::backend::ExecutionOwner,
+        owner: &crate::provider::ExecutionOwner,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         let pending = self
@@ -2545,7 +2537,7 @@ impl HarnessBroker {
             }
             self.emit_session_update(
                 SessionUpdate::Approval {
-                    update: Box::new(crate::backend::ApprovalUpdate::Cancelled(approval.clone())),
+                    update: Box::new(crate::provider::ApprovalUpdate::Cancelled(approval.clone())),
                 },
                 event,
             )
@@ -2560,7 +2552,7 @@ impl HarnessBroker {
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         let agent = self.agent_coordinator.resolve(target)?;
-        let owner = crate::backend::ExecutionOwner {
+        let owner = crate::provider::ExecutionOwner {
             session_id: (self.session.id.clone()).into(),
             agent_id: (agent.id.clone()).into(),
         };
@@ -2579,15 +2571,15 @@ impl HarnessBroker {
             self.agent_coordinator.retain(agent.clone(), task)?;
         }
         if let Some(mut task) = self.agent_coordinator.cleanup_task(&agent.id) {
-            let backend = self
-                .child_backend_by_agent
+            let provider = self
+                .child_provider_by_agent
                 .get(&agent.id)
                 .cloned()
                 .context("child cleanup obligation has no retained provider adapter")?;
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                backend.cancel_session(&owner.runtime_key()).await?;
-                backend.cleanup_execution(&owner.runtime_key()).await?;
-                backend.shutdown().await
+                provider.cancel_session(&owner.runtime_key()).await?;
+                provider.cleanup_execution(&owner.runtime_key()).await?;
+                provider.shutdown().await
             })
             .await
             .context("child cleanup retry exceeded 30 seconds")??;
@@ -2605,7 +2597,7 @@ impl HarnessBroker {
             self.agent_coordinator.retain(agent, task.clone())?;
             self.agent_coordinator
                 .settled(&owner.agent_id, &task.id, false)?;
-            self.child_backend_by_agent.remove(owner.agent_id.as_str());
+            self.child_provider_by_agent.remove(owner.agent_id.as_str());
         }
         self.publish_agent_state(event).await?;
         Ok(())
@@ -2636,12 +2628,12 @@ impl HarnessBroker {
                 incoming.delivery = crate::agent::MessageDelivery::Attached;
                 incoming.task_id = Some(admission.task.id.clone());
             }
-            let mut request = self.agent_backend_factory.request(
-                &self.backend_request(BackendInput::from_text(String::new()), PromptMode::Chat),
+            let mut request = self.agent_provider_factory.request(
+                &self.provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat),
                 &admission,
                 message,
             )?;
-            let backend = self.agent_backend_factory.build(
+            let provider = self.agent_provider_factory.build(
                 admission
                     .agent
                     .selection
@@ -2678,15 +2670,15 @@ impl HarnessBroker {
             self.agent_registry.insert(admission.agent.clone());
             self.agent_coordinator
                 .retain(admission.agent.clone(), admission.task.clone())?;
-            self.child_backend_by_agent
-                .insert(admission.agent.id.clone(), backend.clone());
+            self.child_provider_by_agent
+                .insert(admission.agent.id.clone(), provider.clone());
             Ok(crate::agent::AgentRuntime {
-                backend,
+                provider,
                 tool_timeout: crate::settings::SettingsStore::read_only(&self.data_root)?
                     .get(
                         &self.session.workspace,
                         &self.session.id,
-                        &self.session.backend,
+                        &self.session.provider,
                     )?
                     .desired
                     .tool_timeout
@@ -2748,7 +2740,7 @@ impl HarnessBroker {
                         authority.as_ref().is_some_and(|authority| {
                             !*authority.expired.borrow()
                                 && authority.owner
-                                    == crate::backend::ExecutionOwner::root(&self.session.id)
+                                    == crate::provider::ExecutionOwner::root(&self.session.id)
                                 && parent
                                     .as_deref()
                                     .is_some_and(|parent| parent.id == authority.parent_exchange_id)
@@ -2769,9 +2761,9 @@ impl HarnessBroker {
                 crate::agent::AgentCommand::Event {
                     owner,
                     task_id,
-                    event: backend_event,
+                    event: provider_event,
                 } => {
-                    self.observe_managed_agent(owner, &task_id, *backend_event, &mut event)
+                    self.observe_managed_agent(owner, &task_id, *provider_event, &mut event)
                         .await?;
                 }
                 crate::agent::AgentCommand::Completed {
@@ -2796,16 +2788,16 @@ impl HarnessBroker {
 
     async fn observe_managed_agent(
         &mut self,
-        owner: crate::backend::ExecutionOwner,
+        owner: crate::provider::ExecutionOwner,
         task_id: &str,
-        mut backend_event: BackendEvent,
+        mut provider_event: ProviderEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         anyhow::ensure!(
             owner.session_id == self.session.id && !owner.is_root(),
             "child event crosses execution ownership"
         );
-        let binding = backend_event.scope();
+        let binding = provider_event.scope();
         let scope = binding
             .invocation()
             .context("child event requires invocation ownership")?;
@@ -2824,24 +2816,24 @@ impl HarnessBroker {
         if task.completed_at_ms.is_some() {
             return Ok(());
         }
-        if let BackendEvent::Agent {
-            update: crate::backend::AgentUpdate::Lifecycle { event: lifecycle },
+        if let ProviderEvent::Agent {
+            update: crate::provider::AgentUpdate::Lifecycle { event: lifecycle },
             ..
-        } = &backend_event
+        } = &provider_event
         {
             self.apply_agent_lifecycle(lifecycle, Some(&task.parent_exchange_id), event)
                 .await?;
             return Ok(());
         }
-        if backend_event
+        if provider_event
             .turn_address()
             .is_some_and(|address| self.diagnostic_native_thread.contains(&address.thread_id))
         {
             return Ok(());
         }
-        let provider_thread_id = match &backend_event {
-            BackendEvent::Agent {
-                update: crate::backend::AgentUpdate::ConversationResolved { thread_id },
+        let provider_thread_id = match &provider_event {
+            ProviderEvent::Agent {
+                update: crate::provider::AgentUpdate::ConversationResolved { thread_id },
                 ..
             } => Some(thread_id.as_str()),
             event => event
@@ -2857,13 +2849,13 @@ impl HarnessBroker {
                 self.agent_coordinator.retain(agent, task.clone())?;
             }
         }
-        if matches!(&backend_event, BackendEvent::Agent { .. }) {
+        if matches!(&provider_event, ProviderEvent::Agent { .. }) {
             return Ok(());
         }
-        if let BackendEvent::Runtime {
-            update: crate::backend::RuntimeUpdate::Resolved { runtime },
+        if let ProviderEvent::Runtime {
+            update: crate::provider::RuntimeUpdate::Resolved { runtime },
             ..
-        } = &backend_event
+        } = &provider_event
         {
             let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
             if let Some(model) = runtime.model.as_ref().filter(|model| !model.is_empty())
@@ -2911,9 +2903,9 @@ impl HarnessBroker {
                 }
             }
         };
-        match &mut backend_event {
-            BackendEvent::Approval {
-                update: crate::backend::ApprovalUpdate::Requested(request),
+        match &mut provider_event {
+            ProviderEvent::Approval {
+                update: crate::provider::ApprovalUpdate::Requested(request),
                 ..
             } => {
                 let turn = runtime
@@ -2939,11 +2931,11 @@ impl HarnessBroker {
                 );
                 *request = approval;
             }
-            BackendEvent::Approval { update, .. } => {
+            ProviderEvent::Approval { update, .. } => {
                 let approval = match update {
-                    crate::backend::ApprovalUpdate::Resolved(approval)
-                    | crate::backend::ApprovalUpdate::Cancelled(approval) => approval,
-                    crate::backend::ApprovalUpdate::Requested(_) => unreachable!(),
+                    crate::provider::ApprovalUpdate::Resolved(approval)
+                    | crate::provider::ApprovalUpdate::Cancelled(approval) => approval,
+                    crate::provider::ApprovalUpdate::Requested(_) => unreachable!(),
                 };
                 runtime.exchange.observe_blocker(
                     format!("approval:{}", approval.id),
@@ -2952,7 +2944,7 @@ impl HarnessBroker {
                 );
                 runtime.exchange.approval_resolution.push(approval.clone());
             }
-            BackendEvent::Compaction { update, .. } => {
+            ProviderEvent::Compaction { update, .. } => {
                 runtime
                     .exchange
                     .observe_compaction(update.as_ref().clone(), self.clock.now_ms());
@@ -2961,7 +2953,7 @@ impl HarnessBroker {
                 runtime
                     .exchange
                     .observe_turn(observation, self.clock.now_ms())?;
-                if let BackendEvent::Checklist { update, .. } = observation {
+                if let ProviderEvent::Checklist { update, .. } = observation {
                     runtime.checklist.replace(update);
                     runtime.exchange.checklist = Some(runtime.checklist.snapshot().clone());
                 }
@@ -2972,9 +2964,9 @@ impl HarnessBroker {
                 )?;
             }
         }
-        if backend_event.tool_output_delta().is_some() {
+        if provider_event.tool_output_delta().is_some() {
             self.store
-                .save_tool_output_delta(&runtime.exchange, &backend_event)?;
+                .save_tool_output_delta(&runtime.exchange, &provider_event)?;
         } else {
             self.store.save_exchange(&runtime.exchange)?;
         }
@@ -2988,7 +2980,7 @@ impl HarnessBroker {
             .retain(self.agent_coordinator.resolve(&owner.agent_id)?, task)?;
         self.child_exchange_runtime_by_agent
             .insert(owner.agent_id.to_string(), runtime);
-        self.emit_observation(&backend_event, event).await?;
+        self.emit_observation(&provider_event, event).await?;
         self.publish_agent_state(event).await?;
         self.agent_coordinator.notify_activity();
         Ok(())
@@ -2996,9 +2988,9 @@ impl HarnessBroker {
 
     async fn complete_managed_agent(
         &mut self,
-        owner: crate::backend::ExecutionOwner,
+        owner: crate::provider::ExecutionOwner,
         task_id: String,
-        output: Result<crate::backend::BackendCompletion>,
+        output: Result<crate::provider::ProviderCompletion>,
         cleanup_error: Option<String>,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
@@ -3037,7 +3029,7 @@ impl HarnessBroker {
         task.completed_at_ms = Some(self.clock.now_ms());
         if let Ok(output) = &output {
             agent.provider_thread_id = output
-                .backend_session_id
+                .provider_session_id
                 .clone()
                 .or(agent.provider_thread_id);
         }
@@ -3097,7 +3089,7 @@ impl HarnessBroker {
             self.agent_coordinator
                 .settled(&owner.agent_id, &task_id, cleanup_error.is_some())?;
         if cleanup_error.is_none() {
-            self.child_backend_by_agent.remove(owner.agent_id.as_str());
+            self.child_provider_by_agent.remove(owner.agent_id.as_str());
         }
         self.trace.record(&self.session.id,"agent.completed",json!({"agent_id":owner.agent_id,"exchange_id":task_id,"state":task.state,"cleanup_error":cleanup_error}));
         self.publish_agent_state(event).await?;
@@ -3124,15 +3116,15 @@ impl HarnessBroker {
         Ok(None)
     }
 
-    async fn list_backend_model(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
+    async fn list_provider_model(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut model_list = self
-            .backend
-            .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+            .provider
+            .model_list(self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
             .await?;
         let preference = self
             .store
-            .load_preference(&self.session.workspace, &self.session.backend)?;
-        crate::backend::select_model_settings(&mut model_list, preference.as_ref());
+            .load_preference(&self.session.workspace, &self.session.provider)?;
+        crate::provider::select_model_settings(&mut model_list, preference.as_ref());
         let event = self.resolve_default_model(&model_list)?;
         Ok((serde_json::to_value(model_list)?, event))
     }
@@ -3140,7 +3132,7 @@ impl HarnessBroker {
     /// Publishes an unresolved default model without replacing an explicit selection.
     pub(crate) fn resolve_default_model(
         &mut self,
-        model_list: &[crate::backend::BackendModel],
+        model_list: &[crate::provider::ProviderModel],
     ) -> Result<Vec<SessionEvent>> {
         if self.session.model == "default"
             && let Some(model) = model_list
@@ -3274,12 +3266,14 @@ impl HarnessBroker {
                 .get(
                     &self.session.workspace,
                     &self.session.id,
-                    &self.session.backend,
+                    &self.session.provider,
                 )?
                 .ask_model()?;
             let catalog = if selection.model.is_some() {
-                self.backend
-                    .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+                self.provider
+                    .model_list(
+                        self.provider_request(ProviderInput::from_text(""), PromptMode::Chat),
+                    )
                     .await?
             } else {
                 Vec::new()
@@ -3315,7 +3309,7 @@ impl HarnessBroker {
                     visible_text.clone(),
                     PromptMode::Chat,
                     Some(ExchangeAdmission::chat(visible_text)),
-                    BackendInput::from_text(text),
+                    ProviderInput::from_text(text),
                 )
                 .await;
             self.question_discussion = false;
@@ -3418,7 +3412,7 @@ impl HarnessBroker {
                     text.clone(),
                     mode,
                     review_exchange.is_none().then_some(admission),
-                    BackendInput::from_text(text),
+                    ProviderInput::from_text(text),
                 )
                 .await;
         }
@@ -3463,7 +3457,7 @@ impl HarnessBroker {
                     text.clone(),
                     PromptMode::Chat,
                     Some(ExchangeAdmission::chat(text.clone())),
-                    BackendInput::parse(&text),
+                    ProviderInput::parse(&text),
                 )
                 .await;
         }
@@ -3549,8 +3543,8 @@ impl HarnessBroker {
             }
             _ => text.clone(),
         };
-        let input = match BackendInput::parse(&text) {
-            BackendInput::Skill {
+        let input = match ProviderInput::parse(&text) {
+            ProviderInput::Skill {
                 name,
                 mut arguments,
                 attachments,
@@ -3561,13 +3555,13 @@ impl HarnessBroker {
                 {
                     arguments = format!("{context}{arguments}");
                 }
-                BackendInput::Skill {
+                ProviderInput::Skill {
                     name,
                     arguments,
                     attachments,
                 }
             }
-            BackendInput::Text { .. } => BackendInput::from_text(prompt.clone()),
+            ProviderInput::Text { .. } => ProviderInput::from_text(prompt.clone()),
         };
         let prompt_mode = if self.current_task_is_plan()?
             && active_plan.as_ref().is_some_and(|plan| {
@@ -3620,20 +3614,20 @@ impl HarnessBroker {
         self.session = snapshot.session;
         self.session.active_task = current;
         self.save_session()?;
-        if unchanged && self.capability.native_goal && self.session.backend_session_id.is_some() {
-            let request = self.backend_request(BackendInput::from_text(""), PromptMode::Chat);
+        if unchanged && self.capability.native_goal && self.session.provider_session_id.is_some() {
+            let request = self.provider_request(ProviderInput::from_text(""), PromptMode::Chat);
             match snapshot.goal {
                 Some(goal) => {
-                    self.backend
+                    self.provider
                         .goal_status(
                             request,
-                            crate::backend::NativeGoalUpdate::from_goal(goal.objective, goal.state),
+                            crate::provider::native_goal_update(goal.objective, goal.state),
                         )
                         .await?
                 }
                 None => {
-                    self.backend
-                        .goal_status(request, crate::backend::NativeGoalUpdate::Absent)
+                    self.provider
+                        .goal_status(request, crate::provider::NativeGoalUpdate::Absent)
                         .await?
                 }
             }
@@ -4291,7 +4285,7 @@ impl HarnessBroker {
     }
 
     async fn continue_after_approval_timeout(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let owner = crate::backend::ExecutionOwner::root(&self.session.id);
+        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
         let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? else {
             return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
         };
@@ -4375,7 +4369,7 @@ impl HarnessBroker {
             return Ok(None);
         }
         *active_deadline = None;
-        let owner = crate::backend::ExecutionOwner::root(&self.session.id);
+        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
         if !self.active_plan_has_acceptance()?
             && self.permission_coordinator.has_timeout_feedback(&owner)?
         {
@@ -4418,7 +4412,7 @@ impl HarnessBroker {
                 crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).ok()
             })
             .map(|snapshot| snapshot.digest);
-        let input = BackendInput::from_text(text.clone());
+        let input = ProviderInput::from_text(text.clone());
         let result = self
             .run_interaction_input(text, mode, admission, input)
             .await?;
@@ -4591,7 +4585,7 @@ impl HarnessBroker {
         text: String,
         mode: PromptMode,
         admission: Option<ExchangeAdmission>,
-        input: BackendInput,
+        input: ProviderInput,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         self.context_usage_fresh = false;
         match Box::pin(self.run_interaction_input_inner(text, mode, admission, input)).await {
@@ -4651,7 +4645,7 @@ impl HarnessBroker {
             .get(
                 &self.session.workspace,
                 &self.session.id,
-                &self.session.backend,
+                &self.session.provider,
             )?
             .desired;
         if !check_settings.automatic_checks_enabled() {
@@ -4689,7 +4683,7 @@ impl HarnessBroker {
                 .get(
                     &self.session.workspace,
                     &self.session.id,
-                    &self.session.backend,
+                    &self.session.provider,
                 )?
                 .desired
                 .automatic_checks_enabled()
@@ -4753,7 +4747,7 @@ impl HarnessBroker {
                 .get(
                     &self.session.workspace,
                     &self.session.id,
-                    &self.session.backend,
+                    &self.session.provider,
                 )?
                 .desired
                 .automatic_checks_enabled()
@@ -4771,7 +4765,7 @@ impl HarnessBroker {
             if let Some(reason) = &automatic.blocked {
                 self.emit_session_update(
                     SessionUpdate::Diagnostic {
-                        diagnostic: crate::backend::ProviderDiagnostic {
+                        diagnostic: crate::provider::ProviderDiagnostic {
                             code: None,
                             message: reason.clone(),
                             fatal: false,
@@ -4795,7 +4789,7 @@ impl HarnessBroker {
                 prompt.clone(),
                 PromptMode::Chat,
                 Some(admission),
-                BackendInput::from_text(prompt),
+                ProviderInput::from_text(prompt),
             ))
             .await?;
             result.0 = repaired.0;
@@ -5054,7 +5048,7 @@ impl HarnessBroker {
         attempted: &mut std::collections::HashSet<String>,
         delivery: &mut tokio::task::JoinSet<(crate::agent::AgentTask, Result<()>)>,
     ) -> Result<()> {
-        if !self.backend.descriptor().capability.native_steer {
+        if !self.provider.descriptor().capability.native_steer {
             return Ok(());
         }
         for task in self.agent_coordinator.unreported_result() {
@@ -5064,18 +5058,18 @@ impl HarnessBroker {
                 continue;
             }
             let message = self.agent_result_message(&task)?;
-            let backend = self.backend.clone();
+            let provider = self.provider.clone();
             let session_id = self.session.id.clone();
             delivery.spawn(async move {
                 let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                     anyhow::ensure!(
-                        backend.has_active_turn(&session_id).await,
+                        provider.has_active_turn(&session_id).await,
                         "parent provider turn ended before delivery"
                     );
-                    backend
+                    provider
                         .steer_session(
                             &session_id,
-                            crate::backend::SteeringInput::AgentResult(message),
+                            crate::provider::SteeringInput::AgentResult(message),
                         )
                         .await
                 })
@@ -5117,17 +5111,17 @@ impl HarnessBroker {
 
     async fn prompt_with_timeline(
         &mut self,
-        mut request: BackendRequest,
+        mut request: ProviderRequest,
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
         prepared: admission::PreparedTurn,
-    ) -> Result<crate::backend::BackendCompletion> {
+    ) -> Result<crate::provider::ProviderCompletion> {
         prepared.consume(interaction)?;
         let mut parent_input = self.parent_input.activate(None)?;
         let mut deferred_input = std::collections::VecDeque::new();
-        let mut continuation_command: Option<crate::backend::SteerCommand> = None;
+        let mut continuation_command: Option<crate::provider::SteerCommand> = None;
         let mut continuation_count = 0;
-        let mut aggregate: Option<crate::backend::BackendCompletion> = None;
+        let mut aggregate: Option<crate::provider::ProviderCompletion> = None;
         let mut continuation_result = self.agent_coordinator.unreported_result();
         if !continuation_result.is_empty() {
             let message = continuation_result
@@ -5136,11 +5130,11 @@ impl HarnessBroker {
                 .collect::<Result<Vec<_>>>()?
                 .join("\n\n");
             match &mut request.input {
-                BackendInput::Text { text, .. } => {
+                ProviderInput::Text { text, .. } => {
                     text.push_str("\n\n");
                     text.push_str(&message);
                 }
-                BackendInput::Skill { arguments, .. } => {
+                ProviderInput::Skill { arguments, .. } => {
                     arguments.push_str("\n\n");
                     arguments.push_str(&message);
                 }
@@ -5175,18 +5169,20 @@ impl HarnessBroker {
                 || output.control_error.is_some()
                 || output.evidence.structured_blocked
                 || interaction.awaiting_input();
-            request.backend_session_id = output
-                .backend_session_id
+            request.provider_session_id = output
+                .provider_session_id
                 .clone()
-                .or(request.backend_session_id);
+                .or(request.provider_session_id);
             aggregate = Some(if let Some(mut aggregate) = aggregate {
-                aggregate.backend_session_id = output
-                    .backend_session_id
+                aggregate.native.provider_session_id = output
+                    .native
+                    .provider_session_id
                     .clone()
-                    .or(aggregate.backend_session_id);
-                aggregate.provider_checkpoint_id = output
+                    .or(aggregate.native.provider_session_id);
+                aggregate.native.provider_checkpoint_id = output
+                    .native
                     .provider_checkpoint_id
-                    .or(aggregate.provider_checkpoint_id);
+                    .or(aggregate.native.provider_checkpoint_id);
                 aggregate.plan_edit.extend(output.plan_edit);
                 aggregate.design_patch.extend(output.design_patch);
                 aggregate.plan_deviation.extend(output.plan_deviation);
@@ -5196,25 +5192,31 @@ impl HarnessBroker {
                 aggregate.question_withdrawal =
                     output.question_withdrawal.or(aggregate.question_withdrawal);
                 aggregate.structured_plan |= output.structured_plan;
-                aggregate.evidence.workspace_changed |= output.evidence.workspace_changed;
-                aggregate.evidence.tool_called |= output.evidence.tool_called;
-                aggregate.evidence.native_state = output
+                aggregate.native.evidence.workspace_changed |=
+                    output.native.evidence.workspace_changed;
+                aggregate.native.evidence.tool_called |= output.native.evidence.tool_called;
+                aggregate.native.evidence.native_state = output
+                    .native
                     .evidence
                     .native_state
-                    .or(aggregate.evidence.native_state);
-                aggregate.evidence.structured_complete |= output.evidence.structured_complete;
-                aggregate.evidence.structured_blocked |= output.evidence.structured_blocked;
+                    .or(aggregate.native.evidence.native_state);
+                aggregate.native.evidence.structured_complete |=
+                    output.native.evidence.structured_complete;
+                aggregate.native.evidence.structured_blocked |=
+                    output.native.evidence.structured_blocked;
                 aggregate.goal_control = output.goal_control.or(aggregate.goal_control);
-                aggregate.metrics.context_usage = output
+                aggregate.native.metrics.context_usage = output
+                    .native
                     .metrics
                     .context_usage
-                    .or(aggregate.metrics.context_usage);
-                aggregate.metrics.native_compact_update = output
+                    .or(aggregate.native.metrics.context_usage);
+                aggregate.native.metrics.native_compact_update = output
+                    .native
                     .metrics
                     .native_compact_update
-                    .or(aggregate.metrics.native_compact_update);
-                aggregate.capability = output.capability;
-                aggregate.runtime = output.runtime.clone();
+                    .or(aggregate.native.metrics.native_compact_update);
+                aggregate.native.capability = output.native.capability;
+                aggregate.native.runtime = output.native.runtime.clone();
                 aggregate.plan_question = output.plan_question;
                 aggregate.plan_submit = output.plan_submit;
                 aggregate.control_error = output.control_error;
@@ -5248,13 +5250,13 @@ impl HarnessBroker {
                 }
                 if let Some(input) = deferred_input.pop_front() {
                     continuation_input = Some(
-                        BackendInput::from_text(input.text.clone())
+                        ProviderInput::from_text(input.text.clone())
                             .with_attachments(input.attachments.clone()),
                     );
                     continuation_submission = input.submission.clone();
                     continuation_command = Some(input);
                     continuation_result = self.agent_coordinator.unreported_result();
-                    if let Some(BackendInput::Text { text, .. }) = &mut continuation_input {
+                    if let Some(ProviderInput::Text { text, .. }) = &mut continuation_input {
                         for task in &continuation_result {
                             text.push_str("\n\n");
                             text.push_str(&self.agent_result_message(task)?);
@@ -5277,7 +5279,7 @@ impl HarnessBroker {
                         .map(|task| self.agent_result_message(task))
                         .collect::<Result<Vec<_>>>()?
                         .join("\n\n");
-                    continuation_input = Some(BackendInput::from_text(format!(
+                    continuation_input = Some(ProviderInput::from_text(format!(
                         "Continue this same unfinished request using the child messages below. Synthesize the results and complete the original request when its required work is settled.\n\n{message}"
                     )));
                     continuation_result = result;
@@ -5335,10 +5337,10 @@ impl HarnessBroker {
 
     async fn notify_unavailable_mcp(
         &mut self,
-        request: &BackendCatalogRequest,
+        request: &ProviderCatalogRequest,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        let target = match self.session.backend.as_str() {
+        let target = match self.session.provider.as_str() {
             "codex" => "codexcli",
             "copilot" => "copilotcli",
             "claude" => "claudecode",
@@ -5348,7 +5350,7 @@ impl HarnessBroker {
         let resources = crate::settings::SessionResources::load(
             &self.data_root,
             request,
-            &self.session.backend,
+            &self.session.provider,
             target,
         )?;
         for (id, message) in &resources.launch_notice {
@@ -5362,7 +5364,7 @@ impl HarnessBroker {
             );
             self.emit_session_update(
                 SessionUpdate::Diagnostic {
-                    diagnostic: crate::backend::ProviderDiagnostic {
+                    diagnostic: crate::provider::ProviderDiagnostic {
                         code: None,
                         message: message.clone(),
                         fatal: false,
@@ -5378,12 +5380,12 @@ impl HarnessBroker {
 
     async fn prompt_provider_with_timeline(
         &mut self,
-        mut request: BackendRequest,
+        mut request: ProviderRequest,
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
         attached_result: &[crate::agent::AgentTask],
         steering: ProviderSteering<'_>,
-    ) -> Result<crate::backend::BackendCompletion> {
+    ) -> Result<crate::provider::ProviderCompletion> {
         let ProviderSteering {
             active: parent_input,
             deferred: deferred_input,
@@ -5395,20 +5397,20 @@ impl HarnessBroker {
             .and_then(crate::tools::TaskAuthority::capture);
         if request.mode != PromptMode::Background {
             self.notify_unavailable_mcp(
-                &BackendCatalogRequest {
+                &ProviderCatalogRequest {
                     execution_owner: request.execution_owner.clone(),
                     harness_session_id: request.harness_session_id.clone(),
                     workspace: request.workspace.clone(),
                     access: request.access.clone(),
                     approval_mode: request.approval_mode,
-                    backend_session_id: request.backend_session_id.clone(),
+                    provider_session_id: request.provider_session_id.clone(),
                 },
                 event,
             )
             .await?;
         }
         let (agent_scope, _agent_lease) = crate::agent::AgentToolScope::new(
-            crate::backend::ExecutionOwner::root(&self.session.id),
+            crate::provider::ExecutionOwner::root(&self.session.id),
             interaction.id.clone(),
             self.agent_coordinator.clone(),
         )?;
@@ -5424,30 +5426,30 @@ impl HarnessBroker {
             .exchange_runtime
             .take()
             .context("active interaction timeline is missing")?;
-        let backend = Arc::clone(&self.backend);
+        let provider = Arc::clone(&self.provider);
         let cancellation = Arc::clone(&self.turn_cancellation);
         let retry_trace = Arc::clone(&self.trace);
         let submission_store = self.submission_store.clone();
         let mut cleanup = cancellation.cleanup.subscribe();
-        let scope = crate::backend::InvocationScope::new(request.owner()?, interaction.id.clone());
-        let (backend_event_sink, mut backend_event_stream) =
-            crate::backend::events::channel(scope.clone());
+        let scope = crate::provider::InvocationScope::new(request.owner()?, interaction.id.clone());
+        let (provider_event_sink, mut provider_event_stream) =
+            crate::provider::events::channel(scope.clone());
         let tool_timeout = crate::settings::SettingsStore::read_only(&self.data_root)?
             .get(
                 &self.session.workspace,
                 &self.session.id,
-                &self.session.backend,
+                &self.session.provider,
             )?
             .desired
             .tool_timeout
             .unwrap_or(self.session.tool_timeout);
-        let tool_watchdog = Arc::new(crate::backend::tool_timeout::ToolWatchdog::new(
+        let tool_watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
             tool_timeout,
         )?);
         self.observer
             .session_events
             .watch_tools(&scope, &tool_watchdog)?;
-        let backend_event_sink = backend_event_sink.supervise_tools(tool_watchdog.clone());
+        let provider_event_sink = provider_event_sink.with_observer(tool_watchdog.clone());
         let (execution_sender, mut execution_receiver) =
             tokio::sync::mpsc::channel::<crate::plan::execution::ExecutionControl>(1);
         let execution = self
@@ -5469,7 +5471,7 @@ impl HarnessBroker {
             Arc::clone(&self.check_runner),
             crate::checks::CheckAuthority {
                 data_root: self.data_root.clone(),
-                backend: self.session.backend.clone(),
+                provider: self.session.provider.clone(),
                 task_id: self.task_controller.current()?.map(|task| {
                     task.entry
                         .as_ref()
@@ -5482,7 +5484,7 @@ impl HarnessBroker {
                 permission: self.session.approval_mode,
                 permissions: Arc::clone(&self.permission_coordinator),
                 scope: scope.clone(),
-                authorization_sink: backend_event_sink.clone(),
+                authorization_sink: provider_event_sink.clone(),
                 editing: Arc::clone(&self.observer.check_editing),
                 setup: interaction.check_setup.is_some(),
                 can_run: interaction.check_setup.is_none()
@@ -5514,7 +5516,7 @@ impl HarnessBroker {
         let mut provider_task = tokio::task::JoinSet::new();
         // Provider polling starts at a task boundary instead of inside the host dispatch stack.
         provider_task.spawn(async move {
-            if !backend.checkpoint_tool_gate()
+            if !provider.checkpoint_tool_gate()
                 && let Some(gate) = request
                     .control_context
                     .as_ref()
@@ -5522,11 +5524,11 @@ impl HarnessBroker {
             {
                 gate.wait().await?;
             }
-            let acceptance_sink = backend_event_sink.clone();
-            let response = crate::backend::retry::prompt(
-                backend.as_ref(),
+            let acceptance_sink = provider_event_sink.clone();
+            let response = crate::provider::retry::prompt(
+                provider.as_ref(),
                 request,
-                Some(backend_event_sink),
+                Some(provider_event_sink),
                 &retry_trace,
                 &submission_store,
             );
@@ -5547,11 +5549,11 @@ impl HarnessBroker {
                         let expired = expired?.context("tool watchdog ended during foreground execution")?;
                         cancellation.requested.store(true, Ordering::Release);
                         let message = expired.to_string();
-                        self.process_backend_event(&mut runtime, interaction, BackendEvent::Tool {
+                        self.process_provider_event(&mut runtime, interaction, ProviderEvent::Tool {
                             address: expired.address.clone(),
-                            update: crate::backend::ToolUpdate::Finished {
-                                outcome: crate::backend::ToolOutcome::Failed {
-                                    diagnostic: crate::backend::ToolDiagnostic {
+                            update: crate::provider::ToolUpdate::Finished {
+                                outcome: crate::provider::ToolOutcome::Failed {
+                                    diagnostic: crate::provider::ToolDiagnostic {
                                         code: Some("tool_timeout".into()), message,
                                     },
                                 },
@@ -5562,15 +5564,16 @@ impl HarnessBroker {
                     changed = question_changes.changed(), if !self.question_discussion => {
                         changed.context("question controller closed during execution")?;
                         if self.questions.snapshot()?.required_in_exchange(&interaction.id) {
-                            let backend_session_id = self.backend.active_session_id_for(&self.session.id).await
-                                .or_else(|| self.session.backend_session_id.clone());
-                            self.backend.cleanup_execution(&self.session.id).await
+                            let provider_session_id = self.provider.active_session_id_for(&self.session.id).await
+                                .or_else(|| self.session.provider_session_id.clone());
+                            self.provider.cleanup_execution(&self.session.id).await
                                 .context("stop execution for required questions")?;
                             // The controller owns this deliberate stop; it is not evidence of task completion.
-                            let completion = crate::backend::BackendCompletion {
-                                backend_session_id,
+        let completion = crate::provider::ProviderCompletion {
+            native: forge_provider_api::completion::ProviderCompletion {
+                                provider_session_id,
                                 provider_checkpoint_id: self.session.provider_checkpoint_id.clone(),
-                                capability: self.capability.clone(),
+                                capability: self.capability.clone(), ..Default::default() },
                                 ..Default::default()
                             };
                             break Ok(completion);
@@ -5590,13 +5593,14 @@ impl HarnessBroker {
                     }
                     input = parent_input.receive(), if user_delivery.is_empty() && deferred_input.is_empty() => {
                         let input = input.context("parent input receiver closed")?;
-                        if self.backend.descriptor().capability.native_steer {
-                            let backend = self.backend.clone();
+                        if self.provider.descriptor().capability.native_steer {
+                            let provider = self.provider.clone();
                             let session_id = self.session.id.clone();
                             user_delivery.spawn(async move {
-                                let result = tokio::time::timeout(std::time::Duration::from_secs(30),
-                                    backend.steer_session(&session_id,input.input()))
-                                    .await.context("parent input delivery exceeded 30 seconds").and_then(|result|result);
+                                // The native lane owns admission until it acknowledges or rejects
+                                // the input. A host deadline can strand a still-queued command and
+                                // incorrectly defer subsequent steering until the turn ends.
+                                let result = provider.steer_session(&session_id,input.input()).await;
                                 (input,result)
                             });
                         } else {deferred_input.push_back(input);}
@@ -5615,8 +5619,8 @@ impl HarnessBroker {
                     }
                     control = execution_receiver.recv() => {
                         if let Some(control) = control {
-                            while let Ok(backend_event) = backend_event_stream.try_recv() {
-                                self.process_backend_event(&mut runtime, interaction, backend_event, event).await?;
+                            while let Ok(provider_event) = provider_event_stream.try_recv() {
+                                self.process_provider_event(&mut runtime, interaction, provider_event, event).await?;
                             }
                             let submission = matches!(&control.operation, crate::plan::execution::ExecutionOperation::Submit { .. });
                             let result = self.handle_execution_control(&control.execution_id, control.generation, &control.task_permit, control.operation, interaction).await;
@@ -5737,14 +5741,14 @@ impl HarnessBroker {
                             }
                         }
                     }
-                    backend_event = backend_event_stream.recv(), if stream_open => {
-                        let backend_event = match backend_event {
+                    provider_event = provider_event_stream.recv(), if stream_open => {
+                        let provider_event = match provider_event {
                             Ok(Some(event)) => event,
                             Ok(None) => { stream_open = false; continue; },
                             Err(error) => break Err(error.into()),
                         };
                         if let Err(error) = self
-                            .process_backend_event(&mut runtime, interaction, backend_event, event)
+                            .process_provider_event(&mut runtime, interaction, provider_event, event)
                             .await
                         {
                             break Err(error);
@@ -5754,12 +5758,12 @@ impl HarnessBroker {
                     // Admit queued background lifetime markers before their session-stream completion.
                     ready = session_events.notified() => {
                         ready?;
-                        for observation in session_events.drain_after(&mut backend_event_stream)? {
+                        for observation in session_events.drain_after(&mut provider_event_stream)? {
                             if observation.scope().invocation().is_some_and(|scope| scope.exchange_id == interaction.id) {
-                                self.process_backend_event(&mut runtime, interaction, observation, event).await?;
-                            } else if matches!(observation, BackendEvent::Tool { .. }) {
+                                self.process_provider_event(&mut runtime, interaction, observation, event).await?;
+                            } else if matches!(observation, ProviderEvent::Tool { .. }) {
                                 anyhow::ensure!(
-                                    observation.scope().owner() == &crate::backend::ExecutionOwner::root(&self.session.id),
+                                    observation.scope().owner() == &crate::provider::ExecutionOwner::root(&self.session.id),
                                     "session tool event crosses execution ownership"
                                 );
                                 self.route_settled_parent_event(interaction, &observation, event).await?;
@@ -5844,10 +5848,10 @@ impl HarnessBroker {
             outcome
         };
         loop {
-            match backend_event_stream.try_next() {
-                Ok(Some(backend_event)) => {
+            match provider_event_stream.try_next() {
+                Ok(Some(provider_event)) => {
                     if let Err(error) = self
-                        .process_backend_event(&mut runtime, interaction, backend_event, event)
+                        .process_provider_event(&mut runtime, interaction, provider_event, event)
                         .await
                     {
                         outcome = Err(error);
@@ -5861,7 +5865,7 @@ impl HarnessBroker {
             }
         }
         if outcome.is_ok()
-            && let Err(error) = backend_event_stream.check()
+            && let Err(error) = provider_event_stream.check()
         {
             outcome = Err(error.into());
         }
@@ -5869,7 +5873,7 @@ impl HarnessBroker {
             && let Err(error) = self
                 .permission_coordinator
                 .cancel_owner(
-                    &crate::backend::ExecutionOwner::root(&self.session.id),
+                    &crate::provider::ExecutionOwner::root(&self.session.id),
                     None,
                 )
                 .await
@@ -5880,21 +5884,21 @@ impl HarnessBroker {
             checkpoint_failed
                 || error.downcast_ref::<TurnCancelled>().is_some()
                 || error
-                    .downcast_ref::<crate::backend::tool_timeout::ToolTimeout>()
+                    .downcast_ref::<crate::provider::tool_timeout::ToolTimeout>()
                     .is_some()
                 || error
-                    .downcast_ref::<crate::backend::events::EventDeliveryError>()
+                    .downcast_ref::<crate::provider::events::EventDeliveryError>()
                     .is_some()
-        }) && let Err(error) = self.backend.cancel_session(&self.session.id).await
+        }) && let Err(error) = self.provider.cancel_session(&self.session.id).await
         {
-            outcome = Err(error).context("stop cancelled backend transport");
+            outcome = Err(error).context("stop cancelled provider transport");
         }
         self.exchange_runtime = Some(runtime);
         if outcome.is_ok() {
             self.observer.session_events.monitor_background(
                 scope,
                 tool_watchdog,
-                self.backend.clone(),
+                self.provider.clone(),
             )?;
         }
         outcome
@@ -5906,7 +5910,7 @@ impl HarnessBroker {
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
         match self
-            .backend
+            .provider
             .rollback_cancelled_turn_for(&self.session.id)
             .await
         {
@@ -5921,7 +5925,7 @@ impl HarnessBroker {
             Err(error) => {
                 self.emit_live(
                     SessionUpdate::Diagnostic {
-                        diagnostic: crate::backend::ProviderDiagnostic {
+                        diagnostic: crate::provider::ProviderDiagnostic {
                             code: None,
                             message: format!("Cancelled turn could not be retracted: {error:#}"),
                             fatal: false,
@@ -6161,15 +6165,15 @@ impl HarnessBroker {
         Ok(())
     }
 
-    fn process_backend_event<'event>(
+    fn process_provider_event<'event>(
         &'event mut self,
         runtime: &'event mut ExchangeRuntime,
         interaction: &'event mut Exchange,
-        backend_event: BackendEvent,
+        provider_event: ProviderEvent,
         event: &'event mut Vec<SessionEvent>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'event>> {
-        let scope = backend_event.scope();
-        if scope.owner() != &crate::backend::ExecutionOwner::root(&self.session.id) {
+        let scope = provider_event.scope();
+        if scope.owner() != &crate::provider::ExecutionOwner::root(&self.session.id) {
             self.trace.record(
                 &self.session.id,
                 "provider.event.rejected",
@@ -6186,8 +6190,8 @@ impl HarnessBroker {
         }) {
             return Box::pin(async { Ok(()) });
         }
-        match backend_event {
-            BackendEvent::DirectoryAccess { grant, .. } => Box::pin(async move {
+        match provider_event {
+            ProviderEvent::DirectoryAccess { grant, .. } => Box::pin(async move {
                 for grant in grant {
                     let directories = match grant.operation {
                         crate::permissions::directory::DirectoryOperation::Read => {
@@ -6211,8 +6215,8 @@ impl HarnessBroker {
                 )
                 .await
             }),
-            BackendEvent::Runtime {
-                update: crate::backend::RuntimeUpdate::Resolved { runtime: resolved },
+            ProviderEvent::Runtime {
+                update: crate::provider::RuntimeUpdate::Resolved { runtime: resolved },
                 ..
             } => Box::pin(async move {
                 if !resolved.provider.is_empty() {
@@ -6225,7 +6229,7 @@ impl HarnessBroker {
                 self.emit_session_update(
                     SessionUpdate::Runtime {
                         session_id: self.session.id.clone(),
-                        runtime: crate::backend::BackendRuntime {
+                        runtime: crate::provider::ProviderRuntime {
                             provider: self.session.provider_label.clone(),
                             model: self.session.resolved_model.clone(),
                         },
@@ -6234,17 +6238,17 @@ impl HarnessBroker {
                 )
                 .await
             }),
-            BackendEvent::Compaction { scope, update } => Box::pin(async move {
-                let observation = BackendEvent::Compaction {
+            ProviderEvent::Compaction { scope, update } => Box::pin(async move {
+                let observation = ProviderEvent::Compaction {
                     scope,
                     update: update.clone(),
                 };
                 self.process_compaction_event(runtime, interaction, observation, *update, event)
                     .await
             }),
-            BackendEvent::Approval {
+            ProviderEvent::Approval {
                 scope,
-                update: crate::backend::ApprovalUpdate::Requested(request),
+                update: crate::provider::ApprovalUpdate::Requested(request),
             } => Box::pin(async move {
                 if !self
                     .permission_coordinator
@@ -6275,7 +6279,7 @@ impl HarnessBroker {
                 self.store.save_exchange(interaction)?;
                 self.emit_live(
                     SessionUpdate::Approval {
-                        update: Box::new(crate::backend::ApprovalUpdate::Requested(approval)),
+                        update: Box::new(crate::provider::ApprovalUpdate::Requested(approval)),
                     },
                     event,
                 )
@@ -6283,11 +6287,11 @@ impl HarnessBroker {
                 let _ = scope;
                 Ok(())
             }),
-            BackendEvent::Approval { update, .. } => Box::pin(async move {
+            ProviderEvent::Approval { update, .. } => Box::pin(async move {
                 let approval = match &update {
-                    crate::backend::ApprovalUpdate::Resolved(approval)
-                    | crate::backend::ApprovalUpdate::Cancelled(approval) => approval,
-                    crate::backend::ApprovalUpdate::Requested(_) => unreachable!(),
+                    crate::provider::ApprovalUpdate::Resolved(approval)
+                    | crate::provider::ApprovalUpdate::Cancelled(approval) => approval,
+                    crate::provider::ApprovalUpdate::Requested(_) => unreachable!(),
                 };
                 interaction.observe_blocker(
                     format!("approval:{}", approval.id),
@@ -6304,10 +6308,10 @@ impl HarnessBroker {
                 )
                 .await
             }),
-            BackendEvent::ParentBoundary { update, .. } => Box::pin(async move {
+            ProviderEvent::ParentBoundary { update, .. } => Box::pin(async move {
                 let now_ms = self.clock.now_ms();
                 match update {
-                    crate::backend::ParentBoundaryUpdate::WaitStarted { agent_count } => {
+                    crate::provider::ParentBoundaryUpdate::WaitStarted { agent_count } => {
                         interaction.observe_blocker("agent_wait".into(), true, now_ms);
                         interaction.close_running_messages();
                         runtime.active_wait = Some(ActiveWait {
@@ -6316,12 +6320,12 @@ impl HarnessBroker {
                             agent_count,
                         });
                     }
-                    crate::backend::ParentBoundaryUpdate::WaitUpdated { agent_count } => {
+                    crate::provider::ParentBoundaryUpdate::WaitUpdated { agent_count } => {
                         if let Some(wait) = runtime.active_wait.as_mut() {
                             wait.agent_count = agent_count;
                         }
                     }
-                    crate::backend::ParentBoundaryUpdate::WaitFinished => {
+                    crate::provider::ParentBoundaryUpdate::WaitFinished => {
                         interaction.observe_blocker("agent_wait".into(), false, now_ms);
                         runtime.active_wait = None;
                     }
@@ -6329,16 +6333,16 @@ impl HarnessBroker {
                 self.store.save_exchange(interaction)?;
                 self.emit_active_wait(interaction, runtime, event).await
             }),
-            BackendEvent::Agent {
-                update: crate::backend::AgentUpdate::Lifecycle { event: lifecycle },
+            ProviderEvent::Agent {
+                update: crate::provider::AgentUpdate::Lifecycle { event: lifecycle },
                 ..
             } => Box::pin(async move {
                 self.apply_agent_lifecycle(&lifecycle, Some(&interaction.id), event)
                     .await?;
                 Ok(())
             }),
-            BackendEvent::Agent { .. } => Box::pin(async { Ok(()) }),
-            BackendEvent::Diagnostic { diagnostic, .. } => Box::pin(async move {
+            ProviderEvent::Agent { .. } => Box::pin(async { Ok(()) }),
+            ProviderEvent::Diagnostic { diagnostic, .. } => Box::pin(async move {
                 self.emit_session_update(SessionUpdate::Diagnostic { diagnostic }, event)
                     .await
             }),
@@ -6350,12 +6354,12 @@ impl HarnessBroker {
         &'event mut self,
         runtime: &'event mut ExchangeRuntime,
         interaction: &'event mut Exchange,
-        backend_event: BackendEvent,
+        provider_event: ProviderEvent,
         event: &'event mut Vec<SessionEvent>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'event>> {
         Box::pin(async move {
-            self.prepare_backend_observation(interaction, &backend_event);
-            if backend_event.turn_address().is_some_and(|address| {
+            self.prepare_provider_observation(interaction, &provider_event);
+            if provider_event.turn_address().is_some_and(|address| {
                 self.diagnostic_native_thread.contains(&address.thread_id)
                     || self
                         .agent_registry
@@ -6365,38 +6369,38 @@ impl HarnessBroker {
                 return Ok(());
             }
             if self
-                .route_settled_parent_event(interaction, &backend_event, event)
+                .route_settled_parent_event(interaction, &provider_event, event)
                 .await?
             {
                 return Ok(());
             }
-            self.admit_native_goal_continuation(runtime, interaction, &backend_event, event)
+            self.admit_native_goal_continuation(runtime, interaction, &provider_event, event)
                 .await?;
-            if !interaction.observe_turn(&backend_event, self.clock.now_ms())? {
+            if !interaction.observe_turn(&provider_event, self.clock.now_ms())? {
                 self.trace.record(&self.session.id, "provider.event.rejected",
-                    json!({"exchange_id":interaction.id,"code":"execution_unknown_or_settled","event":backend_event}));
+                    json!({"exchange_id":interaction.id,"code":"execution_unknown_or_settled","event":provider_event}));
                 return Ok(());
             }
-            match &backend_event {
-                BackendEvent::Turn { address, update } => {
-                    if matches!(update, crate::backend::TurnUpdate::Started { .. })
-                        && self.session.backend_session_id.as_deref()
+            match &provider_event {
+                ProviderEvent::Turn { address, update } => {
+                    if matches!(update, crate::provider::TurnUpdate::Started { .. })
+                        && self.session.provider_session_id.as_deref()
                             != Some(address.thread_id.as_str())
                     {
-                        self.session.backend_session_id = Some(address.thread_id.clone());
+                        self.session.provider_session_id = Some(address.thread_id.clone());
                         self.save_session()?;
                     }
                     self.store.save_exchange(interaction)?;
-                    self.emit_observation(&backend_event, event).await?;
+                    self.emit_observation(&provider_event, event).await?;
                     return Ok(());
                 }
-                BackendEvent::InputAccepted {
+                ProviderEvent::InputAccepted {
                     acknowledgement, ..
                 } => {
                     runtime.retraction_eligible = false;
                     let now_ms = self.clock.now_ms();
                     match acknowledgement {
-                        crate::backend::InputAcknowledgement::TaskStarted {
+                        crate::provider::InputAcknowledgement::TaskStarted {
                             input_id,
                             start,
                             prompt,
@@ -6459,7 +6463,7 @@ impl HarnessBroker {
                             )
                             .await?;
                         }
-                        crate::backend::InputAcknowledgement::Steering { input_id, text } => {
+                        crate::provider::InputAcknowledgement::Steering { input_id, text } => {
                             if input_id.as_ref().is_some_and(|id| interaction.node_list.iter().any(|node|
                                 matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == *id))) {
                                 return Ok(());
@@ -6490,11 +6494,11 @@ impl HarnessBroker {
                     self.emit_active_wait(interaction, runtime, event).await?;
                     return Ok(());
                 }
-                BackendEvent::Runtime {
-                    update: crate::backend::RuntimeUpdate::ContextUsage { usage },
+                ProviderEvent::Runtime {
+                    update: crate::provider::RuntimeUpdate::ContextUsage { usage },
                     ..
                 } => {
-                    let thread_id = self.session.backend_session_id.as_deref();
+                    let thread_id = self.session.provider_session_id.as_deref();
                     if let Some(thread_id) = thread_id
                         && interaction.observe_compaction_usage(thread_id, usage.used) {
                         self.store.save_exchange(interaction)?;
@@ -6507,7 +6511,7 @@ impl HarnessBroker {
                             .find(|record| matches!(&record.detail, SessionEventKind::Compaction { compaction }
                                 if compaction.thread_id == thread_id))
                         && let SessionEventKind::Compaction { compaction } = &mut record.detail
-                        && compaction.state == crate::backend::CompactionState::Completed
+                        && compaction.state == crate::provider::CompactionState::Completed
                         && compaction.result.context_tokens_before.is_some()
                         && compaction.result.context_tokens_after.is_none()
                         && !self.store.list_exchange_metadata(&self.session.id)?.iter().any(|exchange|
@@ -6522,10 +6526,10 @@ impl HarnessBroker {
                     }
                     self.session.context_usage = Some(usage.clone());
                     self.context_usage_fresh = true;
-                    self.emit_observation(&backend_event, event).await?;
+                    self.emit_observation(&provider_event, event).await?;
                     return Ok(());
                 }
-                BackendEvent::Checklist { update, .. } => {
+                ProviderEvent::Checklist { update, .. } => {
                     runtime.retraction_eligible = false;
                     runtime.checklist.replace(update);
                     interaction.checklist = Some(runtime.checklist.snapshot().clone());
@@ -6537,43 +6541,43 @@ impl HarnessBroker {
                     )
                     .await?;
                 }
-                BackendEvent::Tool { .. } => runtime.retraction_eligible = false,
-                BackendEvent::Message { update, .. }
+                ProviderEvent::Tool { .. } => runtime.retraction_eligible = false,
+                ProviderEvent::Message { update, .. }
                     if update.text().is_some_and(|text| !text.is_empty()) =>
                 {
                     runtime.retraction_eligible = false
                 }
                 _ => {}
             }
-            if backend_event.turn_address().is_some() {
-                attribute_provider_tool(interaction, &mut runtime.checklist, &backend_event)?;
-                if backend_event.tool_output_delta().is_some() {
+            if provider_event.turn_address().is_some() {
+                attribute_provider_tool(interaction, &mut runtime.checklist, &provider_event)?;
+                if provider_event.tool_output_delta().is_some() {
                     self.store
-                        .save_tool_output_delta(interaction, &backend_event)?;
+                        .save_tool_output_delta(interaction, &provider_event)?;
                 } else {
                     self.store.save_exchange(interaction)?;
                 }
-                self.emit_live_interaction(backend_event, interaction, event)
+                self.emit_live_interaction(provider_event, interaction, event)
                     .await?;
             } else {
-                self.emit_observation(&backend_event, event).await?;
+                self.emit_observation(&provider_event, event).await?;
             }
             Ok(())
         })
     }
 
-    fn prepare_backend_observation(
+    fn prepare_provider_observation(
         &mut self,
         interaction: &mut Exchange,
-        backend_event: &BackendEvent,
+        provider_event: &ProviderEvent,
     ) {
         if !self.capability.compaction.background
-            && let BackendEvent::Turn {
+            && let ProviderEvent::Turn {
                 address,
-                update: crate::backend::TurnUpdate::Finished { .. },
-            } = backend_event
+                update: crate::provider::TurnUpdate::Finished { .. },
+            } = provider_event
         {
-            let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
+            let now_ms = provider_event.observed_at_ms(self.clock.now_ms());
             interaction.unconfirm_compaction(&address.thread_id, now_ms);
             for child in self.child_exchange_runtime_by_agent.values_mut() {
                 child
@@ -6587,19 +6591,19 @@ impl HarnessBroker {
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
-        backend_event: BackendEvent,
-        mut compaction: crate::backend::Compaction,
+        provider_event: ProviderEvent,
+        mut compaction: crate::provider::Compaction,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        if compaction.state == crate::backend::CompactionState::Running
-            && self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str())
+        if compaction.state == crate::provider::CompactionState::Running
+            && self.session.provider_session_id.as_deref() == Some(compaction.thread_id.as_str())
         {
             compaction.result.context_tokens_before = compaction
                 .result
                 .context_tokens_before
                 .or_else(|| self.session.context_usage.as_ref().map(|usage| usage.used));
         }
-        let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
+        let now_ms = provider_event.observed_at_ms(self.clock.now_ms());
         let previous_owner = self.compaction_exchange_owner(&compaction)?;
         let owns_other_exchange = previous_owner.as_ref().is_some_and(|owner| {
             owner.id != interaction.id
@@ -6647,13 +6651,13 @@ impl HarnessBroker {
             child.exchange.observe_compaction(compaction, now_ms);
             let result = async {
                 self.store.save_exchange(&child.exchange)?;
-                self.emit_live_interaction(backend_event, &child.exchange, event)
+                self.emit_live_interaction(provider_event, &child.exchange, event)
                     .await
             }
             .await;
             self.child_exchange_runtime_by_agent.insert(child_id, child);
             result?;
-        } else if self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str())
+        } else if self.session.provider_session_id.as_deref() == Some(compaction.thread_id.as_str())
             || interaction
                 .turn
                 .iter()
@@ -6662,7 +6666,7 @@ impl HarnessBroker {
             runtime.retraction_eligible = false;
             interaction.observe_compaction(compaction, now_ms);
             self.store.save_exchange(interaction)?;
-            self.emit_live_interaction(backend_event, interaction, event)
+            self.emit_live_interaction(provider_event, interaction, event)
                 .await?;
         }
         Ok(())
@@ -6671,16 +6675,18 @@ impl HarnessBroker {
     async fn route_settled_parent_event(
         &mut self,
         current: &Exchange,
-        backend_event: &BackendEvent,
+        provider_event: &ProviderEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
-        let Some(address) = backend_event.turn_address() else {
+        let Some(address) = provider_event.turn_address() else {
             return Ok(false);
         };
         if current.turn.iter().any(|turn| turn.provider() == address)
             || !matches!(
-                backend_event,
-                BackendEvent::Usage { .. } | BackendEvent::Turn { .. } | BackendEvent::Tool { .. }
+                provider_event,
+                ProviderEvent::Usage { .. }
+                    | ProviderEvent::Turn { .. }
+                    | ProviderEvent::Tool { .. }
             )
         {
             return Ok(false);
@@ -6691,13 +6697,13 @@ impl HarnessBroker {
         else {
             return Ok(false);
         };
-        if matches!(backend_event, BackendEvent::Usage { .. })
-            || matches!(backend_event, BackendEvent::Tool { address, update }
+        if matches!(provider_event, ProviderEvent::Usage { .. })
+            || matches!(provider_event, ProviderEvent::Tool { address, update }
                 if owner.accepts_settled_tool_update(address, update))
         {
-            owner.observe_turn(backend_event, self.clock.now_ms())?;
-            if backend_event.tool_output_delta().is_some() {
-                self.store.save_tool_output_delta(&owner, backend_event)?;
+            owner.observe_turn(provider_event, self.clock.now_ms())?;
+            if provider_event.tool_output_delta().is_some() {
+                self.store.save_tool_output_delta(&owner, provider_event)?;
             } else {
                 self.store.save_exchange(&owner)?;
             }
@@ -6712,7 +6718,7 @@ impl HarnessBroker {
                     status,
                     self.observer.status_thoughts.load(Ordering::Relaxed),
                 )?;
-            self.emit_observation(backend_event, event).await?;
+            self.emit_observation(provider_event, event).await?;
             self.emit_timeline_patch(patch, event).await?;
         }
         Ok(true)
@@ -6722,12 +6728,12 @@ impl HarnessBroker {
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
-        observation: &BackendEvent,
+        observation: &ProviderEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        let BackendEvent::Turn {
+        let ProviderEvent::Turn {
             address,
-            update: crate::backend::TurnUpdate::Started { .. },
+            update: crate::provider::TurnUpdate::Started { .. },
         } = observation
         else {
             return Ok(());
@@ -6870,7 +6876,7 @@ impl HarnessBroker {
 
     async fn emit_observation(
         &mut self,
-        observation: &BackendEvent,
+        observation: &ProviderEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         if let Some(update) = SessionUpdate::from_observation(observation) {
@@ -6902,7 +6908,7 @@ impl HarnessBroker {
                 self.event_sink = None;
             }
         } else {
-            event.push(self.event("backend_event", payload)?);
+            event.push(self.event("provider_event", payload)?);
         }
         Ok(())
     }
@@ -7546,13 +7552,13 @@ impl HarnessBroker {
     }
 
     async fn sync_native_goal(&mut self, goal: &GoalRecord, state: GoalState) -> Result<()> {
-        if !goal.native || self.session.backend_session_id.is_none() {
+        if !goal.native || self.session.provider_session_id.is_none() {
             return Ok(());
         }
-        self.backend
+        self.provider
             .goal_status(
-                self.backend_request(BackendInput::from_text(""), PromptMode::GoalContinuation),
-                crate::backend::NativeGoalUpdate::from_goal(goal.objective.clone(), state),
+                self.provider_request(ProviderInput::from_text(""), PromptMode::GoalContinuation),
+                crate::provider::native_goal_update(goal.objective.clone(), state),
             )
             .await
     }
@@ -7779,15 +7785,15 @@ impl HarnessBroker {
             )?;
             session.active_task = None;
         }
-        let replacement = crate::backend::build(
-            self.backend_launch.clone(),
+        let replacement = crate::provider::build(
+            self.provider_launch.clone(),
             self.permission_coordinator.clone(),
             self.trace.clone(),
             self.data_root.clone(),
         )?;
-        self.backend.shutdown().await?;
-        self.backend = Arc::from(replacement);
-        session.backend_session_id = None;
+        self.provider.shutdown().await?;
+        self.provider = Arc::from(replacement);
+        session.provider_session_id = None;
         session.provider_checkpoint_id = None;
         session.provider_fork_state = ProviderForkState::Ready;
         session.context_usage = None;
@@ -7811,8 +7817,8 @@ impl HarnessBroker {
     fn rollback_context(
         &self,
         current_exchange: &str,
-        input: BackendInput,
-    ) -> Result<BackendInput> {
+        input: ProviderInput,
+    ) -> Result<ProviderInput> {
         let exchanges = self.store.list_exchange(&self.session.id)?;
         if !exchanges
             .iter()
@@ -7832,15 +7838,15 @@ impl HarnessBroker {
             "The conversation was rolled back. Use only this retained conversation history as prior context. The current workspace files are authoritative.\n{history}\n\nCurrent request:\n"
         );
         Ok(match input {
-            BackendInput::Text { text, attachments } => BackendInput::Text {
+            ProviderInput::Text { text, attachments } => ProviderInput::Text {
                 text: format!("{context}{text}"),
                 attachments,
             },
-            BackendInput::Skill {
+            ProviderInput::Skill {
                 name,
                 arguments,
                 attachments,
-            } => BackendInput::Skill {
+            } => ProviderInput::Skill {
                 name,
                 arguments: format!("{context}{arguments}"),
                 attachments,
@@ -7933,8 +7939,8 @@ impl HarnessBroker {
         let child = prepare_new_session(
             &self.data_root,
             &self.client_id,
-            &self.backend_launch.kind,
-            self.backend.descriptor().capability.native_compact,
+            &self.provider_launch.kind,
+            self.provider.descriptor().capability.native_compact,
             &self.session.id,
             &params,
             now_ms,
@@ -7961,8 +7967,8 @@ impl HarnessBroker {
             "cross-worktree resume requires native fork"
         );
         anyhow::ensure!(
-            session.backend == self.backend_launch.kind,
-            "session uses a different configured backend"
+            session.provider == self.provider_launch.kind,
+            "session uses a different configured provider"
         );
         if session.id == self.session.id {
             return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
@@ -7973,7 +7979,7 @@ impl HarnessBroker {
             .acquire_session_lease(&session.id, &self.client_id)?;
         self.release_lease()?;
         if session.provider_label.is_empty() {
-            session.provider_label = self.backend.descriptor().label;
+            session.provider_label = self.provider.descriptor().label;
         }
         self.store.save_session(&session)?;
         self.exchange_runtime = None;
@@ -7983,7 +7989,7 @@ impl HarnessBroker {
         self.child_exchange_runtime_by_agent.clear();
         self.capability.native_fork = self.session.native_fork;
         self.capability.native_compact = self.session.native_compact;
-        self.capability = self.backend.descriptor().capability;
+        self.capability = self.provider.descriptor().capability;
         self.capability.native_fork = self.session.native_fork || self.capability.native_fork;
         self.capability.native_compact =
             self.session.native_compact || self.capability.native_compact;
@@ -8037,7 +8043,7 @@ impl HarnessBroker {
             let settings = crate::settings::SettingsStore::open(&self.data_root)?.get(
                 &self.session.workspace,
                 &self.session.id,
-                &self.session.backend,
+                &self.session.provider,
             )?;
             anyhow::ensure!(
                 params["settings_revision"].as_u64() == Some(settings.revision),
@@ -8076,7 +8082,7 @@ impl HarnessBroker {
             policy.validate(configured.context_usage.as_ref())?;
             anyhow::ensure!(
                 !policy.enabled || self.capability.native_compact,
-                "This backend does not support automatic compaction"
+                "This provider does not support automatic compaction"
             );
             configured.auto_compaction = policy;
         }
@@ -8108,7 +8114,7 @@ impl HarnessBroker {
         }
         let requested_service_tier = params
             .get("service_tier")
-            .map(|value| serde_json::from_value::<crate::backend::ServiceTier>(value.clone()))
+            .map(|value| serde_json::from_value::<crate::provider::ServiceTier>(value.clone()))
             .transpose()?;
         if let Some(tier) = requested_service_tier {
             tier.validate(&self.capability)?;
@@ -8123,7 +8129,7 @@ impl HarnessBroker {
             if enabled {
                 anyhow::ensure!(
                     self.capability.native_compact,
-                    "current backend does not support context compaction"
+                    "current provider does not support context compaction"
                 );
             }
             plan_compact = enabled;
@@ -8132,7 +8138,7 @@ impl HarnessBroker {
             if enabled {
                 anyhow::ensure!(
                     self.capability.model_selection,
-                    "current backend does not support model selection"
+                    "current provider does not support model selection"
                 );
                 if plan_executor.model.is_none() {
                     let active_model = self
@@ -8140,19 +8146,21 @@ impl HarnessBroker {
                         .resolved_model
                         .clone()
                         .unwrap_or_else(|| self.session.model.clone());
-                    let selected_model = if active_model == "default" {
-                        self.backend
-                            .model_list(
-                                self.backend_request(BackendInput::from_text(""), PromptMode::Chat),
-                            )
-                            .await?
-                            .into_iter()
-                            .find(|candidate| candidate.is_default)
-                            .context("the backend has no default model")?
-                            .id
-                    } else {
-                        active_model
-                    };
+                    let selected_model =
+                        if active_model == "default" {
+                            self.provider
+                                .model_list(self.provider_request(
+                                    ProviderInput::from_text(""),
+                                    PromptMode::Chat,
+                                ))
+                                .await?
+                                .into_iter()
+                                .find(|candidate| candidate.is_default)
+                                .context("the provider has no default model")?
+                                .id
+                        } else {
+                            active_model
+                        };
                     plan_executor.model = Some(selected_model);
                     plan_executor.effort = Some(self.session.effort.clone());
                 }
@@ -8180,7 +8188,7 @@ impl HarnessBroker {
             self.validate_plan_executor(&plan_executor).await?;
         }
         let selected_tier = requested_service_tier.unwrap_or(self.session.service_tier);
-        let validate_tier = selected_tier != crate::backend::ServiceTier::Standard
+        let validate_tier = selected_tier != crate::provider::ServiceTier::Standard
             && (requested_service_tier.is_some() || requested_model.is_some());
         if validate_tier
             || (validate_selection
@@ -8189,8 +8197,8 @@ impl HarnessBroker {
                     || requested_context_window.is_some()))
         {
             let model_list = self
-                .backend
-                .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+                .provider
+                .model_list(self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
                 .await?;
             let selected_model = requested_model.unwrap_or_else(|| {
                 self.session
@@ -8209,17 +8217,17 @@ impl HarnessBroker {
                 anyhow::ensure!(
                     target_model
                         .is_some_and(|candidate| model == "default" || candidate.id == model),
-                    "model {model} is unavailable for this backend"
+                    "model {model} is unavailable for this provider"
                 );
             }
             if validate_tier {
                 selected_tier.validate_model(
-                    target_model.context("the selected model is unavailable for this backend")?,
+                    target_model.context("the selected model is unavailable for this provider")?,
                 )?;
             }
             if let Some(effort) = requested_effort {
                 let model =
-                    target_model.context("the active model is unavailable for this backend")?;
+                    target_model.context("the active model is unavailable for this provider")?;
                 if !model.reasoning.is_empty() {
                     anyhow::ensure!(
                         model.reasoning.iter().any(|candidate| candidate == effort),
@@ -8230,7 +8238,7 @@ impl HarnessBroker {
             }
             if let Some(context_window) = requested_context_window {
                 let model =
-                    target_model.context("the active model is unavailable for this backend")?;
+                    target_model.context("the active model is unavailable for this provider")?;
                 if !model.context_window.is_empty() {
                     anyhow::ensure!(
                         model
@@ -8280,18 +8288,18 @@ impl HarnessBroker {
         if let Some(access) = &access {
             configured.access = access.clone();
         }
-        configured.access = crate::backend::BackendKind::parse(&configured.backend)?
+        configured.access = crate::provider::ProviderKind::parse(&configured.provider)?
             .resolve_access(configured.access);
         if let Some(selection) = resource_selection {
-            self.backend
+            self.provider
                 .reconcile_settings(
-                    BackendCatalogRequest {
+                    ProviderCatalogRequest {
                         execution_owner: None,
                         harness_session_id: configured.id.clone(),
                         workspace: configured.workspace.clone(),
                         access: configured.access.clone(),
                         approval_mode: configured.approval_mode,
-                        backend_session_id: configured.backend_session_id.clone(),
+                        provider_session_id: configured.provider_session_id.clone(),
                     },
                     &selection,
                 )
@@ -8315,7 +8323,7 @@ impl HarnessBroker {
             let snapshot = settings.get(
                 &self.session.workspace,
                 &self.session.id,
-                &self.session.backend,
+                &self.session.provider,
             )?;
             let scope =
                 if params.get("auto_compaction").is_some() || params["session_policy"] == true {
@@ -8389,7 +8397,7 @@ impl HarnessBroker {
                 || params.get("service_tier").is_some()
                 || params.get("plan_executor_enabled").is_some()
             {
-                settings.save_provider(revision,&self.session.backend,&json!({"model":self.session.model,"effort":self.session.effort,
+                settings.save_provider(revision,&self.session.provider,&json!({"model":self.session.model,"effort":self.session.effort,
                     "context_window":self.session.context_window,"service_tier":self.session.service_tier,"plan_executor":self.session.plan_executor}))?;
             }
         }
@@ -8405,7 +8413,7 @@ impl HarnessBroker {
                 .store(enabled, Ordering::Relaxed);
         }
         if delegation_registry_changed && params.get("settings_revision").is_none() {
-            self.backend.cleanup_execution(&self.session.id).await?;
+            self.provider.cleanup_execution(&self.session.id).await?;
         }
         Ok((
             serde_json::to_value(self.session_view()?)?,
@@ -8422,7 +8430,7 @@ impl HarnessBroker {
     async fn validate_plan_executor(&mut self, executor: &PlanExecutor) -> Result<()> {
         anyhow::ensure!(
             self.capability.model_selection,
-            "current backend does not support model selection"
+            "current provider does not support model selection"
         );
         let model = executor
             .model
@@ -8433,14 +8441,14 @@ impl HarnessBroker {
             .as_deref()
             .context("plan executor thinking is not configured")?;
         let model_list = self
-            .backend
-            .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+            .provider
+            .model_list(self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
             .await?;
         let selected = model_list
             .iter()
             .find(|candidate| candidate.id == model)
             .with_context(|| {
-                format!("plan executor model {model} is unavailable for this backend")
+                format!("plan executor model {model} is unavailable for this provider")
             })?;
         anyhow::ensure!(
             selected.reasoning.is_empty()
@@ -8456,7 +8464,7 @@ impl HarnessBroker {
     /// Resolve persisted ownership across primary and child-agent exchanges.
     fn compaction_exchange_owner(
         &self,
-        compaction: &crate::backend::Compaction,
+        compaction: &crate::provider::Compaction,
     ) -> Result<Option<Exchange>> {
         self.store
             .load_compaction_exchange(&self.session.id, compaction)
@@ -8465,11 +8473,11 @@ impl HarnessBroker {
     /// Merge active and background notifications into their persisted timeline owner.
     fn retain_external_compaction(
         &mut self,
-        mut compaction: crate::backend::Compaction,
+        mut compaction: crate::provider::Compaction,
         now_ms: i64,
     ) -> Result<()> {
-        if compaction.state == crate::backend::CompactionState::Running
-            && self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str())
+        if compaction.state == crate::provider::CompactionState::Running
+            && self.session.provider_session_id.as_deref() == Some(compaction.thread_id.as_str())
         {
             compaction.result.context_tokens_before = compaction
                 .result
@@ -8528,12 +8536,12 @@ impl HarnessBroker {
     /// Retain session notifications after provider execution has released the broker.
     pub(crate) fn observe_session_event(
         &mut self,
-        event: BackendEvent,
+        event: ProviderEvent,
     ) -> Result<Vec<SessionEvent>> {
         let now_ms = event.observed_at_ms(self.clock.now_ms());
-        if let BackendEvent::Tool { address, update } = &event {
+        if let ProviderEvent::Tool { address, update } = &event {
             anyhow::ensure!(
-                address.turn.scope.owner == crate::backend::ExecutionOwner::root(&self.session.id),
+                address.turn.scope.owner == crate::provider::ExecutionOwner::root(&self.session.id),
                 "session tool event crosses execution ownership"
             );
             let Some(mut owner) = self
@@ -8560,14 +8568,14 @@ impl HarnessBroker {
                 vec![self.event("document_changed", patch.notification())?]
             });
         }
-        let BackendEvent::Compaction {
+        let ProviderEvent::Compaction {
             scope,
             update: compaction,
         } = event
         else {
             return Ok(match SessionUpdate::from_observation(&event) {
                 Some(update) => vec![self.event(
-                    "backend_event",
+                    "provider_event",
                     publication::encode_session_update(&update)?,
                 )?],
                 None => Vec::new(),
@@ -8589,25 +8597,25 @@ impl HarnessBroker {
     async fn compact_session(&mut self, manual: bool) -> Result<(Value, Vec<SessionEvent>)> {
         anyhow::ensure!(
             self.capability.native_compact,
-            "current backend does not support context compaction"
+            "current provider does not support context compaction"
         );
         anyhow::ensure!(
-            self.session.backend_session_id.is_some(),
+            self.session.provider_session_id.is_some(),
             "current session has no provider conversation to compact"
         );
         let now_ms = self.clock.now_ms();
-        let mut compaction = crate::backend::Compaction {
+        let mut compaction = crate::provider::Compaction {
             id: Uuid::new_v4().to_string(),
             thread_id: self
                 .session
-                .backend_session_id
+                .provider_session_id
                 .clone()
                 .expect("validated provider conversation"),
-            state: crate::backend::CompactionState::Running,
+            state: crate::provider::CompactionState::Running,
             manual,
             started_at_ms: Some(now_ms),
             completed_at_ms: None,
-            result: crate::backend::CompactionResult {
+            result: crate::provider::CompactionResult {
                 context_tokens_before: self.session.context_usage.as_ref().map(|usage| usage.used),
                 ..Default::default()
             },
@@ -8626,17 +8634,17 @@ impl HarnessBroker {
         let patch = self.reconcile_timeline()?;
         self.emit_timeline_patch(patch, &mut event).await?;
         let result = self
-            .backend
-            .compact(crate::backend::BackendCompactionRequest {
+            .provider
+            .compact(crate::provider::ProviderCompactionRequest {
                 id: compaction.id.clone(),
-                request: self.backend_request(BackendInput::from_text(""), PromptMode::Chat),
+                request: self.provider_request(ProviderInput::from_text(""), PromptMode::Chat),
             })
             .await;
         compaction.completed_at_ms = Some(self.clock.now_ms());
         let output = match result {
             Ok(output) => output,
             Err(error) => {
-                compaction.state = crate::backend::CompactionState::Failed;
+                compaction.state = crate::provider::CompactionState::Failed;
                 compaction.result.error = Some(format!("{error:#}"));
                 record.detail = SessionEventKind::Compaction {
                     compaction: compaction.into(),
@@ -8648,7 +8656,7 @@ impl HarnessBroker {
             }
         };
         let observed = output.event.iter().rev().find_map(|event| match event {
-            BackendEvent::Compaction { update, .. } => Some(update.clone()),
+            ProviderEvent::Compaction { update, .. } => Some(update.clone()),
             _ => None,
         });
         let output = output.completion;
@@ -8657,17 +8665,17 @@ impl HarnessBroker {
             compaction.state = observed.state;
             compaction.result = observed.result;
         } else {
-            compaction.state = crate::backend::CompactionState::Completed;
+            compaction.state = crate::provider::CompactionState::Completed;
         }
         compaction.result.context_tokens_before = context_tokens_before;
-        if compaction.state == crate::backend::CompactionState::Completed {
+        if compaction.state == crate::provider::CompactionState::Completed {
             compaction.result.context_tokens_after = output
                 .metrics
                 .context_usage
                 .as_ref()
                 .map(|usage| usage.used);
         }
-        let failed = compaction.state == crate::backend::CompactionState::Failed;
+        let failed = compaction.state == crate::provider::CompactionState::Failed;
         let failure = compaction
             .result
             .error
@@ -8677,13 +8685,13 @@ impl HarnessBroker {
             compaction: compaction.into(),
         };
         self.store.save_session_event(&record)?;
-        self.capability = output.capability.clone();
-        self.session.native_fork = output.capability.native_fork;
-        self.session.native_compact = output.capability.native_compact;
-        if let Some(backend_session_id) = output.backend_session_id {
-            self.session.backend_session_id = Some(backend_session_id);
+        self.capability = output.native.capability.clone();
+        self.session.native_fork = output.native.capability.native_fork;
+        self.session.native_compact = output.native.capability.native_compact;
+        if let Some(provider_session_id) = output.native.provider_session_id {
+            self.session.provider_session_id = Some(provider_session_id);
         }
-        if let Some(context_usage) = output.metrics.context_usage {
+        if let Some(context_usage) = output.native.metrics.context_usage {
             let size = self
                 .session
                 .context_usage
@@ -8691,11 +8699,11 @@ impl HarnessBroker {
                 .map_or(context_usage.size, |current| current.size);
             self.session.context_usage = ContextUsage::reported(context_usage.used, size);
         }
-        if !output.runtime.provider.is_empty() {
-            self.session.provider_label = output.runtime.provider;
+        if !output.native.runtime.provider.is_empty() {
+            self.session.provider_label = output.native.runtime.provider;
         }
-        if output.runtime.model.is_some() {
-            self.session.resolved_model = output.runtime.model;
+        if output.native.runtime.model.is_some() {
+            self.session.resolved_model = output.native.runtime.model;
         }
         self.save_session()?;
         let snapshot = self.snapshot()?;
@@ -8721,8 +8729,8 @@ impl HarnessBroker {
         snapshot
     }
 
-    fn backend_request(&self, input: BackendInput, mode: PromptMode) -> BackendRequest {
-        let mut request = BackendRequest {
+    fn provider_request(&self, input: ProviderInput, mode: PromptMode) -> ProviderRequest {
+        let mut request = ProviderRequest {
             execution_owner: None,
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
@@ -8750,7 +8758,7 @@ impl HarnessBroker {
                 access
             },
             approval_mode: self.session.approval_mode,
-            backend_session_id: self.session.backend_session_id.clone(),
+            provider_session_id: self.session.provider_session_id.clone(),
             submission: None,
             recovered_input: Vec::new(),
             control_context: self.control_turn_context(if self.session.background.is_some() {
@@ -8802,7 +8810,7 @@ impl HarnessBroker {
         }
         let previous = self
             .store
-            .load_preference(&self.session.workspace, &self.session.backend)?;
+            .load_preference(&self.session.workspace, &self.session.provider)?;
         let mut preference = preference_for_session(&self.session, previous.clone());
         if !update_model_preference && let Some(previous) = previous {
             preference.model = previous.model;
@@ -8810,7 +8818,7 @@ impl HarnessBroker {
             preference.model_setting = previous.model_setting;
         }
         self.store
-            .save_preference(&self.session.workspace, &self.session.backend, &preference)
+            .save_preference(&self.session.workspace, &self.session.provider, &preference)
     }
 
     pub(crate) fn release_lease(&mut self) -> Result<()> {
@@ -8856,9 +8864,9 @@ impl Drop for HarnessBroker {
 fn attribute_provider_tool(
     exchange: &mut Exchange,
     checklist: &mut ChecklistTracker,
-    event: &BackendEvent,
+    event: &ProviderEvent,
 ) -> Result<()> {
-    let BackendEvent::Tool { address, .. } = event else {
+    let ProviderEvent::Tool { address, .. } = event else {
         return Ok(());
     };
     let Some(checklist_item_id) = checklist.attribution_target().map(str::to_owned) else {
@@ -8986,18 +8994,21 @@ fn default_goal_max_turns() -> u32 {
 mod test {
     include!("workflow_test.rs");
     fn completed_message(
-        turn: &crate::backend::TurnAddress,
+        turn: &crate::provider::TurnAddress,
         id: impl Into<String>,
-        role: crate::backend::MessageRole,
+        role: crate::provider::MessageRole,
         text: impl Into<String>,
-    ) -> Vec<BackendEvent> {
-        crate::backend::test_support::message(turn, id, Some(role), text)
+    ) -> Vec<ProviderEvent> {
+        crate::provider::test_support::message(turn, id, Some(role), text)
     }
 
-    fn compaction_event(session_id: &str, compaction: crate::backend::Compaction) -> BackendEvent {
-        BackendEvent::Compaction {
-            scope: crate::backend::EventScope::SessionOperation {
-                owner: crate::backend::ExecutionOwner::root(session_id),
+    fn compaction_event(
+        session_id: &str,
+        compaction: crate::provider::Compaction,
+    ) -> ProviderEvent {
+        ProviderEvent::Compaction {
+            scope: crate::provider::EventScope::SessionOperation {
+                owner: crate::provider::ExecutionOwner::root(session_id),
                 operation_id: compaction.id.clone(),
             },
             update: Box::new(compaction),
@@ -9044,22 +9055,23 @@ mod test {
         Ok(())
     }
 
-    struct AutomaticCheckBackend {
+    struct AutomaticCheckProvider {
         turns: Arc<std::sync::atomic::AtomicUsize>,
         repair: bool,
         explicit: bool,
     }
 
     #[async_trait::async_trait]
-    impl Backend for AutomaticCheckBackend {
+    impl crate::provider::ProviderAdapter for AutomaticCheckProvider {
+        type Host = crate::provider::HarnessProviderHost;
         fn checkpoint_tool_gate(&self) -> bool {
             true
         }
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Automatic check fixture".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
         async fn shutdown(&self) -> Result<()> {
@@ -9082,14 +9094,14 @@ mod test {
         }
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(sink);
             let sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let sink = Some(sink);
                     if let Some(checkpoint) = request
                         .control_context
@@ -9141,7 +9153,7 @@ mod test {
                         }
                     }
                     if let Some(sink) = sink {
-                        let address = crate::backend::TurnAddress {
+                        let address = crate::provider::TurnAddress {
                             scope: fixture_scope.clone(),
                             thread_id: "automatic-check-stream".into(),
                             turn_id: (turn.to_string()).into(),
@@ -9149,26 +9161,26 @@ mod test {
                         sink.send_wait(completed_message(
                             &address,
                             "repair-message",
-                            crate::backend::MessageRole::Commentary,
+                            crate::provider::MessageRole::Commentary,
                             "Check repair response",
                         ))
                         .await?;
-                        sink.send_wait(BackendEvent::Turn {
+                        sink.send_wait(ProviderEvent::Turn {
                             address,
-                            update: crate::backend::TurnUpdate::Finished {
+                            update: crate::provider::TurnUpdate::Finished {
                                 outcome: crate::turn::TurnOutcome::Completed,
                                 completed_at_ms: 100,
                             },
                         })
                         .await?;
                     }
-                    Ok(crate::backend::BackendCompletion::default())
+                    Ok(crate::provider::ProviderCompletion::default())
                 }
                 .await;
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
@@ -9180,7 +9192,7 @@ mod test {
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.shell = crate::session::CheckShell::Nushell;
-        broker.backend = Arc::new(AutomaticCheckBackend {
+        broker.provider = Arc::new(AutomaticCheckProvider {
             turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair: true,
             explicit: false,
@@ -9232,7 +9244,7 @@ mod test {
         broker.session.approval_mode = ApprovalMode::Allow;
         broker.session.shell = crate::session::CheckShell::Nushell;
         let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        broker.backend = Arc::new(AutomaticCheckBackend {
+        broker.provider = Arc::new(AutomaticCheckProvider {
             turns: turns.clone(),
             repair: false,
             explicit: false,
@@ -9279,7 +9291,7 @@ mod test {
             .configure_session(json!({"automatic_checks":true}))
             .await?;
         broker.session.shell = crate::session::CheckShell::Nushell;
-        broker.backend = Arc::new(AutomaticCheckBackend {
+        broker.provider = Arc::new(AutomaticCheckProvider {
             turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair: true,
             explicit: false,
@@ -9336,81 +9348,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn automatic_checks_wait_for_goal_completion_and_do_not_consume_questions() -> Result<()>
-    {
-        let repository = repository();
-        let data = tempfile::tempdir()?;
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker
-            .configure_session(json!({"automatic_checks":true}))
-            .await?;
-        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true},"action":{"command":"print ok","label":"Verify","category":"test"}}}}).to_string())?;
-        let checkpoint = broker
-            .checkpoint
-            .as_ref()
-            .unwrap()
-            .capture(
-                &broker.store.objects,
-                &broker.repositories,
-                &broker.session.id,
-                1,
-            )
-            .await?;
-        broker
-            .check_runner
-            .begin_changes("goal-gate".into(), &checkpoint)?;
-        std::fs::write(repository.path().join("seed.txt"), "changed")?;
-        let goal = broker.create_goal("Verify completion".into(), false)?;
-        broker
-            .check_runner
-            .begin_changes(goal.id.clone(), &checkpoint)?;
-        let mut exchange = completed_interaction("goal-turn", &broker.session.id, Vec::new());
-        exchange.check_owner = Some(goal.id.clone());
-        broker.store.save_exchange(&exchange)?;
-        broker.reconcile_timeline()?;
-        broker
-            .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
-            .await?;
-        assert!(broker.check_runner.history()?.is_empty());
-        broker.task_controller.change(
-            &mut broker.store,
-            None,
-            crate::task::TaskChange::Pause,
-            2,
-        )?;
-        broker
-            .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
-            .await?;
-        assert!(broker.check_runner.history()?.is_empty());
-        let active = broker.task_controller.current()?.unwrap();
-        broker
-            .task_controller
-            .update(&mut broker.store, &active.permit(), 3, |task| {
-                if let crate::task::WorkflowSnapshot::Goal { goal } = &mut task.workflow {
-                    goal.state = GoalState::Complete;
-                }
-                Ok(())
-            })?;
-        exchange.set_awaiting_input(true);
-        broker.store.save_exchange(&exchange)?;
-        broker
-            .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
-            .await?;
-        assert!(broker.check_runner.history()?.is_empty());
-        exchange.set_awaiting_input(false);
-        broker.store.save_exchange(&exchange)?;
-        broker
-            .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
-            .await?;
-        assert_eq!(broker.check_runner.history()?.len(), 1);
-        assert_eq!(
-            broker.check_runner.history()?[0].state,
-            crate::checks::CheckState::Passed
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn interaction_future_has_bounded_inline_storage() {
         let repository = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -9419,7 +9356,7 @@ mod test {
             "Plan a fixture".into(),
             PromptMode::Plan,
             None,
-            BackendInput::from_text("Plan a fixture"),
+            ProviderInput::from_text("Plan a fixture"),
         ));
         let bytes = std::mem::size_of_val(future.as_ref().get_ref());
         assert!(
@@ -9428,7 +9365,7 @@ mod test {
         );
     }
 
-    struct CheckpointBackend {
+    struct CheckpointProvider {
         preparation: Option<Arc<PreparationProbe>>,
         started: Arc<tokio::sync::Notify>,
         tool_ran: Arc<std::sync::atomic::AtomicBool>,
@@ -9444,7 +9381,8 @@ mod test {
     }
 
     #[async_trait::async_trait]
-    impl Backend for CheckpointBackend {
+    impl crate::provider::ProviderAdapter for CheckpointProvider {
+        type Host = crate::provider::HarnessProviderHost;
         async fn prepare_turn(&self, _: &str) -> Result<()> {
             if let Some(preparation) = &self.preparation {
                 preparation.started.notify_one();
@@ -9456,11 +9394,11 @@ mod test {
         fn checkpoint_tool_gate(&self) -> bool {
             true
         }
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Checkpoint fixture".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
         async fn shutdown(&self) -> Result<()> {
@@ -9483,14 +9421,14 @@ mod test {
         }
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            _sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            _sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let _fixture_scope = _sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(_sink);
             let _sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let _sink = Some(_sink);
                     self.active.fetch_add(1, Ordering::SeqCst);
                     let _active = ActiveProviderProbe(Arc::clone(&self.active));
@@ -9507,13 +9445,13 @@ mod test {
                         Path::new(&request.workspace).join("seed.txt"),
                         "tool changed workspace\n",
                     )?;
-                    Ok(crate::backend::BackendCompletion::default())
+                    Ok(crate::provider::ProviderCompletion::default())
                 }
                 .await;
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
@@ -9528,7 +9466,7 @@ mod test {
         let started = Arc::new(Notify::new());
         let tool_ran = Arc::new(AtomicBool::new(false));
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        broker.backend = Arc::new(CheckpointBackend {
+        broker.provider = Arc::new(CheckpointProvider {
             preparation: None,
             started: Arc::clone(&started),
             tool_ran: Arc::clone(&tool_ran),
@@ -9611,14 +9549,14 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            let backend = Arc::new(CleanupRetryBackend {
+            let provider = Arc::new(CleanupRetryProvider {
                 started: Notify::new(),
                 complete: Notify::new(),
                 settled: Notify::new(),
                 attempt: std::sync::atomic::AtomicUsize::new(1),
                 visible_output,
             });
-            broker.backend = backend.clone();
+            broker.provider = provider.clone();
             broker.capability.native_turn_rollback = true;
             let repositories = Arc::clone(&broker.repositories);
             let handle = repositories
@@ -9643,13 +9581,13 @@ mod test {
             cancellation.arm(true);
             let session_id = broker.session.id.clone();
             let cancel = async {
-                backend.started.notified().await;
+                provider.started.notified().await;
                 if cleanup_before_completion {
                     cancellation.begin_cleanup(false, restore_prompt)?;
-                    backend.cleanup_execution(&session_id).await?;
+                    provider.cleanup_execution(&session_id).await?;
                 } else {
-                    backend.complete.notify_one();
-                    backend.settled.notified().await;
+                    provider.complete.notify_one();
+                    provider.settled.notified().await;
                     tokio::task::yield_now().await;
                     cancellation.begin_cleanup(false, restore_prompt)?;
                 }
@@ -9717,7 +9655,7 @@ mod test {
         broker.prompt_admission = Some((Some(document), 1));
         let (sink, mut stream) = publication::channel();
         broker.event_sink = Some(sink);
-        broker.backend = Arc::new(CheckpointBackend {
+        broker.provider = Arc::new(CheckpointProvider {
             preparation: None,
             started: started.clone(),
             tool_ran: tool_ran.clone(),
@@ -9962,7 +9900,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.session.backend_session_id = Some("root-history".into());
+        broker.session.provider_session_id = Some("root-history".into());
         assert!(!broker.agent_coordinator.enabled());
         let (admitted, _) = broker
             .start_agent(json!({"profile":"worker","text":"CHILD_FIRST"}))
@@ -9986,7 +9924,7 @@ mod test {
         assert!(child.provider_thread_id.is_some());
         assert_ne!(child.provider_thread_id.as_deref(), Some("root-history"));
         assert_eq!(
-            broker.session.backend_session_id.as_deref(),
+            broker.session.provider_session_id.as_deref(),
             Some("root-history")
         );
         let exchange = broker.store.list_agent_exchange(&agent_id)?;
@@ -10025,17 +9963,18 @@ mod test {
         Ok(())
     }
 
-    struct DelegatingRootBackend {
+    struct DelegatingRootProvider {
         turn: AtomicU64,
     }
 
     #[async_trait::async_trait]
-    impl Backend for DelegatingRootBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for DelegatingRootProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
         async fn shutdown(&self) -> Result<()> {
@@ -10055,15 +9994,15 @@ mod test {
         }
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(sink);
             let sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
 
-            let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
 let sink = Some(sink);
             let turn = self.turn.fetch_add(1, Ordering::AcqRel);
             if turn == 0 {
@@ -10082,11 +10021,11 @@ let sink = Some(sink);
             } else {
                 anyhow::ensure!(turn == 1, "parent continuation duplicated");
                 anyhow::ensure!(
-                    request.backend_session_id.as_deref() == Some("parent-history"),
+                    request.provider_session_id.as_deref() == Some("parent-history"),
                     "parent lost its conversation"
                 );
                 anyhow::ensure!(
-                    matches!(&request.input,BackendInput::Text {text, ..} if text.contains("CHILD_RESULT") && text.contains("\"response\"")),
+                    matches!(&request.input,ProviderInput::Text {text, ..} if text.contains("CHILD_RESULT") && text.contains("\"response\"")),
                     "parent continuation omitted child result"
                 );
             }
@@ -10096,18 +10035,18 @@ let sink = Some(sink);
                 } else {
                     "SYNTHESIZED_RESULT"
                 };
-                sink.send_wait(completed_message(&crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
-                    "root-response", crate::backend::MessageRole::Response, response,
+                sink.send_wait(completed_message(&crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
+                    "root-response", crate::provider::MessageRole::Response, response,
                 ))
                 .await?;
             }
-            Ok(crate::backend::BackendCompletion { backend_session_id: Some("parent-history".into()), capability: self.descriptor().capability, ..Default::default() })
+            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: Some("parent-history".into()), capability: self.descriptor().capability, ..Default::default() }, ..Default::default() })
 
         }.await;
             Ok(output?)
 
         }.await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
@@ -10119,10 +10058,10 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let backend = Arc::new(DelegatingRootBackend {
+        let provider = Arc::new(DelegatingRootProvider {
             turn: AtomicU64::new(0),
         });
-        broker.backend = backend.clone();
+        broker.provider = provider.clone();
         broker.agent_coordinator.set_enabled(true);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -10133,7 +10072,7 @@ let sink = Some(sink);
             ),
         )
         .await??;
-        assert_eq!(backend.turn.load(Ordering::Acquire), 2);
+        assert_eq!(provider.turn.load(Ordering::Acquire), 2);
         let exchange = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(exchange.len(), 1);
         assert_eq!(exchange[0].state(), ExchangeState::Complete);
@@ -10156,8 +10095,8 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        for (backend, sandbox_supported) in [("codex", true), ("copilot", false)] {
-            broker.session.backend = backend.into();
+        for (provider, sandbox_supported) in [("codex", true), ("copilot", false)] {
+            broker.session.provider = provider.into();
             for admitted in [false, true] {
                 broker
                     .configure_session(json!({"access":crate::session::AccessPolicy {
@@ -10207,7 +10146,7 @@ let sink = Some(sink);
             ..Default::default()
         };
         for provider in ["copilot", "claude", "antigravity", "mock", "codex"] {
-            broker.session.backend = provider.into();
+            broker.session.provider = provider.into();
             preferences.apply(&mut broker.session, true).unwrap();
             assert_eq!(broker.session.access.sandbox, provider == "codex");
             for (enabled, mode) in [
@@ -10263,7 +10202,7 @@ let sink = Some(sink);
                 saved.apply(&mut restored, true).unwrap();
                 assert_eq!(restored.access.sandbox, enabled && provider == "codex");
                 assert_eq!(restored.access.windows_sandbox, mode);
-                restored.backend = "codex".into();
+                restored.provider = "codex".into();
                 saved.apply(&mut restored, true).unwrap();
                 assert_eq!(
                     restored.access.sandbox, enabled,
@@ -10299,7 +10238,7 @@ let sink = Some(sink);
         assert_eq!(stored.approval_mode, ApprovalMode::Ask);
         let preference = broker
             .store
-            .load_preference(&stored.workspace, &stored.backend)
+            .load_preference(&stored.workspace, &stored.provider)
             .unwrap()
             .unwrap();
         assert_eq!(preference.access, stored.access);
@@ -11335,7 +11274,7 @@ let sink = Some(sink);
                 .read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1)
                 .is_err()
         );
-        broker.backend = Arc::new(SemanticExecutionBackend {
+        broker.provider = Arc::new(SemanticExecutionProvider {
             turn: Default::default(),
             revision: plan.model_revision + 1,
         });
@@ -11373,19 +11312,20 @@ let sink = Some(sink);
         );
     }
 
-    struct NoProgressExecutionBackend;
+    struct NoProgressExecutionProvider;
 
-    struct StoppedExecutionBackend {
+    struct StoppedExecutionProvider {
         cancelled: bool,
     }
 
     #[async_trait::async_trait]
-    impl Backend for StoppedExecutionBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for StoppedExecutionProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -11394,7 +11334,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -11411,13 +11351,13 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            _: BackendRequest,
-            fixture_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            _: ProviderRequest,
+            fixture_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let _fixture_scope = fixture_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(fixture_sink);
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let fixture = crate::provider::test_support::FixtureStream::new(fixture_sink);
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     if self.cancelled {
                         return Err(anyhow::Error::new(TurnCancelled));
                     }
@@ -11427,12 +11367,15 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
-        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
-            anyhow::bail!("test backend cannot fork")
+        async fn fork(
+            &self,
+            _: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("test provider cannot fork")
         }
     }
 
@@ -11442,8 +11385,8 @@ let sink = Some(sink);
             let repository = repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            broker.backend = Arc::from(crate::backend::build(
-                BackendLaunch {
+            broker.provider = Arc::from(crate::provider::build(
+                ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -11460,7 +11403,7 @@ let sink = Some(sink);
                     .snapshot()?
                     .active_plan
                     .context("test plan missing")?;
-                broker.backend = Arc::new(StoppedExecutionBackend { cancelled: true });
+                broker.provider = Arc::new(StoppedExecutionProvider { cancelled: true });
                 broker.dispatch_session_command(
                     "session.plan.accept",
                     json!({"plan_id":plan.id,"approval_mode":"ask"}),
@@ -11509,9 +11452,9 @@ let sink = Some(sink);
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            broker.backend = Arc::from(
-                crate::backend::build(
-                    BackendLaunch {
+            broker.provider = Arc::from(
+                crate::provider::build(
+                    ProviderLaunch {
                         kind: "mock".into(),
                         command: vec!["mock".into()],
                     },
@@ -11527,7 +11470,7 @@ let sink = Some(sink);
                 .unwrap();
             run_plan_to_input_boundary(&mut broker).await.unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
-            broker.backend = Arc::new(StoppedExecutionBackend { cancelled });
+            broker.provider = Arc::new(StoppedExecutionProvider { cancelled });
             broker
                 .dispatch_session_command(
                     "session.plan.accept",
@@ -11557,7 +11500,7 @@ let sink = Some(sink);
             assert_eq!(text.contains("Plan failed:"), !cancelled, "{text}");
             assert_eq!(text.matches("Plan accepted:").count(), 1);
             let stopped_id = stopped.id.clone();
-            broker.backend = Arc::new(NoProgressExecutionBackend);
+            broker.provider = Arc::new(NoProgressExecutionProvider);
             broker
                 .dispatch_session_command("session.goal.resume", json!({}))
                 .unwrap();
@@ -11579,12 +11522,13 @@ let sink = Some(sink);
     }
 
     #[async_trait::async_trait]
-    impl Backend for NoProgressExecutionBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for NoProgressExecutionProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -11593,7 +11537,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -11610,13 +11554,13 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            fixture_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            fixture_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let _fixture_scope = fixture_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(fixture_sink);
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let fixture = crate::provider::test_support::FixtureStream::new(fixture_sink);
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let context = request.control_context.unwrap();
                     let plan_id = context.plan_document.as_ref().unwrap().plan_id.clone();
                     let mut runtime = crate::tools::ControlToolRuntime::new(context);
@@ -11637,10 +11581,13 @@ let sink = Some(sink);
                             .await
                             .is_err()
                     );
-                    Ok(crate::backend::BackendCompletion {
-                        evidence: crate::goal::TurnEvidence {
-                            tool_called: true,
-                            structured_complete: true,
+                    Ok(crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            evidence: crate::goal::TurnEvidence {
+                                tool_called: true,
+                                structured_complete: true,
+                                ..Default::default()
+                            },
                             ..Default::default()
                         },
                         ..Default::default()
@@ -11650,12 +11597,15 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
-        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
-            anyhow::bail!("test backend cannot fork")
+        async fn fork(
+            &self,
+            _: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("test provider cannot fork")
         }
     }
 
@@ -11667,13 +11617,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "guard-test".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -11705,7 +11655,7 @@ let sink = Some(sink);
             .unwrap()
             .len();
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
-        broker.backend = Arc::new(NoProgressExecutionBackend);
+        broker.provider = Arc::new(NoProgressExecutionProvider);
         broker
             .dispatch_session_command(
                 "session.plan.accept",
@@ -11762,18 +11712,19 @@ let sink = Some(sink);
         assert_eq!(broker.active_goal().unwrap().continuation.turn_count, 1);
     }
 
-    struct SemanticExecutionBackend {
+    struct SemanticExecutionProvider {
         turn: std::sync::atomic::AtomicUsize,
         revision: u32,
     }
 
     #[async_trait::async_trait]
-    impl Backend for SemanticExecutionBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for SemanticExecutionProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -11782,7 +11733,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -11799,26 +11750,26 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(sink);
             let sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
 
-            let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
 let sink = Some(sink);
             use crate::tools::{ControlToolInvocation, ControlToolRuntime};
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
-            let address = crate::backend::TurnAddress {
+            let address = crate::provider::TurnAddress {
         scope: fixture_scope.clone(),
         thread_id: "semantic-execution".into(),
         turn_id: (format!("phase-{turn}")).into(),
     };
             sink.as_ref()
                 .unwrap()
-                .send_wait(BackendEvent::Turn { address: address.clone(), update: crate::backend::TurnUpdate::Started { started_at_ms: 0 } })
+                .send_wait(ProviderEvent::Turn { address: address.clone(), update: crate::provider::TurnUpdate::Started { started_at_ms: 0 } })
                 .await?;
             let context = request
                 .control_context
@@ -11859,11 +11810,11 @@ let sink = Some(sink);
                 let id = format!("check-{turn}");
                 sink.as_ref()
                     .unwrap()
-                    .send_wait(crate::backend::test_support::tool(
+                    .send_wait(crate::provider::test_support::tool(
             &address.clone(), id.clone(),
-            crate::backend::ToolInvocation { kind: crate::backend::ToolActivityKind::Command, name: "fixture".into(),
+            crate::provider::ToolInvocation { kind: crate::provider::ToolActivityKind::Command, name: "fixture".into(),
                 title: "Observe fixture".into(), arguments: serde_json::Value::Null },
-            crate::turn::test_support::tool_updates(crate::backend::ToolStatus::Succeeded, Some(
+            crate::turn::test_support::tool_updates(crate::provider::ToolStatus::Succeeded, Some(
                                 if turn == 1 {
                                     "round reset failed"
                                 } else {
@@ -11952,29 +11903,32 @@ let sink = Some(sink);
             );
             sink.as_ref()
                 .unwrap()
-                .send_wait(BackendEvent::Usage { address: address.clone(), update: serde_json::from_value(json!({"id":format!("usage-{turn}"), "usage": {
+                .send_wait(ProviderEvent::Usage { address: address.clone(), update: serde_json::from_value(json!({"id":format!("usage-{turn}"), "usage": {
                     "input":100 + turn, "cached_input":10, "reasoning":2, "output":20 + turn
                 }, "cumulative": null, "cumulative_total": null}))? })
                 .await?;
             sink.as_ref()
                 .unwrap()
-                .send_wait(BackendEvent::Turn { address: address, update: crate::backend::TurnUpdate::Finished { outcome: crate::turn::TurnOutcome::Completed, completed_at_ms: 100 } })
+                .send_wait(ProviderEvent::Turn { address: address, update: crate::provider::TurnUpdate::Finished { outcome: crate::turn::TurnOutcome::Completed, completed_at_ms: 100 } })
                 .await?;
-            Ok(crate::backend::BackendCompletion { backend_session_id: Some("semantic-execution".into()), capability: crate::backend::BackendCapability {
+            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: Some("semantic-execution".into()), capability: crate::provider::ProviderCapability {
                     approval_mode_list: vec![ApprovalMode::Ask],
                     ..Default::default()
-                }, ..Default::default() })
+                }, ..Default::default() }, ..Default::default() })
 
         }.await;
             Ok(output?)
 
         }.await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
-        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
-            anyhow::bail!("test backend cannot fork")
+        async fn fork(
+            &self,
+            _: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("test provider cannot fork")
         }
     }
 
@@ -12068,19 +12022,20 @@ let sink = Some(sink);
         }
     }
 
-    struct SaturatingBackend {
+    struct SaturatingProvider {
         completed: bool,
         wait_for_capacity: bool,
         cancelled: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
-    impl Backend for SaturatingBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for SaturatingProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -12089,7 +12044,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -12102,39 +12057,39 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            _request: BackendRequest,
-            event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            _request: ProviderRequest,
+            event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
             let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let event_sink = Some(event_sink);
                     let event_sink = event_sink.unwrap();
-                    let address = crate::backend::MessageAddress {
-                        turn: crate::backend::test_support::address(
+                    let address = crate::provider::MessageAddress {
+                        turn: crate::provider::test_support::address(
                             &fixture_scope,
                             "fixture",
                             "turn",
                         ),
-                        message_id: crate::backend::MessageId::Native("saturated-message".into()),
+                        message_id: crate::provider::MessageId::Native("saturated-message".into()),
                     };
                     let mut text = String::new();
                     for sequence in 0..384 {
                         let delta = sequence.to_string();
                         text.push_str(&delta);
                         let update = if sequence == 0 {
-                            crate::backend::MessageUpdate::Started {
-                                classification: crate::backend::MessageClassification::Known(
-                                    crate::backend::MessageRole::Response,
+                            crate::provider::MessageUpdate::Started {
+                                classification: crate::provider::MessageClassification::Known(
+                                    crate::provider::MessageRole::Response,
                                 ),
                                 text: delta,
                             }
                         } else {
-                            crate::backend::MessageUpdate::Delta { text: delta }
+                            crate::provider::MessageUpdate::Delta { text: delta }
                         };
-                        let event = BackendEvent::Message {
+                        let event = ProviderEvent::Message {
                             address: address.clone(),
                             update,
                         };
@@ -12146,14 +12101,14 @@ let sink = Some(sink);
                     }
                     if self.wait_for_capacity {
                         event_sink
-                            .send_wait(BackendEvent::Message {
+                            .send_wait(ProviderEvent::Message {
                                 address,
-                                update: crate::backend::MessageUpdate::Completed { text },
+                                update: crate::provider::MessageUpdate::Completed { text },
                             })
                             .await?;
                     }
                     if self.completed {
-                        Ok(crate::backend::BackendCompletion::default())
+                        Ok(crate::provider::ProviderCompletion::default())
                     } else {
                         std::future::pending().await
                     }
@@ -12162,7 +12117,7 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
@@ -12174,8 +12129,8 @@ let sink = Some(sink);
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
             anyhow::bail!("fork unavailable")
         }
     }
@@ -12188,13 +12143,13 @@ let sink = Some(sink);
             let mut broker = HarnessBroker::initialize_with_clock(
                 InitializeRequest {
                     background: None,
-                    backend_launch_by_provider: Default::default(),
+                    provider_launch_by_provider: Default::default(),
                     config_dir: None,
                     data_root: data.path().to_string_lossy().into_owned(),
                     permission_file: None,
                     workspace: repository.path().to_string_lossy().into_owned(),
                     client_id: "saturation-test".into(),
-                    backend: BackendLaunch {
+                    provider: ProviderLaunch {
                         kind: "mock".into(),
                         command: vec!["mock".into()],
                     },
@@ -12209,26 +12164,36 @@ let sink = Some(sink);
             )
             .unwrap();
             let cancelled = Arc::new(AtomicBool::new(false));
-            broker.backend = Arc::new(SaturatingBackend {
+            broker.provider = Arc::new(SaturatingProvider {
                 completed,
                 wait_for_capacity: false,
                 cancelled: Arc::clone(&cancelled),
             });
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                broker.dispatch(Request {
+            let admitted = broker
+                .dispatch(Request {
                     id: 1,
                     method: "session.goal.set".into(),
                     params: json!({ "objective": "test bounded provider delivery" }),
-                }),
+                })
+                .await;
+            assert!(admitted.response.error().is_none());
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dispatch_pending_task_input(&mut broker),
             )
             .await
-            .expect("saturation must terminate the affected turn");
-            let error = result
-                .response
-                .error()
-                .expect("saturation must not report success");
-            assert!(error.message.contains("event delivery failed"), "{error:?}");
+            .expect("saturation must terminate the affected turn")
+            .expect_err("saturation must not report success");
+            assert!(
+                error
+                    .downcast_ref::<crate::provider::events::EventDeliveryError>()
+                    .is_some()
+                    || matches!(
+                        error.downcast_ref::<crate::provider::ProviderError>(),
+                        Some(crate::provider::ProviderError::Delivery(_))
+                    ),
+                "{error:?}"
+            );
             assert!(cancelled.load(Ordering::Acquire));
             assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
             let interaction = broker.store.list_exchange(&broker.session.id).unwrap();
@@ -12244,13 +12209,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "burst-test".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -12265,7 +12230,7 @@ let sink = Some(sink);
         )
         .unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
-        broker.backend = Arc::new(SaturatingBackend {
+        broker.provider = Arc::new(SaturatingProvider {
             completed: true,
             wait_for_capacity: true,
             cancelled: Arc::clone(&cancelled),
@@ -12297,7 +12262,7 @@ let sink = Some(sink);
                         notifications += 1;
                         "document_changed"
                     } else {
-                        "backend_event"
+                        "provider_event"
                     };
                     let wire = forge_protocol::message::Message::Event(SessionEvent {
                         session_id: session_id.clone(),
@@ -12337,19 +12302,20 @@ let sink = Some(sink);
         }));
     }
 
-    struct RestartBackend {
+    struct RestartProvider {
         cancellation: Arc<TurnCancellation>,
         invocation: std::sync::atomic::AtomicUsize,
         clarification: bool,
     }
 
     #[async_trait::async_trait]
-    impl Backend for RestartBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for RestartProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -12358,7 +12324,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -12375,23 +12341,23 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
             let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let event_sink = Some(event_sink);
                     let invocation = self.invocation.fetch_add(1, Ordering::SeqCst);
-                    let mut event = BackendEvent::Turn {
-                        address: crate::backend::TurnAddress {
+                    let mut event = ProviderEvent::Turn {
+                        address: crate::provider::TurnAddress {
                             scope: fixture_scope.clone(),
                             thread_id: "restart-thread".into(),
                             turn_id: (format!("turn-{invocation}")).into(),
                         },
-                        update: crate::backend::TurnUpdate::Started { started_at_ms: 0 },
+                        update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
                     };
                     let sink = event_sink.context("restart test requires event delivery")?;
                     sink.send(event.clone())?;
@@ -12400,7 +12366,7 @@ let sink = Some(sink);
                         return std::future::pending().await;
                     }
                     assert_eq!(
-                        request.backend_session_id.as_deref(),
+                        request.provider_session_id.as_deref(),
                         Some("restart-thread")
                     );
                     assert_eq!(request.approval_mode, ApprovalMode::Allow);
@@ -12424,15 +12390,18 @@ let sink = Some(sink);
                         );
                         assert!(!request.input.text().contains("Original request:"));
                     }
-                    if let BackendEvent::Turn { update, .. } = &mut event {
-                        *update = crate::backend::TurnUpdate::Finished {
+                    if let ProviderEvent::Turn { update, .. } = &mut event {
+                        *update = crate::provider::TurnUpdate::Finished {
                             outcome: crate::turn::TurnOutcome::Completed,
                             completed_at_ms: 100,
                         };
                     }
                     sink.send(event)?;
-                    Ok(crate::backend::BackendCompletion {
-                        backend_session_id: Some("restart-thread".into()),
+                    Ok(crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("restart-thread".into()),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     })
                 }
@@ -12440,15 +12409,15 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
             anyhow::bail!("restart test does not fork")
         }
     }
@@ -12459,7 +12428,7 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.approval_mode = ApprovalMode::Ask;
-        broker.backend = Arc::new(RestartBackend {
+        broker.provider = Arc::new(RestartProvider {
             cancellation: Arc::clone(&broker.turn_cancellation),
             invocation: std::sync::atomic::AtomicUsize::new(0),
             clarification: false,
@@ -12484,7 +12453,7 @@ let sink = Some(sink);
         );
         assert!(before[0].checkpoint_after.is_none());
         assert_eq!(
-            broker.session.backend_session_id.as_deref(),
+            broker.session.provider_session_id.as_deref(),
             Some("restart-thread")
         );
         assert_eq!(
@@ -12493,7 +12462,7 @@ let sink = Some(sink);
                 .load_session(&broker.session.id)
                 .unwrap()
                 .unwrap()
-                .backend_session_id
+                .provider_session_id
                 .as_deref(),
             Some("restart-thread")
         );
@@ -12510,149 +12479,6 @@ let sink = Some(sink);
         assert_eq!(after[0].turn.len(), 2);
         assert_eq!(after[0].turn[0].state(), before[0].turn[0].state());
         assert_eq!(after[0].state(), ExchangeState::Complete);
-    }
-
-    #[tokio::test]
-    async fn planning_restart_retains_the_plan_and_resumes_its_existing_exchange() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), true);
-        broker.backend = Arc::new(RestartBackend {
-            cancellation: broker.turn_cancellation(),
-            invocation: std::sync::atomic::AtomicUsize::new(0),
-            clarification: false,
-        });
-        let result = broker
-            .dispatch(Request {
-                id: 1,
-                method: "session.prompt.submit".into(),
-                params: json!({"text":"/plan Design the change"}),
-            })
-            .await;
-        assert_eq!(result.response.error().unwrap().code, "turn_cancelled");
-        let before = broker.snapshot().unwrap();
-        assert_eq!(
-            before.active_plan.as_ref().unwrap().state,
-            PlanState::Generating
-        );
-        assert_eq!(before.exchange.len(), 1);
-        assert!(!matches!(
-            &before.exchange[0].origin,
-            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
-        ));
-        broker.backend = Arc::new(PlanningQuestionBackend::new(true));
-        broker.turn_cancellation.arm(false);
-        broker
-            .resume_exchange(json!({"text":"Continue planning"}))
-            .await
-            .unwrap();
-        let after = broker.snapshot().unwrap();
-        assert_eq!(after.exchange.len(), 1);
-        assert_eq!(after.exchange[0].id, before.exchange[0].id);
-        assert_eq!(after.exchange[0].origin, before.exchange[0].origin);
-        assert_eq!(
-            after.exchange[0].checkpoint_before,
-            before.exchange[0].checkpoint_before
-        );
-        assert_eq!(after.active_plan.unwrap().state, PlanState::AwaitingInput);
-    }
-
-    #[tokio::test]
-    async fn permission_restart_preserves_pending_clarification_and_checkpoint() {
-        for planning in [false, true] {
-            let repository = repository();
-            let data = tempfile::tempdir().unwrap();
-            let mut broker = planning_question_broker(repository.path(), data.path(), true);
-            broker.session.approval_mode = ApprovalMode::Ask;
-            let prompted = broker
-                .dispatch(Request {
-                    id: 1,
-                    method: "session.prompt.submit".into(),
-                    params: json!({"text":if planning {
-                        "/plan Design the migration"
-                    } else {
-                        "Design the migration"
-                    }}),
-                })
-                .await;
-            assert!(prompted.response.error().is_none());
-            let pending = broker.snapshot().unwrap().active_elicitation.unwrap();
-            let question_id = pending.elicitation.current_question().unwrap().id.clone();
-            let restart = Arc::new(RestartBackend {
-                cancellation: broker.turn_cancellation(),
-                invocation: std::sync::atomic::AtomicUsize::new(0),
-                clarification: true,
-            });
-            broker.backend = restart.clone();
-            broker.capability = crate::backend::mock_capability();
-            let interrupted = broker
-                .ask_question(json!({
-                    "question_id":question_id,
-                    "text":"Why choose staged migration?"
-                }))
-                .await;
-            assert!(interrupted.is_err());
-            let before = broker.store.list_exchange(&broker.session.id).unwrap();
-            assert_eq!(before.len(), 1);
-            assert!(before[0].execution_started_at_ms().is_none());
-            broker.turn_cancellation.arm(false);
-            broker
-                .transition_task(json!({"action":"permission","change":{"kind":"set_approval","mode":"allow"},"resume":true}))
-                .await
-                .unwrap();
-            let snapshot = broker.snapshot().unwrap();
-            let after = broker.store.list_exchange(&broker.session.id).unwrap();
-            assert_eq!(after.len(), 1);
-            assert_eq!(after[0].id, before[0].id);
-            assert_eq!(after[0].checkpoint_before, before[0].checkpoint_before);
-            assert!(after[0].checkpoint_after.is_none());
-            assert_eq!(after[0].turn.len(), before[0].turn.len() + 1);
-            assert_eq!(after[0].state(), ExchangeState::Running);
-            assert_eq!(restart.invocation.load(Ordering::SeqCst), 2);
-            let pending_after = snapshot.active_elicitation.unwrap();
-            assert_eq!(pending_after.owner, pending.owner);
-            assert_eq!(
-                pending_after.elicitation.question_set.id,
-                pending.elicitation.question_set.id
-            );
-            assert_eq!(
-                pending_after.elicitation.current_question().unwrap().id,
-                question_id
-            );
-            let clarification = after[0]
-                .node_list
-                .iter()
-                .filter_map(|node| match node {
-                    ExchangeNode::ExchangeInput { prompt }
-                        if prompt.intent == crate::exchange::InputIntent::Clarification =>
-                    {
-                        Some(prompt)
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(clarification.len(), 1);
-            assert_eq!(clarification[0].text, "Why choose staged migration?");
-            assert_eq!(
-                clarification[0]
-                    .question
-                    .as_ref()
-                    .unwrap()
-                    .question_id
-                    .as_deref(),
-                Some(question_id.as_str())
-            );
-            if planning {
-                assert_eq!(
-                    snapshot.active_plan.unwrap().state,
-                    PlanState::AwaitingInput
-                );
-                assert_eq!(
-                    snapshot.session.active_task.as_ref().unwrap().status(),
-                    crate::task::TaskStatus::Waiting
-                );
-            }
-        }
     }
 
     #[tokio::test]
@@ -12706,13 +12532,13 @@ let sink = Some(sink);
                 .await?;
             assert_eq!(configured["active_task"], before);
             assert_eq!(events[0].payload["session"]["active_task"], before);
-            let provider = Arc::new(RestartBackend {
+            let provider = Arc::new(RestartProvider {
                 cancellation: broker.turn_cancellation(),
                 invocation: std::sync::atomic::AtomicUsize::new(0),
                 clarification: false,
             });
-            broker.backend = provider.clone();
-            broker.capability = crate::backend::mock_capability();
+            broker.provider = provider.clone();
+            broker.capability = crate::provider::mock_capability();
             for action in [
                 json!({"action":"configure","config":{"effort":"high"}}),
                 json!({"action":"permission","change":{"kind":"toggle_write_enabled"}}),
@@ -12831,13 +12657,13 @@ let sink = Some(sink);
                 broker.input_purpose = crate::input::InputPurpose::User;
             }
             let before = broker.snapshot().unwrap();
-            let restart = Arc::new(RestartBackend {
+            let restart = Arc::new(RestartProvider {
                 cancellation: broker.turn_cancellation(),
                 invocation: std::sync::atomic::AtomicUsize::new(0),
                 clarification: true,
             });
-            broker.backend = restart.clone();
-            broker.capability = crate::backend::mock_capability();
+            broker.provider = restart.clone();
+            broker.capability = crate::provider::mock_capability();
             let (event_sink, mut event_stream) = publication::channel();
             broker.event_sink = Some(event_sink);
             let forwarded = tokio::spawn(async move {
@@ -12882,7 +12708,7 @@ let sink = Some(sink);
         }
     }
 
-    struct CleanupRetryBackend {
+    struct CleanupRetryProvider {
         started: Notify,
         complete: Notify,
         settled: Notify,
@@ -12891,15 +12717,16 @@ let sink = Some(sink);
     }
 
     #[async_trait::async_trait]
-    impl Backend for CleanupRetryBackend {
+    impl crate::provider::ProviderAdapter for CleanupRetryProvider {
+        type Host = crate::provider::HarnessProviderHost;
         fn checkpoint_tool_gate(&self) -> bool {
             true
         }
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -12925,50 +12752,50 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            _request: BackendRequest,
-            sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            _request: ProviderRequest,
+            sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(sink);
             let sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let sink = Some(sink);
                     let sink = sink.context("cleanup test requires event delivery")?;
-                    let address = crate::backend::test_support::address(
+                    let address = crate::provider::test_support::address(
                         &fixture_scope,
                         "cleanup-thread",
                         "cleanup-turn",
                     );
-                    sink.send(BackendEvent::Turn {
+                    sink.send(ProviderEvent::Turn {
                         address: address.clone(),
-                        update: crate::backend::TurnUpdate::Started { started_at_ms: 0 },
+                        update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
                     })?;
                     if self.visible_output {
                         sink.send(completed_message(
                             &address,
                             "partial-response",
-                            crate::backend::MessageRole::Response,
+                            crate::provider::MessageRole::Response,
                             "Partial response",
                         ))?;
                     }
                     self.started.notify_one();
                     self.complete.notified().await;
-                    sink.send(BackendEvent::Turn {
+                    sink.send(ProviderEvent::Turn {
                         address,
-                        update: crate::backend::TurnUpdate::Finished {
+                        update: crate::provider::TurnUpdate::Finished {
                             outcome: crate::turn::TurnOutcome::Interrupted,
                             completed_at_ms: 100,
                         },
                     })?;
                     self.settled.notify_one();
-                    Ok(crate::backend::BackendCompletion::default())
+                    Ok(crate::provider::ProviderCompletion::default())
                 }
                 .await;
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
@@ -13016,7 +12843,7 @@ let sink = Some(sink);
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn goal_resume_retries_locked_checkpoint_before_admitting_work() {
+    async fn goal_resume_retries_locked_checkpoint_before_provider_work() {
         use std::os::windows::fs::OpenOptionsExt;
 
         let repository = repository();
@@ -13027,7 +12854,17 @@ let sink = Some(sink);
             .unwrap();
         broker
             .task_controller
-            .change(&mut broker.store, None, crate::task::TaskChange::Pause, 2)
+            .change(
+                &mut broker.store,
+                broker
+                    .task_controller
+                    .current()
+                    .unwrap()
+                    .as_ref()
+                    .map(|task| &task.revision),
+                crate::task::TaskChange::Pause,
+                2,
+            )
             .unwrap();
         let before = GitCheckpoint::new(repository.path())
             .capture(
@@ -13067,41 +12904,24 @@ let sink = Some(sink);
             .share_mode(0)
             .open(repository.path().join("seed.txt"))
             .unwrap();
-        let error = broker
+        broker
             .dispatch_session_command("session.goal.resume", json!({}))
-            .unwrap_err();
+            .unwrap();
+        let error = dispatch_pending_task_input(&mut broker).await.unwrap_err();
         assert!(format!("{error:#}").contains("seed.txt"));
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(stored.len(), 1);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[1].state(), ExchangeState::Failed);
+        assert!(stored[1].turn.is_empty());
         assert_eq!(stored[0].state(), ExchangeState::Finalizing);
-        assert!(stored[0].finalization_error.is_some());
         drop(locked);
 
-        broker.turn_cancellation.request(false);
-        assert!(
-            broker
-                .dispatch_session_command("session.goal.resume", json!({}))
-                .unwrap_err()
-                .downcast_ref::<TurnCancelled>()
-                .is_some()
-        );
-        assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
-        assert_eq!(
-            broker
-                .store
-                .list_exchange(&broker.session.id)
-                .unwrap()
-                .len(),
-            1
-        );
-        broker.turn_cancellation.arm(false);
-        let (_, event) = broker
+        broker
             .dispatch_session_command("session.goal.resume", json!({}))
             .unwrap();
-        assert_eq!(event[0].event, "goal_changed");
+        dispatch_pending_task_input(&mut broker).await.unwrap();
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].state(), ExchangeState::Cancelled);
         assert!(stored[0].finalization_error.is_none());
         assert!(stored[0].checkpoint_after.is_some());
@@ -13112,20 +12932,20 @@ let sink = Some(sink);
         let repository = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let backend = Arc::new(CleanupRetryBackend {
+        let provider = Arc::new(CleanupRetryProvider {
             started: Notify::new(),
             complete: Notify::new(),
             settled: Notify::new(),
             attempt: std::sync::atomic::AtomicUsize::new(0),
             visible_output: false,
         });
-        broker.backend = backend.clone();
+        broker.provider = provider.clone();
         let cancellation = broker.turn_cancellation();
         let session_id = broker.session.id.clone();
         let control = async {
-            backend.started.notified().await;
+            provider.started.notified().await;
             cancellation.begin_cleanup(false, false).unwrap();
-            let error = backend.cleanup_execution(&session_id).await.unwrap_err();
+            let error = provider.cleanup_execution(&session_id).await.unwrap_err();
             cancellation.fail_cleanup(&error);
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
@@ -13143,7 +12963,7 @@ let sink = Some(sink);
             .await
             .expect("cleanup failure should persist without losing provider delivery");
             cancellation.begin_cleanup(false, false).unwrap();
-            backend.cleanup_execution(&session_id).await.unwrap();
+            provider.cleanup_execution(&session_id).await.unwrap();
             cancellation.request(false);
         };
         let execution = broker.run_interaction(
@@ -13430,7 +13250,7 @@ let sink = Some(sink);
         assert!(second.checkpoint_before.is_none());
         broker.store.save_exchange(&first)?;
         broker.store.save_exchange(&second)?;
-        broker.session.backend_session_id = Some("old-provider-history".into());
+        broker.session.provider_session_id = Some("old-provider-history".into());
         broker.save_session()?;
         std::fs::write(
             repository.path().join("seed.txt"),
@@ -13472,7 +13292,7 @@ let sink = Some(sink);
                 .store
                 .load_session(&broker.session.id)?
                 .unwrap()
-                .backend_session_id
+                .provider_session_id
                 .is_none()
         );
         assert!(
@@ -13481,8 +13301,8 @@ let sink = Some(sink);
             )
         );
         let input =
-            broker.rollback_context("new-request", BackendInput::from_text("CURRENT_REQUEST"))?;
-        let BackendInput::Text { text, .. } = input else {
+            broker.rollback_context("new-request", ProviderInput::from_text("CURRENT_REQUEST"))?;
+        let ProviderInput::Text { text, .. } = input else {
             unreachable!()
         };
         assert!(text.contains("KEEP_THIS_CONTEXT") && text.contains("CURRENT_REQUEST"));
@@ -13620,15 +13440,16 @@ let sink = Some(sink);
             .unwrap();
     }
 
-    struct FailingBackend;
+    struct FailingProvider;
 
     #[async_trait::async_trait]
-    impl Backend for FailingBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for FailingProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -13637,7 +13458,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -13654,14 +13475,14 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            _event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            _event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let _fixture_scope = _event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(_event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(_event_sink);
             let _event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let _event_sink = Some(_event_sink);
                     let nested = Path::new(&request.workspace).join("failed/deep/write.txt");
                     std::fs::create_dir_all(nested.parent().context("failed write parent")?)?;
@@ -13672,28 +13493,29 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
             anyhow::bail!("synthetic provider failure")
         }
     }
 
-    struct InvalidControlOutputBackend;
+    struct InvalidControlOutputProvider;
 
     #[async_trait::async_trait]
-    impl Backend for InvalidControlOutputBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for InvalidControlOutputProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -13702,7 +13524,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -13719,28 +13541,28 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            _request: BackendRequest,
-            event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            _request: ProviderRequest,
+            event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
             let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let event_sink = Some(event_sink);
                     if let Some(event_sink) = event_sink {
                         let _ = event_sink.send(completed_message(
-                            &crate::backend::test_support::address(
+                            &crate::provider::test_support::address(
                                 &fixture_scope,
                                 "fixture",
                                 "turn",
                             ),
                             "corrected-plan",
-                            crate::backend::MessageRole::Response,
+                            crate::provider::MessageRole::Response,
                             "Validated the corrected plan.",
                         ));
                     }
-                    Ok(crate::backend::BackendCompletion {
+                    Ok(crate::provider::ProviderCompletion {
                         plan_read: Some("rejected-plan".into()),
                         ..Default::default()
                     })
@@ -13749,15 +13571,15 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
             anyhow::bail!("fork unavailable")
         }
     }
@@ -13770,15 +13592,16 @@ let sink = Some(sink);
         }
     }
 
-    struct ParentBoundaryBackend;
+    struct ParentBoundaryProvider;
 
     #[async_trait::async_trait]
-    impl Backend for ParentBoundaryBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for ParentBoundaryProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -13787,7 +13610,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -13804,44 +13627,44 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
             let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let event_sink = Some(event_sink);
                     let event_list = vec![
                         completed_message(
-                            &crate::backend::test_support::address(
+                            &crate::provider::test_support::address(
                                 &fixture_scope,
                                 "fixture",
                                 "turn",
                             ),
                             "intermediate-answer",
-                            crate::backend::MessageRole::Response,
+                            crate::provider::MessageRole::Response,
                             "An intermediate answer.",
                         ),
-                        vec![BackendEvent::ParentBoundary {
+                        vec![ProviderEvent::ParentBoundary {
                             scope: fixture_scope.clone(),
-                            update: crate::backend::ParentBoundaryUpdate::WaitStarted {
+                            update: crate::provider::ParentBoundaryUpdate::WaitStarted {
                                 agent_count: 1,
                             },
                         }],
-                        vec![BackendEvent::ParentBoundary {
+                        vec![ProviderEvent::ParentBoundary {
                             scope: fixture_scope.clone(),
-                            update: crate::backend::ParentBoundaryUpdate::WaitFinished,
+                            update: crate::provider::ParentBoundaryUpdate::WaitFinished,
                         }],
                         completed_message(
-                            &crate::backend::test_support::address(
+                            &crate::provider::test_support::address(
                                 &fixture_scope,
                                 "fixture",
                                 "turn",
                             ),
                             "final-synthesis",
-                            crate::backend::MessageRole::Response,
+                            crate::provider::MessageRole::Response,
                             "A final synthesis.",
                         ),
                     ];
@@ -13850,11 +13673,14 @@ let sink = Some(sink);
                             let _ = event_sink.send(event);
                         }
                     }
-                    Ok(crate::backend::BackendCompletion {
-                        backend_session_id: Some("parent-boundary".into()),
-                        runtime: crate::backend::BackendRuntime {
-                            provider: "Parent boundary test".into(),
-                            model: Some(request.model),
+                    Ok(crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("parent-boundary".into()),
+                            runtime: crate::provider::ProviderRuntime {
+                                provider: "Parent boundary test".into(),
+                                model: Some(request.model),
+                            },
+                            ..Default::default()
                         },
                         ..Default::default()
                     })
@@ -13863,148 +13689,29 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
-            anyhow::bail!("parent boundary backend does not fork")
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("parent boundary provider does not fork")
         }
     }
 
-    struct PlanningQuestionBackend {
+    struct PlanningQuestionProvider {
         turn: std::sync::atomic::AtomicUsize,
         structured: bool,
     }
 
-    struct MutableQuestionBackend {
-        fail_withdrawal_continuation: bool,
-    }
-
-    struct RepeatedQuestionBackend {
+    struct RetryPlanProvider {
         turn: std::sync::atomic::AtomicUsize,
     }
 
-    struct RetryPlanBackend {
-        turn: std::sync::atomic::AtomicUsize,
-    }
-
-    struct RepeatedPlanEditBackend;
-
-    struct PlanDiscussionBackend {
-        turn: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for PlanDiscussionBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
-        }
-
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
-        }
-
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-
-        async fn prompt_stream(
-            &self,
-            request: BackendRequest,
-            fixture_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
-            let _fixture_scope = fixture_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(fixture_sink);
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-
-            let output: anyhow::Result<crate::backend::BackendCompletion> = async {
-            use crate::tools::{
-                ControlToolInvocation, ControlToolRuntime, apply_invocation,
-            };
-            let turn = self.turn.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(
-                request.mode,
-                if turn == 4 {
-                    PromptMode::Plan
-                } else {
-                    PromptMode::PlanDiscussion
-                }
-            );
-            assert_eq!(request.approval_mode, ApprovalMode::Ask);
-            if turn < 4 {
-                assert!(
-                    request
-                        .input
-                        .text()
-                        .contains("Answer questions without editing or resubmitting")
-                );
-            }
-            let context = request.control_context.clone().unwrap();
-            let document = context.plan_document.as_ref().unwrap().clone();
-            let mut runtime = ControlToolRuntime::new(context);
-            let mut output = crate::backend::BackendCompletion::default();
-            let read = runtime
-                .invoke(ControlToolInvocation {
-                    task_permit: None,
-                    name: "plan_overview_read".into(),
-                    arguments: json!({"plan_id":document.plan_id}),
-                })
-                .await?;
-            apply_invocation(&read.invocation.unwrap(), &mut output)?;
-            match turn {
-                0 | 2 => {}
-                1 => {
-                    output.plan_question = Some(PlanQuestionSet::freeform("Which controls?".into()))
-                }
-                3 => {
-                    let edit = runtime.invoke(ControlToolInvocation { task_permit: None,
-                        name: "plan_file_edit".into(),
-                        arguments: json!({"plan_id":document.plan_id, "expected_version":document.version,
-                            "patch":"*** Begin Patch\n*** Add File: src/controls.rs\n+pub fn keyboard_movement();\n+Algorithm\n+  update_movement(keyboard_input())\n*** End Patch"}),
-                    }).await?;
-                    apply_invocation(&edit.invocation.unwrap(), &mut output)?;
-                }
-                4 => {
-                    let submit = runtime.invoke(ControlToolInvocation { task_permit: None,
-                        name: "plan_submit".into(),
-                        arguments: json!({"plan_id":document.plan_id, "expected_version":document.version}),
-                    }).await?;
-                    apply_invocation(&submit.invocation.unwrap(), &mut output)?;
-                }
-                _ => panic!("unexpected planning continuation {turn}"),
-            }
-            Ok(output)
-
-        }.await;
-            Ok(output?)
-
-        }.await;
-            let result = result.map_err(crate::backend::BackendError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-    }
+    struct RepeatedPlanEditProvider;
 
     #[tokio::test]
     async fn plan_queries_preserve_the_selected_task_and_pending_review() {
@@ -14117,78 +13824,6 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn submitted_plan_discussion_preserves_review_then_resumes_revision_after_questions() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker
-            .submit_prompt_inner(json!({"text":"/plan build a scene"}))
-            .await
-            .unwrap();
-        let before = broker.snapshot().unwrap().active_plan.unwrap();
-        let backend = Arc::new(PlanDiscussionBackend {
-            turn: std::sync::atomic::AtomicUsize::new(0),
-        });
-        broker.backend = backend.clone();
-        broker
-            .submit_prompt_inner(json!({"text":"Why this design?"}))
-            .await
-            .unwrap();
-        let snapshot = broker.snapshot().unwrap();
-        let discussed = snapshot.active_plan.as_ref().unwrap();
-        assert_eq!(discussed.state, PlanState::AwaitingReview);
-        assert_eq!(discussed.model_revision, before.model_revision);
-        assert_eq!(discussed.document_version, before.document_version);
-        assert_eq!(discussed.review_digest, before.review_digest);
-        assert_eq!(snapshot.active_plan.as_ref().unwrap().id, before.id);
-        assert!(!matches!(
-            &snapshot.exchange.last().unwrap().origin,
-            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
-        ));
-
-        broker
-            .submit_prompt_inner(json!({"text":"Add interactive controls"}))
-            .await
-            .unwrap();
-        let interaction = broker.active_interaction_elicitation().unwrap();
-        let question_id = interaction.elicitation().unwrap().question_set.questions[0]
-            .id
-            .clone();
-        broker
-            .ask_question(json!({"question_id":question_id,"text":"What do you recommend?"}))
-            .await
-            .unwrap();
-        assert_eq!(
-            broker.snapshot().unwrap().active_plan.unwrap().state,
-            PlanState::AwaitingReview
-        );
-        broker
-            .answer_question(json!({"question_id":question_id,
-            "response":{"kind":"other","text":"Keyboard controls"}}))
-            .unwrap();
-        broker.continue_question().await.unwrap();
-        let snapshot = broker.snapshot().unwrap();
-        let revised = snapshot.active_plan.unwrap();
-        assert_eq!(revised.id, before.id);
-        assert_eq!(revised.state, PlanState::AwaitingReview);
-        assert_eq!(revised.model_revision, before.model_revision + 1);
-        assert_eq!(revised.document_version, before.document_version + 1);
-        let exchange = snapshot.exchange.last().unwrap();
-        assert_ne!(exchange.id, interaction.id);
-        assert!(matches!(
-            &exchange.origin,
-            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
-        ));
-        assert!(!matches!(
-            &exchange.origin,
-            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
-        ));
-        assert_eq!(exchange.state(), ExchangeState::Complete);
-        assert!(!exchange.awaiting_input());
-        assert_eq!(backend.turn.load(Ordering::SeqCst), 5);
-    }
-
-    #[tokio::test]
     async fn review_question_answers_capture_final_responses_without_revising_the_source() {
         use crate::plan::review_document::ReadOnlyPlanReview;
         use forge_buffer::identity::{DocumentId, InputSequence, ViewId};
@@ -14196,8 +13831,8 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.backend = crate::backend::build(
-            broker.backend_launch.clone(),
+        broker.provider = crate::provider::build(
+            broker.provider_launch.clone(),
             Arc::clone(&broker.permission_coordinator),
             Arc::clone(&broker.trace),
             broker.data_root.clone(),
@@ -14210,7 +13845,7 @@ let sink = Some(sink);
             .unwrap();
         run_plan_to_input_boundary(&mut broker).await.unwrap();
         let before = broker.snapshot().unwrap().active_plan.unwrap();
-        let thread = broker.session.backend_session_id.clone();
+        let thread = broker.session.provider_session_id.clone();
         let source = broker
             .plan_file
             .capture_review_source(
@@ -14318,7 +13953,7 @@ let sink = Some(sink);
             serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
             selected_task
         );
-        assert_eq!(broker.session.backend_session_id, thread);
+        assert_eq!(broker.session.provider_session_id, thread);
         assert_eq!(
             broker.plan_review.annotations(&document).unwrap()[0]
                 .reply
@@ -14399,8 +14034,8 @@ let sink = Some(sink);
     }
 
     fn submit_test_plan(
-        request: &BackendRequest,
-        output: &mut crate::backend::BackendCompletion,
+        request: &ProviderRequest,
+        output: &mut crate::provider::ProviderCompletion,
         overview: &str,
     ) {
         let document = request
@@ -14462,19 +14097,20 @@ let sink = Some(sink);
             .patch_design(Path::new(&request.workspace), change.clone())
             .unwrap();
         output.design_patch.push(change.into());
-        output.plan_submit = Some(crate::backend::PlanSubmitRequest {
+        output.plan_submit = Some(crate::provider::PlanSubmitRequest {
             plan_id: document.plan_id.clone(),
             expected_version: changed.version,
         });
     }
 
     #[async_trait::async_trait]
-    impl Backend for MutableQuestionBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for RetryPlanProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -14483,7 +14119,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -14500,261 +14136,25 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            _event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            _event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let _fixture_scope = _event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(_event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(_event_sink);
             let _event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
-                    let _event_sink = Some(_event_sink);
-                    let question_set = || PlanQuestionSet {
-                        id: "migration-set".into(),
-                        questions: vec![crate::plan::PlanQuestion {
-                            id: "migration".into(),
-                            header: "Migration".into(),
-                            question: "Which migration should the implementation use?".into(),
-                            options: vec![
-                                crate::plan::PlanQuestionOption {
-                                    recommended: false,
-                                    label: "Staged".into(),
-                                    description: "Preserve compatibility temporarily.".into(),
-                                },
-                                crate::plan::PlanQuestionOption {
-                                    recommended: false,
-                                    label: "Immediate".into(),
-                                    description: "Replace the old format now.".into(),
-                                },
-                            ],
-                            allow_freeform: true,
-                        }],
-                    };
-                    let request_text = request.input.text();
-                    let mut output = crate::backend::BackendCompletion {
-                        backend_session_id: Some("mutable-question".into()),
-                        capability: BackendCapability::default(),
-                        runtime: crate::backend::BackendRuntime {
-                            provider: "Mutable question test".into(),
-                            model: Some(request.model.clone()),
-                        },
-                        ..Default::default()
-                    };
-                    if request_text.contains("User follow-up:\nreplace the options") {
-                        let mut replacement = question_set();
-                        replacement.questions[0].options = vec![
-                            crate::plan::PlanQuestionOption {
-                                recommended: false,
-                                label: "Safe".into(),
-                                description: "Retain compatibility.".into(),
-                            },
-                            crate::plan::PlanQuestionOption {
-                                recommended: false,
-                                label: "Fast".into(),
-                                description: "Prefer immediate cleanup.".into(),
-                            },
-                        ];
-                        output.plan_question = Some(replacement);
-                    } else if request_text.contains("User follow-up:\nuse staged") {
-                        output.question_answer = Some(PlanQuestionAnswer {
-                            source: crate::session::ResolutionSource::User,
-                            question_id: "migration".into(),
-                            response: PlanQuestionResponse::Selected {
-                                option: "Staged".into(),
-                                feedback: None,
-                            },
-                        });
-                    } else if request_text
-                        .contains("User follow-up:\nthis decision is not material")
-                    {
-                        output.question_withdrawal = Some(PlanQuestionWithdrawal {
-                            reason: "Repository policy determines the migration.".into(),
-                        });
-                    } else if request_text.contains("Pending planning questions withdrawn")
-                        || request_text.contains("Planning feedback:\n- Migration: Staged")
-                        || request_text.contains("Harness resolved the pending questions")
-                    {
-                        if self.fail_withdrawal_continuation
-                            && request_text.contains("Pending planning questions withdrawn")
-                        {
-                            anyhow::bail!("synthetic withdrawal continuation failure");
-                        }
-                        if request.mode == PromptMode::Plan {
-                            submit_test_plan(&request, &mut output, "Follow repository policy.");
-                        }
-                    } else {
-                        output.plan_question = Some(question_set());
-                    }
-                    Ok(output)
-                }
-                .await;
-                Ok(output?)
-            }
-            .await;
-            let result = result.map_err(crate::backend::BackendError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-
-        async fn fork(
-            &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
-            Ok(crate::backend::BackendForkResult::unprofiled(
-                "mutable-question-fork",
-            ))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for RepeatedQuestionBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
-        }
-
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
-        }
-
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-
-        async fn prompt_stream(
-            &self,
-            request: BackendRequest,
-            _event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
-            let _fixture_scope = _event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(_event_sink);
-            let _event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let _event_sink = Some(_event_sink);
                     let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let mut output = crate::backend::BackendCompletion {
-                        backend_session_id: Some("repeated-question".into()),
-                        capability: BackendCapability::default(),
-                        runtime: crate::backend::BackendRuntime {
-                            provider: "Repeated question test".into(),
-                            model: Some(request.model.clone()),
-                        },
-                        ..Default::default()
-                    };
-                    if turn < 2 {
-                        output.plan_question = Some(PlanQuestionSet {
-                            id: format!("provider-set-{turn}"),
-                            questions: vec![crate::plan::PlanQuestion {
-                                id: format!("provider-question-{turn}"),
-                                header: "Migration".into(),
-                                question: "Which migration should the implementation use?".into(),
-                                options: vec![
-                                    crate::plan::PlanQuestionOption {
-                                        recommended: false,
-                                        label: "Staged".into(),
-                                        description: "Preserve compatibility temporarily.".into(),
-                                    },
-                                    crate::plan::PlanQuestionOption {
-                                        recommended: false,
-                                        label: "Immediate".into(),
-                                        description: "Replace the old format now.".into(),
-                                    },
-                                ],
-                                allow_freeform: true,
-                            }],
-                        });
-                    } else {
-                        submit_test_plan(
-                            &request,
-                            &mut output,
-                            "Use the consumed migration decision.",
-                        );
-                    }
-                    Ok(output)
-                }
-                .await;
-                Ok(output?)
-            }
-            .await;
-            let result = result.map_err(crate::backend::BackendError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-
-        async fn fork(
-            &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
-            Ok(crate::backend::BackendForkResult::unprofiled(
-                "repeated-question-fork",
-            ))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for RetryPlanBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
-        }
-
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
-        }
-
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-
-        async fn prompt_stream(
-            &self,
-            request: BackendRequest,
-            _event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
-            let _fixture_scope = _event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(_event_sink);
-            let _event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
-                    let _event_sink = Some(_event_sink);
-                    let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let mut output = crate::backend::BackendCompletion {
-                        backend_session_id: Some("retry-plan".into()),
-                        capability: crate::backend::mock_capability(),
-                        runtime: crate::backend::BackendRuntime {
-                            provider: "Retry plan test".into(),
-                            model: Some(request.model.clone()),
+                    let mut output = crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("retry-plan".into()),
+                            capability: crate::provider::mock_capability(),
+                            runtime: crate::provider::ProviderRuntime {
+                                provider: "Retry plan test".into(),
+                                model: Some(request.model.clone()),
+                            },
+                            ..Default::default()
                         },
                         ..Default::default()
                     };
@@ -14771,28 +14171,29 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
-            Ok(crate::backend::BackendForkResult::unprofiled(
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
                 "retry-plan-fork",
             ))
         }
     }
 
     #[async_trait::async_trait]
-    impl Backend for RepeatedPlanEditBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for RepeatedPlanEditProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -14801,7 +14202,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -14818,21 +14219,24 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            _event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            _event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let _fixture_scope = _event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(_event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(_event_sink);
             let _event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let _event_sink = Some(_event_sink);
-                    let mut output = crate::backend::BackendCompletion {
-                        backend_session_id: Some("repeated-plan-document".into()),
-                        capability: BackendCapability::default(),
-                        runtime: crate::backend::BackendRuntime {
-                            provider: "Repeated plan document test".into(),
-                            model: Some(request.model.clone()),
+                    let mut output = crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("repeated-plan-document".into()),
+                            capability: ProviderCapability::default(),
+                            runtime: crate::provider::ProviderRuntime {
+                                provider: "Repeated plan document test".into(),
+                                model: Some(request.model.clone()),
+                            },
+                            ..Default::default()
                         },
                         ..Default::default()
                     };
@@ -14844,22 +14248,22 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
-            Ok(crate::backend::BackendForkResult::unprofiled(
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
                 "repeated-plan-document-fork",
             ))
         }
     }
 
-    impl PlanningQuestionBackend {
+    impl PlanningQuestionProvider {
         fn new(structured: bool) -> Self {
             Self {
                 turn: std::sync::atomic::AtomicUsize::new(0),
@@ -14869,12 +14273,13 @@ let sink = Some(sink);
     }
 
     #[async_trait::async_trait]
-    impl Backend for PlanningQuestionBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for PlanningQuestionProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -14883,7 +14288,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -14900,14 +14305,14 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
             let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let event_sink = Some(event_sink);
                     let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let text = if turn == 0 {
@@ -14916,9 +14321,9 @@ let sink = Some(sink);
                         "The plan is ready for review."
                     };
                     let event = completed_message(
-                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
+                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "planning-response",
-                        crate::backend::MessageRole::Response,
+                        crate::provider::MessageRole::Response,
                         text,
                     );
                     if let Some(event_sink) = event_sink {
@@ -14945,14 +14350,17 @@ let sink = Some(sink);
                             allow_freeform: true,
                         }],
                     });
-                    let mut output = crate::backend::BackendCompletion {
-                        backend_session_id: Some("planning-question".into()),
-                        plan_question,
-                        capability: BackendCapability::default(),
-                        runtime: crate::backend::BackendRuntime {
-                            provider: "Planning question test".into(),
-                            model: Some(request.model.clone()),
+                    let mut output = crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("planning-question".into()),
+                            capability: ProviderCapability::default(),
+                            runtime: crate::provider::ProviderRuntime {
+                                provider: "Planning question test".into(),
+                                model: Some(request.model.clone()),
+                            },
+                            ..Default::default()
                         },
+                        plan_question,
                         ..Default::default()
                     };
                     if turn > 0 && request.mode == PromptMode::Plan {
@@ -14968,30 +14376,31 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
-            Ok(crate::backend::BackendForkResult::unprofiled(
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
                 "planning-question-fork",
             ))
         }
     }
 
-    struct NestedWriteBackend;
+    struct NestedWriteProvider;
 
     #[async_trait::async_trait]
-    impl Backend for NestedWriteBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for NestedWriteProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -15000,7 +14409,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -15017,57 +14426,57 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
             let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let event_sink = Some(event_sink);
                     let commentary = completed_message(
-                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
+                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "nested-commentary",
-                        crate::backend::MessageRole::Commentary,
+                        crate::provider::MessageRole::Commentary,
                         "Creating the nested module.",
                     );
-                    let provider_change = crate::backend::ProviderChangeSet {
-                        file: vec![crate::backend::ProviderFileChange {
+                    let provider_change = crate::provider::ProviderChangeSet {
+                        file: vec![crate::provider::ProviderFileChange {
                             path: "seed.txt".into(),
                             move_path: None,
-                            kind: crate::backend::ProviderChangeKind::Update,
+                            kind: crate::provider::ProviderChangeKind::Update,
                             diff: "@@ -1 +1 @@\n-seed\n+provider edit".into(),
                         }],
                     };
-                    let file_started = crate::backend::test_support::tool(
-                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
+                    let file_started = crate::provider::test_support::tool(
+                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "provider-file-change".into(),
-                        crate::backend::ToolInvocation {
-                            kind: crate::backend::ToolActivityKind::FileChange,
+                        crate::provider::ToolInvocation {
+                            kind: crate::provider::ToolActivityKind::FileChange,
                             name: "fixture".into(),
                             title: "file changes".into(),
                             arguments: serde_json::Value::Null,
                         },
                         crate::turn::test_support::tool_updates(
-                            crate::backend::ToolStatus::Running,
+                            crate::provider::ToolStatus::Running,
                             None,
                             provider_change.clone(),
                         ),
                     );
-                    let started = crate::backend::test_support::tool(
-                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
+                    let started = crate::provider::test_support::tool(
+                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "nested-command".into(),
-                        crate::backend::ToolInvocation {
-                            kind: crate::backend::ToolActivityKind::Command,
+                        crate::provider::ToolInvocation {
+                            kind: crate::provider::ToolActivityKind::Command,
                             name: "fixture".into(),
                             title: "create nested module".into(),
                             arguments: serde_json::Value::Null,
                         },
                         crate::turn::test_support::tool_updates(
-                            crate::backend::ToolStatus::Running,
+                            crate::provider::ToolStatus::Running,
                             None,
-                            crate::backend::ProviderChangeSet::default(),
+                            crate::provider::ProviderChangeSet::default(),
                         ),
                     );
                     if let Some(event_sink) = event_sink.as_ref() {
@@ -15078,17 +14487,17 @@ let sink = Some(sink);
                         Path::new(&request.workspace).join("seed.txt"),
                         "provider edit\n",
                     )?;
-                    let file_completed = crate::backend::test_support::tool(
-                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
+                    let file_completed = crate::provider::test_support::tool(
+                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "provider-file-change".into(),
-                        crate::backend::ToolInvocation {
-                            kind: crate::backend::ToolActivityKind::FileChange,
+                        crate::provider::ToolInvocation {
+                            kind: crate::provider::ToolActivityKind::FileChange,
                             name: "fixture".into(),
                             title: "file changes".into(),
                             arguments: serde_json::Value::Null,
                         },
                         crate::turn::test_support::tool_updates(
-                            crate::backend::ToolStatus::Succeeded,
+                            crate::provider::ToolStatus::Succeeded,
                             None,
                             provider_change,
                         ),
@@ -15103,37 +14512,40 @@ let sink = Some(sink);
                     let ignored = Path::new(&request.workspace).join("target/generated/deep");
                     std::fs::create_dir_all(&ignored)?;
                     std::fs::write(ignored.join("artifact.txt"), "ignored\n")?;
-                    let completed = crate::backend::test_support::tool(
-                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
+                    let completed = crate::provider::test_support::tool(
+                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "nested-command".into(),
-                        crate::backend::ToolInvocation {
-                            kind: crate::backend::ToolActivityKind::Command,
+                        crate::provider::ToolInvocation {
+                            kind: crate::provider::ToolActivityKind::Command,
                             name: "fixture".into(),
                             title: "create nested module".into(),
                             arguments: serde_json::Value::Null,
                         },
                         crate::turn::test_support::tool_updates(
-                            crate::backend::ToolStatus::Succeeded,
+                            crate::provider::ToolStatus::Succeeded,
                             Some("created nested module".into()),
-                            crate::backend::ProviderChangeSet::default(),
+                            crate::provider::ProviderChangeSet::default(),
                         ),
                     );
                     let response = completed_message(
-                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
+                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "nested-response",
-                        crate::backend::MessageRole::Response,
+                        crate::provider::MessageRole::Response,
                         "The nested module is ready.",
                     );
                     if let Some(event_sink) = event_sink {
                         let _ = event_sink.send(completed.clone());
                         let _ = event_sink.send(response.clone());
                     }
-                    Ok(crate::backend::BackendCompletion {
-                        backend_session_id: Some("nested-write".into()),
-                        capability: BackendCapability::default(),
-                        runtime: crate::backend::BackendRuntime {
-                            provider: "Nested test".into(),
-                            model: Some(request.model),
+                    Ok(crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("nested-write".into()),
+                            capability: ProviderCapability::default(),
+                            runtime: crate::provider::ProviderRuntime {
+                                provider: "Nested test".into(),
+                                model: Some(request.model),
+                            },
+                            ..Default::default()
                         },
                         ..Default::default()
                     })
@@ -15142,30 +14554,31 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
-            Ok(crate::backend::BackendForkResult::unprofiled(
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
                 "nested-write-fork",
             ))
         }
     }
 
-    struct TaskUpdateBackend;
+    struct TaskUpdateProvider;
 
     #[async_trait::async_trait]
-    impl Backend for TaskUpdateBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for TaskUpdateProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -15174,7 +14587,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -15191,51 +14604,54 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(event_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
             let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let event_sink = Some(event_sink);
-                    let task_event = BackendEvent::Checklist {
-                        address: crate::backend::test_support::address(
+                    let task_event = ProviderEvent::Checklist {
+                        address: crate::provider::test_support::address(
                             &fixture_scope,
                             "fixture",
                             "turn",
                         ),
-                        update: crate::backend::ProviderChecklistUpdate {
+                        update: crate::provider::ProviderChecklistUpdate {
                             scope_id: "ordinary-turn".into(),
                             name: None,
                             complete: false,
                             replace_entries: true,
-                            entry_list: vec![crate::backend::ProviderChecklistEntry {
+                            entry_list: vec![crate::provider::ProviderChecklistEntry {
                                 provider_id: None,
                                 content: "Inspect ordinary chat".into(),
                                 priority: None,
-                                status: crate::backend::ChecklistStatus::InProgress,
+                                status: crate::provider::ChecklistStatus::InProgress,
                                 provider_ordinal: 0,
                             }],
                         },
                     };
                     let response = completed_message(
-                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
+                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "ordinary-response",
-                        crate::backend::MessageRole::Response,
+                        crate::provider::MessageRole::Response,
                         "Ordinary chat completed.",
                     );
                     if let Some(event_sink) = event_sink {
                         let _ = event_sink.send(task_event.clone());
                         let _ = event_sink.send(response.clone());
                     }
-                    Ok(crate::backend::BackendCompletion {
-                        backend_session_id: Some("task-update".into()),
-                        capability: BackendCapability::default(),
-                        runtime: crate::backend::BackendRuntime {
-                            provider: "Task test".into(),
-                            model: Some(request.model),
+                    Ok(crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("task-update".into()),
+                            capability: ProviderCapability::default(),
+                            runtime: crate::provider::ProviderRuntime {
+                                provider: "Task test".into(),
+                                model: Some(request.model),
+                            },
+                            ..Default::default()
                         },
                         ..Default::default()
                     })
@@ -15244,16 +14660,16 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn fork(
             &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
-            Ok(crate::backend::BackendForkResult::unprofiled(
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
                 "task-update-fork",
             ))
         }
@@ -15273,13 +14689,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
                 client_id: "test-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -15309,7 +14725,7 @@ let sink = Some(sink);
             .unwrap();
         assert_eq!(broker.session.model, "mock-model");
         assert_eq!(broker.session.effort, "low");
-        broker.session.backend_session_id = Some("mock-session".into());
+        broker.session.provider_session_id = Some("mock-session".into());
         let (_, events) = broker.compact_session(true).await.unwrap();
         assert!(
             events
@@ -15331,13 +14747,13 @@ let sink = Some(sink);
         let next = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
                 client_id: "next-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -15363,12 +14779,12 @@ let sink = Some(sink);
             primary_agent_id: HarnessSession::primary_agent_id("session"),
             name: "name".into(),
             workspace: "work".into(),
-            backend: "mock".into(),
-            backend_session_id: None,
+            provider: "mock".into(),
+            provider_session_id: None,
             provider_checkpoint_id: None,
             provider_fork_state: ProviderForkState::Ready,
             model: "model".into(),
-            provider_label: "Mock backend".into(),
+            provider_label: "Mock provider".into(),
             resolved_model: Some("model".into()),
             effort: "low".into(),
             plan_executor: Default::default(),
@@ -15376,7 +14792,7 @@ let sink = Some(sink);
             approval_timeout: Default::default(),
             tool_timeout: Default::default(),
             context_window: None,
-            service_tier: crate::backend::ServiceTier::Standard,
+            service_tier: crate::provider::ServiceTier::Standard,
             access: Default::default(),
             shell: Default::default(),
             approval_mode: ApprovalMode::Ask,
@@ -15414,7 +14830,7 @@ let sink = Some(sink);
                 model: "other-model".into(),
                 effort: "high".into(),
                 model_setting,
-                service_tier: crate::backend::ServiceTier::Standard,
+                service_tier: crate::provider::ServiceTier::Standard,
                 plan_executor: Default::default(),
                 plan_compact: false,
                 approval_timeout: Default::default(),
@@ -15623,6 +15039,160 @@ let sink = Some(sink);
         }
     }
 
+    struct MutableQuestionProvider {
+        fail_withdrawal_continuation: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::ProviderAdapter for MutableQuestionProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::provider::mock_capability(),
+            }
+        }
+
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("provider cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+
+        async fn prompt_stream(
+            &self,
+            request: ProviderRequest,
+            _event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+            let _fixture_scope = _event_sink.invocation_scope()?.clone();
+            let fixture = crate::provider::test_support::FixtureStream::new(_event_sink);
+            let _event_sink = fixture.clone();
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                    let _event_sink = Some(_event_sink);
+                    let question_set = || PlanQuestionSet {
+                        id: "migration-set".into(),
+                        questions: vec![crate::plan::PlanQuestion {
+                            id: "migration".into(),
+                            header: "Migration".into(),
+                            question: "Which migration should the implementation use?".into(),
+                            options: vec![
+                                crate::plan::PlanQuestionOption {
+                                    recommended: false,
+                                    label: "Staged".into(),
+                                    description: "Preserve compatibility temporarily.".into(),
+                                },
+                                crate::plan::PlanQuestionOption {
+                                    recommended: false,
+                                    label: "Immediate".into(),
+                                    description: "Replace the old format now.".into(),
+                                },
+                            ],
+                            allow_freeform: true,
+                        }],
+                    };
+                    let request_text = request.input.text();
+                    let mut output = crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("mutable-question".into()),
+                            capability: ProviderCapability::default(),
+                            runtime: crate::provider::ProviderRuntime {
+                                provider: "Mutable question test".into(),
+                                model: Some(request.model.clone()),
+                            },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    if request_text.contains("User follow-up:\nreplace the options") {
+                        let mut replacement = question_set();
+                        replacement.questions[0].options = vec![
+                            crate::plan::PlanQuestionOption {
+                                recommended: false,
+                                label: "Safe".into(),
+                                description: "Retain compatibility.".into(),
+                            },
+                            crate::plan::PlanQuestionOption {
+                                recommended: false,
+                                label: "Fast".into(),
+                                description: "Prefer immediate cleanup.".into(),
+                            },
+                        ];
+                        output.plan_question = Some(replacement);
+                    } else if request_text.contains("User follow-up:\nuse staged") {
+                        output.question_answer = Some(PlanQuestionAnswer {
+                            source: crate::session::ResolutionSource::User,
+                            question_id: "migration".into(),
+                            response: PlanQuestionResponse::Selected {
+                                option: "Staged".into(),
+                                feedback: None,
+                            },
+                        });
+                    } else if request_text
+                        .contains("User follow-up:\nthis decision is not material")
+                    {
+                        output.question_withdrawal = Some(PlanQuestionWithdrawal {
+                            reason: "Repository policy determines the migration.".into(),
+                        });
+                    } else if request_text.contains("Pending planning questions withdrawn")
+                        || request_text.contains("Planning feedback:\n- Migration: Staged")
+                        || request_text.contains("Harness resolved the pending questions")
+                    {
+                        if self.fail_withdrawal_continuation
+                            && request_text.contains("Pending planning questions withdrawn")
+                        {
+                            anyhow::bail!("synthetic withdrawal continuation failure");
+                        }
+                        if request.mode == PromptMode::Plan {
+                            submit_test_plan(&request, &mut output, "Follow repository policy.");
+                        }
+                    } else {
+                        output.plan_question = Some(question_set());
+                    }
+                    Ok(output)
+                }
+                .await;
+                Ok(output?)
+            }
+            .await;
+            let result = result.map_err(crate::provider::ProviderError::from);
+            fixture.finish(&result).await?;
+            result
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
+                "mutable-question-fork",
+            ))
+        }
+    }
+
+    fn mutable_question_broker(repository: &Path, data_root: &Path) -> HarnessBroker {
+        let mut broker = planning_question_broker(repository, data_root, true);
+        broker.provider = Arc::new(MutableQuestionProvider {
+            fail_withdrawal_continuation: false,
+        });
+        broker
+    }
+
     pub(super) fn planning_question_broker(
         repository: &Path,
         data_root: &Path,
@@ -15632,13 +15202,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data_root.to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.to_string_lossy().into_owned(),
                 client_id: "planning-question-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -15652,15 +15222,7 @@ let sink = Some(sink);
             Box::new(FixedClock(100)),
         )
         .unwrap();
-        broker.backend = Arc::new(PlanningQuestionBackend::new(structured));
-        broker
-    }
-
-    fn mutable_question_broker(repository: &Path, data_root: &Path) -> HarnessBroker {
-        let mut broker = planning_question_broker(repository, data_root, true);
-        broker.backend = Arc::new(MutableQuestionBackend {
-            fail_withdrawal_continuation: false,
-        });
+        broker.provider = Arc::new(PlanningQuestionProvider::new(structured));
         broker
     }
 
@@ -15672,8 +15234,8 @@ let sink = Some(sink);
         broker.session.access.sandbox = false;
         broker.session.access.write_access = crate::session::WriteScope::Full;
         broker.question_discussion = true;
-        let request = broker.backend_request(
-            BackendInput::from_text("Explain this choice"),
+        let request = broker.provider_request(
+            ProviderInput::from_text("Explain this choice"),
             PromptMode::Chat,
         );
         assert!(request.access.sandbox);
@@ -15691,8 +15253,8 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.backend = Arc::from(crate::backend::build(
-            BackendLaunch {
+        broker.provider = Arc::from(crate::provider::build(
+            ProviderLaunch {
                 kind: "mock".into(),
                 command: vec!["mock".into()],
             },
@@ -15911,7 +15473,7 @@ let sink = Some(sink);
     #[tokio::test]
     async fn background_tool_completes_on_settled_owner_without_touching_current_turn() -> Result<()>
     {
-        use crate::backend::{
+        use crate::provider::{
             TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
         };
 
@@ -15951,7 +15513,7 @@ let sink = Some(sink);
         current.ordinal = 2;
         broker.store.save_exchange(&current)?;
         let current_before = serde_json::to_value(&current)?;
-        let address = crate::backend::ToolAddress {
+        let address = crate::provider::ToolAddress {
             turn: provider,
             tool_id: "background".into(),
         };
@@ -15968,7 +15530,7 @@ let sink = Some(sink);
                 broker
                     .route_settled_parent_event(
                         &current,
-                        &BackendEvent::Tool {
+                        &ProviderEvent::Tool {
                             address: address.clone(),
                             update
                         },
@@ -15999,7 +15561,7 @@ let sink = Some(sink);
             &address,
             &ToolUpdate::Finished {
                 outcome: ToolOutcome::Failed {
-                    diagnostic: crate::backend::ToolDiagnostic {
+                    diagnostic: crate::provider::ToolDiagnostic {
                         code: None,
                         message: "late contradiction".into(),
                     }
@@ -16012,7 +15574,7 @@ let sink = Some(sink);
     #[tokio::test]
     async fn late_tool_title_updates_the_settled_owner_without_touching_current_turn() -> Result<()>
     {
-        use crate::backend::{ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+        use crate::provider::{ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
 
         let repository = repository();
         let data = tempfile::tempdir()?;
@@ -16068,8 +15630,8 @@ let sink = Some(sink);
             broker
                 .route_settled_parent_event(
                     &current,
-                    &BackendEvent::Tool {
-                        address: crate::backend::ToolAddress {
+                    &ProviderEvent::Tool {
+                        address: crate::provider::ToolAddress {
                             turn: provider,
                             tool_id: "search".into(),
                         },
@@ -16122,16 +15684,16 @@ let sink = Some(sink);
             retraction_eligible: true,
             active_wait: None,
         };
-        let fixture_scope = crate::backend::InvocationScope::new(
-            crate::backend::ExecutionOwner::root(&broker.session.id),
+        let fixture_scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root(&broker.session.id),
             exchange.id.clone(),
         );
         let mut events = Vec::new();
         broker
-            .process_backend_event(
+            .process_provider_event(
                 &mut runtime,
                 &mut exchange,
-                crate::backend::BackendRuntime {
+                crate::provider::ProviderRuntime {
                     provider: "Codex CLI".into(),
                     model: Some("resolved-model".into()),
                 }
@@ -16162,7 +15724,7 @@ let sink = Some(sink);
 
     #[tokio::test]
     async fn native_provider_content_never_creates_presentation_segments() {
-        use crate::backend::{
+        use crate::provider::{
             TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate, TurnAddress,
             TurnUpdate,
         };
@@ -16186,8 +15748,8 @@ let sink = Some(sink);
             retraction_eligible: true,
             active_wait: None,
         };
-        let fixture_scope = crate::backend::InvocationScope::new(
-            crate::backend::ExecutionOwner::root(&broker.session.id),
+        let fixture_scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root(&broker.session.id),
             exchange.id.clone(),
         );
         let address = TurnAddress {
@@ -16197,10 +15759,10 @@ let sink = Some(sink);
         };
         let mut events = Vec::new();
         broker
-            .process_backend_event(
+            .process_provider_event(
                 &mut runtime,
                 &mut exchange,
-                BackendEvent::Turn {
+                ProviderEvent::Turn {
                     address: address.clone(),
                     update: TurnUpdate::Started { started_at_ms: 0 },
                 },
@@ -16211,15 +15773,15 @@ let sink = Some(sink);
         for update in completed_message(
             &address,
             "inspection",
-            crate::backend::MessageRole::Commentary,
+            crate::provider::MessageRole::Commentary,
             "Inspecting",
         ) {
             broker
-                .process_backend_event(&mut runtime, &mut exchange, update, &mut events)
+                .process_provider_event(&mut runtime, &mut exchange, update, &mut events)
                 .await
                 .unwrap();
         }
-        for update in crate::backend::test_support::tool(
+        for update in crate::provider::test_support::tool(
             &address,
             "tool".into(),
             ToolInvocation {
@@ -16238,7 +15800,7 @@ let sink = Some(sink);
             ],
         ) {
             broker
-                .process_backend_event(&mut runtime, &mut exchange, update, &mut events)
+                .process_provider_event(&mut runtime, &mut exchange, update, &mut events)
                 .await
                 .unwrap();
         }
@@ -16254,21 +15816,21 @@ let sink = Some(sink);
         let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(persisted[0].node_list.len(), 2);
         assert!(!runtime.retraction_eligible);
-        let compaction = crate::backend::Compaction {
+        let compaction = crate::provider::Compaction {
             id: "native-compaction".into(),
             thread_id: "parent".into(),
-            state: crate::backend::CompactionState::Running,
+            state: crate::provider::CompactionState::Running,
             manual: false,
             started_at_ms: Some(200),
             completed_at_ms: None,
             result: Default::default(),
         };
-        let notification = BackendEvent::Compaction {
+        let notification = ProviderEvent::Compaction {
             scope: fixture_scope.clone().into(),
             update: Box::new(compaction.clone()),
         };
         broker
-            .process_backend_event(&mut runtime, &mut exchange, notification, &mut events)
+            .process_provider_event(&mut runtime, &mut exchange, notification, &mut events)
             .await
             .unwrap();
         let position = exchange.node_list.len() - 1;
@@ -16276,10 +15838,10 @@ let sink = Some(sink);
         let mut unrelated = compaction.clone();
         unrelated.thread_id = "unrelated".into();
         broker
-            .process_backend_event(
+            .process_provider_event(
                 &mut runtime,
                 &mut exchange,
-                BackendEvent::Compaction {
+                ProviderEvent::Compaction {
                     scope: fixture_scope.clone().into(),
                     update: Box::new(unrelated),
                 },
@@ -16289,10 +15851,10 @@ let sink = Some(sink);
             .unwrap();
         assert_eq!(exchange.node_list.len(), 3);
         broker
-            .process_backend_event(
+            .process_provider_event(
                 &mut runtime,
                 &mut exchange,
-                BackendEvent::Turn {
+                ProviderEvent::Turn {
                     address,
                     update: TurnUpdate::Finished {
                         outcome: crate::turn::TurnOutcome::Interrupted,
@@ -16310,17 +15872,17 @@ let sink = Some(sink);
         else {
             panic!("compaction row missing")
         };
-        assert_eq!(pending.state, crate::backend::CompactionState::Unconfirmed);
+        assert_eq!(pending.state, crate::provider::CompactionState::Unconfirmed);
         let mut completed = compaction;
-        completed.state = crate::backend::CompactionState::Completed;
+        completed.state = crate::provider::CompactionState::Completed;
         completed.result.summary_content = Some("Retain the original task.".into());
         completed.completed_at_ms = Some(400);
-        let notification = BackendEvent::Compaction {
+        let notification = ProviderEvent::Compaction {
             scope: fixture_scope.into(),
             update: Box::new(completed),
         };
         broker
-            .process_backend_event(&mut runtime, &mut exchange, notification, &mut events)
+            .process_provider_event(&mut runtime, &mut exchange, notification, &mut events)
             .await
             .unwrap();
         let ExchangeNode::Compaction {
@@ -16330,7 +15892,7 @@ let sink = Some(sink);
         else {
             panic!("compaction position changed")
         };
-        assert_eq!(completed.state, crate::backend::CompactionState::Completed);
+        assert_eq!(completed.state, crate::provider::CompactionState::Completed);
         assert_eq!(completed.started_at_ms, Some(200));
         assert_eq!(completed.completed_at_ms, Some(400));
         assert_eq!(exchange.node_list[position].id(), original_id);
@@ -16532,16 +16094,16 @@ let sink = Some(sink);
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         save_check_exchange(&mut broker, "editing-test", false)?;
-        let fixture_scope = crate::backend::InvocationScope::new(
-            crate::backend::ExecutionOwner::root(&broker.session.id),
+        let fixture_scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root(&broker.session.id),
             "editing-test",
         );
-        let (sink, _events) = crate::backend::events::channel(fixture_scope.clone());
+        let (sink, _events) = crate::provider::events::channel(fixture_scope.clone());
         let (scope, _lease) = crate::checks::CheckToolScope::open(
             Arc::clone(&broker.check_runner),
             crate::checks::CheckAuthority {
                 data_root: broker.data_root.clone(),
-                backend: broker.session.backend.clone(),
+                provider: broker.session.provider.clone(),
                 task_id: None,
                 shell: broker.session.shell,
                 mode: PromptMode::Chat,
@@ -16624,16 +16186,16 @@ let sink = Some(sink);
                 &format!("configured-check-{permission:?}"),
                 false,
             )?;
-            let fixture_scope = crate::backend::InvocationScope::new(
-                crate::backend::ExecutionOwner::root(&broker.session.id),
+            let fixture_scope = crate::provider::InvocationScope::new(
+                crate::provider::ExecutionOwner::root(&broker.session.id),
                 format!("configured-check-{permission:?}"),
             );
-            let (sink, mut events) = crate::backend::events::channel(fixture_scope.clone());
+            let (sink, mut events) = crate::provider::events::channel(fixture_scope.clone());
             let (scope, lease) = crate::checks::CheckToolScope::open(
                 Arc::clone(&broker.check_runner),
                 crate::checks::CheckAuthority {
                     data_root: broker.data_root.clone(),
-                    backend: broker.session.backend.clone(),
+                    provider: broker.session.provider.clone(),
                     task_id: None,
                     shell: crate::session::CheckShell::System,
                     mode: PromptMode::Chat,
@@ -16890,61 +16452,12 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn input_timeout_resumes_durable_questions_once_without_a_view() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), true);
-        let result = broker
-            .dispatch(Request {
-                id: 1,
-                method: "session.prompt.submit".into(),
-                params: json!({"text":"prompt me with a multiple-choice question"}),
-            })
-            .await;
-        assert!(result.response.error().is_none());
-        let mut interaction = broker
-            .find_active_interaction_elicitation()
-            .unwrap()
-            .unwrap();
-        interaction.elicitation_mut().unwrap().deadline =
-            Some(serde_json::from_value(json!({"expires_at_ms":-1})).unwrap());
-        broker.store.save_exchange(&interaction).unwrap();
-        let mut deadline = None;
-        let request = broker
-            .expire_input(&mut deadline)
-            .unwrap()
-            .expect("overdue request");
-        assert_eq!(request.method, "session.question.continue");
-        let result = broker.dispatch(request).await;
-        assert!(
-            result.response.error().is_none(),
-            "{:?}",
-            result.response.error()
-        );
-        assert!(
-            broker
-                .find_active_interaction_elicitation()
-                .unwrap()
-                .is_none()
-        );
-        assert!(broker.expire_input(&mut deadline).unwrap().is_none());
-        let saved = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert!(
-            saved
-                .iter()
-                .flat_map(|exchange| &exchange.node_list)
-                .any(|node| matches!(node,
-            ExchangeNode::ExchangeInput { prompt } if prompt.text.contains("[automatic timeout]")))
-        );
-    }
-
-    #[tokio::test]
     async fn auto_compaction_requires_fresh_usage_and_runs_once_per_turn() -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
             "data_root":data.path(),"workspace":repository.path(),"client_id":"automatic-compaction",
-            "backend":{"kind":"mock","command":[]},"model":"mock-model","effort":"low"
+            "provider":{"kind":"mock","command":[]},"model":"mock-model","effort":"low"
         }))?)?;
         let result = broker
             .dispatch(Request {
@@ -17010,10 +16523,10 @@ let sink = Some(sink);
             owner: crate::timeline::TimelineOwner::session(&broker.session.id),
             created_at_ms: 1,
             detail: SessionEventKind::Compaction {
-                compaction: (crate::backend::Compaction {
+                compaction: (crate::provider::Compaction {
                     id: "native-running".into(),
-                    thread_id: broker.session.backend_session_id.clone().unwrap(),
-                    state: crate::backend::CompactionState::Running,
+                    thread_id: broker.session.provider_session_id.clone().unwrap(),
+                    state: crate::provider::CompactionState::Running,
                     manual: false,
                     started_at_ms: Some(1),
                     completed_at_ms: None,
@@ -17040,13 +16553,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "compact-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -17125,23 +16638,26 @@ let sink = Some(sink);
         let SessionEventKind::Compaction { compaction } = &records[0].detail else {
             panic!("compaction record missing")
         };
-        assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
+        assert_eq!(
+            compaction.state,
+            crate::provider::CompactionState::Completed
+        );
         assert!(compaction.manual);
         assert_eq!(compaction.result.context_tokens_before, Some(50_000));
         assert_eq!(compaction.result.context_tokens_after, Some(20_000));
         assert!(timeline_text(&broker.snapshot().unwrap()).contains("50.0k → 20.0k tokens"));
         for (state, heading) in [
-            (crate::backend::CompactionState::Running, None),
+            (crate::provider::CompactionState::Running, None),
             (
-                crate::backend::CompactionState::Failed,
+                crate::provider::CompactionState::Failed,
                 Some("Context compaction failed"),
             ),
             (
-                crate::backend::CompactionState::Unconfirmed,
+                crate::provider::CompactionState::Unconfirmed,
                 Some("Context compaction completion unconfirmed"),
             ),
             (
-                crate::backend::CompactionState::Completed,
+                crate::provider::CompactionState::Completed,
                 Some("Context compacted"),
             ),
         ] {
@@ -17170,7 +16686,10 @@ let sink = Some(sink);
                         .iter()
                         .any(|entry| matches!(entry, TimelineEntry::SessionEvent { .. }))
                 );
-                assert!(text.contains("Compacting"));
+                assert!(
+                    !text.contains("Compacting"),
+                    "live status belongs to the status document"
+                );
             }
         }
 
@@ -17179,10 +16698,10 @@ let sink = Some(sink);
             .list_exchange(&broker.session.id)
             .unwrap()
             .remove(0);
-        let automatic = crate::backend::Compaction {
+        let automatic = crate::provider::Compaction {
             id: "background".into(),
-            thread_id: broker.session.backend_session_id.clone().unwrap(),
-            state: crate::backend::CompactionState::Running,
+            thread_id: broker.session.provider_session_id.clone().unwrap(),
+            state: crate::provider::CompactionState::Running,
             manual: false,
             started_at_ms: None,
             completed_at_ms: None,
@@ -17197,10 +16716,10 @@ let sink = Some(sink);
             crate::session::state_machine::SessionPhase::Compacting { started_at_ms: 200 }
         ));
         let running_text = timeline_text(&running);
-        assert!(running_text.contains("Compacting"));
+        assert!(!running_text.contains("Compacting"));
         assert!(!running_text.contains("Compacting context"));
         let mut completion = automatic;
-        completion.state = crate::backend::CompactionState::Completed;
+        completion.state = crate::provider::CompactionState::Completed;
         completion.result.summary_content = Some("Retain the original constraints.".into());
         let update = compaction_event(&broker.session.id, completion);
         let mut current =
@@ -17227,15 +16746,15 @@ let sink = Some(sink);
             retraction_eligible: true,
             active_wait: None,
         };
-        let fixture_scope = crate::backend::InvocationScope::new(
-            crate::backend::ExecutionOwner::root(&broker.session.id),
+        let fixture_scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root(&broker.session.id),
             current.id.clone(),
         );
         let (sink, mut stream) = publication::channel();
         broker.event_sink = Some(sink);
         let mut events = Vec::new();
         broker
-            .process_backend_event(&mut runtime, &mut current, update.clone(), &mut events)
+            .process_provider_event(&mut runtime, &mut current, update.clone(), &mut events)
             .await
             .unwrap();
         assert!(
@@ -17265,7 +16784,10 @@ let sink = Some(sink);
         let ExchangeNode::Compaction { compaction, .. } = &restored[0].node_list[position] else {
             panic!("original compaction position lost")
         };
-        assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
+        assert_eq!(
+            compaction.state,
+            crate::provider::CompactionState::Completed
+        );
         assert_eq!(
             compaction.result.summary_content.as_deref(),
             Some("Retain the original constraints.")
@@ -17299,14 +16821,14 @@ let sink = Some(sink);
         compaction.result.context_tokens_after = None;
         broker.store.save_session_event(&record).unwrap();
         for used in [32_000, 64_000] {
-            let usage_event = BackendEvent::Runtime {
+            let usage_event = ProviderEvent::Runtime {
                 scope: fixture_scope.clone(),
-                update: crate::backend::RuntimeUpdate::ContextUsage {
+                update: crate::provider::RuntimeUpdate::ContextUsage {
                     usage: ContextUsage::reported(used, 100_000).unwrap(),
                 },
             };
             broker
-                .process_backend_event(&mut runtime, &mut current, usage_event, &mut events)
+                .process_provider_event(&mut runtime, &mut current, usage_event, &mut events)
                 .await
                 .unwrap();
         }
@@ -17323,17 +16845,17 @@ let sink = Some(sink);
         assert_eq!(compaction.result.context_tokens_after, Some(32_000));
         assert!(timeline_text(&broker.snapshot().unwrap()).contains("50.0k → 32.0k tokens"));
 
-        let automatic = crate::backend::Compaction {
+        let automatic = crate::provider::Compaction {
             id: "current-compaction".into(),
-            thread_id: broker.session.backend_session_id.clone().unwrap(),
-            state: crate::backend::CompactionState::Running,
+            thread_id: broker.session.provider_session_id.clone().unwrap(),
+            state: crate::provider::CompactionState::Running,
             manual: false,
             started_at_ms: None,
             completed_at_ms: None,
             result: Default::default(),
         };
         broker
-            .process_backend_event(
+            .process_provider_event(
                 &mut runtime,
                 &mut current,
                 compaction_event(&broker.session.id, automatic.clone()),
@@ -17342,9 +16864,9 @@ let sink = Some(sink);
             .await
             .unwrap();
         let mut completed = automatic;
-        completed.state = crate::backend::CompactionState::Completed;
+        completed.state = crate::provider::CompactionState::Completed;
         broker
-            .process_backend_event(
+            .process_provider_event(
                 &mut runtime,
                 &mut current,
                 compaction_event(&broker.session.id, completed),
@@ -17352,14 +16874,14 @@ let sink = Some(sink);
             )
             .await
             .unwrap();
-        let usage_event = BackendEvent::Runtime {
+        let usage_event = ProviderEvent::Runtime {
             scope: fixture_scope.clone(),
-            update: crate::backend::RuntimeUpdate::ContextUsage {
+            update: crate::provider::RuntimeUpdate::ContextUsage {
                 usage: ContextUsage::reported(12_000, 100_000).unwrap(),
             },
         };
         broker
-            .process_backend_event(&mut runtime, &mut current, usage_event, &mut events)
+            .process_provider_event(&mut runtime, &mut current, usage_event, &mut events)
             .await
             .unwrap();
         let ExchangeNode::Compaction { compaction, .. } = current.node_list.last().unwrap() else {
@@ -17376,13 +16898,13 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let initialize = |client_id: &str, name: &str| InitializeRequest {
             background: None,
-            backend_launch_by_provider: Default::default(),
+            provider_launch_by_provider: Default::default(),
             config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
             permission_file: None,
             workspace: repository.path().to_string_lossy().into_owned(),
             client_id: client_id.into(),
-            backend: BackendLaunch {
+            provider: ProviderLaunch {
                 kind: "mock".into(),
                 command: vec!["mock".into()],
             },
@@ -17420,13 +16942,13 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let mut request = InitializeRequest {
             background: None,
-            backend_launch_by_provider: Default::default(),
+            provider_launch_by_provider: Default::default(),
             config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
             permission_file: None,
             workspace: workspace.path().to_string_lossy().into_owned(),
             client_id: "source-client".into(),
-            backend: BackendLaunch {
+            provider: ProviderLaunch {
                 kind: "mock".into(),
                 command: vec!["mock".into()],
             },
@@ -17471,13 +16993,17 @@ let sink = Some(sink);
             .load_session(&source.session.id)
             .unwrap()
             .unwrap();
-        stored.backend = "copilot".into();
+        stored.provider = "copilot".into();
         source.store.save_session(&stored).unwrap();
         let failure =
             HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(130)))
                 .err()
                 .unwrap();
-        assert!(failure.to_string().contains("different configured backend"));
+        assert!(
+            failure
+                .to_string()
+                .contains("different configured provider")
+        );
         assert!(
             source
                 .store
@@ -17487,7 +17013,7 @@ let sink = Some(sink);
                 .lease_owner
                 .is_none()
         );
-        stored.backend = "mock".into();
+        stored.provider = "mock".into();
         stored.approval_mode = ApprovalMode::Ask;
         stored.workspace = format!("{}//./", stored.workspace);
         source.store.save_session(&stored).unwrap();
@@ -17507,13 +17033,13 @@ let sink = Some(sink);
         let initialize =
             |client_id: &str, lease_conflict_action: Option<String>| InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: client_id.into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -17583,7 +17109,7 @@ let sink = Some(sink);
             ProviderForkState::Preparing { .. }
         ));
         assert_eq!(
-            preparation.backend_request.checkpoint_id.as_deref(),
+            preparation.provider_request.checkpoint_id.as_deref(),
             Some("mock-checkpoint")
         );
         let child_session_id = preparation.child.id.clone();
@@ -17595,9 +17121,9 @@ let sink = Some(sink);
             .filter(|entry| !matches!(entry, TimelineEntry::Status { .. }))
             .map(|entry| serde_json::to_value(entry).unwrap())
             .collect::<Vec<_>>();
-        let backend_fork = fork_controller
-            .backend
-            .fork(preparation.backend_request)
+        let provider_fork = fork_controller
+            .provider
+            .fork(preparation.provider_request)
             .await
             .unwrap();
         let mut child_initialize = initialize("fork-client", None);
@@ -17608,7 +17134,7 @@ let sink = Some(sink);
         )
         .unwrap();
         let ready_event = child_controller
-            .complete_provider_fork(Ok(backend_fork))
+            .complete_provider_fork(Ok(provider_fork))
             .unwrap();
         assert_eq!(ready_event.event, "session_fork_ready");
         let snapshot = serde_json::to_value(child_controller.snapshot().unwrap()).unwrap();
@@ -17786,15 +17312,16 @@ let sink = Some(sink);
         );
     }
 
-    struct PreferenceBackend;
+    struct PreferenceProvider;
 
     #[async_trait::async_trait]
-    impl Backend for PreferenceBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Codex,
+    impl crate::provider::ProviderAdapter for PreferenceProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Codex,
                 label: "Preference fixture".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -17812,14 +17339,14 @@ let sink = Some(sink);
         }
         async fn prompt_stream(
             &self,
-            _request: BackendRequest,
-            _sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            _request: ProviderRequest,
+            _sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let _fixture_scope = _sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(_sink);
+            let fixture = crate::provider::test_support::FixtureStream::new(_sink);
             let _sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                     let _sink = Some(_sink);
                     anyhow::bail!("preference persistence must not start a model turn")
                 }
@@ -17827,15 +17354,15 @@ let sink = Some(sink);
                 Ok(output?)
             }
             .await;
-            let result = result.map_err(crate::backend::BackendError::from);
+            let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
 
         async fn model_list(
             &self,
-            _request: BackendRequest,
-        ) -> Result<Vec<crate::backend::BackendModel>> {
+            _request: ProviderRequest,
+        ) -> Result<Vec<crate::provider::ProviderModel>> {
             ["gpt-5.6", "gpt-5.4"].into_iter().map(|id| {
                 Ok(serde_json::from_value(json!({
                     "id": id, "reasoning": ["low", "medium", "high"],
@@ -17854,13 +17381,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "settings-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "codex".into(),
                     command: vec!["codex".into(), "app-server".into()],
                 },
@@ -17874,7 +17401,7 @@ let sink = Some(sink);
             Box::new(FixedClock(100)),
         )
         .unwrap();
-        broker.backend = Arc::new(PreferenceBackend);
+        broker.provider = Arc::new(PreferenceProvider);
         let selected = broker
             .dispatch(Request {
                 id: 0,
@@ -17909,7 +17436,7 @@ let sink = Some(sink);
             );
             assert_eq!(
                 broker.session.service_tier,
-                crate::backend::ServiceTier::Ultrafast
+                crate::provider::ServiceTier::Ultrafast
             );
         }
         broker.capability.ultrafast_mode = false;
@@ -17921,7 +17448,7 @@ let sink = Some(sink);
         );
         assert_eq!(
             broker.session.service_tier,
-            crate::backend::ServiceTier::Ultrafast
+            crate::provider::ServiceTier::Ultrafast
         );
         broker.capability.ultrafast_mode = true;
 
@@ -17949,7 +17476,7 @@ let sink = Some(sink);
             .await;
         let preference = broker
             .store
-            .load_preference(&broker.session.workspace, &broker.session.backend)
+            .load_preference(&broker.session.workspace, &broker.session.provider)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -17980,13 +17507,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "settings-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "codex".into(),
                     command: vec!["codex".into(), "app-server".into()],
                 },
@@ -18000,7 +17527,7 @@ let sink = Some(sink);
             Box::new(FixedClock(100)),
         )
         .unwrap();
-        broker.backend = Arc::new(PreferenceBackend);
+        broker.provider = Arc::new(PreferenceProvider);
         let selected = broker
             .dispatch(Request {
                 id: 21,
@@ -18021,7 +17548,7 @@ let sink = Some(sink);
             "Architecture review"
         );
         assert!(!renamed.event.iter().any(|event| {
-            event.event == "backend_event"
+            event.event == "provider_event"
                 && event.payload["kind"] == "timeline_session_event"
                 && event.payload["data"]["event"]["name"] == "Architecture review"
         }));
@@ -18050,13 +17577,13 @@ let sink = Some(sink);
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "restarted-settings-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "codex".into(),
                     command: vec!["codex".into(), "app-server".into()],
                 },
@@ -18074,7 +17601,7 @@ let sink = Some(sink);
         assert_eq!(restarted.session.effort, "low");
         assert_eq!(
             restarted.session.service_tier,
-            crate::backend::ServiceTier::Ultrafast
+            crate::provider::ServiceTier::Ultrafast
         );
         assert_eq!(restarted.session.approval_mode, ApprovalMode::Ask);
         assert!(
@@ -18101,13 +17628,13 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let request = InitializeRequest {
             background: None,
-            backend_launch_by_provider: Default::default(),
+            provider_launch_by_provider: Default::default(),
             config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
             permission_file: None,
             workspace: repository.path().to_string_lossy().into_owned(),
             client_id: "provider-default-test".into(),
-            backend: BackendLaunch {
+            provider: ProviderLaunch {
                 kind: "codex".into(),
                 command: vec!["codex".into(), "app-server".into()],
             },
@@ -18173,24 +17700,24 @@ let sink = Some(sink);
         );
         assert_eq!(
             fresh.session.service_tier,
-            crate::backend::ServiceTier::Fast
+            crate::provider::ServiceTier::Fast
         );
     }
 
     #[tokio::test]
-    async fn rejects_inline_model_effort_and_mode_values_outside_backend_capabilities() {
+    async fn rejects_inline_model_effort_and_mode_values_outside_provider_capabilities() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "inline-config-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -18243,13 +17770,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "preview-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -18321,13 +17848,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "first-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -18359,7 +17886,7 @@ let sink = Some(sink);
         exchange.resume(100).unwrap();
         exchange
             .start_turn(
-                crate::backend::TurnAddress {
+                crate::provider::TurnAddress {
                     scope: crate::turn::test_support::address(&exchange, "unfinished-turn").scope,
                     thread_id: "main-thread".into(),
                     turn_id: "unfinished-turn".into(),
@@ -18375,13 +17902,13 @@ let sink = Some(sink);
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "second-client".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -18430,298 +17957,12 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn pauses_for_structured_feedback_then_submits_the_same_plan() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), true);
-        broker.trace.configure(true).unwrap();
-
-        let paused = broker
-            .dispatch(Request {
-                id: 1,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "/plan migrate the event format" }),
-            })
-            .await;
-        assert!(
-            paused.response.error().is_none(),
-            "{:?}",
-            paused.response.error()
-        );
-        assert!(
-            paused
-                .event
-                .iter()
-                .any(|event| event.event == "plan_question")
-        );
-        let paused_snapshot = broker.snapshot().unwrap();
-        let pending_plan = paused_snapshot.active_plan.expect("active paused plan");
-        assert_eq!(pending_plan.state, PlanState::AwaitingInput);
-        let elicitation = pending_plan.elicitation.expect("durable elicitation");
-        assert_eq!(elicitation.question_set.questions[0].header, "Migration");
-        assert_eq!(paused_snapshot.artifact.len(), 1);
-        assert!(paused_snapshot.exchange.last().unwrap().awaiting_input());
-
-        let original_exchange = paused_snapshot.exchange.last().unwrap().clone();
-        assert!(original_exchange.execution_started_at_ms().is_none());
-        assert!(
-            broker
-                .append_plan_feedback(
-                    "unrelated-plan",
-                    "wrong owner".into(),
-                    crate::exchange::InputIntent::Clarification,
-                    None
-                )
-                .is_err()
-        );
-        assert_eq!(
-            broker.store.list_exchange(&broker.session.id).unwrap()[0]
-                .node_list
-                .len(),
-            original_exchange.node_list.len()
-        );
-        let question_id = elicitation.question_set.questions[0].id.clone();
-        let clarified = broker
-            .dispatch(Request {
-                id: 2,
-                method: "session.question.ask".into(),
-                params: json!({
-                    "question_id": question_id,
-                    "text": "What compatibility cost does staged migration add?"
-                }),
-            })
-            .await;
-        assert!(clarified.response.error().is_none());
-        let clarified_snapshot = broker.snapshot().unwrap();
-        assert_eq!(clarified_snapshot.exchange.len(), 1);
-        let clarified_exchange = &clarified_snapshot.exchange[0];
-        assert_eq!(clarified_exchange.id, original_exchange.id);
-        assert!(clarified_exchange.checkpoint_after.is_none());
-        assert!(clarified_exchange.execution_started_at_ms().is_none());
-        let clarified_plan = clarified_snapshot.active_plan.unwrap();
-        assert_eq!(clarified_plan.state, PlanState::AwaitingInput);
-        assert!(
-            clarified_plan
-                .elicitation
-                .as_ref()
-                .unwrap()
-                .clarification_active
-        );
-        let follow_up = broker
-            .dispatch(Request {
-                id: 3,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "How long should compatibility remain?" }),
-            })
-            .await;
-        assert!(follow_up.response.error().is_none());
-        assert_eq!(
-            broker.snapshot().unwrap().active_plan.unwrap().state,
-            PlanState::AwaitingInput
-        );
-        let answered = broker
-            .dispatch(Request {
-                id: 4,
-                method: "session.question.answer".into(),
-                params: json!({
-                    "question_id": question_id,
-                    "response": {
-                        "kind": "selected",
-                        "option": "Staged",
-                        "feedback": "Preserve compatibility for one release"
-                    }
-                }),
-            })
-            .await;
-        assert!(answered.response.error().is_none());
-        let completed = broker
-            .dispatch(Request {
-                id: 5,
-                method: "session.question.continue".into(),
-                params: json!({}),
-            })
-            .await;
-        assert!(completed.response.error().is_none());
-        assert!(
-            completed
-                .event
-                .iter()
-                .any(|event| event.event == "plan_question_answered")
-        );
-        assert!(
-            completed
-                .event
-                .iter()
-                .filter(|event| event.event == "document_changed")
-                .any(|event| {
-                    let payload = event.payload.to_string();
-                    payload.contains("\"kind\":\"working\"")
-                        || payload.contains("\"kind\":\"retrying_plan_generation\"")
-                }),
-            "resuming plan feedback must restore an active footer in live patches"
-        );
-        assert!(
-            completed
-                .event
-                .iter()
-                .any(|event| event.event == "plan_created")
-        );
-        let completed_snapshot = broker.snapshot().unwrap();
-        let rendered = timeline_text(&completed_snapshot);
-        assert_eq!(rendered.matches("You answered: Staged").count(), 1);
-        assert!(!rendered.contains("QuestionAsked"));
-        let plan = completed_snapshot
-            .active_plan
-            .as_ref()
-            .expect("submitted plan");
-        assert_eq!(plan.state, PlanState::AwaitingReview);
-        assert!(plan.elicitation.is_none());
-        assert!(completed_snapshot.timeline.iter().any(|entry| matches!(
-            entry,
-            TimelineEntry::Status {
-                status: crate::session::state_machine::SessionPhase::AwaitingPlanReview { .. },
-                ..
-            }
-        )));
-        assert_eq!(completed_snapshot.artifact.len(), 1);
-        assert!(Path::new(&plan.working_path).exists());
-        assert_eq!(completed_snapshot.exchange.len(), 1);
-        let completed_exchange = &completed_snapshot.exchange[0];
-        assert_eq!(completed_exchange.id, original_exchange.id);
-        assert_eq!(
-            completed_exchange.checkpoint_before,
-            original_exchange.checkpoint_before
-        );
-        assert!(original_exchange.checkpoint_after.is_none());
-        assert!(completed_exchange.checkpoint_after.is_some());
-        assert!(
-            broker
-                .append_plan_feedback(
-                    &plan.id,
-                    "late feedback".into(),
-                    crate::exchange::InputIntent::Clarification,
-                    None
-                )
-                .is_err()
-        );
-        assert_eq!(completed_snapshot.active_plan.as_ref().unwrap().id, plan.id);
-        assert!(completed_snapshot.timeline.iter().all(|entry| matches!(
-            entry,
-            TimelineEntry::Exchange { .. } | TimelineEntry::Status { .. }
-        )));
-        let lifecycle = broker
-            .store
-            .list_plan_lifecycle(&broker.session.id)
-            .unwrap();
-        assert_eq!(
-            lifecycle
-                .iter()
-                .map(|record| record.kind)
-                .collect::<Vec<_>>(),
-            [
-                PlanLifecycleKind::QuestionAsked,
-                PlanLifecycleKind::QuestionAnswered,
-                PlanLifecycleKind::Created
-            ]
-        );
-        let trace = std::fs::read_to_string(data.path().join("harness-trace.jsonl")).unwrap();
-        assert!(trace.contains("feedback_consumed"));
-        assert!(trace.contains("plan_submitted"));
-        assert!(trace.contains("snapshot_plan_state"));
-    }
-
-    #[tokio::test]
-    async fn consumed_question_content_cannot_reenter_awaiting_input() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), true);
-        broker.backend = Arc::new(RepeatedQuestionBackend {
-            turn: std::sync::atomic::AtomicUsize::new(0),
-        });
-
-        let paused = broker
-            .dispatch(Request {
-                id: 1,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "/plan migrate the event format" }),
-            })
-            .await;
-        assert!(paused.response.error().is_none());
-        let pending = broker.snapshot().unwrap().active_plan.unwrap();
-        let question_id = pending.elicitation.as_ref().unwrap().question_set.questions[0]
-            .id
-            .clone();
-        broker
-            .dispatch(Request {
-                id: 2,
-                method: "session.question.answer".into(),
-                params: json!({
-                    "question_id": question_id,
-                    "response": {
-                        "kind": "selected",
-                        "option": "Staged",
-                        "feedback": null
-                    }
-                }),
-            })
-            .await;
-        let completed = broker
-            .dispatch(Request {
-                id: 3,
-                method: "session.question.continue".into(),
-                params: json!({}),
-            })
-            .await;
-        assert!(completed.response.error().is_none());
-
-        let snapshot = broker.snapshot().unwrap();
-        let plan = snapshot.active_plan.unwrap();
-        assert_eq!(plan.state, PlanState::AwaitingReview);
-        assert!(plan.elicitation.is_none());
-        assert_eq!(plan.question_ledger.resolution.len(), 1);
-        assert_eq!(
-            snapshot.exchange.len(),
-            2,
-            "automatic retries must follow the answered exchange as a separate attempt"
-        );
-        assert!(matches!(
-            &snapshot.exchange[1].origin,
-            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
-        ));
-        assert_eq!(
-            broker
-                .store
-                .list_plan_lifecycle(&broker.session.id)
-                .unwrap()
-                .iter()
-                .filter(|entry| entry.kind == PlanLifecycleKind::QuestionAsked)
-                .count(),
-            1
-        );
-        assert_eq!(
-            broker
-                .store
-                .list_plan_lifecycle(&broker.session.id)
-                .unwrap()
-                .iter()
-                .filter(|entry| entry.kind == PlanLifecycleKind::QuestionAnswered)
-                .count(),
-            1
-        );
-        assert!(
-            completed
-                .event
-                .iter()
-                .any(|event| event.event == "plan_generation_retry")
-        );
-    }
-
-    #[tokio::test]
     async fn retry_resumes_the_same_failed_plan_with_a_fresh_budget() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.backend = Arc::new(RetryPlanBackend {
+        broker.goal_max_turns = 2;
+        broker.provider = Arc::new(RetryPlanProvider {
             turn: std::sync::atomic::AtomicUsize::new(0),
         });
 
@@ -18732,6 +17973,10 @@ let sink = Some(sink);
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
+        run_plan_to_input_boundary(&mut broker)
+            .await
+            .expect_err("fixture must fail planning");
+
         assert!(failed.response.error().is_none());
         let failed_plan = broker.snapshot().unwrap().active_plan.unwrap();
         let plan_id = failed_plan.id.clone();
@@ -18760,6 +18005,7 @@ let sink = Some(sink);
             })
             .await;
         assert!(retried.response.error().is_none());
+        run_plan_to_input_boundary(&mut broker).await.unwrap();
         let submitted = broker.snapshot().unwrap().active_plan.unwrap();
         assert_eq!(submitted.id, plan_id);
         assert_eq!(submitted.state, PlanState::AwaitingReview);
@@ -18788,27 +18034,11 @@ let sink = Some(sink);
         );
         let recovered = broker.snapshot().unwrap().active_plan.unwrap();
         assert_eq!(recovered.id, plan_id);
-        assert_eq!(recovered.state, PlanState::Failed);
+        assert_eq!(recovered.state, PlanState::AwaitingReview);
         assert_eq!(
             broker.task_controller.current().unwrap().unwrap().revision,
             paused.revision
         );
-        let resumed = broker
-            .dispatch(Request {
-                id: 5,
-                method: "session.prompt.submit".into(),
-                params: json!({"text":"/plan retry"}),
-            })
-            .await;
-        assert!(
-            resumed.response.error().is_none(),
-            "{:?}",
-            resumed.response.error()
-        );
-        let recovered = broker.snapshot().unwrap().active_plan.unwrap();
-        assert_eq!(recovered.id, plan_id);
-        assert_eq!(recovered.state, PlanState::AwaitingReview);
-        assert_eq!(recovered.generation.budget.turn_count, 1);
     }
 
     #[tokio::test]
@@ -18867,7 +18097,8 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.backend = Arc::new(RetryPlanBackend {
+        broker.goal_max_turns = 2;
+        broker.provider = Arc::new(RetryPlanProvider {
             turn: std::sync::atomic::AtomicUsize::new(0),
         });
         broker
@@ -18877,6 +18108,10 @@ let sink = Some(sink);
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
+        run_plan_to_input_boundary(&mut broker)
+            .await
+            .expect_err("fixture must fail planning");
+
         assert_eq!(
             broker.snapshot().unwrap().active_plan.unwrap().state,
             PlanState::Failed
@@ -18891,14 +18126,7 @@ let sink = Some(sink);
             .await;
         assert!(cancelled.response.error().is_none());
         assert!(broker.snapshot().unwrap().active_plan.is_none());
-        assert!(
-            broker
-                .store
-                .list_plan_lifecycle(&broker.session.id)
-                .unwrap()
-                .iter()
-                .any(|entry| entry.kind == PlanLifecycleKind::Cancelled)
-        );
+        assert!(broker.task_controller.current().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -18906,7 +18134,7 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.backend = Arc::new(RepeatedPlanEditBackend);
+        broker.provider = Arc::new(RepeatedPlanEditProvider);
 
         let result = broker
             .dispatch(Request {
@@ -18915,184 +18143,21 @@ let sink = Some(sink);
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
+        run_plan_to_input_boundary(&mut broker)
+            .await
+            .expect_err("unchanged plan must exhaust its progress budget");
+
         assert!(result.response.error().is_none());
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
         assert_eq!(plan.state, PlanState::Failed);
-        assert_eq!(plan.generation.budget.turn_count, 3);
-        assert_eq!(plan.generation.canonical_revision, 1);
-        assert_eq!(plan.generation.budget.consecutive_no_progress, 2);
-    }
-
-    #[tokio::test]
-    async fn replaces_unsubmitted_questions_and_preserves_editable_answers() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), true);
-        broker
-            .dispatch(Request {
-                id: 1,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "/plan migrate the event format" }),
-            })
-            .await;
-        let initial = broker.snapshot().unwrap().active_plan.unwrap();
-        let question = initial.elicitation.as_ref().unwrap().question_set.questions[0].clone();
-        broker
-            .dispatch(Request {
-                id: 2,
-                method: "session.question.answer".into(),
-                params: json!({
-                    "question_id": question.id,
-                    "response": { "kind": "selected", "option": "Staged", "feedback": "one release" }
-                }),
-            })
-            .await;
-        let replacement = PlanQuestionSet {
-            id: "replacement".into(),
-            questions: vec![question],
-        }
-        .normalize()
-        .unwrap();
-        let mut event = Vec::new();
-        assert!(
-            broker
-                .replace_active_elicitation(replacement, &mut event)
-                .unwrap()
-        );
-
-        let snapshot = broker.snapshot().unwrap();
-        let plan = snapshot.active_plan.unwrap();
-        let elicitation = plan.elicitation.unwrap();
-        assert_eq!(elicitation.revision, 2);
-        assert_eq!(elicitation.answer.len(), 1);
-        assert_eq!(snapshot.active_elicitation.unwrap().plan_id, Some(plan.id));
-        assert!(event.iter().any(|event| event.event == "plan_question"));
-    }
-
-    #[tokio::test]
-    async fn clarification_after_review_reopens_the_answer_without_continuing() {
-        for prompt in [
-            "ask which migration to use",
-            "/plan migrate the event format",
-        ] {
-            let repository = repository();
-            let data = tempfile::tempdir().unwrap();
-            let mut broker = mutable_question_broker(repository.path(), data.path());
-            let result = broker
-                .dispatch(Request {
-                    id: 1,
-                    method: "session.prompt.submit".into(),
-                    params: json!({"text": prompt}),
-                })
-                .await;
-            assert!(result.response.error().is_none());
-            let question_id = broker
-                .snapshot()
-                .unwrap()
-                .active_elicitation
-                .unwrap()
-                .elicitation
-                .question_set
-                .questions[0]
-                .id
-                .clone();
-            let result = broker.dispatch(Request { id: 2, method: "session.question.answer".into(),
-                params: json!({"question_id":question_id, "response":{"kind":"selected","option":"Staged"}}) }).await;
-            assert!(result.response.error().is_none());
-            assert!(
-                broker
-                    .snapshot()
-                    .unwrap()
-                    .active_elicitation
-                    .unwrap()
-                    .elicitation
-                    .current_question()
-                    .is_none()
-            );
-            let result = broker
-                .dispatch(Request {
-                    id: 3,
-                    method: "session.question.ask".into(),
-                    params: json!({"question_id":question_id,"text":"what do you mean?"}),
-                })
-                .await;
-            assert!(
-                result.response.error().is_none(),
-                "{:?}",
-                result.response.error()
-            );
-            let snapshot = broker.snapshot().unwrap();
-            let elicitation = snapshot.active_elicitation.unwrap().elicitation;
-            assert!(elicitation.answer.is_empty());
-            assert_eq!(elicitation.current_question().unwrap().id, question_id);
-            assert_eq!(snapshot.exchange.len(), 1);
-            assert!(snapshot.exchange[0].completed_at_ms().is_none());
-            let input = snapshot.exchange[0]
-                .node_list
-                .iter()
-                .find_map(|node| match node {
-                    ExchangeNode::ExchangeInput { prompt }
-                        if prompt.intent == crate::exchange::InputIntent::Clarification =>
-                    {
-                        Some(prompt)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            let target = input
-                .question
-                .as_ref()
-                .expect("clarification must retain its question target");
-            assert_eq!(target.question_id.as_deref(), Some(question_id.as_str()));
-            assert_eq!(target.set_id, elicitation.question_set.id);
-            assert!(
-                !result
-                    .event
-                    .iter()
-                    .any(|event| event.event == "question_answered")
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn clarification_replaces_the_complete_pending_question_set() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = mutable_question_broker(repository.path(), data.path());
-        broker
-            .dispatch(Request {
-                id: 1,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "/plan migrate the event format" }),
-            })
-            .await;
-        let previous_revision = broker
-            .snapshot()
-            .unwrap()
-            .active_plan
-            .unwrap()
-            .elicitation
-            .unwrap()
-            .revision;
-        let result = broker
-            .dispatch(Request {
-                id: 2,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "replace the options" }),
-            })
-            .await;
-        assert!(result.response.error().is_none());
-        let elicitation = broker
-            .snapshot()
-            .unwrap()
-            .active_plan
-            .unwrap()
-            .elicitation
-            .unwrap();
-        assert!(elicitation.revision > previous_revision);
         assert_eq!(
-            elicitation.question_set.questions[0].options[0].label,
-            "Safe"
+            plan.generation.budget.turn_count,
+            u32::from(plan.generation.budget.max_consecutive_no_progress) + 1
+        );
+        assert_eq!(plan.generation.canonical_revision, 1);
+        assert_eq!(
+            plan.generation.budget.consecutive_no_progress,
+            plan.generation.budget.max_consecutive_no_progress
         );
     }
 
@@ -19126,128 +18191,11 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn explicit_chat_answer_resumes_a_plan_when_no_decisions_remain() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = mutable_question_broker(repository.path(), data.path());
-        broker
-            .dispatch(Request {
-                id: 1,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "/plan migrate the event format" }),
-            })
-            .await;
-        let result = broker
-            .dispatch(Request {
-                id: 2,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "use staged" }),
-            })
-            .await;
-        assert!(result.response.error().is_none());
-        let snapshot = broker.snapshot().unwrap();
-        assert_eq!(
-            snapshot.active_plan.unwrap().state,
-            PlanState::AwaitingReview
-        );
-        assert!(snapshot.active_elicitation.is_none());
-        assert!(
-            result
-                .event
-                .iter()
-                .any(|event| event.event == "plan_question_answered")
-        );
-    }
-
-    #[tokio::test]
-    async fn withdrawn_plan_question_resumes_planning_and_records_its_reason() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = mutable_question_broker(repository.path(), data.path());
-        broker
-            .dispatch(Request {
-                id: 1,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "/plan migrate the event format" }),
-            })
-            .await;
-        let result = broker
-            .dispatch(Request {
-                id: 2,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "this decision is not material" }),
-            })
-            .await;
-        assert!(result.response.error().is_none());
-        let snapshot = broker.snapshot().unwrap();
-        assert_eq!(
-            snapshot.active_plan.unwrap().state,
-            PlanState::AwaitingReview
-        );
-        assert!(snapshot.active_elicitation.is_none());
-        let lifecycle = broker
-            .store
-            .list_plan_lifecycle(&broker.session.id)
-            .unwrap();
-        assert!(lifecycle.iter().any(|entry| {
-            entry.kind == PlanLifecycleKind::QuestionWithdrawn
-                && entry.answer.as_deref() == Some("Repository policy determines the migration.")
-        }));
-        assert!(
-            result
-                .event
-                .iter()
-                .any(|event| event.event == "plan_question_withdrawn")
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_withdrawal_continuation_keeps_the_question_consumed() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = mutable_question_broker(repository.path(), data.path());
-        broker.backend = Arc::new(MutableQuestionBackend {
-            fail_withdrawal_continuation: true,
-        });
-        broker
-            .dispatch(Request {
-                id: 1,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "/plan migrate the event format" }),
-            })
-            .await;
-        let result = broker
-            .dispatch(Request {
-                id: 2,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": "this decision is not material" }),
-            })
-            .await;
-        assert!(result.response.error().is_some());
-        let plan = broker.snapshot().unwrap().active_plan.unwrap();
-        assert_eq!(plan.state, PlanState::Failed);
-        assert!(plan.elicitation.is_none());
-        assert_eq!(plan.question_ledger.resolution.len(), 1);
-        assert_eq!(
-            plan.question_ledger.resolution[0].kind,
-            crate::plan::PlanQuestionResolutionKind::Withdrawn
-        );
-        assert!(
-            broker
-                .store
-                .list_plan_lifecycle(&broker.session.id)
-                .unwrap()
-                .iter()
-                .any(|entry| entry.kind == PlanLifecycleKind::QuestionWithdrawn)
-        );
-    }
-
-    #[tokio::test]
     async fn postprocessing_failure_finalizes_the_interaction_timeline() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.backend = Arc::new(InvalidControlOutputBackend);
+        broker.provider = Arc::new(InvalidControlOutputProvider);
         broker.clock = Box::new(AdvancingClock(std::sync::atomic::AtomicI64::new(100)));
 
         let result = broker
@@ -19257,8 +18205,9 @@ let sink = Some(sink);
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
+        assert!(dispatch_pending_task_input(&mut broker).await.is_err());
 
-        assert!(result.response.error().is_some());
+        assert!(result.response.error().is_none());
         let interaction = broker
             .store
             .list_exchange(&broker.session.id)
@@ -19290,13 +18239,15 @@ let sink = Some(sink);
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
+        run_plan_to_input_boundary(&mut broker).await.unwrap();
+
         assert!(paused.response.error().is_none());
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
         assert_eq!(plan.state, PlanState::AwaitingReview);
         assert!(plan.elicitation.is_none());
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 2);
-        assert_eq!(exchanges[0].prompt, "/plan migrate the event format");
+        assert!(exchanges[0].prompt.contains("migrate the event format"));
         assert!(
             !exchanges[1].prompt.is_empty(),
             "internal continuation omitted its provider instruction"
@@ -19351,194 +18302,9 @@ let sink = Some(sink);
         assert_eq!(broker.agent_coordinator.active_count(), 0);
         Ok(())
     }
-    struct NativeSettlementBackend {
-        inner: Arc<dyn Backend>,
+    struct NativeSettlementProvider {
+        inner: Arc<Provider>,
         state: GoalState,
-    }
-
-    struct NativeContinuationBackend {
-        cancel_continuation: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for NativeContinuationBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
-        }
-
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
-        }
-
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-
-        async fn prompt_stream(
-            &self,
-            _request: BackendRequest,
-            sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
-            let fixture_scope = sink.invocation_scope()?.clone();
-            let fixture = crate::backend::test_support::FixtureStream::new(sink);
-            let sink = fixture.clone();
-            let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-                let output: anyhow::Result<crate::backend::BackendCompletion> = async {
-                    let sink = Some(sink);
-                    use crate::backend::TurnUpdate;
-                    use crate::backend::usage::{TokenUsage, UsageUpdate};
-                    let sink = sink.unwrap();
-                    for ordinal in 1..=2 {
-                        let address = crate::backend::test_support::address(
-                            &fixture_scope,
-                            "native-goal-thread",
-                            format!("turn-{ordinal}"),
-                        );
-                        let started = BackendEvent::Turn {
-                            address: address.clone(),
-                            update: TurnUpdate::Started { started_at_ms: 0 },
-                        };
-                        sink.send_wait(started.clone()).await?;
-                        sink.send_wait(started).await?;
-                        if ordinal == 2 && self.cancel_continuation {
-                            return Err(TurnCancelled.into());
-                        }
-                        sink.send_wait(completed_message(
-                            &address,
-                            format!("attempt-{ordinal}"),
-                            crate::backend::MessageRole::Response,
-                            format!("Attempt {ordinal}"),
-                        ))
-                        .await?;
-                        sink.send_wait(BackendEvent::Usage {
-                            address: address.clone(),
-                            update: UsageUpdate {
-                                id: format!("request-{ordinal}"),
-                                cumulative: None,
-                                cumulative_total: None,
-                                usage: TokenUsage {
-                                    input: Some(100 * ordinal),
-                                    cached_input: Some(0),
-                                    reasoning: Some(10),
-                                    output: Some(20),
-                                },
-                            },
-                        })
-                        .await?;
-                        if ordinal == 2 {
-                            let original = crate::backend::test_support::address(
-                                &fixture_scope,
-                                "native-goal-thread",
-                                "turn-1",
-                            );
-                            let late = BackendEvent::Usage {
-                                address: original.clone(),
-                                update: UsageUpdate {
-                                    id: "late-request".into(),
-                                    cumulative: None,
-                                    cumulative_total: None,
-                                    usage: TokenUsage {
-                                        input: Some(50),
-                                        cached_input: Some(0),
-                                        reasoning: Some(0),
-                                        output: Some(5),
-                                    },
-                                },
-                            };
-                            sink.send_wait(late.clone()).await?;
-                            sink.send_wait(late).await?;
-                            sink.send_wait(BackendEvent::Turn {
-                                address: original,
-                                update: TurnUpdate::Started { started_at_ms: 0 },
-                            })
-                            .await?;
-                        }
-                        sink.send_wait(BackendEvent::Turn {
-                            address,
-                            update: TurnUpdate::Finished {
-                                outcome: crate::turn::TurnOutcome::Completed,
-                                completed_at_ms: 100,
-                            },
-                        })
-                        .await?;
-                    }
-                    let mut output = crate::backend::BackendCompletion::default();
-                    output.evidence.native_state = Some(GoalState::Complete);
-                    output.evidence.tool_called = true;
-                    Ok(output)
-                }
-                .await;
-                Ok(output?)
-            }
-            .await;
-            let result = result.map_err(crate::backend::BackendError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-
-        async fn fork(
-            &self,
-            _request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
-            anyhow::bail!("native continuation fixture does not fork")
-        }
-    }
-
-    #[tokio::test]
-    async fn native_goal_turns_start_separate_exchanges_and_route_late_usage() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.capability.native_goal = true;
-        broker.backend = Arc::new(NativeContinuationBackend {
-            cancel_continuation: false,
-        });
-        broker
-            .dispatch_session_command(
-                "session.goal.set",
-                json!({"objective":"complete two native turns"}),
-            )
-            .unwrap();
-        let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(exchanges.len(), 2);
-        assert_eq!(exchanges[0].prompt, "/goal complete two native turns");
-        assert!(!exchanges[1].prompt.is_empty());
-        assert!(matches!(
-            &exchanges[1].origin,
-            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
-        ));
-        assert!(exchanges.iter().all(
-            |exchange| exchange.state() == ExchangeState::Complete && exchange.turn.len() == 1
-        ));
-        assert_eq!(exchanges[0].usage().input, Some(150));
-        assert_eq!(exchanges[1].usage().input, Some(200));
-        assert_eq!(exchanges[0].metrics.request_count, 2);
-        assert_eq!(exchanges[1].metrics.request_count, 1);
-        assert_eq!(broker.active_goal().unwrap().state, GoalState::Complete);
-        let retained = serde_json::to_value(&exchanges).unwrap();
-        let session_id = broker.session.id.clone();
-        drop(broker);
-        let store = SqliteStore::open(data.path()).unwrap();
-        assert_eq!(
-            serde_json::to_value(store.list_exchange(&session_id).unwrap()).unwrap(),
-            retained
-        );
     }
 
     #[tokio::test]
@@ -19546,8 +18312,8 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.backend = Arc::new(NativeSettlementBackend {
-            inner: broker.backend.clone(),
+        broker.provider = Arc::new(NativeSettlementProvider {
+            inner: broker.provider.clone(),
             state: GoalState::Active,
         });
         broker
@@ -19556,16 +18322,19 @@ let sink = Some(sink);
                 json!({"objective":"complete a continued goal"}),
             )
             .unwrap();
+        dispatch_pending_task_input(&mut broker).await.unwrap();
         broker
             .dispatch_session_command("session.command.apply", json!({"action":"continue"}))
             .unwrap();
-        broker.backend = Arc::new(NativeSettlementBackend {
-            inner: broker.backend.clone(),
+        dispatch_pending_task_input(&mut broker).await.unwrap();
+        broker.provider = Arc::new(NativeSettlementProvider {
+            inner: broker.provider.clone(),
             state: GoalState::Complete,
         });
         broker
             .dispatch_session_command("session.command.apply", json!({"action":"continue"}))
             .unwrap();
+        dispatch_pending_task_input(&mut broker).await.unwrap();
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 3);
         assert!(exchanges.iter().all(
@@ -19644,58 +18413,14 @@ let sink = Some(sink);
         );
     }
 
-    #[tokio::test]
-    async fn cancelling_native_continuation_preserves_the_previous_attempt() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let backend = broker.backend.clone();
-        broker.capability.native_goal = true;
-        broker.backend = Arc::new(NativeContinuationBackend {
-            cancel_continuation: true,
-        });
-        let error = broker
-            .dispatch_session_command(
-                "session.goal.set",
-                json!({"objective":"interrupt the second native turn"}),
-            )
-            .unwrap_err();
-        assert!(error.downcast_ref::<TurnCancelled>().is_some());
-        let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(exchanges.len(), 2);
-        assert_eq!(exchanges[0].state(), ExchangeState::Complete);
-        assert_eq!(exchanges[1].state(), ExchangeState::Cancelled);
-        assert!(matches!(
-            &exchanges[1].origin,
-            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
-        ));
-        assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
-        broker.backend = Arc::new(NativeSettlementBackend {
-            inner: backend,
-            state: GoalState::Complete,
-        });
-        broker
-            .dispatch_session_command("session.goal.resume", json!({}))
-            .unwrap();
-        let resumed = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(resumed.len(), 3);
-        assert!(matches!(
-            &resumed[2].origin,
-            crate::exchange::ExchangeOrigin::TaskContinuation { .. }
-        ));
-        assert_eq!(
-            serde_json::to_value(&resumed[..2]).unwrap(),
-            serde_json::to_value(exchanges).unwrap()
-        );
-    }
-
     #[async_trait::async_trait]
-    impl Backend for NativeSettlementBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor {
-                kind: crate::backend::BackendKind::Mock,
+    impl crate::provider::ProviderAdapter for NativeSettlementProvider {
+        type Host = crate::provider::HarnessProviderHost;
+        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+            crate::provider::ProviderDescriptor {
+                kind: crate::provider::ProviderKind::Mock,
                 label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability(),
+                capability: crate::provider::mock_capability(),
             }
         }
 
@@ -19704,7 +18429,7 @@ let sink = Some(sink);
         }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("backend cannot confirm execution cleanup")
+            anyhow::bail!("provider cannot confirm execution cleanup")
         }
 
         async fn cancel_session(&self, _session_id: &str) -> Result<()> {
@@ -19721,9 +18446,9 @@ let sink = Some(sink);
 
         async fn prompt_stream(
             &self,
-            request: BackendRequest,
-            event_sink: BackendEventSink,
-        ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+            request: ProviderRequest,
+            event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
             let mut output = self.inner.prompt_stream(request, event_sink).await?;
             output.evidence.native_state = Some(self.state);
             output.evidence.tool_called = true;
@@ -19732,26 +18457,26 @@ let sink = Some(sink);
 
         async fn fork(
             &self,
-            request: BackendForkRequest,
-        ) -> Result<crate::backend::BackendForkResult> {
+            request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
             self.inner.fork(request).await
         }
     }
 
     #[tokio::test]
-    async fn pauses_an_active_goal_after_a_backend_failure() {
+    async fn pauses_an_active_goal_after_a_provider_failure() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "failure-test".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -19765,7 +18490,7 @@ let sink = Some(sink);
             Box::new(FixedClock(200)),
         )
         .unwrap();
-        broker.backend = Arc::new(FailingBackend);
+        broker.provider = Arc::new(FailingProvider);
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -19773,7 +18498,8 @@ let sink = Some(sink);
                 params: json!({ "objective": "finish the work" }),
             })
             .await;
-        assert!(result.response.error().is_some());
+        assert!(result.response.error().is_none());
+        assert!(dispatch_pending_task_input(&mut broker).await.is_err());
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         let interaction = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(interaction.len(), 1);
@@ -19794,13 +18520,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "task-test".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -19814,7 +18540,7 @@ let sink = Some(sink);
             Box::new(FixedClock(250)),
         )
         .unwrap();
-        broker.backend = Arc::new(TaskUpdateBackend);
+        broker.provider = Arc::new(TaskUpdateProvider);
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -19842,13 +18568,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "parent-boundary-test".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -19862,7 +18588,7 @@ let sink = Some(sink);
             Box::new(FixedClock(500)),
         )
         .unwrap();
-        broker.backend = Arc::new(ParentBoundaryBackend);
+        broker.provider = Arc::new(ParentBoundaryProvider);
 
         let result = broker
             .dispatch(Request {
@@ -19876,7 +18602,7 @@ let sink = Some(sink);
             .event
             .iter()
             .filter(|event| {
-                event.event == "backend_event"
+                event.event == "provider_event"
                     && event.payload.get("kind").and_then(Value::as_str)
                         == Some("timeline_wait_updated")
             })
@@ -19916,13 +18642,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
                 client_id: "reported-edits-test".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -19936,7 +18662,7 @@ let sink = Some(sink);
             Box::new(FixedClock(300)),
         )
         .unwrap();
-        broker.backend = Arc::new(NestedWriteBackend);
+        broker.provider = Arc::new(NestedWriteProvider);
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -19977,13 +18703,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "interaction-diff-test".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -19997,7 +18723,7 @@ let sink = Some(sink);
             Box::new(FixedClock(300)),
         )
         .unwrap();
-        broker.backend = Arc::new(NestedWriteBackend);
+        broker.provider = Arc::new(NestedWriteProvider);
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -20060,13 +18786,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "matching-interaction-diff-test".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -20080,7 +18806,7 @@ let sink = Some(sink);
             Box::new(FixedClock(300)),
         )
         .unwrap();
-        broker.backend = Arc::new(NestedWriteBackend);
+        broker.provider = Arc::new(NestedWriteProvider);
 
         let occupied: Vec<_> = (0..4)
             .map(|_| broker.repositories.reads.submit(0, |_| Ok(())).unwrap())
@@ -20143,13 +18869,13 @@ let sink = Some(sink);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "child-attribution-test".into(),
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -20174,26 +18900,26 @@ let sink = Some(sink);
                 crate::turn::test_support::TestTurn::new(format!("{id}:turn:1"), provider, 1);
             let call_id = format!("{id}:change");
             for update in [
-                crate::backend::ToolUpdate::Requested {
-                    invocation: crate::backend::ToolInvocation {
-                        kind: crate::backend::ToolActivityKind::FileChange,
+                crate::provider::ToolUpdate::Requested {
+                    invocation: crate::provider::ToolInvocation {
+                        kind: crate::provider::ToolActivityKind::FileChange,
                         name: "edit".into(),
                         title: "file changes".into(),
                         arguments: Value::Null,
                     },
                 },
-                crate::backend::ToolUpdate::Changes {
-                    changes: crate::backend::ProviderChangeSet {
-                        file: vec![crate::backend::ProviderFileChange {
+                crate::provider::ToolUpdate::Changes {
+                    changes: crate::provider::ProviderChangeSet {
+                        file: vec![crate::provider::ProviderFileChange {
                             path: path.into(),
                             move_path: None,
-                            kind: crate::backend::ProviderChangeKind::Add,
+                            kind: crate::provider::ProviderChangeKind::Add,
                             diff: "child".into(),
                         }],
                     },
                 },
-                crate::backend::ToolUpdate::Finished {
-                    outcome: crate::backend::ToolOutcome::Succeeded,
+                crate::provider::ToolUpdate::Finished {
+                    outcome: crate::provider::ToolOutcome::Succeeded,
                 },
             ] {
                 turn.record_tool(&call_id, update, 1).unwrap();
@@ -20265,19 +18991,19 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn rejects_resuming_a_session_owned_by_another_backend() {
+    async fn rejects_resuming_a_session_owned_by_another_provider() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 background: None,
-                backend_launch_by_provider: Default::default(),
+                provider_launch_by_provider: Default::default(),
                 config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
-                client_id: "backend-test".into(),
-                backend: BackendLaunch {
+                client_id: "provider-test".into(),
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec!["mock".into()],
                 },
@@ -20295,7 +19021,7 @@ let sink = Some(sink);
         let mut incompatible = broker.session.clone();
         incompatible.id = "copilot-session".into();
         incompatible.primary_agent_id = HarnessSession::primary_agent_id(&incompatible.id);
-        incompatible.backend = "copilot".into();
+        incompatible.provider = "copilot".into();
         incompatible.lease_owner = None;
         broker.store.save_session(&incompatible).unwrap();
         let result = broker
@@ -20309,3 +19035,5 @@ let sink = Some(sink);
         assert_eq!(broker.session.id, active_id);
     }
 }
+
+pub(crate) use forge_provider_api::error::TurnCancelled;

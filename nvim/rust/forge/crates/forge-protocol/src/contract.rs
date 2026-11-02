@@ -25,16 +25,16 @@ pub fn method_policy(name: &str) -> Option<&'static crate::method_policy::Method
         .map(|index| &METHODS[index].1)
 }
 
-/// Selects only normalized backend events consumed by the editor.
-pub fn backend_visible(kind: &str) -> bool {
-    BACKEND.iter().any(|event| event.name == kind)
+/// Selects only normalized provider events consumed by the editor.
+pub fn provider_visible(kind: &str) -> bool {
+    PROVIDER.iter().any(|event| event.name == kind)
 }
 
 /// Rejects unknown event variants and missing fields before serialization.
 pub fn validate(channel: &str, name: &str, payload: &Value) -> Result<(), String> {
     let events = match channel {
         "session" => SESSION,
-        "backend" => BACKEND,
+        "provider" => PROVIDER,
         "request" => REQUEST,
         "document" => DOCUMENT,
         _ => return Err(format!("unknown event channel: {channel}")),
@@ -59,9 +59,9 @@ pub fn validate(channel: &str, name: &str, payload: &Value) -> Result<(), String
             ));
         }
     }
-    if channel == "session" && name == "backend_event" {
+    if channel == "session" && name == "provider_event" {
         validate(
-            "backend",
+            "provider",
             payload["kind"].as_str().unwrap_or_default(),
             payload,
         )?;
@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn event_vocabulary_rejects_unknown_names_and_nested_payloads() {
         assert!(validate("session", "unregistered", &json!({})).is_err());
-        assert!(validate("session", "backend_event", &json!({"kind":"unregistered"})).is_err());
+        assert!(validate("session", "provider_event", &json!({"kind":"unregistered"})).is_err());
         assert!(
             validate(
                 "session",
@@ -90,33 +90,33 @@ mod tests {
         assert!(validate("session", "exchange_updated", &json!([])).is_err());
         assert!(
             validate(
-                "backend",
+                "provider",
                 "prompt_submission",
                 &json!({"data":{"document":"doc","token":"1","state":"accepted"}})
             )
             .is_err()
         );
         validate(
-            "backend",
+            "provider",
             "prompt_submission",
             &json!({"data":{"document":"doc","token":1,"state":"accepted"}}),
         )
         .unwrap();
         validate(
-            "backend",
+            "provider",
             "runtime_resolved",
             &json!({"data":{"session_id":"session","provider":"Codex","model":null}}),
         )
         .unwrap();
         validate(
-            "backend",
+            "provider",
             "prompt_submission",
             &json!({"data":{"document":null,"token":2,"state":"accepted"}}),
         )
         .unwrap();
         assert!(
             validate(
-                "backend",
+                "provider",
                 "prompt_submission",
                 &json!({"data":{"document":null,"token":"2","state":"accepted"}}),
             )
@@ -128,10 +128,10 @@ mod tests {
     fn serialization_cannot_bypass_the_event_contract() {
         let mut event = SessionEvent {
             session_id: "session".into(),
-            event: "backend_event".into(),
+            event: "provider_event".into(),
             payload: json!({"kind":"tool-output"}),
         };
-        assert!(!backend_visible("tool-output"));
+        assert!(!provider_visible("tool-output"));
         assert!(serde_json::to_string(&Message::Event(event.clone())).is_err());
         event.payload = json!({"kind":"execution_state","data":{"session":{"id":"session"}}});
         assert!(serde_json::to_string(&Message::Event(event)).is_ok());

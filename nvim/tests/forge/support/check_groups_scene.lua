@@ -18,7 +18,7 @@ function M.open()
   client._host_set_launcher_for_test(vim.system)
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
-    harness = { backend = "mock", backends = { mock = { command = { "retained-control" }, selectable = true } } } })
+    harness = { provider = "mock", providers = { mock = { command = { "retained-control" }, selectable = true } } } })
   require("forge.views.harness").open()
   local state = require("forge.session").harness
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "scene startup timed out")

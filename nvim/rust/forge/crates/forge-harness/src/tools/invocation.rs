@@ -1,5 +1,5 @@
 use super::{ControlToolArgumentError, ControlToolRegistry, schema_violation_list};
-use crate::backend::BackendCompletion;
+use crate::provider::ProviderCompletion;
 use crate::tools::error::{ToolContext, ToolResult as Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,7 +47,7 @@ impl ControlToolInvocation {
         &mut self,
         controller: Option<&crate::task::SessionTaskController>,
         turn_permit: Option<&crate::task::TaskPermit>,
-        mode: crate::backend::PromptMode,
+        mode: crate::provider::PromptMode,
     ) -> anyhow::Result<()> {
         self.admit_task_control(controller)?;
         let Some(controller) = controller else {
@@ -63,12 +63,12 @@ impl ControlToolInvocation {
                     | "question_withdraw"
             );
         let kind = match mode {
-            crate::backend::PromptMode::Plan | crate::backend::PromptMode::PlanDiscussion
+            crate::provider::PromptMode::Plan | crate::provider::PromptMode::PlanDiscussion
                 if scoped =>
             {
                 crate::task::TaskKind::Plan
             }
-            crate::backend::PromptMode::ExecutePlan if scoped => crate::task::TaskKind::Execute,
+            crate::provider::PromptMode::ExecutePlan if scoped => crate::task::TaskKind::Execute,
             _ => return Ok(()),
         };
         let captured =
@@ -100,7 +100,7 @@ static CONTROL_TOOL_VALIDATOR_MAP: OnceLock<HashMap<&'static str, ControlToolVal
 /// Apply one provider-neutral control invocation to the normalized turn result.
 pub fn apply_invocation(
     invocation: &ControlToolInvocation,
-    output: &mut BackendCompletion,
+    output: &mut ProviderCompletion,
 ) -> Result<()> {
     validate_arguments(invocation)?;
     match invocation.name.as_str() {

@@ -1,6 +1,6 @@
 mod support;
 
-use forge_git::{completion::RevisionBackend, store::RepositoryStore};
+use forge_git::{completion::RevisionProvider, store::RepositoryStore};
 use std::{fs, path::Path, sync::Arc};
 use support::git;
 
@@ -40,7 +40,7 @@ async fn local_remote_ambiguous_and_symbolic_candidates_match_git() {
         .collect::<Vec<_>>();
     expected.sort_unstable();
     assert_eq!(candidates.values, expected);
-    assert_eq!(candidates.backend, RevisionBackend::Gix);
+    assert_eq!(candidates.provider, RevisionProvider::Gix);
     assert!(Arc::ptr_eq(
         &candidates,
         &repository.current_revisions().unwrap()

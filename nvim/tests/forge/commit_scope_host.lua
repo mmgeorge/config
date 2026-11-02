@@ -43,7 +43,7 @@ local success, failure = xpcall(function()
   vim.fn.writefile({ "scope-unstaged" }, fixture .. "/tracked.txt")
   vim.fn.writefile({ "scope-untracked" }, fixture .. "/untracked.txt")
   vim.fn.writefile({ "scope-ignored" }, fixture .. "/ignored.txt")
-  require("forge.infra.config").setup({ harness = { backend = "mock" },
+  require("forge.infra.config").setup({ harness = { provider = "mock" },
     background_generation = { mock = { model = "mock-model", reasoning_effort = "low",
       auto_compaction = { enabled = false, threshold_tokens = 128000 } } } })
   local about = generate()
@@ -70,7 +70,7 @@ local success, failure = xpcall(function()
   assert(vim.deep_equal(previous, vim.api.nvim_buf_get_lines(buffer, 0, -1, false)), "empty staged request changed the draft")
   vim.api.nvim_buf_delete(buffer, { force = true })
 end, debug.traceback)
-generator.reset_backend()
+generator.reset_provider()
 client.host_stop()
 await(function() return client._client.process == nil end, "scope test host was not collected")
 vim.fn.stdpath = original_stdpath

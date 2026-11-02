@@ -42,12 +42,12 @@ local ok, failure = xpcall(function()
     "harness_commands", "harness_files",
   }), "the real composer did not select its Harness completion providers")
 
-  session.harness.session = { id = "completion-test", backend = "codex", workspace = "fixture-workspace" }
+  session.harness.session = { id = "completion-test", provider = "codex", workspace = "fixture-workspace" }
   session.harness.capability = {
     model_selection = true, effort_selection = true,
     catalog = { skill = true, mcp = true },
   }
-  session.harness.model_backend = "codex"
+  session.harness.model_provider = "codex"
   session.harness.model_list = { { id = "fixture-model", reasoning = { "low", "high" } } }
   client.request = function(request_specification, callback)
   local method = request_specification.method

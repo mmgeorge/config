@@ -1,6 +1,6 @@
 vim.loader.enable(false)
 vim.o.columns, vim.o.lines = 76, 32
-require("forge").setup({ harness = { backend = "mock" } })
+require("forge").setup({ harness = { provider = "mock" } })
 
 local picker = require("forge.views.picker")
 local requests = {}

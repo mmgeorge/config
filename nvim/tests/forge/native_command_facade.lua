@@ -11,7 +11,7 @@ package.loaded["forge.status"] = {
   refresh = function() refreshed = refreshed + 1 end,
   close = function(state) closed = closed + 1 state.active = false end,
 }
-package.loaded["forge.git.git_backend"] = { git_root_async = function(callback) callback("D:/config") end }
+package.loaded["forge.git.git_provider"] = { git_root_async = function(callback) callback("D:/config") end }
 package.loaded["forge.views.branch_diff"] = setmetatable({}, { __index = function() error("legacy branch rendering was loaded") end })
 local commands = require("forge.views.commands")
 local ok, failure = xpcall(function()

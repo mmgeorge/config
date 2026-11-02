@@ -37,7 +37,7 @@ impl HarnessBroker {
             .get(
                 &self.session.workspace,
                 &self.session.id,
-                &self.session.backend,
+                &self.session.provider,
             )?
             .ask_model()?;
         Ok((document, questions, settings))
@@ -55,8 +55,8 @@ impl HarnessBroker {
                 self.capability.model_selection,
                 "current provider does not support model selection"
             );
-            self.backend
-                .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+            self.provider
+                .model_list(self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
                 .await?
         } else {
             Vec::new()
@@ -66,11 +66,11 @@ impl HarnessBroker {
         let snapshot = settings.get(
             &self.session.workspace,
             &self.session.id,
-            &self.session.backend,
+            &self.session.provider,
         )?;
         settings.save_provider(
             snapshot.revision,
-            &self.session.backend,
+            &self.session.provider,
             &json!({"ask_model":selection}),
         )?;
         Ok(json!({"ask_model":selection}))
@@ -84,9 +84,9 @@ impl HarnessBroker {
         progress: Option<(&forge_protocol::outbound::MessageSender, u64)>,
     ) -> Result<()> {
         let catalog = if selection.model.is_some() {
-            self.backend
+            self.provider
                 .model_list(
-                    self.backend_request(BackendInput::from_text(""), PromptMode::PlanQuestion),
+                    self.provider_request(ProviderInput::from_text(""), PromptMode::PlanQuestion),
                 )
                 .await?
         } else {

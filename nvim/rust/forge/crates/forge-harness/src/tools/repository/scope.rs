@@ -590,7 +590,7 @@ mod tests {
                 .contains("inactive interaction")
         );
         let mut runtime = crate::tools::ControlToolRuntime::new(
-            crate::tools::ControlTurnContext::inactive(crate::backend::PromptMode::Chat),
+            crate::tools::ControlTurnContext::inactive(crate::provider::PromptMode::Chat),
         );
         assert!(
             runtime

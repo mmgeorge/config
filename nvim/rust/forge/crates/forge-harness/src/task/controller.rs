@@ -760,7 +760,7 @@ impl SessionTaskController {
         let mut store = SqliteStore::open(root.path()).unwrap();
         let session: crate::session::HarnessSession = serde_json::from_value(serde_json::json!({
             "id":"session", "primary_agent_id":crate::session::HarnessSession::primary_agent_id("session"),
-            "name":"Test", "workspace":"workspace", "backend":"mock", "model":"mock",
+            "name":"Test", "workspace":"workspace", "provider":"mock", "model":"mock",
             "effort":"", "approval_mode":"ask", "created_at_ms":0, "updated_at_ms":0,
             "provider_fork_state":{"state":"ready"}
         })).unwrap();
@@ -1629,7 +1629,7 @@ mod tests {
         let mut store = SqliteStore::open(root.path())?;
         let session: HarnessSession = serde_json::from_value(serde_json::json!({
             "id":"session", "primary_agent_id":HarnessSession::primary_agent_id("session"),
-            "name":"Test", "workspace":"workspace", "backend":"mock", "model":"mock",
+            "name":"Test", "workspace":"workspace", "provider":"mock", "model":"mock",
             "effort":"", "approval_mode":"ask", "created_at_ms":0, "updated_at_ms":0,
             "provider_fork_state":{"state":"ready"}
         }))?;

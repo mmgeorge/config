@@ -60,7 +60,7 @@ impl Exchange {
                     || matches!(&commentary.source, CommentarySource::Provider { turn_id, message_id }
                         if self.turn.iter().find(|turn| turn.id() == turn_id)
                             .and_then(|turn| turn.messages().iter().find(|message| message.id() == message_id))
-                            .is_some_and(|message| message.role() == Some(crate::backend::MessageRole::Response))),
+                            .is_some_and(|message| message.role() == Some(crate::provider::MessageRole::Response))),
                 ExchangeEntry::Response { .. } => true,
                 ExchangeEntry::Event { id } => self.node_list.iter().any(|node| {
                     node.id() == id
@@ -108,7 +108,7 @@ impl Exchange {
                         .context("commentary references a missing provider message")?,
                 )
                 .filter(|message| {
-                    message.role() == Some(crate::backend::MessageRole::Commentary)
+                    message.role() == Some(crate::provider::MessageRole::Commentary)
                         && !message.text().trim().is_empty()
                 }),
             };
@@ -205,7 +205,7 @@ impl Exchange {
                             .context("timeline references a missing provider message")?;
                         if !matches!(
                             message.role(),
-                            None | Some(crate::backend::MessageRole::Response)
+                            None | Some(crate::provider::MessageRole::Response)
                         ) || message.text().trim().is_empty()
                         {
                             continue;
@@ -224,11 +224,11 @@ impl Exchange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{
-        BackendEvent, MessageRole, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome,
+    use crate::exchange::InputIntent;
+    use crate::provider::{
+        MessageRole, ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome,
         ToolUpdate,
     };
-    use crate::exchange::InputIntent;
     use serde_json::json;
 
     #[test]
@@ -248,8 +248,8 @@ mod tests {
             "Inspect files",
         );
         exchange.observe_turn(&event, 1)?;
-        let mut event = BackendEvent::Tool {
-            address: crate::backend::ToolAddress {
+        let mut event = ProviderEvent::Tool {
+            address: crate::provider::ToolAddress {
                 turn: address,
                 tool_id: "before".into(),
             },
@@ -264,18 +264,18 @@ mod tests {
         };
         exchange.observe_turn(&event, 2)?;
         exchange.append_input(InputIntent::Steering, "Include tests".into(), 3)?;
-        if let BackendEvent::Tool { address, .. } = &mut event {
+        if let ProviderEvent::Tool { address, .. } = &mut event {
             address.tool_id = "after".into();
         }
         exchange.observe_turn(&event, 4)?;
-        if let BackendEvent::Tool { address, update } = &mut event {
+        if let ProviderEvent::Tool { address, update } = &mut event {
             address.tool_id = "before".into();
             *update = ToolUpdate::Output {
                 update: TextUpdate::Replace("Late result".into()),
             };
         }
         exchange.observe_turn(&event, 5)?;
-        if let BackendEvent::Tool { update, .. } = &mut event {
+        if let ProviderEvent::Tool { update, .. } = &mut event {
             *update = ToolUpdate::Finished {
                 outcome: ToolOutcome::Succeeded,
             };
@@ -302,8 +302,8 @@ mod tests {
 
     #[test]
     fn consecutive_steering_keeps_tools_and_edits_under_the_acknowledgement() -> Result<()> {
-        use crate::backend::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
         use crate::buffer::projection::{ProjectionSource, project};
+        use crate::provider::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
         use forge_buffer::node::NodeKind;
         use forge_buffer::width::WidthProfile;
 
@@ -491,9 +491,9 @@ mod tests {
                     &address,
                     "existing",
                     Some(if phase == "commentary" {
-                        crate::backend::MessageRole::Commentary
+                        crate::provider::MessageRole::Commentary
                     } else {
-                        crate::backend::MessageRole::Response
+                        crate::provider::MessageRole::Response
                     }),
                     "Existing message",
                 );

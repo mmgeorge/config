@@ -1,11 +1,11 @@
 local workspace = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(workspace .. "/nvim")
 local commands = require("forge.views.commands")
-local backend = require("forge.git.git_backend")
-local original_root, original_read = backend.git_root_async, backend.systemlist_async
+local provider = require("forge.git.git_provider")
+local original_root, original_read = provider.git_root_async, provider.systemlist_async
 local pending_root, pending_read
-backend.git_root_async = function(callback) pending_root = callback end
-backend.systemlist_async = function(_, callback) pending_read = callback end
+provider.git_root_async = function(callback) pending_root = callback end
+provider.systemlist_async = function(_, callback) pending_read = callback end
 
 local succeeded, failure = xpcall(function()
   local origin_window = vim.api.nvim_get_current_win()
@@ -36,7 +36,7 @@ local succeeded, failure = xpcall(function()
   assert(not vim.bo[preview].modifiable)
 end, debug.traceback)
 
-backend.git_root_async, backend.systemlist_async = original_root, original_read
+provider.git_root_async, provider.systemlist_async = original_root, original_read
 if not succeeded then
   io.stderr:write(tostring(failure), "\n")
   vim.cmd("cquit 1")

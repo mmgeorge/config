@@ -14,10 +14,10 @@
 //!
 //! After verifying a case's prerequisites and authorizing its external requests,
 //! select it explicitly, for example:
-//! `cargo test --profile dev --locked -p forge-harness --test live_provider codex_cli::lists_backend_owned_codex_model_metadata -- --ignored --exact --nocapture`
+//! `cargo test --profile dev --locked -p forge-harness --test live_provider codex_cli::lists_provider_owned_codex_model_metadata -- --ignored --exact --nocapture`
 //! Do not add `--ignored` or `--include-ignored` to routine checks.
 
-use forge_harness::backend::{BackendCatalogRequest, BackendInput, BackendRequest, PromptMode};
+use forge_harness::provider::{PromptMode, ProviderCatalogRequest, ProviderInput, ProviderRequest};
 use forge_harness::session::ApprovalMode;
 use std::path::Path;
 
@@ -36,23 +36,23 @@ mod text_generation;
 #[path = "live_provider/workflows.rs"]
 mod workflows;
 
-fn catalog_request(workspace: &Path, session_id: &str) -> BackendCatalogRequest {
-    BackendCatalogRequest {
+fn catalog_request(workspace: &Path, session_id: &str) -> ProviderCatalogRequest {
+    ProviderCatalogRequest {
         execution_owner: None,
         harness_session_id: session_id.into(),
         workspace: workspace.to_string_lossy().into_owned(),
-        backend_session_id: None,
+        provider_session_id: None,
         access: Default::default(),
         approval_mode: ApprovalMode::Ask,
     }
 }
 
-fn prompt_request(request: &BackendCatalogRequest) -> BackendRequest {
-    BackendRequest {
+fn prompt_request(request: &ProviderCatalogRequest) -> ProviderRequest {
+    ProviderRequest {
         execution_owner: request.execution_owner.clone(),
         harness_session_id: request.harness_session_id.clone(),
         workspace: request.workspace.clone(),
-        input: BackendInput::from_text(""),
+        input: ProviderInput::from_text(""),
         mode: PromptMode::Chat,
         model: "default".into(),
         effort: "medium".into(),
@@ -60,7 +60,7 @@ fn prompt_request(request: &BackendCatalogRequest) -> BackendRequest {
         service_tier: Default::default(),
         access: request.access.clone(),
         approval_mode: request.approval_mode,
-        backend_session_id: request.backend_session_id.clone(),
+        provider_session_id: request.provider_session_id.clone(),
         submission: None,
         recovered_input: Vec::new(),
         control_context: None,

@@ -8,7 +8,7 @@ local snapshot = { session = { id = "active-startup", active_task = { revision =
 local result, failure, completed
 
 local success, error_message = xpcall(function()
-  require("forge").setup({ harness = { backend = "mock" }, harness_logging = false })
+  require("forge").setup({ harness = { provider = "mock" }, harness_logging = false })
   builder.ensure = function(callback) callback({ ok = true, path = "active-startup-fixture" }) end
   client._host_reset_for_test()
   client._host_set_launcher_for_test(function(_, options, on_exit)
@@ -22,6 +22,11 @@ local success, error_message = xpcall(function()
         if request.method == "host.initialize" then
           emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
         elseif request.method == "session.initialize" then
+          for kind, configured in pairs(require("forge.infra.config").options.harness.providers) do
+            local launch = request.params.provider_launch_by_provider[kind]
+            assert(launch and launch.kind == kind, "startup lost the provider name in its launch catalog")
+            assert(vim.deep_equal(launch.command, configured.command or {}), "startup changed a provider command")
+          end
           emit({ id = request.id, result = snapshot })
         elseif request.method == "host.trace.configure" then
           emit({ id = request.id, result = { enabled = false } })

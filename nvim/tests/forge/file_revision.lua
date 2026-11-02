@@ -90,19 +90,19 @@ local function native_status_snapshot(document)
   return snapshot
 end
 
----@type ForgeGhBackend
-local gh_backend = {}
+---@type ForgeGhProvider
+local gh_provider = {}
 
-function gh_backend.system_async(_, _, cb)
+function gh_provider.system_async(_, _, cb)
   vim.defer_fn(function()
     cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
   end, 5)
 end
 
----@type ForgeGitBackend
-local backend = {}
+---@type ForgeGitProvider
+local provider = {}
 
-function backend.systemlist(command)
+function provider.systemlist(command)
   local key = command_key(command)
   if key == "git\trev-parse\t--show-toplevel" then
     return { root }, 0
@@ -149,14 +149,14 @@ function backend.systemlist(command)
   return {}, 1
 end
 
-function backend.systemlist_async(command, cb)
+function provider.systemlist_async(command, cb)
   vim.defer_fn(function()
-    local output, code = backend.systemlist(command)
+    local output, code = provider.systemlist(command)
     cb(output, code)
   end, 3)
 end
 
-function backend.system(command)
+function provider.system(command)
   local key = command_key(command)
   local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
   local diff_key = "git\t--no-optional-locks\t-C\t" .. root
@@ -169,14 +169,14 @@ function backend.system(command)
   return "unexpected command: " .. command_key(command), 1
 end
 
-function backend.system_async(command, input, cb)
+function provider.system_async(command, input, cb)
   vim.defer_fn(function()
-    local output, code = backend.system(command)
+    local output, code = provider.system(command)
     cb({ code = code, stdout = output, stderr = "", output = output })
   end, 3)
 end
 
-function backend.delete()
+function provider.delete()
   return 0
 end
 
@@ -229,7 +229,7 @@ end
 
 local function run()
   vim.notify = capture_notify
-  forge.set_git_backend(backend)
+  forge.set_git_provider(provider)
   forge.setup({ about_auto_generate = false })
   status._set_runner_for_test(function(method, params, callback)
     assert_true(method == "repository.status.document", "file revision status must use the native route")
@@ -363,8 +363,8 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 vim.notify = original_notify
-forge.reset_git_backend()
-gh.reset_backend()
+forge.reset_git_provider()
+gh.reset_provider()
 status._set_runner_for_test(nil)
 require("forge.source_document")._set_runner_for_test(nil)
 if not ok then

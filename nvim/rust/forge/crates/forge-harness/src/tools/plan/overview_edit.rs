@@ -172,7 +172,7 @@ fn input_schema() -> serde_json::Value {
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    output: crate::backend::BackendCompletion,
+    output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     let editing_checks = invocation
         .arguments
@@ -201,7 +201,7 @@ pub(super) async fn execute(
 /// Decode the tool's replayable completion fields.
 pub(super) fn record(
     invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::backend::BackendCompletion,
+    output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
     output
         .design_patch

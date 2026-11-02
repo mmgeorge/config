@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, ensure};
-use forge_harness::backend::approval::PermissionCoordinator;
-use forge_harness::backend::codex::CodexBackend;
-use forge_harness::backend::copilot::CopilotBackend;
-use forge_harness::backend::{
-    Backend, BackendError, BackendEvent, BackendInput, BackendRequest, InvocationScope, ToolUpdate,
-};
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
+use forge_harness::provider::approval::PermissionCoordinator;
+use forge_harness::provider::codex::CodexProvider;
+use forge_harness::provider::copilot::CopilotProvider;
+use forge_harness::provider::{
+    InvocationScope, Provider, ProviderError, ProviderEvent, ProviderInput, ProviderRequest,
+    ToolUpdate,
+};
 use forge_harness::session::{ApprovalMode, SessionStore};
 use forge_harness::trace::TraceStore;
 use forge_protocol::message::Request;
@@ -331,7 +332,7 @@ fn initialize(provider: &str, root: &Path) -> Result<InitializeRequest> {
     Ok(serde_json::from_value(json!({
         "config_dir":config,"data_root":data_root,"workspace":workspace,
         "client_id":format!("live-{provider}-workflow"),"model":"gpt-6-luna","effort":"low",
-        "backend":{"kind":provider,"command":if provider=="codex" {vec!["codex","app-server"]} else {Vec::new()}}
+        "provider":{"kind":provider,"command":if provider=="codex" {vec!["codex","app-server"]} else {Vec::new()}}
     }))?)
 }
 
@@ -396,8 +397,8 @@ async fn tool_workflow(provider: &str) -> Result<()> {
     let mut initialize = initialize(provider, &fixture)?;
     let workspace = Path::new(&initialize.workspace).to_owned();
     let mut broker = HarnessBroker::initialize(initialize.clone())?;
-    let initial_backend = broker.backend_handle();
-    let mut resumed_backend: Option<Arc<dyn Backend>> = None;
+    let initial_provider = broker.provider_handle();
+    let mut resumed_provider: Option<Arc<Provider>> = None;
     let result: Result<()> = async {
     let session_id = broker.snapshot()?.session.id;
     dispatch(
@@ -455,7 +456,7 @@ async fn tool_workflow(provider: &str) -> Result<()> {
         checklist
             .current
             .iter()
-            .all(|item| item.status == forge_harness::backend::ChecklistStatus::Completed),
+            .all(|item| item.status == forge_harness::provider::ChecklistStatus::Completed),
         "native task updates did not settle: {checklist:?}"
     );
     ensure!(
@@ -501,22 +502,22 @@ async fn tool_workflow(provider: &str) -> Result<()> {
     initialize.session_id = Some(snapshot.session.id.clone());
     let original_provider_id = snapshot
         .session
-        .backend_session_id
+        .provider_session_id
         .clone()
         .context("missing durable provider identity")?;
     drop(snapshot);
-    initial_backend.shutdown().await?;
+    initial_provider.shutdown().await?;
     drop(broker);
 
     let mut reopened = HarnessBroker::initialize(initialize.clone())?;
     eprintln!("{provider}: reopened durable provider session for file editing; evidence: {}", fixture.display());
-    resumed_backend = Some(reopened.backend_handle());
+    resumed_provider = Some(reopened.provider_handle());
     ensure!(
         reopened.snapshot()?.session.name == "Workflow before first exchange",
         "local rename was lost on reopen"
     );
     ensure!(
-        reopened.snapshot()?.session.backend_session_id.as_deref()
+        reopened.snapshot()?.session.provider_session_id.as_deref()
             == Some(original_provider_id.as_str()),
         "completed history discarded its provider identity"
     );
@@ -532,7 +533,7 @@ async fn tool_workflow(provider: &str) -> Result<()> {
         "resumed tool turn failed to preserve and append the requested markers: {resumed_content:?}"
     );
     drop(reopened);
-    if let Some(backend) = &resumed_backend { backend.shutdown().await?; }
+    if let Some(provider) = &resumed_provider { provider.shutdown().await?; }
     let mut task_service = WorkflowService::open(initialize.clone()).await?;
     eprintln!("{provider}: starting Harness Goal task after reopen; evidence: {}", fixture.display());
     let task_result: Result<()> = async {
@@ -577,9 +578,9 @@ async fn tool_workflow(provider: &str) -> Result<()> {
     );
     Ok(())
     }.await;
-    let initial_cleanup = initial_backend.shutdown().await;
-    let resumed_cleanup = match resumed_backend {
-        Some(backend) => backend.shutdown().await,
+    let initial_cleanup = initial_provider.shutdown().await;
+    let resumed_cleanup = match resumed_provider {
+        Some(provider) => provider.shutdown().await,
         None => Ok(()),
     };
     result.with_context(|| format!("{provider} tool workflow; evidence: {}", fixture.display()))?;
@@ -672,27 +673,27 @@ async fn plan_feedback(provider: &str) -> Result<()> {
 }
 
 /// Construct an isolated provider for active-tool interruption and retry.
-fn backend(
+fn create_provider(
     provider: &str,
     initialize: &InitializeRequest,
-    request: &BackendRequest,
-) -> Result<Box<dyn Backend>> {
+    request: &ProviderRequest,
+) -> Result<Box<Provider>> {
     let permission = PermissionCoordinator::transient(&request.workspace)?;
     let root = Path::new(&initialize.data_root);
     let trace = Arc::new(TraceStore::open(root)?);
     Ok(match provider {
-        "codex" => Box::new(CodexBackend::new_with_permission_coordinator(
+        "codex" => Box::new(CodexProvider::new_with_permission_coordinator(
             vec!["codex".into(), "app-server".into()],
             permission,
             trace,
             Some(root.into()),
-        )?) as Box<dyn Backend>,
-        "copilot" => Box::new(CopilotBackend::new_with_permission_coordinator(
+        )?) as Box<Provider>,
+        "copilot" => Box::new(CopilotProvider::new_with_permission_coordinator(
             Vec::new(),
             permission,
             trace,
             Some(root.into()),
-        )?) as Box<dyn Backend>,
+        )?) as Box<Provider>,
         _ => unreachable!("test provider is explicit"),
     })
 }
@@ -741,14 +742,15 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
             finished.to_string_lossy().replace('\'', "'\\''")
         )
     };
-    request.input = BackendInput::from_text(format!(
+    request.input = ProviderInput::from_text(format!(
         "Run exactly this command using your command tool: `{command}`. Wait until the command exits before reporting completion. If the tool returns a still-running session, keep polling that session until it exits. Do not run other commands."
     ));
-    let backend = backend(provider, &initialize, &request)?;
+    let provider_name = provider;
+    let provider = create_provider(provider, &initialize, &request)?;
     let result: Result<()> = async {
-        request.backend_session_id = backend.initialize_session(request.clone()).await?;
-        let (sink, mut stream) = forge_harness::backend::events::channel(InvocationScope::new(request.owner()?, "cancel-tool"));
-        let execution = backend.prompt_stream(request.clone(), sink);
+        request.provider_session_id = provider.initialize_session(request.clone()).await?;
+        let (sink, mut stream) = forge_harness::provider::events::channel(InvocationScope::new(request.owner()?, "cancel-tool"));
+        let execution = provider.prompt_stream(request.clone(), sink);
         tokio::pin!(execution);
         let mut observed = Vec::new();
         loop {
@@ -756,14 +758,14 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
                 output = &mut execution => anyhow::bail!("provider completed before active-tool cancellation: {output:?}; observed events: {observed:#?}"),
                 event = stream.recv() => {
                     let event = event?.context("event stream ended before command started")?;
-                    if let BackendEvent::Tool { update: ToolUpdate::Requested { invocation }, .. } = &event {
-                        eprintln!("{provider}: requested tool {} ({:?})", invocation.name, invocation.kind);
+                    if let ProviderEvent::Tool { update: ToolUpdate::Requested { invocation }, .. } = &event {
+                        eprintln!("{provider_name}: requested tool {} ({:?})", invocation.name, invocation.kind);
                     }
                     observed.push(event);
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
                     if std::fs::read_to_string(&sentinel).is_ok_and(|content| content == "CANCEL-WORKFLOW-STARTED") {
-                        eprintln!("{provider}: command wrote its start sentinel, cancelling active execution");
+                        eprintln!("{provider_name}: command wrote its start sentinel, cancelling active execution");
                         break;
                     }
                 }
@@ -772,7 +774,7 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
         let command_started_at = tokio::time::Instant::now();
         let cancellation_session_id = request.harness_session_id.clone();
         let cancellation = async {
-            tokio::join!(backend.cancel_session(&cancellation_session_id), &mut execution)
+            tokio::join!(provider.cancel_session(&cancellation_session_id), &mut execution)
         };
         tokio::pin!(cancellation);
         let mut stream_open = true;
@@ -794,9 +796,9 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
         }
         std::fs::write(fixture.join("cancelled-events.json"), serde_json::to_vec_pretty(&observed)?)?;
         match completed {
-            Err(BackendError::Cancelled) => {}
+            Err(ProviderError::Cancelled) => {}
             Ok(_) => ensure!(observed.iter().any(|event| matches!(event,
-                BackendEvent::Turn { update: forge_harness::backend::TurnUpdate::Finished {
+                ProviderEvent::Turn { update: forge_harness::provider::TurnUpdate::Finished {
                     outcome: forge_harness::turn::TurnOutcome::Cancelled | forge_harness::turn::TurnOutcome::Interrupted, ..
                 }, .. }
             )), "cancelled command omitted interrupted-turn evidence: {observed:#?}"),
@@ -805,18 +807,18 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
         // Observe past the command's scheduled write; a closed turn alone does not prove process cancellation.
         tokio::time::sleep_until(command_started_at + std::time::Duration::from_secs(5)).await;
         ensure!(!finished.exists(), "cancelled native command continued executing after turn settlement");
-        request.backend_session_id = backend.active_session_id_for(&request.harness_session_id).await;
-        request.input = BackendInput::from_text("The previous command was intentionally cancelled. Use a tool to read input.txt, then reply with its exact token. Do not run another sleep.");
-        let retried = backend.prompt(request).await?;
-        ensure!(retried.event.iter().any(|event| matches!(event, BackendEvent::Tool { update: ToolUpdate::Finished { .. }, .. })), "retry did not execute a tool");
+        request.provider_session_id = provider.active_session_id_for(&request.harness_session_id).await;
+        request.input = ProviderInput::from_text("The previous command was intentionally cancelled. Use a tool to read input.txt, then reply with its exact token. Do not run another sleep.");
+        let retried = provider.prompt(request).await?;
+        ensure!(retried.event.iter().any(|event| matches!(event, ProviderEvent::Tool { update: ToolUpdate::Finished { .. }, .. })), "retry did not execute a tool");
         ensure!(serde_json::to_string(&retried.event)?.contains("WORKFLOW-72931"), "retry lost workspace access");
-        eprintln!("{provider}: active command cancellation, drained execution, and successful tool retry passed");
+        eprintln!("{provider_name}: active command cancellation, drained execution, and successful tool retry passed");
         Ok(())
     }.await;
-    backend.shutdown().await?;
+    provider.shutdown().await?;
     result.with_context(|| {
         format!(
-            "{provider} cancellation workflow; evidence: {}",
+            "{provider_name} cancellation workflow; evidence: {}",
             fixture.display()
         )
     })

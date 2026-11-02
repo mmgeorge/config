@@ -1,4 +1,4 @@
-use crate::backend::{
+use crate::provider::{
     ProviderChangeSet, TextUpdate, ToolAddress, ToolInvocation, ToolOutcome, ToolUpdate,
 };
 use serde::{Deserialize, Serialize};
@@ -122,7 +122,7 @@ impl ToolStore {
                 if let Some(execution) = self.execution.get_mut(&tool.id) {
                     execution.outcome = Some(match outcome {
                         super::TurnOutcome::Failed => ToolOutcome::Failed {
-                            diagnostic: crate::backend::ToolDiagnostic {
+                            diagnostic: crate::provider::ToolDiagnostic {
                                 code: None,
                                 message: "provider execution failed before tool completion".into(),
                             },
@@ -141,7 +141,7 @@ impl ToolStore {
     pub(crate) fn interrupt_detached_background(
         &mut self,
         observed_at: i64,
-    ) -> Result<bool, crate::backend::BackendError> {
+    ) -> Result<bool, crate::provider::ProviderError> {
         let address: Vec<_> = self
             .execution
             .values()
@@ -183,9 +183,9 @@ impl ToolStore {
         address: &ToolAddress,
         update: &ToolUpdate,
         now_ms: i64,
-    ) -> Result<(), crate::backend::BackendError> {
+    ) -> Result<(), crate::provider::ProviderError> {
         let id = address.tool_id.as_str();
-        let protocol = |message: &str| crate::backend::BackendError::Protocol {
+        let protocol = |message: &str| crate::provider::ProviderError::Protocol {
             message: message.into(),
         };
         if !self.execution.contains_key(id) {
@@ -239,7 +239,7 @@ impl ToolStore {
                 tool.started_at_ms.get_or_insert(now_ms);
             }
             ToolUpdate::Backgrounded if tool.state() == ToolState::Running => {
-                if execution.invocation.kind != crate::backend::ToolActivityKind::Command {
+                if execution.invocation.kind != crate::provider::ToolActivityKind::Command {
                     return Err(protocol(
                         "only command tools can outlive their foreground turn",
                     ));
@@ -257,7 +257,7 @@ impl ToolStore {
             },
             ToolUpdate::Changes { changes } => {
                 tool.change.clone_from(changes);
-                tool.kind = tool_kind(crate::backend::ToolActivityKind::FileChange);
+                tool.kind = tool_kind(crate::provider::ToolActivityKind::FileChange);
             }
             ToolUpdate::Finished { outcome } if tool.state() == ToolState::Running => {
                 tool.status = match outcome {
@@ -307,11 +307,11 @@ impl ToolStore {
     }
 }
 
-fn tool_kind(kind: crate::backend::ToolActivityKind) -> String {
+fn tool_kind(kind: crate::provider::ToolActivityKind) -> String {
     match kind {
-        crate::backend::ToolActivityKind::Command => "command",
-        crate::backend::ToolActivityKind::FileChange => "file_change",
-        crate::backend::ToolActivityKind::ToolCall => "tool_call",
+        crate::provider::ToolActivityKind::Command => "command",
+        crate::provider::ToolActivityKind::FileChange => "file_change",
+        crate::provider::ToolActivityKind::ToolCall => "tool_call",
     }
     .into()
 }
@@ -327,11 +327,11 @@ mod tests {
     /// Preserve proven background work only across normal foreground completion.
     #[test]
     fn background_tools_outlive_completed_turns_but_not_cancellation()
-    -> Result<(), crate::backend::BackendError> {
+    -> Result<(), crate::provider::ProviderError> {
         let address = ToolAddress {
-            turn: crate::backend::TurnAddress {
-                scope: crate::backend::InvocationScope::new(
-                    crate::backend::ExecutionOwner::root("session"),
+            turn: crate::provider::TurnAddress {
+                scope: crate::provider::InvocationScope::new(
+                    crate::provider::ExecutionOwner::root("session"),
                     "exchange",
                 ),
                 thread_id: "thread".into(),
@@ -350,7 +350,7 @@ mod tests {
                 &address,
                 &ToolUpdate::Requested {
                     invocation: ToolInvocation {
-                        kind: crate::backend::ToolActivityKind::Command,
+                        kind: crate::provider::ToolActivityKind::Command,
                         name: "exec".into(),
                         title: "Background command".into(),
                         arguments: serde_json::json!({}),
@@ -412,11 +412,11 @@ mod tests {
     /// Keep invocation identity immutable while display metadata evolves and survives reload.
     #[test]
     fn title_updates_preserve_invocation_identity_and_settled_execution()
-    -> Result<(), crate::backend::BackendError> {
+    -> Result<(), crate::provider::ProviderError> {
         let address = ToolAddress {
-            turn: crate::backend::TurnAddress {
-                scope: crate::backend::InvocationScope::new(
-                    crate::backend::ExecutionOwner::root("session"),
+            turn: crate::provider::TurnAddress {
+                scope: crate::provider::InvocationScope::new(
+                    crate::provider::ExecutionOwner::root("session"),
                     "exchange",
                 ),
                 thread_id: "thread".into(),
@@ -425,7 +425,7 @@ mod tests {
             tool_id: "call".into(),
         };
         let invocation = ToolInvocation {
-            kind: crate::backend::ToolActivityKind::ToolCall,
+            kind: crate::provider::ToolActivityKind::ToolCall,
             name: "web_search".into(),
             title: "Web Search".into(),
             arguments: serde_json::json!({"query":"Neovim"}),
@@ -508,11 +508,11 @@ mod tests {
 
     #[test]
     fn tool_identity_input_and_denial_survive_reopening_without_restarting_execution()
-    -> Result<(), crate::backend::BackendError> {
+    -> Result<(), crate::provider::ProviderError> {
         let address = ToolAddress {
-            turn: crate::backend::TurnAddress {
-                scope: crate::backend::InvocationScope::new(
-                    crate::backend::ExecutionOwner::root("session"),
+            turn: crate::provider::TurnAddress {
+                scope: crate::provider::InvocationScope::new(
+                    crate::provider::ExecutionOwner::root("session"),
                     "exchange",
                 ),
                 thread_id: "thread".into(),
@@ -525,7 +525,7 @@ mod tests {
             &address,
             &ToolUpdate::Requested {
                 invocation: ToolInvocation {
-                    kind: crate::backend::ToolActivityKind::Command,
+                    kind: crate::provider::ToolActivityKind::Command,
                     name: "inspect".into(),
                     title: "Inspect files".into(),
                     arguments: serde_json::json!({"path":"source.rs"}),
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn only_structured_execution_failures_count_as_failed_tools()
-    -> Result<(), crate::backend::BackendError> {
+    -> Result<(), crate::provider::ProviderError> {
         for status in [
             "denied",
             "declined",
@@ -619,9 +619,9 @@ mod tests {
         assert!(tool_failed("failed"));
         let mut store = ToolStore::default();
         let address = ToolAddress {
-            turn: crate::backend::TurnAddress {
-                scope: crate::backend::InvocationScope::new(
-                    crate::backend::ExecutionOwner::root("session"),
+            turn: crate::provider::TurnAddress {
+                scope: crate::provider::InvocationScope::new(
+                    crate::provider::ExecutionOwner::root("session"),
                     "exchange",
                 ),
                 thread_id: "thread".into(),
@@ -633,7 +633,7 @@ mod tests {
             &address,
             &ToolUpdate::Requested {
                 invocation: ToolInvocation {
-                    kind: crate::backend::ToolActivityKind::Command,
+                    kind: crate::provider::ToolActivityKind::Command,
                     name: "inspect".into(),
                     title: "Inspect files".into(),
                     arguments: serde_json::json!({}),

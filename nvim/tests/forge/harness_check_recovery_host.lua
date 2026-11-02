@@ -36,7 +36,7 @@ local success, failure = xpcall(function()
   ["slow"] = { trigger = { auto = false }, action = { command = "print running; sleep 30sec", label = "Recovery check", category = "test" } }
 } }) }, workspace .. "/.forge.json")
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "mock" } } } } })
+  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "mock" } } } } })
   local snapshot = open()
   local session_id = snapshot.session.id
   request(session_id, "session.configure", { shell = "nushell" })

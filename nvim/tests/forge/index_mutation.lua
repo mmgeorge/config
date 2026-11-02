@@ -1,6 +1,6 @@
 package.path = "nvim/lua/?.lua;nvim/lua/?/init.lua;" .. package.path
 
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 local index_mutation = require("forge.git.index_mutation")
 
 local function assert_true(condition, message)
@@ -16,12 +16,12 @@ end
 local root = "D:/mutation-root"
 local command_list = {}
 local fail_path = "fail.txt"
-local duplicate_backend_callback = false
+local duplicate_provider_callback = false
 
----@type ForgeGitBackend
-local backend = {}
+---@type ForgeGitProvider
+local provider = {}
 
-function backend.system_async(command, input, callback)
+function provider.system_async(command, input, callback)
   command_list[#command_list + 1] = { command = vim.deepcopy(command), input = input }
   local failed = command[#command] == fail_path
   local result = {
@@ -31,10 +31,10 @@ function backend.system_async(command, input, callback)
     output = failed and "rejected" or "",
   }
   callback(result)
-  if duplicate_backend_callback then callback(result) end
+  if duplicate_provider_callback then callback(result) end
 end
 
-git_backend.set_backend(backend)
+git_provider.set_provider(provider)
 
 local patch = table.concat({
   "diff --git a/first.txt b/first.txt",
@@ -114,7 +114,7 @@ assert_true(
 command_list = {}
 result = nil
 local completion_count = 0
-duplicate_backend_callback = true
+duplicate_provider_callback = true
 index_mutation.execute_async(root, {
   direction = "stage",
   target_list = {
@@ -125,11 +125,11 @@ index_mutation.execute_async(root, {
   completion_count = completion_count + 1
   result = next_result
 end)
-duplicate_backend_callback = false
-assert_true(result ~= nil and result.ok, "duplicate backend callback changed the mutation result")
-assert_equal(#command_list, 2, "duplicate backend callback issued a target twice")
-assert_equal(completion_count, 1, "duplicate backend callback completed the mutation twice")
+duplicate_provider_callback = false
+assert_true(result ~= nil and result.ok, "duplicate provider callback changed the mutation result")
+assert_equal(#command_list, 2, "duplicate provider callback issued a target twice")
+assert_equal(completion_count, 1, "duplicate provider callback completed the mutation twice")
 
-git_backend.reset_backend()
+git_provider.reset_provider()
 print("index_mutation OK")
 vim.cmd("qa!")

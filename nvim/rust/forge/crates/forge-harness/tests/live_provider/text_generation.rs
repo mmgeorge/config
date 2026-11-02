@@ -1,6 +1,7 @@
-use forge_harness::backend::codex::CodexBackend;
-use forge_harness::backend::copilot::CopilotBackend;
-use forge_harness::backend::{Backend, TextGeneration};
+use forge_harness::provider::ProviderAdapter as _;
+use forge_harness::provider::TextGeneration;
+use forge_harness::provider::codex::CodexProvider;
+use forge_harness::provider::copilot::CopilotProvider;
 
 const HISTORY: &str = "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.";
 
@@ -8,8 +9,8 @@ const HISTORY: &str = "User: Fix terminal counts.\nAssistant: The counts are fix
 #[ignore = "requires authenticated Codex and makes one isolated naming request"]
 async fn live_codex_session_name() {
     let workspace = tempfile::tempdir().unwrap();
-    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
-    let result = backend
+    let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let result = provider
         .generate_text(
             super::catalog_request(workspace.path(), "codex-name"),
             TextGeneration::SessionName,
@@ -18,7 +19,7 @@ async fn live_codex_session_name() {
             HISTORY,
         )
         .await;
-    backend.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
     assert!(
         TextGeneration::SessionName
             .validate(&result.unwrap())
@@ -30,8 +31,8 @@ async fn live_codex_session_name() {
 #[ignore = "requires authenticated Copilot and makes one isolated naming request"]
 async fn live_copilot_session_name() {
     let workspace = tempfile::tempdir().unwrap();
-    let backend = CopilotBackend::new(vec!["copilot".into()]).unwrap();
-    let result = backend
+    let provider = CopilotProvider::new(vec!["copilot".into()]).unwrap();
+    let result = provider
         .generate_text(
             super::catalog_request(workspace.path(), "copilot-name"),
             TextGeneration::SessionName,
@@ -40,7 +41,7 @@ async fn live_copilot_session_name() {
             HISTORY,
         )
         .await;
-    backend.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
     assert!(
         TextGeneration::SessionName
             .validate(&result.unwrap())
@@ -52,8 +53,8 @@ async fn live_copilot_session_name() {
 #[ignore = "requires authenticated Codex and makes one isolated recap request"]
 async fn live_codex_recap() {
     let workspace = tempfile::tempdir().unwrap();
-    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
-    let result = backend
+    let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let result = provider
         .generate_text(
             super::catalog_request(workspace.path(), "codex-recap"),
             TextGeneration::Recap,
@@ -62,7 +63,7 @@ async fn live_codex_recap() {
             HISTORY,
         )
         .await;
-    backend.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
     assert!(!result.unwrap().is_empty());
 }
 
@@ -70,8 +71,8 @@ async fn live_codex_recap() {
 #[ignore = "requires authenticated Copilot and makes one isolated recap request"]
 async fn live_copilot_recap() {
     let workspace = tempfile::tempdir().unwrap();
-    let backend = CopilotBackend::new(vec!["copilot".into()]).unwrap();
-    let result = backend
+    let provider = CopilotProvider::new(vec!["copilot".into()]).unwrap();
+    let result = provider
         .generate_text(
             super::catalog_request(workspace.path(), "copilot-recap"),
             TextGeneration::Recap,
@@ -80,6 +81,6 @@ async fn live_copilot_recap() {
             HISTORY,
         )
         .await;
-    backend.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
     assert!(!result.unwrap().is_empty());
 }

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
-use forge_harness::{backend::ServiceTier, session::AutoCompaction, settings::SettingsStore};
+use forge_harness::{provider::ServiceTier, session::AutoCompaction, settings::SettingsStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

@@ -103,7 +103,7 @@ local ok, failure = xpcall(function()
   local original_source = review.owner.source
   local optimistic = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
   assert(not optimistic:find("fourth", 1, true) and not optimistic:find("src/game.rs", 1, true)
-    and optimistic:find("keep", 1, true), "test deletion waited for the backend")
+    and optimistic:find("keep", 1, true), "test deletion waited for the provider")
   assert(review.owner.version == 1 and review.owner.source == original_source, "preview changed the canonical version")
   local comments = require("forge.draft_comments")
   comments.add(review.buf, { id = "rollback-feedback", source_line = 1, body = "Feedback typed while deleting" }, false)

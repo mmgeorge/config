@@ -3,10 +3,9 @@ use anyhow::Result;
 pub use auto_compaction::AutoCompaction;
 use serde::{Deserialize, Serialize};
 
-mod access;
 mod shell;
 mod timeout;
-pub use access::{AccessPolicy, DirectoryScope, WindowsSandbox, WriteScope};
+pub use forge_provider_api::access::{AccessPolicy, DirectoryScope, WindowsSandbox, WriteScope};
 pub use shell::CheckShell;
 pub(crate) use timeout::InputSchedule;
 pub use timeout::{InputDeadline, InputTimeout, ResolutionSource, TimeoutUnit};
@@ -14,41 +13,11 @@ pub mod continuation;
 pub mod state_machine;
 use std::collections::BTreeMap;
 
-/// Defines the approval policy selected for one Harness session.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalMode {
-    #[default]
-    /// Apply rules and request a decision for remaining tool requests.
-    Ask,
-    /// Reject tool requests that still require a decision.
-    Deny,
-    /// Approve remaining tool requests once, preserving explicit denials.
-    Allow,
-}
-
-impl ApprovalMode {
-    /// Return the stable user-facing label for this approval policy.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Ask => "ask",
-            Self::Deny => "deny",
-            Self::Allow => "allow",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ContextUsage {
-    pub used: u64,
-    pub size: u64,
-    pub remaining_percent: u8,
-}
-
 /// Captures the provider-owned boundary used to materialize one fork.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderForkPoint {
-    pub backend_session_id: Option<String>,
+    #[serde(alias = "backend_session_id")]
+    pub provider_session_id: Option<String>,
     pub checkpoint_id: Option<String>,
 }
 
@@ -69,34 +38,6 @@ pub enum ProviderForkState {
     },
 }
 
-impl ContextUsage {
-    const CODEX_BASELINE_TOKENS: u64 = 12_000;
-
-    pub fn codex(used: u64, size: u64) -> Option<Self> {
-        Self::with_baseline(used, size, Self::CODEX_BASELINE_TOKENS)
-    }
-
-    pub fn reported(used: u64, size: u64) -> Option<Self> {
-        Self::with_baseline(used, size, 0)
-    }
-
-    fn with_baseline(used: u64, size: u64, baseline: u64) -> Option<Self> {
-        let effective_size = size.checked_sub(baseline)?;
-        if effective_size == 0 {
-            return None;
-        }
-        let effective_used = used.saturating_sub(baseline);
-        let remaining = effective_size.saturating_sub(effective_used);
-        let remaining_percent = ((remaining as f64 / effective_size as f64) * 100.0)
-            .clamp(0.0, 100.0)
-            .round() as u8;
-        Some(Self {
-            used,
-            size,
-            remaining_percent,
-        })
-    }
-}
 use std::fmt;
 
 /// Represents an active session lease held by another Neovim client.
@@ -123,7 +64,7 @@ pub enum SessionPurpose {
     PlanReviewAnswer,
 }
 
-/// Represents one durable conversation and its backend identity.
+/// Represents one durable conversation and its provider identity.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessSession {
     /// Controls automatic resumption while retaining explicit access to every session.
@@ -143,8 +84,10 @@ pub struct HarnessSession {
     pub primary_agent_id: String,
     pub name: String,
     pub workspace: String,
-    pub backend: String,
-    pub backend_session_id: Option<String>,
+    #[serde(alias = "backend")]
+    pub provider: String,
+    #[serde(alias = "backend_session_id")]
+    pub provider_session_id: Option<String>,
     pub provider_checkpoint_id: Option<String>,
     pub provider_fork_state: ProviderForkState,
     pub model: String,
@@ -166,7 +109,7 @@ pub struct HarnessSession {
     #[serde(default)]
     pub context_window: Option<String>,
     #[serde(default)]
-    pub service_tier: crate::backend::ServiceTier,
+    pub service_tier: crate::provider::ServiceTier,
     #[serde(default)]
     pub access: crate::session::AccessPolicy,
     #[serde(default)]
@@ -185,7 +128,7 @@ pub struct HarnessSession {
     pub context_usage: Option<ContextUsage>,
 }
 
-/// Stores the last model controls selected for one backend and workspace.
+/// Stores the last model controls selected for one provider and workspace.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessPreference {
     #[serde(default)]
@@ -197,7 +140,7 @@ pub struct HarnessPreference {
     #[serde(default)]
     pub model_setting: BTreeMap<String, ModelSetting>,
     #[serde(default)]
-    pub service_tier: crate::backend::ServiceTier,
+    pub service_tier: crate::provider::ServiceTier,
     #[serde(default)]
     pub plan_executor: PlanExecutor,
     #[serde(default)]
@@ -277,8 +220,10 @@ mod context_usage_test {
     }
 
     #[test]
-    fn preserves_provider_context_as_reported_by_the_backend() {
+    fn preserves_provider_context_as_reported_by_the_provider() {
         let usage = ContextUsage::reported(156_000, 200_000).expect("valid reported usage");
         assert_eq!(usage.remaining_percent, 22);
     }
 }
+
+pub use forge_provider_api::{approval::ApprovalMode, context::ContextUsage};

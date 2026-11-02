@@ -1,5 +1,5 @@
-use crate::backend::BackendCompletion;
 use crate::plan::{PlanDocument, PlanState};
+use crate::provider::ProviderCompletion;
 use crate::tools::error::{ToolContext, ToolResult as Result};
 use crate::tools::{ControlToolInvocation, ControlToolResult, runtime::ControlToolRuntime};
 
@@ -7,7 +7,7 @@ use crate::tools::{ControlToolInvocation, ControlToolResult, runtime::ControlToo
 pub(super) async fn apply_edit(
     runtime: &mut ControlToolRuntime,
     mut invocation: ControlToolInvocation,
-    mut output: BackendCompletion,
+    mut output: ProviderCompletion,
 ) -> Result<ControlToolResult> {
     runtime.require_readable_plan()?;
     crate::tools::error::ensure!(

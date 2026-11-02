@@ -74,7 +74,7 @@ local success, failure = xpcall(function()
   git({ "add", "source.rs" })
   git({ "commit", "-qm", "fixture" })
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "writing-blocking" } } } } })
+  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "writing-blocking" } } } } })
   local initialized, initialization_failure
   client.session_initialize(function(value, problem) initialized, initialization_failure = value, problem end)
   wait(function() return initialized or initialization_failure end, "Harness initialization did not settle")

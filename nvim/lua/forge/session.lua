@@ -66,7 +66,7 @@ M.empty_diff_rows = {}
 ---@field client table?
 ---@field ready boolean
 ---@field busy boolean
----@field switching_backend? boolean
+---@field switching_provider? boolean
 ---@field state_sync_pending? boolean
 ---@field aborting_plan? boolean
 ---@field cancel_requested boolean
@@ -82,7 +82,7 @@ M.empty_diff_rows = {}
 ---@field input_timeout_configuration? ForgeTimeoutConfiguration
 ---@field capability table
 ---@field model_list table[]?
----@field model_backend string?
+---@field model_provider string?
 ---@field render_rows table<integer, table>
 ---@field fold_installed table<string, boolean>
 ---@field activity_expanded table<string, boolean>

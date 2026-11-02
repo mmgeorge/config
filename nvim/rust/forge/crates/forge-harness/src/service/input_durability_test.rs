@@ -6,7 +6,7 @@ async fn controller_reopens_acknowledged_queue_suspended() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let initialize: InitializeRequest = serde_json::from_value(json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
-        "client_id":"input-durability", "backend":{"kind":"mock","command":[]},
+        "client_id":"input-durability", "provider":{"kind":"mock","command":[]},
     }))?;
     let controller = SessionController::new(HarnessBroker::initialize(initialize.clone())?)?;
     let session_id = controller.observer.session_id().to_owned();
@@ -65,7 +65,7 @@ fn interrupted_session_deletion_retries_queue_cleanup() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let initialize: InitializeRequest = serde_json::from_value(json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
-        "client_id":"input-deletion", "backend":{"kind":"mock","command":[]},
+        "client_id":"input-deletion", "provider":{"kind":"mock","command":[]},
     }))?;
     let controller = SessionController::new(HarnessBroker::initialize(initialize)?)?;
     let session_id = controller.observer.session_id().to_owned();
@@ -95,7 +95,7 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
     let fixture = tempfile::tempdir()?;
     let initialize: InitializeRequest = serde_json::from_value(json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
-        "client_id":"input-gap", "backend":{"kind":"mock","command":[]},
+        "client_id":"input-gap", "provider":{"kind":"mock","command":[]},
     }))?;
     let controller = SessionController::new(HarnessBroker::initialize(initialize.clone())?)?;
     let session_id = controller.observer.session_id().to_owned();
@@ -111,8 +111,8 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
     let journal = controller.submission_store.clone();
     let prepared = journal.prepare_input(
         &catalog,
-        crate::backend::BackendInput::from_text("once"),
-        crate::backend::BackendKind::Mock,
+        crate::provider::ProviderInput::from_text("once"),
+        crate::provider::ProviderKind::Mock,
         Some("gap".into()),
     )?;
     drop(controller);
@@ -122,27 +122,27 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
     assert!(controller.coordinator.submissions.snapshot()?.suspended);
     let again = journal.prepare_input(
         &catalog,
-        crate::backend::BackendInput::from_text("once"),
-        crate::backend::BackendKind::Mock,
+        crate::provider::ProviderInput::from_text("once"),
+        crate::provider::ProviderKind::Mock,
         Some("gap".into()),
     )?;
     assert_eq!(prepared.id(), again.id());
     let edited = journal.prepare_input(
         &catalog,
-        crate::backend::BackendInput::from_text("edited"),
-        crate::backend::BackendKind::Mock,
+        crate::provider::ProviderInput::from_text("edited"),
+        crate::provider::ProviderKind::Mock,
         Some("gap".into()),
     )?;
     assert_ne!(prepared.id(), edited.id());
     assert!(matches!(
         prepared.record()?.delivery,
-        crate::backend::submission::SubmissionState::Cancelled
+        crate::provider::submission::SubmissionState::Cancelled
     ));
     assert_eq!(
         journal
             .pending(
                 &edited.record()?.request,
-                crate::backend::BackendKind::Mock,
+                crate::provider::ProviderKind::Mock,
                 None
             )?
             .len(),

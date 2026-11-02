@@ -72,7 +72,7 @@ end
 
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   require("forge").open_harness()
   await(function() return state.ready and state.session ~= nil end, "Harness did not open")
   if stage == "seed" then

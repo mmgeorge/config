@@ -1287,7 +1287,7 @@ impl HostRouter {
                         .await
                 {
                     sink.send_event(forge_protocol::message::SessionEvent {
-                            session_id, event: "backend_event".into(),
+                            session_id, event: "provider_event".into(),
                             payload: json!({"kind":"error","text":format!("Provider initialization failed: {error:#}")}),
                         }).await?;
                 }
@@ -1552,7 +1552,7 @@ fn revision_page(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_git::completion::{RevisionBackend, RevisionId};
+    use forge_git::completion::{RevisionId, RevisionProvider};
 
     #[test]
     fn renamed_methods_preserve_dispatch() {
@@ -1618,7 +1618,7 @@ mod tests {
             revision: RevisionId(1),
             generation: repository.generation(),
             storage: repository.identity.storage.clone(),
-            backend: RevisionBackend::Gix,
+            provider: RevisionProvider::Gix,
             reference_digest: "fixture".into(),
             retained_bytes: expected.len(),
             values,

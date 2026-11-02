@@ -2,7 +2,7 @@ use super::*;
 use forge_diff::cache::CacheLimits;
 use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair};
-use forge_harness::backend::TextGeneration;
+use forge_harness::provider::TextGeneration;
 
 #[path = "excerpt_regression_tests.rs"]
 mod regression;

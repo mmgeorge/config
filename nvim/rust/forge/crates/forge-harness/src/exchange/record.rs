@@ -74,7 +74,7 @@ pub struct Exchange {
     pub(crate) archived_output: std::collections::HashMap<String, String>,
     #[serde(default)]
     /// Current provider retry, cleared when execution settles.
-    pub provider_retry: Option<crate::backend::retry::ProviderRetry>,
+    pub provider_retry: Option<crate::provider::retry::ProviderRetry>,
     #[serde(default)]
     /// Retains one check baseline across queued work and automatic repair turns.
     pub check_owner: Option<String>,
@@ -99,7 +99,7 @@ pub struct Exchange {
     pub attributed_matches_checkpoint: bool,
     /// Retains terminal approvals and their response source after the picker closes.
     #[serde(default)]
-    pub approval_resolution: Vec<crate::backend::approval::ApprovalRequestView>,
+    pub approval_resolution: Vec<crate::provider::approval::ApprovalRequestView>,
     /// Owns the setup question boundary independently of the active plan.
     pub check_setup: Option<crate::checks::CheckSetupState>,
     pub created_at_ms: i64,
@@ -139,7 +139,7 @@ struct ExchangeRecord {
     pub(crate) archived_output: std::collections::HashMap<String, String>,
     #[serde(default)]
     /// Current provider retry, cleared when execution settles.
-    pub provider_retry: Option<crate::backend::retry::ProviderRetry>,
+    pub provider_retry: Option<crate::provider::retry::ProviderRetry>,
     #[serde(default)]
     /// Retains one check baseline across queued work and automatic repair turns.
     pub check_owner: Option<String>,
@@ -164,7 +164,7 @@ struct ExchangeRecord {
     pub attributed_matches_checkpoint: bool,
     /// Retains terminal approvals and their response source after the picker closes.
     #[serde(default)]
-    pub approval_resolution: Vec<crate::backend::approval::ApprovalRequestView>,
+    pub approval_resolution: Vec<crate::provider::approval::ApprovalRequestView>,
     /// Owns the setup question boundary independently of the active plan.
     pub check_setup: Option<crate::checks::CheckSetupState>,
     pub created_at_ms: i64,
@@ -361,7 +361,7 @@ impl Exchange {
     /// Retain one compaction at its first observed position and merge terminal evidence.
     pub(crate) fn observe_compaction(
         &mut self,
-        compaction: crate::backend::Compaction,
+        compaction: crate::provider::Compaction,
         now_ms: i64,
     ) {
         if let Some(ExchangeNode::Compaction {
@@ -402,9 +402,9 @@ impl Exchange {
         for node in &mut self.node_list {
             if let ExchangeNode::Compaction { compaction, .. } = node
                 && compaction.thread_id == thread_id
-                && compaction.state == crate::backend::CompactionState::Running
+                && compaction.state == crate::provider::CompactionState::Running
             {
-                compaction.state = crate::backend::CompactionState::Unconfirmed;
+                compaction.state = crate::provider::CompactionState::Unconfirmed;
                 compaction.completed_at_ms = Some(now_ms);
             }
         }
@@ -413,10 +413,10 @@ impl Exchange {
     /// Route provider lifecycle and tool provenance before accepting presentation content.
     pub(crate) fn observe_turn(
         &mut self,
-        event: &crate::backend::BackendEvent,
+        event: &crate::provider::ProviderEvent,
         now_ms: i64,
     ) -> anyhow::Result<bool> {
-        use crate::backend::{BackendEvent, TurnUpdate};
+        use crate::provider::{ProviderEvent, TurnUpdate};
         use crate::turn::TurnState;
         let event_scope = event.scope();
         let Some(scope) = event_scope.invocation() else {
@@ -429,7 +429,7 @@ impl Exchange {
         {
             return Ok(false);
         }
-        if let BackendEvent::Retry { update, .. } = event {
+        if let ProviderEvent::Retry { update, .. } = event {
             if self.state() != ExchangeState::Running
                 || self.is_finished()
                 || !self.turn.iter().any(|turn| &turn.provider().scope == scope)
@@ -443,7 +443,7 @@ impl Exchange {
             self.metrics.observe_elapsed(self.elapsed(now_ms));
             return Ok(true);
         };
-        if let BackendEvent::Usage { update, .. } = event {
+        if let ProviderEvent::Usage { update, .. } = event {
             let Some(index) = self.turn.iter().position(|turn| turn.provider() == address) else {
                 return Ok(false);
             };
@@ -456,13 +456,13 @@ impl Exchange {
             return Ok(true);
         }
         match event {
-            BackendEvent::Turn {
+            ProviderEvent::Turn {
                 update: TurnUpdate::Started { started_at_ms },
                 ..
             } => {
                 self.start_turn(address.clone(), *started_at_ms)?;
             }
-            BackendEvent::Turn {
+            ProviderEvent::Turn {
                 update: TurnUpdate::CallFinished { completed_at_ms },
                 ..
             } => {
@@ -472,7 +472,7 @@ impl Exchange {
                 };
                 turn.finish_call(*completed_at_ms);
             }
-            BackendEvent::Turn {
+            ProviderEvent::Turn {
                 update: TurnUpdate::Summary { summary },
                 ..
             } => {
@@ -482,7 +482,7 @@ impl Exchange {
                 };
                 turn.record_summary(summary);
             }
-            BackendEvent::Turn {
+            ProviderEvent::Turn {
                 update:
                     TurnUpdate::Finished {
                         outcome,
@@ -512,17 +512,17 @@ impl Exchange {
                     self.metrics.block(id, false, elapsed);
                 }
             }
-            BackendEvent::Message { .. }
-            | BackendEvent::Tool { .. }
-            | BackendEvent::Checklist { .. } => {
+            ProviderEvent::Message { .. }
+            | ProviderEvent::Tool { .. }
+            | ProviderEvent::Checklist { .. } => {
                 let late_update = match event {
-                    BackendEvent::Tool { address, update } => {
+                    ProviderEvent::Tool { address, update } => {
                         self.accepts_settled_tool_update(address, update)
                     }
                     _ => false,
                 };
                 let existing_tool = match event {
-                    BackendEvent::Tool {
+                    ProviderEvent::Tool {
                         address: tool_address,
                         ..
                     } => self
@@ -543,12 +543,12 @@ impl Exchange {
                     return Ok(false);
                 }
                 let item_count = turn.items().len();
-                if let BackendEvent::Tool { address, .. } = event
+                if let ProviderEvent::Tool { address, .. } = event
                     && !existing_tool
                 {
                     turn.admit_tool(address.tool_id.as_str())?;
                 }
-                if let BackendEvent::Message { address, update } = event {
+                if let ProviderEvent::Message { address, update } = event {
                     turn.record_message(address, update)?;
                 }
                 let turn_id = turn.id().to_owned();
@@ -564,7 +564,7 @@ impl Exchange {
                     });
                 }
                 self.reconcile_entries()?;
-                if let BackendEvent::Tool { address, update } = event {
+                if let ProviderEvent::Tool { address, update } = event {
                     self.record_tool_event(&turn_id, address, update, now_ms)?;
                     let tool = self
                         .tools_for_turn(&turn_id)
@@ -579,7 +579,7 @@ impl Exchange {
                     let id = format!("tool:{turn_id}:{}", address.tool_id);
                     let elapsed = self.clock.elapsed(now_ms);
                     self.metrics.block(id, running, elapsed);
-                    if let crate::backend::ToolUpdate::SkillRead { read } = update {
+                    if let crate::provider::ToolUpdate::SkillRead { read } = update {
                         for read in read {
                             let id = format!("{turn_id}:skill:{}", read.resource_id);
                             if !self.node_list.iter().any(|node| node.id() == id) {
@@ -602,7 +602,7 @@ impl Exchange {
     /// Record provider execution, including late start evidence received during cleanup.
     pub fn start_turn(
         &mut self,
-        address: crate::backend::TurnAddress,
+        address: crate::provider::TurnAddress,
         now_ms: i64,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -651,7 +651,7 @@ impl Exchange {
 
     pub(crate) fn inherit_native_turn(
         &mut self,
-        address: crate::backend::TurnAddress,
+        address: crate::provider::TurnAddress,
         now_ms: i64,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -679,7 +679,7 @@ impl Exchange {
     /// Resolve an execution address without creating work from a late content event.
     pub fn turn_mut(
         &mut self,
-        address: &crate::backend::TurnAddress,
+        address: &crate::provider::TurnAddress,
     ) -> anyhow::Result<&mut crate::turn::Turn> {
         self.turn
             .iter_mut()
@@ -801,7 +801,7 @@ impl Exchange {
     pub(crate) fn compaction_started_at_ms(&self) -> Option<i64> {
         self.node_list.iter().rev().find_map(|node| match node {
             ExchangeNode::Compaction { compaction, .. }
-                if compaction.state == crate::backend::CompactionState::Running =>
+                if compaction.state == crate::provider::CompactionState::Running =>
             {
                 Some(compaction.started_at_ms.unwrap_or(self.created_at_ms))
             }
@@ -1020,7 +1020,7 @@ impl Exchange {
     }
 
     /// Sum usage across owned turns, retaining unavailable categories.
-    pub fn usage(&self) -> crate::backend::usage::TokenUsage {
+    pub fn usage(&self) -> crate::provider::usage::TokenUsage {
         let mut turn = self.turn.iter().filter_map(|turn| turn.usage());
         let Some(first) = turn.next() else {
             return Default::default();
@@ -1044,7 +1044,7 @@ impl Exchange {
     }
 }
 
-/// Represents whether an interaction can still receive backend turns.
+/// Represents whether an interaction can still receive provider turns.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExchangeState {
@@ -1188,17 +1188,17 @@ mod test {
 
     #[test]
     fn retry_state_requires_known_turn_and_clears_after_recovery() -> anyhow::Result<()> {
-        use crate::backend::BackendEvent;
+        use crate::provider::ProviderEvent;
         use crate::session::state_machine::SessionPhase;
         let mut exchange = interaction();
         exchange.resume(1000)?;
         let address = crate::turn::test_support::address(&exchange, "failed-turn");
-        let retry = crate::backend::retry::ProviderRetry {
+        let retry = crate::provider::retry::ProviderRetry {
             attempt: 1,
             max_attempts: 5,
             retry_at_ms: Some(2000),
         };
-        let mut event = BackendEvent::Retry {
+        let mut event = ProviderEvent::Retry {
             scope: address.scope.clone(),
             update: Some(retry.clone()),
         };
@@ -1212,7 +1212,7 @@ mod test {
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::RetryingProvider { .. }
         ));
-        if let BackendEvent::Retry { update, .. } = &mut event {
+        if let ProviderEvent::Retry { update, .. } = &mut event {
             *update = None;
         }
         assert!(exchange.observe_turn(&event, 2000)?);
@@ -1220,7 +1220,7 @@ mod test {
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::Working { .. }
         ));
-        if let BackendEvent::Retry { update, .. } = &mut event {
+        if let ProviderEvent::Retry { update, .. } = &mut event {
             *update = Some(retry);
         }
         exchange.finish(crate::exchange::ExchangeOutcome::Failed, 2001)?;
@@ -1231,18 +1231,29 @@ mod test {
 
     #[test]
     fn tool_timing_excludes_user_input_pauses_and_rejects_missing_start_evidence() {
-        use crate::backend::{BackendEvent, ToolOutcome, ToolUpdate};
+        use crate::provider::{ProviderEvent, ToolOutcome, ToolUpdate};
         let mut exchange = interaction();
         exchange.resume(1000).unwrap();
         let address = crate::turn::test_support::address(&exchange, "one");
         exchange.start_turn(address.clone(), 1000).unwrap();
-        let mut event = BackendEvent::Tool {
-            address: crate::backend::ToolAddress {
+        let mut event = ProviderEvent::Tool {
+            address: crate::provider::ToolAddress {
                 turn: address,
                 tool_id: "call".into(),
             },
-            update: ToolUpdate::Started,
+            update: ToolUpdate::Requested {
+                invocation: crate::provider::ToolInvocation {
+                    kind: crate::provider::ToolActivityKind::Command,
+                    name: "probe".into(),
+                    title: "Probe".into(),
+                    arguments: serde_json::json!({}),
+                },
+            },
         };
+        exchange.observe_turn(&event, 2000).unwrap();
+        if let ProviderEvent::Tool { update, .. } = &mut event {
+            *update = ToolUpdate::Started;
+        }
         exchange.observe_turn(&event, 2000).unwrap();
         exchange.pause(3000);
         assert_eq!(exchange.elapsed(90000), 2000);
@@ -1251,7 +1262,7 @@ mod test {
             Some(1000)
         );
         exchange.resume(90000).unwrap();
-        if let BackendEvent::Tool { update, .. } = &mut event {
+        if let ProviderEvent::Tool { update, .. } = &mut event {
             *update = ToolUpdate::Finished {
                 outcome: ToolOutcome::Succeeded,
             };
@@ -1259,24 +1270,36 @@ mod test {
         exchange.observe_turn(&event, 92000).unwrap();
         assert_eq!(exchange.elapsed(93000), 5000);
         assert_eq!(exchange.metrics.response_ms(5000), Some(2000));
-        if let BackendEvent::Tool { update, .. } = &mut event {
+        if let ProviderEvent::Tool { address, update } = &mut event {
+            address.tool_id = "second".into();
+            *update = ToolUpdate::Requested {
+                invocation: crate::provider::ToolInvocation {
+                    kind: crate::provider::ToolActivityKind::Command,
+                    name: "probe".into(),
+                    title: "Probe".into(),
+                    arguments: serde_json::json!({}),
+                },
+            };
+        }
+        exchange.observe_turn(&event, 93000).unwrap();
+        if let ProviderEvent::Tool { update, .. } = &mut event {
             *update = ToolUpdate::Started;
         }
         exchange.observe_turn(&event, 93000).unwrap();
-        assert_eq!(exchange.metrics.response_ms(6000), Some(3000));
-        if let BackendEvent::Tool { address, update } = &mut event {
+        assert_eq!(exchange.metrics.response_ms(6000), Some(2000));
+        if let ProviderEvent::Tool { address, update } = &mut event {
             address.tool_id = "missing-start".into();
             *update = ToolUpdate::Finished {
                 outcome: ToolOutcome::Succeeded,
             };
         }
-        exchange.observe_turn(&event, 94000).unwrap();
-        assert_eq!(exchange.metrics.response_ms(6000), None);
+        assert!(exchange.observe_turn(&event, 94000).is_err());
+        assert_eq!(exchange.metrics.response_ms(6000), Some(2000));
     }
 
     #[test]
     fn message_snapshots_reconcile_without_duplicating_or_reordering_content() {
-        use crate::backend::{BackendEvent, MessageRole, MessageUpdate};
+        use crate::provider::{MessageRole, MessageUpdate, ProviderEvent};
         let mut exchange = interaction();
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 10).unwrap();
@@ -1301,7 +1324,7 @@ mod test {
                 13,
             )
             .unwrap();
-        if let BackendEvent::Message { update, .. } = &mut event {
+        if let ProviderEvent::Message { update, .. } = &mut event {
             *update = MessageUpdate::Completed {
                 text: "Checking files.".into(),
             };
@@ -1323,7 +1346,7 @@ mod test {
         exchange.turn[0]
             .finish(crate::turn::TurnOutcome::Completed, 16)
             .unwrap();
-        if let BackendEvent::Message { update, .. } = &mut event {
+        if let ProviderEvent::Message { update, .. } = &mut event {
             *update = MessageUpdate::Completed {
                 text: "Late correction".into(),
             };
@@ -1334,7 +1357,7 @@ mod test {
 
     #[test]
     fn active_turn_exposes_only_its_latest_readable_reasoning_summary() {
-        use crate::backend::MessageRole;
+        use crate::provider::MessageRole;
         let mut exchange = interaction();
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 10).unwrap();
@@ -1420,13 +1443,13 @@ mod test {
 
     #[test]
     fn provider_turn_identity_survives_steering_and_rejects_late_tools() {
-        use crate::backend::{
-            BackendEvent, MessageRole, ToolInvocation, ToolOutcome, ToolUpdate, TurnUpdate,
+        use crate::provider::{
+            MessageRole, ProviderEvent, ToolInvocation, ToolOutcome, ToolUpdate, TurnUpdate,
         };
         use crate::turn::{TurnOutcome, TurnState};
         let mut exchange = interaction();
         let address = crate::turn::test_support::address(&exchange, "first");
-        let mut event = BackendEvent::Turn {
+        let mut event = ProviderEvent::Turn {
             address: address.clone(),
             update: TurnUpdate::Started { started_at_ms: 10 },
         };
@@ -1455,7 +1478,7 @@ mod test {
         assert_eq!(exchange.turn[0].messages().len(), 2);
         assert_eq!(
             exchange.turn[0].messages()[0].provider_id(),
-            &crate::backend::MessageId::Native("message-one".into())
+            &crate::provider::MessageId::Native("message-one".into())
         );
         assert_eq!(
             exchange.turn[0].messages()[0].delivery(),
@@ -1464,7 +1487,7 @@ mod test {
         assert_eq!(exchange.turn[0].messages()[1].text(), "After steering");
         assert_eq!(
             exchange.turn[0].messages()[1].provider_id(),
-            &crate::backend::MessageId::Native("message-two".into())
+            &crate::provider::MessageId::Native("message-two".into())
         );
         assert_eq!(
             exchange.turn[0].messages()[1].delivery(),
@@ -1477,7 +1500,7 @@ mod test {
             &address,
             "change",
             ToolInvocation {
-                kind: crate::backend::ToolActivityKind::FileChange,
+                kind: crate::provider::ToolActivityKind::FileChange,
                 name: "edit".into(),
                 title: "edit".into(),
                 arguments: serde_json::json!({}),
@@ -1485,11 +1508,11 @@ mod test {
             [
                 ToolUpdate::Started,
                 ToolUpdate::Changes {
-                    changes: crate::backend::ProviderChangeSet {
-                        file: vec![crate::backend::ProviderFileChange {
+                    changes: crate::provider::ProviderChangeSet {
+                        file: vec![crate::provider::ProviderFileChange {
                             path: "owned.rs".into(),
                             move_path: None,
-                            kind: crate::backend::ProviderChangeKind::Add,
+                            kind: crate::provider::ProviderChangeKind::Add,
                             diff: "+owned".into(),
                         }],
                     },
@@ -1508,7 +1531,7 @@ mod test {
             "attribution depended on presentation segments"
         );
         assert_eq!(exchange.tools_for_turn(exchange.turn[0].id()).count(), 1);
-        event = BackendEvent::Turn {
+        event = ProviderEvent::Turn {
             address: address.clone(),
             update: TurnUpdate::Finished {
                 outcome: TurnOutcome::Completed,
@@ -1516,8 +1539,8 @@ mod test {
             },
         };
         assert!(exchange.observe_turn(&event, 20).unwrap());
-        event = BackendEvent::Tool {
-            address: crate::backend::ToolAddress {
+        event = ProviderEvent::Tool {
+            address: crate::provider::ToolAddress {
                 turn: address.clone(),
                 tool_id: "late".into(),
             },

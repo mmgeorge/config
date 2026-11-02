@@ -12,8 +12,8 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   callback({ ok = true, path = executable })
   return function() end
 end }
-require("forge").setup({ harness_logging = true, harness = { backend = "mock",
-  backends = { mock = { command = { "control-tools" }, selectable = true } } },
+require("forge").setup({ harness_logging = true, harness = { provider = "mock",
+  providers = { mock = { command = { "control-tools" }, selectable = true } } },
   background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
 vim.fn.chdir(workspace)
 local client = require("forge.client")

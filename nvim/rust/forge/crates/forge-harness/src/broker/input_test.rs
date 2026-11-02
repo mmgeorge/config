@@ -43,7 +43,7 @@ async fn ordinary_input_does_not_activate_a_pending_plan_entry() -> Result<()> {
     Ok(())
 }
 
-struct BoundarySteeringBackend {
+struct BoundarySteeringProvider {
     initial_started: tokio::sync::Semaphore,
     initial_release: tokio::sync::Semaphore,
     steering_deferred: tokio::sync::Semaphore,
@@ -54,14 +54,15 @@ struct BoundarySteeringBackend {
     fail_response: std::sync::atomic::AtomicBool,
 }
 
-struct TaskStartEventBackend {
-    inner: Arc<dyn Backend>,
+struct TaskStartEventProvider {
+    inner: Arc<Provider>,
     conflicting_replay: bool,
 }
 
 #[async_trait::async_trait]
-impl Backend for TaskStartEventBackend {
-    fn descriptor(&self) -> crate::backend::BackendDescriptor {
+impl crate::provider::ProviderAdapter for TaskStartEventProvider {
+    type Host = crate::provider::HarnessProviderHost;
+    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
         self.inner.descriptor()
     }
     async fn shutdown(&self) -> Result<()> {
@@ -78,31 +79,31 @@ impl Backend for TaskStartEventBackend {
     }
     async fn prompt_stream(
         &self,
-        request: BackendRequest,
-        sink: crate::backend::BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+        request: ProviderRequest,
+        sink: crate::provider::ProviderEventSink,
+    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
         let scope = sink.invocation_scope()?.clone();
         let start = crate::exchange::TaskStart {
             kind: crate::task::TaskKind::Goal,
             title: "Reduce startup time".into(),
         };
-        let mut acknowledgement = crate::backend::InputAcknowledgement::TaskStarted {
+        let mut acknowledgement = crate::provider::InputAcknowledgement::TaskStarted {
             input_id: Some("task-entry".into()),
             start,
             prompt: "Complete startup work.\nVerify the result.".into(),
         };
-        sink.send_wait(BackendEvent::InputAccepted {
+        sink.send_wait(ProviderEvent::InputAccepted {
             scope: scope.clone(),
             acknowledgement: acknowledgement.clone(),
         })
         .await?;
         if self.conflicting_replay
-            && let crate::backend::InputAcknowledgement::TaskStarted { prompt, .. } =
+            && let crate::provider::InputAcknowledgement::TaskStarted { prompt, .. } =
                 &mut acknowledgement
         {
             *prompt = "Conflicting instruction".into();
         }
-        sink.send_wait(BackendEvent::InputAccepted {
+        sink.send_wait(ProviderEvent::InputAccepted {
             scope,
             acknowledgement,
         })
@@ -116,8 +117,8 @@ async fn acknowledged_task_start_is_retained_once_inside_its_exchange() -> Resul
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    broker.backend = Arc::new(TaskStartEventBackend {
-        inner: broker.backend.clone(),
+    broker.provider = Arc::new(TaskStartEventProvider {
+        inner: broker.provider.clone(),
         conflicting_replay: false,
     });
     broker
@@ -197,12 +198,12 @@ async fn task_start_updates_live_presentation_before_the_turn_finishes() -> Resu
         retraction_eligible: true,
         active_wait: None,
     };
-    let task_event = BackendEvent::InputAccepted {
-        scope: crate::backend::InvocationScope::new(
-            crate::backend::ExecutionOwner::root(&broker.session.id),
+    let task_event = ProviderEvent::InputAccepted {
+        scope: crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root(&broker.session.id),
             exchange.id.clone(),
         ),
-        acknowledgement: crate::backend::InputAcknowledgement::TaskStarted {
+        acknowledgement: crate::provider::InputAcknowledgement::TaskStarted {
             input_id: Some("live-input".into()),
             start: crate::exchange::TaskStart {
                 kind: crate::task::TaskKind::Goal,
@@ -233,7 +234,7 @@ async fn task_start_updates_live_presentation_before_the_turn_finishes() -> Resu
             "{text}"
         );
         assert!(
-            text.contains("Complete startup work.") && text.contains("Verify the result."),
+            text.contains("Reduce startup time"),
             "{text}"
         );
         Ok(())
@@ -262,8 +263,8 @@ async fn task_start_replay_rejects_reused_identity_with_different_content() -> R
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    broker.backend = Arc::new(TaskStartEventBackend {
-        inner: broker.backend.clone(),
+    broker.provider = Arc::new(TaskStartEventProvider {
+        inner: broker.provider.clone(),
         conflicting_replay: true,
     });
     let result = broker
@@ -290,7 +291,7 @@ async fn task_start_replay_rejects_reused_identity_with_different_content() -> R
     Ok(())
 }
 
-impl BoundarySteeringBackend {
+impl BoundarySteeringProvider {
     fn new() -> Self {
         Self {
             initial_started: tokio::sync::Semaphore::new(0),
@@ -306,12 +307,13 @@ impl BoundarySteeringBackend {
 }
 
 #[async_trait::async_trait]
-impl Backend for BoundarySteeringBackend {
-    fn descriptor(&self) -> crate::backend::BackendDescriptor {
-        crate::backend::BackendDescriptor {
-            kind: crate::backend::BackendKind::Codex,
+impl crate::provider::ProviderAdapter for BoundarySteeringProvider {
+    type Host = crate::provider::HarnessProviderHost;
+    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+        crate::provider::ProviderDescriptor {
+            kind: crate::provider::ProviderKind::Codex,
             label: "Boundary steering fixture".into(),
-            capability: crate::backend::mock_capability(),
+            capability: crate::provider::mock_capability(),
         }
     }
 
@@ -328,21 +330,21 @@ impl Backend for BoundarySteeringBackend {
         Some("boundary-thread".into())
     }
 
-    async fn steer_session(&self, _: &str, _: crate::backend::SteeringInput) -> Result<()> {
+    async fn steer_session(&self, _: &str, _: crate::provider::SteeringInput) -> Result<()> {
         self.steering_deferred.add_permits(1);
         anyhow::bail!("provider turn ended before steering dispatch")
     }
 
     async fn prompt_stream(
         &self,
-        request: BackendRequest,
-        sink: crate::backend::BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+        request: ProviderRequest,
+        sink: crate::provider::ProviderEventSink,
+    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
         let fixture_scope = sink.invocation_scope()?.clone();
-        let fixture = crate::backend::test_support::FixtureStream::new(sink);
+        let fixture = crate::provider::test_support::FixtureStream::new(sink);
         let sink = fixture.clone();
-        let result: anyhow::Result<crate::backend::BackendCompletion> = async {
-            let output: anyhow::Result<crate::backend::BackendCompletion> = async {
+        let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+            let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
                 let sink = Some(sink);
                 let text = request.input.text();
                 self.input.lock().unwrap().push(text.clone());
@@ -355,7 +357,7 @@ impl Backend for BoundarySteeringBackend {
                     .submission
                     .as_ref()
                     .context("missing tracked submission")?;
-                submission.sending(crate::backend::submission::SubmissionTarget::Codex {
+                submission.sending(crate::provider::submission::SubmissionTarget::Codex {
                     thread_id: "boundary-thread".into(),
                 })?;
                 submission.accepted("boundary provider receipt".into())?;
@@ -373,16 +375,16 @@ impl Backend for BoundarySteeringBackend {
                 }
                 if let Some(sink) = sink {
                     sink.send_wait(completed_message(
-                        &crate::backend::test_support::address(&fixture_scope, "fixture", "turn"),
+                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
                         "handled-response",
-                        crate::backend::MessageRole::Response,
+                        crate::provider::MessageRole::Response,
                         format!("handled {text}"),
                     ))
                     .await?;
                 }
-                Ok(crate::backend::BackendCompletion {
-                    backend_session_id: Some("boundary-thread".into()),
-                    capability: self.descriptor().capability,
+                Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {
+                    provider_session_id: Some("boundary-thread".into()),
+                    capability: self.descriptor().capability, ..Default::default() },
                     ..Default::default()
                 })
             }
@@ -390,7 +392,7 @@ impl Backend for BoundarySteeringBackend {
             Ok(output?)
         }
         .await;
-        let result = result.map_err(crate::backend::BackendError::from);
+        let result = result.map_err(crate::provider::ProviderError::from);
         fixture.finish(&result).await?;
         result
     }
@@ -413,13 +415,13 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
             let repository = repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            let backend = Arc::new(BoundarySteeringBackend::new());
-            broker.backend = backend.clone();
+            let provider = Arc::new(BoundarySteeringProvider::new());
+            broker.provider = provider.clone();
             let lane = broker.parent_input.clone();
-            let catalog = broker.backend_catalog_request();
+            let catalog = broker.provider_catalog_request();
             let cancellation = broker.turn_cancellation();
             cancellation.arm(true);
-            let journal = crate::backend::submission::SubmissionStore::open(
+            let journal = crate::provider::submission::SubmissionStore::open(
                 data.path(),
                 broker.trace.clone(),
             )?;
@@ -433,24 +435,24 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
                     .await;
                 (broker, result)
             });
-            backend.initial_started.acquire().await?.forget();
+            provider.initial_started.acquire().await?.forget();
             let submission = journal.prepare_input(
                 &catalog,
-                BackendInput::from_text("boundary correction"),
-                crate::backend::BackendKind::Codex,
+                ProviderInput::from_text("boundary correction"),
+                crate::provider::ProviderKind::Codex,
                 Some("cancel-boundary-message".into()),
             )?;
-            let mut steering = Box::pin(lane.steer(crate::backend::SteeringInput::User {
+            let mut steering = Box::pin(lane.steer(crate::provider::SteeringInput::User {
                 text: "boundary correction".into(),
                 attachments: Vec::new(),
                 submission: Some(submission.clone()),
             }));
             assert!(futures_util::poll!(steering.as_mut()).is_pending());
-            backend.steering_deferred.acquire().await?.forget();
-            backend.initial_release.add_permits(1);
-            backend.continuation_started.acquire().await?.forget();
+            provider.steering_deferred.acquire().await?.forget();
+            provider.initial_release.add_permits(1);
+            provider.continuation_started.acquire().await?.forget();
             if accept_before_cancel {
-                backend.continuation_accept.add_permits(1);
+                provider.continuation_accept.add_permits(1);
                 (&mut steering).await?;
             }
             cancellation.request(false);
@@ -465,7 +467,7 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
             assert_eq!(
                 matches!(
                     submission.record()?.delivery,
-                    crate::backend::submission::SubmissionState::Accepted { .. }
+                    crate::provider::submission::SubmissionState::Accepted { .. }
                 ),
                 accept_before_cancel
             );
@@ -493,42 +495,135 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let backend = Arc::new(BoundarySteeringBackend::new());
-        backend.fail_response.store(fail_response, std::sync::atomic::Ordering::Release);
-        broker.backend = backend.clone();
+        let provider = Arc::new(BoundarySteeringProvider::new());
+        provider.fail_response.store(fail_response, std::sync::atomic::Ordering::Release);
+        broker.provider = provider.clone();
         let lane = broker.parent_input.clone();
-        let catalog = broker.backend_catalog_request();
-        let journal = crate::backend::submission::SubmissionStore::open(data.path(), broker.trace.clone())?;
+        let catalog = broker.provider_catalog_request();
+        let journal = crate::provider::submission::SubmissionStore::open(data.path(), broker.trace.clone())?;
         let running = tokio::spawn(async move {
             let result = broker.run_interaction("initial request".into(), PromptMode::Chat,
                 Some(ExchangeAdmission::chat("initial request".into()))).await;
             (broker, result)
         });
-        backend.initial_started.acquire().await?.forget();
+        provider.initial_started.acquire().await?.forget();
         let submission = journal.prepare_input(&catalog,
-            BackendInput::from_text("boundary correction"), crate::backend::BackendKind::Codex, Some("boundary-message".into()))?;
-        let mut steering = Box::pin(lane.steer(crate::backend::SteeringInput::User {
+            ProviderInput::from_text("boundary correction"), crate::provider::ProviderKind::Codex, Some("boundary-message".into()))?;
+        let mut steering = Box::pin(lane.steer(crate::provider::SteeringInput::User {
             text: "boundary correction".into(), attachments: Vec::new(), submission: Some(submission.clone()),
         }));
         assert!(futures_util::poll!(steering.as_mut()).is_pending());
-        backend.steering_deferred.acquire().await?.forget();
-        backend.initial_release.add_permits(1);
-        backend.continuation_started.acquire().await?.forget();
-        assert!(matches!(submission.record()?.delivery, crate::backend::submission::SubmissionState::Prepared));
+        provider.steering_deferred.acquire().await?.forget();
+        provider.initial_release.add_permits(1);
+        provider.continuation_started.acquire().await?.forget();
+        assert!(matches!(submission.record()?.delivery, crate::provider::submission::SubmissionState::Prepared));
         assert!(futures_util::poll!(steering.as_mut()).is_pending(),
             "a continuation was acknowledged while its journal still allowed requeueing");
-        backend.continuation_accept.add_permits(1);
+        provider.continuation_accept.add_permits(1);
         steering.await?;
-        assert!(matches!(submission.record()?.delivery, crate::backend::submission::SubmissionState::Accepted { .. }));
+        assert!(matches!(submission.record()?.delivery, crate::provider::submission::SubmissionState::Accepted { .. }));
         assert!(!running.is_finished(), "steering acknowledgement waited for the full provider response");
-        backend.continuation_release.add_permits(1);
+        provider.continuation_release.add_permits(1);
         let (broker, result) = running.await?;
         if fail_response { assert!(result.is_err()); } else { result?; }
         let exchange = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(exchange.len(), 1, "steering created a second exchange");
         assert_eq!(exchange[0].node_list.iter().filter(|node| matches!(node,
             crate::exchange::ExchangeNode::ExchangeInput { prompt } if prompt.text == "boundary correction" && prompt.id == "boundary-message")).count(), 1);
-        assert_eq!(*backend.input.lock().unwrap(), ["initial request", "boundary correction"]);
+        assert_eq!(*provider.input.lock().unwrap(), ["initial request", "boundary correction"]);
         Ok::<(), anyhow::Error>(())
     }).await?
+}
+
+/// Hold native steering admission while the original provider turn keeps running.
+struct SlowSteeringProvider {
+    inner: BoundarySteeringProvider,
+    steering_started: tokio::sync::Semaphore,
+    steering_release: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl crate::provider::ProviderAdapter for SlowSteeringProvider {
+    type Host = crate::provider::HarnessProviderHost;
+
+    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+    async fn cleanup_execution(&self, _: &str) -> Result<()> { Ok(()) }
+
+    async fn has_active_turn(&self, _: &str) -> bool { true }
+
+    async fn active_session_id_for(&self, _: &str) -> Option<String> {
+        Some("boundary-thread".into())
+    }
+
+    async fn prompt_stream(
+        &self,
+        request: ProviderRequest,
+        sink: crate::provider::ProviderEventSink,
+    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+        self.inner.prompt_stream(request, sink).await
+    }
+
+    async fn steer_session(&self, _: &str, input: crate::provider::SteeringInput) -> Result<()> {
+        self.steering_started.add_permits(1);
+        self.steering_release.acquire().await?.forget();
+        let submission = input.submission().context("steering lost its journal")?;
+        submission.sending(crate::provider::submission::SubmissionTarget::Codex {
+            thread_id: "boundary-thread".into(),
+        })?;
+        submission.accepted("native steering receipt".into())?;
+        Ok(())
+    }
+}
+
+/// A slow native admission must not turn live steering into a deferred second prompt.
+#[tokio::test]
+async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let provider = Arc::new(SlowSteeringProvider {
+        inner: BoundarySteeringProvider::new(),
+        steering_started: tokio::sync::Semaphore::new(0),
+        steering_release: tokio::sync::Semaphore::new(0),
+    });
+    broker.provider = provider.clone();
+    let lane = broker.parent_input.clone();
+    let catalog = broker.provider_catalog_request();
+    let cancellation = broker.turn_cancellation();
+    let journal = crate::provider::submission::SubmissionStore::open(data.path(), broker.trace.clone())?;
+    let running = tokio::spawn(async move {
+        broker.run_interaction("initial request".into(), PromptMode::Chat,
+            Some(ExchangeAdmission::chat("initial request".into()))).await
+    });
+    provider.inner.initial_started.acquire().await?.forget();
+    let submission = journal.prepare_input(&catalog,
+        ProviderInput::from_text("keep working"), crate::provider::ProviderKind::Codex,
+        Some("slow-steering".into()))?;
+    let mut steering = Box::pin(lane.steer(crate::provider::SteeringInput::User {
+        text: "keep working".into(), attachments: Vec::new(), submission: Some(submission.clone()),
+    }));
+    assert!(futures_util::poll!(steering.as_mut()).is_pending());
+    provider.steering_started.acquire().await?.forget();
+
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    provider.steering_release.add_permits(1);
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), steering.as_mut()).await;
+    cancellation.request(false);
+    provider.inner.initial_release.add_permits(1);
+    let _cancelled = running.await?;
+
+    delivered.context("steering was abandoned at the old 30-second deadline")??;
+    assert!(matches!(submission.record()?.delivery,
+        crate::provider::submission::SubmissionState::Accepted { .. }));
+    assert_eq!(*provider.inner.input.lock().unwrap(), ["initial request"]);
+    Ok(())
 }

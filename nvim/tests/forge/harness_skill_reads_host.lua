@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 local repository = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h:h")
 vim.opt.runtimepath:prepend(repository .. "/nvim")
-local backend = vim.g.forge_skill_test_backend or "codex"
+local provider = vim.g.forge_skill_test_provider or "codex"
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data .. "/forge", "p")
@@ -44,8 +44,8 @@ local function request(method, parameter)
 end
 local succeeded, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ harness = { config_dir = data, backend = backend,
-    backends = vim.g.forge_skill_test_launch } })
+  require("forge").setup({ harness = { config_dir = data, provider = provider,
+    providers = vim.g.forge_skill_test_launch } })
   require("forge.views.harness").open()
   assert(vim.wait(15000, function() return state.session or #errors > 0 end, 10), "host startup timed out")
   assert(state.session, table.concat(errors, "\n"))
@@ -107,7 +107,7 @@ local succeeded, failure = xpcall(function()
   assert(diamonds == 1, "expected one skill diamond, observed " .. diamonds)
   assert(table.concat(vim.fn.readfile(data .. "/forge/permissions.json"), "\n") == policy,
     "runtime grants changed the permission document")
-  print("HARNESS_SKILL_READ_PASS " .. backend .. " diamonds=" .. diamonds .. " approvals=0")
+  print("HARNESS_SKILL_READ_PASS " .. provider .. " diamonds=" .. diamonds .. " approvals=0")
 end, debug.traceback)
 local stopped = false
 client.host_stop(nil, function() stopped = true end)

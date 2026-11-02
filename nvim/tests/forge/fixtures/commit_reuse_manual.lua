@@ -29,7 +29,7 @@ vim.fn.chdir(fixture)
 _G.forge_reuse = { fixture = fixture, model_calls = 0, message = "refactor: rename source and update fixtures" }
 local client = require("forge.client")
 local ai_commit = require("forge.integrations.ai_commit")
-ai_commit.set_backend({ request_async = function(params, callback)
+ai_commit.set_provider({ request_async = function(params, callback)
   local native = vim.deepcopy(params)
   client.request({ method = "repository.generation", params = native }, function(result, failure)
     if failure == "unsupported detached generation provider fixture" then

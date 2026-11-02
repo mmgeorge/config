@@ -75,23 +75,23 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Returns the last resolved provider default in the same workspace and backend.
+    /// Returns the last resolved provider default in the same workspace and provider.
     pub(crate) fn latest_resolved_default_model(
         &self,
         workspace: &str,
-        backend: &str,
+        provider: &str,
     ) -> Result<Option<String>> {
         Ok(self
             .connection
             .query_row(
                 "SELECT json_extract(payload,'$.session.resolved_model') FROM session_record \
              WHERE workspace=?1 AND json_extract(payload,'$.format_version')=?2 \
-             AND json_extract(payload,'$.session.backend')=?3 \
+             AND COALESCE(json_extract(payload,'$.session.provider'),json_extract(payload,'$.session.backend'))=?3 \
              AND json_extract(payload,'$.session.model')='default' \
              AND json_type(payload,'$.session.resolved_model')='text' \
              AND trim(json_extract(payload,'$.session.resolved_model'))<>'' \
              ORDER BY updated_at_ms DESC, rowid DESC LIMIT 1",
-                params![workspace, SESSION_FORMAT_VERSION, backend],
+                params![workspace, SESSION_FORMAT_VERSION, provider],
                 |row| row.get(0),
             )
             .optional()?)
@@ -272,15 +272,15 @@ impl SqliteStore {
         })
     }
 
-    /// Load the last model controls selected for one backend and workspace.
+    /// Load the last model controls selected for one provider and workspace.
     pub fn load_preference(
         &self,
         workspace: &str,
-        backend: &str,
+        provider: &str,
     ) -> Result<Option<HarnessPreference>> {
         let payload: Option<serde_json::Value> = self.load_payload(
             "SELECT payload FROM preference_record WHERE workspace = ?1 AND backend = ?2",
-            params![workspace, backend],
+            params![workspace, provider],
         )?;
         let Some(payload) =
             payload.filter(|payload| payload["format_version"] == PREFERENCE_FORMAT_VERSION)
@@ -296,17 +296,17 @@ impl SqliteStore {
         Ok(Some(serde_json::from_value(preference.clone())?))
     }
 
-    /// Persist the last model controls selected for one backend and workspace.
+    /// Persist the last model controls selected for one provider and workspace.
     pub fn save_preference(
         &mut self,
         workspace: &str,
-        backend: &str,
+        provider: &str,
         preference: &HarnessPreference,
     ) -> Result<()> {
         self.connection.execute(
             "INSERT INTO preference_record(workspace, backend, payload) VALUES(?1, ?2, ?3) \
              ON CONFLICT(workspace, backend) DO UPDATE SET payload=excluded.payload",
-            params![workspace, backend, encode(&serde_json::json!({"format_version":PREFERENCE_FORMAT_VERSION,"preference":preference}))?],
+            params![workspace, provider, encode(&serde_json::json!({"format_version":PREFERENCE_FORMAT_VERSION,"preference":preference}))?],
         )?;
         Ok(())
     }
@@ -637,7 +637,7 @@ impl SqliteStore {
     pub(crate) fn load_provider_exchange(
         &self,
         session_id: &str,
-        address: &crate::backend::TurnAddress,
+        address: &crate::provider::TurnAddress,
     ) -> Result<Option<Exchange>> {
         Ok(self
             .list_exchange_payload(
@@ -658,7 +658,7 @@ impl SqliteStore {
     pub(crate) fn load_compaction_exchange(
         &self,
         session_id: &str,
-        compaction: &crate::backend::Compaction,
+        compaction: &crate::provider::Compaction,
     ) -> Result<Option<Exchange>> {
         Ok(self.list_exchange_payload(
             "SELECT payload FROM exchange_record WHERE session_id=?1 AND EXISTS(SELECT 1 FROM json_each(exchange_record.payload,'$.node_list') AS node WHERE json_extract(node.value,'$.kind')='compaction' AND json_extract(node.value,'$.compaction.id')=?2 AND json_extract(node.value,'$.compaction.thread_id')=?3) ORDER BY (agent_id=?4) DESC,ordinal LIMIT 1",
@@ -958,7 +958,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Remove one provisional lifecycle event after its owning backend turn fails.
+    /// Remove one provisional lifecycle event after its owning provider turn fails.
     pub fn delete_plan_lifecycle(&mut self, lifecycle_id: &str) -> Result<()> {
         self.connection.execute(
             "DELETE FROM plan_lifecycle_record WHERE id=?1",
@@ -1432,7 +1432,7 @@ mod test {
             store.latest_resolved_default_model("D:/work", "copilot")?,
             None
         );
-        for (ordinal, (id, workspace, backend, model, resolved)) in [
+        for (ordinal, (id, workspace, provider, model, resolved)) in [
             (
                 "older",
                 "D:/work",
@@ -1458,7 +1458,7 @@ mod test {
                 Some("workspace-default"),
             ),
             (
-                "backend",
+                "provider",
                 "D:/work",
                 "codex",
                 "default",
@@ -1476,7 +1476,7 @@ mod test {
         .enumerate()
         {
             let mut record = session(id, workspace);
-            record.backend = backend.into();
+            record.provider = provider.into();
             record.model = model.into();
             record.resolved_model = resolved.map(str::to_owned);
             record.updated_at_ms = ordinal as i64;
@@ -1637,8 +1637,8 @@ mod test {
 
     #[test]
     fn streamed_output_reopens_migrates_and_commits_completion_atomically() -> Result<()> {
-        use crate::backend::{
-            BackendEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
+        use crate::provider::{
+            ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
         };
         let directory = tempfile::tempdir()?;
         let mut store = SqliteStore::open(directory.path())?;
@@ -1665,8 +1665,8 @@ mod test {
             [ToolUpdate::Started],
             2,
         )?;
-        let mut event = BackendEvent::Tool {
-            address: crate::backend::ToolAddress {
+        let mut event = ProviderEvent::Tool {
+            address: crate::provider::ToolAddress {
                 turn: address,
                 tool_id: "call".into(),
             },
@@ -1677,7 +1677,7 @@ mod test {
         exchange.observe_turn(&event, 2)?;
         store.save_exchange(&exchange)?;
         for chunk in ["\u{1b}[31", "mλ\r\n", "tail"] {
-            if let BackendEvent::Tool { update, .. } = &mut event {
+            if let ProviderEvent::Tool { update, .. } = &mut event {
                 *update = ToolUpdate::Output {
                     update: TextUpdate::Append(chunk.into()),
                 };
@@ -1728,13 +1728,13 @@ mod test {
                 .output,
             expected
         );
-        if let BackendEvent::Tool { update, .. } = &mut event {
+        if let ProviderEvent::Tool { update, .. } = &mut event {
             *update = ToolUpdate::Output {
                 update: TextUpdate::Replace("authoritative λ\n".into()),
             };
         }
         exchange.observe_turn(&event, 4)?;
-        if let BackendEvent::Tool { update, .. } = &mut event {
+        if let ProviderEvent::Tool { update, .. } = &mut event {
             *update = ToolUpdate::Finished {
                 outcome: ToolOutcome::Succeeded,
             };
@@ -1868,8 +1868,8 @@ mod test {
             primary_agent_id: HarnessSession::primary_agent_id(id),
             name: id.into(),
             workspace: workspace.into(),
-            backend: "copilot".into(),
-            backend_session_id: None,
+            provider: "copilot".into(),
+            provider_session_id: None,
             provider_checkpoint_id: None,
             provider_fork_state: crate::session::ProviderForkState::Ready,
             model: "default".into(),
@@ -1881,7 +1881,7 @@ mod test {
             approval_timeout: Default::default(),
             tool_timeout: Default::default(),
             context_window: None,
-            service_tier: crate::backend::ServiceTier::Standard,
+            service_tier: crate::provider::ServiceTier::Standard,
             access: Default::default(),
             shell: Default::default(),
             approval_mode: crate::session::ApprovalMode::Ask,
@@ -2217,7 +2217,7 @@ mod test {
             model: "remembered-model".into(),
             effort: "low".into(),
             model_setting: Default::default(),
-            service_tier: crate::backend::ServiceTier::Fast,
+            service_tier: crate::provider::ServiceTier::Fast,
             plan_executor: Default::default(),
             plan_compact: false,
             approval_timeout: Default::default(),

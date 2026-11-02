@@ -37,7 +37,7 @@ end
 ---@param input ForgeInputViewState
 ---@return boolean
 local function owns_input(state, input)
-  return state.input == input and not state.switching_backend and not state.host_error
+  return state.input == input and not state.switching_provider and not state.host_error
     and state.session and state.session.id == input.session_id and state.runtime_epoch == input.runtime_epoch
     and client.host_get_generation() == input.host_generation
 end
@@ -250,7 +250,7 @@ end
 ---@param state table
 function M.refresh(state)
   local input = state.input
-  if not input or state.switching_backend or state.host_error then return end
+  if not input or state.switching_provider or state.host_error then return end
   if input.runtime_epoch ~= state.runtime_epoch or input.host_generation ~= client.host_get_generation() then
     local changed = input.changed
     local recovered = vim.deepcopy(input.confirmed)

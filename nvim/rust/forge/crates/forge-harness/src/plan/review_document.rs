@@ -1396,7 +1396,7 @@ impl ReadOnlyPlanReview {
                 }
                 if !matching.is_empty() {
                     let choices = matching.iter().enumerate().map(|(index, symbol)| serde_json::json!({
-                        "index": index, "label": format!("{}:{} â€” {}", symbol.destination.path, symbol.destination.line, symbol.destination.name)
+                        "index": index, "label": format!("{}:{} — {}", symbol.destination.path, symbol.destination.line, symbol.destination.name)
                     })).collect::<Vec<_>>();
                     return Ok(serde_json::json!({"symbol_choices": choices}));
                 }
@@ -2518,7 +2518,7 @@ mod tests {
                 .iter()
                 .filter(|block| block.id.0.starts_with("plan:configured-checks:"))
                 .flat_map(|block| block.text.wire_rows())
-                .filter_map(|row| row.split(" â”‚ ").nth(1))
+                .filter_map(|row| row.split(" │ ").nth(1))
                 .map(str::trim_end)
                 .collect::<String>();
             assert_eq!(displayed, format!("Command{command}"), "viewport {columns}");

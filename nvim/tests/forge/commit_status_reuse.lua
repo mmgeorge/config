@@ -17,7 +17,7 @@ local generation_calls = 0
 local comparison_calls = 0
 local hold_regeneration = false
 local first_editor_line
-ai_commit._backend.request_async = function(params, callback)
+ai_commit._provider.request_async = function(params, callback)
   if params.operation == "generate" then generation_calls = generation_calls + 1 end
   if params.operation == "fingerprint" then comparison_calls = comparison_calls + 1 end
   request(params, function(result, failure)

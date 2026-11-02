@@ -1,13 +1,12 @@
 mod activity;
-mod backend;
 mod capability;
 mod coordinator;
 #[cfg(test)]
 mod coordinator_test;
 mod delegation;
-mod event;
 mod identity;
 mod profile;
+mod provider;
 mod registry;
 mod runtime;
 mod selection;
@@ -24,11 +23,11 @@ pub use profile::{AgentProfile, AgentProfileDocument, AgentProfileStore};
 pub use selection::AgentSelection;
 pub use task::{AgentMessage, AgentSource, AgentTask, MessageDelivery};
 
-pub use backend::{AgentBackendFactory, provider_name};
 pub use capability::AgentCapability;
 pub use delegation::Delegation;
-pub use event::AgentLifecycleEvent;
+pub use forge_provider_api::agent::AgentLifecycleEvent;
 pub use identity::{Agent, AgentExecutionState, AgentState};
+pub use provider::{AgentProviderFactory, provider_name};
 pub use registry::AgentRegistry;
 pub use runtime::AgentRuntime;
 pub use tool_scope::{AgentToolLease, AgentToolScope};

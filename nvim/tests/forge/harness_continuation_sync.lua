@@ -72,7 +72,7 @@ end
 local success, failure = xpcall(function()
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win =
     require("forge.views.harness.layout").open("continuation-sync")
-  state.session = { id = "continuation-sync", backend = "mock", model = "mock", approval_mode = "ask" }
+  state.session = { id = "continuation-sync", provider = "mock", model = "mock", approval_mode = "ask" }
   controller.attach()
   vim.api.nvim_set_current_win(state.composer_win)
   local focused_window = vim.api.nvim_get_current_win()

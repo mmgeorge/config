@@ -24,7 +24,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 vim.fn.chdir(workspace)
-require("forge").setup({ harness_logging = false, harness = { backend = "mock", config_dir = data } })
+require("forge").setup({ harness_logging = false, harness = { provider = "mock", config_dir = data } })
 local client = require("forge.client")
 client._host_set_launcher_for_test(function(command, options, callback)
   options.env = vim.tbl_extend("force", options.env or {}, { PATH = executable_directory })

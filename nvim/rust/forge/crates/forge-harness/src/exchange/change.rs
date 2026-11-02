@@ -1,5 +1,5 @@
-use crate::backend::{ProviderChangeKind, ProviderFileChange};
 use crate::exchange::{Exchange, ToolCall};
+use crate::provider::{ProviderChangeKind, ProviderFileChange};
 use std::collections::BTreeSet;
 
 /// Stores normalized paths from successful provider-owned file changes.
@@ -236,8 +236,8 @@ fn render_projection(output: &mut String, projection: FileProjection) {
 #[cfg(test)]
 mod test {
     use super::{ProviderChangeIndex, ProviderDiffBuilder};
-    use crate::backend::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
     use crate::exchange::ToolCall;
+    use crate::provider::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
 
     fn file_tool(id: &str, status: &str, file: Vec<ProviderFileChange>) -> ToolCall {
         ToolCall {

@@ -76,7 +76,7 @@ impl HarnessInspectionScope {
         trace: Arc<crate::trace::TraceStore>,
     ) -> Result<(Arc<Self>, InspectionLease)> {
         let enabled = SettingsStore::read_only(&data_root)?
-            .get(&session.workspace, &session.id, &session.backend)?
+            .get(&session.workspace, &session.id, &session.provider)?
             .desired
             .session_tools
             .unwrap_or(true);
@@ -116,7 +116,7 @@ impl HarnessInspectionScope {
                     .get(
                         &self.session.workspace,
                         &self.session.id,
-                        &self.session.backend
+                        &self.session.provider
                     )?
                     .desired
                     .session_tools
@@ -429,7 +429,7 @@ impl HarnessInspectionScope {
 
     fn config(&self, reader: &SessionReader, session: &HarnessSession) -> Result<Value> {
         let settings = SettingsStore::read_only(&self.data_root)?;
-        let snapshot = settings.get(&session.workspace, &session.id, &session.backend)?;
+        let snapshot = settings.get(&session.workspace, &session.id, &session.provider)?;
         let root = settings.catalog_root()?;
         let source = root.as_ref().map(|root| root.join("nvim"));
         let mut result = self.status(reader, session)?;

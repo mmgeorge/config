@@ -52,7 +52,7 @@ local ok, failure = xpcall(function()
   result, error = request("staged")
   assert(not result and error == "unsupported detached generation provider fixture", vim.inspect({ result, error }))
   local generation = {
-    backend = { kind = "mock", command = { "mock" } }, model = "fixture-model", data_root = fixture .. "/generation-data",
+    provider = { kind = "mock", command = { "mock" } }, model = "fixture-model", data_root = fixture .. "/generation-data",
   }
   local rejected, rejection = request("head", "preview", generation)
   assert(not rejected and rejection:find("prompt preview does not accept provider configuration", 1, true), rejection)

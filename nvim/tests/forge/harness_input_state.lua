@@ -165,14 +165,14 @@ assert(state.input.revision == 13 and not state.input.required_revision, "snapsh
 local previous_errors = #errors
 input.refresh(state)
 local closing_refresh = requests[#requests]
-state.switching_backend = true
+state.switching_provider = true
 closing_refresh.callback(nil, "Harness session is closing")
 assert(#errors == previous_errors and not state.input.refreshing,
   "retired input refresh published a provider-switch error")
 local previous_requests = #requests
 input.refresh(state)
 assert(#requests == previous_requests, "input refresh submitted while switching providers")
-state.switching_backend = false
+state.switching_provider = false
 input.refresh(state)
 requests[#requests].callback({ revision = 13, suspended = false, execution_busy = false, messages = {} })
 print("harness_input_state: passed")

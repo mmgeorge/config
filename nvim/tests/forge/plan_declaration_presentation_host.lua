@@ -73,7 +73,7 @@ local function bytes(path) return table.concat(vim.fn.readfile(path, "b"), "\n")
 local function text(buffer) return table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n") end
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ diff_logging = false, harness_logging = false, harness = { backend = "mock" } })
+  require("forge").setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
   require("forge.views.harness").open()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan revise the registry interface" })

@@ -64,15 +64,15 @@ end
 
 local policy = { copilot = copilot_before }
 
---- Preserve the source catalog while applying the backend policy and pins first.
+--- Preserve the source catalog while applying the provider policy and pins first.
 ---@param model_list ForgeHarnessModel[]
----@param backend string
+---@param provider string
 ---@param pinned_id_set? table<string, boolean>
 ---@return ForgeHarnessModel[]
-function ModelOrder.order(model_list, backend, pinned_id_set)
+function ModelOrder.order(model_list, provider, pinned_id_set)
   local ranked_list = {}
   for ordinal, model in ipairs(model_list) do ranked_list[ordinal] = rank(model, ordinal) end
-  local before = policy[backend]
+  local before = policy[provider]
   if before then table.sort(ranked_list, before) end
   local ordered_list = {}
   for _, pinned in ipairs({ true, false }) do

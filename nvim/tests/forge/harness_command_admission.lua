@@ -95,7 +95,7 @@ controller.submit()
 assert(#requests == 3 and #warnings == 0 and #state.queue == 0)
 state.busy = false
 state.capability = { fast_mode = true, ultrafast_mode = true }
-state.model_backend, state.model_list = state.session.backend, { { id = state.session.model or "default", is_default = true, service_tiers = { "fast", "ultrafast" } } }
+state.model_provider, state.model_list = state.session.provider, { { id = state.session.model or "default", is_default = true, service_tiers = { "fast", "ultrafast" } } }
 controller.configure = function(params) state.session.service_tier = params.service_tier end
 for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
   for _, selection in ipairs({ { "/fast", "fast" }, { "/ultrafast", "ultrafast" }, { "/ultrafast", "default" } }) do
@@ -143,9 +143,9 @@ vim.cmd("new")
 vim.api.nvim_set_current_buf(state.composer_buf)
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/x" })
 vim.api.nvim_win_set_cursor(0, { 1, 1 })
-state.session.backend = "codex"
+state.session.provider = "codex"
 state.session.model = "default"
-state.model_backend = "codex"
+state.model_provider = "codex"
 require("forge.views.harness.model_pins").get = function() return {} end
 state.model_list = {
   { id = "luna", is_default = true, service_tiers = { "fast" } },
@@ -169,6 +169,6 @@ for _, case in ipairs({
   source.new():get_completions({}, function(result) completion = result end)
   assert(completion, "command completion did not return")
   assert(vim.iter(completion.items):any(function(item) return item.label == "/ultrafast" end) == case.visible,
-    "ultrafast completion ignored selected model or backend capability: " .. vim.inspect(case))
+    "ultrafast completion ignored selected model or provider capability: " .. vim.inspect(case))
 end
 print("harness_command_admission: passed")

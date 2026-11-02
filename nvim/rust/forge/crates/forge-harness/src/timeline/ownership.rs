@@ -320,7 +320,7 @@ mod tests {
             crate::turn::test_support::message(
                 &address,
                 id,
-                Some(crate::backend::MessageRole::Commentary),
+                Some(crate::provider::MessageRole::Commentary),
                 id,
             )
         };

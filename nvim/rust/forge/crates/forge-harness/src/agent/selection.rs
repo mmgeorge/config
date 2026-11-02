@@ -7,7 +7,7 @@ pub struct AgentSelection {
     pub profile: String,
     pub instructions: String,
     /// Chooses the adapter independently of the root provider.
-    pub provider: crate::backend::BackendKind,
+    pub provider: crate::provider::ProviderKind,
     /// Retains the advertised model selected before task admission.
     pub model: String,
     /// Retains reasoning validated against that model's supported choices.
@@ -15,7 +15,7 @@ pub struct AgentSelection {
     /// Retains the selected provider context tier.
     pub context_window: Option<String>,
     /// Retains a compatible provider service tier.
-    pub service_tier: crate::backend::ServiceTier,
+    pub service_tier: crate::provider::ServiceTier,
     /// Prevents cross-provider creation from weakening the root's access policy.
     pub access: crate::session::AccessPolicy,
     /// Retains the root's effective approval mode.

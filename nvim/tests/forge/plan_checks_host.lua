@@ -46,7 +46,7 @@ local function await(predicate, message)
 end
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   require("forge.views.harness").open()
   await(function() return state.presentation and state.presentation.ready end, "Harness startup")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan add a small feature" })

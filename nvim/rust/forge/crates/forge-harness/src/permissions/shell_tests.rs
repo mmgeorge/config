@@ -1,4 +1,3 @@
-use super::*;
 use crate::permissions::command::normalize_command_in;
 use crate::permissions::document::PermissionDecision;
 use crate::permissions::document::parse_permission_document;
@@ -6,6 +5,7 @@ use crate::permissions::matcher::{
     CompiledPermissionDocument, PermissionRequest, PermissionTarget,
 };
 use crate::session::ApprovalMode;
+use forge_shell::shell::*;
 
 #[test]
 fn deep_command_highlights_do_not_weaken_permission_analysis() {
@@ -26,7 +26,7 @@ fn deep_command_highlights_do_not_weaken_permission_analysis() {
         );
     }
     assert!(matches!(
-        parse(&command, CommandShell::Bash).failure,
+        normalize_command_in(&command, CommandShell::Bash).failure,
         Some(CommandAnalysisFailure::Incomplete(_))
     ));
 }
@@ -45,13 +45,7 @@ fn check_matrix(shell: CommandShell, fixture_list: &[&str]) {
         let source = fixture.replace("CHECK", "probe");
         let parsed = normalize_command_in(&source, shell);
         if parsed.failure.is_some() {
-            let mut parser = Parser::new();
-            parser.set_language(&shell.grammar().unwrap()).unwrap();
-            let tree = parser.parse(&source, None).unwrap();
-            failure_list.push(format!(
-                "{source}\n{parsed:?}\n{}",
-                tree.root_node().to_sexp()
-            ));
+            failure_list.push(format!("{source}\n{parsed:?}"));
             continue;
         }
         for invocation in &parsed.invocation_list {
@@ -78,10 +72,7 @@ fn check_matrix(shell: CommandShell, fixture_list: &[&str]) {
             || asked.pending_target_list.is_empty()
             || !asked.pending_target_list.iter().all(|target| matches!(target,
                 PermissionTarget::Command { command, .. } if command.trim_start_matches('^').starts_with("probe"))) {
-            let mut parser = Parser::new();
-            parser.set_language(&shell.grammar().unwrap()).unwrap();
-            let tree = parser.parse(&source, None).unwrap();
-            failure_list.push(format!("{source}\n{parsed:?}\n{}", tree.root_node().to_sexp()));
+            failure_list.push(format!("{source}\n{parsed:?}"));
         }
     }
     assert!(
@@ -870,8 +861,6 @@ fn shell_quote_decoding_preserves_policy_arguments() {
         (CommandShell::Nushell, "probe \"a\\\"b\"", "a\"b"),
         (CommandShell::Nushell, "probe ''", ""),
     ] {
-        let decoded = super::super::command::shell_token_list(source, shell).unwrap();
-        assert_eq!(decoded[1], expected, "{shell:?}: {source}");
         let parsed = normalize_command_in(source, shell);
         if parsed.failure.is_some() {
             failure_list.push(format!("{shell:?}: {source}"));
@@ -882,9 +871,9 @@ fn shell_quote_decoding_preserves_policy_arguments() {
             continue;
         }
         let pattern =
-            super::super::command::exact_command_pattern(&parsed.invocation_list[0]).unwrap();
+            crate::permissions::command::exact_command_pattern(&parsed.invocation_list[0]).unwrap();
         assert_eq!(
-            super::super::command::command_token_list(&pattern).unwrap(),
+            crate::permissions::command::command_token_list(&pattern).unwrap(),
             parsed.invocation_list[0].token_list
         );
         assert_eq!(parsed.invocation_list[0].source, source);
@@ -914,27 +903,6 @@ fn unhandled_string_encodings_fail_closed_instead_of_losing_quoting() {
             "probe \"a\\u{110000}b\"",
         ],
     );
-}
-
-#[test]
-fn lexical_escapes_preserve_arguments_and_rejected_syntax_stays_rejected() {
-    for (shell, source, expected) in [
-        (CommandShell::PowerShell, "probe a`|b", "a|b"),
-        (CommandShell::PowerShell, "probe a`\nb", "a\nb"),
-        (CommandShell::Zsh, "probe a\\\nb", "ab"),
-        (CommandShell::Zsh, "probe \"a\\\nb\"", "ab"),
-    ] {
-        let tokens = super::super::command::shell_token_list(source, shell).unwrap();
-        assert_eq!(tokens, ["probe", expected]);
-        let parsed = normalize_command_in(source, shell);
-        if shell == CommandShell::PowerShell {
-            assert!(parsed.failure.is_none());
-            assert_eq!(parsed.invocation_list.len(), 1);
-            assert_eq!(parsed.invocation_list[0].token_list, tokens);
-        } else {
-            assert!(parsed.failure.is_some());
-        }
-    }
 }
 
 #[test]

@@ -44,8 +44,8 @@ local function text()
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness_logging = false, harness = { backend = "mock",
-    backends = { mock = { command = { "mock" }, selectable = true } } } })
+  require("forge").setup({ harness_logging = false, harness = { provider = "mock",
+    providers = { mock = { command = { "mock" }, selectable = true } } } })
   require("forge.views.harness").open()
   await(function() return state.ready and state.presentation and state.presentation.ready and state.input end, "startup")
   controller.cancel_turn()

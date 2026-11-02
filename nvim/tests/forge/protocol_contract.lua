@@ -31,21 +31,21 @@ local ok, failure = xpcall(function()
   decode({ session_id = "session", event = "questions_changed", payload = { revision = 1, questions = {} } })
   reject({ session_id = "session", event = "questions_changed", payload = { revision = 1, questions = vim.empty_dict() } })
   reject({ session_id = "session", event = "questions_changed", payload = { questions = {} } })
-  reject({ session_id = "session", event = "backend_event", payload = { kind = "unregistered" } })
+  reject({ session_id = "session", event = "provider_event", payload = { kind = "unregistered" } })
   reject({ session_id = "session", event = "document_changed", payload = { session_id = "session", revision = -1 } })
-  reject({ session_id = "session", event = "backend_event", payload = {
+  reject({ session_id = "session", event = "provider_event", payload = {
     kind = "prompt_submission", data = { document = "document", token = "1", state = "accepted" },
   } })
-  decode({ session_id = "session", event = "backend_event", payload = {
+  decode({ session_id = "session", event = "provider_event", payload = {
     kind = "runtime_resolved", data = { session_id = "session", provider = "Codex", model = vim.NIL },
   } })
-  decode({ session_id = "session", event = "backend_event", payload = {
+  decode({ session_id = "session", event = "provider_event", payload = {
     kind = "prompt_submission", data = { document = "document", token = 1, state = "accepted" },
   } })
-  decode({ session_id = "session", event = "backend_event", payload = {
+  decode({ session_id = "session", event = "provider_event", payload = {
     kind = "prompt_submission", data = { document = vim.NIL, token = 2, state = "accepted" },
   } })
-  reject({ session_id = "session", event = "backend_event", payload = {
+  reject({ session_id = "session", event = "provider_event", payload = {
     kind = "prompt_submission", data = { document = vim.NIL, token = "2", state = "accepted" },
   } })
 end, debug.traceback)

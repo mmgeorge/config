@@ -148,7 +148,7 @@ pub enum SessionPhase {
         activity: WorkflowActivity,
     },
     RetryingProvider {
-        retry: crate::backend::retry::ProviderRetry,
+        retry: crate::provider::retry::ProviderRetry,
         activity: WorkflowActivity,
     },
     PlanningFailed {
@@ -483,7 +483,7 @@ impl SessionPhase {
                 ..
             } | Self::Compacting { .. }
                 | Self::RetryingProvider {
-                    retry: crate::backend::retry::ProviderRetry {
+                    retry: crate::provider::retry::ProviderRetry {
                         retry_at_ms: Some(_),
                         ..
                     },
@@ -548,18 +548,21 @@ mod test {
     }
 
     #[test]
-    fn planning_retries_preserve_creation_and_revision_activity() {
-        for (state, activity) in [
-            (PlanState::Generating, WorkflowActivity::Planning),
-            (PlanState::Revising, WorkflowActivity::Revising),
+    fn planning_failure_preserves_budget_reason() {
+        for (state, _activity) in [
+            (PlanState::Generating, WorkflowActivity::Working),
+            (PlanState::Revising, WorkflowActivity::Working),
         ] {
             let exchange = exchange();
             let mut plan = plan(state);
             plan.generation.budget.observe(true);
-            assert!(
-                matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
-                SessionPhase::RetryingPlanGeneration { activity: actual, .. } if actual == activity)
-            );
+            assert!(matches!(
+                SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
+                SessionPhase::Working {
+                    activity: WorkflowActivity::Working,
+                    ..
+                }
+            ));
             plan.state = PlanState::Failed;
             plan.generation.budget.turn_count = plan.generation.budget.max_turn_count;
             assert!(
@@ -583,7 +586,7 @@ mod test {
             SessionPhase::Working {
                 duration_ms: 0,
                 started_at_ms: Some(42),
-                activity: WorkflowActivity::Planning,
+                activity: WorkflowActivity::Working,
                 execution: None,
                 reasoning_summary: None,
             }
@@ -593,16 +596,16 @@ mod test {
     #[test]
     fn compaction_restores_workflow_status_after_every_terminal_outcome() {
         for state in [
-            crate::backend::CompactionState::Completed,
-            crate::backend::CompactionState::Failed,
-            crate::backend::CompactionState::Unconfirmed,
+            crate::provider::CompactionState::Completed,
+            crate::provider::CompactionState::Failed,
+            crate::provider::CompactionState::Unconfirmed,
         ] {
             let mut exchange = exchange();
             let original = SessionPhase::resolve(None, None, Some(&exchange));
-            let mut compaction = crate::backend::Compaction {
+            let mut compaction = crate::provider::Compaction {
                 id: "compaction".into(),
                 thread_id: "provider".into(),
-                state: crate::backend::CompactionState::Running,
+                state: crate::provider::CompactionState::Running,
                 manual: false,
                 started_at_ms: None,
                 completed_at_ms: None,
@@ -687,23 +690,6 @@ mod test {
             SessionPhase::resolve(Some(&plan), None, None),
             SessionPhase::PlanningFailed { .. }
         ));
-    }
-
-    #[test]
-    fn retry_projection_exposes_authoritative_budget_position() {
-        let mut plan = plan(PlanState::Generating);
-        plan.generation.budget.observe(false);
-        assert_eq!(
-            SessionPhase::resolve(Some(&plan), None, Some(&exchange())),
-            SessionPhase::RetryingPlanGeneration {
-                plan_id: "plan".into(),
-                turn: 2,
-                max_turn: 20,
-                activity: WorkflowActivity::Planning,
-                duration_ms: 0,
-                started_at_ms: Some(42),
-            }
-        );
     }
 
     #[test]
@@ -799,10 +785,10 @@ mod test {
         ] {
             let mut exchange = exchange();
             exchange.observe_compaction(
-                crate::backend::Compaction {
+                crate::provider::Compaction {
                     id: "compaction".into(),
                     thread_id: "thread".into(),
-                    state: crate::backend::CompactionState::Running,
+                    state: crate::provider::CompactionState::Running,
                     manual: false,
                     started_at_ms: Some(42),
                     completed_at_ms: None,

@@ -701,24 +701,24 @@ mod test {
                 .server
                 .is_empty()
         );
-        for backend in ["codex", "copilot", "claude", "antigravity"] {
-            let snapshot = store.catalog(&workspace, "session", backend)?;
+        for provider in ["codex", "copilot", "claude", "antigravity"] {
+            let snapshot = store.catalog(&workspace, "session", provider)?;
             assert_eq!(snapshot.server.len(), 1);
             assert_eq!(
                 snapshot.server[0].scope,
-                Some(crate::backend::ResourceScope::Workspace)
+                Some(crate::provider::ResourceScope::Workspace)
             );
             assert_eq!(snapshot.settings.desired.mcp.get(&id), Some(&false));
-            let request = crate::backend::BackendCatalogRequest {
+            let request = crate::provider::ProviderCatalogRequest {
                 execution_owner: None,
                 harness_session_id: "session".into(),
                 workspace: workspace.clone(),
                 access: Default::default(),
                 approval_mode: crate::session::ApprovalMode::Ask,
-                backend_session_id: None,
+                provider_session_id: None,
             };
             assert!(
-                SessionResources::load(root.path(), &request, backend, "test")?
+                SessionResources::load(root.path(), &request, provider, "test")?
                     .launch
                     .is_empty()
             );
@@ -726,19 +726,19 @@ mod test {
         let mut desired = store.get(&workspace, "session", "claude")?.desired;
         desired.mcp.insert(id, true);
         store.update(1, SettingScope::Workspace, &workspace, "session", &desired)?;
-        let request = crate::backend::BackendCatalogRequest {
+        let request = crate::provider::ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: "session".into(),
             workspace: workspace.clone(),
             access: Default::default(),
             approval_mode: crate::session::ApprovalMode::Ask,
-            backend_session_id: None,
+            provider_session_id: None,
         };
         let launched = SessionResources::load(root.path(), &request, "antigravity", "test")?;
         assert_eq!(launched.launch[0].1["env"]["TOKEN"], "native-token-fixture");
         assert_eq!(
             launched.mcp[0].scope,
-            Some(crate::backend::ResourceScope::Workspace)
+            Some(crate::provider::ResourceScope::Workspace)
         );
         assert_eq!(
             launched.mcp[0].source_path.as_deref(),
@@ -815,7 +815,7 @@ mod test {
         assert_eq!(snapshot.skill[0].name, "imported-skill");
         assert_eq!(
             snapshot.skill[0].scope,
-            Some(crate::backend::ResourceScope::Global)
+            Some(crate::provider::ResourceScope::Global)
         );
         assert!(Path::new(&snapshot.skill[0].source).is_file());
         assert_eq!(
@@ -848,12 +848,12 @@ mod test {
         assert!(
             skill
                 .iter()
-                .any(|skill| skill.scope == Some(crate::backend::ResourceScope::Workspace))
+                .any(|skill| skill.scope == Some(crate::provider::ResourceScope::Workspace))
         );
         assert!(
             skill
                 .iter()
-                .any(|skill| skill.scope == Some(crate::backend::ResourceScope::Global))
+                .any(|skill| skill.scope == Some(crate::provider::ResourceScope::Global))
         );
         Ok(())
     }

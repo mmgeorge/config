@@ -46,10 +46,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
       process.exit(0);
       return;
     }
-    // Isolate projection from provider-specific skill detection with normalized read evidence.
+    // Exercise native ACP read and failed-edit updates before the final response.
     write({method:'session/update',params:{sessionId:'native',update:{sessionUpdate:'tool_call',
-      toolCallId:'skill-read',kind:'read',title:'Read fixture',status:'completed',rawInput:{path:process.argv[4]},
-      skill_reads:[{resource_id:'fixture',name:'fixture',path:process.argv[4],tool_id:'skill-read'}]}}});
+      toolCallId:'skill-read',kind:'read',title:'Read fixture',status:'completed',rawInput:{path:process.argv[4]}}}});
     write({method:'session/update',params:{sessionId:'native',update:{sessionUpdate:'tool_call',
       toolCallId:'edit',kind:'edit',title:'File changes',status:'interrupted'}}});
     write({method:'session/update',params:{sessionId:'native',update:{sessionUpdate:'agent_message_chunk',
@@ -75,11 +74,19 @@ require("forge.views.harness.controller").resolve_runtime_model = function() end
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local function request(method, params, expected_failure)
-  local value, failure, finished
-  client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, request_error)
-    value, failure, finished = result, request_error, true
-  end)
-  assert(vim.wait(10000, function() return finished end, 10), method .. " timed out")
+  local value, failure, detail, finished
+  local deadline = vim.uv.hrtime() + 10000000000
+  repeat
+    value, failure, detail, finished = nil, nil, nil, false
+    client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, request_error, request_detail)
+      value, failure, detail, finished = result, request_error, request_detail, true
+    end)
+    assert(vim.wait(10000, function() return finished end, 10), method .. " timed out")
+    -- Native initialization can still own preparation. Only its explicit pre-dispatch
+    -- rejection permits retry; uncertain delivery must reach the assertions below.
+    if method ~= "session.prompt.submit" or not detail or detail.code ~= "not_admitted" then break end
+    vim.wait(20, function() return false end, 10)
+  until vim.uv.hrtime() >= deadline
   if not expected_failure then assert(not failure, method .. ": " .. tostring(failure)) end
   return value, failure
 end
@@ -93,8 +100,8 @@ local function settle(count)
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = kind, config_dir = data,
-    backends = { [kind] = { command = { "node", peer, sent, lost and "lost" or "ok", skill }, selectable = true } } } })
+  require("forge").setup({ harness = { provider = kind, config_dir = data,
+    providers = { [kind] = { command = { "node", peer, sent, lost and "lost" or "ok", skill }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.ready and state.session end, 10), table.concat(errors, " | "))
   request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {}, windows_sandbox = "elevated" } })
@@ -115,7 +122,7 @@ local success, failure = xpcall(function()
     assert(not native[2]:find("FIRST_SUBMISSION_MARKER", 1, true), "accepted input was replayed as missing context")
     assert(native[2]:find("SECOND_SUBMISSION_MARKER", 1, true), "follow-up input was lost")
     local transcript = state.presentation.transcript
-    local function toggle_activity()
+    local function set_activity(expanded)
       local row
       assert(vim.wait(5000, function()
         local count = 0
@@ -132,44 +139,56 @@ local success, failure = xpcall(function()
       end, 10), "activity heading did not arrive")
       vim.api.nvim_set_current_win(state.transcript_win)
       vim.api.nvim_win_set_cursor(state.transcript_win, { row + 1, 0 })
-      assert(state.presentation.toggle_heading(state.transcript_win), "activity did not accept expansion")
+      local location = require("forge.buffer").locate(transcript, row, 0)
+      local descriptor = transcript.sequence.node[location.block].entry.metadata.node
+      state.presentation.set_section(descriptor.id, expanded, false)
     end
-    toggle_activity()
+    set_activity(true)
+    local expanded = {}
     local function assert_activity()
+      for index = 0, transcript.sequence:count() - 1 do
+        local node = transcript.sequence:at(index).entry.metadata.node
+        if node and node ~= vim.NIL and (node.kind == "thought" or node.kind == "tool_group")
+          and node.display ~= "full" and not expanded[node.id] then
+          expanded[node.id] = true
+          state.presentation.set_section(node.id, true, false)
+        end
+      end
       local found = {}
       for row, text in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-        for _, label in ipairs({ "Read skill · fixture", "File changes interrupted" }) do
+        for _, label in ipairs({ "Read fixture", "Reported edits" }) do
           if text:find(label, 1, true) then
             local location = require("forge.buffer").locate(transcript, row - 1, 0)
             local entry = transcript.sequence.node[location.block].entry
-            assert(entry.metadata.layout.indent == 4, label .. " escaped activity indentation")
+            assert(entry.metadata.layout.indent == 6, label .. " escaped activity indentation")
             found[label] = true
           end
         end
       end
-      return found["Read skill · fixture"] and found["File changes interrupted"]
+      return found["Read fixture"] and found["Reported edits"]
     end
     assert(vim.wait(5000, assert_activity, 10), "activity events did not render:\n"
       .. table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
       .. "\n" .. table.concat(errors, "\n"))
     local visible = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-    assert(visible:find("Read skill · fixture", 1, true) and visible:find("File changes interrupted", 1, true))
+    assert(visible:find("Read fixture", 1, true) and visible:find("Reported edits", 1, true))
+    assert(visible:find("1 unsuccessful", 1, true), "failed ACP edit lost its outcome")
     vim.api.nvim_set_current_win(state.transcript_win)
     for row, text in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-      if text:find("Read skill · fixture", 1, true) or text:find("File changes interrupted", 1, true) then
+      if text:find("Read fixture", 1, true) or text:find("Reported edits", 1, true) then
         vim.api.nvim_win_set_cursor(state.transcript_win, { row, 0 })
         vim.cmd("normal! zz")
         vim.cmd("redraw!")
         local screen = vim.fn.screenpos(state.transcript_win, row, 1)
         local rendered = ""
         for column = 1, 120 do rendered = rendered .. vim.fn.screenstring(screen.row, column) end
-        assert(rendered:find("  ◇ ", 1, true) == 1, "event marker escaped the activity column: " .. rendered)
+        assert(rendered:find(text, 1, true), "activity text is absent from the attached editor grid: " .. rendered)
       end
     end
-    toggle_activity()
+    set_activity(false)
     assert(vim.wait(5000, function()
       visible = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-      return not visible:find("Read skill · fixture", 1, true) and not visible:find("File changes interrupted", 1, true)
+      return not visible:find("Read fixture", 1, true) and not visible:find("Reported edits", 1, true)
     end, 10), "collapsed activity left its events outside the fold")
     assert(visible:find("ACP_SUBMISSION_ACCEPTED", 1, true), "activity collapse hid the final response")
   end

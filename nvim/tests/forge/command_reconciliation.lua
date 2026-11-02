@@ -14,7 +14,7 @@ local exposed = replica.view()
 exposed.count = 100
 assert(replica.view().count == 7, "view mutation changed authoritative state")
 
-require("forge").setup({ walkthrough_inventory = "sem", harness = { backend = "mock" } })
+require("forge").setup({ walkthrough_inventory = "sem", harness = { provider = "mock" } })
 local view = require("forge.views.harness.plan_question")
 local pending, continued = {}, 0
 local initial = { revision = 1, answer_revision = 0, answer = {}, current_index = 0,

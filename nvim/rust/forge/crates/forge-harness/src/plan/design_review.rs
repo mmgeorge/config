@@ -126,7 +126,8 @@ pub(super) fn test_source_range(rendered: &RenderedPlan) -> Result<(usize, usize
         start = start.min(line);
         end = end.max(line);
     }
-    Ok((start - 1, end))
+    // The inventory always owns a blank row after its heading, even without cases.
+    Ok((start - 1, end.max(start + 1)))
 }
 
 pub(super) fn project(
@@ -3742,7 +3743,7 @@ mod tests {
         assert!(
             rendered
                 .markdown
-                .starts_with(" Objective \nSupport observable cancellation and safe texture replacement.\n\n Requirements ")
+                .starts_with(" Objective \n\nSupport observable cancellation and safe texture replacement.\n\n Requirements ")
         );
         let task_anchor = rendered.navigation.resolve_line(1).unwrap();
         assert_eq!(task_anchor.json_path, "/design/document/objective");
@@ -3767,8 +3768,8 @@ mod tests {
             id: "description".into(),
             anchor: None,
             source: super::super::PlanAnnotationInput {
-                start_line: design_line + 1,
-                end_line: design_line + 1,
+                start_line: design_line + 2,
+                end_line: design_line + 2,
                 body: "Confirm the cancellation lifecycle".into(),
             },
         };
@@ -3987,7 +3988,7 @@ mod tests {
             render(&document)
                 .unwrap()
                 .markdown
-                .contains(" Changes \nNo declaration changes.")
+                .contains(" Changes \n\nNo declaration changes.")
         );
     }
 
@@ -4046,7 +4047,7 @@ mod tests {
             .iter()
             .filter(|block| !block.metadata.fold.is_empty())
             .collect();
-        assert_eq!(folded_header.len(), 9);
+        assert_eq!(folded_header.len(), 10);
         assert_eq!(folded_header[0].text.row(0), Some(" Objective "));
         assert_eq!(folded_header[1].text.row(0), Some(" Requirements "));
         assert_eq!(folded_header[2].text.row(0), Some(" Background "));
@@ -4060,8 +4061,9 @@ mod tests {
                 .starts_with("Modified src/lib.rs")
         );
         assert!(folded_header[6].text.row(0).unwrap().starts_with("@@"));
-        assert_eq!(folded_header[7].text.row(0), Some(" Checks "));
-        assert_eq!(folded_header[8].text.row(0), Some(" Verification "));
+        assert!(folded_header[7].text.row(0).unwrap().starts_with(" Tests "));
+        assert_eq!(folded_header[8].text.row(0), Some(" Checks "));
+        assert_eq!(folded_header[9].text.row(0), Some(" Verification "));
         for header in folded_header {
             let fold = &header.metadata.fold[0];
             assert!(fold.heading_start.is_none());

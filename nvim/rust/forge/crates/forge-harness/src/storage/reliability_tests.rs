@@ -170,7 +170,7 @@ fn sqlite_contention_produces_an_actionable_error() -> Result<()> {
 
 #[test]
 fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
-    use crate::backend::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+    use crate::provider::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&session("session", "workspace"))?;

@@ -42,7 +42,7 @@ local succeeded, failure = xpcall(function()
   vim.fn.writefile({ vim.json.encode({ checks = checks }) }, workspace .. "/.forge.json")
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
-    harness = { backend = "mock", backends = { mock = { command = { "mock" }, selectable = true } } } })
+    harness = { provider = "mock", providers = { mock = { command = { "mock" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timed out")
   request("session.configure", { shell = "nushell" })

@@ -1,5 +1,5 @@
 vim.loader.enable(false)
-require("forge").setup({ harness = { backend = "mock" } })
+require("forge").setup({ harness = { provider = "mock" } })
 local picker = require("forge.views.picker")
 local datetime = require("forge.integrations.datetime")
 local now = 1700000000

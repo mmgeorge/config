@@ -2,20 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::continuation::ContinuationBudget;
 
-/// Represents the lifecycle state of one persistent harness goal.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalState {
-    Active,
-    Paused,
-    Complete,
-    Blocked,
-    UsageLimited,
-    BudgetLimited,
-    Stalled,
-    Cleared,
-}
-
 /// Tracks continuation limits and progress evidence for one goal.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GoalRecord {
@@ -30,16 +16,7 @@ pub struct GoalRecord {
     pub updated_at_ms: i64,
 }
 
-/// Represents observable evidence produced by one backend turn.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-pub struct TurnEvidence {
-    pub workspace_changed: bool,
-    pub tool_called: bool,
-    #[serde(default)]
-    pub native_state: Option<GoalState>,
-    pub structured_complete: bool,
-    pub structured_blocked: bool,
-}
+pub use forge_provider_api::completion::{GoalState, TurnEvidence};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GoalTermination {
@@ -133,12 +110,15 @@ mod test {
         let previous = crate::task::Task::goal("Previous".into(), Default::default(), false, 1);
         let current = crate::task::Task::goal("Current".into(), Default::default(), false, 2);
         for termination in [GoalTermination::Complete, GoalTermination::Blocked] {
-            let output = crate::backend::BackendOutput {
+            let output = crate::provider::ProviderOutput {
                 event: Vec::new(),
-                completion: crate::backend::BackendCompletion {
-                    evidence: TurnEvidence {
-                        structured_complete: true,
-                        structured_blocked: true,
+                completion: crate::provider::ProviderCompletion {
+                    native: forge_provider_api::completion::ProviderCompletion {
+                        evidence: TurnEvidence {
+                            structured_complete: true,
+                            structured_blocked: true,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
                     goal_control: Some(GoalControl {

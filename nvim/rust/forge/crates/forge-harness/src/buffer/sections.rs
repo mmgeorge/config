@@ -1757,7 +1757,7 @@ mod tests {
             crate::buffer::sections::SectionRequest {
                 view: view.clone(),
                 sequence: 2,
-                id: "changes:file:0",
+                id: "changes:file:8:first.rs",
                 expanded: true,
                 more: false,
                 page: Some((12, width.clone())),
@@ -1791,13 +1791,13 @@ mod tests {
             first
                 .block
                 .iter()
-                .any(|block| block.id.0 == "changes:file:1")
+                .any(|block| block.id.0 == "changes:file:9:second.rs")
         );
         assert!(
             !first
                 .block
                 .iter()
-                .any(|block| block.id.0.starts_with("changes:file:1:hunk"))
+                .any(|block| block.id.0.starts_with("changes:file:9:second.rs:hunk"))
         );
         let boundary: Vec<_> = first
             .block
@@ -1806,7 +1806,7 @@ mod tests {
             .filter(|section| section.more)
             .collect();
         assert_eq!(boundary.len(), 1);
-        assert_eq!(boundary[0].id.0, "changes:file:0");
+        assert_eq!(boundary[0].id.0, "changes:file:8:first.rs");
         assert!(
             first_body
                 .iter()
@@ -1819,7 +1819,7 @@ mod tests {
             crate::buffer::sections::SectionRequest {
                 view: second,
                 sequence: 1,
-                id: "changes:file:0",
+                id: "changes:file:8:first.rs",
                 expanded: true,
                 more: false,
                 page: Some((12, width.clone())),
@@ -1830,7 +1830,7 @@ mod tests {
             crate::buffer::sections::SectionRequest {
                 view: view.clone(),
                 sequence: 3,
-                id: "changes:file:0",
+                id: "changes:file:8:first.rs",
                 expanded: true,
                 more: true,
                 page: Some((16, width.clone())),
@@ -1854,7 +1854,7 @@ mod tests {
             crate::buffer::sections::SectionRequest {
                 view: view.clone(),
                 sequence: 4,
-                id: "changes:file:0:hunk:0",
+                id: "changes:file:8:first.rs:hunk:0",
                 expanded: false,
                 more: false,
                 page: None,
@@ -1867,7 +1867,7 @@ mod tests {
                 .snapshot()?
                 .block
                 .iter()
-                .any(|block| block.id.0 == "changes:file:0:hunk:0:rows:0"),
+                .any(|block| block.id.0 == "changes:file:8:first.rs:hunk:0:rows:0"),
             "a window with the file closed retained a collapsed hunk body"
         );
         visible.set(
@@ -1875,7 +1875,7 @@ mod tests {
             crate::buffer::sections::SectionRequest {
                 view: view.clone(),
                 sequence: 5,
-                id: "changes:file:0",
+                id: "changes:file:8:first.rs",
                 expanded: false,
                 more: false,
                 page: Some((12, width.clone())),
@@ -1886,7 +1886,7 @@ mod tests {
             crate::buffer::sections::SectionRequest {
                 view: view.clone(),
                 sequence: 6,
-                id: "changes:file:0",
+                id: "changes:file:8:first.rs",
                 expanded: true,
                 more: true,
                 page: Some((12, width.clone())),
@@ -1906,7 +1906,7 @@ mod tests {
             crate::buffer::sections::SectionRequest {
                 view,
                 sequence: 7,
-                id: "changes:file:0",
+                id: "changes:file:8:first.rs",
                 expanded: true,
                 more: false,
                 page: Some((12, width)),
@@ -1918,7 +1918,7 @@ mod tests {
             reopened
                 .block
                 .iter()
-                .all(|block| block.id.0 != "changes:file:0:hunk:0:rows:0"),
+                .all(|block| block.id.0 != "changes:file:8:first.rs:hunk:0:rows:0"),
             "reopening a parent discarded the child's explicit closure"
         );
         let reopened_count = reopened

@@ -2,11 +2,11 @@ vim.loader.enable(false)
 local repository = vim.fn.fnamemodify(debug.getinfo(1,"S").source:sub(2),":h:h:h:h")
 vim.opt.runtimepath:prepend(repository .. "/nvim")
 
-local backend = vim.g.forge_agent_test_backend or "mock"
+local provider = vim.g.forge_agent_test_provider or "mock"
 local function log(message)
   if not vim.g.forge_agent_test_visual then print(message) end
 end
-local child_backend = vim.g.forge_agent_test_child_backend or backend
+local child_provider = vim.g.forge_agent_test_child_provider or provider
 local data = vim.g.forge_agent_test_data or vim.fn.tempname()
 local workspace = vim.fn.tempname()
 vim.fn.mkdir(data,"p")
@@ -47,7 +47,7 @@ local function approvals()
   end
 end
 local function request(method,params)
-  if method ~= "session.state.get" then log("AGENT_REQUEST " .. backend .. " " .. method) end
+  if method ~= "session.state.get" then log("AGENT_REQUEST " .. provider .. " " .. method) end
   local settled,value,failure
   client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil },function(result,error) value,failure,settled=result,error,true end)
   assert(vim.wait(90000,function() approvals() return settled end,10),method .. " timeout: " .. vim.inspect(errors))
@@ -78,19 +78,19 @@ end
 local succeeded,failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   local launch = vim.g.forge_agent_test_launch or {}
-  if backend == "mock" and not launch.mock then launch.mock = {command={"mock"},selectable=true} end
-  require("forge").setup({harness={config_dir=data,backend=backend,backends=launch}})
+  if provider == "mock" and not launch.mock then launch.mock = {command={"mock"},selectable=true} end
+  require("forge").setup({harness={config_dir=data,provider=provider,providers=launch}})
   require("forge.views.harness").open()
   assert(vim.wait(30000,function() return state.session or #errors>0 end,10),"startup timeout")
   assert(state.session,table.concat(errors,"\n"))
   request("host.trace.configure",{enabled=true})
   request("session.configure",{access={sandbox=false,write_access="workspace",writable_directory={},windows_sandbox="elevated"}})
   errors = {}
-  local root_model = model_for(backend,vim.g.forge_agent_test_model)
+  local root_model = model_for(provider,vim.g.forge_agent_test_model)
   if root_model then request("session.configure",{model=root_model}) end
   local initial = request("session.state.get")
   assert(initial.subagent_tools == false,"delegation must default off")
-  local catalog = request("session.agent.model.list", {provider=backend})
+  local catalog = request("session.agent.model.list", {provider=provider})
   assert(type(catalog.models) == "table" and #catalog.models > 0, "child catalog omitted models")
   assert(type(catalog.capability.fast_mode) == "boolean", "child catalog omitted speed capabilities")
   if vim.g.forge_agent_test_settings then
@@ -109,7 +109,7 @@ local succeeded,failure = xpcall(function()
     local instance,option = config_picker()
     instance.spec.action_list[2].callback({option=option})
     assert(vim.wait(2000,function() return state.subagent_tools == true end,10),
-      "config did not show On after enable; backend value: " .. vim.inspect(request("session.state.get").subagent_tools))
+      "config did not show On after enable; provider value: " .. vim.inspect(request("session.state.get").subagent_tools))
     assert(table.concat(vim.api.nvim_buf_get_lines(instance.buf,0,-1,false),"\n"):find("On",1,true),"picker did not render On")
     picker.close()
     instance,option = config_picker()
@@ -118,13 +118,13 @@ local succeeded,failure = xpcall(function()
     assert(vim.wait(2000,function() return state.subagent_tools == false end,10),"Enter did not disable subagent tools")
     assert(request("session.state.get").subagent_tools == false,"disabling did not persist")
     picker.close()
-    log("HARNESS_AGENTS_SETTINGS_PASS " .. backend)
+    log("HARNESS_AGENTS_SETTINGS_PASS " .. provider)
   end
   local marker = "CHILD_FRESH_D529"
-  local child_model = model_for(child_backend,vim.g.forge_agent_test_child_model)
+  local child_model = model_for(child_provider,vim.g.forge_agent_test_child_model)
   local profiles = request("agent.profile.get")
   profiles.document.profiles["test-child"] = { enabled=true,description="Runtime verification child",instructions="",
-    provider=child_backend == "mock" and "inherit" or child_backend,model=child_model or "inherit",
+    provider=child_provider == "mock" and "inherit" or child_provider,model=child_model or "inherit",
     reasoning_effort="default",service_tier="default",approval_mode="inherit" }
   request("agent.profile.save",{expected_revision=profiles.revision,document=profiles.document})
   if vim.g.forge_agent_test_manual ~= false then
@@ -163,7 +163,7 @@ local succeeded,failure = xpcall(function()
   assert(vim.wait(10000,function()
     return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"):find(marker,1,true)
   end,10),"child timeline omitted marker")
-  assert(snapshot.session.backend_session_id == vim.NIL or snapshot.session.backend_session_id == nil,"manual children changed root provider history")
+  assert(snapshot.session.provider_session_id == vim.NIL or snapshot.session.provider_session_id == nil,"manual children changed root provider history")
   require("forge.views.harness.agent_picker").refresh()
   require("forge.views.harness.agent_picker").close()
   local edited = request("agent.profile.get")
@@ -185,7 +185,7 @@ local succeeded,failure = xpcall(function()
   assert(vim.wait(10000,function()
     return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"):find("INBOX_P492",1,true)
   end,10),"follow-up lost the retained inbox")
-  log("HARNESS_AGENTS_MANUAL_PASS " .. backend .. " -> " .. child_backend .. " " .. id)
+  log("HARNESS_AGENTS_MANUAL_PASS " .. provider .. " -> " .. child_provider .. " " .. id)
   end
   log("HARNESS_AGENTS_DATA " .. data)
   if vim.g.forge_agent_test_model_tools then
@@ -211,7 +211,7 @@ local succeeded,failure = xpcall(function()
     assert(found,"root did not admit a managed model child: " .. vim.inspect(model_snapshot.agent.run) .. "\n" .. root_transcript)
     assert(table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"):find("ROOT_SYNTHESIS_R783",1,true),"root omitted child result synthesis")
     require("forge.views.harness.agent_picker").close()
-    log("HARNESS_AGENTS_MODEL_PASS " .. backend .. " -> " .. child_backend)
+    log("HARNESS_AGENTS_MODEL_PASS " .. provider .. " -> " .. child_provider)
   end
   if vim.g.forge_agent_test_controls then
     local target = {}
@@ -247,7 +247,7 @@ local succeeded,failure = xpcall(function()
     local settled = await_state(function(snapshot) return snapshot.agent.summary[sibling].state == "cancelled"
       and snapshot.agent.summary[additional].state == "cancelled" end)
     assert(settled.agent.summary[first].exchange_count == 1,"interruption restarted queued work")
-    log("HARNESS_AGENTS_CONTROLS_PASS " .. backend .. " -> " .. child_backend)
+    log("HARNESS_AGENTS_CONTROLS_PASS " .. provider .. " -> " .. child_provider)
     local session_id = settled.session.id
     local stopped = false
     client.host_stop(nil,function() stopped=true end)
@@ -262,7 +262,7 @@ local succeeded,failure = xpcall(function()
       assert(reopened.agent.summary[id].state == "cancelled",vim.inspect(reopened.agent.summary[id]))
       assert(reopened.agent.summary[id].exchange_count == 1,"recovery replayed a child task")
     end
-    log("HARNESS_AGENTS_RECOVERY_PASS " .. backend .. " -> " .. child_backend)
+    log("HARNESS_AGENTS_RECOVERY_PASS " .. provider .. " -> " .. child_provider)
   end
 end,debug.traceback)
 if succeeded and vim.g.forge_agent_test_visual then

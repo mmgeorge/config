@@ -208,7 +208,7 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
     let data = tempfile::tempdir().unwrap();
     let params = json!({
         "workspace": workspace.path(), "data_root": data.path(), "client_id": "large-history",
-        "backend": {"kind":"mock", "command":[]}
+        "provider": {"kind":"mock", "command":[]}
     });
     let mut host = Host::start().await;
     let initialized = host.request(2, "session.initialize", params.clone()).await;
@@ -1430,7 +1430,7 @@ async fn repository_reads_do_not_require_harness_initialization() {
             "session.initialize",
             json!({
                 "workspace":fixture.path(),"data_root":data_root,"client_id":"shared-host-test",
-                "backend":{"kind":"mock","command":[]}
+                "provider":{"kind":"mock","command":[]}
             }),
         )
         .await;
@@ -1802,7 +1802,7 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
             "session.initialize",
             json!({
                 "workspace":fixture.path(), "data_root":data.path(),
-                "client_id":"document-host-test", "backend":{"kind":"mock","command":[]}
+                "client_id":"document-host-test", "provider":{"kind":"mock","command":[]}
             }),
         )
         .await;
@@ -1864,7 +1864,7 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
     assert!(
         host.progress
             .iter()
-            .any(|event| event["event"] == "backend_event"
+            .any(|event| event["event"] == "provider_event"
                 && event["payload"]["kind"] == "prompt_submission"
                 && event["payload"]["data"]
                     == json!({"document":"transcript","token":2,"state":"accepted"})),

@@ -23,11 +23,11 @@ function M.policy(session)
   }, vim.deepcopy(session.access or {}))
 end
 
----@param session {backend: string}
+---@param session {provider: string}
 ---@param capability? {os_sandbox?: boolean}
 ---@return boolean
 function M.supports_sandbox(session, capability)
-  return session.backend == "codex" and capability ~= nil and capability.os_sandbox == true
+  return session.provider == "codex" and capability ~= nil and capability.os_sandbox == true
 end
 
 ---@param policy ForgeDirectoryPolicy

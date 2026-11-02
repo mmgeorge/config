@@ -1,0 +1,19 @@
+[package]
+name = "forge-provider-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+forge-protocol = { workspace = true }
+forge-shell = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
+anyhow = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -407,7 +407,7 @@ if arg[1] then
 end
 
 vim.api.nvim_set_current_dir(workspace)
-require("forge").setup({ diff_logging = false, harness_logging = false, harness = { backend = "mock" } })
+require("forge").setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
 local failures = {}
 for _, case in ipairs(cases) do
   errors = {}

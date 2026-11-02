@@ -52,7 +52,7 @@ local function composer()
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   require("forge").open_harness()
   await(function() return state.ready and state.session and state.presentation and state.presentation.ready end, "Harness did not open")
   vim.api.nvim_set_current_win(state.composer_win)

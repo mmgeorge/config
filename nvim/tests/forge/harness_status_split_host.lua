@@ -36,7 +36,7 @@ end
 local ok, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
-    harness = { backend = "mock", backends = { mock = { command = { "visible-blocking" }, selectable = true } } } })
+    harness = { provider = "mock", providers = { mock = { command = { "visible-blocking" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.presentation and state.presentation.ready end, 10), table.concat(errors, "\n"))
   assert(state.presentation.status_view.window == nil)

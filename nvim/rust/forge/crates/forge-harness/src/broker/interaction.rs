@@ -6,7 +6,7 @@ impl HarnessBroker {
         text: String,
         mode: PromptMode,
         admission: Option<ExchangeAdmission>,
-        input: BackendInput,
+        input: ProviderInput,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let admitted_task = self
             .task_controller
@@ -70,8 +70,8 @@ impl HarnessBroker {
         let submission = match self.input_submission.take() {
             Some(submission) => submission,
             None => submission_store.prepare(
-                &self.backend_request(input.clone(), mode),
-                self.backend.descriptor().kind,
+                &self.provider_request(input.clone(), mode),
+                self.provider.descriptor().kind,
             )?,
         };
         let (mut interaction, new_runtime, mut event) = Box::pin(self.admit_interaction(
@@ -160,10 +160,10 @@ impl HarnessBroker {
                     return Err(error);
                 }
                 if cancelled
-                    && let Some(backend_session_id) =
-                        self.backend.active_session_id_for(&self.session.id).await
+                    && let Some(provider_session_id) =
+                        self.provider.active_session_id_for(&self.session.id).await
                 {
-                    self.session.backend_session_id = Some(backend_session_id);
+                    self.session.provider_session_id = Some(provider_session_id);
                 }
                 if cancelled && self.turn_cancellation.restart.load(Ordering::Acquire) {
                     Box::pin(self.park_exchange_for_restart(&mut interaction)).await?;
@@ -253,7 +253,7 @@ impl HarnessBroker {
                     .await?;
                     return Err(error);
                 }
-                return Err(error).context("backend turn failed");
+                return Err(error).context("provider turn failed");
             }
         };
         Box::pin(self.complete_interaction(interaction, output, mode, event)).await
@@ -390,7 +390,7 @@ impl HarnessBroker {
     async fn complete_interaction(
         &mut self,
         mut interaction: Exchange,
-        mut output: crate::backend::BackendCompletion,
+        mut output: crate::provider::ProviderCompletion,
         mut mode: PromptMode,
         mut event: Vec<SessionEvent>,
     ) -> Result<(Value, Vec<SessionEvent>)> {
@@ -424,7 +424,7 @@ impl HarnessBroker {
             self.session.context_usage = Some(context_usage);
             self.context_usage_fresh = true;
         }
-        self.session.backend_session_id = output.backend_session_id.clone();
+        self.session.provider_session_id = output.provider_session_id.clone();
         self.session.provider_checkpoint_id = output.provider_checkpoint_id.clone();
         if !output.runtime.provider.is_empty() {
             self.session.provider_label = output.runtime.provider.clone();
@@ -444,7 +444,7 @@ impl HarnessBroker {
             interaction.elicitation().is_some() && elicitation_control_count > 0;
         anyhow::ensure!(
             elicitation_control_count <= 1,
-            "backend turn emitted multiple Harness question control actions"
+            "provider turn emitted multiple Harness question control actions"
         );
         if mode == PromptMode::Plan {
             anyhow::ensure!(

@@ -25,7 +25,7 @@ pub(in crate::tools) fn is_tool(name: &str) -> bool {
 pub(in crate::tools) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    output: crate::backend::BackendCompletion,
+    output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     match invocation.name.as_str() {
         super::ask::NAME => super::ask::execute(runtime, invocation, output).await,
@@ -39,7 +39,7 @@ pub(in crate::tools) async fn execute(
 /// Record questions completion fields for provider-neutral replay.
 pub(in crate::tools) fn record(
     invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::backend::BackendCompletion,
+    output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
     match invocation.name.as_str() {
         super::ask::NAME => super::ask::record(invocation, output),

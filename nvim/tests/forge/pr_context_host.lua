@@ -46,7 +46,7 @@ local success, failure = xpcall(function()
   vim.fn.stdpath = function(kind)
     return kind == "data" and fixture .. "/data" or original_stdpath(kind)
   end
-  require("forge").setup({ harness = { backend = "mock", model = "mock-model" },
+  require("forge").setup({ harness = { provider = "mock", model = "mock-model" },
     background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
   local generation_request = client.generation_request
   local function generate_commit()

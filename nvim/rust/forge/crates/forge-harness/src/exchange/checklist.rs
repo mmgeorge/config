@@ -1,4 +1,4 @@
-use crate::backend::{ChecklistStatus, ProviderChecklistEntry, ProviderChecklistUpdate};
+use crate::provider::{ChecklistStatus, ProviderChecklistEntry, ProviderChecklistUpdate};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 

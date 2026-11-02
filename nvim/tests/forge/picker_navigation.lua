@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 local original_columns, original_lines = vim.o.columns, vim.o.lines
 vim.o.columns, vim.o.lines = 110, 38
-require("forge").setup({ harness = { backend = "mock" } })
+require("forge").setup({ harness = { provider = "mock" } })
 
 local picker = require("forge.views.picker")
 local picker_state = require("forge.views.picker.state")
@@ -371,7 +371,7 @@ local function child_picker_return_preserves_configuration_location()
   local background = require("forge.integrations.background_settings")
   local original_request, original_configure, original_background = client.request, controller.configure, background.request
   local state = { session = {
-    id = "navigation-session", backend = "codex", model = "first", effort = "low", workspace = vim.fn.getcwd(),
+    id = "navigation-session", provider = "codex", model = "first", effort = "low", workspace = vim.fn.getcwd(),
   }, capability = { model_selection = true, effort_selection = true, native_compact = true, os_sandbox = true } }
   local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
   local pending_response, pending_background
@@ -447,7 +447,7 @@ local function child_picker_return_preserves_configuration_location()
     select_field("main-model")
     press("<CR>")
     press("<CR>")
-    state.session = { id = "new-session", backend = "codex", model = "first" }
+    state.session = { id = "new-session", provider = "codex", model = "first" }
     picker.open({ owner = "new-owner", page_list = { { id = "new", option_list = {} } } })
     pending_response()
     assert(picker.is_open("new-owner"), "old session callback replaced the new picker")

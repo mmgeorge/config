@@ -4,22 +4,22 @@ use std::sync::{Arc, Mutex, Weak};
 use anyhow::{Result, anyhow};
 use tokio::sync::Notify;
 
-use crate::backend::BackendEvent;
+use crate::provider::ProviderEvent;
 
 /// Retain provider session events while the foreground request owns the broker.
 #[derive(Default)]
 pub(crate) struct SessionEventInbox {
-    pending: Mutex<VecDeque<BackendEvent>>,
+    pending: Mutex<VecDeque<ProviderEvent>>,
     ready: Notify,
     watchdogs: Mutex<
-        HashMap<crate::backend::InvocationId, Weak<crate::backend::tool_timeout::ToolWatchdog>>,
+        HashMap<crate::provider::InvocationId, Weak<crate::provider::tool_timeout::ToolWatchdog>>,
     >,
     background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl SessionEventInbox {
     /// Queue a complete event before notifying either idle or active broker delivery.
-    pub(crate) fn push(&self, event: BackendEvent) -> Result<()> {
+    pub(crate) fn push(&self, event: ProviderEvent) -> Result<()> {
         if let Some(scope) = event.scope().invocation()
             && let Some(watchdog) = self
                 .watchdogs
@@ -41,8 +41,8 @@ impl SessionEventInbox {
     /// Route late command observations to the watchdog that owns their original invocation.
     pub(crate) fn watch_tools(
         &self,
-        scope: &crate::backend::InvocationScope,
-        watchdog: &Arc<crate::backend::tool_timeout::ToolWatchdog>,
+        scope: &crate::provider::InvocationScope,
+        watchdog: &Arc<crate::provider::tool_timeout::ToolWatchdog>,
     ) -> Result<()> {
         let mut watchdogs = self
             .watchdogs
@@ -56,9 +56,9 @@ impl SessionEventInbox {
     /// Keep a background shell's deadline active after its foreground response completes.
     pub(crate) fn monitor_background(
         self: &Arc<Self>,
-        scope: crate::backend::InvocationScope,
-        watchdog: Arc<crate::backend::tool_timeout::ToolWatchdog>,
-        backend: Arc<dyn crate::backend::Backend>,
+        scope: crate::provider::InvocationScope,
+        watchdog: Arc<crate::provider::tool_timeout::ToolWatchdog>,
+        provider: Arc<crate::provider::Provider>,
     ) -> Result<()> {
         if !watchdog.finish_foreground()? {
             return Ok(());
@@ -68,16 +68,16 @@ impl SessionEventInbox {
             let result: Result<()> = async {
                 if let Some(timeout) = watchdog.expired().await? {
                     if let Some(inbox) = inbox.upgrade() {
-                        inbox.push(BackendEvent::Diagnostic {
+                        inbox.push(ProviderEvent::Diagnostic {
                             scope: scope.clone().into(),
-                            diagnostic: crate::backend::ProviderDiagnostic {
+                            diagnostic: crate::provider::ProviderDiagnostic {
                                 code: Some("tool_timeout".into()),
                                 message: timeout.to_string(),
                                 fatal: true,
                             },
                         })?;
                     }
-                    backend.cancel_session(&scope.owner.runtime_key()).await?;
+                    provider.cancel_session(&scope.owner.runtime_key()).await?;
                 }
                 Ok(())
             }
@@ -85,9 +85,9 @@ impl SessionEventInbox {
             if let Err(error) = result
                 && let Some(inbox) = inbox.upgrade()
             {
-                let _ = inbox.push(BackendEvent::Diagnostic {
+                let _ = inbox.push(ProviderEvent::Diagnostic {
                     scope: scope.into(),
-                    diagnostic: crate::backend::ProviderDiagnostic {
+                    diagnostic: crate::provider::ProviderDiagnostic {
                         code: Some("tool_timeout_cleanup".into()),
                         message: format!("Tool timeout cleanup failed: {error:#}"),
                         fatal: true,
@@ -105,7 +105,7 @@ impl SessionEventInbox {
     }
 
     /// Take queued events in provider order without holding the lock during delivery.
-    pub(crate) fn drain(&self) -> Result<Vec<BackendEvent>> {
+    pub(crate) fn drain(&self) -> Result<Vec<ProviderEvent>> {
         Ok(self
             .pending
             .lock()
@@ -117,8 +117,8 @@ impl SessionEventInbox {
     /// Deliver queued invocation markers before already-arrived session completions.
     pub(crate) fn drain_after(
         &self,
-        invocation: &mut crate::backend::events::BackendEventStream,
-    ) -> Result<Vec<BackendEvent>> {
+        invocation: &mut crate::provider::events::ProviderEventStream,
+    ) -> Result<Vec<ProviderEvent>> {
         let mut event = Vec::new();
         while let Some(observation) = invocation.try_next()? {
             event.push(observation);
@@ -172,11 +172,11 @@ mod tests {
     #[tokio::test]
     async fn notification_retains_events_before_waiter_starts() -> Result<()> {
         let inbox = SessionEventInbox::default();
-        let event = BackendEvent::Tool {
-            address: crate::backend::ToolAddress {
-                turn: crate::backend::TurnAddress {
-                    scope: crate::backend::InvocationScope::new(
-                        crate::backend::ExecutionOwner::root("session"),
+        let event = ProviderEvent::Tool {
+            address: crate::provider::ToolAddress {
+                turn: crate::provider::TurnAddress {
+                    scope: crate::provider::InvocationScope::new(
+                        crate::provider::ExecutionOwner::root("session"),
                         "exchange",
                     ),
                     thread_id: "thread".into(),
@@ -184,7 +184,7 @@ mod tests {
                 },
                 tool_id: "background".into(),
             },
-            update: crate::backend::ToolUpdate::Backgrounded,
+            update: crate::provider::ToolUpdate::Backgrounded,
         };
         inbox.push(event)?;
         inbox.notified().await?;
@@ -197,43 +197,43 @@ mod tests {
     #[tokio::test]
     async fn immediate_background_completion_follows_queued_lifetime_marker() -> Result<()> {
         let inbox = SessionEventInbox::default();
-        let scope = crate::backend::InvocationScope::new(
-            crate::backend::ExecutionOwner::root("session"),
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root("session"),
             "exchange",
         );
-        let address = crate::backend::ToolAddress {
-            turn: crate::backend::TurnAddress {
+        let address = crate::provider::ToolAddress {
+            turn: crate::provider::TurnAddress {
                 scope: scope.clone(),
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
             },
             tool_id: "background".into(),
         };
-        let (sink, mut stream) = crate::backend::events::channel(scope);
-        inbox.push(BackendEvent::Tool {
+        let (sink, mut stream) = crate::provider::events::channel(scope);
+        inbox.push(ProviderEvent::Tool {
             address: address.clone(),
-            update: crate::backend::ToolUpdate::Finished {
-                outcome: crate::backend::ToolOutcome::Succeeded,
+            update: crate::provider::ToolUpdate::Finished {
+                outcome: crate::provider::ToolOutcome::Succeeded,
             },
         })?;
-        sink.send_wait(BackendEvent::Tool {
+        sink.send_wait(ProviderEvent::Tool {
             address,
-            update: crate::backend::ToolUpdate::Backgrounded,
+            update: crate::provider::ToolUpdate::Backgrounded,
         })
         .await?;
         let event = inbox.drain_after(&mut stream)?;
         assert_eq!(event.len(), 2);
         assert!(matches!(
             event[0],
-            BackendEvent::Tool {
-                update: crate::backend::ToolUpdate::Backgrounded,
+            ProviderEvent::Tool {
+                update: crate::provider::ToolUpdate::Backgrounded,
                 ..
             }
         ));
         assert!(matches!(
             event[1],
-            BackendEvent::Tool {
-                update: crate::backend::ToolUpdate::Finished { .. },
+            ProviderEvent::Tool {
+                update: crate::provider::ToolUpdate::Finished { .. },
                 ..
             }
         ));

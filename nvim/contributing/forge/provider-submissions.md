@@ -6,7 +6,9 @@ This reference explains what counts as acceptance for each provider, and how to 
 
 ## Journal states
 
-`backend/submission.rs` owns the journal in `provider-submissions.sqlite3` under the Harness data root, using WAL and FULL synchronous commits. It stays enabled when tracing is disabled. Root admission saves the complete typed input before acknowledging the composer, and live steering saves its input before entering the active-turn queue. Child and Background requests use the same journal with their own owner identity.
+`provider/submission.rs` owns the journal in `provider-submissions.sqlite3` under the Harness data root, using WAL and FULL synchronous commits. It stays enabled when tracing is disabled. Root admission saves the complete typed input before acknowledging the composer, and live steering saves its input before entering the active-turn queue. Child and Background requests use the same journal with their own owner identity.
+
+Live steering waits for the native lane to accept or reject the input. The broker does not impose a separate admission deadline: abandoning a command still queued in that lane can strand later inputs or schedule a duplicate continuation. Cancelling the owning turn still interrupts delivery.
 
 | State | Meaning |
 | --- | --- |
@@ -56,7 +58,7 @@ Failure to reconcile blocks dispatch and reports the last error, keeping both th
 
 ## Add a provider
 
-Persist the correlation target before the first possible write, and acknowledge only a successful native response. Implement `Backend::reconcile_submission` with read-only, fully paginated history. Return a receipt only for a positively identified input, and `None` when acceptance cannot be proved. Never turn a timeout, an empty history page, or a message substring into a rejection.
+Persist the correlation target before the first possible write, and acknowledge only a successful native response. Implement `Provider::reconcile_submission` with read-only, fully paginated history. Return a receipt only for a positively identified input, and `None` when acceptance cannot be proved. Never turn a timeout, an empty history page, or a message substring into a rejection.
 
 Test the write-before-acknowledge crash, acknowledgment commit failure, expired history, cancellation, attachments, and later queued input before enabling recovery.
 

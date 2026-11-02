@@ -1,6 +1,6 @@
 use super::{ControlToolInvocation, apply_invocation};
-use crate::backend::{BackendCompletion, PromptMode};
 use crate::plan::{PlanDocument, PlanState};
+use crate::provider::{PromptMode, ProviderCompletion};
 use crate::tools::ToolResult as Result;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -56,7 +56,7 @@ impl std::fmt::Debug for ControlTurnContext {
 }
 
 impl ControlTurnContext {
-    /// Build an inert context for backend calls without broker state.
+    /// Build an inert context for provider calls without broker state.
     pub fn inactive(mode: PromptMode) -> Self {
         Self {
             questions: None,
@@ -86,7 +86,7 @@ impl ControlTurnContext {
     }
 }
 
-/// Owns provider-visible control validation for one bounded backend turn.
+/// Owns provider-visible control validation for one bounded provider turn.
 pub struct ControlToolRuntime {
     pub(super) context: ControlTurnContext,
     pub(super) plan_document: Option<PlanDocument>,
@@ -155,9 +155,10 @@ impl ControlToolRuntime {
         }
         if super::questions::is_tool(&invocation.name) && self.context.questions.is_some() {
             super::validate_arguments(&invocation)?;
-            return super::questions::execute(self, invocation, BackendCompletion::default()).await;
+            return super::questions::execute(self, invocation, ProviderCompletion::default())
+                .await;
         }
-        let mut output = BackendCompletion::default();
+        let mut output = ProviderCompletion::default();
         apply_invocation(&invocation, &mut output)?;
         self.invoke_decoded(invocation, output).await
     }
@@ -166,7 +167,7 @@ impl ControlToolRuntime {
     pub(crate) async fn invoke_decoded(
         &mut self,
         mut invocation: ControlToolInvocation,
-        output: BackendCompletion,
+        output: ProviderCompletion,
     ) -> Result<ControlToolResult> {
         invocation.admit_turn_control(
             self.context.task_controller.as_deref(),
@@ -391,7 +392,7 @@ mod test {
             .unwrap();
         let serialized = serde_json::to_value(&accepted).unwrap();
         assert!(serialized.get("task_permit").is_none());
-        let mut output = BackendCompletion::default();
+        let mut output = ProviderCompletion::default();
         apply_invocation(&accepted, &mut output).unwrap();
         let permit = output.goal_control.unwrap().permit;
         permit.validate(Some(&goal)).unwrap();
@@ -417,7 +418,7 @@ mod test {
                     exchange_ordinal: 1,
                     turn_ordinal: 1,
                 },
-                output.evidence,
+                output.native.evidence,
                 5,
             )
             .unwrap_err();
@@ -477,7 +478,7 @@ mod test {
             staged.design.as_ref().unwrap().document.checks,
             vec!["manual"]
         );
-        let mut output = BackendCompletion::default();
+        let mut output = ProviderCompletion::default();
         apply_invocation(&accepted.invocation.unwrap(), &mut output).unwrap();
         assert_eq!(
             initial
@@ -506,7 +507,7 @@ mod test {
                 .is_empty()
         );
         assert_eq!(after_clear.version, staged.version + 1);
-        let mut replay = BackendCompletion::default();
+        let mut replay = ProviderCompletion::default();
         apply_invocation(&cleared.invocation.unwrap(), &mut replay).unwrap();
         assert_eq!(
             staged
@@ -558,7 +559,7 @@ mod test {
         assert_eq!(runtime.plan_document(), Some(&initial));
         runtime.invoke(read).await.unwrap();
         let accepted = runtime.invoke(edit).await.unwrap().invocation.unwrap();
-        let mut output = BackendCompletion::default();
+        let mut output = ProviderCompletion::default();
         apply_invocation(&accepted, &mut output).unwrap();
         let request = output.design_patch.pop().unwrap();
         let crate::plan::DesignEditRequest::File(file) = &request else {
@@ -617,7 +618,7 @@ mod test {
         );
         assert_eq!(saved_design.document.checks, ["manual"]);
         assert_eq!(saved_design.document.disabled_checks, ["optional"]);
-        let mut replay = BackendCompletion::default();
+        let mut replay = ProviderCompletion::default();
         apply_invocation(&edited.invocation.unwrap(), &mut replay).unwrap();
         assert_eq!(
             original
@@ -874,7 +875,7 @@ mod test {
         let initial = context.plan_document.clone().unwrap();
         let workspace = context.workspace_root.clone().unwrap();
         let mut runtime = ControlToolRuntime::new(context);
-        let mut output = BackendCompletion::default();
+        let mut output = ProviderCompletion::default();
         let submit = |version| ControlToolInvocation {
             task_permit: None,
             name: "plan_submit".into(),

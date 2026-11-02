@@ -45,8 +45,8 @@
 ---   open_review(pr, opts)       Batched review mode for a PR.
 ---   get(cb, ctx)                Async-collect git status items, then `cb(items)`
 ---                               (a Trouble/quickfix-style source entry point).
----   set_git_backend(b) /        Inject / restore the git command backend — the
----     reset_git_backend()       seam the headless test suite drives.
+---   set_git_provider(b) /        Inject / restore the git command provider — the
+---     reset_git_provider()       seam the headless test suite drives.
 ---
 --- ===========================================================================
 --- CONFIGURATION & KEYBINDINGS  (lazy.nvim)
@@ -133,7 +133,7 @@
 --- every layer imports it without a cycle.
 ---
 --- init.lua is therefore a thin **public-API facade**: the `open*`/`setup`/`get`
---- entry points (a passthrough to views/commands and git/git_backend) plus the
+--- entry points (a passthrough to views/commands and git/git_provider) plus the
 --- one deliberate `require("forge")` seam left in the tree — the
 --- gitstatus-debug dev/test flags below, which views/status/status_debug.lua
 --- reads and the test suite overrides.
@@ -150,7 +150,7 @@ require("forge.query_runtime")
 local config = require("forge.infra.config")
 local highlights = require("forge.infra.highlights")
 local commands = require("forge.views.commands")
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 local perf = require("forge.infra.perf")
 
 highlights.setup()
@@ -238,7 +238,7 @@ end
 ---@param cb fun(items: table[]) Callback invoked with collected status items.
 ---@param _ctx table? Optional collection context.
 function M.get(cb, _ctx)
-  git_backend.git_root_async(function(cwd)
+  git_provider.git_root_async(function(cwd)
     if not cwd then
       cb({})
       return
@@ -258,8 +258,8 @@ M.open_compact_preview = commands.open_compact_preview
 M.open_harness = function() require("forge.views.harness").open() end
 M.open_background_timeline = function(session_id) require("forge.views.background").open(session_id) end
 M.new_harness_session = function() require("forge.views.harness").new_session() end
-M.set_git_backend = git_backend.set_backend
-M.reset_git_backend = git_backend.reset_backend
+M.set_git_provider = git_provider.set_provider
+M.reset_git_provider = git_provider.reset_provider
 
 --- Resolves the filesystem path for the ForgeStatus debug log.
 --- Creates parent directories in `stdpath("state")` if they do not exist.

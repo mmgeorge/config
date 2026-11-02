@@ -8,7 +8,7 @@ local repository = vim.fn.tempname()
 assert(vim.fn.mkdir(repository, "p") == 1)
 
 local original_execute = git_write.execute
-local original_backend = ai_commit._backend
+local original_provider = ai_commit._provider
 local background_settings = require("forge.integrations.background_settings")
 local original_settings_request = background_settings.request
 background_settings.request = function(_, _, callback)
@@ -30,8 +30,8 @@ end
 
 local function run()
   local request_list, receipt_list = {}, {}
-  ai_commit.reset_backend()
-  ai_commit.set_backend({ request_async = function(params, callback)
+  ai_commit.reset_provider()
+  ai_commit.set_provider({ request_async = function(params, callback)
     request_list[#request_list + 1] = { params = params, callback = callback }
   end })
 
@@ -111,8 +111,8 @@ end
 
 local ok, failure = xpcall(run, debug.traceback)
 git_write.execute = original_execute
-ai_commit.reset_backend()
-ai_commit.set_backend(original_backend)
+ai_commit.reset_provider()
+ai_commit.set_provider(original_provider)
 background_settings.request = original_settings_request
 if commit._active then commit._active.aborted = true end
 vim.fn.delete(repository, "rf")

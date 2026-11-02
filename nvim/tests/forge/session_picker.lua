@@ -77,7 +77,7 @@ local function snapshot(entry)
 end
 
 local ok, failure = pcall(function()
-  forge.setup({ walkthrough_inventory = "sem", harness = { backend = "mock" } })
+  forge.setup({ walkthrough_inventory = "sem", harness = { provider = "mock" } })
   local state = session.harness
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win = layout.open()
   layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
@@ -87,10 +87,10 @@ local ok, failure = pcall(function()
   local now = 1700000000
   datetime.now_override = function() return now end
   local entry_list = {
-    { id = "active", name = "Architecture review", workspace = workspace, backend = "mock", approval_mode = "ask", created_at_ms = (now - 2 * 86400) * 1000 },
-    { id = "beta", name = "Beta cleanup", workspace = workspace, backend = "mock", approval_mode = "ask", created_at_ms = (now - 2 * 3600) * 1000 },
-    { id = "gamma", name = "Gamma migration", workspace = workspace, backend = "mock", approval_mode = "ask" },
-    { id = "remote", name = "Remote review", workspace = workspace .. "-other", backend = "mock", approval_mode = "ask" },
+    { id = "active", name = "Architecture review", workspace = workspace, provider = "mock", approval_mode = "ask", created_at_ms = (now - 2 * 86400) * 1000 },
+    { id = "beta", name = "Beta cleanup", workspace = workspace, provider = "mock", approval_mode = "ask", created_at_ms = (now - 2 * 3600) * 1000 },
+    { id = "gamma", name = "Gamma migration", workspace = workspace, provider = "mock", approval_mode = "ask" },
+    { id = "remote", name = "Remote review", workspace = workspace .. "-other", provider = "mock", approval_mode = "ask" },
   }
   state.session = entry_list[1]
   state.interaction = {}

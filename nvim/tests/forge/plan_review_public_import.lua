@@ -36,7 +36,7 @@ client.request = function(request_specification, callback)
 end
 
 local success, failure = xpcall(function()
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   session.session = { id = "public-import" }
   session.transcript_win = vim.api.nvim_get_current_win()
 

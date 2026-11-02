@@ -1,6 +1,6 @@
 use super::checks::is_tool as is_check_tool;
 use super::schema::plan_edit_input_schema;
-use crate::backend::BackendCompletion;
+use crate::provider::ProviderCompletion;
 use serde_json::{Value, json};
 
 #[test]
@@ -53,7 +53,7 @@ fn every_tool_has_one_family_and_valid_schema() {
 
 #[tokio::test]
 async fn every_tool_validates_routes_and_returns_a_controlled_result() {
-    use crate::backend::PromptMode;
+    use crate::provider::PromptMode;
     for tool in ControlToolRegistry.definition_list() {
         let question = json!({"header":"Choice","question":"Which behavior?","options":[]});
         let arguments = match tool.name {
@@ -148,7 +148,7 @@ async fn every_tool_validates_routes_and_returns_a_controlled_result() {
 
 #[tokio::test]
 async fn wrong_plan_id_returns_a_typed_tool_error_and_allows_retry() {
-    let mut context = ControlTurnContext::inactive(crate::backend::PromptMode::Plan);
+    let mut context = ControlTurnContext::inactive(crate::provider::PromptMode::Plan);
     let mut document = crate::plan::test_fixture("active", "Plan");
     document.design = Some(crate::plan::DeclarationDesign::default());
     context.plan_state = Some(crate::plan::PlanState::Generating);
@@ -389,7 +389,7 @@ fn checks_catalog_matches_runtime_requests_and_root_ownership() {
                 name: name.into(),
                 arguments: arguments.clone(),
             },
-            &mut BackendCompletion::default(),
+            &mut ProviderCompletion::default(),
         )
         .unwrap();
         let mut invalid = arguments;
@@ -403,8 +403,8 @@ fn checks_catalog_matches_runtime_requests_and_root_ownership() {
             .is_err()
         );
     }
-    let root = crate::backend::ExecutionOwner::root("session");
-    let child = crate::backend::ExecutionOwner {
+    let root = crate::provider::ExecutionOwner::root("session");
+    let child = crate::provider::ExecutionOwner {
         session_id: "session".into(),
         agent_id: "child".into(),
     };
@@ -422,7 +422,7 @@ fn checks_catalog_matches_runtime_requests_and_root_ownership() {
             .iter()
             .any(|tool| is_check_tool(tool.name))
     );
-    let context = ControlTurnContext::inactive(crate::backend::PromptMode::Chat);
+    let context = ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
     assert!(
         !ControlToolRegistry
             .definition_list_for_context(Some(&context), true)
@@ -456,12 +456,12 @@ fn plan_tools_separate_files_and_overview() {
         name: "plan_file_edit".into(),
         arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}),
     };
-    let mut output = BackendCompletion::default();
+    let mut output = ProviderCompletion::default();
     apply_invocation(&invocation, &mut output).unwrap();
     assert_eq!(output.design_patch.len(), 1);
     let mut invalid = invocation;
     invalid.arguments["baseline"] = json!({});
-    assert!(apply_invocation(&invalid, &mut BackendCompletion::default()).is_err());
+    assert!(apply_invocation(&invalid, &mut ProviderCompletion::default()).is_err());
 }
 
 #[test]
@@ -822,7 +822,7 @@ fn decodes_the_advertised_plan_edit_shape() {
             }
         }),
     };
-    let mut output = BackendCompletion::default();
+    let mut output = ProviderCompletion::default();
 
     apply_invocation(&invocation, &mut output).unwrap();
 
@@ -899,7 +899,7 @@ fn rejects_internal_identity_fields_from_model_edits() {
         }),
     };
 
-    let error = apply_invocation(&invocation, &mut BackendCompletion::default())
+    let error = apply_invocation(&invocation, &mut ProviderCompletion::default())
         .unwrap_err()
         .to_string();
 
@@ -930,7 +930,7 @@ fn rejects_harness_resolved_dependency_versions_from_model_edits() {
         }),
     };
 
-    let error = apply_invocation(&invocation, &mut BackendCompletion::default())
+    let error = apply_invocation(&invocation, &mut ProviderCompletion::default())
         .unwrap_err()
         .to_string();
 
@@ -969,7 +969,7 @@ fn reports_the_exact_nested_json_path_for_invalid_arguments() {
     };
     let error = format!(
         "{:#}",
-        apply_invocation(&invocation, &mut BackendCompletion::default()).unwrap_err()
+        apply_invocation(&invocation, &mut ProviderCompletion::default()).unwrap_err()
     );
 
     assert!(
@@ -995,7 +995,7 @@ fn reports_every_independent_structural_violation_in_one_response() {
     };
     let error = format!(
         "{:#}",
-        apply_invocation(&invocation, &mut BackendCompletion::default()).unwrap_err()
+        apply_invocation(&invocation, &mut ProviderCompletion::default()).unwrap_err()
     );
 
     assert!(
@@ -1039,7 +1039,7 @@ fn rejects_member_properties_from_enum_variants_before_plan_mutation() {
 
     let error = format!(
         "{:#}",
-        apply_invocation(&invocation, &mut BackendCompletion::default()).unwrap_err()
+        apply_invocation(&invocation, &mut ProviderCompletion::default()).unwrap_err()
     );
 
     assert!(error.contains("entity_changes.add[0].variants[0]"));

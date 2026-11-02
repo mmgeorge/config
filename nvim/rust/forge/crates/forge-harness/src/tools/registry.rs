@@ -1,26 +1,11 @@
 use super::agents::is_tool as is_agent_tool;
 use super::checks::is_tool as is_check_tool;
 use super::{ControlTurnContext, lsp, session};
-use serde::Serialize;
 use serde_json::Value;
 
-/// Defines one Harness control tool independently from any provider transport.
-#[derive(Clone, Debug, Serialize)]
-pub struct ControlToolDefinition {
-    pub name: &'static str,
-    pub description: &'static str,
-    #[serde(rename = "inputSchema")]
-    pub input_schema: Value,
-}
+pub use forge_provider_api::control::ControlToolDefinition;
 
-impl ControlToolDefinition {
-    /// Convert the provider-neutral definition into the MCP tool-list shape.
-    pub fn mcp_value(&self) -> Value {
-        serde_json::to_value(self).expect("tool definitions must serialize as JSON")
-    }
-}
-
-/// Owns the canonical Harness control-tool catalog for every backend adapter.
+/// Owns the canonical Harness control-tool catalog for every provider adapter.
 #[derive(Clone, Debug, Default)]
 pub struct ControlToolRegistry;
 
@@ -66,7 +51,7 @@ impl ControlToolRegistry {
         context: Option<&ControlTurnContext>,
         root: bool,
     ) -> Vec<ControlToolDefinition> {
-        if context.is_some_and(|context| context.mode == crate::backend::PromptMode::Background) {
+        if context.is_some_and(|context| context.mode == crate::provider::PromptMode::Background) {
             return Vec::new();
         }
         let phase =
@@ -74,12 +59,12 @@ impl ControlToolRegistry {
         self.definition_list()
             .into_iter()
             .filter(|definition| {
-                if context
-                    .is_some_and(|context| context.mode == crate::backend::PromptMode::PlanQuestion)
-                    && !(definition.name.starts_with("repository_")
-                        || lsp::is_tool(definition.name)
-                        || session::is_tool(definition.name)
-                        || definition.name == super::config::NAME)
+                if context.is_some_and(|context| {
+                    context.mode == crate::provider::PromptMode::PlanQuestion
+                }) && !(definition.name.starts_with("repository_")
+                    || lsp::is_tool(definition.name)
+                    || session::is_tool(definition.name)
+                    || definition.name == super::config::NAME)
                 {
                     return false;
                 }
@@ -129,7 +114,7 @@ impl ControlToolRegistry {
     /// Advertise optional root tools before an ACP transport admits its first turn.
     pub fn definition_list_for_owner(
         &self,
-        owner: &crate::backend::ExecutionOwner,
+        owner: &crate::provider::ExecutionOwner,
         agent_tools: bool,
         lsp_tools: bool,
     ) -> Vec<ControlToolDefinition> {

@@ -1,6 +1,6 @@
 vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 vim.o.columns, vim.o.lines = 130, 50
-require("forge").setup({ harness = { backend = "mock" } })
+require("forge").setup({ harness = { provider = "mock" } })
 local client = require("forge.client")
 local store = require("forge.integrations.background_settings")
 local settings = require("forge.views.harness.settings")
@@ -30,7 +30,7 @@ client.request = function(request_specification, callback)
   })
   else error("Commit settings used a conversation mutation: " .. method) end
 end
-local state = { session = { id = "background-config", backend = "codex", model = "chat-model", effort = "high", service_tier = "default" },
+local state = { session = { id = "background-config", provider = "codex", model = "chat-model", effort = "high", service_tier = "default" },
   capability = { os_sandbox = true, fast_mode = true, ultrafast_mode = true } }
 local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
 local function open()

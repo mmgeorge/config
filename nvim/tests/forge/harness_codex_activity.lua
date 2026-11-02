@@ -71,7 +71,7 @@ local function transcript()
 end
 local succeeded, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ harness = { config_dir = data, backend = "codex" } })
+  require("forge").setup({ harness = { config_dir = data, provider = "codex" } })
   require("forge.views.harness").open()
   assert(vim.wait(15000, function()
     return (state.session and state.ready and state.presentation and state.presentation.ready) or #errors > 0

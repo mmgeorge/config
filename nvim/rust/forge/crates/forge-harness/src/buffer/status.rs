@@ -506,7 +506,7 @@ mod retry_tests {
 
     #[test]
     fn retry_status_counts_down_then_keeps_attempt_visible() {
-        let mut retry = crate::backend::retry::ProviderRetry {
+        let mut retry = crate::provider::retry::ProviderRetry {
             attempt: 2,
             max_attempts: 5,
             retry_at_ms: Some(6000),

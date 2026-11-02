@@ -7,7 +7,7 @@ local function assert_equals(actual, expected)
 end
 
 local ok, failure = pcall(function()
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   local renderer = require("forge.render.harness.interaction_tree")
   local exchange = {
     id = "metrics", kind = "chat", state = "complete", prompt = "Work",

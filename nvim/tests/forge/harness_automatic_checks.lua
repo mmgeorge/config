@@ -31,7 +31,7 @@ local function request(method, params)
 end
 local succeeded, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "session-blocking" }, selectable = true } } } })
+  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "session-blocking" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timeout")
   request("session.configure", { shell = "nushell", automatic_checks = true })

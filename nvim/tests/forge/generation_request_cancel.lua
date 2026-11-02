@@ -2,7 +2,7 @@ vim.loader.enable(false)
 local client = require("forge.client")
 local builder = require("forge.builder")
 local config = require("forge.infra.config")
-config.setup({ harness = { backend = "mock" } })
+config.setup({ harness = { provider = "mock" } })
 builder.ensure = function(callback) callback({ ok = true, path = "generation-cancellation-fixture" }) end
 local requests, respond = {}, nil
 client._host_reset_for_test()

@@ -35,7 +35,7 @@ local function submit(text)
 end
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ diff_logging = false, harness_logging = false, harness = { backend = "mock" } })
+  require("forge").setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
   require("forge.views.harness").open()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
   submit("/plan build the feature")

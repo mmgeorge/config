@@ -34,7 +34,7 @@ local function thought_with_tool(tool_list)
 end
 
 local ok, failure = pcall(function()
-  forge.setup({ walkthrough_inventory = "sem", harness = { backend = "mock" } })
+  forge.setup({ walkthrough_inventory = "sem", harness = { provider = "mock" } })
   local origin_win = vim.api.nvim_get_current_win()
   local picker = require("forge.views.picker")
   local picker_state = require("forge.views.picker.state")

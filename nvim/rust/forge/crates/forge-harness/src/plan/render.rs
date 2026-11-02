@@ -2217,9 +2217,9 @@ mod test {
             action: EntityChangeAction::Modify,
             kind: EntityKind::Trait,
             renamed_from: None,
-            name: "Backend".into(),
+            name: "Provider".into(),
             description: "Defines execution behavior.".into(),
-            path: "src/backend.rs".into(),
+            path: "src/provider.rs".into(),
             members: vec![ProgramEntityMemberChange {
                 action: ChangeAction::Modify,
                 renamed_from: None,
@@ -2239,7 +2239,7 @@ mod test {
             action: EntityChangeAction::Add,
             kind: EntityKind::Struct,
             renamed_from: None,
-            name: "CodexBackend".into(),
+            name: "CodexProvider".into(),
             description: "Runs requests through Codex.".into(),
             path: "src/codex.rs".into(),
             members: vec![
@@ -2293,14 +2293,17 @@ mod test {
         let declaration_line = rendered
             .markdown
             .lines()
-            .find(|line| line.starts_with("*trait Backend"))
+            .find(|line| line.starts_with("*trait Provider"))
             .expect("paired declarations");
-        let backend_path_column = declaration_line.find("[src/backend.rs]").unwrap();
+        let provider_path_column = declaration_line.find("[src/provider.rs]").unwrap();
         let codex_path_column = declaration_line.find("[src/codex.rs]").unwrap();
-        assert_eq!(backend_path_column, 26);
+        assert_eq!(
+            provider_path_column,
+            DIAGRAM_CONCRETE_COLUMN - "[src/provider.rs]".len()
+        );
         assert_eq!(
             codex_path_column,
-            DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX + 3
+            DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX + 4
         );
         assert!(rendered.markdown.contains("+ run(): Result"));
         assert!(rendered.markdown.contains("- client: Client"));
@@ -2315,7 +2318,7 @@ mod test {
             child_line.find("[src/codex.rs]"),
             Some(DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX)
         );
-        assert!(!rendered.markdown.contains("\n  [src/backend.rs]"));
+        assert!(!rendered.markdown.contains("\n  [src/provider.rs]"));
         assert!(!rendered.markdown.contains("\n  [src/codex.rs]"));
     }
 

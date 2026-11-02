@@ -3,49 +3,11 @@ use super::document::{
     CATEGORY_BASH, CATEGORY_EDIT, CATEGORY_ELEVATE, CATEGORY_MCP, CATEGORY_READ, CATEGORY_TOOL,
     CATEGORY_WEBFETCH, PermissionDecision, PermissionDocument,
 };
-use super::shell::{CommandAnalysisFailure, CommandShell};
-use serde::{Deserialize, Serialize};
+use super::shell::CommandShell;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PermissionTarget {
-    Command {
-        command: String,
-        #[serde(default)]
-        shell: Option<CommandShell>,
-    },
-    Read {
-        path: String,
-    },
-    Write {
-        path: String,
-    },
-    UnknownFile {
-        operation: super::directory::DirectoryOperation,
-    },
-    Network {
-        target: String,
-    },
-    Mcp {
-        target: String,
-    },
-    Elevate {
-        target: String,
-    },
-    Tool {
-        target: String,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PermissionRequest {
-    pub id: String,
-    pub provider: String,
-    pub reason: Option<String>,
-    pub target_list: Vec<PermissionTarget>,
-}
+pub use forge_provider_api::permissions::{PermissionRequest, PermissionTarget};
 
 /// Stores a validated permission document compiled for one workspace.
 #[derive(Clone, Debug)]
@@ -64,43 +26,7 @@ pub struct PermissionEvaluation {
     pub pending_command_list: Vec<PendingCommand>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Rejects command execution when Harness cannot determine every shell invocation.
-pub struct CommandAnalysisError {
-    /// Shell selected at the provider or nested-launcher boundary.
-    pub(crate) shell: CommandShell,
-    /// Cause that prevents authorization of any partial result.
-    pub(crate) failure: CommandAnalysisFailure,
-}
-
-impl std::fmt::Display for CommandAnalysisError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.failure {
-            CommandAnalysisFailure::MalformedTransport => write!(
-                formatter,
-                "shell_command_parse_error: Harness could not decode the {:?} command transport. No command was executed.",
-                self.shell
-            ),
-            CommandAnalysisFailure::Syntax => write!(
-                formatter,
-                "shell_command_parse_error: Harness could not parse the {:?} command syntax. Simplify it or split independent operations into separate tool calls, keeping pipelines intact. No command was executed.",
-                self.shell
-            ),
-            CommandAnalysisFailure::Unsupported(construct) => write!(
-                formatter,
-                "shell_command_unsupported: Harness does not support {construct} in {:?} command analysis. Rewrite the unsupported construct while keeping pipelines intact. No command was executed.",
-                self.shell
-            ),
-            CommandAnalysisFailure::Incomplete(reason) => write!(
-                formatter,
-                "shell_command_analysis_failed: Harness could not finish {:?} command analysis: {reason}. No command was executed.",
-                self.shell
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CommandAnalysisError {}
+pub use forge_provider_api::permissions::CommandAnalysisError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Binds one unapproved executable occurrence to its complete original source.

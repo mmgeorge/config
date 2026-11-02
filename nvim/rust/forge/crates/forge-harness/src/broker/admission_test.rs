@@ -49,7 +49,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             fail: outcome == "fail",
         });
         let tool_ran = Arc::new(AtomicBool::new(false));
-        broker.backend = Arc::new(CheckpointBackend {
+        broker.provider = Arc::new(CheckpointProvider {
             preparation: Some(preparation.clone()),
             started: Arc::new(Notify::new()),
             tool_ran: tool_ran.clone(),

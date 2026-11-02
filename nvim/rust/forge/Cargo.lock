@@ -960,7 +960,6 @@ dependencies = [
 name = "forge-harness"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
@@ -970,6 +969,9 @@ dependencies = [
  "forge-diff",
  "forge-git",
  "forge-protocol",
+ "forge-provider-api",
+ "forge-providers",
+ "forge-shell",
  "futures-util",
  "github-copilot-sdk",
  "hex",
@@ -1001,9 +1003,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-powershell",
- "tree-sitter-zsh",
  "uuid",
  "windows",
  "zip",
@@ -1016,6 +1015,52 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "forge-provider-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "forge-protocol",
+ "forge-shell",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "forge-providers"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "forge-diff",
+ "forge-protocol",
+ "forge-provider-api",
+ "forge-shell",
+ "futures-util",
+ "github-copilot-sdk",
+ "hex",
+ "process-wrap",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "shlex",
+ "similar",
+ "strip-ansi-escapes",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tokio-util",
+ "uuid",
+ "windows",
 ]
 
 [[package]]
@@ -1032,6 +1077,24 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "forge-shell"
+version = "0.1.0"
+dependencies = [
+ "process-wrap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-nu",
+ "tree-sitter-powershell",
+ "tree-sitter-zsh",
+ "windows",
 ]
 
 [[package]]

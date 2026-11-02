@@ -4,13 +4,13 @@ enum ChildBackgroundCompletion {
     Natural,
 }
 
-struct ChildBackgroundBackend {
+struct ChildBackgroundProvider {
     completion: ChildBackgroundCompletion,
-    observer: std::sync::Mutex<Option<BackendEventSink>>,
-    final_event: std::sync::Mutex<Vec<BackendEvent>>,
+    observer: std::sync::Mutex<Option<ProviderEventSink>>,
+    final_event: std::sync::Mutex<Vec<ProviderEvent>>,
 }
 
-impl ChildBackgroundBackend {
+impl ChildBackgroundProvider {
     /// Publish the retained native tool address through the session observation channel.
     async fn publish_final(&self) -> Result<()> {
         let events = std::mem::take(&mut *self.final_event.lock().unwrap());
@@ -33,13 +33,14 @@ impl ChildBackgroundBackend {
 }
 
 #[async_trait::async_trait]
-impl Backend for ChildBackgroundBackend {
+impl crate::provider::ProviderAdapter for ChildBackgroundProvider {
+    type Host = crate::provider::HarnessProviderHost;
     /// Select the registered test provider without starting an external process.
-    fn descriptor(&self) -> crate::backend::BackendDescriptor {
-        crate::backend::BackendDescriptor {
-            kind: crate::backend::BackendKind::Mock,
+    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+        crate::provider::ProviderDescriptor {
+            kind: crate::provider::ProviderKind::Mock,
             label: "child background fixture".into(),
-            capability: crate::backend::mock_capability(),
+            capability: crate::provider::mock_capability(),
         }
     }
 
@@ -73,10 +74,10 @@ impl Backend for ChildBackgroundBackend {
     /// Bind session observations to the actual admitted managed child owner.
     async fn session_event_stream(
         &self,
-        owner: crate::backend::ExecutionOwner,
-    ) -> Result<Option<crate::backend::events::BackendEventStream>> {
+        owner: crate::provider::ExecutionOwner,
+    ) -> Result<Option<crate::provider::events::ProviderEventStream>> {
         let (sink, stream) =
-            crate::backend::events::channel(crate::backend::EventScope::SessionOperation {
+            crate::provider::events::channel(crate::provider::EventScope::SessionOperation {
                 owner,
                 operation_id: "child-background-observer".into(),
             });
@@ -87,67 +88,67 @@ impl Backend for ChildBackgroundBackend {
     /// Admit a real background tool with partial output, then finish only its foreground turn.
     async fn prompt_stream(
         &self,
-        _: BackendRequest,
-        sink: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+        _: ProviderRequest,
+        sink: ProviderEventSink,
+    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
         let result: Result<_> = async {
             // Capture the original invocation before either event stream publishes completion.
             let scope = sink.invocation_scope()?.clone();
-            let turn = crate::backend::test_support::address(
+            let turn = crate::provider::test_support::address(
                 &scope,
                 "child-background-thread",
                 "original-turn",
             );
-            let address = crate::backend::ToolAddress {
+            let address = crate::provider::ToolAddress {
                 turn: turn.clone(),
                 tool_id: "original-background-tool".into(),
             };
             let outcome = match self.completion {
-                ChildBackgroundCompletion::Shutdown => crate::backend::ToolOutcome::Interrupted,
-                ChildBackgroundCompletion::Natural => crate::backend::ToolOutcome::Succeeded,
+                ChildBackgroundCompletion::Shutdown => crate::provider::ToolOutcome::Interrupted,
+                ChildBackgroundCompletion::Natural => crate::provider::ToolOutcome::Succeeded,
             };
             *self.final_event.lock().unwrap() = vec![
-                BackendEvent::Tool {
+                ProviderEvent::Tool {
                     address: address.clone(),
-                    update: crate::backend::ToolUpdate::Output {
-                        update: crate::backend::TextUpdate::Append("shutdown-tail\n".into()),
+                    update: crate::provider::ToolUpdate::Output {
+                        update: crate::provider::TextUpdate::Append("shutdown-tail\n".into()),
                     },
                 },
-                BackendEvent::Tool {
+                ProviderEvent::Tool {
                     address: address.clone(),
-                    update: crate::backend::ToolUpdate::Finished { outcome },
+                    update: crate::provider::ToolUpdate::Finished { outcome },
                 },
             ];
             // Admit foreground ownership before handing the tool to background observation.
-            sink.send_wait(BackendEvent::Turn {
+            sink.send_wait(ProviderEvent::Turn {
                 address: turn.clone(),
-                update: crate::backend::TurnUpdate::Started { started_at_ms: 1 },
+                update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
             })
             .await?;
             for update in [
-                crate::backend::ToolUpdate::Requested {
-                    invocation: crate::backend::ToolInvocation {
-                        kind: crate::backend::ToolActivityKind::Command,
+                crate::provider::ToolUpdate::Requested {
+                    invocation: crate::provider::ToolInvocation {
+                        kind: crate::provider::ToolActivityKind::Command,
                         name: "background-command".into(),
                         title: "Original child background command".into(),
                         arguments: json!({"command":"fixture"}),
                     },
                 },
-                crate::backend::ToolUpdate::Started,
-                crate::backend::ToolUpdate::Output {
-                    update: crate::backend::TextUpdate::Append("initial-output\n".into()),
+                crate::provider::ToolUpdate::Started,
+                crate::provider::ToolUpdate::Output {
+                    update: crate::provider::TextUpdate::Append("initial-output\n".into()),
                 },
-                crate::backend::ToolUpdate::Backgrounded,
+                crate::provider::ToolUpdate::Backgrounded,
             ] {
-                sink.send_wait(BackendEvent::Tool {
+                sink.send_wait(ProviderEvent::Tool {
                     address: address.clone(),
                     update,
                 })
                 .await?;
             }
-            sink.send_wait(BackendEvent::Turn {
+            sink.send_wait(ProviderEvent::Turn {
                 address: turn,
-                update: crate::backend::TurnUpdate::Finished {
+                update: crate::provider::TurnUpdate::Finished {
                     outcome: crate::turn::TurnOutcome::Completed,
                     completed_at_ms: 2,
                 },
@@ -156,14 +157,14 @@ impl Backend for ChildBackgroundBackend {
             if matches!(self.completion, ChildBackgroundCompletion::Natural) {
                 self.publish_final().await?;
             }
-            Ok(crate::backend::BackendCompletion {
-                backend_session_id: Some("child-background-thread".into()),
-                capability: self.descriptor().capability,
+            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {
+                provider_session_id: Some("child-background-thread".into()),
+                capability: self.descriptor().capability, ..Default::default() },
                 ..Default::default()
             })
         }
         .await;
-        result.map_err(crate::backend::BackendError::from)
+        result.map_err(crate::provider::ProviderError::from)
     }
 }
 
@@ -184,13 +185,13 @@ async fn managed_child_natural_background_completion_preserves_original_tool() -
 async fn assert_managed_child_background_completion(
     completion: ChildBackgroundCompletion,
 ) -> Result<()> {
-    // Admit the child through the production coordinator and backend factory.
+    // Admit the child through the production coordinator and provider factory.
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     broker
-        .agent_backend_factory
-        .register(Arc::new(ChildBackgroundBackend {
+        .agent_provider_factory
+        .register(Arc::new(ChildBackgroundProvider {
             completion,
             observer: Default::default(),
             final_event: Default::default(),

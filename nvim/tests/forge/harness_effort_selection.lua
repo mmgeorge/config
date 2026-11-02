@@ -36,7 +36,7 @@ end
 controller.render, controller.attach_transcript = function() controller.refresh_winbar() end, function() end
 state.command_set = controller.command_set()
 state.transcript_win = vim.api.nvim_get_current_win()
-state.session = { id = "effort-test", backend = "codex", model = "test", resolved_model = "test", effort = "medium" }
+state.session = { id = "effort-test", provider = "codex", model = "test", resolved_model = "test", effort = "medium" }
 state.capability = { effort_selection = true, fast_mode = true, ultrafast_mode = true }
 for _, tier in ipairs({ "default", "fast", "ultrafast" }) do
   state.session.service_tier = tier
@@ -89,7 +89,7 @@ end
 state.busy = false
 state.session.model, state.session.resolved_model, state.session.effort = "test", "test", "medium"
 state.session.service_tier = nil
-state.model_backend, state.model_list = "codex", { { id = "test", reasoning = { "minimal", "low", "medium", "high" }, service_tiers = { "fast", "ultrafast" } } }
+state.model_provider, state.model_list = "codex", { { id = "test", reasoning = { "minimal", "low", "medium", "high" }, service_tiers = { "fast", "ultrafast" } } }
 state.queue, state.pending_steer = {}, {}
 local function settled()
   assert(#transition > 0, "configuration did not reach Rust immediately")

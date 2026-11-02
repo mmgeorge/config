@@ -80,7 +80,7 @@ impl HostProcess {
     async fn start_turn(&mut self, workspace: &std::path::Path, data: &std::path::Path) {
         self.send(json!({"id":2,"method":"session.initialize","params":{
             "workspace":workspace,"data_root":data,"client_id":"eof-test",
-            "backend":{"kind":"mock","command":["visible-blocking"]}
+            "provider":{"kind":"mock","command":["visible-blocking"]}
         }}))
         .await;
         let initialized = self.response(2).await;

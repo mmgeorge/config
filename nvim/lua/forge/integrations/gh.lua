@@ -8,7 +8,7 @@
 
 ---@alias ForgeGhTextCallback fun(result: ForgeGhAsyncResult)
 
----@class ForgeGhBackend
+---@class ForgeGhProvider
 ---@field system_async? fun(command: ForgeGhCommand, input: string?, cb: ForgeGhTextCallback, cwd?: string)
 ---@field open_url? fun(url: string): boolean
 
@@ -178,7 +178,7 @@
 ---@field code? integer
 
 ---@class ForgeGhModule
----@field _backend ForgeGhBackend?
+---@field _provider ForgeGhProvider?
 ---@field [string] any
 
 ---@type ForgeGhModule
@@ -233,13 +233,13 @@ local pr_list_json_fields = table.concat({
   "closedAt",
 }, ",")
 
----@param backend ForgeGhBackend?
-function M.set_backend(backend)
-  M._backend = backend
+---@param provider ForgeGhProvider?
+function M.set_provider(provider)
+  M._provider = provider
 end
 
-function M.reset_backend()
-  M._backend = nil
+function M.reset_provider()
+  M._provider = nil
 end
 
 ---@param value integer
@@ -268,9 +268,9 @@ end
 ---@param cwd string?
 ---@param cb ForgeGhTextCallback
 local function system_text_async(command, input, cwd, cb)
-  local backend = M._backend
-  if backend and backend.system_async then
-    backend.system_async(command, input, cb, cwd)
+  local provider = M._provider
+  if provider and provider.system_async then
+    provider.system_async(command, input, cb, cwd)
     return
   end
 
@@ -1581,9 +1581,9 @@ end
 ---@return boolean
 function M.browse_url(url)
   if not (url and url ~= "") then return false end
-  local backend = M._backend
-  if backend and backend.open_url then
-    return backend.open_url(url)
+  local provider = M._provider
+  if provider and provider.open_url then
+    return provider.open_url(url)
   end
   if vim.ui and vim.ui.open then
     vim.ui.open(url)

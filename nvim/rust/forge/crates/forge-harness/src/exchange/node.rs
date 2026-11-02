@@ -19,7 +19,7 @@ pub enum ExchangeNode {
     /// Retains provider context replacement separately from model text and tool calls.
     Compaction {
         id: String,
-        compaction: Box<crate::backend::Compaction>,
+        compaction: Box<crate::provider::Compaction>,
     },
     ImplementationReport {
         id: String,

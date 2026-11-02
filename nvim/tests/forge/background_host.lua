@@ -18,7 +18,7 @@ local executable = require("forge.builder").binary_path()
 local stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and root or stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback) callback({ ok = true, path = executable }) return function() end end }
-require("forge").setup({ harness = { backend = "mock" }, background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
+require("forge").setup({ harness = { provider = "mock" }, background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
 vim.fn.chdir(workspace)
 local client = require("forge.client")
 client._host_set_launcher_for_test(vim.system)

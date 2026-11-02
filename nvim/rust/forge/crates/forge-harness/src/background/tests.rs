@@ -1,5 +1,5 @@
 use super::*;
-use crate::{backend::BackendLaunch, session::SessionStore, storage::SqliteStore};
+use crate::{provider::ProviderLaunch, session::SessionStore, storage::SqliteStore};
 use anyhow::{Context, Result};
 use std::{path::Path, sync::Arc};
 
@@ -36,9 +36,9 @@ async fn generate(
     manager
         .generate(BackgroundRequest {
             cancellation: CancellationToken::new(),
-            purpose: crate::backend::TextGeneration::CommitMessage,
+            purpose: crate::provider::TextGeneration::CommitMessage,
             config: crate::service::TextGenerationConfig {
-                backend: BackendLaunch {
+                provider: ProviderLaunch {
                     kind: "mock".into(),
                     command: vec![],
                 },
@@ -105,10 +105,10 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
             owner: crate::timeline::TimelineOwner::session(&first.session_id),
             created_at_ms: 1,
             detail: crate::timeline::SessionEventKind::Compaction {
-                compaction: (crate::backend::Compaction {
+                compaction: (crate::provider::Compaction {
                     id: "interrupted-compaction".into(),
                     thread_id: "provider".into(),
-                    state: crate::backend::CompactionState::Running,
+                    state: crate::provider::CompactionState::Running,
                     manual: false,
                     started_at_ms: Some(1),
                     completed_at_ms: None,
@@ -126,7 +126,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
         "fresh manager lost durable session"
     );
     let events = SqliteStore::open(&data)?.list_session_event(&first.session_id)?;
-    assert!(events.iter().any(|event| matches!(&event.detail,crate::timeline::SessionEventKind::Compaction { compaction } if compaction.state == crate::backend::CompactionState::Unconfirmed)));
+    assert!(events.iter().any(|event| matches!(&event.detail,crate::timeline::SessionEventKind::Compaction { compaction } if compaction.state == crate::provider::CompactionState::Unconfirmed)));
 
     git(&root, &["switch", "-q", "-c", "feature"]);
     let branch = generate(&resumed_manager, &root, &data).await?;
@@ -152,7 +152,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
         store
             .load_session(&first.session_id)?
             .context("session missing")?
-            .backend_session_id
+            .provider_session_id
             .is_some()
     );
     Ok(())
@@ -173,14 +173,14 @@ async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -
     );
     let mut identity = None;
     let purposes = [
-        crate::backend::TextGeneration::CommitMessage,
-        crate::backend::TextGeneration::PullRequestDescription,
-        crate::backend::TextGeneration::CommitMessage,
+        crate::provider::TextGeneration::CommitMessage,
+        crate::provider::TextGeneration::PullRequestDescription,
+        crate::provider::TextGeneration::CommitMessage,
     ];
     for (purpose, service_tier) in purposes.into_iter().zip([
-        crate::backend::ServiceTier::Fast,
-        crate::backend::ServiceTier::Ultrafast,
-        crate::backend::ServiceTier::Standard,
+        crate::provider::ServiceTier::Fast,
+        crate::provider::ServiceTier::Ultrafast,
+        crate::provider::ServiceTier::Standard,
     ]) {
         let owner = manager();
         let context = BackgroundContext::read(&owner.repositories, root.to_str().unwrap()).await?;
@@ -192,7 +192,7 @@ async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -
                 input: "Current fixture evidence".into(),
                 delivery: None,
                 config: crate::service::TextGenerationConfig {
-                    backend: BackendLaunch {
+                    provider: ProviderLaunch {
                         kind: "mock".into(),
                         command: vec![],
                     },
@@ -213,7 +213,7 @@ async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -
             session.service_tier, service_tier,
             "Background speed was reset or inherited"
         );
-        let current = (result.session_id.clone(), session.backend_session_id);
+        let current = (result.session_id.clone(), session.provider_session_id);
         if let Some(previous) = &identity {
             assert_eq!(&current, previous);
         }

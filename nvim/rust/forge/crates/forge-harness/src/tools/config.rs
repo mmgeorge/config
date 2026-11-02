@@ -18,7 +18,7 @@ pub(in crate::tools) fn definition() -> ControlToolDefinition {
 pub(in crate::tools) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    _output: crate::backend::BackendCompletion,
+    _output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     let scope = runtime
         .context

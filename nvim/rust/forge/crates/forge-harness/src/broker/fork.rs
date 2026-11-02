@@ -1,7 +1,7 @@
 use super::{HarnessBroker, resolve_fork_name};
-use crate::backend::{
-    BackendCapability, BackendForkRequest, BackendForkResult, BackendInput, BackendRequest,
-    BackendTimingRecord, PromptMode,
+use crate::provider::{
+    PromptMode, ProviderCapability, ProviderForkRequest, ProviderForkResult, ProviderInput,
+    ProviderRequest, ProviderTimingRecord,
 };
 use crate::session::{
     HarnessSession, ProviderForkPoint, ProviderForkState, SessionPurpose, SessionStore,
@@ -21,8 +21,8 @@ use uuid::Uuid;
 /// Represents a durable child session plus the provider work that materializes its native fork.
 pub struct ForkPreparation {
     pub child: HarnessSession,
-    pub backend_request: BackendForkRequest,
-    pub timing: Vec<BackendTimingRecord>,
+    pub provider_request: ProviderForkRequest,
+    pub timing: Vec<ProviderTimingRecord>,
     pub total_duration_ms: f64,
 }
 
@@ -30,8 +30,8 @@ pub struct ForkPreparation {
 pub fn prepare_provider_fork(
     data_root: &Path,
     client_id: &str,
-    configured_backend: &str,
-    capability: &BackendCapability,
+    configured_provider: &str,
+    capability: &ProviderCapability,
     default_source_session_id: &str,
     params: &Value,
     purpose: SessionPurpose,
@@ -48,18 +48,18 @@ pub fn prepare_provider_fork(
         .context("source session not found")?;
     anyhow::ensure!(
         source.native_fork || (source.id == default_source_session_id && capability.native_fork),
-        "native fork is unavailable for this backend session"
+        "native fork is unavailable for this provider session"
     );
     anyhow::ensure!(
-        source.backend == configured_backend,
-        "source session uses a different configured backend"
+        source.provider == configured_provider,
+        "source session uses a different configured provider"
     );
     source.access =
-        crate::backend::BackendKind::parse(&source.backend)?.resolve_access(source.access);
+        crate::provider::ProviderKind::parse(&source.provider)?.resolve_access(source.access);
 
     let target_session_id = Uuid::new_v4().to_string();
     let fork_point = ProviderForkPoint {
-        backend_session_id: source.backend_session_id.clone(),
+        provider_session_id: source.provider_session_id.clone(),
         checkpoint_id: source.provider_checkpoint_id.clone(),
     };
     let existing_name_set = store
@@ -76,7 +76,7 @@ pub fn prepare_provider_fork(
     child.id.clone_from(&target_session_id);
     child.primary_agent_id = HarnessSession::primary_agent_id(&target_session_id);
     child.name = resolve_fork_name(params, &source.name, &existing_name_set);
-    child.backend_session_id = None;
+    child.provider_session_id = None;
     child.provider_checkpoint_id = None;
     child.provider_fork_state = ProviderForkState::Preparing {
         source_session_id: source.id.clone(),
@@ -150,12 +150,12 @@ pub fn prepare_provider_fork(
         },
     )?;
 
-    let backend_request = BackendForkRequest {
-        source: BackendRequest {
+    let provider_request = ProviderForkRequest {
+        source: ProviderRequest {
             execution_owner: None,
             harness_session_id: source.id,
             workspace: source.workspace,
-            input: BackendInput::from_text(""),
+            input: ProviderInput::from_text(""),
             mode: PromptMode::Chat,
             model: source.model,
             effort: source.effort,
@@ -163,7 +163,7 @@ pub fn prepare_provider_fork(
             service_tier: source.service_tier,
             access: source.access,
             approval_mode: source.approval_mode,
-            backend_session_id: fork_point.backend_session_id,
+            provider_session_id: fork_point.provider_session_id,
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
@@ -171,28 +171,28 @@ pub fn prepare_provider_fork(
         target_harness_session_id: target_session_id,
         checkpoint_id: fork_point.checkpoint_id,
     };
-    let timing = vec![BackendTimingRecord {
+    let timing = vec![ProviderTimingRecord {
         phase: "broker.persist_child".into(),
         duration_ms: persistence_started.elapsed().as_secs_f64() * 1000.0,
     }];
     Ok(ForkPreparation {
         child,
-        backend_request,
+        provider_request,
         timing,
         total_duration_ms: fork_started.elapsed().as_secs_f64() * 1000.0,
     })
 }
 
 impl HarnessBroker {
-    /// Return the provider preparation state that gates child-session backend work.
+    /// Return the provider preparation state that gates child-session provider work.
     pub fn provider_fork_state(&self) -> ProviderForkState {
         self.session.provider_fork_state.clone()
     }
 
-    /// Commit provider preparation into the durable child before queued work enters the backend.
+    /// Commit provider preparation into the durable child before queued work enters the provider.
     pub fn complete_provider_fork(
         &mut self,
-        result: std::result::Result<BackendForkResult, String>,
+        result: std::result::Result<ProviderForkResult, String>,
     ) -> Result<SessionEvent> {
         let ProviderForkState::Preparing {
             source_session_id,
@@ -203,7 +203,7 @@ impl HarnessBroker {
         };
         let (event, timing) = match result {
             Ok(result) => {
-                self.session.backend_session_id = Some(result.backend_session_id);
+                self.session.provider_session_id = Some(result.provider_session_id);
                 self.session.provider_fork_state = ProviderForkState::Ready;
                 ("session_fork_ready", result.timing)
             }

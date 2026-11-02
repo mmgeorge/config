@@ -14,7 +14,7 @@ local operation, starts, current_session = {}, 0, nil
 local model_frames, original_refresh = {}, nil
 client.session_events_subscribe(function(event, payload)
   if event == "task_operation" then operation[payload.id] = payload end
-  if event == "backend_event" and payload.kind == "execution_state" then starts = starts + 1 end
+  if event == "provider_event" and payload.kind == "execution_state" then starts = starts + 1 end
   if event == "session_configured" then current_session = payload.session or payload end
 end)
 local function await(predicate, message)
@@ -62,7 +62,7 @@ local function assert_model_frames(deferred)
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "blocking" } } } } })
+  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "blocking" } } } } })
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")
   local startup_frames = {}

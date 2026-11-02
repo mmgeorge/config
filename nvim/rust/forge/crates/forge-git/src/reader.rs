@@ -13,13 +13,13 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StatusBackend {
+pub enum StatusProvider {
     Gix,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct StatusEnumeration {
-    pub backend: StatusBackend,
+    pub provider: StatusProvider,
     pub path: Vec<PathRecord>,
 }
 
@@ -156,7 +156,7 @@ impl StatusReader {
         path.sort_unstable_by(|left, right| left.path.raw().cmp(right.path.raw()));
         check()?;
         Ok(StatusEnumeration {
-            backend: StatusBackend::Gix,
+            provider: StatusProvider::Gix,
             path,
         })
     }

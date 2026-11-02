@@ -45,7 +45,7 @@ local function raw_request(method, params)
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   require("forge").open_harness()
   assert(vim.wait(10000, function() return state.ready and state.session ~= nil end, 10), "Harness did not open")
   for _, selection in ipairs({ { "/fast", "fast" }, { "/ultrafast", "ultrafast" }, { "/ultrafast", "default" } }) do

@@ -1,9 +1,9 @@
 vim.loader.enable(false)
 
 local file_body = require("forge.git.file_body")
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 
-local original_backend = git_backend.current
+local original_provider = git_provider.current
 local command_list = {}
 local response_list = {}
 
@@ -17,10 +17,10 @@ local function assert_equal(actual, expected, message)
   end
 end
 
----@type ForgeGitBackend
-local backend = {}
+---@type ForgeGitProvider
+local provider = {}
 
-function backend.system_async(command, _, callback)
+function provider.system_async(command, _, callback)
   command_list[#command_list + 1] = vim.deepcopy(command)
   local response = table.remove(response_list, 1)
   assert_true(response ~= nil, "file body issued an unexpected Git command: " .. vim.inspect(command))
@@ -153,7 +153,7 @@ local function assert_binary_addition_never_reads_content()
 end
 
 local function run()
-  git_backend.set_backend(backend)
+  git_provider.set_provider(provider)
   assert_staged_addition_uses_index_blob()
   assert_large_addition_preserves_complete_diff()
   assert_large_deletion_preserves_complete_diff()
@@ -163,7 +163,7 @@ local function run()
 end
 
 local ok, error_message = xpcall(run, debug.traceback)
-git_backend.set_backend(original_backend)
+git_provider.set_provider(original_provider)
 if not ok then
   vim.api.nvim_err_writeln(error_message)
   vim.cmd("cquit")

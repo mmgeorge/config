@@ -98,7 +98,7 @@ impl Eq for ObservedPath {}
 pub(crate) struct CollectedObservation {
     pub head: HeadState,
     pub index: IndexStamp,
-    pub backend: crate::reader::StatusBackend,
+    pub provider: crate::reader::StatusProvider,
     pub path: Vec<ObservedPath>,
     pub timing: ObservationTiming,
 }
@@ -201,8 +201,8 @@ fn collect_with(
     let verified = status(check)?;
     let verification_status_ms = phase_started.elapsed().as_millis();
     ensure!(
-        initial.backend == verified.backend,
-        "status backend changed during observation"
+        initial.provider == verified.provider,
+        "status provider changed during observation"
     );
     ensure!(
         path.len() == verified.path.len()
@@ -253,7 +253,7 @@ fn collect_with(
     Ok(CollectedObservation {
         head,
         index,
-        backend: initial.backend,
+        provider: initial.provider,
         path,
         timing: ObservationTiming {
             head_and_index_ms,

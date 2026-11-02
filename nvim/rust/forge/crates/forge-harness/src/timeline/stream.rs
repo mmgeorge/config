@@ -105,12 +105,12 @@ impl TimelineStream {
     pub(crate) fn update_message(
         &mut self,
         exchange: &crate::exchange::Exchange,
-        event: &crate::backend::BackendEvent,
+        event: &crate::provider::ProviderEvent,
     ) -> Result<Option<TimelinePatch>> {
         let Some(index) = self.exchange_owner.get(&exchange.id).copied() else {
             return Ok(None);
         };
-        let crate::backend::BackendEvent::Message {
+        let crate::provider::ProviderEvent::Message {
             address: message_address,
             ..
         } = event
@@ -198,12 +198,12 @@ impl TimelineStream {
     pub(crate) fn append_tool_output(
         &mut self,
         exchange: &crate::exchange::Exchange,
-        event: &crate::backend::BackendEvent,
+        event: &crate::provider::ProviderEvent,
     ) -> Result<Option<TimelinePatch>> {
         let Some(index) = self.exchange_owner.get(&exchange.id).copied() else {
             return Ok(None);
         };
-        let crate::backend::BackendEvent::Tool {
+        let crate::provider::ProviderEvent::Tool {
             address: tool_address,
             update,
         } = event
@@ -1038,8 +1038,8 @@ mod test {
 
     #[test]
     fn file_edit_output_reconciles_the_change_node_without_a_tool_cache() -> anyhow::Result<()> {
-        use crate::backend::{
-            BackendEvent, TextUpdate, ToolActivityKind, ToolDiagnostic, ToolInvocation,
+        use crate::provider::{
+            ProviderEvent, TextUpdate, ToolActivityKind, ToolDiagnostic, ToolInvocation,
             ToolOutcome, ToolUpdate,
         };
         let mut exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
@@ -1072,11 +1072,11 @@ mod test {
 
             agent_by_id: Default::default(),
         }])?;
-        let tool_address = crate::backend::ToolAddress {
+        let tool_address = crate::provider::ToolAddress {
             turn: address,
             tool_id: "patch".into(),
         };
-        let event = BackendEvent::Tool {
+        let event = ProviderEvent::Tool {
             address: tool_address.clone(),
             update: ToolUpdate::Output {
                 update: TextUpdate::Append("Patch context did not match".into()),
@@ -1084,7 +1084,7 @@ mod test {
         };
         exchange.observe_turn(&event, 2)?;
         exchange.observe_turn(
-            &BackendEvent::Tool {
+            &ProviderEvent::Tool {
                 address: tool_address,
                 update: ToolUpdate::Finished {
                     outcome: ToolOutcome::Failed {

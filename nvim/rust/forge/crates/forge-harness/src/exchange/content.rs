@@ -1,5 +1,5 @@
 use super::{Exchange, ExchangeNode, InputIntent};
-use crate::backend::MessageRole;
+use crate::provider::MessageRole;
 use crate::turn::{ToolCall, ToolStore, TurnItem};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -507,8 +507,8 @@ impl Exchange {
     /// Check late updates against the exact persisted tool owner without reopening execution.
     pub(crate) fn accepts_settled_tool_update(
         &self,
-        address: &crate::backend::ToolAddress,
-        update: &crate::backend::ToolUpdate,
+        address: &crate::provider::ToolAddress,
+        update: &crate::provider::ToolUpdate,
     ) -> bool {
         self.entry.iter().any(|entry| {
             let ExchangeEntry::Commentary { commentary } = entry else {
@@ -521,7 +521,7 @@ impl Exchange {
                     .is_some_and(|execution| {
                         execution.address == *address
                             && (update.can_update_settled()
-                                || matches!(update, crate::backend::ToolUpdate::Finished { .. })
+                                || matches!(update, crate::provider::ToolUpdate::Finished { .. })
                                     && tools.store.accepts_background_completion(address))
                     })
             })
@@ -531,8 +531,8 @@ impl Exchange {
     pub(crate) fn record_tool_event(
         &mut self,
         turn_id: &str,
-        address: &crate::backend::ToolAddress,
-        update: &crate::backend::ToolUpdate,
+        address: &crate::provider::ToolAddress,
+        update: &crate::provider::ToolUpdate,
         now_ms: i64,
     ) -> Result<()> {
         let existing = self
@@ -546,8 +546,8 @@ impl Exchange {
                 && !address.tool_id.is_empty(),
             "completed turn rejects tool events"
         );
-        if !existing && !matches!(update, crate::backend::ToolUpdate::Requested { .. }) {
-            return Err(crate::backend::BackendError::Protocol {
+        if !existing && !matches!(update, crate::provider::ToolUpdate::Requested { .. }) {
+            return Err(crate::provider::ProviderError::Protocol {
                 message: "provider tool update arrived before its request".into(),
             }
             .into());
@@ -596,7 +596,9 @@ impl Exchange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendEvent, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+    use crate::provider::{
+        ProviderEvent, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
+    };
     use serde_json::json;
 
     #[test]
@@ -616,8 +618,8 @@ mod tests {
         );
         assert!(exchange.entry.is_empty());
         assert!(exchange.turn[0].messages().is_empty());
-        let tool = BackendEvent::Tool {
-            address: crate::backend::ToolAddress {
+        let tool = ProviderEvent::Tool {
+            address: crate::provider::ToolAddress {
                 turn: address.clone(),
                 tool_id: "call".into(),
             },
@@ -634,8 +636,8 @@ mod tests {
         let owner = exchange.entry[0].id().to_owned();
         exchange.observe_turn(&message, 3)?;
         assert_eq!(exchange.entry.len(), 2);
-        if let BackendEvent::Message { update, .. } = &mut message {
-            *update = crate::backend::MessageUpdate::Completed {
+        if let ProviderEvent::Message { update, .. } = &mut message {
+            *update = crate::provider::MessageUpdate::Completed {
                 text: String::new(),
             };
         }
@@ -650,7 +652,7 @@ mod tests {
 
     #[test]
     fn typed_classification_preserves_activity_without_duplicate_message_blocks() -> Result<()> {
-        use crate::backend::MessageUpdate;
+        use crate::provider::MessageUpdate;
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"classification", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Work", "state":"running", "created_at_ms":0,
@@ -662,14 +664,14 @@ mod tests {
             crate::turn::test_support::message(&address, "answer", None, "Canonical answer");
         exchange.observe_turn(&event, 1)?;
         assert!(exchange.entry.is_empty());
-        if let BackendEvent::Message { update, .. } = &mut event {
+        if let ProviderEvent::Message { update, .. } = &mut event {
             *update = MessageUpdate::Classified {
                 role: MessageRole::Commentary,
             };
         }
         exchange.observe_turn(&event, 2)?;
-        let mut tool = BackendEvent::Tool {
-            address: crate::backend::ToolAddress {
+        let mut tool = ProviderEvent::Tool {
+            address: crate::provider::ToolAddress {
                 turn: address.clone(),
                 tool_id: "original".into(),
             },
@@ -684,7 +686,7 @@ mod tests {
         };
         exchange.observe_turn(&tool, 3)?;
         let provider_owner = exchange.entry[0].id().to_owned();
-        if let BackendEvent::Message { update, .. } = &mut event {
+        if let ProviderEvent::Message { update, .. } = &mut event {
             *update = MessageUpdate::Classified {
                 role: MessageRole::Response,
             };
@@ -692,11 +694,11 @@ mod tests {
         let before_conflict = serde_json::to_value(&exchange)?;
         let error = exchange.observe_turn(&event, 4).unwrap_err();
         assert!(matches!(
-            error.downcast_ref::<crate::backend::BackendError>(),
-            Some(crate::backend::BackendError::Protocol { .. })
+            error.downcast_ref::<crate::provider::ProviderError>(),
+            Some(crate::provider::ProviderError::Protocol { .. })
         ));
         assert_eq!(serde_json::to_value(&exchange)?, before_conflict);
-        if let BackendEvent::Message { update, .. } = &mut event {
+        if let ProviderEvent::Message { update, .. } = &mut event {
             *update = MessageUpdate::Completed {
                 text: "Canonical final answer".into(),
             };
@@ -718,7 +720,7 @@ mod tests {
             ),
             6,
         )?;
-        if let BackendEvent::Tool { address, .. } = &mut tool {
+        if let ProviderEvent::Tool { address, .. } = &mut tool {
             address.tool_id = "later".into();
         }
         restored.observe_turn(&tool, 6)?;
@@ -779,8 +781,8 @@ mod tests {
         }))?;
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
-        let mut event = BackendEvent::Tool {
-            address: crate::backend::ToolAddress {
+        let mut event = ProviderEvent::Tool {
+            address: crate::provider::ToolAddress {
                 turn: address.clone(),
                 tool_id: "first".into(),
             },
@@ -795,7 +797,7 @@ mod tests {
         };
         exchange.observe_turn(&event, 1)?;
         exchange.append_input(InputIntent::Steering, "more".into(), 2)?;
-        if let BackendEvent::Tool { address, .. } = &mut event {
+        if let ProviderEvent::Tool { address, .. } = &mut event {
             address.tool_id = "second".into();
         }
         exchange.observe_turn(&event, 3)?;
@@ -815,7 +817,7 @@ mod tests {
             ),
             4,
         )?;
-        if let BackendEvent::Tool { address, update } = &mut event {
+        if let ProviderEvent::Tool { address, update } = &mut event {
             address.tool_id = "first".into();
             *update = ToolUpdate::Finished {
                 outcome: ToolOutcome::Succeeded,
@@ -833,9 +835,9 @@ mod tests {
         assert_eq!(restored.tool_counter.total, 2);
         assert_eq!(restored.tool_counter.completed, 1);
         restored.observe_turn(
-            &BackendEvent::Turn {
+            &ProviderEvent::Turn {
                 address: address.clone(),
-                update: crate::backend::TurnUpdate::Finished {
+                update: crate::provider::TurnUpdate::Finished {
                     outcome: crate::turn::TurnOutcome::Completed,
                     completed_at_ms: 6,
                 },
@@ -843,21 +845,21 @@ mod tests {
             6,
         )?;
         restored.observe_turn(
-            &BackendEvent::Tool {
-                address: crate::backend::ToolAddress {
+            &ProviderEvent::Tool {
+                address: crate::provider::ToolAddress {
                     turn: address.clone(),
                     tool_id: "first".into(),
                 },
                 update: ToolUpdate::Output {
-                    update: crate::backend::TextUpdate::Append("late output".into()),
+                    update: crate::provider::TextUpdate::Append("late output".into()),
                 },
             },
             6,
         )?;
         let node_count = restored.node_list.len();
         assert!(restored.observe_turn(
-            &BackendEvent::Tool {
-                address: crate::backend::ToolAddress {
+            &ProviderEvent::Tool {
+                address: crate::provider::ToolAddress {
                     turn: address.clone(),
                     tool_id: "first".into(),
                 },
@@ -929,7 +931,7 @@ mod tests {
                 .iter()
                 .all(|fold| fold.end.block != steering.id)
         );
-        if let BackendEvent::Tool { address, update } = &mut event {
+        if let ProviderEvent::Tool { address, update } = &mut event {
             address.tool_id = "failed-call".into();
             *update = ToolUpdate::Requested {
                 invocation: ToolInvocation {
@@ -941,10 +943,10 @@ mod tests {
             };
         }
         exchange.observe_turn(&event, 7)?;
-        if let BackendEvent::Tool { update, .. } = &mut event {
+        if let ProviderEvent::Tool { update, .. } = &mut event {
             *update = ToolUpdate::Finished {
                 outcome: ToolOutcome::Failed {
-                    diagnostic: crate::backend::ToolDiagnostic {
+                    diagnostic: crate::provider::ToolDiagnostic {
                         code: None,
                         message: "failed".into(),
                     },

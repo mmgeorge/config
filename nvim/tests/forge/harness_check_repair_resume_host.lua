@@ -31,7 +31,7 @@ local function await(predicate, message)
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = {
+  require("forge").setup({ harness = { provider = "mock", providers = {
     mock = { command = { "session-blocking" }, selectable = true },
   } } })
   require("forge").open_harness()

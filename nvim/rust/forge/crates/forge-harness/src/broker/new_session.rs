@@ -9,7 +9,7 @@ use uuid::Uuid;
 pub fn prepare_new_session(
     data_root: &Path,
     client_id: &str,
-    configured_backend: &str,
+    configured_provider: &str,
     native_compact: bool,
     source_session_id: &str,
     params: &Value,
@@ -20,10 +20,10 @@ pub fn prepare_new_session(
         .load_session(source_session_id)?
         .context("source session not found")?;
     anyhow::ensure!(
-        source.backend == configured_backend,
-        "source session uses a different configured backend"
+        source.provider == configured_provider,
+        "source session uses a different configured provider"
     );
-    let preference = store.load_preference(&source.workspace, &source.backend)?;
+    let preference = store.load_preference(&source.workspace, &source.provider)?;
     let session_id = Uuid::new_v4().to_string();
     let mut child = HarnessSession {
         purpose: crate::session::SessionPurpose::Conversation,
@@ -37,8 +37,8 @@ pub fn prepare_new_session(
             .unwrap_or_default()
             .to_owned(),
         workspace: source.workspace,
-        backend: source.backend,
-        backend_session_id: None,
+        provider: source.provider,
+        provider_session_id: None,
         provider_checkpoint_id: None,
         provider_fork_state: ProviderForkState::Ready,
         model: preference
@@ -84,13 +84,13 @@ pub fn prepare_new_session(
     let shared = crate::settings::SettingsStore::open(data_root)?.get(
         &child.workspace,
         &child.id,
-        &child.backend,
+        &child.provider,
     )?;
     shared.desired.apply(&mut child, native_compact)?;
     shared.apply_provider_defaults(&mut child)?;
     if child.model == "default" && child.resolved_model.is_none() {
         child.resolved_model =
-            store.latest_resolved_default_model(&child.workspace, &child.backend)?;
+            store.latest_resolved_default_model(&child.workspace, &child.provider)?;
     }
     store.save_session(&child)?;
     Ok(child)
@@ -108,7 +108,7 @@ mod tests {
                 "workspace": fixture.path(),
                 "data_root": fixture.path().join("data"),
                 "client_id": "cached-default-test",
-                "backend": { "kind": "mock", "command": ["mock"] },
+                "provider": { "kind": "mock", "command": ["mock"] },
             }))
             .unwrap(),
         )

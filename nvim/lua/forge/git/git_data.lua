@@ -3,9 +3,9 @@
 --- async tree-sitter syntax computation entry points.
 ---
 --- Reads the notify/filetype/nul helpers and live status state from session.lua and sibling modules,
---- and the git backend, syntax engine, and path helpers as direct requires.
+--- and the git provider, syntax engine, and path helpers as direct requires.
 
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 local syntax_engine = require("forge.render.syntax_engine")
 local paths = require("forge.infra.paths")
 
@@ -251,7 +251,7 @@ end
 ---@param filename? string absolute file path
 ---@param cb fun(hunks: ForgeHunk[])
 local function get_hunks_async(cwd, staged, filename, cb)
-  local args = git_backend.git_diff_command(cwd, staged and { "--cached" } or nil)
+  local args = git_provider.git_diff_command(cwd, staged and { "--cached" } or nil)
   if filename then
     local relpath, relative_error = paths.repo_relative(filename, cwd)
     if not relpath then
@@ -261,7 +261,7 @@ local function get_hunks_async(cwd, staged, filename, cb)
     end
     vim.list_extend(args, { "--", relpath })
   end
-  git_backend.systemlist_async(args, function(result, code)
+  git_provider.systemlist_async(args, function(result, code)
     if code ~= 0 then
       cb({})
       return

@@ -1,29 +1,35 @@
 use anyhow::{Context, Result};
-use forge_harness::backend::approval::PermissionCoordinator;
-use forge_harness::backend::codex::CodexBackend;
-use forge_harness::backend::copilot::CopilotBackend;
-use forge_harness::backend::{Backend, BackendEvent, BackendInput, BackendRequest, MessageUpdate};
+use forge_harness::provider::approval::PermissionCoordinator;
+use forge_harness::provider::codex::CodexProvider;
+use forge_harness::provider::copilot::CopilotProvider;
+use forge_harness::provider::{
+    MessageUpdate, Provider, ProviderEvent, ProviderInput, ProviderRequest,
+};
 use forge_harness::trace::TraceStore;
 use std::path::Path;
 use std::sync::Arc;
 
 /// Construct an isolated runtime while retaining the installed provider's authentication.
-fn backend(provider: &str, root: &Path, request: &BackendRequest) -> Result<Box<dyn Backend>> {
+fn create_provider(
+    provider: &str,
+    root: &Path,
+    request: &ProviderRequest,
+) -> Result<Box<Provider>> {
     let permission = PermissionCoordinator::transient(&request.workspace)?;
     let trace = Arc::new(TraceStore::open(root)?);
     Ok(match provider {
-        "codex" => Box::new(CodexBackend::new_with_permission_coordinator(
+        "codex" => Box::new(CodexProvider::new_with_permission_coordinator(
             vec!["codex".into(), "app-server".into()],
             permission,
             trace,
             Some(root.into()),
-        )?) as Box<dyn Backend>,
-        "copilot" => Box::new(CopilotBackend::new_with_permission_coordinator(
+        )?) as Box<Provider>,
+        "copilot" => Box::new(CopilotProvider::new_with_permission_coordinator(
             Vec::new(),
             permission,
             trace,
             Some(root.into()),
-        )?) as Box<dyn Backend>,
+        )?) as Box<Provider>,
         _ => unreachable!("fixture provider is explicit"),
     })
 }
@@ -44,9 +50,9 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     let catalog = super::catalog_request(&workspace, &format!("{provider}-eager-resume"));
     let mut request = super::prompt_request(&catalog);
     request.access.sandbox = provider == "codex";
-    let first = backend(provider, &data, &request)?;
+    let first = create_provider(provider, &data, &request)?;
     let mut missing = request.clone();
-    missing.backend_session_id = Some(uuid::Uuid::new_v4().to_string());
+    missing.provider_session_id = Some(uuid::Uuid::new_v4().to_string());
     let unavailable = first.initialize_session(missing).await;
     eprintln!("{provider}: missing history result {unavailable:?}");
     assert!(
@@ -56,8 +62,8 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     assert!(matches!(
         unavailable
             .unwrap_err()
-            .downcast_ref::<forge_harness::backend::BackendError>(),
-        Some(forge_harness::backend::BackendError::SessionMissing { .. })
+            .downcast_ref::<forge_harness::provider::ProviderError>(),
+        Some(forge_harness::provider::ProviderError::SessionMissing { .. })
     ));
     let prepared = first.initialize_session(request.clone()).await;
     if let Ok(Some(thread)) = &prepared {
@@ -70,56 +76,56 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     let thread = prepared?.context("provider initialization omitted its thread")?;
     eprintln!("{provider}: prepared {thread}");
     // Reopening a local session with no exchanges discards its provisional provider ID.
-    request.backend_session_id = None;
-    let second = backend(provider, &data, &request)?;
+    request.provider_session_id = None;
+    let second = create_provider(provider, &data, &request)?;
     let result: Result<String> = async {
         let prepared = second.initialize_session(request.clone()).await?.context("missing prepared thread")?;
         assert_ne!(prepared, thread);
         let mut inventory = catalog.clone();
         inventory.access = request.access.clone();
-        inventory.backend_session_id = Some(prepared.clone());
+        inventory.provider_session_id = Some(prepared.clone());
         second.mcp_list(inventory.clone()).await?;
         second.background_terminals(inventory.clone()).await?;
         if provider == "codex" {
             let mut goal_request = request.clone();
-            goal_request.backend_session_id = Some(prepared.clone());
-            second.goal_status(goal_request, forge_harness::backend::NativeGoalUpdate::Absent).await?;
+            goal_request.provider_session_id = Some(prepared.clone());
+            second.goal_status(goal_request, forge_harness::provider::NativeGoalUpdate::Absent).await?;
         }
         // Exercise the live binding independently of a caller-supplied identity.
-        request.backend_session_id = None;
-        request.input = BackendInput::from_text("Remember the exact token FORGE-RESUME-72931. Reply only with that token. Do not use any tools.");
+        request.provider_session_id = None;
+        request.input = ProviderInput::from_text("Remember the exact token FORGE-RESUME-72931. Reply only with that token. Do not use any tools.");
         let output = second.prompt(request.clone()).await?;
-        let conversation = output.completion.backend_session_id.clone().context("missing conversation thread")?;
+        let conversation = output.completion.provider_session_id.clone().context("missing conversation thread")?;
         assert_eq!(conversation, prepared);
-        inventory.backend_session_id = Some(conversation.clone());
+        inventory.provider_session_id = Some(conversation.clone());
         assert_token(&output.event);
-        request.backend_session_id = Some(conversation.clone());
-        request.input = BackendInput::from_text("What exact token did I ask you to remember? Reply only with the token. Do not use tools.");
+        request.provider_session_id = Some(conversation.clone());
+        request.input = ProviderInput::from_text("What exact token did I ask you to remember? Reply only with the token. Do not use tools.");
         let warm = second.prompt(request.clone()).await?;
-        assert_eq!(warm.completion.backend_session_id.as_deref(), Some(conversation.as_str()));
+        assert_eq!(warm.completion.provider_session_id.as_deref(), Some(conversation.as_str()));
         assert_token(&warm.event);
         second.background_terminals(inventory).await?;
         if provider == "codex" {
-            second.goal_status(request.clone(), forge_harness::backend::NativeGoalUpdate::from_goal("Verify resumed thread".into(), forge_harness::goal::GoalState::Active)).await?;
-            second.goal_status(request.clone(), forge_harness::backend::NativeGoalUpdate::Absent).await?;
+            second.goal_status(request.clone(), forge_harness::provider::native_goal_update("Verify resumed thread".into(), forge_harness::goal::GoalState::Active)).await?;
+            second.goal_status(request.clone(), forge_harness::provider::NativeGoalUpdate::Absent).await?;
         }
         Ok(conversation)
     }.await;
     second.shutdown().await?;
-    request.backend_session_id = Some(result?);
-    let third = backend(provider, &data, &request)?;
+    request.provider_session_id = Some(result?);
+    let third = create_provider(provider, &data, &request)?;
     let resumed: Result<()> = async {
         let resumed = third.initialize_session(request.clone()).await?;
-        assert_eq!(resumed, request.backend_session_id);
+        assert_eq!(resumed, request.provider_session_id);
         let mut inventory = catalog.clone();
         inventory.access = request.access.clone();
-        inventory.backend_session_id = resumed;
+        inventory.provider_session_id = resumed;
         third.background_terminals(inventory).await?;
         if provider == "codex" {
             third
                 .goal_status(
                     request.clone(),
-                    forge_harness::backend::NativeGoalUpdate::Absent,
+                    forge_harness::provider::NativeGoalUpdate::Absent,
                 )
                 .await?;
         }
@@ -134,10 +140,10 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
 }
 
 /// Verify the provider retained conversation context across each transition.
-fn assert_token(event: &[BackendEvent]) {
+fn assert_token(event: &[ProviderEvent]) {
     assert!(
         event.iter().any(|event| matches!(event,
-            BackendEvent::Message { update: MessageUpdate::Completed { text }, .. }
+            ProviderEvent::Message { update: MessageUpdate::Completed { text }, .. }
                 if text.contains("FORGE-RESUME-72931")
         )),
         "provider did not retain the conversation token: {event:?}"
@@ -177,12 +183,12 @@ async fn service_recovery(provider: &str) -> Result<()> {
     let initialize: forge_harness::broker::InitializeRequest =
         serde_json::from_value(serde_json::json!({
             "config_dir":config,"data_root":data,"workspace":workspace,"client_id":"live-recovery",
-            "backend":{"kind":provider,"command":command}
+            "provider":{"kind":provider,"command":command}
         }))?;
     let broker = forge_harness::broker::HarnessBroker::initialize(initialize.clone())?;
     let mut session = broker.snapshot()?.session;
     drop(broker);
-    session.backend_session_id = Some(uuid::Uuid::new_v4().to_string());
+    session.provider_session_id = Some(uuid::Uuid::new_v4().to_string());
     forge_harness::storage::SqliteStore::open(&data)?.save_session(&session)?;
     let diff = forge_diff::engine::DiffEngine::new(Default::default(), 1);
     let syntax = forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool());
@@ -217,15 +223,15 @@ async fn service_recovery(provider: &str) -> Result<()> {
                 "startup failed: {event}"
             );
             if event["event"] == "session_configured" {
-                assert!(event["payload"]["session"]["backend_session_id"].is_string());
-                assert_ne!(event["payload"]["session"]["backend_session_id"], serde_json::json!(session.backend_session_id));
+                assert!(event["payload"]["session"]["provider_session_id"].is_string());
+                assert_ne!(event["payload"]["session"]["provider_session_id"], serde_json::json!(session.provider_session_id));
                 break;
             }
         }
         let store = forge_harness::storage::SqliteStore::open(&data)?;
-        let initialized = store.load_session(&session.id)?.unwrap().backend_session_id;
+        let initialized = store.load_session(&session.id)?.unwrap().provider_session_id;
         assert!(initialized.is_some());
-        assert_ne!(initialized, session.backend_session_id);
+        assert_ne!(initialized, session.provider_session_id);
         assert!(store.list_exchange(&session.id)?.is_empty());
         assert_eq!(store.load_session(&session.id)?.unwrap().name, "Renamed without an exchange");
         Ok(())
@@ -236,7 +242,7 @@ async fn service_recovery(provider: &str) -> Result<()> {
     let reopened = forge_harness::broker::HarnessBroker::initialize(initialize)?;
     let reopened = reopened.snapshot()?.session;
     assert_eq!(reopened.name, "Renamed without an exchange");
-    assert!(reopened.backend_session_id.is_none());
+    assert!(reopened.provider_session_id.is_none());
     eprintln!("{provider}: production startup recovered the missing empty session");
     Ok(())
 }

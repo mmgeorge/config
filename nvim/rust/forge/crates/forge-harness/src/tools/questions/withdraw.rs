@@ -1,4 +1,4 @@
-use crate::backend::PromptMode;
+use crate::provider::PromptMode;
 use crate::tools::ControlToolDefinition;
 use crate::tools::error::ToolContext;
 use crate::tools::schema::strict_object_input_schema;
@@ -34,7 +34,7 @@ pub fn question_withdraw_input_schema() -> Value {
 /// Decode the tool's replayable completion fields.
 pub(super) fn record(
     invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::backend::BackendCompletion,
+    output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
     output.question_withdrawal = Some(crate::tools::invocation::decode_arguments::<
         crate::plan::PlanQuestionWithdrawal,
@@ -46,7 +46,7 @@ pub(super) fn record(
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    _output: crate::backend::BackendCompletion,
+    _output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     if runtime.context.questions.is_some() {
         let reason = invocation.arguments["reason"]

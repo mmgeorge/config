@@ -102,7 +102,7 @@ async fn settings(
     )?;
     if method == RuntimeMethod::SettingsGet {
         let snapshot =
-            settings.catalog(&workspace, session_key, &registry.initialize.backend.kind)?;
+            settings.catalog(&workspace, session_key, &registry.initialize.provider.kind)?;
         let mut value = serde_json::to_value(snapshot.settings)?;
         value["catalog"] = json!({"mcp":snapshot.server,"skill":snapshot.skill});
         value["layers"] = json!({
@@ -122,7 +122,7 @@ async fn settings(
             &request.params,
             &workspace,
             session_key,
-            &registry.initialize.backend.kind,
+            &registry.initialize.provider.kind,
         )
         .await?;
         let result = serde_json::to_value(preview)?;
@@ -151,7 +151,7 @@ async fn settings(
             Some(revision) => revision,
             None if resource_mutation => {
                 settings
-                    .get(&workspace, session_key, &registry.initialize.backend.kind)?
+                    .get(&workspace, session_key, &registry.initialize.provider.kind)?
                     .revision
             }
             None => anyhow::bail!("settings require expected_revision"),
@@ -182,7 +182,7 @@ async fn settings(
                 &request.params,
                 &workspace,
                 session_key,
-                &registry.initialize.backend.kind,
+                &registry.initialize.provider.kind,
             )
             .await?;
             settings = restored;
@@ -308,23 +308,23 @@ async fn pins(
     let data_root = PathBuf::from(&registry.initialize.data_root);
     let parameter = request.params;
     let identifier_list = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-        let backend = parameter
-            .get("backend")
+        let provider = parameter
+            .get("provider")
             .and_then(Value::as_str)
-            .context("model pin request requires backend")?;
+            .context("model pin request requires provider")?;
         let mut store = crate::storage::model_pin::ModelPinStore::open(&data_root)?;
         if method == RuntimeMethod::ProviderModelPinList {
-            store.load(backend)
+            store.load(provider)
         } else {
             let model = parameter
                 .get("model")
                 .and_then(Value::as_str)
-                .context("backend.model_pin requires model")?;
+                .context("provider.model_pin requires model")?;
             let pinned = parameter
                 .get("pinned")
                 .and_then(Value::as_bool)
-                .context("backend.model_pin requires pinned")?;
-            store.set(backend, model, pinned)
+                .context("provider.model_pin requires pinned")?;
+            store.set(provider, model, pinned)
         }
     })
     .await
@@ -383,7 +383,7 @@ async fn preview_native_import(
     params: &Value,
     workspace: &str,
     session_id: &str,
-    backend: &str,
+    provider: &str,
 ) -> Result<(
     crate::settings::SettingsStore,
     crate::settings::NativeImport,
@@ -397,10 +397,10 @@ async fn preview_native_import(
     let scope = serde_json::from_value(params.get("scope").cloned().unwrap_or(json!("workspace")))?;
     let workspace = workspace.to_owned();
     let session_id = session_id.to_owned();
-    let backend = backend.to_owned();
+    let provider = provider.to_owned();
     tokio::task::spawn_blocking(move || {
         let preview =
-            settings.preview_import(kind, &source, scope, &workspace, &session_id, &backend)?;
+            settings.preview_import(kind, &source, scope, &workspace, &session_id, &provider)?;
         Ok((settings, preview))
     })
     .await

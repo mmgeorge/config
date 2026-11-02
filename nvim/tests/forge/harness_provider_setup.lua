@@ -1,6 +1,6 @@
 vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 local state = require("forge.session").harness
-state.session = { id = "setup-test", backend = "claude" }
+state.session = { id = "setup-test", provider = "claude" }
 local notices = {}
 vim.notify = function(message, level) notices[#notices + 1] = { message = message, level = level } end
 local available = false

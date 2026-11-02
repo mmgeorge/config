@@ -6,7 +6,7 @@ local original_ensure = builder.ensure
 local event_count, result, failure
 
 local ok, error_message = xpcall(function()
-  require("forge").setup({ harness = { backend = "mock" }, harness_logging = false })
+  require("forge").setup({ harness = { provider = "mock" }, harness_logging = false })
   builder.ensure = function(callback) callback({ ok = true, path = "injected-forge" }) end
   client._host_set_launcher_for_test(function(_, options, on_exit)
     local published, acknowledged_frames, acknowledged_bytes = {}, 0, 0

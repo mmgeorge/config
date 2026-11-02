@@ -18,7 +18,7 @@ local function find_row(buf, text)
 end
 
 local ok, failure = pcall(function()
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   local comment_view = require("forge.draft_comments")
   local source_lines = { "# Plan", "Inspect this boundary", "Finish" }
   local annotation_list = {}

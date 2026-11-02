@@ -28,7 +28,7 @@ local snapshot = { path = "global/forge/subagents.json", revision = "1", documen
   },
 } }
 snapshot.document.profiles.disabled = vim.tbl_extend("force", snapshot.document.profiles.reviewer, { enabled = false })
-local state = { session = { id = "profiles", backend = "codex", model = "fixture-model", effort = "high", service_tier = "fast" } }
+local state = { session = { id = "profiles", provider = "codex", model = "fixture-model", effort = "high", service_tier = "fast" } }
 vim.notify = function(message) errors[#errors + 1] = message end
 form.open = function(options) current_form = original_open(options) return current_form end
 client.request = function(request_specification, callback)
@@ -97,7 +97,7 @@ local function edit(id, value)
 end
 
 local succeeded, failure = xpcall(function()
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   local window, origin_tab = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_tabpage()
   local host = { window_list = { window }, control_win = window }
   require("forge.views.harness.subagent_profiles").open(state, host)

@@ -18,7 +18,7 @@ pub(super) fn definition() -> ControlToolDefinition {
 pub(super) async fn execute(
     _runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    _output: crate::backend::BackendCompletion,
+    _output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     Ok(crate::tools::ControlToolResult {
         invocation: Some(invocation),
@@ -29,7 +29,7 @@ pub(super) async fn execute(
 /// Decode the tool's replayable completion fields.
 pub(super) fn record(
     _invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::backend::BackendCompletion,
+    output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
     output.evidence.tool_called = true;
     Ok(())

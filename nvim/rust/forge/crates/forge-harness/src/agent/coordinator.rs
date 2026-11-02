@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{Agent, AgentSelection, AgentSource, AgentTask};
 use crate::{
-    backend::{BackendCompletion, BackendEvent, ExecutionOwner},
     exchange::ExchangeState,
+    provider::{ExecutionOwner, ProviderCompletion, ProviderEvent},
 };
 
 pub const MAX_ACTIVE_CHILDREN: usize = 8;
@@ -75,12 +75,12 @@ pub enum AgentCommand {
     Event {
         owner: ExecutionOwner,
         task_id: String,
-        event: Box<BackendEvent>,
+        event: Box<ProviderEvent>,
     },
     Completed {
         owner: ExecutionOwner,
         task_id: String,
-        output: Box<Result<BackendCompletion>>,
+        output: Box<Result<ProviderCompletion>>,
         cleanup_error: Option<String>,
     },
 }
@@ -161,18 +161,18 @@ pub struct ReservedAgentWork {
 #[derive(Clone, Debug)]
 struct AdmittedExecution {
     owner: ExecutionOwner,
-    task: crate::backend::TaskId,
-    exchange: crate::backend::ExchangeId,
+    task: crate::provider::TaskId,
+    exchange: crate::provider::ExchangeId,
 }
 
 impl AgentWork {
     pub fn owner(&self) -> &ExecutionOwner {
         &self.execution.owner
     }
-    pub fn task_id(&self) -> &crate::backend::TaskId {
+    pub fn task_id(&self) -> &crate::provider::TaskId {
         &self.execution.task
     }
-    pub fn exchange_id(&self) -> &crate::backend::ExchangeId {
+    pub fn exchange_id(&self) -> &crate::provider::ExchangeId {
         &self.execution.exchange
     }
 }

@@ -10,7 +10,7 @@ use tokio::sync::{Notify, watch};
 pub(crate) struct ControlToolExecutor {
     task_controller: Option<std::sync::Arc<crate::task::SessionTaskController>>,
     task_permit: Option<crate::task::TaskPermit>,
-    mode: crate::backend::PromptMode,
+    mode: crate::provider::PromptMode,
     runtime: tokio::sync::Mutex<ControlToolRuntime>,
     admission: Mutex<Admission>,
     cancelled: watch::Sender<bool>,
@@ -157,7 +157,7 @@ impl Drop for Execution<'_> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::backend::PromptMode;
+    use crate::provider::PromptMode;
     use anyhow::{Context, Result};
 
     #[test]

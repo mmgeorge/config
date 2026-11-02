@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-agent-client-protocol = { workspace = true, features = ["unstable_session_fork"] }
+forge-provider-api = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -16,8 +16,9 @@ forge-buffer = { workspace = true }
 forge-diff = { workspace = true }
 forge-git = { workspace = true }
 forge-protocol = { workspace = true }
+forge-providers = { workspace = true }
+forge-shell = { workspace = true }
 futures-util = { workspace = true }
-github-copilot-sdk = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
 home = { workspace = true }
 jsonschema = { workspace = true }
@@ -42,18 +43,16 @@ strip-ansi-escapes = { workspace = true }
 syn = { workspace = true, features = ["full", "visit-mut"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
 toml = { workspace = true }
-tree-sitter = { workspace = true }
-tree-sitter-bash = { workspace = true }
-tree-sitter-powershell = { workspace = true }
-tree-sitter-zsh = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 zip = { workspace = true, features = ["deflate"] }
 
 [dev-dependencies]
+github-copilot-sdk = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = { workspace = true }
+tree-sitter = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 junction = { workspace = true }

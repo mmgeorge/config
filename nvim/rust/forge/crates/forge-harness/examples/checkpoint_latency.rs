@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
                 "primary_agent_id": HarnessSession::primary_agent_id(session),
                 "name": "Checkpoint latency",
                 "workspace": workspace,
-                "backend": "benchmark",
+                "provider": "benchmark",
                 "provider_fork_state": { "state": "ready" },
                 "model": "",
                 "effort": "",

@@ -1,4 +1,4 @@
-use crate::backend::{MessageClassification, MessageRole};
+use crate::provider::{MessageClassification, MessageRole};
 use serde::{Deserialize, Serialize};
 
 /// Distinguishes provider reasoning from user-visible assistant text.
@@ -32,7 +32,7 @@ pub enum MessageState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Message {
     pub(crate) id: String,
-    pub(crate) provider_id: crate::backend::MessageId,
+    pub(crate) provider_id: crate::provider::MessageId,
     pub(crate) classification: MessageClassification,
     pub(crate) start: MessageStart,
     pub(crate) state: MessageState,
@@ -62,7 +62,7 @@ impl Message {
     }
 
     /// Return the provider identity used to coalesce replayed message deltas.
-    pub fn provider_id(&self) -> &crate::backend::MessageId {
+    pub fn provider_id(&self) -> &crate::provider::MessageId {
         &self.provider_id
     }
 

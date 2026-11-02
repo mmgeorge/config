@@ -32,7 +32,7 @@
 ---@field stdout? string
 ---@field code? integer
 
----@class ForgeGitBackend
+---@class ForgeGitProvider
 ---@field systemlist? fun(command: ForgeGitCommand): string[]|string, integer?
 ---@field system? fun(command: ForgeGitCommand, input?: string): string, integer?
 ---@field systemlist_async? fun(command: ForgeGitCommand, cb: ForgeGitListCallback)

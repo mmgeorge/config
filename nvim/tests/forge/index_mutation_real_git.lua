@@ -1,5 +1,5 @@
 local index_mutation = require("forge.git.index_mutation")
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 local status_snapshot = require("forge.git.status_snapshot")
 
 local test_root = vim.fn.tempname() .. "-forge-index-mutation-real-git"
@@ -306,7 +306,7 @@ local function cleanup()
 end
 
 local function run()
-  git_backend.reset_backend()
+  git_provider.reset_provider()
   initialize_repository()
   assert_basic_hunk_stage_and_reverse_unstage()
   assert_crlf_policy_preserves_semantic_hunk()
@@ -316,7 +316,7 @@ end
 
 local ok, error_message = xpcall(run, debug.traceback)
 local cleanup_ok, cleanup_error = pcall(cleanup)
-git_backend.reset_backend()
+git_provider.reset_provider()
 if not cleanup_ok then
   vim.api.nvim_err_writeln(tostring(cleanup_error))
   vim.cmd("cquit")

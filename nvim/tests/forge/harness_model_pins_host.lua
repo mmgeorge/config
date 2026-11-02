@@ -45,12 +45,12 @@ local function first()
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   require("forge").open_harness()
   await(function() return state.ready and state.session end, "Harness did not open")
-  await(function() return state.model_backend == "mock" and state.model_list end, "initial model catalog did not resolve")
+  await(function() return state.model_provider == "mock" and state.model_list end, "initial model catalog did not resolve")
   local active_model = state.session.model
-  state.model_backend = "mock"
+  state.model_provider = "mock"
   state.model_list = { { id = "provider-first" }, { id = "pinned-model", is_default = true } }
   controller.select_model()
   await(function()

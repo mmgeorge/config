@@ -1,19 +1,20 @@
 use super::*;
-use crate::backend::submission::{Submission, SubmissionState};
 use crate::input::{
     InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputRoute, InputUpdate,
 };
+use crate::provider::native_goal_update;
+use crate::provider::submission::{Submission, SubmissionState};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Retain the acknowledged native selection together with its canonical task authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct NativeGoalSelection {
     /// Provider conversation that owns the acknowledged update.
-    pub(super) backend_session_id: String,
+    pub(super) provider_session_id: String,
     /// Canonical task authority observed when selecting the update.
     pub(super) revision: Option<crate::task::TaskRevision>,
     /// Complete native goal state selected by the canonical task.
-    pub(super) update: crate::backend::NativeGoalUpdate,
+    pub(super) update: crate::provider::NativeGoalUpdate,
 }
 
 impl SessionController {
@@ -237,7 +238,7 @@ impl SessionController {
                                     .as_deref()
                                     .context("delivery evidence is missing")?,
                             )?;
-                            let record = submission.reconcile(self.backend.as_ref()).await?;
+                            let record = submission.reconcile(self.provider.as_ref()).await?;
                             if matches!(record.delivery, SubmissionState::Accepted { .. }) {
                                 let update = self
                                     .coordinator
@@ -369,13 +370,13 @@ impl SessionController {
                     .reconcile_native_goal(&mut native_goal_selection)
                     .await;
                 if let Err(error) = controller.relay_questions(&sink).await {
-                    let _ = sink.send_event(SessionEvent { session_id: controller.observer.session_id().into(), event: "backend_event".into(), payload: json!({"kind":"error","text":format!("Question delivery failed: {error:#}")}) }).await;
+                    let _ = sink.send_event(SessionEvent { session_id: controller.observer.session_id().into(), event: "provider_event".into(), payload: json!({"kind":"error","text":format!("Question delivery failed: {error:#}")}) }).await;
                 }
                 let native_retry = native_result.is_err();
                 if let Err(error) = &native_result {
                     if !native_error_reported {
                         let _ = sink.send_event(SessionEvent {
-                            session_id: controller.observer.session_id().into(), event: "backend_event".into(),
+                            session_id: controller.observer.session_id().into(), event: "provider_event".into(),
                             payload: json!({"kind":"error","text":format!("Native goal synchronization failed and will retry: {error:#}")}),
                         }).await;
                     }
@@ -397,7 +398,7 @@ impl SessionController {
                     Err(error) => {
                         let _ = sink.send_event(SessionEvent {
                             session_id: controller.catalog_request.read().await.harness_session_id.clone(),
-                            event: "backend_event".into(),
+                            event: "provider_event".into(),
                             payload: json!({"kind":"error","text":format!("Input delivery failed: {error:#}")}),
                         }).await;
                         false
@@ -417,18 +418,17 @@ impl SessionController {
                             }
                             Some(Err(error)) => {
                                 let Some(controller) = owner.upgrade() else { break };
-                                if let Some(id) = job_owner.remove(&error.id()) {
-                                    if let Err(failure) = controller.input_failure(&id, format!("Input worker failed: {error}"), &sink).await {
+                                if let Some(id) = job_owner.remove(&error.id())
+                                    && let Err(failure) = controller.input_failure(&id, format!("Input worker failed: {error}"), &sink).await {
                                         let _ = sink.send_event(SessionEvent {
                                             session_id: controller.catalog_request.read().await.harness_session_id.clone(),
-                                            event: "backend_event".into(),
+                                            event: "provider_event".into(),
                                             payload: json!({"kind":"error","text":format!("Could not reconcile failed input worker: {failure:#}")}),
                                         }).await;
-                                    }
                                 }
                                 let _ = sink.send_event(SessionEvent {
                                     session_id: controller.catalog_request.read().await.harness_session_id.clone(),
-                                    event: "backend_event".into(),
+                                    event: "provider_event".into(),
                                     payload: json!({"kind":"error","text":format!("Input worker failed: {error}")}),
                                 }).await;
                             }
@@ -456,43 +456,43 @@ impl SessionController {
             let session = SqliteStore::read_only(&self.data_root)?
                 .load_session(self.observer.session_id())?
                 .context("native goal session is missing")?;
-            let Some(backend_session_id) = session.backend_session_id.clone() else {
+            let Some(provider_session_id) = session.provider_session_id.clone() else {
                 return Ok(());
             };
-            let desired = self.native_goal_selection(backend_session_id.clone())?;
+            let desired = self.native_goal_selection(provider_session_id.clone())?;
             if applied.as_ref() == Some(&desired) {
                 return Ok(());
             }
-            let request = crate::backend::BackendRequest {
+            let request = crate::provider::ProviderRequest {
                 execution_owner: None,
                 harness_session_id: session.id,
                 workspace: session.workspace,
-                input: crate::backend::BackendInput::from_text(""),
-                mode: crate::backend::PromptMode::GoalContinuation,
+                input: crate::provider::ProviderInput::from_text(""),
+                mode: crate::provider::PromptMode::GoalContinuation,
                 model: session.model,
                 effort: session.effort,
                 context_window: session.context_window,
                 service_tier: session.service_tier,
                 access: session.access,
                 approval_mode: session.approval_mode,
-                backend_session_id: Some(backend_session_id),
+                provider_session_id: Some(provider_session_id),
                 submission: None,
                 recovered_input: Vec::new(),
                 control_context: None,
             };
             // Apply only a still-current selection, without holding state guards across I/O.
-            if self.native_goal_selection(desired.backend_session_id.clone())? != desired {
+            if self.native_goal_selection(desired.provider_session_id.clone())? != desired {
                 continue;
             }
-            self.backend
+            self.provider
                 .goal_status(request, desired.update.clone())
                 .await?;
             // A stale acknowledgment cannot authorize input or mark its old state applied.
             let current_session = SqliteStore::read_only(&self.data_root)?
                 .load_session(self.observer.session_id())?
                 .context("native goal session is missing")?;
-            if current_session.backend_session_id.as_deref() != Some(&desired.backend_session_id)
-                || self.native_goal_selection(desired.backend_session_id.clone())? != desired
+            if current_session.provider_session_id.as_deref() != Some(&desired.provider_session_id)
+                || self.native_goal_selection(desired.provider_session_id.clone())? != desired
             {
                 continue;
             }
@@ -502,9 +502,9 @@ impl SessionController {
     }
 
     /// Preserve suspended native tasks instead of treating them as deleted goals.
-    fn native_goal_selection(&self, backend_session_id: String) -> Result<NativeGoalSelection> {
-        use crate::backend::NativeGoalUpdate;
+    fn native_goal_selection(&self, provider_session_id: String) -> Result<NativeGoalSelection> {
         use crate::plan::PlanExecutionState;
+        use crate::provider::NativeGoalUpdate;
         use crate::task::WorkflowSnapshot;
         let task = self.task_controller.current()?;
         let question_gate = self.questions_block_work()?;
@@ -518,7 +518,7 @@ impl SessionController {
                     } else {
                         goal.state
                     };
-                    NativeGoalUpdate::from_goal(goal.objective.clone(), state)
+                    native_goal_update(goal.objective.clone(), state)
                 }
                 WorkflowSnapshot::Execute { execution } if execution.native => {
                     let state = match execution.record.state {
@@ -532,7 +532,7 @@ impl SessionController {
                         PlanExecutionState::Blocked => crate::goal::GoalState::Blocked,
                         PlanExecutionState::Cancelled => crate::goal::GoalState::Cleared,
                     };
-                    NativeGoalUpdate::from_goal(execution.title.clone(), state)
+                    native_goal_update(execution.title.clone(), state)
                 }
                 WorkflowSnapshot::Goal { .. }
                 | WorkflowSnapshot::Execute { .. }
@@ -541,7 +541,7 @@ impl SessionController {
             None => NativeGoalUpdate::Absent,
         };
         Ok(NativeGoalSelection {
-            backend_session_id,
+            provider_session_id,
             revision: task.map(|task| task.revision.clone()),
             update,
         })
@@ -642,10 +642,10 @@ impl SessionController {
         let admission = self.coordinator.execution.clone().try_acquire_owned().ok();
         let steering_available = admission.is_none()
             && steering.available_permits() > 0
-            && jobs.len() < crate::backend::SteeringLane::CAPACITY
+            && jobs.len() < crate::provider::SteeringLane::CAPACITY
             && (self.parent_input.is_active()
                 || snapshot.native_steer
-                    && self.backend.has_active_turn(&snapshot.session.id).await);
+                    && self.provider.has_active_turn(&snapshot.session.id).await);
         if command.is_none()
             && steering_available
             && message.intent == InputIntent::Queue
@@ -740,7 +740,7 @@ impl SessionController {
             && message.config.is_none()
             && match &message.purpose {
                 crate::input::InputPurpose::TaskEntry { start, .. } => {
-                    self.backend.supports_task_steering(start.kind)
+                    self.provider.supports_task_steering(start.kind)
                 }
                 crate::input::InputPurpose::TaskContinuation { .. }
                 | crate::input::InputPurpose::QuestionContinuation { .. } => false,
@@ -787,13 +787,13 @@ impl SessionController {
                 if let Err(persistence) = controller.input_failure(&message.id, diagnostic.clone(), &sink).await {
                         let _ = sink.send_event(SessionEvent {
                             session_id: controller.catalog_request.read().await.harness_session_id.clone(),
-                            event: "backend_event".into(),
+                            event: "provider_event".into(),
                             payload: json!({"kind":"error","text":format!("Input failed: {error:#}; recording the failure also failed: {persistence:#}")}),
                         }).await;
                 } else {
                     let _ = sink.send_event(SessionEvent {
                         session_id: controller.catalog_request.read().await.harness_session_id.clone(),
-                        event: "backend_event".into(),
+                        event: "provider_event".into(),
                         payload: json!({"kind":"error","text":diagnostic}),
                     }).await;
                 }
@@ -881,7 +881,7 @@ impl SessionController {
                 Ok::<(), anyhow::Error>(())
             }.await;
             if let Err(error) = result {
-                let _ = sink.send_event(SessionEvent { session_id:session_id.clone(), event:"backend_event".into(),
+                let _ = sink.send_event(SessionEvent { session_id:session_id.clone(), event:"provider_event".into(),
                     payload:json!({"kind":"error","text":format!("Execution checks failed: {error:#}")}) }).await;
             }
             drop(broker);
@@ -1058,7 +1058,7 @@ impl SessionController {
             drop(admission);
             if let Err(error) = result {
                 let _ = sink.send_event(SessionEvent {
-                    session_id, event: "backend_event".into(),
+                    session_id, event: "provider_event".into(),
                     payload: json!({"kind":"error","text":format!("Queue completion checks failed: {error:#}")}),
                 }).await;
             }
@@ -1083,7 +1083,7 @@ impl SessionController {
             if matches!(
                 message.purpose,
                 crate::input::InputPurpose::TaskEntry { .. }
-            ) && let Err(activation) = submission.reconcile(self.backend.as_ref()).await
+            ) && let Err(activation) = submission.reconcile(self.provider.as_ref()).await
             {
                 return self
                     .publish_input(
@@ -1207,9 +1207,9 @@ impl SessionController {
             .await?;
             return Ok(());
         }
-        let input = crate::backend::BackendInput::from_text(message.text.clone())
+        let input = crate::provider::ProviderInput::from_text(message.text.clone())
             .with_attachments(attachments.clone());
-        let provider = self.backend.descriptor().kind;
+        let provider = self.provider.descriptor().kind;
         let message_id = message.id.clone();
         let task_input_id = match &message.purpose {
             crate::input::InputPurpose::TaskEntry { id, .. }
@@ -1309,13 +1309,13 @@ impl SessionController {
         let result = if steer {
             let input =
                 if let crate::input::InputPurpose::TaskEntry { start, .. } = &message.purpose {
-                    crate::backend::SteeringInput::TaskEntry {
+                    crate::provider::SteeringInput::TaskEntry {
                         start: start.clone(),
                         text: message.text.clone(),
                         submission: submission.clone(),
                     }
                 } else {
-                    crate::backend::SteeringInput::User {
+                    crate::provider::SteeringInput::User {
                         text: message.text.clone(),
                         attachments,
                         submission: Some(submission.clone()),
@@ -1326,7 +1326,7 @@ impl SessionController {
                 if self.parent_input.is_active() {
                     self.parent_input.steer(input).await
                 } else {
-                    self.backend
+                    self.provider
                         .steer_session(&catalog.harness_session_id, input)
                         .await
                 }
@@ -1396,7 +1396,7 @@ impl SessionController {
                         )
                     } else {
                         (
-                            "backend_event",
+                            "provider_event",
                             crate::broker::publication::encode_session_update(&event)?,
                         )
                     };
@@ -1458,7 +1458,7 @@ impl SessionController {
                 "input.catalog_pending",
                 json!({"message_id":message.id}),
             );
-            *self.catalog_request.write().await = broker.backend_catalog_request();
+            *self.catalog_request.write().await = broker.provider_catalog_request();
             drop(broker);
             self.trace.record(
                 &catalog.harness_session_id,
@@ -1521,7 +1521,7 @@ impl SessionController {
         steer: bool,
         sink: &MessageSender,
     ) -> Result<()> {
-        let record = submission.reconcile(self.backend.as_ref()).await?;
+        let record = submission.reconcile(self.provider.as_ref()).await?;
         if matches!(
             message.purpose,
             crate::input::InputPurpose::TaskEntry { .. }
@@ -1552,7 +1552,7 @@ impl SessionController {
         {
             sink.send_event(SessionEvent {
                 session_id: record.request.harness_session_id.clone(),
-                event: "backend_event".into(),
+                event: "provider_event".into(),
                 payload: json!({"kind":"error","text":error}),
             })
             .await?;
@@ -1563,7 +1563,7 @@ impl SessionController {
                 if steer
                     && !self.parent_input.is_active()
                     && !self
-                        .backend
+                        .provider
                         .has_active_turn(&record.request.harness_session_id)
                         .await =>
             {

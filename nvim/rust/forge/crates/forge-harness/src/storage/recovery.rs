@@ -21,9 +21,9 @@ impl SqliteStore {
         for payload in session_event {
             let mut event: crate::timeline::SessionEventRecord = serde_json::from_str(&payload)?;
             if let crate::timeline::SessionEventKind::Compaction { compaction } = &mut event.detail
-                && compaction.state == crate::backend::CompactionState::Running
+                && compaction.state == crate::provider::CompactionState::Running
             {
-                compaction.state = crate::backend::CompactionState::Unconfirmed;
+                compaction.state = crate::provider::CompactionState::Unconfirmed;
                 compaction.result.error =
                     Some("Runtime stopped before compaction completion was confirmed".into());
                 transaction.execute(
@@ -213,7 +213,7 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+    use crate::provider::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
     use crate::session::SessionStore;
     use serde_json::json;
 

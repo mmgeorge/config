@@ -1,7 +1,7 @@
 local M = {}
 
 local builder = require("forge.builder")
-local backend_preference = require("forge.harness.backend_preference")
+local provider_preference = require("forge.harness.provider_preference")
 local config = require("forge.infra.config")
 local notifications = require("forge.infra.notifications")
 local protocol = require("forge.protocol")
@@ -29,7 +29,7 @@ local send_request
 ---@field auto_compaction? {enabled: boolean, threshold_tokens: integer}
 
 ---@class ForgeTextGenerationConfig
----@field backend {kind: string, command: string[]}
+---@field provider {kind: string, command: string[]}
 ---@field model string
 ---@field reasoning_effort? string
 ---@field service_tier? 'default'|'fast'|'ultrafast'
@@ -173,14 +173,14 @@ local function host_write_request(id, method, params, session_id)
   end
 end
 
----@return ForgeHarnessBackendDescriptor
-local function session_backend_descriptor()
+---@return ForgeHarnessProviderDescriptor
+local function session_provider_descriptor()
   local harness_config = config.options.harness
-  local backend = harness_config.backend
-  local configured = harness_config.backends[backend]
-  assert(configured, "Unknown Harness backend: " .. tostring(backend))
+  local provider = harness_config.provider
+  local configured = harness_config.providers[provider]
+  assert(configured, "Unknown Harness provider: " .. tostring(provider))
   return {
-    kind = backend,
+    kind = provider,
     command = vim.deepcopy(configured.command or {}),
     permission_note = "Forge owns approval rules. Provider capabilities describe isolation support.",
   }
@@ -530,10 +530,10 @@ local function session_send_initialize(callback, initialize_options, startup)
   local client = host_state()
   local mode = initialize_options and initialize_options.services_only and "runtime" or "harness"
   local harness_config = config.options.harness
-  if not config.harness_backend_explicit and not session.harness.session then
-    harness_config.backend = backend_preference.load(harness_config.backends, harness_config.backend)
+  if not config.harness_provider_explicit and not session.harness.session then
+    harness_config.provider = provider_preference.load(harness_config.providers, harness_config.provider)
   end
-  local descriptor = session_backend_descriptor()
+  local descriptor = session_provider_descriptor()
   local function initialized(result, request_error, error_detail)
     if startup then startup.mark("harness.initialize.received", { error = request_error,
       session_id = result and result.session and result.session.id,
@@ -561,9 +561,9 @@ local function session_send_initialize(callback, initialize_options, startup)
       session_finish_initialize(mode, callback, result, nil)
     end)
   end
-  local backend_launch_by_provider = {}
-  for provider, backend in pairs(harness_config.backends) do
-    backend_launch_by_provider[provider] = { kind = provider, command = vim.deepcopy(backend.command or {}) }
+  local provider_launch_by_provider = {}
+  for kind, provider in pairs(harness_config.providers) do
+    provider_launch_by_provider[kind] = { kind = kind, command = vim.deepcopy(provider.command or {}) }
   end
   local params = {
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
@@ -572,8 +572,8 @@ local function session_send_initialize(callback, initialize_options, startup)
     permission_file = vim.fs.joinpath(vim.fn.stdpath("config"), "forge", "permissions.json"),
     workspace = vim.fn.getcwd(),
     client_id = ("nvim-%s-%s"):format(vim.fn.getpid(), vim.uv.hrtime()),
-    backend = { kind = descriptor.kind, command = descriptor.command },
-    backend_launch_by_provider = backend_launch_by_provider,
+    provider = { kind = descriptor.kind, command = descriptor.command },
+    provider_launch_by_provider = provider_launch_by_provider,
     model = harness_config.model,
     effort = harness_config.effort,
     goal_max_turns = harness_config.goal_max_turns,
@@ -881,19 +881,19 @@ end
 function M.generation_get_config(selection)
   local harness_config = config.options.harness
   local selected = session.harness.session
-  local backend = selected and selected.backend or harness_config.backend
-  if not selected and not config.harness_backend_explicit then
-    backend = backend_preference.load(harness_config.backends, backend)
+  local provider = selected and selected.provider or harness_config.provider
+  if not selected and not config.harness_provider_explicit then
+    provider = provider_preference.load(harness_config.providers, provider)
   end
-  local configured = harness_config.backends[backend]
-  if not configured then return nil, "Unknown Harness backend: " .. tostring(backend) end
-  selection = selection or (config.options.background_generation or {})[backend]
+  local configured = harness_config.providers[provider]
+  if not configured then return nil, "Unknown Harness provider: " .. tostring(provider) end
+  selection = selection or (config.options.background_generation or {})[provider]
   if selection and (type(selection) ~= "table" or type(selection.model) ~= "string" or vim.trim(selection.model) == "") then
-    return nil, "Invalid Background-generation model for backend: " .. backend
+    return nil, "Invalid Background-generation model for provider: " .. provider
   end
   ---@type ForgeTextGenerationConfig
   local generation = {
-    backend = { kind = backend, command = vim.deepcopy(configured.command or {}) },
+    provider = { kind = provider, command = vim.deepcopy(configured.command or {}) },
     model = selection and selection.model or (selected and selected.model or harness_config.model),
     reasoning_effort = selection and selection.reasoning_effort,
     service_tier = selection and selection.service_tier or "default",
@@ -913,7 +913,7 @@ function M.generation_request(params, callback, on_model, selection)
   if not generation then callback(nil, failure) return function() end end
   if on_model then
     local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
-    on_model(generation.model .. effort .. " (" .. generation.backend.kind .. ")")
+    on_model(generation.model .. effort .. " (" .. generation.provider.kind .. ")")
   end
   local label = generation.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
   local owner, finished = host_state(), false

@@ -88,7 +88,7 @@ client.request = function(request_specification, callback)
 end
 local success, failure = xpcall(function()
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab = require("forge.views.harness.layout").open("native-controller")
-  state.session = { id = "native-controller", backend = "mock", provider_label = "Mock CLI", model = "mock", approval_mode = "ask" }
+  state.session = { id = "native-controller", provider = "mock", provider_label = "Mock CLI", model = "mock", approval_mode = "ask" }
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "native draft" })
   state.initial_snapshot_pending = true
   controller.attach()
@@ -174,7 +174,7 @@ local success, failure = xpcall(function()
   end
   receive("state_invalidated", {}, "native-controller")
   local stale_snapshot = pending_snapshot
-  receive("backend_event", { kind = "approval_requested", data = permission }, "native-controller")
+  receive("provider_event", { kind = "approval_requested", data = permission }, "native-controller")
   assert(vim.wait(1000, approval_view.is_open), "approval did not open")
   stale_snapshot(approval_snapshot({}))
   assert(#state.approval == 1 and pending_snapshot ~= stale_snapshot,
@@ -194,7 +194,7 @@ local success, failure = xpcall(function()
   controller.reopen_question()
   assert(approval_view.is_open(), "explicit reopen must restore the pending approval")
   vim.fn.maparg("q", "n", false, true).callback()
-  receive("backend_event", { kind = "approval_cancelled", data = { id = permission.id } }, "native-controller")
+  receive("provider_event", { kind = "approval_cancelled", data = { id = permission.id } }, "native-controller")
   assert(#state.approval == 0 and not state.dismissed_approval_id)
   client.request = snapshot_request
   assert(vim.wo[state.transcript_win].breakindent, "native attachment discarded Harness continuation indentation")
@@ -395,25 +395,25 @@ local success, failure = xpcall(function()
   assert(state.status_thoughts == false and state.busy,
     "a superseded status thought response changed the preference or interrupted work")
   state.session.model, state.session.resolved_model = "default", nil
-  receive("backend_event", { kind = "runtime_resolved", data = {
+  receive("provider_event", { kind = "runtime_resolved", data = {
     session_id = "native-controller", provider = "Mock CLI", model = "resolved-model",
   } }, "native-controller")
   title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str
   assert(title:find("resolved-model", 1, true) and not title:find("resolving model", 1, true),
     "running session did not publish the resolved model immediately")
-  receive("backend_event", { kind = "runtime_resolved", data = {
+  receive("provider_event", { kind = "runtime_resolved", data = {
     session_id = "other-session", model = "wrong-model",
   } }, "native-controller")
   assert(state.session.resolved_model == "resolved-model", "foreign runtime replaced the active model")
   state.session.model, state.session.resolved_model = "mock", nil
   state.recap = { text = "Old recap" }
-  receive("backend_event", { kind = "turn_started" }, "native-controller")
+  receive("provider_event", { kind = "turn_started" }, "native-controller")
   assert(state.recap == nil and state.busy, "provider continuation retained recap or changed busy state")
   controller.refresh_winbar()
   assert(vim.wo[state.composer_win].winbar == "", "busy composer restored key hints")
-  receive("backend_event", { kind = "execution_state", data = {
-    session = { id = "native-controller", backend = "mock", model = "mock", approval_mode = "ask",
+  receive("provider_event", { kind = "execution_state", data = {
+    session = { id = "native-controller", provider = "mock", model = "mock", approval_mode = "ask",
       active_task = { revision = "execution", kind = "execute", phase = "implement", status = "running", execution = {
         title = "Implement the design", record = { state = "active", phase = "implement" } } } },
   } }, "native-controller")
@@ -495,8 +495,8 @@ local success, failure = xpcall(function()
   assert(submitted and submitted.action.kind == "submit" and submitted.action.message.text == "native draft")
   assert(#state.queue == 0 and #state.pending_steer == 0 and #state.pending_submit == 1,
     "idle Ctrl-S entered a queue instead of submitting directly")
-  assert(not require("forge.views.harness").backend_switch_available(),
-    "direct submission lost the pending-input backend-switch guard")
+  assert(not require("forge.views.harness").provider_switch_available(),
+    "direct submission lost the pending-input provider-switch guard")
   assert(vim.wait(2500, function() return sync_count > sync_before_submission end, 20),
     "optimistic submission did not refresh the native transcript")
   assert(#staged_request.queue == 0 and #staged_request.steering == 0, "idle submission flashed in the visual queue")
@@ -617,7 +617,7 @@ local success, failure = xpcall(function()
   assert(picker_state.selected_option(picker_instance.state,picker_instance.spec).value.run.id == "child")
   local updated_agent = vim.deepcopy(state.agent)
   updated_agent.summary.child = { state = "running", tool_count = 7, failed_count = 1 }
-  receive("backend_event", {kind="agent_updated",data=updated_agent},"native-controller")
+  receive("provider_event", {kind="agent_updated",data=updated_agent},"native-controller")
   picker_instance = picker._state_for_test()
   local selected = picker_state.selected_option(picker_instance.state,picker_instance.spec)
   assert(selected.value.run.id == "child" and selected.detail:find("7 tools called (1 failed)",1,true),
@@ -628,7 +628,7 @@ local success, failure = xpcall(function()
   child_permission.provider = "Codex"
   child_permission.execution_owner = {session_id="native-controller",agent_id="child"}
   state.selected_agent_run_id = "different-child"
-  receive("backend_event", {kind="approval_requested",data=child_permission},"native-controller")
+  receive("provider_event", {kind="approval_requested",data=child_permission},"native-controller")
   assert(vim.wait(1000,approval_view.is_open))
   picker_instance = picker._state_for_test()
   local approval_page = picker_state.page(picker_instance.state,picker_instance.spec)
@@ -638,20 +638,20 @@ local success, failure = xpcall(function()
   vim.fn.maparg(interrupt_key,"n",false,true).callback()
   assert(child_request[#child_request].params.target == "child",
     "approval interruption must ignore the selected timeline and target its owner")
-  receive("backend_event", {kind="approval_cancelled",data={id=child_permission.id}},"native-controller")
+  receive("provider_event", {kind="approval_cancelled",data={id=child_permission.id}},"native-controller")
   local original_transition = controller.task_transition
   local root_interruption
   controller.task_transition = function(action) root_interruption=action end
   local root_permission = vim.deepcopy(permission)
   root_permission.id = "root-approval"
   root_permission.execution_owner = {session_id="native-controller",agent_id="native-controller:agent:primary"}
-  receive("backend_event", {kind="approval_requested",data=root_permission},"native-controller")
+  receive("provider_event", {kind="approval_requested",data=root_permission},"native-controller")
   assert(vim.wait(1000,approval_view.is_open))
   vim.fn.maparg(interrupt_key,"n",false,true).callback()
   assert(root_interruption and root_interruption.action == "pause",
     "root approval interruption must remain root-owned while a child is selected")
   controller.task_transition = original_transition
-  receive("backend_event", {kind="approval_cancelled",data={id=root_permission.id}},"native-controller")
+  receive("provider_event", {kind="approval_cancelled",data={id=root_permission.id}},"native-controller")
   client.request = original_plain_request
   client.request = child_request_for
   state.busy, state.task_operation, state.task_config = true, nil, nil

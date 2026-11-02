@@ -11,7 +11,7 @@ local session_navigation = require("forge.views.harness.session_navigation")
 local active = nil
 
 ---@class ForgeHarnessSessionPickerOptions
----@field backend? string
+---@field provider? string
 ---@field on_select? fun(entry: table)
 ---@field on_cancel? fun()
 
@@ -24,7 +24,7 @@ local function option(entry, scope)
   local current_session = session.harness.session or {}
   local label = current_session.id == entry.id and (name .. " (current)") or name
   local mode = entry.approval_mode or "ask"
-  local columns = { datetime.relative_ms(entry.created_at_ms), label, entry.backend or "", mode }
+  local columns = { datetime.relative_ms(entry.created_at_ms), label, entry.provider or "", mode }
   if scope == "all" then columns[#columns + 1] = entry.workspace or "" end
   return {
     id = entry.id,
@@ -70,8 +70,8 @@ local function resume_session(instance, entry)
     notifications.warn("Cross-worktree sessions are history-only. Open Harness from that worktree to resume.", "ForgeSessions")
     return
   end
-  if entry.backend ~= (instance.backend or current_session.backend) then
-    notifications.warn("This session uses a different configured backend.", "ForgeSessions")
+  if entry.provider ~= (instance.provider or current_session.provider) then
+    notifications.warn("This session uses a different configured provider.", "ForgeSessions")
     return
   end
   picker.close(false)
@@ -120,18 +120,18 @@ build_spec = function(instance)
     page_list = {
       {
         id = "sessions",
-        title = instance.backend and "Resume Session" or "Select Session",
+        title = instance.provider and "Resume Session" or "Select Session",
         column_headers = column_headers,
-        header_right = instance.backend or ("Search: " .. scope_label .. " | Open: " .. open_label),
+        header_right = instance.provider or ("Search: " .. scope_label .. " | Open: " .. open_label),
         option_list = option_list,
         wrap_selection = false,
         empty_text = "No matching Harness sessions.",
         search = { start_in_normal = true },
-        footer = instance.backend and "↑↓ select  / search  Enter resume  q back"
+        footer = instance.provider and "↑↓ select  / search  Enter resume  q back"
           or "↑↓ select  / search  Enter open  Tab toggle tab  C-j delete  C-o scope  q close",
       },
     },
-    action_list = instance.backend and {} or {
+    action_list = instance.provider and {} or {
       {
         id = "open-mode",
         key = "<Tab>",
@@ -182,14 +182,14 @@ load_session_list = function(instance)
     if active ~= instance or generation ~= instance.list_generation then return end
     if request_error then
       notifications.error(request_error, "ForgeSessions")
-      if instance.backend then
+      if instance.provider then
         active = nil
         if instance.on_cancel then vim.schedule(instance.on_cancel) end
       end
       return
     end
     instance.entry_list = vim.tbl_filter(function(entry)
-      return not instance.backend or (entry.backend == instance.backend and same_workspace(entry.workspace, instance.workspace))
+      return not instance.provider or (entry.provider == instance.provider and same_workspace(entry.workspace, instance.workspace))
     end, result or {})
     if picker.is_open("sessions") then
       picker.update(build_spec(instance))
@@ -216,7 +216,7 @@ function SessionPicker.open(host, options)
     entry_list = {},
     list_generation = 0,
     preview_generation = 0,
-    backend = options.backend,
+    provider = options.provider,
     workspace = session.harness.session and session.harness.session.workspace,
     on_select = options.on_select,
     on_cancel = options.on_cancel,

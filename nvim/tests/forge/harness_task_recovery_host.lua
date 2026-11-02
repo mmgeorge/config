@@ -85,7 +85,7 @@ end
 local success, failure = xpcall(function()
   vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   local initial = open()
   local session_id = initial.session.id
   local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")

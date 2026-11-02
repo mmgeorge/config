@@ -19,7 +19,7 @@ local function invoke(key, mode)
 end
 
 local ok, failure = pcall(function()
-  forge.setup({ walkthrough_inventory = "sem", harness = { backend = "mock" } })
+  forge.setup({ walkthrough_inventory = "sem", harness = { provider = "mock" } })
   local layout = require("forge.views.picker.layout")
   local picker_input = require("forge.views.picker.input")
   local picker_state = require("forge.views.picker.state")

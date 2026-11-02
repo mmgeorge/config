@@ -1,11 +1,13 @@
-use forge_harness::backend::codex::CodexBackend;
-use forge_harness::backend::{
-    AgentUpdate, Backend, BackendCatalogRequest, BackendEvent, BackendForkRequest, BackendInput,
-    BackendLaunch, BackendRequest, InvocationScope, MessageAddress, MessageClassification,
-    MessageRole, MessageUpdate, PromptMode, ToolActivityKind, ToolOutcome, ToolUpdate, TurnUpdate,
-};
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::plan::PlanPrompt;
+use forge_harness::provider::ProviderAdapter as _;
+use forge_harness::provider::codex::CodexProvider;
+use forge_harness::provider::{
+    AgentUpdate, InvocationScope, MessageAddress, MessageClassification, MessageRole,
+    MessageUpdate, PromptMode, ProviderCatalogRequest, ProviderEvent, ProviderForkRequest,
+    ProviderInput, ProviderLaunch, ProviderRequest, ToolActivityKind, ToolOutcome, ToolUpdate,
+    TurnUpdate,
+};
 use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
 use std::collections::HashMap;
@@ -22,20 +24,20 @@ fn git(workspace: &Path, args: &[&str]) {
     assert!(status.success(), "git {} failed", args.join(" "));
 }
 
-fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
-    BackendRequest {
+fn request(workspace: &Path, mode: PromptMode, text: &str) -> ProviderRequest {
+    ProviderRequest {
         execution_owner: None,
         harness_session_id: "harness-session".into(),
         workspace: workspace.to_string_lossy().into_owned(),
-        input: BackendInput::from_text(text),
+        input: ProviderInput::from_text(text),
         mode,
         model: "gpt-5.6-terra".into(),
         effort: "low".into(),
         context_window: None,
-        service_tier: forge_harness::backend::ServiceTier::Fast,
+        service_tier: forge_harness::provider::ServiceTier::Fast,
         access: Default::default(),
         approval_mode: ApprovalMode::Ask,
-        backend_session_id: None,
+        provider_session_id: None,
         submission: None,
         recovered_input: Vec::new(),
         control_context: None,
@@ -43,10 +45,10 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
 }
 
 fn observe_assistant_text(
-    event: &BackendEvent,
+    event: &ProviderEvent,
     classification: &mut HashMap<MessageAddress, MessageClassification>,
 ) -> bool {
-    let BackendEvent::Message { address, update } = event else {
+    let ProviderEvent::Message { address, update } = event else {
         return false;
     };
     match update {
@@ -72,13 +74,13 @@ fn observe_assistant_text(
 
 #[tokio::test]
 #[ignore = "requires an installed and authenticated Codex CLI"]
-async fn lists_backend_owned_codex_model_metadata() {
+async fn lists_provider_owned_codex_model_metadata() {
     let repository = tempfile::tempdir().unwrap();
-    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
 
     let model_list = tokio::time::timeout(
         Duration::from_secs(30),
-        backend.model_list(request(repository.path(), PromptMode::Chat, "")),
+        provider.model_list(request(repository.path(), PromptMode::Chat, "")),
     )
     .await
     .expect("Codex model list timed out")
@@ -99,19 +101,19 @@ async fn lists_backend_owned_codex_model_metadata() {
 #[ignore = "requires authenticated Codex and configured skills and MCP servers"]
 async fn lists_provider_skills_and_complete_mcp_rows() {
     let repository = tempfile::tempdir().unwrap();
-    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
-    let catalog_request = BackendCatalogRequest {
+    let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let catalog_request = ProviderCatalogRequest {
         execution_owner: None,
         harness_session_id: "catalog-session".into(),
         workspace: repository.path().to_string_lossy().into_owned(),
         access: Default::default(),
         approval_mode: ApprovalMode::Ask,
-        backend_session_id: None,
+        provider_session_id: None,
     };
 
     let skill_list = tokio::time::timeout(
         Duration::from_secs(30),
-        backend.skill_list(catalog_request.clone()),
+        provider.skill_list(catalog_request.clone()),
     )
     .await
     .expect("Codex skill list timed out")
@@ -119,7 +121,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
     assert!(!skill_list.is_empty());
     assert!(skill_list.iter().all(|skill| !skill.name.is_empty()));
     assert!(skill_list.iter().all(|skill| skill.path.is_some()));
-    let process_id = backend
+    let process_id = provider
         .app_server_process_id()
         .await
         .expect("Codex app-server PID");
@@ -128,7 +130,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
     new_session_catalog_request.harness_session_id = "new-catalog-session".into();
     let mcp_list = tokio::time::timeout(
         Duration::from_secs(30),
-        backend.mcp_list(new_session_catalog_request),
+        provider.mcp_list(new_session_catalog_request),
     )
     .await
     .expect("Codex MCP list timed out")
@@ -142,17 +144,17 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
             .iter()
             .all(|server| server.tools.iter().all(|tool| !tool.name.is_empty()))
     );
-    let fork = backend
-        .fork(BackendForkRequest {
+    let fork = provider
+        .fork(ProviderForkRequest {
             source: request(repository.path(), PromptMode::Chat, ""),
             target_harness_session_id: "prepared-fork-session".into(),
             checkpoint_id: None,
         })
         .await
         .unwrap();
-    assert!(!fork.backend_session_id.is_empty());
-    assert_eq!(backend.app_server_process_id().await, Some(process_id));
-    assert_eq!(backend.app_server_start_count(), 1);
+    assert!(!fork.provider_session_id.is_empty());
+    assert_eq!(provider.app_server_process_id().await, Some(process_id));
+    assert_eq!(provider.app_server_start_count(), 1);
 }
 
 #[tokio::test]
@@ -176,16 +178,16 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     git(repository.path(), &["add", "."]);
     git(repository.path(), &["commit", "-qm", "seed"]);
 
-    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
-    backend
+    let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    provider
         .model_list(request(repository.path(), PromptMode::Chat, ""))
         .await
         .unwrap();
-    let process_id = backend
+    let process_id = provider
         .app_server_process_id()
         .await
         .expect("Codex app-server PID");
-    let answer_request = BackendRequest {
+    let answer_request = ProviderRequest {
         execution_owner: None,
         model: "default".into(),
         ..request(
@@ -194,10 +196,10 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
             "What is this repo? Answer in one sentence after reading README.md.",
         )
     };
-    let (answer_event_sink, mut answer_event_stream) = forge_harness::backend::events::channel(
+    let (answer_event_sink, mut answer_event_stream) = forge_harness::provider::events::channel(
         InvocationScope::new(answer_request.owner().unwrap(), "answer"),
     );
-    let mut answer_future = Box::pin(backend.prompt_stream(answer_request, answer_event_sink));
+    let mut answer_future = Box::pin(provider.prompt_stream(answer_request, answer_event_sink));
     let mut answer_events = Vec::new();
     let mut answer_classification = HashMap::new();
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -259,11 +261,11 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     assert!(
         answer_events
             .iter()
-            .any(|event| matches!(event, BackendEvent::Usage { update, .. }
+            .any(|event| matches!(event, ProviderEvent::Usage { update, .. }
             if update.usage.output.is_some_and(|output| output > 0))),
         "Codex should report final turn token usage"
     );
-    let model_list = backend
+    let model_list = provider
         .model_list(request(repository.path(), PromptMode::Chat, ""))
         .await
         .unwrap();
@@ -279,14 +281,14 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         ),
         r#"{"version":1,"plan_id":"plan","title":"Add harness integration marker","overview":"Planning in progress.","usage":null,"entity_changes":[],"flows":[],"tasks":[],"tests":[],"assumptions":[]}"#,
     );
-    let planning = backend.prompt(request(
+    let planning = provider.prompt(request(
         repository.path(),
         PromptMode::Plan,
         &planning_prompt,
     ));
     let steering = async {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        backend
+        provider
             .steer_session(
                 "harness-session",
                 "Include the literal marker `STEERING_CONSTRAINT_7B3D` in the plan Overview."
@@ -314,12 +316,12 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         "Execute the accepted plan now. Create harness-integration.txt containing exactly `verified` followed by a newline, then call goal_complete.",
     );
     execute.approval_mode = ApprovalMode::Allow;
-    execute.backend_session_id = planned.completion.backend_session_id.clone();
-    let (event_sink, mut event_stream) = forge_harness::backend::events::channel(
+    execute.provider_session_id = planned.completion.provider_session_id.clone();
+    let (event_sink, mut event_stream) = forge_harness::provider::events::channel(
         InvocationScope::new(execute.owner().unwrap(), "execution"),
     );
     let (executed, streamed_event_list) = tokio::time::timeout(Duration::from_secs(90), async {
-        let execution = backend.prompt_stream(execute.clone(), event_sink);
+        let execution = provider.prompt_stream(execute.clone(), event_sink);
         tokio::pin!(execution);
         let mut streamed_event_list = Vec::new();
         let mut stream_open = true;
@@ -350,7 +352,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let mut tool_change = HashMap::new();
     let mut tool_outcome = HashMap::new();
     for event in &streamed_event_list {
-        if let BackendEvent::Tool { address, update } = event {
+        if let ProviderEvent::Tool { address, update } = event {
             match update {
                 ToolUpdate::Requested { invocation } => {
                     tool_kind.insert(address.clone(), invocation.kind);
@@ -387,12 +389,12 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
             || executed.evidence.native_state == Some(forge_harness::goal::GoalState::Complete)
     );
 
-    execute.backend_session_id = executed.backend_session_id;
+    execute.provider_session_id = executed.native.provider_session_id;
     tokio::time::timeout(
         Duration::from_secs(10),
-        backend.goal_status(
+        provider.goal_status(
             execute.clone(),
-            forge_harness::backend::NativeGoalUpdate::from_goal(
+            forge_harness::provider::native_goal_update(
                 "Complete the plan".into(),
                 forge_harness::goal::GoalState::Paused,
             ),
@@ -403,9 +405,9 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .unwrap();
     tokio::time::timeout(
         Duration::from_secs(10),
-        backend.goal_status(
+        provider.goal_status(
             execute.clone(),
-            forge_harness::backend::NativeGoalUpdate::from_goal(
+            forge_harness::provider::native_goal_update(
                 "Complete the plan".into(),
                 forge_harness::goal::GoalState::Active,
             ),
@@ -416,9 +418,9 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .unwrap();
     tokio::time::timeout(
         Duration::from_secs(10),
-        backend.goal_status(
+        provider.goal_status(
             execute.clone(),
-            forge_harness::backend::NativeGoalUpdate::Absent,
+            forge_harness::provider::NativeGoalUpdate::Absent,
         ),
     )
     .await
@@ -426,7 +428,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .unwrap();
     let forked = tokio::time::timeout(
         Duration::from_secs(30),
-        backend.fork(BackendForkRequest {
+        provider.fork(ProviderForkRequest {
             source: execute,
             target_harness_session_id: "forked-harness-session".into(),
             checkpoint_id: None,
@@ -435,9 +437,9 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .await
     .expect("Codex fork timed out")
     .unwrap();
-    assert!(!forked.backend_session_id.trim().is_empty());
-    assert_eq!(backend.app_server_process_id().await, Some(process_id));
-    assert_eq!(backend.app_server_start_count(), 1);
+    assert!(!forked.provider_session_id.trim().is_empty());
+    assert_eq!(provider.app_server_process_id().await, Some(process_id));
+    assert_eq!(provider.app_server_start_count(), 1);
 }
 
 #[tokio::test]
@@ -446,21 +448,21 @@ async fn streams_structured_child_agent_lifecycle() {
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     fs::write(repository.path().join("README.md"), "# Child lifecycle\n").unwrap();
-    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
-    let mut backend_request = request(
+    let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let mut provider_request = request(
         repository.path(),
         PromptMode::Chat,
         "Spawn an explorer subagent to read README.md and report its heading. Wait for it to finish.",
     );
-    backend_request.approval_mode = ApprovalMode::Ask;
-    let output = tokio::time::timeout(Duration::from_secs(90), backend.prompt(backend_request))
+    provider_request.approval_mode = ApprovalMode::Ask;
+    let output = tokio::time::timeout(Duration::from_secs(90), provider.prompt(provider_request))
         .await
         .expect("Codex subagent turn exceeded 90 seconds")
         .unwrap();
     assert!(
         output.event.iter().any(|event| matches!(
             event,
-            BackendEvent::Agent {
+            ProviderEvent::Agent {
                 update: AgentUpdate::Lifecycle { .. },
                 ..
             }
@@ -472,7 +474,7 @@ async fn streams_structured_child_agent_lifecycle() {
         .event
         .iter()
         .filter_map(|event| match event {
-            BackendEvent::Agent {
+            ProviderEvent::Agent {
                 update: AgentUpdate::Lifecycle { event },
                 ..
             } => Some(event),
@@ -493,14 +495,14 @@ async fn streams_structured_child_agent_lifecycle() {
         .event
         .iter()
         .position(|event| {
-            matches!(event, BackendEvent::Turn {
+            matches!(event, ProviderEvent::Turn {
             address, update: TurnUpdate::Finished { .. },
         } if address.thread_id == child_thread_id)
         })
         .expect("the explorer must emit a terminal turn event for its provider identity");
     let parent_thread_id = output
         .completion
-        .backend_session_id
+        .provider_session_id
         .as_deref()
         .expect("the parent turn must preserve its provider thread identity");
     let mut message_classification = HashMap::new();
@@ -513,7 +515,7 @@ async fn streams_structured_child_agent_lifecycle() {
         .enumerate()
         .skip(child_completion_index + 1)
         .find_map(|(index, event)| {
-            matches!(event, BackendEvent::Message {
+            matches!(event, ProviderEvent::Message {
                 address, update: MessageUpdate::Completed { text },
             } if address.turn.thread_id == parent_thread_id
                 && message_classification.get(address).is_some_and(|classification| matches!(
@@ -530,7 +532,7 @@ async fn streams_structured_child_agent_lifecycle() {
         .enumerate()
         .skip(parent_response_index + 1)
         .find_map(|(index, event)| {
-            matches!(event, BackendEvent::Turn {
+            matches!(event, ProviderEvent::Turn {
                 address, update: TurnUpdate::Finished { .. },
             } if address.thread_id == parent_thread_id)
             .then_some(index)
@@ -557,13 +559,13 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
     .unwrap();
     let mut broker = HarnessBroker::initialize(InitializeRequest {
         background: None,
-        backend_launch_by_provider: Default::default(),
+        provider_launch_by_provider: Default::default(),
         config_dir: None,
         data_root: data_root.path().to_string_lossy().into_owned(),
         permission_file: None,
         workspace: repository.path().to_string_lossy().into_owned(),
         client_id: "real-local-code-explorer-test".into(),
-        backend: BackendLaunch {
+        provider: ProviderLaunch {
             kind: "codex".into(),
             command: vec!["codex".into(), "app-server".into()],
         },

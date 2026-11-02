@@ -176,7 +176,7 @@ impl SessionInputQueue {
     pub(crate) fn open(
         root: &std::path::Path,
         session_id: &str,
-        submissions: &Arc<crate::backend::submission::SubmissionStore>,
+        submissions: &Arc<crate::provider::submission::SubmissionStore>,
     ) -> Result<Self> {
         // Load active input independently of completed interaction history.
         let mut journal = journal::InputJournal::open(root, session_id)?;
@@ -208,21 +208,21 @@ impl SessionInputQueue {
                         "input submission belongs to another session"
                     );
                     match record.delivery {
-                        crate::backend::submission::SubmissionState::Accepted { .. } => {
+                        crate::provider::submission::SubmissionState::Accepted { .. } => {
                             message.delivery = InputDelivery::Accepted;
                         }
-                        crate::backend::submission::SubmissionState::Sending { .. } => {
+                        crate::provider::submission::SubmissionState::Sending { .. } => {
                             message.delivery = InputDelivery::Unknown;
                             message.error =
                                 Some("Delivery requires reconciliation before retry".into());
                         }
-                        crate::backend::submission::SubmissionState::Prepared => {
+                        crate::provider::submission::SubmissionState::Prepared => {
                             message.delivery = InputDelivery::Failed;
                             message.error = Some(
                                 "Interrupted before provider dispatch; retry explicitly".into(),
                             );
                         }
-                        crate::backend::submission::SubmissionState::Cancelled => {
+                        crate::provider::submission::SubmissionState::Cancelled => {
                             message.delivery = InputDelivery::Failed;
                             message.error =
                                 Some("Previous submission was cancelled; retry explicitly".into());

@@ -4,20 +4,22 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 
 use super::{AgentCommand, AgentCommandSender};
-use crate::backend::{Backend, BackendCompletion, BackendEvent, BackendRequest, ExecutionOwner};
+use crate::provider::{
+    ExecutionOwner, Provider, ProviderCompletion, ProviderEvent, ProviderRequest,
+};
 
 /// Runs one child turn without retaining a broker, storage, or presentation lock.
 pub struct AgentRuntime {
-    pub backend: Arc<dyn Backend>,
+    pub provider: Arc<Provider>,
     /// Applies the root session's deadline to each child tool and shell invocation.
     pub(crate) tool_timeout: crate::session::InputTimeout,
     /// Shared diagnostics for provider retry attempts and cancellation.
     pub(crate) trace: Arc<crate::trace::TraceStore>,
     /// Persistent submission journal shared by the child execution owner.
-    pub(crate) submission_store: Arc<crate::backend::submission::SubmissionStore>,
+    pub(crate) submission_store: Arc<crate::provider::submission::SubmissionStore>,
     /// Shares timeout feedback without crossing child conversation ownership.
-    pub permission: Arc<crate::backend::approval::PermissionCoordinator>,
-    pub request: BackendRequest,
+    pub permission: Arc<crate::provider::approval::PermissionCoordinator>,
+    pub request: ProviderRequest,
     pub task_id: String,
     pub cancellation: watch::Receiver<bool>,
     pub sender: AgentCommandSender,
@@ -33,14 +35,14 @@ impl AgentRuntime {
             "child runtime cannot own the root conversation"
         );
         // Subscribe before dispatch so retained child observations keep their original owner.
-        let scope = crate::backend::InvocationScope::new(owner.clone(), self.task_id.clone());
-        let (event_sink, event_stream) = crate::backend::events::channel(scope.clone());
-        let watchdog = Arc::new(crate::backend::tool_timeout::ToolWatchdog::new(
+        let scope = crate::provider::InvocationScope::new(owner.clone(), self.task_id.clone());
+        let (event_sink, event_stream) = crate::provider::events::channel(scope.clone());
+        let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
             self.tool_timeout,
         )?);
-        let event_sink = event_sink.supervise_tools(watchdog.clone());
+        let event_sink = event_sink.with_observer(watchdog.clone());
         let (session_events, subscription_error) =
-            match self.backend.session_event_stream(owner.clone()).await {
+            match self.provider.session_event_stream(owner.clone()).await {
                 Ok(stream) => (stream, None),
                 Err(error) => (None, Some(error)),
             };
@@ -58,11 +60,11 @@ impl AgentRuntime {
                 if request.submission.is_none() {
                     request.submission = Some(
                         self.submission_store
-                            .prepare(&request, self.backend.descriptor().kind)?,
+                            .prepare(&request, self.provider.descriptor().kind)?,
                     );
                 }
                 let result = async {
-            let prompt = crate::backend::retry::prompt(self.backend.as_ref(), request.clone(), Some(event_sink.clone()), &self.trace, &self.submission_store);
+            let prompt = crate::provider::retry::prompt(self.provider.as_ref(), request.clone(), Some(event_sink.clone()), &self.trace, &self.submission_store);
             tokio::pin!(prompt);
             loop {
                 if cancelled {break Err(anyhow::anyhow!("child task interrupted before dispatch"));}
@@ -70,11 +72,11 @@ impl AgentRuntime {
                     biased;
                     expired = watchdog.expired() => {
                         let expired = expired?.context("tool watchdog ended during child execution")?;
-                        self.publish(&owner, BackendEvent::Tool {
+                        self.publish(&owner, ProviderEvent::Tool {
                             address: expired.address.clone(),
-                            update: crate::backend::ToolUpdate::Finished {
-                                outcome: crate::backend::ToolOutcome::Failed {
-                                    diagnostic: crate::backend::ToolDiagnostic {
+                            update: crate::provider::ToolUpdate::Finished {
+                                outcome: crate::provider::ToolOutcome::Failed {
+                                    diagnostic: crate::provider::ToolDiagnostic {
                                         code: Some("tool_timeout".into()), message: expired.to_string(),
                                     },
                                 },
@@ -113,11 +115,11 @@ impl AgentRuntime {
                     break result;
                 };
                 if let Ok(output) = &result
-                    && output.backend_session_id.is_some()
+                    && output.provider_session_id.is_some()
                 {
-                    request.backend_session_id = output.backend_session_id.clone();
+                    request.provider_session_id = output.provider_session_id.clone();
                 }
-                request.input = crate::backend::BackendInput::from_text(feedback);
+                request.input = crate::provider::ProviderInput::from_text(feedback);
                 request.submission = None;
                 request.recovered_input.clear();
             }
@@ -132,7 +134,7 @@ impl AgentRuntime {
                 &owner,
                 tokio::time::timeout(
                     std::time::Duration::from_secs(2),
-                    self.backend.active_session_id_for(&runtime_key),
+                    self.provider.active_session_id_for(&runtime_key),
                 ),
             )
             .await;
@@ -155,9 +157,9 @@ impl AgentRuntime {
             && let Err(error) = self
                 .publish(
                     &owner,
-                    BackendEvent::Agent {
+                    ProviderEvent::Agent {
                         scope: scope.clone(),
-                        update: crate::backend::AgentUpdate::ConversationResolved {
+                        update: crate::provider::AgentUpdate::ConversationResolved {
                             thread_id: provider_thread_id.clone(),
                         },
                     },
@@ -172,14 +174,14 @@ impl AgentRuntime {
                 .forward_until(&self, &owner, async {
                     let mut failure = Vec::new();
                     if cancelled || output.is_err() {
-                        if let Err(error) = self.backend.cancel_session(&runtime_key).await {
+                        if let Err(error) = self.provider.cancel_session(&runtime_key).await {
                             failure.push(format!("cancel: {error:#}"));
                         }
-                        if let Err(error) = self.backend.cleanup_execution(&runtime_key).await {
+                        if let Err(error) = self.provider.cleanup_execution(&runtime_key).await {
                             failure.push(format!("cleanup: {error:#}"));
                         }
                     }
-                    if let Err(error) = self.backend.shutdown().await {
+                    if let Err(error) = self.provider.shutdown().await {
                         failure.push(format!("shutdown: {error:#}"));
                     }
                     failure
@@ -198,9 +200,9 @@ impl AgentRuntime {
             }
             Err(error) => Err(error),
         };
-        let output = output.map(|mut output: BackendCompletion| {
-            if output.backend_session_id.is_none() {
-                output.backend_session_id = retained;
+        let output = output.map(|mut output: ProviderCompletion| {
+            if output.provider_session_id.is_none() {
+                output.provider_session_id = retained;
             }
             output
         });
@@ -219,7 +221,7 @@ impl AgentRuntime {
             .await
     }
 
-    async fn publish(&self, owner: &ExecutionOwner, event: BackendEvent) -> Result<()> {
+    async fn publish(&self, owner: &ExecutionOwner, event: ProviderEvent) -> Result<()> {
         anyhow::ensure!(
             event.scope().owner() == owner,
             "provider event crosses child execution ownership"
@@ -243,8 +245,8 @@ impl AgentRuntime {
 
 /// Preserve invocation ordering while draining observations owned by the same child session.
 struct ChildEventDelivery {
-    invocation: Option<crate::backend::events::BackendEventStream>,
-    session: Option<crate::backend::events::BackendEventStream>,
+    invocation: Option<crate::provider::events::ProviderEventStream>,
+    session: Option<crate::provider::events::ProviderEventStream>,
 }
 
 impl ChildEventDelivery {
@@ -254,7 +256,7 @@ impl ChildEventDelivery {
     }
 
     /// Poll admitted invocation events before later session observations of those items.
-    async fn next(&mut self) -> Result<Option<BackendEvent>> {
+    async fn next(&mut self) -> Result<Option<ProviderEvent>> {
         loop {
             tokio::select! {
                 biased;
@@ -323,8 +325,8 @@ impl ChildEventDelivery {
                         }
                         continue;
                     }
-                    Err(crate::backend::events::EventDeliveryError::Empty) => {}
-                    Err(crate::backend::events::EventDeliveryError::Closed { .. }) => {
+                    Err(crate::provider::events::EventDeliveryError::Empty) => {}
+                    Err(crate::provider::events::EventDeliveryError::Closed { .. }) => {
                         self.invocation = None
                     }
                     Err(error) => {
@@ -342,8 +344,8 @@ impl ChildEventDelivery {
                         failure.get_or_insert(error);
                     }
                 }
-                Err(crate::backend::events::EventDeliveryError::Empty) => break,
-                Err(crate::backend::events::EventDeliveryError::Closed { .. }) => {
+                Err(crate::provider::events::EventDeliveryError::Empty) => break,
+                Err(crate::provider::events::EventDeliveryError::Closed { .. }) => {
                     self.session = None;
                     break;
                 }

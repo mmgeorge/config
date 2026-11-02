@@ -20,7 +20,7 @@ local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "session-blocking" } } } } })
+  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "mock" } } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function()
     return (session.harness.session and session.harness.presentation and session.harness.presentation.ready) or #errors > 0
@@ -37,26 +37,28 @@ local success, failure = xpcall(function()
   end
   local initial = request("session.state.get", {})
   assert(vim.deep_equal(initial.session.approval_timeout, { amount = 10, unit = "m" }))
-  assert(vim.deep_equal(initial.session.answer_timeout, { amount = 10, unit = "m" }))
+  assert(vim.deep_equal(initial.session.tool_timeout, { amount = 10, unit = "m" }))
+  local held = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua").hold(session.harness.session.id, "chat")
   local prompt_finished, prompt_error
   client.request({ method = "session.prompt.submit", params = { text = "Verify timeout configuration during this turn" }, session_id = assert(require("forge.session").harness.session).id }, function(_, error)
     prompt_finished, prompt_error = true, error
   end)
-  vim.wait(100, function() return false end, 10)
+  held:wait()
   assert(not prompt_finished, "mock turn must remain active during configuration")
   local updated = request("session.input.timeout.configure", {
-    approval_timeout = { amount = 2, unit = "s" }, answer_timeout = { amount = 0, unit = "h" },
+    approval_timeout = { amount = 2, unit = "s" }, tool_timeout = { amount = 3, unit = "m" },
   })
-  assert(updated.approval_timeout.amount == 2 and updated.answer_timeout.amount == 0)
+  assert(updated.approval_timeout.amount == 2 and updated.tool_timeout.amount == 3)
   assert(not prompt_finished, "configuration waited for or interrupted the provider")
+  held:release()
   assert(vim.wait(10000, function() return prompt_finished end, 10))
   assert(not prompt_error, prompt_error)
   local snapshot = request("session.state.get", {})
   assert(vim.deep_equal(snapshot.session.approval_timeout, updated.approval_timeout))
-  assert(vim.deep_equal(snapshot.session.answer_timeout, updated.answer_timeout))
+  assert(vim.deep_equal(snapshot.session.tool_timeout, updated.tool_timeout))
   local settings = request("settings.get", {})
   assert(vim.deep_equal(settings.desired.approval_timeout, updated.approval_timeout))
-  assert(vim.deep_equal(settings.desired.answer_timeout, updated.answer_timeout))
+  assert(vim.deep_equal(settings.desired.tool_timeout, updated.tool_timeout))
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)
 require("forge.views.picker").close(false)

@@ -1,16 +1,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::backend::{ApprovalUpdate, BackendEvent, ProviderDiagnostic, RuntimeUpdate};
+use crate::provider::{ApprovalUpdate, ProviderDiagnostic, ProviderEvent, RuntimeUpdate};
 
 pub enum LiveUpdate {
     StateChanged,
-    Observation(Box<BackendEvent>),
+    Observation(Box<ProviderEvent>),
     Notification(Box<SessionUpdate>),
 }
 
-impl From<BackendEvent> for LiveUpdate {
-    fn from(event: BackendEvent) -> Self {
+impl From<ProviderEvent> for LiveUpdate {
+    fn from(event: ProviderEvent) -> Self {
         Self::Observation(Box::new(event))
     }
 }
@@ -37,13 +37,13 @@ pub enum SessionUpdate {
     },
     Runtime {
         session_id: String,
-        runtime: crate::backend::BackendRuntime,
+        runtime: crate::provider::ProviderRuntime,
     },
     ContextUsage {
         usage: crate::session::ContextUsage,
     },
     TurnStarted {
-        address: crate::backend::TurnAddress,
+        address: crate::provider::TurnAddress,
     },
     Timeline {
         update: TimelineUpdate,
@@ -58,7 +58,7 @@ pub enum SessionUpdate {
         session: Box<crate::session::HarnessSession>,
         access_abbreviation: String,
         operation_id: Option<String>,
-        catalog: Box<crate::backend::BackendCatalogRequest>,
+        catalog: Box<crate::provider::ProviderCatalogRequest>,
     },
     ConfigurationProgress {
         operation_id: String,
@@ -126,45 +126,45 @@ pub struct PlanProgressUpdate {
 }
 
 impl SessionUpdate {
-    pub fn from_observation(event: &BackendEvent) -> Option<Self> {
+    pub fn from_observation(event: &ProviderEvent) -> Option<Self> {
         match event {
-            BackendEvent::Approval { update, .. } => Some(Self::Approval {
+            ProviderEvent::Approval { update, .. } => Some(Self::Approval {
                 update: Box::new(update.clone()),
             }),
-            BackendEvent::Runtime {
+            ProviderEvent::Runtime {
                 scope,
                 update: RuntimeUpdate::Resolved { runtime },
             } => Some(Self::Runtime {
                 session_id: scope.owner.session_id.to_string(),
                 runtime: runtime.clone(),
             }),
-            BackendEvent::Runtime {
+            ProviderEvent::Runtime {
                 update: RuntimeUpdate::ContextUsage { usage },
                 ..
             } => Some(Self::ContextUsage {
                 usage: usage.clone(),
             }),
-            BackendEvent::Diagnostic { diagnostic, .. } => Some(Self::Diagnostic {
+            ProviderEvent::Diagnostic { diagnostic, .. } => Some(Self::Diagnostic {
                 diagnostic: diagnostic.clone(),
             }),
-            BackendEvent::Turn {
+            ProviderEvent::Turn {
                 address,
-                update: crate::backend::TurnUpdate::Started { .. },
+                update: crate::provider::TurnUpdate::Started { .. },
             } => Some(Self::TurnStarted {
                 address: address.clone(),
             }),
-            BackendEvent::Message { .. }
-            | BackendEvent::Tool { .. }
-            | BackendEvent::Turn { .. }
-            | BackendEvent::Usage { .. }
-            | BackendEvent::Runtime { .. }
-            | BackendEvent::Compaction { .. }
-            | BackendEvent::Agent { .. }
-            | BackendEvent::Checklist { .. }
-            | BackendEvent::DirectoryAccess { .. }
-            | BackendEvent::InputAccepted { .. }
-            | BackendEvent::Retry { .. }
-            | BackendEvent::ParentBoundary { .. } => None,
+            ProviderEvent::Message { .. }
+            | ProviderEvent::Tool { .. }
+            | ProviderEvent::Turn { .. }
+            | ProviderEvent::Usage { .. }
+            | ProviderEvent::Runtime { .. }
+            | ProviderEvent::Compaction { .. }
+            | ProviderEvent::Agent { .. }
+            | ProviderEvent::Checklist { .. }
+            | ProviderEvent::DirectoryAccess { .. }
+            | ProviderEvent::InputAccepted { .. }
+            | ProviderEvent::Retry { .. }
+            | ProviderEvent::ParentBoundary { .. } => None,
         }
     }
 

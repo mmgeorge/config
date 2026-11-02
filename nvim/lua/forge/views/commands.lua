@@ -6,7 +6,7 @@ local M = {}
 local config = require("forge.infra.config")
 local notifications = require("forge.infra.notifications")
 local gh = require("forge.integrations.gh")
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 local paths = require("forge.infra.paths")
 
 local file_revision = require("forge.views.file_revision")
@@ -34,7 +34,7 @@ function M.open_file_revision(file, rev)
     notify_error("ForgeFileRevision requires a file and a revision", "Forge")
     return
   end
-  git_backend.git_root_async(function(root, root_err)
+  git_provider.git_root_async(function(root, root_err)
     if not root then
       notify_error(root_err or "Not a git repository", "Forge")
       return
@@ -174,7 +174,7 @@ function M.open_branch_diff(branch, opts)
     open_for_root(opts.cwd, nil)
     return
   end
-  git_backend.git_root_async(open_for_root)
+  git_provider.git_root_async(open_for_root)
 end
 
 ---@class ForgeCompactPreviewOptions
@@ -199,9 +199,9 @@ function M.open_compact_preview(opts)
       return
     end
 
-    local command = git_backend.git_diff_command(cwd)
+    local command = git_provider.git_diff_command(cwd)
     if opts.staged then command[#command + 1] = "--cached" end
-    git_backend.systemlist_async(command, function(output, code, stderr)
+    git_provider.systemlist_async(command, function(output, code, stderr)
       if not origin_current() then return end
       if code ~= 0 then
         local message = vim.trim(stderr or "")
@@ -246,7 +246,7 @@ function M.open_compact_preview(opts)
   if opts.cwd then
     open_for_root(opts.cwd)
   else
-    git_backend.git_root_async(open_for_root)
+    git_provider.git_root_async(open_for_root)
   end
 end
 

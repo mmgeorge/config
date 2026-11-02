@@ -38,7 +38,7 @@ pub enum SessionEventKind {
     },
     /// Retains an explicitly requested compaction without creating a user exchange.
     Compaction {
-        compaction: Box<crate::backend::Compaction>,
+        compaction: Box<crate::provider::Compaction>,
     },
     Renamed {
         name: String,
@@ -442,7 +442,7 @@ impl TimelineProjector {
                 continue;
             }
             if matches!(&event.detail, SessionEventKind::Compaction { compaction }
-                if compaction.state == crate::backend::CompactionState::Running)
+                if compaction.state == crate::provider::CompactionState::Running)
             {
                 continue;
             }

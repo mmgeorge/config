@@ -1,7 +1,7 @@
 --- Executes one ordered stage or unstage action at a known repository root.
 local M = {}
 
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 local paths = require("forge.infra.paths")
 
 ---@alias ForgeIndexMutationDirection "stage"|"unstage"
@@ -108,7 +108,7 @@ function M.execute_async(root, spec, callback)
       return
     end
     local target_finished = false
-    git_backend.run_git_at_root_async(root, args, input, function(result)
+    git_provider.run_git_at_root_async(root, args, input, function(result)
       if mutation_finished or target_finished then return end
       target_finished = true
       if not result.ok then

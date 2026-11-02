@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::{
+use crate::provider::{
     ProviderChangeKind, ProviderChangeSet, ProviderFileChange, TextUpdate, ToolActivityKind,
     ToolInvocation, ToolOutcome, ToolUpdate,
 };
@@ -181,7 +181,7 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
         let outcome = match status {
             "completed" => Some(ToolOutcome::Succeeded),
             "failed" => Some(ToolOutcome::Failed {
-                diagnostic: crate::backend::ToolDiagnostic {
+                diagnostic: crate::provider::ToolDiagnostic {
                     code: None,
                     message: "write failed".into(),
                 },

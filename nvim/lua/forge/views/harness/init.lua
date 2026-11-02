@@ -1,7 +1,7 @@
 local M = {}
 
 local client = require("forge.client")
-local backend_preference = require("forge.harness.backend_preference")
+local provider_preference = require("forge.harness.provider_preference")
 local config = require("forge.infra.config")
 local controller = require("forge.views.harness.controller")
 local layout = require("forge.views.harness.layout")
@@ -118,9 +118,9 @@ function M.open()
 end
 
 ---@return boolean
-function M.backend_switch_available()
+function M.provider_switch_available()
   local state = session.harness
-  return state.session ~= nil and not state.busy and not state.switching_backend
+  return state.session ~= nil and not state.busy and not state.switching_provider
     and not state.configuring and not state.state_sync_pending
     and not state.aborting_plan
     and not (state.status and state.status.kind == "finalizing")
@@ -128,58 +128,58 @@ function M.backend_switch_available()
     and #(state.pending_submit or {}) == 0
 end
 
----@class ForgeHarnessBackendDestination
+---@class ForgeHarnessProviderDestination
 ---@field kind "new"|"resume"
 ---@field session_id? string
 
----@param backend string
----@param destination ForgeHarnessBackendDestination
-function M.switch_backend(backend, destination)
+---@param provider string
+---@param destination ForgeHarnessProviderDestination
+function M.switch_provider(provider, destination)
   local state = session.harness
-  local backend_config = config.options.harness.backends[backend]
-  if not backend_config or backend_config.selectable == false then
-    notifications.error("Unknown Harness backend: " .. tostring(backend), "Harness backend")
+  local provider_config = config.options.harness.providers[provider]
+  if not provider_config or provider_config.selectable == false then
+    notifications.error("Unknown Harness provider: " .. tostring(provider), "Harness provider")
     return
   end
-  if not M.backend_switch_available() then
-    notifications.warn("Finish or cancel pending work before switching providers", "Harness backend")
+  if not M.provider_switch_available() then
+    notifications.warn("Finish or cancel pending work before switching providers", "Harness provider")
     return
   end
   if not destination or (destination.kind ~= "new" and destination.kind ~= "resume")
     or (destination.kind == "resume" and not destination.session_id) then
-    notifications.error("Select a new chat or a session to resume", "Harness backend")
+    notifications.error("Select a new chat or a session to resume", "Harness provider")
     return
   end
-  local previous_backend = state.session.backend
+  local previous_provider = state.session.provider
   local previous_session_id = state.session.id
   local previous_mode = state.session.approval_mode
   local previous_access = vim.deepcopy(state.session.access)
-  if backend == previous_backend then return end
+  if provider == previous_provider then return end
   local initialize_options = destination.kind == "new" and { new_session_name = "" }
     or { session_id = destination.session_id }
-  state.switching_backend = true
+  state.switching_provider = true
   client.host_stop(nil, function()
-    config.options.harness.backend = backend
+    config.options.harness.provider = provider
     client.session_initialize(function(result, start_error, error_detail)
       finish_start(state, result, start_error, error_detail, {
         open_mode = "current",
         on_ready = function()
-          state.switching_backend = false
+          state.switching_provider = false
           if destination.kind == "new" then
             controller.configure({ access = previous_access, approval_mode = previous_mode })
           end
           controller.render()
-          local saved, save_error = backend_preference.save(backend)
+          local saved, save_error = provider_preference.save(provider)
           if not saved then
-            notifications.error(save_error or "Failed to save backend preference", "Harness backend")
+            notifications.error(save_error or "Failed to save provider preference", "Harness provider")
           end
         end,
         on_error = function(switch_error)
-          notifications.error("Failed to switch Harness backend: " .. switch_error, "Harness backend")
-          config.options.harness.backend = previous_backend
+          notifications.error("Failed to switch Harness provider: " .. switch_error, "Harness provider")
+          config.options.harness.provider = previous_provider
           client.host_stop(nil, function()
             client.session_initialize(function(previous_result, previous_error, previous_detail)
-              state.switching_backend = false
+              state.switching_provider = false
               finish_start(state, previous_result, previous_error, previous_detail)
             end, { session_id = previous_session_id })
           end)

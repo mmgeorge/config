@@ -11,7 +11,7 @@ struct Contract {
     version: u32,
     node: NodeContract,
     session: BTreeMap<String, Event>,
-    backend: BTreeMap<String, Event>,
+    provider: BTreeMap<String, Event>,
     request: BTreeMap<String, Event>,
     document: BTreeMap<String, Event>,
     methods: BTreeMap<String, method_policy::MethodPolicy>,
@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     writeln!(generated, "];")?;
     for (channel, events) in [
         ("SESSION", contract.session),
-        ("BACKEND", contract.backend),
+        ("PROVIDER", contract.provider),
         ("REQUEST", contract.request),
         ("DOCUMENT", contract.document),
     ] {

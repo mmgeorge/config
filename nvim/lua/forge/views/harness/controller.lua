@@ -319,7 +319,7 @@ function M.render()
   if state.initial_snapshot_pending then M.refresh_winbar() return end
   render_status_hint(state)
   if state.host_error then M.refresh_winbar() return end
-  if state.switching_backend then M.refresh_winbar() return end
+  if state.switching_provider then M.refresh_winbar() return end
   if not (state.transcript_buf and vim.api.nvim_buf_is_valid(state.transcript_buf)
       and state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)) then return end
   if not (state.session and state.session.id) then
@@ -344,7 +344,7 @@ function M.render()
   end
   local opening_session_id, opening_generation = state.session.id, client.host_get_generation()
   local function owns_presentation()
-    return not state.switching_backend and state.session and state.session.id == opening_session_id
+    return not state.switching_provider and state.session and state.session.id == opening_session_id
       and client.host_get_generation() == opening_generation
   end
   state.presentation = require("forge.views.harness.presentation").open({
@@ -542,7 +542,7 @@ end
 
 local function on_event(event, payload)
   local state = harness_state()
-  if event ~= "backend_event" and event ~= "input_changed" and event ~= "task_operation" then
+  if event ~= "provider_event" and event ~= "input_changed" and event ~= "task_operation" then
     state.state_invalidation = (state.state_invalidation or 0) + 1
   end
   if event == "task_operation" then task_control.receive(state, payload) return end
@@ -594,8 +594,8 @@ local function on_event(event, payload)
       question_presentation.reset(state)
     end
     schedule_render()
-  elseif event == "backend_event" then
-    if require("forge.event_contract").route("backend", payload.kind) == "ignore" then return end
+  elseif event == "provider_event" then
+    if require("forge.event_contract").route("provider", payload.kind) == "ignore" then return end
     if payload.kind == "checks_configuration_error" then
       notifications.error((payload.data or {}).error or "Fix the project check configuration", "Harness checks")
     elseif payload.kind == "turn_started" then
@@ -644,7 +644,7 @@ local function on_event(event, payload)
     elseif payload.kind == "error" then
       if type(payload.text) == "string" then notifications.warn(payload.text, "ForgeHarness") end
     else
-      error("Unhandled Harness backend event: " .. tostring(payload.kind))
+      error("Unhandled Harness provider event: " .. tostring(payload.kind))
     end
   elseif event == "questions_changed" then
     local questions = require("forge.views.harness.questions")
@@ -1012,7 +1012,7 @@ function M.cancel_turn()
 end
 function M.compact(completed)
   if not (harness_state().capability and harness_state().capability.native_compact) then
-    notifications.error("The current backend does not support manual context compaction", "ForgeHarness")
+    notifications.error("The current provider does not support manual context compaction", "ForgeHarness")
     return
   end
   M.task_transition({ action = "compact" }, nil, completed)
@@ -1038,7 +1038,7 @@ function M.fork_session(name)
     return
   end
   if state.capability.native_fork ~= true then
-    notifications.warn("The current backend does not support session fork", "ForgeHarness")
+    notifications.warn("The current provider does not support session fork", "ForgeHarness")
     return
   end
   local params = { session_id = active_session.id }
@@ -1492,7 +1492,7 @@ function M.open_background_picker()
     if not current() then return end
     if failure then notifications.error(failure, "Select Background Terminal") return end
     if not inventory.supported then
-      notifications.warn("The current backend does not support background terminals", "ForgeHarness")
+      notifications.warn("The current provider does not support background terminals", "ForgeHarness")
       return
     end
     local options = {}
@@ -1555,7 +1555,7 @@ local function admit_composer_input(state)
     notifications.warn("Harness is still initializing", "ForgeHarness")
     return false
   end
-  if state.switching_backend then return false end
+  if state.switching_provider then return false end
   return true
 end
 
@@ -1675,9 +1675,9 @@ function M.submit()
     M.select_model()
     return
   end
-  if text == "/backend" then
+  if text == "/provider" then
     set_composer_text(state.composer_buf, "")
-    M.select_backend()
+    M.select_provider()
     return
   end
   if text == "/checks" then
@@ -1792,7 +1792,7 @@ function M.submit()
   if text == "/compact" then
     set_composer_text(state.composer_buf, "")
     if state.capability.native_compact ~= true then
-      notifications.warn("The current backend does not support manual context compaction", "ForgeHarness")
+      notifications.warn("The current provider does not support manual context compaction", "ForgeHarness")
       return
     end
     M.compact()
@@ -1821,11 +1821,11 @@ function M.submit()
   if model then
     set_composer_text(state.composer_buf, "")
     if state.capability.model_selection ~= true then
-      notifications.warn("The current backend does not support model selection", "ForgeHarness")
+      notifications.warn("The current provider does not support model selection", "ForgeHarness")
       return
     end
     if model_effort and state.capability.effort_selection ~= true then
-      notifications.warn("The current backend does not support reasoning effort selection", "ForgeHarness")
+      notifications.warn("The current provider does not support reasoning effort selection", "ForgeHarness")
       return
     end
     M.configure({ model = model, effort = model_effort }, true)
@@ -1835,7 +1835,7 @@ function M.submit()
   if effort then
     set_composer_text(state.composer_buf, "")
     if state.capability.effort_selection ~= true then
-      notifications.warn("The current backend does not support reasoning effort selection", "ForgeHarness")
+      notifications.warn("The current provider does not support reasoning effort selection", "ForgeHarness")
       return
     end
     M.configure({ effort = effort }, true)
@@ -1983,7 +1983,7 @@ end
 
 function M.select_effort()
   if harness_state().capability.effort_selection ~= true then
-    harness_state().configuration_error = "The current backend does not support reasoning effort selection"
+    harness_state().configuration_error = "The current provider does not support reasoning effort selection"
     M.refresh_winbar()
     return
   end
@@ -1997,7 +1997,7 @@ function M.select_effort()
   local state = harness_state()
   local session_id = state.session and state.session.id
   local loading_owner = "harness-effort-loading-" .. tostring(session_id)
-  local loading = state.model_backend ~= (state.session and state.session.backend) or type(state.model_list) ~= "table"
+  local loading = state.model_provider ~= (state.session and state.session.provider) or type(state.model_list) ~= "table"
   if loading then
     picker.open({ owner = loading_owner, host = picker_host(state), page_list = { {
       id = "effort-loading", title = "Select Reasoning Effort", option_list = {}, empty_text = "Loading reasoning options...", footer = "q close",
@@ -2031,7 +2031,7 @@ function M.configure_service_tier(tier)
   if (tier == "fast" and state.capability.fast_mode ~= true)
     or (tier == "ultrafast" and state.capability.ultrafast_mode ~= true)
   then
-    state.configuration_error = "The current backend does not support " .. tier .. " mode"
+    state.configuration_error = "The current provider does not support " .. tier .. " mode"
     M.refresh_winbar()
     return
   end
@@ -2050,7 +2050,7 @@ function M.configure_service_tier(tier)
     end
     M.configure({ service_tier = tier })
   end
-  if state.model_backend == state.session.backend and state.model_list then apply(state.model_list)
+  if state.model_provider == state.session.provider and state.model_list then apply(state.model_list)
   else require("forge.views.harness.provider_catalog").models(false, apply) end
 end
 
@@ -2069,17 +2069,17 @@ function M.select_model(on_confirm)
       and selected_setting(state, "service_tier") or "default"
     M.configure(value)
   end
-  local backend = state.session and state.session.backend or config.options.harness.backend
+  local provider = state.session and state.session.provider or config.options.harness.provider
   local session_id = state.session and state.session.id
   local loading_owner = "harness-model-loading-" .. tostring(session_id)
-  local loading = state.model_backend ~= backend or type(state.model_list) ~= "table"
+  local loading = state.model_provider ~= provider or type(state.model_list) ~= "table"
   local function is_current()
     return harness_state() == state and state.session and state.session.id == session_id
-      and state.session.backend == backend
+      and state.session.provider == provider
       and (not loading or picker.is_open(loading_owner))
   end
   if state.capability.model_selection ~= true then
-    notifications.warn("The current backend does not support model selection", "ForgeHarness")
+    notifications.warn("The current provider does not support model selection", "ForgeHarness")
     return
   end
   if loading then
@@ -2114,14 +2114,14 @@ function M.select_model(on_confirm)
     model_picker.open({
       host = picker_host(state),
       model_list = model_list,
-      backend = backend,
+      provider = provider,
       is_current = is_current,
       current_model = selected_setting(state, "model") == "default" and state.session.resolved_model
         or selected_setting(state, "model"),
       on_confirm = on_confirm,
     })
   end
-  model_pins.refresh(backend, function(_, pin_error)
+  model_pins.refresh(provider, function(_, pin_error)
     if pin_error then
       if loading and picker.is_open(loading_owner) then picker.close() end
       notifications.error("Failed to load Harness model pins: " .. pin_error, "Harness model")
@@ -2135,7 +2135,7 @@ function M.select_model(on_confirm)
         return
       end
       if not is_current() then return end
-      state.model_backend = backend
+      state.model_provider = provider
       state.model_list = vim.deepcopy(model_list or {})
       open_model_picker(state.model_list)
     end)
@@ -2145,7 +2145,7 @@ end
 function M.open_skill_picker()
   local state = harness_state()
   if not (state.capability.catalog and state.capability.catalog.skill) then
-    notifications.warn("The current backend does not advertise provider skills", "Harness skills")
+    notifications.warn("The current provider does not advertise provider skills", "Harness skills")
     return
   end
   provider_picker.open_skills({
@@ -2163,7 +2163,7 @@ function M.open_mcp_picker()
     return current == state and (current.session and current.session.id) == session_id
   end
   if not (state.capability.catalog and state.capability.catalog.mcp) then
-    notifications.warn("The current backend does not advertise MCP management", "Harness MCP")
+    notifications.warn("The current provider does not advertise MCP management", "Harness MCP")
     return
   end
   provider_picker.open_mcp({
@@ -2173,47 +2173,47 @@ function M.open_mcp_picker()
   })
 end
 
-function M.select_backend()
+function M.select_provider()
   local state = harness_state()
   local harness = require("forge.views.harness")
-  if not harness.backend_switch_available() then
-    notifications.warn("Finish or cancel pending work before switching providers", "Harness backend")
+  if not harness.provider_switch_available() then
+    notifications.warn("Finish or cancel pending work before switching providers", "Harness provider")
     return
   end
   local source_session_id = state.session.id
   local function current_source()
     return session.harness == state and state.session and state.session.id == source_session_id
   end
-  local current = state.session and state.session.backend or config.options.harness.backend
+  local current = state.session and state.session.provider or config.options.harness.provider
   local option_list = {}
-  for backend, backend_config in pairs(config.options.harness.backends) do
-    if backend_config.selectable ~= false then
+  for provider, provider_config in pairs(config.options.harness.providers) do
+    if provider_config.selectable ~= false then
       option_list[#option_list + 1] = {
-        id = backend,
-        label = backend_config.label,
-        detail = backend_config.detail .. (backend == current and " (current)" or ""),
-        value = backend,
+        id = provider,
+        label = provider_config.label,
+        detail = provider_config.detail .. (provider == current and " (current)" or ""),
+        value = provider,
       }
     end
   end
   table.sort(option_list, function(left, right) return left.label < right.label end)
   open_choice_picker(state, "Select Harness", nil, option_list,
-    function(backend)
-      if backend == current or not current_source() then return end
+    function(provider)
+      if provider == current or not current_source() then return end
       local function destination_picker()
         if not current_source() then return end
-        open_choice_picker(state, "Select Chat", config.options.harness.backends[backend].label, {
+        open_choice_picker(state, "Select Chat", config.options.harness.providers[provider].label, {
           { id = "new", label = "New chat", value = "new" },
           { id = "resume", label = "Resume session…", value = "resume" },
         }, function(destination)
           if not current_source() then return end
           if destination == "new" then
-            harness.switch_backend(backend, { kind = "new" })
+            harness.switch_provider(provider, { kind = "new" })
           else
             require("forge.views.harness.session_picker").open(picker_host(state), {
-              backend = backend,
+              provider = provider,
               on_select = function(entry)
-                if current_source() then harness.switch_backend(backend, { kind = "resume", session_id = entry.id }) end
+                if current_source() then harness.switch_provider(provider, { kind = "resume", session_id = entry.id }) end
               end,
               on_cancel = destination_picker,
             })
@@ -2226,11 +2226,11 @@ end
 
 function M.resolve_runtime_model()
   local state = harness_state()
-  local backend = state.session and state.session.backend
+  local provider = state.session and state.session.provider
   require("forge.views.harness.provider_catalog").models(true, function(model_list, request_error)
     if request_error then notifications.error("Failed to resolve Harness model: " .. request_error, "ForgeHarness") end
     if request_error then return end
-    state.model_backend = backend
+    state.model_provider = provider
     state.model_list = vim.deepcopy(model_list or {})
   end)
 end
@@ -2568,7 +2568,7 @@ function M.attach()
   prompt_history.attach(state.composer_buf)
   if state.unsubscribe then state.unsubscribe() end
   state.unsubscribe = client.session_events_subscribe(function(event, payload, event_session_id)
-    if state.switching_backend then return end
+    if state.switching_provider then return end
     if state.session and event_session_id and state.session.id ~= event_session_id then return end
     local active_state = session.harness
     session.activate_harness(state)

@@ -42,10 +42,10 @@ package.loaded["forge.builder"] = {
 local client = require("forge.client")
 client._host_set_launcher_for_test(vim.system)
 local state, errors = require("forge.session").harness, {}
-local backend_errors = {}
+local provider_errors = {}
 local unsubscribe_errors = client.session_events_subscribe(function(event, payload)
-  if event == "backend_event" and payload.kind == "error" then
-    backend_errors[#backend_errors + 1] = payload
+  if event == "provider_event" and payload.kind == "error" then
+    provider_errors[#provider_errors + 1] = payload
   end
 end)
 require("forge.infra.notifications").error = function(message)
@@ -158,8 +158,8 @@ local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
   require("forge").setup({
     harness = {
-      backend = "mock",
-      backends = { mock = { command = { "provider-stream" }, selectable = true } },
+      provider = "mock",
+      providers = { mock = { command = { "provider-stream" }, selectable = true } },
     },
   })
   require("forge").open_harness()
@@ -221,4 +221,4 @@ if success and vim.g.forge_provider_stream_keep_open then
   return
 end
 cleanup()
-assert(success, tostring(failure) .. ": " .. vim.inspect(backend_errors))
+assert(success, tostring(failure) .. ": " .. vim.inspect(provider_errors))

@@ -90,7 +90,7 @@ function M.validate(channel, name, payload)
       or expected == "boolean" and type(value) == "boolean"
     assert(valid, ("Forge %s event %s: %s requires %s"):format(channel, name, path, expected))
   end
-  if channel == "session" and name == "backend_event" then M.validate("backend", payload.kind, payload) end
+  if channel == "session" and name == "provider_event" then M.validate("provider", payload.kind, payload) end
 end
 
 return M

@@ -32,3 +32,5 @@ toml
 rustup
 
 lld
+
+pdb

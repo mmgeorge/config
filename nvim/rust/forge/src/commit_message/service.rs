@@ -11,8 +11,8 @@ use forge_diff::engine::DiffEngine;
 use forge_diff::syntax::SyntaxEngine;
 use forge_git::store::RepositoryStore;
 use forge_harness::{
-    backend::TextGeneration,
     background::CancellationToken,
+    provider::TextGeneration,
     service::{HarnessService, TextGenerationConfig},
 };
 use serde::{Deserialize, Serialize};
@@ -340,7 +340,7 @@ impl GenerationService {
             let system = if context_only {
                 ""
             } else {
-                forge_harness::backend::BACKGROUND_SYSTEM_MESSAGE
+                forge_harness::provider::BACKGROUND_SYSTEM_MESSAGE
             };
             let user = if context_only {
                 prompt.to_owned()

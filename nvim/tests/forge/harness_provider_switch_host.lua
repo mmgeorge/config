@@ -23,7 +23,7 @@ require('forge.infra.notifications').error = function(message) errors[#errors + 
 controller.resolve_runtime_model = function() end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require('forge').setup({ harness = { backend = 'codex' } })
+  require('forge').setup({ harness = { provider = 'codex' } })
   harness.open()
   assert(vim.wait(10000, function() return (session.harness.ready and session.harness.session) or #errors > 0 end, 10))
   assert(#errors == 0, table.concat(errors, '\n'))
@@ -49,20 +49,20 @@ local success, failure = xpcall(function()
     return observed.state == 'completed' or observed.state == 'failed'
   end, 10), 'portable settings did not settle')
   assert(request('session.command.operation.get', { operation_id = operation.id }).state == 'completed')
-  assert(vim.wait(3000, function() return harness.backend_switch_available() end, 10))
-  local function switch_backend(backend, destination)
-    assert(vim.wait(10000, harness.backend_switch_available, 10), 'provider controls did not become available: '
+  assert(vim.wait(3000, function() return harness.provider_switch_available() end, 10))
+  local function switch_provider(provider, destination)
+    assert(vim.wait(10000, harness.provider_switch_available, 10), 'provider controls did not become available: '
       .. vim.inspect({ busy = session.harness.busy, configuring = session.harness.configuring,
-        switching = session.harness.switching_backend, syncing = session.harness.state_sync_pending,
+        switching = session.harness.switching_provider, syncing = session.harness.state_sync_pending,
         operation = session.harness.task_operation, status = session.harness.status,
         queue = session.harness.queue, steering = session.harness.pending_steer,
         submission = session.harness.pending_submit }))
-    harness.switch_backend(backend, destination)
+    harness.switch_provider(provider, destination)
   end
-  local function settle(backend)
+  local function settle(provider)
     assert(vim.wait(10000, function()
       local state = session.harness
-      return #errors > 0 or (state.ready and not state.switching_backend and state.session and state.session.backend == backend)
+      return #errors > 0 or (state.ready and not state.switching_provider and state.session and state.session.provider == provider)
     end, 10), 'provider switch did not settle')
     assert(#errors == 0, table.concat(errors, '\n'))
     assert(vim.api.nvim_get_current_tabpage() == source_tab and #vim.api.nvim_list_tabpages() == tab_count)
@@ -102,25 +102,25 @@ local success, failure = xpcall(function()
   assert(vim.wait(3000, function() return created ~= nil end, 10))
   controller.activate_snapshot(created)
   assert(created.session.id ~= chosen_id)
-  switch_backend('codex', { kind = 'resume', session_id = source_id })
+  switch_provider('codex', { kind = 'resume', session_id = source_id })
   settle('codex')
   assert(session.harness.session.id == source_id)
-  switch_backend('copilot', { kind = 'resume', session_id = chosen_id })
+  switch_provider('copilot', { kind = 'resume', session_id = chosen_id })
   settle('copilot')
   assert(session.harness.session.id == chosen_id, 'resumed latest instead of the selected session')
-  for _, backend in ipairs({ 'claude', 'antigravity' }) do
-    switch_backend(backend, { kind = 'new' })
-    settle(backend)
+  for _, provider in ipairs({ 'claude', 'antigravity' }) do
+    switch_provider(provider, { kind = 'new' })
+    settle(provider)
     assert(session.harness.session.model == 'default', 'provider switch copied a foreign model')
   end
-  switch_backend('copilot', { kind = 'resume', session_id = chosen_id })
+  switch_provider('copilot', { kind = 'resume', session_id = chosen_id })
   settle('copilot')
   local config = require('forge.infra.config')
-  config.options.harness.backends.codex.command = {}
-  switch_backend('codex', { kind = 'new' })
-  assert(vim.wait(10000, function() return #errors > 0 and session.harness.ready and not session.harness.switching_backend end, 10))
-  assert(session.harness.session.id == chosen_id and config.options.harness.backend == 'copilot')
-  assert(errors[1]:find('Codex backend requires', 1, true), errors[1])
+  config.options.harness.providers.codex.command = {}
+  switch_provider('codex', { kind = 'new' })
+  assert(vim.wait(10000, function() return #errors > 0 and session.harness.ready and not session.harness.switching_provider end, 10))
+  assert(session.harness.session.id == chosen_id and config.options.harness.provider == 'copilot')
+  assert(errors[1]:find('Codex provider requires', 1, true), errors[1])
 end, debug.traceback)
 picker.close(false)
 client.host_stop()

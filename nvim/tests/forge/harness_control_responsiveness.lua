@@ -13,7 +13,7 @@ local original_request = client.request
 local original_transition = controller.task_transition
 local original_error = notifications.error
 local composer = vim.api.nvim_create_buf(false, true)
-state.session = { id = "responsive", backend = "mock", model = "test", effort = "medium" }
+state.session = { id = "responsive", provider = "mock", model = "test", effort = "medium" }
 state.composer_buf, state.composer_win = composer, vim.api.nvim_get_current_win()
 state.busy, state.queue = true, {}
 local routed, configured = {}, {}
@@ -24,7 +24,7 @@ local success, failure = xpcall(function()
   controller.drain, history.record = function() end, function() end
   local controls = { "/config", "/effort", "/effort high", "/model", "/read", "/write", "/yolo", "/ask", "/deny", "/allow",
     "/fast", "/ultrafast", "/skills", "/mcp", "/checks", "/rename", "/sessions",
-    "/task refresh", "/agents on", "/agents edit", "/backend", "/questions" }
+    "/task refresh", "/agents on", "/agents edit", "/provider", "/questions" }
   for _, command in ipairs(controls) do
     vim.api.nvim_buf_set_lines(composer, 0, -1, false, { command })
     controller.queue_submit()
@@ -66,14 +66,14 @@ local success, failure = xpcall(function()
   picker.close()
   local requested = 0
   client.request = function() requested = requested + 1 end
-  state.model_backend, state.model_list = "mock", { { id = "test", reasoning = { "low", "medium", "high" } } }
+  state.model_provider, state.model_list = "mock", { { id = "test", reasoning = { "low", "medium", "high" } } }
   local delivered = false
   catalog.models(false, function(models) delivered = models[1].id == "test" end)
   assert(delivered and requested == 0, "warm model controls waited for provider discovery")
   state.capability = { model_selection = true }
   state.composer_win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(state.composer_win, composer)
-  state.model_list, state.model_backend = nil, nil
+  state.model_list, state.model_provider = nil, nil
   local model_response
   client.request = function(request_specification, callback)
   local method = request_specification.method
@@ -89,7 +89,7 @@ local success, failure = xpcall(function()
   model_response({ { id = "test", reasoning = { "low", "high" } } })
   assert(not picker.is_open(), "late model discovery reopened a cancelled picker")
   catalog.clear()
-  state.model_list, state.model_backend = nil, nil
+  state.model_list, state.model_provider = nil, nil
   state.capability.effort_selection = true
   local reported
   notifications.error = function(message) reported = message end

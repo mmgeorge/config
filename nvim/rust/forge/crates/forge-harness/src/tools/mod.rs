@@ -1,10 +1,13 @@
 mod authority;
+pub(crate) mod control_server;
+pub(crate) mod control_session;
 mod error;
 mod executor;
 mod failure;
 mod invocation;
 pub(crate) mod mcp;
 mod registry;
+pub(crate) mod router;
 mod runtime;
 mod schema;
 mod stdio;

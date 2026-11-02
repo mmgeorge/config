@@ -1,6 +1,6 @@
 use super::*;
-use crate::backend::{
-    BackendCompletion, BackendError, BackendEventSink, ToolActivityKind, ToolAddress,
+use crate::provider::{
+    ProviderCompletion, ProviderError, ProviderEventSink, ToolActivityKind, ToolAddress,
     ToolInvocation, ToolOutcome, ToolUpdate, TurnUpdate,
 };
 use crate::turn::{ToolState, TurnOutcome, TurnState};
@@ -13,20 +13,21 @@ enum ProviderFailure {
     Stalled,
 }
 
-struct CancelledNativeBackend {
+struct CancelledNativeProvider {
     failure: ProviderFailure,
     calls: AtomicUsize,
     cancellations: AtomicUsize,
 }
 
 #[async_trait::async_trait]
-impl Backend for CancelledNativeBackend {
+impl crate::provider::ProviderAdapter for CancelledNativeProvider {
+    type Host = crate::provider::HarnessProviderHost;
     /// Advertise the existing mock transport while exercising the real broker lifecycle.
-    fn descriptor(&self) -> crate::backend::BackendDescriptor {
-        crate::backend::BackendDescriptor {
-            kind: crate::backend::BackendKind::Mock,
+    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
+        crate::provider::ProviderDescriptor {
+            kind: crate::provider::ProviderKind::Mock,
             label: "Native cancellation fixture".into(),
-            capability: crate::backend::mock_capability(),
+            capability: crate::provider::mock_capability(),
         }
     }
 
@@ -64,37 +65,37 @@ impl Backend for CancelledNativeBackend {
     /// Emit native cancellation evidence on the first call and a successful subsequent response.
     async fn prompt_stream(
         &self,
-        request: BackendRequest,
-        sink: BackendEventSink,
-    ) -> Result<BackendCompletion, BackendError> {
+        request: ProviderRequest,
+        sink: ProviderEventSink,
+    ) -> Result<ProviderCompletion, ProviderError> {
         if let Some(checkpoint) = request
             .control_context
             .as_ref()
             .and_then(|context| context.checkpoint.as_ref())
         {
-            checkpoint.wait().await.map_err(BackendError::from)?;
+            checkpoint.wait().await.map_err(ProviderError::from)?;
         }
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        let turn = crate::backend::test_support::address(
+        let turn = crate::provider::test_support::address(
             sink.invocation_scope()?,
             "native-thread",
             format!("native-turn-{call}"),
         );
-        sink.send_wait(BackendEvent::Turn {
+        sink.send_wait(ProviderEvent::Turn {
             address: turn.clone(),
             update: TurnUpdate::Started { started_at_ms: 1 },
         })
         .await?;
         if call > 0 {
-            for event in crate::backend::test_support::message(
+            for event in crate::provider::test_support::message(
                 &turn,
                 "recovered",
-                Some(crate::backend::MessageRole::Response),
+                Some(crate::provider::MessageRole::Response),
                 "AFTER-CANCEL-OK",
             ) {
                 sink.send_wait(event).await?;
             }
-            sink.send_wait(BackendEvent::Turn {
+            sink.send_wait(ProviderEvent::Turn {
                 address: turn,
                 update: TurnUpdate::Finished {
                     outcome: TurnOutcome::Completed,
@@ -102,7 +103,7 @@ impl Backend for CancelledNativeBackend {
                 },
             })
             .await?;
-            return Ok(BackendCompletion::default());
+            return Ok(ProviderCompletion::default());
         }
         let address = ToolAddress {
             turn: turn.clone(),
@@ -119,7 +120,7 @@ impl Backend for CancelledNativeBackend {
             },
             ToolUpdate::Started,
         ] {
-            sink.send_wait(BackendEvent::Tool {
+            sink.send_wait(ProviderEvent::Tool {
                 address: address.clone(),
                 update,
             })
@@ -127,17 +128,17 @@ impl Backend for CancelledNativeBackend {
         }
         if matches!(self.failure, ProviderFailure::Stalled) {
             loop {
-                sink.send_wait(BackendEvent::Tool {
+                sink.send_wait(ProviderEvent::Tool {
                     address: address.clone(),
                     update: ToolUpdate::Output {
-                        update: crate::backend::TextUpdate::Append("still running\n".into()),
+                        update: crate::provider::TextUpdate::Append("still running\n".into()),
                     },
                 })
                 .await?;
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         }
-        sink.send_wait(BackendEvent::Tool {
+        sink.send_wait(ProviderEvent::Tool {
             address,
             update: ToolUpdate::Finished {
                 outcome: ToolOutcome::Denied {
@@ -151,7 +152,7 @@ impl Backend for CancelledNativeBackend {
             ProviderFailure::SimilarMessage => TurnOutcome::Failed,
             ProviderFailure::Stalled => unreachable!("stalled provider never completes"),
         };
-        sink.send_wait(BackendEvent::Turn {
+        sink.send_wait(ProviderEvent::Turn {
             address: turn,
             update: TurnUpdate::Finished {
                 outcome,
@@ -160,8 +161,8 @@ impl Backend for CancelledNativeBackend {
         })
         .await?;
         Err(match self.failure {
-            ProviderFailure::Cancelled => BackendError::Cancelled,
-            ProviderFailure::SimilarMessage => BackendError::Provider {
+            ProviderFailure::Cancelled => ProviderError::Cancelled,
+            ProviderFailure::SimilarMessage => ProviderError::Provider {
                 code: Some("provider_failure".into()),
                 message: "provider execution cancelled".into(),
             },
@@ -203,12 +204,12 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
             unit: crate::session::TimeoutUnit::S,
         };
     }
-    let backend = Arc::new(CancelledNativeBackend {
+    let provider = Arc::new(CancelledNativeProvider {
         failure,
         calls: AtomicUsize::new(0),
         cancellations: AtomicUsize::new(0),
     });
-    broker.backend = backend.clone();
+    broker.provider = provider.clone();
     broker.turn_cancellation.arm(true);
     let result = broker
         .dispatch(Request {
@@ -231,7 +232,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
         expected_code
     );
     assert_eq!(
-        backend.calls.load(Ordering::SeqCst),
+        provider.calls.load(Ordering::SeqCst),
         1,
         "terminal provider results must not replay"
     );
@@ -259,7 +260,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     assert_eq!(tool.id, "denied-native-command");
     if matches!(failure, ProviderFailure::Stalled) {
         assert_eq!(tool.state(), ToolState::Failed);
-        assert!(backend.cancellations.load(Ordering::SeqCst) > 0);
+        assert!(provider.cancellations.load(Ordering::SeqCst) > 0);
     } else {
         assert_eq!(tool.state(), ToolState::Denied);
     }
@@ -284,7 +285,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
         "{:?}",
         recovered.response.error()
     );
-    assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     let history = broker.store.list_exchange(&broker.session.id)?;
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].state(), expected);

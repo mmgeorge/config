@@ -2,10 +2,10 @@ return function(context)
   local state, controller, client = context.state, context.controller, context.client
   local input = require("forge.views.harness.input_state")
   local original_request, original_receive = client.request, input.receive
-  local backend_errors = {}
+  local provider_errors = {}
   local unsubscribe = client.session_events_subscribe(function(event, payload)
-    if event == "backend_event" and payload.kind == "error" then
-      backend_errors[#backend_errors + 1] = payload.text
+    if event == "provider_event" and payload.kind == "error" then
+      provider_errors[#provider_errors + 1] = payload.text
     end
   end)
   local function await(predicate, label)
@@ -35,11 +35,11 @@ return function(context)
     end
   end
   local function expect_attachment_failure(previous_errors)
-    await(function() return #backend_errors > 0 end, "missing attachment failure was not reported")
-    for _, diagnostic in ipairs(backend_errors) do
+    await(function() return #provider_errors > 0 end, "missing attachment failure was not reported")
+    for _, diagnostic in ipairs(provider_errors) do
       assert(diagnostic:find("attachment is unavailable", 1, true), diagnostic)
     end
-    backend_errors = {}
+    provider_errors = {}
     while #context.errors > previous_errors do
       local diagnostic = table.remove(context.errors)
       assert(diagnostic:find("attachment is unavailable", 1, true), diagnostic)

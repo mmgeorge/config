@@ -29,7 +29,7 @@ local source = {
 }
 local function open(current, is_current)
   return model_picker.open({ host = { win = vim.api.nvim_get_current_win() }, model_list = source,
-    backend = "codex", current_model = current, is_current = is_current,
+    provider = "codex", current_model = current, is_current = is_current,
     on_confirm = function(config) confirmed = config end })
 end
 local function first()
@@ -37,7 +37,7 @@ local function first()
 end
 
 local success, failure = xpcall(function()
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   pins.refresh("codex", function(_, pin_error) assert(not pin_error) end)
   request_list[#request_list].callback({})
   open("newer")
@@ -77,7 +77,7 @@ local success, failure = xpcall(function()
   write = request_list[#request_list]
   current = false
   write.callback({ "newer", "third" })
-  assert(first().id == "newer", "backend-stale response changed the picker")
+  assert(first().id == "newer", "provider-stale response changed the picker")
   assert(pins.get("codex").third, "successful stale write was not retained")
   picker.close()
 
@@ -89,8 +89,8 @@ local success, failure = xpcall(function()
   assert(pins.get("codex").older and not pins.get("codex").third, "late read replaced a newer write")
 
   local state = require("forge.session").harness
-  state.session = { id = "pin-completion", backend = "codex" }
-  state.model_backend, state.model_list = "codex", source
+  state.session = { id = "pin-completion", provider = "codex" }
+  state.model_provider, state.model_list = "codex", source
   local completion = require("forge.views.harness.completion.command_source").new()
   local result
   completion:request_model_list(function(model_list) result = model_list end)

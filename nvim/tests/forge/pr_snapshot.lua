@@ -4,7 +4,7 @@ local raw = { id = "PR_test", number = 7, title = "Title", body = "Paragraph\r\n
   url = "https://github.com/owner/repo/pull/7", headRefName = "feature", headRefOid = string.rep("b", 40),
   baseRefOid = string.rep("a", 40), baseRefName = "main", headRepository = { name = "repo" },
   headRepositoryOwner = { login = "fork" }, reviewRequests = {}, commits = {}, state = "OPEN" }
-gh.set_backend({ system_async = function(command, _, callback)
+gh.set_provider({ system_async = function(command, _, callback)
   assert(table.concat(command, " "):find("baseRefOid", 1, true), "shared lookup omitted comparison identity")
   callback({ code = 0, stdout = vim.json.encode(raw), output = "" })
 end })
@@ -18,5 +18,5 @@ assert(opened.number == 7 and vim.deep_equal(opened.initial, raw), "PR command d
 raw.reviewRequests, raw.commits = nil, nil
 gh.pr_async(vim.fn.getcwd(), 7, "owner/repo", function(value) result = value end)
 assert(result.pr.snapshot == nil, "partial lookup was treated as a complete PR snapshot")
-gh.reset_backend()
+gh.reset_provider()
 print("pr_snapshot: shared lookup, command handoff, raw Markdown and incomplete-response fallback passed")

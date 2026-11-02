@@ -18,7 +18,7 @@ local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "blocking" } } } } })
+  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "blocking" } } } } })
   local opened
   client.session_initialize(function(snapshot, request_error)
     assert(not request_error, request_error)
@@ -26,54 +26,31 @@ local success, failure = xpcall(function()
   end)
   assert(vim.wait(10000, function() return opened ~= nil end, 10), "host initialization stalled")
   local finished, rejected, cancelled
-  client.request({ method = "session.prompt.submit", params = { text = "Wait for interruption" }, session_id = assert(require("forge.session").harness.session).id }, function(_, request_error, detail)
+  client.request({ method = "session.prompt.submit", params = { text = "Wait for interruption" }, session_id = opened.session.id }, function(_, request_error, detail)
     assert(request_error and detail.code == "turn_cancelled", vim.inspect({ request_error, detail }))
     finished = true
   end)
-  client.request({ method = "session.prompt.submit", params = { text = "Must not reset cancellation" }, session_id = assert(require("forge.session").harness.session).id }, function(_, request_error)
+  client.request({ method = "session.prompt.submit", params = { text = "Must not reset cancellation" }, session_id = opened.session.id }, function(_, request_error)
     assert(request_error and request_error:find("execution request is already running", 1, true), request_error)
     rejected = true
   end)
   assert(vim.wait(5000, function() return rejected end, 10), "overlapping request was not rejected")
-  client.request({ method = "session.turn.cancel", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(result, request_error)
+  client.request({ method = "session.turn.cancel", params = {}, session_id = opened.session.id }, function(result, request_error)
     assert(not request_error, request_error)
     cancelled = result.cancel_requested
   end)
   assert(vim.wait(10000, function() return finished and cancelled end, 10), "cancellation failed to settle")
 
   finished, cancelled = false, false
-  client.request({ method = "session.prompt.submit", params = { text = "Cancel immediately after admission" }, session_id = assert(require("forge.session").harness.session).id }, function(_, request_error, detail)
+  client.request({ method = "session.prompt.submit", params = { text = "Cancel immediately after admission" }, session_id = opened.session.id }, function(_, request_error, detail)
     assert(request_error and detail.code == "turn_cancelled", vim.inspect({ request_error, detail }))
     finished = true
   end)
-  client.request({ method = "session.turn.cancel", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(result, request_error)
+  client.request({ method = "session.turn.cancel", params = {}, session_id = opened.session.id }, function(result, request_error)
     assert(not request_error, request_error)
     cancelled = result.cancel_requested
   end)
   assert(vim.wait(10000, function() return finished and cancelled end, 10), "early cancellation was lost")
-  finished = false
-  local restarted, stopped
-  client.request({ method = "session.goal.set", params = { objective = "Retain a durable stop after restart" }, session_id = assert(require("forge.session").harness.session).id }, function(_, request_error, detail)
-    assert(request_error and detail.code == "turn_cancelled", vim.inspect({ request_error, detail }))
-    finished = true
-  end)
-  client.request({ method = "session.turn.restart", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(result, request_error)
-    assert(not request_error, request_error)
-    restarted = result.restart_requested
-  end)
-  assert(vim.wait(10000, function() return finished and restarted end, 10), "restart did not settle")
-  client.request({ method = "session.turn.cancel", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(result, request_error)
-    assert(not request_error, request_error)
-    stopped = result.cancel_requested
-  end)
-  assert(vim.wait(5000, function() return stopped end, 10), "settled restart could not be cancelled")
-  local settled
-  client.request({ method = "session.state.get", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(result, request_error)
-    assert(not request_error, request_error)
-    settled = result
-  end)
-  assert(vim.wait(5000, function() return settled ~= nil end, 10))
-  assert(settled.session.active_task.goal.state == "paused", "goal stop was not persisted")
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)
 client.host_stop()

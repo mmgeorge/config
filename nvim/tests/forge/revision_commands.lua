@@ -11,7 +11,7 @@ local initialized = false
 
 local ok, failure = xpcall(function()
   local plugin = dofile("nvim/lua/plugins/forge.lua")[1]
-  plugin.config(nil, { harness = { backend = "mock" }, harness_logging = false, diff_logging = false })
+  plugin.config(nil, { harness = { provider = "mock" }, harness_logging = false, diff_logging = false })
   builder.ensure = function(done) done({ ok = true, path = "injected-forge" }) end
   client._host_set_launcher_for_test(function(_, options)
     host_count = host_count + 1
@@ -24,7 +24,7 @@ local ok, failure = xpcall(function()
         if request.method == "host.transport.consumed" or request.method == "host.shutdown" then return end
         if request.method == "host.initialize" then
           assert(request.params.protocol_version == require("forge.protocol").VERSION)
-          assert(request.params.backend == nil and request.params.data_root == nil)
+          assert(request.params.provider == nil and request.params.data_root == nil)
           emit(request.id, { protocol_version = require("forge.protocol").VERSION })
         elseif request.method == "repository.revision.list" then
           page_count = page_count + 1

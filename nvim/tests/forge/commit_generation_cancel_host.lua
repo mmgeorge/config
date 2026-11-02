@@ -26,7 +26,7 @@ local success, failure = xpcall(function()
   git({ "commit", "--quiet", "-m", "initial" })
   vim.fn.writefile({ "after" }, fixture .. "/tracked.txt")
   git({ "add", "." })
-  config.setup({ harness = { backend = "mock", backends = { mock = { command = { "writing-blocking" } } } } })
+  config.setup({ harness = { provider = "mock", providers = { mock = { command = { "writing-blocking" } } } } })
   local started, completed, diagnostic = false, false, nil
   local cancel = client.generation_request({ operation = "generate", workspace = fixture, comparison = "staged" },
     function(_, error) completed, diagnostic = true, error end,
@@ -40,7 +40,7 @@ local success, failure = xpcall(function()
   cancel()
   await(function() return completed end, "cancelled provider request did not settle")
   assert(diagnostic and diagnostic:find("cancelled", 1, true), tostring(diagnostic))
-  config.setup({ harness = { backend = "mock", backends = { mock = { command = {} } } } })
+  config.setup({ harness = { provider = "mock", providers = { mock = { command = {} } } } })
   local replacement, replacement_error
   client.generation_request({ operation = "generate", workspace = fixture, comparison = "staged" },
     function(result, error) replacement, replacement_error = result, error end, nil,

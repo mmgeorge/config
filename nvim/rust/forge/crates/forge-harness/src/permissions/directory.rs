@@ -7,21 +7,7 @@ use crate::session::WriteScope;
 use crate::session::{AccessPolicy, DirectoryScope};
 use crate::settings::{SettingScope, SettingsStore};
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DirectoryOperation {
-    Read,
-    Write,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct DirectoryGrant {
-    pub operation: DirectoryOperation,
-    pub path: String,
-}
 
 /// Owns reported file authorization for one provider execution without claiming shell confinement.
 pub(crate) struct DirectoryPolicy {
@@ -798,3 +784,5 @@ mod test {
         Ok(())
     }
 }
+
+pub use forge_provider_api::access::{DirectoryGrant, DirectoryOperation};

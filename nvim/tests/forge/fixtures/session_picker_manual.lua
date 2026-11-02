@@ -56,7 +56,7 @@ local function snapshot(entry)
   }
 end
 
-forge.setup({ walkthrough_inventory = "sem", harness = { backend = "mock" } })
+forge.setup({ walkthrough_inventory = "sem", harness = { provider = "mock" } })
 local state = session.harness
 state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win = layout.open()
 layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
@@ -64,16 +64,16 @@ controller.attach()
 
 local workspace = vim.fn.getcwd()
 local entry_list = {
-  { id = "active", name = "Architecture review", workspace = workspace, backend = "mock", approval_mode = "ask" },
-  { id = "streaming", name = "Streaming renderer", workspace = workspace, backend = "mock", approval_mode = "ask" },
-  { id = "picker", name = "Picker polish", workspace = workspace, backend = "mock", approval_mode = "ask" },
-  { id = "gamma", name = "Gamma migration", workspace = workspace, backend = "mock", approval_mode = "ask" },
-  { id = "plans", name = "Plan review", workspace = workspace, backend = "mock", approval_mode = "ask" },
-  { id = "agents", name = "Agent timeline", workspace = workspace, backend = "mock", approval_mode = "ask" },
-  { id = "approvals", name = "Approval flow", workspace = workspace, backend = "mock", approval_mode = "ask" },
-  { id = "rollback", name = "Rollback checks", workspace = workspace, backend = "mock", approval_mode = "ask" },
-  { id = "unnamed", name = "", workspace = workspace, backend = "mock", approval_mode = "ask" },
-  { id = "remote", name = "Remote repository", workspace = workspace .. "-remote", backend = "mock", approval_mode = "ask" },
+  { id = "active", name = "Architecture review", workspace = workspace, provider = "mock", approval_mode = "ask" },
+  { id = "streaming", name = "Streaming renderer", workspace = workspace, provider = "mock", approval_mode = "ask" },
+  { id = "picker", name = "Picker polish", workspace = workspace, provider = "mock", approval_mode = "ask" },
+  { id = "gamma", name = "Gamma migration", workspace = workspace, provider = "mock", approval_mode = "ask" },
+  { id = "plans", name = "Plan review", workspace = workspace, provider = "mock", approval_mode = "ask" },
+  { id = "agents", name = "Agent timeline", workspace = workspace, provider = "mock", approval_mode = "ask" },
+  { id = "approvals", name = "Approval flow", workspace = workspace, provider = "mock", approval_mode = "ask" },
+  { id = "rollback", name = "Rollback checks", workspace = workspace, provider = "mock", approval_mode = "ask" },
+  { id = "unnamed", name = "", workspace = workspace, provider = "mock", approval_mode = "ask" },
+  { id = "remote", name = "Remote repository", workspace = workspace .. "-remote", provider = "mock", approval_mode = "ask" },
 }
 
 state.session = entry_list[1]

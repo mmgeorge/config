@@ -1,23 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskStart {
-    pub kind: crate::task::TaskKind,
-    pub title: String,
-}
-
-impl TaskStart {
-    pub fn heading(&self) -> String {
-        let label = match self.kind {
-            crate::task::TaskKind::Goal => "Goal",
-            crate::task::TaskKind::Plan => "Plan",
-            crate::task::TaskKind::Execute => "Execution",
-        };
-        format!("{label} started: {}", self.title)
-    }
-}
-
 /// Identifies who requested an exchange without retaining task ownership.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -86,3 +68,5 @@ mod tests {
         );
     }
 }
+
+pub use forge_provider_api::input::TaskStart;

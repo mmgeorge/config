@@ -74,7 +74,7 @@ pub struct RepositoryObservation {
     pub worktree: crate::WorktreeId,
     pub head: HeadState,
     pub index: IndexStamp,
-    pub backend: crate::reader::StatusBackend,
+    pub provider: crate::reader::StatusProvider,
     pub path: Vec<ObservedPath>,
 }
 

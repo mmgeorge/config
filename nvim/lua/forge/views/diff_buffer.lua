@@ -7,7 +7,7 @@
 --- own view state while reaching render/parse seams and orchestrator functions via direct requires.
 
 local diff_render = require("forge.render.diff_render")
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 local notifications = require("forge.infra.notifications")
 
 -- state edge kept lazy to avoid a load-time cycle.
@@ -468,7 +468,7 @@ function M._update_file_diff_cache_async(filename, cb)
     end)
     return
   end
-  git_backend.git_root_async(function(cwd)
+  git_provider.git_root_async(function(cwd)
     if not cwd then
       if cb then cb() end
       return

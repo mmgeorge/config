@@ -36,7 +36,7 @@ pub(crate) struct BrokerObserver {
 #[derive(Clone)]
 pub(super) struct ObservationMetadata {
     pub revision: u64,
-    pub capability: BackendCapability,
+    pub capability: ProviderCapability,
     pub active_wait: Option<ActiveWait>,
     pub no_checkpoint: bool,
 }
@@ -300,7 +300,7 @@ impl BrokerObserver {
         let snapshot = crate::settings::SettingsStore::read_only(&self.data_root)?.get(
             &session.workspace,
             &session.id,
-            &session.backend,
+            &session.provider,
         )?;
         let ask_model = snapshot.ask_model()?;
         let settings = snapshot.desired;
@@ -408,7 +408,7 @@ impl BrokerObserver {
             .rev()
             .find_map(|event| match &event.detail {
                 SessionEventKind::Compaction { compaction }
-                    if compaction.state == crate::backend::CompactionState::Running =>
+                    if compaction.state == crate::provider::CompactionState::Running =>
                 {
                     Some(compaction.started_at_ms.unwrap_or(event.created_at_ms))
                 }

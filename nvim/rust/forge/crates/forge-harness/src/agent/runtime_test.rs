@@ -1,7 +1,7 @@
 use super::*;
-use crate::backend::submission::{SubmissionState, SubmissionStore, SubmissionTarget};
-use crate::backend::{
-    BackendDescriptor, BackendError, BackendEventSink, BackendInput, BackendKind, PromptMode,
+use crate::provider::submission::{SubmissionState, SubmissionStore, SubmissionTarget};
+use crate::provider::{
+    PromptMode, ProviderDescriptor, ProviderError, ProviderEventSink, ProviderInput, ProviderKind,
     ServiceTier,
 };
 use crate::session::ApprovalMode;
@@ -16,38 +16,38 @@ enum BackgroundFinish {
 }
 
 /// Retain the actual session delivery lane until the simulated native command settles.
-struct BackgroundBackend {
+struct BackgroundProvider {
     finish: BackgroundFinish,
     output_count: usize,
-    session_sink: tokio::sync::Mutex<Option<BackendEventSink>>,
-    background: tokio::sync::Mutex<Option<(BackendEventSink, crate::backend::ToolAddress)>>,
+    session_sink: tokio::sync::Mutex<Option<ProviderEventSink>>,
+    background: tokio::sync::Mutex<Option<(ProviderEventSink, crate::provider::ToolAddress)>>,
     shutdown_called: std::sync::atomic::AtomicBool,
 }
 
-impl BackgroundBackend {
+impl BackgroundProvider {
     async fn finish_background(&self) -> Result<()> {
         let pending = self.background.lock().await.take();
         if let Some((sink, address)) = pending {
             for sequence in 0..self.output_count {
-                sink.send_wait(BackendEvent::Tool {
+                sink.send_wait(ProviderEvent::Tool {
                     address: address.clone(),
-                    update: crate::backend::ToolUpdate::Output {
-                        update: crate::backend::TextUpdate::Append(format!("END-{sequence}\n")),
+                    update: crate::provider::ToolUpdate::Output {
+                        update: crate::provider::TextUpdate::Append(format!("END-{sequence}\n")),
                     },
                 })
                 .await?;
             }
-            sink.send_wait(BackendEvent::Tool {
+            sink.send_wait(ProviderEvent::Tool {
                 address,
-                update: crate::backend::ToolUpdate::Finished {
+                update: crate::provider::ToolUpdate::Finished {
                     outcome: match self.finish {
                         BackgroundFinish::Shutdown
                         | BackgroundFinish::ForeignOwner
                         | BackgroundFinish::PriorTask
                         | BackgroundFinish::NoisyTimeout => {
-                            crate::backend::ToolOutcome::Interrupted
+                            crate::provider::ToolOutcome::Interrupted
                         }
-                        BackgroundFinish::IdentityLookup => crate::backend::ToolOutcome::Succeeded,
+                        BackgroundFinish::IdentityLookup => crate::provider::ToolOutcome::Succeeded,
                     },
                 },
             })
@@ -58,10 +58,11 @@ impl BackgroundBackend {
 }
 
 #[async_trait::async_trait]
-impl Backend for BackgroundBackend {
-    fn descriptor(&self) -> BackendDescriptor {
-        BackendDescriptor {
-            kind: BackendKind::Mock,
+impl crate::provider::ProviderAdapter for BackgroundProvider {
+    type Host = crate::provider::HarnessProviderHost;
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor {
+            kind: ProviderKind::Mock,
             label: "background child fixture".into(),
             capability: Default::default(),
         }
@@ -70,12 +71,12 @@ impl Backend for BackgroundBackend {
     async fn session_event_stream(
         &self,
         mut owner: ExecutionOwner,
-    ) -> Result<Option<crate::backend::events::BackendEventStream>> {
+    ) -> Result<Option<crate::provider::events::ProviderEventStream>> {
         if matches!(self.finish, BackgroundFinish::ForeignOwner) {
             owner.agent_id = "foreign-child".into();
         }
         let (sink, stream) =
-            crate::backend::events::channel(crate::backend::EventScope::SessionOperation {
+            crate::provider::events::channel(crate::provider::EventScope::SessionOperation {
                 owner,
                 operation_id: "background-observation".into(),
             });
@@ -85,12 +86,12 @@ impl Backend for BackgroundBackend {
 
     async fn prompt_stream(
         &self,
-        _: BackendRequest,
-        sink: BackendEventSink,
-    ) -> Result<BackendCompletion, BackendError> {
+        _: ProviderRequest,
+        sink: ProviderEventSink,
+    ) -> Result<ProviderCompletion, ProviderError> {
         let scope = sink.invocation_scope()?.clone();
-        let address = crate::backend::ToolAddress {
-            turn: crate::backend::TurnAddress {
+        let address = crate::provider::ToolAddress {
+            turn: crate::provider::TurnAddress {
                 scope: scope.clone(),
                 thread_id: "child-thread".into(),
                 turn_id: "child-turn".into(),
@@ -98,21 +99,21 @@ impl Backend for BackgroundBackend {
             tool_id: "background-tool".into(),
         };
         for update in [
-            crate::backend::ToolUpdate::Requested {
-                invocation: crate::backend::ToolInvocation {
-                    kind: crate::backend::ToolActivityKind::Command,
+            crate::provider::ToolUpdate::Requested {
+                invocation: crate::provider::ToolInvocation {
+                    kind: crate::provider::ToolActivityKind::Command,
                     name: "exec".into(),
                     title: "Background command".into(),
                     arguments: serde_json::json!({}),
                 },
             },
-            crate::backend::ToolUpdate::Started,
-            crate::backend::ToolUpdate::Output {
-                update: crate::backend::TextUpdate::Append("BEGIN\n".into()),
+            crate::provider::ToolUpdate::Started,
+            crate::provider::ToolUpdate::Output {
+                update: crate::provider::TextUpdate::Append("BEGIN\n".into()),
             },
-            crate::backend::ToolUpdate::Backgrounded,
+            crate::provider::ToolUpdate::Backgrounded,
         ] {
-            sink.send_wait(BackendEvent::Tool {
+            sink.send_wait(ProviderEvent::Tool {
                 address: address.clone(),
                 update,
             })
@@ -121,10 +122,10 @@ impl Backend for BackgroundBackend {
         let mut observed_scope = scope;
         if matches!(self.finish, BackgroundFinish::NoisyTimeout) {
             loop {
-                sink.send_wait(BackendEvent::Tool {
+                sink.send_wait(ProviderEvent::Tool {
                     address: address.clone(),
-                    update: crate::backend::ToolUpdate::Output {
-                        update: crate::backend::TextUpdate::Append("still running\n".into()),
+                    update: crate::provider::ToolUpdate::Output {
+                        update: crate::provider::TextUpdate::Append("still running\n".into()),
                     },
                 })
                 .await?;
@@ -150,7 +151,7 @@ impl Backend for BackgroundBackend {
             .context("runtime did not subscribe to child session events")?
             .invocation_sink(&observed_scope)?;
         *self.background.lock().await = Some((observer, observed_address));
-        Ok(BackendCompletion::default())
+        Ok(ProviderCompletion::default())
     }
 
     async fn active_session_id_for(&self, _: &str) -> Option<String> {
@@ -183,7 +184,7 @@ impl Backend for BackgroundBackend {
 async fn collect_background_child(
     finish: BackgroundFinish,
     output_count: usize,
-) -> Result<Vec<BackendEvent>> {
+) -> Result<Vec<ProviderEvent>> {
     let fixture = tempfile::tempdir()?;
     let trace = Arc::new(crate::trace::TraceStore::open(fixture.path())?);
     let store = SubmissionStore::open(fixture.path(), trace.clone())?;
@@ -193,7 +194,7 @@ async fn collect_background_child(
         session_id: "session".into(),
         agent_id: "child".into(),
     };
-    let backend = Arc::new(BackgroundBackend {
+    let provider = Arc::new(BackgroundProvider {
         finish,
         output_count,
         session_sink: Default::default(),
@@ -201,7 +202,7 @@ async fn collect_background_child(
         shutdown_called: Default::default(),
     });
     let runtime = AgentRuntime {
-        backend: backend.clone(),
+        provider: provider.clone(),
         tool_timeout: if matches!(finish, BackgroundFinish::NoisyTimeout) {
             crate::session::InputTimeout {
                 amount: 1,
@@ -212,14 +213,14 @@ async fn collect_background_child(
         },
         trace,
         submission_store: store,
-        permission: crate::backend::approval::PermissionCoordinator::transient(
+        permission: crate::provider::approval::PermissionCoordinator::transient(
             fixture.path().to_str().unwrap(),
         )?,
-        request: BackendRequest {
+        request: ProviderRequest {
             execution_owner: Some(owner.clone()),
             harness_session_id: "session".into(),
             workspace: fixture.path().to_string_lossy().into_owned(),
-            input: BackendInput::from_text("Start one background command"),
+            input: ProviderInput::from_text("Start one background command"),
             mode: PromptMode::Chat,
             model: "fixture".into(),
             effort: "low".into(),
@@ -227,7 +228,7 @@ async fn collect_background_child(
             service_tier: ServiceTier::Standard,
             access: Default::default(),
             approval_mode: ApprovalMode::Ask,
-            backend_session_id: None,
+            provider_session_id: None,
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
@@ -291,10 +292,10 @@ async fn collect_background_child(
     .context("child cleanup blocked while observation queues filled")??;
     running.await??;
     assert!(
-        backend
+        provider
             .shutdown_called
             .load(std::sync::atomic::Ordering::Acquire),
-        "scope failure skipped backend cleanup"
+        "scope failure skipped provider cleanup"
     );
     assert!(
         coordinator.try_receive().is_none(),
@@ -304,40 +305,40 @@ async fn collect_background_child(
 }
 
 fn assert_background_completion(
-    events: &[BackendEvent],
-    outcome: crate::backend::ToolOutcome,
+    events: &[ProviderEvent],
+    outcome: crate::provider::ToolOutcome,
     output_count: usize,
 ) {
     let mut text = String::new();
     let mut terminal_count = 0;
     for event in events {
-        if let BackendEvent::Tool { address, update } = event {
+        if let ProviderEvent::Tool { address, update } = event {
             assert_eq!(address.tool_id.as_str(), "background-tool");
             assert_eq!(address.turn.scope.exchange_id.as_str(), "child-task");
             match update {
-                crate::backend::ToolUpdate::Output {
-                    update: crate::backend::TextUpdate::Append(part),
+                crate::provider::ToolUpdate::Output {
+                    update: crate::provider::TextUpdate::Append(part),
                 } => {
                     assert_eq!(terminal_count, 0, "output followed terminal settlement");
                     text.push_str(part);
                 }
-                crate::backend::ToolUpdate::Finished { outcome: received } => {
+                crate::provider::ToolUpdate::Finished { outcome: received } => {
                     terminal_count += 1;
                     assert_eq!(received, &outcome);
                 }
-                crate::backend::ToolUpdate::Output {
-                    update: crate::backend::TextUpdate::Replace(part),
+                crate::provider::ToolUpdate::Output {
+                    update: crate::provider::TextUpdate::Replace(part),
                 } => {
                     assert_eq!(terminal_count, 0, "output followed terminal settlement");
                     text = part.clone();
                 }
-                crate::backend::ToolUpdate::Requested { .. }
-                | crate::backend::ToolUpdate::TitleChanged { .. }
-                | crate::backend::ToolUpdate::Input { .. }
-                | crate::backend::ToolUpdate::Started
-                | crate::backend::ToolUpdate::Backgrounded
-                | crate::backend::ToolUpdate::Changes { .. }
-                | crate::backend::ToolUpdate::SkillRead { .. } => {}
+                crate::provider::ToolUpdate::Requested { .. }
+                | crate::provider::ToolUpdate::TitleChanged { .. }
+                | crate::provider::ToolUpdate::Input { .. }
+                | crate::provider::ToolUpdate::Started
+                | crate::provider::ToolUpdate::Backgrounded
+                | crate::provider::ToolUpdate::Changes { .. }
+                | crate::provider::ToolUpdate::SkillRead { .. } => {}
             }
         }
     }
@@ -361,9 +362,9 @@ async fn noisy_child_tool_timeout_stops_execution_and_cleans_up() -> Result<()> 
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, BackendEvent::Tool {
-        update: crate::backend::ToolUpdate::Finished {
-            outcome: crate::backend::ToolOutcome::Failed { diagnostic },
+            .any(|event| matches!(event, ProviderEvent::Tool {
+        update: crate::provider::ToolUpdate::Finished {
+            outcome: crate::provider::ToolOutcome::Failed { diagnostic },
         }, ..
     } if diagnostic.code.as_deref() == Some("tool_timeout")))
     );
@@ -374,7 +375,7 @@ async fn noisy_child_tool_timeout_stops_execution_and_cleans_up() -> Result<()> 
 #[tokio::test]
 async fn background_shutdown_settlement_precedes_child_completion() -> Result<()> {
     let events = collect_background_child(BackgroundFinish::Shutdown, 1).await?;
-    assert_background_completion(&events, crate::backend::ToolOutcome::Interrupted, 1);
+    assert_background_completion(&events, crate::provider::ToolOutcome::Interrupted, 1);
     Ok(())
 }
 
@@ -382,7 +383,7 @@ async fn background_shutdown_settlement_precedes_child_completion() -> Result<()
 #[tokio::test]
 async fn natural_background_completion_during_identity_lookup_is_preserved() -> Result<()> {
     let events = collect_background_child(BackgroundFinish::IdentityLookup, 1).await?;
-    assert_background_completion(&events, crate::backend::ToolOutcome::Succeeded, 1);
+    assert_background_completion(&events, crate::provider::ToolOutcome::Succeeded, 1);
     Ok(())
 }
 
@@ -393,7 +394,7 @@ async fn background_shutdown_drains_full_provider_queue_before_child_completion(
     let events = collect_background_child(BackgroundFinish::Shutdown, output_count).await?;
     assert_background_completion(
         &events,
-        crate::backend::ToolOutcome::Interrupted,
+        crate::provider::ToolOutcome::Interrupted,
         output_count,
     );
     Ok(())
@@ -407,8 +408,8 @@ async fn foreign_owner_session_event_fails_child_without_forwarding_or_skipping_
     assert!(
         !events.iter().any(|event| matches!(
             event,
-            BackendEvent::Tool {
-                update: crate::backend::ToolUpdate::Finished { .. },
+            ProviderEvent::Tool {
+                update: crate::provider::ToolUpdate::Finished { .. },
                 ..
             }
         )),
@@ -425,8 +426,8 @@ async fn prior_task_session_event_fails_child_without_forwarding_or_skipping_cle
     assert!(
         !events.iter().any(|event| matches!(
             event,
-            BackendEvent::Tool {
-                update: crate::backend::ToolUpdate::Finished { .. },
+            ProviderEvent::Tool {
+                update: crate::provider::ToolUpdate::Finished { .. },
                 ..
             }
         )),
@@ -442,18 +443,19 @@ enum SubmissionBoundary {
     Accepted,
 }
 
-struct ProviderCancelledBackend {
+struct ProviderCancelledProvider {
     boundary: SubmissionBoundary,
 }
 
 #[async_trait::async_trait]
-impl Backend for ProviderCancelledBackend {
+impl crate::provider::ProviderAdapter for ProviderCancelledProvider {
+    type Host = crate::provider::HarnessProviderHost;
     /// Use a tracked provider kind without launching an external provider.
-    fn descriptor(&self) -> BackendDescriptor {
-        BackendDescriptor {
-            kind: BackendKind::Codex,
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor {
+            kind: ProviderKind::Codex,
             label: "cancelled child".into(),
-            capability: crate::backend::mock_capability(),
+            capability: crate::provider::mock_capability(),
         }
     }
     /// Complete fixture cleanup without resources.
@@ -479,9 +481,9 @@ impl Backend for ProviderCancelledBackend {
     /// Cancel after the selected durable submission boundary without changing the watch channel.
     async fn prompt_stream(
         &self,
-        request: BackendRequest,
-        _: BackendEventSink,
-    ) -> Result<BackendCompletion, BackendError> {
+        request: ProviderRequest,
+        _: ProviderEventSink,
+    ) -> Result<ProviderCompletion, ProviderError> {
         let submission = request.submission.as_ref().unwrap();
         match self.boundary {
             SubmissionBoundary::Prepared => {}
@@ -489,19 +491,19 @@ impl Backend for ProviderCancelledBackend {
                 .sending(SubmissionTarget::Codex {
                     thread_id: "thread".into(),
                 })
-                .map_err(BackendError::from)?,
+                .map_err(ProviderError::from)?,
             SubmissionBoundary::Accepted => {
                 submission
                     .sending(SubmissionTarget::Codex {
                         thread_id: "thread".into(),
                     })
-                    .map_err(BackendError::from)?;
+                    .map_err(ProviderError::from)?;
                 submission
                     .accepted("accepted".into())
-                    .map_err(BackendError::from)?;
+                    .map_err(ProviderError::from)?;
             }
         }
-        Err(BackendError::Cancelled)
+        Err(ProviderError::Cancelled)
     }
 }
 
@@ -518,14 +520,14 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         let store = SubmissionStore::open(fixture.path(), trace.clone())?;
         let coordinator = crate::agent::AgentCoordinator::new("session".into());
         let (_cancel, cancellation) = watch::channel(false);
-        let mut request = BackendRequest {
+        let mut request = ProviderRequest {
             execution_owner: Some(ExecutionOwner {
                 session_id: "session".into(),
                 agent_id: "child".into(),
             }),
             harness_session_id: "session".into(),
             workspace: fixture.path().to_string_lossy().into_owned(),
-            input: BackendInput::from_text("child request"),
+            input: ProviderInput::from_text("child request"),
             mode: PromptMode::Chat,
             model: "fixture".into(),
             effort: "low".into(),
@@ -533,19 +535,19 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
             service_tier: ServiceTier::Standard,
             access: Default::default(),
             approval_mode: ApprovalMode::Ask,
-            backend_session_id: None,
+            provider_session_id: None,
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
         };
-        let submission = store.prepare(&request, BackendKind::Codex)?;
+        let submission = store.prepare(&request, ProviderKind::Codex)?;
         request.submission = Some(submission.clone());
         AgentRuntime {
-            backend: Arc::new(ProviderCancelledBackend { boundary }),
+            provider: Arc::new(ProviderCancelledProvider { boundary }),
             tool_timeout: Default::default(),
             trace,
             submission_store: store,
-            permission: crate::backend::approval::PermissionCoordinator::transient(
+            permission: crate::provider::approval::PermissionCoordinator::transient(
                 &request.workspace,
             )?,
             request,

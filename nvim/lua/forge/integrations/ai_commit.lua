@@ -1,4 +1,4 @@
----@class ForgeAICommitBackend
+---@class ForgeAICommitProvider
 ---@field request_async? fun(params: table, callback: fun(result: table?, failure: string?)): fun()?
 ---@class ForgeAICommitState
 ---@field state "none"|"generating"|"ready"|"error"
@@ -11,7 +11,7 @@
 ---@field waiters fun(result: ForgeAICommitState)[]
 
 ---@class ForgeAICommitModule
----@field _backend ForgeAICommitBackend?
+---@field _provider ForgeAICommitProvider?
 ---@field _state ForgeAICommitState?
 ---@field _states table<string, ForgeAICommitState>
 ---@field _request_ids table<string, integer>
@@ -20,12 +20,12 @@
 local M = { _request_ids = {}, _states = {}, _buffer_generation = {} }
 local notifications = require("forge.infra.notifications")
 
----@param backend ForgeAICommitBackend?
-function M.set_backend(backend) M._backend = backend end
-function M.reset_backend()
+---@param provider ForgeAICommitProvider?
+function M.set_provider(provider) M._provider = provider end
+function M.reset_provider()
   for _, cancel in pairs(M._buffer_generation) do cancel() end
   local previous = M._states
-  M._backend, M._state = nil, nil
+  M._provider, M._state = nil, nil
   M._states, M._request_ids = {}, {}
   for _, state in pairs(previous) do
     if state.cancel then state.cancel() end
@@ -60,7 +60,7 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     local client = require("forge.client")
     local generation, configuration_failure = client.generation_get_config()
     if not generation then callback(nil, configuration_failure) return end
-    local choice = require("forge.integrations.background_settings").model(snapshot, generation.backend.kind)
+    local choice = require("forge.integrations.background_settings").model(snapshot, generation.provider.kind)
     local function publish_model(label)
       local speed = choice.service_tier
       on_model((label:match("[^\r\n]*") or label) .. (speed and speed ~= "default" and (" · " .. speed) or ""))
@@ -69,7 +69,7 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     local params = { operation = "generate", workspace = cwd,
       comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "status",
       ignored_paths = ignored or {} }
-    if M._backend and M._backend.request_async then cancel_request = M._backend.request_async(params, receive)
+    if M._provider and M._provider.request_async then cancel_request = M._provider.request_async(params, receive)
     else
       cancel_request = client.generation_request(params, receive, publish_model, { model = choice.model,
         reasoning_effort = choice.thinking, service_tier = choice.service_tier,

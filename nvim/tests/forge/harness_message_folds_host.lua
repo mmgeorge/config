@@ -36,10 +36,10 @@ package.loaded["forge.builder"] = { ensure = function(callback) callback({ ok = 
 local client = require("forge.client")
 client._host_set_launcher_for_test(vim.system)
 local state, errors = require("forge.session").harness, {}
-local backend_errors = {}
+local provider_errors = {}
 local unsubscribe_errors = client.session_events_subscribe(function(event, payload)
-  if event == "backend_event" and payload.kind == "error" then
-    backend_errors[#backend_errors + 1] = payload
+  if event == "provider_event" and payload.kind == "error" then
+    provider_errors[#provider_errors + 1] = payload
   end
 end)
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
@@ -61,7 +61,7 @@ local function await(predicate, reason)
   assert(ready, reason .. ": " .. vim.inspect({
     busy = state.busy, status = state.status, diagnostic = state.diagnostic,
     session_id = state.session and state.session.id,
-    backend_errors = backend_errors,
+    provider_errors = provider_errors,
     transcript = state.transcript_buf and vim.api.nvim_buf_is_valid(state.transcript_buf)
       and vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false) or nil,
   }))
@@ -86,7 +86,7 @@ local function toggle(node)
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   require("forge").open_harness()
   await(function() return state.ready and state.session and state.presentation and state.presentation.ready end, "Harness did not open")
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "first", "second", "third", "fourth", "fifth" })

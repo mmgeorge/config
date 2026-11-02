@@ -1,11 +1,11 @@
 vim.loader.enable(false)
 
 local ai_commit = require("forge.integrations.ai_commit")
-local original_backend = ai_commit._backend
+local original_provider = ai_commit._provider
 local original_client = package.loaded["forge.client"]
 local original_notify = vim.notify
 local original_settings = package.loaded["forge.integrations.background_settings"]
-local function generation_get_config() return { backend = { kind = "codex" } } end
+local function generation_get_config() return { provider = { kind = "codex" } } end
 package.loaded["forge.integrations.background_settings"] = {
   request = function(_, _, callback)
     callback({ settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
@@ -29,8 +29,8 @@ end
 
 local function run()
   local requests, generated = {}, 0
-  ai_commit.reset_backend()
-  ai_commit.set_backend({ request_async = function(params, callback)
+  ai_commit.reset_provider()
+  ai_commit.set_provider({ request_async = function(params, callback)
     if params.operation == "generate" then generated = generated + 1 end
     local request = { params = params, callback = callback, cancelled = false }
     requests[#requests + 1] = request
@@ -225,12 +225,12 @@ local function run()
   local failed_count = #notices
   vim.wait(150, function() return false end)
   assert_equal(#notices, failed_count, "failed generation timer kept notifying")
-  ai_commit.set_backend({ request_async = function() error("request startup failed") end })
+  ai_commit.set_provider({ request_async = function() error("request startup failed") end })
   ai_commit.ensure(cwd, { ref = "HEAD", force = true })
   assert(ai_commit.state(cwd, "HEAD").error:find("request startup failed", 1, true))
   assert_equal(notices[#notices].level, vim.log.levels.ERROR)
 
-  ai_commit.reset_backend()
+  ai_commit.reset_provider()
   package.loaded["forge.client"] = {
     request = function() error("Commit generation initialized a conversation") end,
     generation_get_config = generation_get_config,
@@ -254,8 +254,8 @@ local function run()
 end
 
 local ok, failure = xpcall(run, debug.traceback)
-ai_commit.reset_backend()
-ai_commit.set_backend(original_backend)
+ai_commit.reset_provider()
+ai_commit.set_provider(original_provider)
 package.loaded["forge.client"] = original_client
 package.loaded["forge.integrations.background_settings"] = original_settings
 vim.notify = original_notify

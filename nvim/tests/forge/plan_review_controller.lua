@@ -206,7 +206,7 @@ local success, failure = xpcall(function()
   pending.callback({ session = { id = "plan-session" }, active_plan = { state = "accepted", acceptance = vim.NIL },
     goal_execution = { state = "paused" } })
   assert(execution == nil and state.plan_review == nil,
-    "revision approval overrode the backend pause with an execute request")
+    "revision approval overrode the provider pause with an execute request")
   native.open(review.plan)
   review = state.plan_review
   review.command_set.action_by_id.request_changes.run({})

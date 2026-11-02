@@ -7,7 +7,7 @@ use crate::tools::session::catalog::{definitions, is_tool};
 fn session(id: &str, workspace: &Path) -> HarnessSession {
     serde_json::from_value(json!({
         "id":id,"primary_agent_id":HarnessSession::primary_agent_id(id),"name":id,
-        "workspace":workspace,"backend":"copilot","model":"default","effort":"medium",
+        "workspace":workspace,"provider":"copilot","model":"default","effort":"medium",
         "provider_fork_state":{"state":"ready"},"approval_mode":"ask",
         "created_at_ms":1,"updated_at_ms":1
     }))
@@ -163,7 +163,7 @@ fn disabling_history_keeps_config_and_skill_but_revokes_runtime_reads() -> Resul
         fixture.scope.trace.clone(),
     )?;
     assert!(!scope.enabled());
-    let mut context = crate::tools::ControlTurnContext::inactive(crate::backend::PromptMode::Chat);
+    let mut context = crate::tools::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
     context.harness = Some(scope);
     let tools = crate::tools::ControlToolRegistry.definition_list_for_context(Some(&context), true);
     assert!(tools.iter().any(|tool| tool.name == "harness_config"));
@@ -178,7 +178,7 @@ fn disabling_history_keeps_config_and_skill_but_revokes_runtime_reads() -> Resul
             .iter()
             .any(|tool| is_tool(tool.name))
     );
-    context.mode = crate::backend::PromptMode::Background;
+    context.mode = crate::provider::PromptMode::Background;
     assert!(
         crate::tools::ControlToolRegistry
             .definition_list_for_context(Some(&context), true)
@@ -196,13 +196,13 @@ fn disabling_history_keeps_config_and_skill_but_revokes_runtime_reads() -> Resul
     std::fs::write(skill_directory.join("SKILL.md"), skill)?;
     let resources = crate::settings::SessionResources::load(
         fixture.root.path(),
-        &crate::backend::BackendCatalogRequest {
+        &crate::provider::ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: "current".into(),
             workspace: fixture.scope.session.workspace.clone(),
             access: Default::default(),
             approval_mode: crate::session::ApprovalMode::Ask,
-            backend_session_id: None,
+            provider_session_id: None,
         },
         "copilot",
         "copilotcli",
@@ -555,7 +555,7 @@ fn search_respects_workspace_read_boundary_and_explicit_denials() -> Result<()> 
 
 #[test]
 fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> Result<()> {
-    use crate::backend::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+    use crate::provider::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
     let fixture = Fixture::new()?;
     let mut store = SqliteStore::open(fixture.root.path())?;
     let mut exchange = exchange(&fixture.scope.session, "exchange", "Initial question");
@@ -571,7 +571,7 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     let event = crate::turn::test_support::message(
         &address,
         "progress",
-        Some(crate::backend::MessageRole::Commentary),
+        Some(crate::provider::MessageRole::Commentary),
         "progress excluded",
     );
     exchange.observe_turn(&event, 1)?;
@@ -583,7 +583,7 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     let event = crate::turn::test_support::message(
         &address,
         "answer",
-        Some(crate::backend::MessageRole::Response),
+        Some(crate::provider::MessageRole::Response),
         "Final answer",
     );
     exchange.observe_turn(&event, 3)?;

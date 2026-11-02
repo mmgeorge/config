@@ -34,7 +34,7 @@ local function snapshot(name)
       id = "session-" .. session_sequence,
       name = name or "",
       workspace = vim.fn.getcwd(),
-      backend = "mock",
+      provider = "mock",
       model = "mock-model",
       provider_label = "Mock CLI",
       resolved_model = "mock-model",
@@ -90,7 +90,7 @@ local function fake_launcher(_, options, _)
 end
 
 local test_success, failure = pcall(function()
-  forge.setup({ diff_logging = false, harness_logging = false, harness = { backend = "mock" } })
+  forge.setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
   builder._set_crate_dir_for_test(crate_root)
   builder._set_artifact_root_for_test(vim.fs.joinpath(test_root, "artifacts"))
   vim.fn.mkdir(vim.fs.dirname(builder.binary_path()), "p")

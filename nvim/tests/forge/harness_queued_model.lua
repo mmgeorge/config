@@ -16,7 +16,7 @@ client.request = function(request_specification, callback)
 
   assert(host.request(method, parameters, callback), method)
 end
-state.session = { id = "queued-model", backend = "mock", model = "old" }
+state.session = { id = "queued-model", provider = "mock", model = "old" }
 state.capability = { model_selection = true, effort_selection = true }
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 state.presentation = { follow_tail = function() end }

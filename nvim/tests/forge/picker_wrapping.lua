@@ -17,7 +17,7 @@ local function invoke(key)
 end
 
 local ok, failure = pcall(function()
-  require("forge").setup({ harness = { backend = "mock" } })
+  require("forge").setup({ harness = { provider = "mock" } })
   local layout = require("forge.views.picker.layout")
   local render = require("forge.views.picker.render")
   local picker = require("forge.views.picker")

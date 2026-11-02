@@ -1,0 +1,36 @@
+[package]
+name = "forge-providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-provider-api = { workspace = true }
+agent-client-protocol = { workspace = true, features = ["unstable_session_fork"] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+forge-shell = { workspace = true }
+forge-diff = { workspace = true }
+forge-protocol = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+shlex = { workspace = true }
+github-copilot-sdk = { workspace = true, features = ["derive"] }
+process-wrap = { workspace = true, features = ["tokio1", "job-object", "kill-on-drop", "process-group", "creation-flags"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+semver = { workspace = true }
+similar = { workspace = true }
+strip-ansi-escapes = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true, features = ["compat"] }
+
+[dev-dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+tempfile = { workspace = true }
+

@@ -56,7 +56,7 @@
         "revision": "integer"
       }
     },
-    "backend_event": {
+    "provider_event": {
       "route": "handle",
       "required": {
         "kind": "string"
@@ -247,7 +247,7 @@
       }
     }
   },
-  "backend": {
+  "provider": {
     "turn_started": {
       "route": "handle",
       "required": {}

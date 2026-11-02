@@ -169,7 +169,7 @@ impl PortableSettings {
         if let Some(access) = &self.access {
             session.access = access.clone().validate()?;
         }
-        session.access = crate::backend::BackendKind::parse(&session.backend)?
+        session.access = crate::provider::ProviderKind::parse(&session.provider)?
             .resolve_access(session.access.clone());
         if let Some(shell) = self.shell {
             shell.executable()?;
@@ -350,13 +350,13 @@ impl SettingsStore {
         &self,
         workspace: &str,
         session: &str,
-        backend: &str,
+        provider: &str,
     ) -> Result<CatalogSnapshot> {
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.connection,
             rusqlite::TransactionBehavior::Deferred,
         )?;
-        let settings = self.get(workspace, session, backend)?;
+        let settings = self.get(workspace, session, provider)?;
         let skill = self.skills(workspace)?;
         let server = self.servers(workspace)?;
         transaction.commit()?;
@@ -396,7 +396,7 @@ impl SettingsStore {
     fn imported(
         &self,
         workspace: &str,
-    ) -> Result<Vec<(crate::backend::ResourceScope, super::ImportedResource)>> {
+    ) -> Result<Vec<(crate::provider::ResourceScope, super::ImportedResource)>> {
         let mut statement = self.connection.prepare(
             "SELECT scope, payload FROM setting_resource
             WHERE scope='global' OR (scope='workspace' AND identity=?1) ORDER BY id",
@@ -408,8 +408,8 @@ impl SettingsStore {
             .map(|entry| {
                 let (scope, payload) = entry?;
                 let scope = match scope.as_str() {
-                    "global" => crate::backend::ResourceScope::Global,
-                    "workspace" => crate::backend::ResourceScope::Workspace,
+                    "global" => crate::provider::ResourceScope::Global,
+                    "workspace" => crate::provider::ResourceScope::Workspace,
                     _ => anyhow::bail!("unsupported resource scope {scope}"),
                 };
                 Ok((scope, serde_json::from_str(&payload)?))
@@ -425,7 +425,7 @@ impl SettingsStore {
         scope: SettingScope,
         workspace: &str,
         session: &str,
-        backend: &str,
+        provider: &str,
     ) -> Result<super::NativeImport> {
         let namespace = match scope {
             SettingScope::Global => "global".to_owned(),
@@ -436,7 +436,7 @@ impl SettingsStore {
         };
         let mut preview =
             super::NativeImport::read(kind, source, &namespace, Path::new(workspace))?;
-        let catalog = self.catalog(workspace, session, backend)?;
+        let catalog = self.catalog(workspace, session, provider)?;
         preview.revision = catalog.settings.revision;
         let desired = catalog.settings.desired;
         for candidate in &mut preview.candidate {
@@ -469,7 +469,7 @@ impl SettingsStore {
 
     /// Resolve current portable layers and provider-local tuning without implicit imports.
     /// Ignore unsupported saved formats and propagate current-format decoding failures.
-    pub fn get(&self, workspace: &str, session: &str, backend: &str) -> Result<SettingsSnapshot> {
+    pub fn get(&self, workspace: &str, session: &str, provider: &str) -> Result<SettingsSnapshot> {
         let (revision, global, workspace, session, provider) = self.connection.query_row(
             "SELECT revision,
                 (SELECT payload FROM setting_layer WHERE scope='global' AND identity=''),
@@ -477,7 +477,7 @@ impl SettingsStore {
                 (SELECT payload FROM setting_layer WHERE scope='session' AND identity=?2),
                 (SELECT payload FROM setting_layer WHERE scope='provider' AND identity=?3)
              FROM setting_revision WHERE id=1",
-            params![workspace, session, backend],
+            params![workspace, session, provider],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -882,7 +882,7 @@ impl SettingsStore {
     pub fn save_provider(
         &mut self,
         expected_revision: u64,
-        backend: &str,
+        provider: &str,
         setting: &Value,
     ) -> Result<u64> {
         let field_map = setting
@@ -903,7 +903,7 @@ impl SettingsStore {
         let payload = transaction
             .query_row(
                 "SELECT payload FROM setting_layer WHERE scope='provider' AND identity=?1",
-                [backend],
+                [provider],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -922,7 +922,7 @@ impl SettingsStore {
             }
         }
         transaction.execute("INSERT INTO setting_layer VALUES ('provider',?1,?2) ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload",
-            params![backend,serde_json::to_string(&preference)?])?;
+            params![provider,serde_json::to_string(&preference)?])?;
         let next = revision
             .checked_add(1)
             .context("settings revision exhausted")?;

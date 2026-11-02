@@ -4,11 +4,13 @@ Each provider reports identities, phases, tools, and failures differently, and a
 
 [Harness](harness.md) covers the session lifecycle, [Permissions](permissions.md) covers approvals, and [Provider configuration](provider-configuration.md) covers settings, resources, and models. Input delivery is in [Provider submissions](../provider-submissions.md).
 
-## Backend contract
+## Provider contract and ownership
 
-The crate lives at `nvim/rust/forge/crates/forge-harness`, organized by capability: `broker`, `session`, `plan`, `goal`, `exchange`, `turn`, `timeline`, `checkpoint`, `backend`, `storage`, `workspace`, `protocol`, and `tools`. `Backend` defines the complete provider contract once. `CodexBackend`, `CopilotBackend`, and `AcpBackend` own private transports, and `MockBackend` implements the same boundary deterministically.
+The provider boundary spans three crates. `forge-provider-api` defines normalized events, errors, models, capabilities, and the `Provider` interface. Its `ProviderHost` associated types keep Harness request and workflow results out of the native implementations. `forge-providers` owns native protocol decoding, process runtimes, SDK handles, and session state. `forge-harness` supplies host adapters that bind those implementations to tools, permissions, resources, task authority, and durable submissions. Neither native crate depends on Harness.
 
-`Backend::prompt_stream` writes to an ordered event sink and returns `BackendCompletion`, with provider metadata and control results but no event history. The broker drains accepted updates before settling the exchange. `BackendEvent` is an exhaustive enum with typed payloads, and every update carries the invocation scope of its owner, so no shared consumer decodes provider JSON. Compaction uses a separate session-operation scope instead of inventing an exchange.
+`Provider::prompt_stream` writes to an ordered event sink and returns completion metadata. Native completion is separate from Harness plan and task effects; the persisted completion keeps its flat representation. The broker drains accepted updates before settling the exchange. `ProviderEvent` is an exhaustive enum carrying invocation ownership. Compaction uses a separate session-operation scope instead of inventing an exchange.
+
+`ProviderTools`, `ProviderPermissions`, `InputReceipt`, `ProviderTrace`, and `TurnControl` are callback boundaries into the host. Native code asks for a tool result, permission decision, or committed receipt without acquiring Harness storage or task state. `forge-shell` separately owns shell parsing and process primitives used by the policy layer and native runtimes.
 
 `CapabilityManifest` records each operation's support, ownership, and runtime availability, and `/capabilities` displays it. Unsupported optional operations return typed errors, and cancellation and identity queries carry the Harness session ID, so they cannot affect another conversation.
 
@@ -16,7 +18,9 @@ The crate lives at `nvim/rust/forge/crates/forge-harness`, organized by capabili
 
 Interactive Codex and Copilot conversations initialize their provider session asynchronously on open, creation, and resume, without creating an exchange or sending model input. The controller releases its broker lock during network work and rejects stale results after configuration changes. The broker persists the root conversation ID when it accepts a provider turn-start boundary, so interrupting the first turn still keeps the conversation.
 
-Harness defaults to the Codex app-server backend, and `harness.backend = "copilot"` selects the Copilot SDK. Broker initialization resumes the most recently updated session for the repository and backend. Switching providers requires choosing New chat or Resume session, is unavailable during active work, and never transfers context across providers. A failed switch restores the previous session.
+Harness defaults to the Codex app-server provider, and `harness.provider = "copilot"` selects the Copilot SDK. Broker initialization resumes the most recently updated session for the repository and provider. Switching providers requires choosing New chat or Resume session, is unavailable during active work, and never transfers context across providers. A failed switch restores the previous session.
+
+Copilot's native session registry serializes preparation per execution owner. It retains repair notices, resource leases, terminal readers, and compaction subscriptions with the matching binding. Replacing submitted history disconnects its old SDK router before resuming the same ID; replacing a provisional session keeps the old binding until preparation succeeds. The host marks a specific binding as submitted before input can reach the provider, so an output-free cancellation cannot accidentally publish a new history boundary.
 
 ## Messages
 
@@ -67,7 +71,7 @@ Normalized events flow through queues of at most 96 records, each at most 512 Ki
 
 ## ACP
 
-`AcpBackend` owns one ACP v1 connection and its process tree per Harness root. Claude Code uses the Claude ACP adapter, and Antigravity uses its standalone ACP server. Harness control tools reach ACP agents through a private loopback MCP endpoint of at most 16 connections.
+`AcpConversation` in `forge-providers` owns each ACP v1 connection, handshake, model configuration, and native event state. Its Harness adapter owns the control endpoint, permission context, and resource lease for that conversation. Claude Code uses the Claude ACP adapter, and Antigravity uses its standalone ACP server. Harness control tools reach ACP agents through a private loopback MCP endpoint of at most 16 connections.
 
 Provider restart reloads the same native conversation, and failing to load it fails configuration instead of creating replacement history. Initialization rejects agents that cannot load conversations. Advertised child sessions enter the shared agent registry, at most 256 per prompt, and become interrupted when the root prompt returns. `AcpRuntime` resolves configured adapters and never installs provider runtimes.
 
@@ -75,8 +79,8 @@ Provider restart reloads the same native conversation, and failing to load it fa
 
 All three approval modes keep identical native callback setup, and Harness applies Ask, Deny, or Allow after saved rules and reported-file checks. Native operations without callbacks stay outside that boundary. Antigravity enterprise terminal policy can run commands without a callback, so its approval capability is limited. After a Copilot denial, completion requires a later final answer or Harness handoff, and provider idle without either fails the exchange.
 
-`BackendKind::supports_sandbox` allows the OS sandbox only for Codex, and child providers that cannot enforce the root's sandbox are rejected. Each provider's native delegation is disabled, so delegation goes through managed Harness agents.
+`ProviderKind::supports_sandbox` allows the OS sandbox only for Codex, and child providers that cannot enforce the root's sandbox are rejected. Each provider's native delegation is disabled, so delegation goes through managed Harness agents.
 
 ## Test provider
 
-`backend/mock_response.rs` stores session-scoped, one-response holds. The `session.provider.mock_response` route works without the broker execution lock, so a test can control a response while its real turn owns that lock. [Editor tests](../editor-tests.md#control-provider-timing) shows how to use it.
+`provider/mock_response.rs` stores session-scoped, one-response holds. The `session.provider.mock_response` route works without the broker execution lock, so a test can control a response while its real turn owns that lock. [Editor tests](../editor-tests.md#control-provider-timing) shows how to use it.

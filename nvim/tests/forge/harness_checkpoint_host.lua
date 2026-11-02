@@ -63,7 +63,7 @@ local success, failure = xpcall(function()
   write("b", "initial unstaged b")
   local initial_index = vim.fn.readblob(workspace .. "/.git/index")
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "writing-blocking" } } } } })
+  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "writing-blocking" } } } } })
   local session_id = open().session.id
   exchange({ a = "first a", b = "first b" })
   exchange({ a = "second a", c = "second c" })

@@ -1,5 +1,5 @@
 use super::{ResourceCatalog, SettingsStore, SkillResource};
-use crate::backend::{BackendCatalogRequest, McpDefinition, McpStatus, SkillDefinition};
+use crate::provider::{McpDefinition, McpStatus, ProviderCatalogRequest, SkillDefinition};
 use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -43,12 +43,12 @@ impl SessionResources {
     /// Resolve persisted selection and reject provider-name collisions before launching a session.
     pub(crate) fn load(
         root: &Path,
-        request: &BackendCatalogRequest,
-        backend: &str,
+        request: &ProviderCatalogRequest,
+        provider: &str,
         target: &str,
     ) -> Result<Self> {
         let store = SettingsStore::open(root)?;
-        let catalog = store.catalog(&request.workspace, &request.harness_session_id, backend)?;
+        let catalog = store.catalog(&request.workspace, &request.harness_session_id, provider)?;
         let settings = catalog.settings;
         let mut selected_skill = Vec::new();
         let mut skill = Vec::new();
@@ -232,15 +232,15 @@ mod test {
         }
         let mut store = SettingsStore::open(root.path()).unwrap();
         store.configure_catalog(root.path()).unwrap();
-        let request = BackendCatalogRequest {
+        let request = ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: "session".into(),
             workspace: workspace.to_string_lossy().into_owned(),
             access: AccessPolicy::default(),
             approval_mode: ApprovalMode::Ask,
-            backend_session_id: None,
+            provider_session_id: None,
         };
-        for (backend, target, provider_skill) in [
+        for (provider, target, provider_skill) in [
             ("codex", "codexcli", Some("codex-only")),
             ("copilot", "copilotcli", None),
             ("claude", "claudecode", Some("claude-only")),
@@ -254,12 +254,12 @@ mod test {
             ];
             expected.extend(provider_skill);
             expected.sort_unstable();
-            let loaded = SessionResources::load(root.path(), &request, backend, target).unwrap();
+            let loaded = SessionResources::load(root.path(), &request, provider, target).unwrap();
             for skill in &loaded.skill {
                 let scope = if matches!(skill.name.as_str(), "global-wildcard" | "unrestricted") {
-                    crate::backend::ResourceScope::Global
+                    crate::provider::ResourceScope::Global
                 } else {
-                    crate::backend::ResourceScope::Workspace
+                    crate::provider::ResourceScope::Workspace
                 };
                 assert_eq!(skill.scope, Some(scope));
                 assert!(Path::new(skill.path.as_deref().unwrap()).is_file());
@@ -329,13 +329,13 @@ mod test {
                 &desired,
             )
             .unwrap();
-        for (backend, target) in [
+        for (provider, target) in [
             ("codex", "codexcli"),
             ("copilot", "copilotcli"),
             ("claude", "claudecode"),
             ("antigravity", "antigravity-cli"),
         ] {
-            let loaded = SessionResources::load(root.path(), &request, backend, target).unwrap();
+            let loaded = SessionResources::load(root.path(), &request, provider, target).unwrap();
             assert!(
                 !loaded
                     .skill
@@ -351,7 +351,7 @@ mod test {
                     .find(|skill| skill.name == "local-wildcard")
                     .unwrap()
                     .scope,
-                Some(crate::backend::ResourceScope::Workspace)
+                Some(crate::provider::ResourceScope::Workspace)
             );
             assert_eq!(
                 loaded
@@ -360,7 +360,7 @@ mod test {
                     .find(|server| server.name == "local-wildcard")
                     .unwrap()
                     .scope,
-                Some(crate::backend::ResourceScope::Workspace)
+                Some(crate::provider::ResourceScope::Workspace)
             );
             assert_eq!(
                 loaded
@@ -405,13 +405,13 @@ mod test {
         }}).to_string()).unwrap();
         let mut store = SettingsStore::open(root.path()).unwrap();
         store.configure_catalog(root.path()).unwrap();
-        let request = BackendCatalogRequest {
+        let request = ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: "session".into(),
             workspace: workspace.to_string_lossy().into_owned(),
             access: AccessPolicy::default(),
             approval_mode: ApprovalMode::Ask,
-            backend_session_id: None,
+            provider_session_id: None,
         };
         let loaded =
             SessionResources::load(root.path(), &request, "copilot", "copilotcli").unwrap();
@@ -473,13 +473,13 @@ mod test {
                 &setting,
             )
             .unwrap();
-        for (backend, target) in [
+        for (provider, target) in [
             ("codex", "codexcli"),
             ("copilot", "copilotcli"),
             ("claude", "claudecode"),
             ("antigravity", "antigravity-cli"),
         ] {
-            let loaded = SessionResources::load(root.path(), &request, backend, target).unwrap();
+            let loaded = SessionResources::load(root.path(), &request, provider, target).unwrap();
             let missing = loaded
                 .mcp
                 .iter()

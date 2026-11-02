@@ -182,7 +182,7 @@ fn status(root: &std::path::Path) -> Vec<forge_git::snapshot::PathRecord> {
 }
 
 #[tokio::test]
-async fn process_reader_uses_store_admission_and_reports_backend() {
+async fn process_reader_uses_store_admission_and_reports_provider() {
     let directory = tempfile::tempdir().unwrap();
     git(directory.path(), &["init", "--quiet"]);
     std::fs::write(directory.path().join("new file"), "content\n").unwrap();
@@ -197,7 +197,10 @@ async fn process_reader_uses_store_admission_and_reports_backend() {
         .await
         .unwrap();
     assert_eq!(status.generation, generation);
-    assert_eq!(status.value.backend, forge_git::reader::StatusBackend::Gix);
+    assert_eq!(
+        status.value.provider,
+        forge_git::reader::StatusProvider::Gix
+    );
     assert_eq!(status.value.path.len(), 1);
     assert_eq!(status.value.path[0].path.raw(), b"new file");
     assert_eq!(

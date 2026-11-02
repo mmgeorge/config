@@ -1,4 +1,4 @@
-use crate::backend::PromptMode;
+use crate::provider::PromptMode;
 use crate::tools::ControlToolDefinition;
 use crate::tools::error::ToolContext;
 use serde_json::Value;
@@ -64,7 +64,7 @@ pub fn plan_question_input_schema() -> Value {
 /// Decode the tool's replayable completion fields.
 pub(super) fn record(
     invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::backend::BackendCompletion,
+    output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
     output.plan_question = Some(
         crate::tools::invocation::decode_arguments::<crate::plan::PlanQuestionSet>(invocation)?
@@ -78,7 +78,7 @@ pub(super) fn record(
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    output: crate::backend::BackendCompletion,
+    output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     if let Some(controller) = runtime.context.questions.clone() {
         let task = super::state::current_task(runtime)?;

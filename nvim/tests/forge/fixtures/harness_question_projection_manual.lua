@@ -11,7 +11,7 @@ local transcript = buffer.open("question-projection", {})
 state.transcript_buf = transcript.buffer
 vim.api.nvim_win_set_buf(state.transcript_win, transcript.buffer)
 vim.api.nvim_set_current_win(state.transcript_win)
-state.session = { id = "question-projection", backend = "fixture", mode = "plan" }
+state.session = { id = "question-projection", provider = "fixture", mode = "plan" }
 state.active_elicitation = { owner = "interaction", exchange_id = "question-flow", elicitation = {
   question_set = { id = "scope-set", questions = {
     { id = "scope", header = "Migration scope", question = "What should the replacement demonstrate?",

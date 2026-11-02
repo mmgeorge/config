@@ -37,12 +37,12 @@ end
 local state = session.harness
 state.session = {
   id = "context-catalog",
-  backend = "copilot",
+  provider = "copilot",
   workspace = vim.fn.getcwd(),
   model = "gpt-test",
   context_usage = { used = 60000, size = 272000, remaining_percent = 78 },
 }
-state.model_list, state.model_backend = nil, nil
+state.model_list, state.model_provider = nil, nil
 state.configuring_config, state.task_config = nil, nil
 catalog.clear()
 
@@ -69,7 +69,7 @@ assert(source[1].context_window[1].token_limit == 400000, "live capacity mutated
 local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
 model_picker.open({
   host = host,
-  backend = "copilot",
+  provider = "copilot",
   model_list = delivered,
   current_model = "gpt-test",
   on_confirm = function() end,
@@ -122,8 +122,8 @@ state.session.context_usage = nil
 assert(models()[1].context_window[1].token_limit == 400000, "missing usage discarded the explicit model limit")
 
 state.session.id = "another-session"
-state.session.backend = "codex"
-state.model_list, state.model_backend = nil, nil
+state.session.provider = "codex"
+state.model_list, state.model_provider = nil, nil
 delivered = models()
 assert(request_count == 2, "switching sessions did not request an independent catalog")
 assert(delivered[1].context_window[1].token_limit == 400000, "session switch retained another session's limit")

@@ -19,9 +19,9 @@ local errors = {}
 local approval_requests = 0
 local resolution_list = {}
 client.session_events_subscribe(function(event, payload)
-  if event == "backend_event" and payload.kind == "approval_requested" then
+  if event == "provider_event" and payload.kind == "approval_requested" then
     approval_requests = approval_requests + 1
-  elseif event == "backend_event" and payload.kind == "approval_resolved" then
+  elseif event == "provider_event" and payload.kind == "approval_resolved" then
     resolution_list[#resolution_list + 1] = payload.data
   end
 end)
@@ -50,7 +50,7 @@ end
 local succeeded, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
-    harness = { backend = "mock", backends = { mock = { command = { "approval-blocking" }, selectable = true } } } })
+    harness = { provider = "mock", providers = { mock = { command = { "approval-blocking" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10),
     "startup timeout: " .. vim.inspect(errors))

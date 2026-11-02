@@ -1,7 +1,7 @@
 --- Loads deferred added and deleted file previews without requesting unified Git diffs.
 --- Resolves immutable staged content through porcelain object IDs and worktree content from disk.
 
-local git_backend = require("forge.git.git_backend")
+local git_provider = require("forge.git.git_provider")
 local git_data = require("forge.git.git_data")
 local status_snapshot = require("forge.git.status_snapshot")
 
@@ -125,7 +125,7 @@ local function read_blob_async(root, file, callback)
     callback(error_result(("Git status did not provide a blob object for %s"):format(file.relpath)))
     return
   end
-  git_backend.system_text_async({ "git", "--no-optional-locks", "-C", root, "cat-file", "blob", oid }, nil, function(result)
+  git_provider.system_text_async({ "git", "--no-optional-locks", "-C", root, "cat-file", "blob", oid }, nil, function(result)
     if (result.code or 0) ~= 0 then
       local message = vim.trim(result.stderr or result.output or "")
       callback(error_result(message ~= "" and message or ("Unable to read Git blob %s"):format(oid)))
@@ -164,7 +164,7 @@ local function load_deleted_async(root, file, callback)
   }
   if file.preview_source == "head_deleted" then command[#command + 1] = "--cached" end
   vim.list_extend(command, { "--numstat", "-z", "--diff-filter=D", "--", file.relpath })
-  git_backend.system_text_async(command, nil, function(result)
+  git_provider.system_text_async(command, nil, function(result)
     if (result.code or 0) ~= 0 then
       local message = vim.trim(result.stderr or result.output or "")
       callback(error_result(message ~= "" and message or ("Unable to count deleted lines for %s"):format(file.relpath)))

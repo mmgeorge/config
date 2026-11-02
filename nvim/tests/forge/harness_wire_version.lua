@@ -5,7 +5,7 @@ local session = require("forge.session")
 local original_ensure = builder.ensure
 
 local ok, failure = xpcall(function()
-  require("forge").setup({ harness = { backend = "mock" }, harness_logging = false })
+  require("forge").setup({ harness = { provider = "mock" }, harness_logging = false })
   builder.ensure = function(callback) callback({ ok = true, path = "injected-forge" }) end
   for _, version in ipairs({ 0, 2, 4, 5, "6", false }) do
     client._host_reset_for_test()

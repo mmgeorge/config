@@ -237,7 +237,7 @@ impl HarnessBroker {
                     .get(
                         &self.session.workspace,
                         &self.session.id,
-                        &self.session.backend,
+                        &self.session.provider,
                     )?
                     .desired;
                 self.check_runner

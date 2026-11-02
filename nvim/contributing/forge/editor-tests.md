@@ -9,7 +9,7 @@ Host fixtures need a built executable. See [Building and testing](building-and-t
 | Check | Runs | Provider |
 | --- | --- | --- |
 | `lua-test` | Ordinary module fixtures | None |
-| `lua-test-mock-integration` | Host fixtures | `MockBackend` or a simulated process, with no model requests |
+| `lua-test-mock-integration` | Host fixtures | `MockProvider` or a simulated process, with no model requests |
 | `lua-test-live-integration` | Fixtures that use installed provider CLIs | Real, and may make model requests |
 | `lua-benchmark` | Benchmarks | Varies |
 
@@ -43,7 +43,7 @@ Parameterized fixtures for languages and providers need the setup in [Verificati
 
 ## Control provider timing
 
-An interaction test often has to act after the provider receives a prompt but before it responds. Elapsed-time sleeps make these tests flaky, so `nvim/tests/forge/support/mock_provider.lua` holds the real host's `MockBackend` through `session.provider.mock_response` instead. Create the hold before submitting, then wait for the prompt to arrive:
+An interaction test often has to act after the provider receives a prompt but before it responds. Elapsed-time sleeps make these tests flaky, so `nvim/tests/forge/support/mock_provider.lua` holds the real host's `MockProvider` through `session.provider.mock_response` instead. Create the hold before submitting, then wait for the prompt to arrive:
 
 ```lua
 local mock = dofile("nvim/tests/forge/support/mock_provider.lua")

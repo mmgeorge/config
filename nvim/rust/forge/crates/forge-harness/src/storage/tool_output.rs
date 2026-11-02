@@ -458,13 +458,13 @@ impl SqliteStore {
     pub(crate) fn save_tool_output_delta(
         &mut self,
         exchange: &Exchange,
-        event: &crate::backend::BackendEvent,
+        event: &crate::provider::ProviderEvent,
     ) -> Result<()> {
-        let crate::backend::BackendEvent::Tool {
+        let crate::provider::ProviderEvent::Tool {
             address,
             update:
-                crate::backend::ToolUpdate::Output {
-                    update: crate::backend::TextUpdate::Append(delta),
+                crate::provider::ToolUpdate::Output {
+                    update: crate::provider::TextUpdate::Append(delta),
                 },
         } = event
         else {

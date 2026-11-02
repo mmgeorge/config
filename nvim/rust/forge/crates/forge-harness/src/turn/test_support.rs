@@ -1,10 +1,10 @@
 use super::*;
 use crate::{
-    backend::{
-        BackendEvent, ExecutionOwner, InvocationScope, MessageAddress, MessageClassification,
-        MessageId, MessageRole, MessageUpdate, ToolInvocation, ToolUpdate, TurnAddress,
-    },
     exchange::{Exchange, ExchangeNode},
+    provider::{
+        ExecutionOwner, InvocationScope, MessageAddress, MessageClassification, MessageId,
+        MessageRole, MessageUpdate, ProviderEvent, ToolInvocation, ToolUpdate, TurnAddress,
+    },
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -29,8 +29,8 @@ pub(crate) fn message(
     id: impl Into<String>,
     role: Option<MessageRole>,
     text: impl Into<String>,
-) -> BackendEvent {
-    BackendEvent::Message {
+) -> ProviderEvent {
+    ProviderEvent::Message {
         address: MessageAddress {
             turn: turn.clone(),
             message_id: MessageId::Native(id.into()),
@@ -53,12 +53,12 @@ pub(crate) fn tool(
     update: impl IntoIterator<Item = ToolUpdate>,
     now_ms: i64,
 ) -> Result<()> {
-    let address = crate::backend::ToolAddress {
+    let address = crate::provider::ToolAddress {
         turn: turn.clone(),
         tool_id: id.into(),
     };
     exchange.observe_turn(
-        &BackendEvent::Tool {
+        &ProviderEvent::Tool {
             address: address.clone(),
             update: ToolUpdate::Requested { invocation },
         },
@@ -66,7 +66,7 @@ pub(crate) fn tool(
     )?;
     for update in update {
         exchange.observe_turn(
-            &BackendEvent::Tool {
+            &ProviderEvent::Tool {
                 address: address.clone(),
                 update,
             },
@@ -77,11 +77,11 @@ pub(crate) fn tool(
 }
 
 pub(crate) fn tool_updates(
-    status: crate::backend::ToolStatus,
+    status: crate::provider::ToolStatus,
     output: Option<String>,
-    changes: crate::backend::ProviderChangeSet,
+    changes: crate::provider::ProviderChangeSet,
 ) -> Vec<ToolUpdate> {
-    use crate::backend::{TextUpdate, ToolOutcome, ToolStatus};
+    use crate::provider::{TextUpdate, ToolOutcome, ToolStatus};
     let mut update = Vec::new();
     if status == ToolStatus::Running {
         update.push(ToolUpdate::Started);
@@ -98,7 +98,7 @@ pub(crate) fn tool_updates(
         ToolStatus::Running => None,
         ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
         ToolStatus::Failed => Some(ToolOutcome::Failed {
-            diagnostic: crate::backend::ToolDiagnostic {
+            diagnostic: crate::provider::ToolDiagnostic {
                 code: None,
                 message: "tool execution failed".into(),
             },
@@ -161,7 +161,7 @@ impl TestTurn {
     }
 
     pub(crate) fn record_tool(&mut self, id: &str, update: ToolUpdate, now_ms: i64) -> Result<()> {
-        let address = crate::backend::ToolAddress {
+        let address = crate::provider::ToolAddress {
             turn: self.exchange.turn[0].provider().clone(),
             tool_id: id.into(),
         };
@@ -179,7 +179,7 @@ impl TestTurn {
                 &address,
                 &ToolUpdate::Requested {
                     invocation: ToolInvocation {
-                        kind: crate::backend::ToolActivityKind::ToolCall,
+                        kind: crate::provider::ToolActivityKind::ToolCall,
                         name: id.into(),
                         title: id.into(),
                         arguments: serde_json::json!({}),

@@ -6,7 +6,7 @@ This guide explains the retry contract and how to allow a new error. For the del
 
 ## Lifecycle
 
-`backend/retry.rs` owns the request runner shared by root, child, and Background sessions. Adapters classify native errors and return a `RetryableFailure` only after checking `replay_safe`. The runner keeps the provider thread, model, settings, and control context, and submits a continuation rather than appending the user's message again. Retries stay in the same exchange.
+`provider/retry.rs` owns the request runner shared by root, child, and Background sessions. Adapters classify native errors and return a `RetryableFailure` only after checking `replay_safe`. The runner keeps the provider thread, model, settings, and control context, and submits a continuation rather than appending the user's message again. Retries stay in the same exchange.
 
 The first attempt has no delay. Five retries then wait 1, 5, 10, 30, and 60 seconds. The budget belongs to one runner invocation and does not reset after each error. After the fifth retry, or on any non-retryable error, the actual provider error goes through the normal failure path.
 
@@ -37,7 +37,7 @@ Sources:
 
 1. Capture the final error and the provider lifecycle before it from the session log, including the provider version, exact code, HTTP status, turn identity, and whether the provider continues on its own.
 2. Verify the metadata against the provider's schema or implementation. Establish whether the failure is temporary, whether native execution has ended, and whether any tool or model output can already have occurred. A message substring, a generic `recoverable` flag, or a broad HTTP range is not proof.
-3. Add the smallest exact match to `backend/codex/retry.rs` or `backend/copilot/retry.rs`, and keep unknown codes rejected. If safe termination or replay cannot be established, leave the error out and design reconciliation separately.
+3. Add the smallest exact match to `provider/codex/retry.rs` or `provider/copilot/retry.rs`, and keep unknown codes rejected. If safe termination or replay cannot be established, leave the error out and design reconciliation separately.
 4. Add a positive classifier case and neighboring negative cases. Exercise the adapter's terminal event, recovery, exhausted budget, cancellation, and output-before-failure paths. Leave the shared schedule and status logic unchanged.
 5. Update the allowlist with its evidence and provider version, run the targeted tests, rebuild, and verify the status in a fresh host.
 

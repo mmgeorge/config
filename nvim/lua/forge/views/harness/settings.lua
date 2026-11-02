@@ -273,7 +273,7 @@ function M.open(state, host, resume_state)
     active.check_timing = state.check_timing or "after_queue"
     active.automatic_checks = state.automatic_checks == true
     local configuration_revision = 0
-    local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
+    local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.provider] or active.provider
     local build_spec
     local commit
     local current
@@ -466,7 +466,7 @@ function M.open(state, host, resume_state)
       end
     end
     current = function()
-      return M._revision == owner_revision and not state.switching_backend
+      return M._revision == owner_revision and not state.switching_provider
         and state.session ~= nil and state.session.id == session_id
     end
     local function model_descriptor()
@@ -514,7 +514,7 @@ function M.open(state, host, resume_state)
         end
         picker.close(false)
         require("forge.views.harness.model_picker").open({ host = host, model_list = models,
-          backend = active.backend, current_model = ask.model or active.model, is_current = current,
+          provider = active.provider, current_model = ask.model or active.model, is_current = current,
           on_close = reopen,
           on_confirm = function(value)
             picker.close(false)
@@ -530,7 +530,7 @@ function M.open(state, host, resume_state)
         end
         picker.close(false)
         require("forge.views.harness.model_picker").open({ host = host, model_list = models,
-          backend = active.backend, current_model = active.model, is_current = current,
+          provider = active.provider, current_model = active.model, is_current = current,
           on_close = reopen,
           on_confirm = function(value)
             picker.close(false)
@@ -543,7 +543,7 @@ function M.open(state, host, resume_state)
       elseif id == "provider-setup" then
         require("forge.views.harness.provider_setup").open({ host = host, session_id = session_id })
       elseif id == "provider" then
-        require("forge.views.harness.controller").select_backend()
+        require("forge.views.harness.controller").select_provider()
       elseif id:match("^main%-") then
         change_main(id, 1)
       else
@@ -599,7 +599,7 @@ function M.open(state, host, resume_state)
         sandbox[#sandbox].description = windows_description
       end
       local provider_configuration = {}
-      if active.backend == "claude" or active.backend == "antigravity" then
+      if active.provider == "claude" or active.provider == "antigravity" then
         provider_configuration[#provider_configuration + 1] = field("provider-setup", "action", "Provider setup / sign in…", nil)
       end
       ---@param category string
@@ -704,7 +704,7 @@ function M.open(state, host, resume_state)
       }
     end
     commit = require("forge.views.harness.background_configuration").new({
-      backend = active.backend, session_id = session_id, host = host,
+      provider = active.provider, session_id = session_id, host = host,
       capability = function() return state.capability or {} end,
       current = current,
       changed = function() if commit and picker.is_open("harness-config") then picker.update(build_spec()) end end,

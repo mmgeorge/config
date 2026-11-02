@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 vim.o.columns = 130
 vim.o.lines = 50
-require("forge").setup({ harness = { backend = "mock" } })
+require("forge").setup({ harness = { provider = "mock" } })
 local client = require("forge.client")
 local settings = require("forge.views.harness.settings")
 local picker = require("forge.views.picker")
@@ -26,7 +26,7 @@ package.loaded["mini.clue"] = {
 }
 local state
 local configured_session = {
-  id = "settings-session", backend = "codex", model = "mock-model", effort = "medium",
+  id = "settings-session", provider = "codex", model = "mock-model", effort = "medium",
   plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
 }
 local original_request = client.request
@@ -71,7 +71,7 @@ client.request = function(request_specification, callback)
     if params.shell then configured_session.shell = params.shell end
     if params.access then
       configured_session.access = vim.deepcopy(params.access)
-      if configured_session.backend ~= "codex" then configured_session.access.sandbox = false end
+      if configured_session.provider ~= "codex" then configured_session.access.sandbox = false end
     end
     if params.plan_executor_enabled ~= nil then configured_session.plan_executor.enabled = params.plan_executor_enabled end
     if params.plan_compact ~= nil then configured_session.plan_compact = params.plan_compact end
@@ -424,7 +424,7 @@ local success, failure = xpcall(function()
   key("provider", "<Left>")
   assert(picker.is_open("harness-config"), "Left opened an action")
   picker.close()
-  configured_session.backend, configured_session.provider_label = "copilot", "Copilot CLI"
+  configured_session.provider, configured_session.provider_label = "copilot", "Copilot CLI"
   state.capability.os_sandbox = false
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
   local _, sandbox = find("sandbox")
@@ -453,18 +453,18 @@ local success, failure = xpcall(function()
   key("write-access", "<Right>")
   assert(configured_session.access.write_access == "workspace")
   picker.close()
-  for _, backend in ipairs({ "copilot", "claude", "antigravity", "mock" }) do
-    configured_session.backend = backend
+  for _, provider in ipairs({ "copilot", "claude", "antigravity", "mock" }) do
+    configured_session.provider = provider
     state.capability.os_sandbox = true
     settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
     for _, id in ipairs(vim.fn.has("win32") == 1 and { "sandbox", "windows-sandbox" } or { "sandbox" }) do
       local row, field = find(id)
-      assert(field.muted and not field.disabled_reason, backend .. " did not keep " .. id .. " editable and muted")
+      assert(field.muted and not field.disabled_reason, provider .. " did not keep " .. id .. " editable and muted")
       local _, spans = require("forge.views.picker.field").columns(row, id, true)
-      assert(spans[2][1][2] == "ForgePickerHint", backend .. " did not gray out " .. id)
+      assert(spans[2][1][2] == "ForgePickerHint", provider .. " did not gray out " .. id)
       local before = field.value
       key(id, id == "sandbox" and "<CR>" or "<Right>")
-      assert(find(id).fields[1].value ~= before, backend .. " could not change muted " .. id)
+      assert(find(id).fields[1].value ~= before, provider .. " could not change muted " .. id)
       assert(not configured_session.access.sandbox, "unsupported provider enabled runtime isolation")
     end
     picker.close()

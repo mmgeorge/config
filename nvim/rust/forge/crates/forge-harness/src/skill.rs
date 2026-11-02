@@ -1,27 +1,13 @@
-use crate::backend::{BackendEvent, BackendEventSink, ExecutionOwner};
 use crate::permissions::command::{CommandInvocation, normalize_command_in};
 use crate::permissions::matcher::PermissionTarget;
 use crate::permissions::shell::CommandShell;
+use crate::provider::{ExecutionOwner, ProviderEvent, ProviderEventSink};
 use crate::settings::SkillResource;
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-/// Retains a confirmed selected-skill read and its originating provider tool.
-pub struct SkillRead {
-    /// Identifies the selected catalog definition, independently of profile aliases.
-    pub resource_id: String,
-    /// Names the skill displayed in the timeline.
-    pub name: String,
-    /// Opens the canonical skill definition after runtime profiles are removed.
-    pub path: String,
-    /// Identifies the provider tool within its owning turn.
-    pub tool_id: String,
-}
 
 /// Shares selected bundle containment between read detection and runtime approval.
 pub(crate) struct SkillAccess {
@@ -137,10 +123,10 @@ impl SkillAccess {
             .collect()
     }
 
-    fn reads(&self, event: &BackendEvent) -> Vec<SkillRead> {
-        let BackendEvent::Tool {
+    fn reads(&self, event: &ProviderEvent) -> Vec<SkillRead> {
+        let ProviderEvent::Tool {
             address,
-            update: crate::backend::ToolUpdate::Requested { invocation },
+            update: crate::provider::ToolUpdate::Requested { invocation },
         } = event
         else {
             return Vec::new();
@@ -217,7 +203,7 @@ impl SkillAccess {
 /// Reconciles sparse tool input and completion before attaching confirmed read metadata.
 pub(crate) struct SkillObserver {
     access: Arc<SkillAccess>,
-    pending: HashMap<crate::backend::ToolAddress, Vec<SkillRead>>,
+    pending: HashMap<crate::provider::ToolAddress, Vec<SkillRead>>,
 }
 
 impl SkillObserver {
@@ -230,19 +216,19 @@ impl SkillObserver {
     }
 
     /// Annotate successful completions without treating progress or filenames in output as reads.
-    pub(crate) fn observe(&mut self, event: &BackendEvent) -> Vec<SkillRead> {
-        let BackendEvent::Tool { address, update } = event else {
+    pub(crate) fn observe(&mut self, event: &ProviderEvent) -> Vec<SkillRead> {
+        let ProviderEvent::Tool { address, update } = event else {
             return Vec::new();
         };
         let reads = self.access.reads(event);
         if !reads.is_empty() {
             self.pending.insert(address.clone(), reads);
         }
-        let crate::backend::ToolUpdate::Finished { outcome } = update else {
+        let crate::provider::ToolUpdate::Finished { outcome } = update else {
             return Vec::new();
         };
         let reads = self.pending.remove(address).unwrap_or_default();
-        if matches!(outcome, crate::backend::ToolOutcome::Succeeded) {
+        if matches!(outcome, crate::provider::ToolOutcome::Succeeded) {
             reads
         } else {
             Vec::new()
@@ -255,13 +241,13 @@ pub(crate) struct SkillExecution {
     pub(crate) observer: Arc<Mutex<SkillObserver>>,
     pub(crate) access: Arc<SkillAccess>,
     pub(crate) owner: ExecutionOwner,
-    pub(crate) coordinator: Arc<crate::backend::approval::PermissionCoordinator>,
+    pub(crate) coordinator: Arc<crate::provider::approval::PermissionCoordinator>,
 }
 
 impl SkillExecution {
     /// Attach the shared observer to streamed delivery or annotate collected fallback events.
-    pub(crate) fn sink(&self, sink: Option<BackendEventSink>) -> Option<BackendEventSink> {
-        sink.map(|sink| sink.skills(self.observer.clone()))
+    pub(crate) fn sink(&self, sink: Option<ProviderEventSink>) -> Option<ProviderEventSink> {
+        sink.map(|sink| sink.with_observer(Arc::new(SkillEventObserver(self.observer.clone()))))
     }
 }
 
@@ -383,7 +369,7 @@ fn script_path(invocation: &CommandInvocation) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+    use crate::provider::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
     use serde_json::json;
 
     fn fixture() -> (tempfile::TempDir, Arc<SkillAccess>, PathBuf) {
@@ -406,11 +392,11 @@ mod tests {
         (directory, access, bundle)
     }
 
-    fn event(id: &str, update: ToolUpdate) -> BackendEvent {
-        BackendEvent::Tool {
-            address: crate::backend::ToolAddress {
-                turn: crate::backend::TurnAddress {
-                    scope: crate::backend::InvocationScope {
+    fn event(id: &str, update: ToolUpdate) -> ProviderEvent {
+        ProviderEvent::Tool {
+            address: crate::provider::ToolAddress {
+                turn: crate::provider::TurnAddress {
+                    scope: crate::provider::InvocationScope {
                         owner: ExecutionOwner::root("session"),
                         exchange_id: "exchange".into(),
                         invocation_id: "invocation".into(),
@@ -424,7 +410,7 @@ mod tests {
         }
     }
 
-    fn requested(id: &str, name: &str, arguments: Value) -> BackendEvent {
+    fn requested(id: &str, name: &str, arguments: Value) -> ProviderEvent {
         event(
             id,
             ToolUpdate::Requested {
@@ -501,7 +487,7 @@ mod tests {
         }
         for outcome in [
             ToolOutcome::Failed {
-                diagnostic: crate::backend::ToolDiagnostic {
+                diagnostic: crate::provider::ToolDiagnostic {
                     code: None,
                     message: "exit 1".into(),
                 },
@@ -594,9 +580,9 @@ mod tests {
     #[tokio::test]
     async fn skill_diamonds_keep_turn_ownership_tool_history_and_file_actions_after_reload()
     -> Result<()> {
-        use crate::backend::{TurnAddress, TurnUpdate};
         use crate::buffer::projection::{ProjectionSource, TranscriptAction};
         use crate::exchange::{Exchange, ExchangeNode};
+        use crate::provider::{TurnAddress, TurnUpdate};
         let (_directory, access, bundle) = fixture();
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"exchange","session_id":"session","agent_id":"primary","ordinal":1,
@@ -605,8 +591,10 @@ mod tests {
         }))?;
         exchange.resume(0)?;
         let binding = crate::turn::test_support::address(&exchange, "first").scope;
-        let (sink, mut stream) = crate::backend::events::channel(binding.clone());
-        let sink = sink.skills(Arc::new(Mutex::new(SkillObserver::new(access))));
+        let (sink, mut stream) = crate::provider::events::channel(binding.clone());
+        let sink = sink.with_observer(Arc::new(SkillEventObserver(Arc::new(Mutex::new(
+            SkillObserver::new(access),
+        )))));
         for turn_id in ["first", "second"] {
             let turn = TurnAddress {
                 scope: binding.clone(),
@@ -614,18 +602,18 @@ mod tests {
                 turn_id: turn_id.into(),
             };
             exchange.observe_turn(
-                &BackendEvent::Turn {
+                &ProviderEvent::Turn {
                     address: turn.clone(),
                     update: TurnUpdate::Started { started_at_ms: 1 },
                 },
                 1,
             )?;
             for tool_id in ["read-one", "read-two"] {
-                let address = crate::backend::ToolAddress {
+                let address = crate::provider::ToolAddress {
                     turn: turn.clone(),
                     tool_id: tool_id.into(),
                 };
-                sink.send_wait(BackendEvent::Tool {
+                sink.send_wait(ProviderEvent::Tool {
                     address: address.clone(),
                     update: ToolUpdate::Requested {
                         invocation: ToolInvocation {
@@ -637,7 +625,7 @@ mod tests {
                     },
                 })
                 .await?;
-                sink.send_wait(BackendEvent::Tool {
+                sink.send_wait(ProviderEvent::Tool {
                     address,
                     update: ToolUpdate::Finished {
                         outcome: ToolOutcome::Succeeded,
@@ -649,7 +637,7 @@ mod tests {
                 }
             }
             exchange.observe_turn(
-                &BackendEvent::Turn {
+                &ProviderEvent::Turn {
                     address: turn,
                     update: TurnUpdate::Finished {
                         outcome: crate::turn::TurnOutcome::Completed,
@@ -702,5 +690,35 @@ mod tests {
         ));
         assert_eq!(rendered.tool.len(), 4);
         Ok(())
+    }
+}
+
+pub use forge_provider_api::skill::SkillRead;
+
+struct SkillEventObserver(Arc<Mutex<SkillObserver>>);
+
+impl forge_provider_api::events::EventObserver for SkillEventObserver {
+    fn additional_events(
+        &self,
+        event: &ProviderEvent,
+    ) -> Result<Vec<ProviderEvent>, forge_provider_api::events::EventDeliveryError> {
+        let read = self
+            .0
+            .lock()
+            .map_err(|_| {
+                forge_provider_api::events::EventDeliveryError::transport(
+                    "skill observer lock poisoned",
+                )
+            })?
+            .observe(event);
+        match event {
+            ProviderEvent::Tool { address, .. } if !read.is_empty() => {
+                Ok(vec![ProviderEvent::Tool {
+                    address: address.clone(),
+                    update: crate::provider::ToolUpdate::SkillRead { read },
+                }])
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 }

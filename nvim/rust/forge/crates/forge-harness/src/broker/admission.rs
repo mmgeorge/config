@@ -3,12 +3,12 @@ impl HarnessBroker {
     pub(super) async fn run_admitted_provider(
         &mut self,
         mode: PromptMode,
-        mut input: BackendInput,
-        submission: Arc<crate::backend::submission::Submission>,
+        mut input: ProviderInput,
+        submission: Arc<crate::provider::submission::Submission>,
         new_runtime: bool,
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
-    ) -> Result<crate::backend::BackendCompletion> {
+    ) -> Result<crate::provider::ProviderCompletion> {
         let trace = self.trace.clone();
         let session_id = self.session.id.clone();
         let exchange_id = interaction.id.clone();
@@ -22,15 +22,15 @@ impl HarnessBroker {
             .await?;
         if mode == PromptMode::PlanDiscussion {
             input = match input {
-                BackendInput::Text { text, attachments } => {
-                    BackendInput::from_text(PlanPrompt::discussion(&text))
+                ProviderInput::Text { text, attachments } => {
+                    ProviderInput::from_text(PlanPrompt::discussion(&text))
                         .with_attachments(attachments)
                 }
-                BackendInput::Skill {
+                ProviderInput::Skill {
                     name,
                     arguments,
                     attachments,
-                } => BackendInput::Skill {
+                } => ProviderInput::Skill {
                     name,
                     arguments: PlanPrompt::discussion(&arguments),
                     attachments,
@@ -49,15 +49,15 @@ impl HarnessBroker {
                 .read_working_document(&self.session.id, plan_id)?;
             let context = PlanPrompt::with_active_document(String::new(), &document.model_json()?);
             input = match input {
-                BackendInput::Text { text, attachments } => {
-                    BackendInput::from_text(format!("{context}{text}"))
+                ProviderInput::Text { text, attachments } => {
+                    ProviderInput::from_text(format!("{context}{text}"))
                         .with_attachments(attachments)
                 }
-                BackendInput::Skill {
+                ProviderInput::Skill {
                     name,
                     arguments,
                     attachments,
-                } => BackendInput::Skill {
+                } => ProviderInput::Skill {
                     name,
                     arguments: format!("{context}{arguments}"),
                     attachments,
@@ -65,16 +65,16 @@ impl HarnessBroker {
             };
         }
 
-        if self.session.backend_session_id.is_none() {
+        if self.session.provider_session_id.is_none() {
             input = self.rollback_context(&interaction.id, input)?;
         }
-        let mut backend_request = self.backend_request(input, mode);
-        backend_request.submission = Some(submission.clone());
-        let owner = crate::backend::ExecutionOwner::root(&self.session.id);
+        let mut provider_request = self.provider_request(input, mode);
+        provider_request.submission = Some(submission.clone());
+        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
         if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
-            match &mut backend_request.input {
-                BackendInput::Text { text, .. } => *text = format!("{feedback}\n\n{text}"),
-                BackendInput::Skill { arguments, .. } => {
+            match &mut provider_request.input {
+                ProviderInput::Text { text, .. } => *text = format!("{feedback}\n\n{text}"),
+                ProviderInput::Skill { arguments, .. } => {
                     *arguments = format!("{feedback}\n\n{arguments}")
                 }
             }
@@ -114,7 +114,7 @@ impl HarnessBroker {
             policy,
             self.turn_cancellation.requested.clone(),
         );
-        if let Some(context) = &mut backend_request.control_context {
+        if let Some(context) = &mut provider_request.control_context {
             context.lsp = Some(lsp_scope);
             context.repository = Some(repository_scope);
             context.harness = Some(harness_scope);
@@ -123,9 +123,9 @@ impl HarnessBroker {
         self.trace.record(
             &self.session.id,
             "model.requested",
-            serde_json::to_value(&backend_request)?,
+            serde_json::to_value(&provider_request)?,
         );
-        let input_id = backend_request
+        let input_id = provider_request
             .submission
             .as_ref()
             .map(|submission| submission.record())
@@ -154,7 +154,7 @@ impl HarnessBroker {
             .and_then(|task| task.entry.as_ref())
             .map(|entry| entry.id.clone());
         let mut execution =
-            Box::pin(self.prompt_with_timeline(backend_request, interaction, event, prepared));
+            Box::pin(self.prompt_with_timeline(provider_request, interaction, event, prepared));
         // Automatic repair reenters provider execution while its parent request is still polling.
         // Grow temporary segments here without increasing the worker's stack allocation.
         let output = trace
@@ -250,7 +250,7 @@ impl HarnessBroker {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(anyhow::Error::new(TurnCancelled)),
-            result = trace.instrument(&session_id, &exchange_id, "provider.prepare", self.backend.prepare_turn(&self.session.id)) => result?,
+            result = trace.instrument(&session_id, &exchange_id, "provider.prepare", self.provider.prepare_turn(&self.session.id)) => result?,
         }
         Ok(PreparedTurn {
             exchange_id: exchange.id.clone(),

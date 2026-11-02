@@ -19,7 +19,7 @@ local function cache_key()
   local harness = session.harness
   local provider_session = harness.session or {}
   return table.concat({
-    provider_session.backend or "active",
+    provider_session.provider or "active",
     provider_session.workspace or "",
     provider_session.id or "",
   }, "\0")
@@ -69,7 +69,7 @@ end
 ---@param callback fun(value: table[]?, error: string?)
 function M.models(force, callback)
   local state = session.harness
-  local backend = state.session and state.session.backend
+  local provider = state.session and state.session.provider
   local function deliver(value, failure)
     if failure then callback(nil, failure) return end
     local models = vim.deepcopy(value or {})
@@ -101,7 +101,7 @@ function M.models(force, callback)
     end
     callback(models, nil)
   end
-  if not force and backend == state.model_backend and type(state.model_list) == "table" then
+  if not force and provider == state.model_provider and type(state.model_list) == "table" then
     deliver(state.model_list, nil)
     return
   end
@@ -109,7 +109,7 @@ function M.models(force, callback)
   request_catalog(model_cache, "session.provider.model.list", force, function(value, failure)
     if key ~= cache_key() then return end
     if not failure then
-      state.model_backend, state.model_list = backend, vim.deepcopy(value or {})
+      state.model_provider, state.model_list = provider, vim.deepcopy(value or {})
     end
     deliver(value, failure)
   end)

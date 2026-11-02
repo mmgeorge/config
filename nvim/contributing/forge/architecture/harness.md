@@ -36,7 +36,7 @@ Settings, permission, model, resource, and compaction changes go through one coo
 
 ## Tool execution deadlines
 
-`BackendEventSink` supplies tool lifecycle events to `ToolWatchdog`, which captures
+`ProviderEventSink` supplies tool lifecycle events to `ToolWatchdog`, which captures
 each invocation's deadline once. The root broker and `AgentRuntime` stop provider
 execution when the earliest unfinished tool expires and retain the timeout as a
 failure. Output, title changes, and replayed start events cannot extend a deadline.
@@ -97,7 +97,7 @@ Pasted file paths import through `session.attachment.import` into the object sto
 
 The adapter marks a known running command with `ToolUpdate::Backgrounded` before reporting normal foreground completion. `ToolStore` persists that lifetime on the original invocation and keeps the command running until its native completion arrives. Unmarked unfinished tools still settle as interrupted when the foreground turn ends. A turn ending in cancellation, interruption, or failure settles its running tools even when they were marked as background work, and a later completion cannot reopen a terminal result.
 
-`Backend::session_event_stream` carries observations that outlive a foreground turn, including background-command output and provider-initiated compaction. Its sinks retain the original execution owner and invocation address. The session collector queues events without waiting for the broker lock, so foreground work cannot block intake; the active broker drains invocation events before session events so lifetime admission precedes late completion. Delivery resolves the original stored tool and permits completion only while that exact background execution is still running. Output chunks commit before publication, historical updates preserve the current foreground view, and a failed subscription is reported rather than treated as an empty stream.
+`Provider::session_event_stream` carries observations that outlive a foreground turn, including background-command output and provider-initiated compaction. Its sinks retain the original execution owner and invocation address. The session collector queues events without waiting for the broker lock, so foreground work cannot block intake; the active broker drains invocation events before session events so lifetime admission precedes late completion. Delivery resolves the original stored tool and permits completion only while that exact background execution is still running. Output chunks commit before publication, historical updates preserve the current foreground view, and a failed subscription is reported rather than treated as an empty stream.
 
 Managed children consume that same session-event contract alongside their invocation stream. `AgentRuntime` continues forwarding observations during provider identity lookup and shutdown, then drains the final events before reporting child completion. Every forwarded invocation must belong to the current child and task; a foreign observation fails the task without bypassing cleanup. This ordering prevents a stopped child command from remaining marked as running after its child has completed.
 
@@ -139,7 +139,7 @@ Execution compares saved workspace checkpoints and plan document versions when o
 
 Provider usage normalizes into durable `ContextUsage`. `AutoCompaction` is a per-session policy with an enabled flag and a token threshold. It is off for ordinary sessions, and Background sessions enable it at 128,000 tokens. It runs after completed provider work and never estimates tokens from bytes.
 
-`Compaction` is a separate lifecycle with an operation identity, observed start and completion, and an outcome. Its after-compaction token count is accepted only once the provider confirms completion, and a turn that ends first records an unconfirmed outcome. `native_compact` gates manual `/compact`, which uses Codex `thread/compact/start` or Copilot `session.history.compact` and creates no user exchange. Copilot keeps a `Backend::session_event_stream` subscription across turns because it can start compaction on its own.
+`Compaction` is a separate lifecycle with an operation identity, observed start and completion, and an outcome. Its after-compaction token count is accepted only once the provider confirms completion, and a turn that ends first records an unconfirmed outcome. `native_compact` gates manual `/compact`, which uses Codex `thread/compact/start` or Copilot `session.history.compact` and creates no user exchange. Copilot keeps a `Provider::session_event_stream` subscription across turns because it can start compaction on its own.
 
 ## Rollback
 

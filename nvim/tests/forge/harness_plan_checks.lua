@@ -58,7 +58,7 @@ end
 local succeeded, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
-    harness = { backend = "mock", backends = { mock = { command = { "retained-control" }, selectable = true } } } })
+    harness = { provider = "mock", providers = { mock = { command = { "retained-control" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timeout")
   local original_request = "create the requested starter game with movement and combat"

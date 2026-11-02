@@ -12,7 +12,7 @@ require("forge.infra.notifications").error = function(message) errors[#errors + 
 controller.render = function() end
 controller.refresh_winbar = function() end
 controller.attach_transcript = function() end
-state.session = { id = "prompt-lifecycle", backend = "mock" }
+state.session = { id = "prompt-lifecycle", provider = "mock" }
 state.capability = { native_steer = true }
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 state.queue, state.pending_steer = {}, {}

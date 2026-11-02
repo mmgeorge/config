@@ -45,8 +45,8 @@ end
 local function choices(field, values, catalog, root)
   local result = { "default" }
   if field == "model" then
-    local provider = values.provider == "inherit" and root.backend or values.provider
-    if provider == root.backend and selected_model(catalog, "inherit", root) then table.insert(result, 1, "inherit") end
+    local provider = values.provider == "inherit" and root.provider or values.provider
+    if provider == root.provider and selected_model(catalog, "inherit", root) then table.insert(result, 1, "inherit") end
     for _, model in ipairs(catalog.models) do
       if not vim.tbl_contains(result, model.id) then result[#result + 1] = model.id end
     end
@@ -85,7 +85,7 @@ function Selection:cycle(values, field, direction, done)
   local updated = vim.deepcopy(values)
   local catalog_cache = self.catalog
   if field == "provider" then updated.provider = cycle(provider_list, values.provider, direction) end
-  local provider = updated.provider == "inherit" and root.backend or updated.provider
+  local provider = updated.provider == "inherit" and root.provider or updated.provider
   local function apply(catalog, failure)
     if failure then done(nil, failure) return end
     if not catalog or not catalog.models or #catalog.models == 0 or not catalog.capability then

@@ -19,7 +19,7 @@ pub(super) fn definition() -> ControlToolDefinition {
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    _output: crate::backend::BackendCompletion,
+    _output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     runtime.terminal = true;
     Ok(crate::tools::ControlToolResult {
@@ -31,7 +31,7 @@ pub(super) async fn execute(
 /// Decode the tool's replayable completion fields.
 pub(super) fn record(
     invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::backend::BackendCompletion,
+    output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
     output.evidence.structured_blocked = true;
     if let Some(permit) = &invocation.task_permit {

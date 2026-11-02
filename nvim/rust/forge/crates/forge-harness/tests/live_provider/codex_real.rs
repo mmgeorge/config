@@ -1,5 +1,5 @@
-use forge_harness::backend::BackendLaunch;
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
+use forge_harness::provider::ProviderLaunch;
 use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
 use serde_json::{Value, json};
@@ -64,13 +64,13 @@ async fn initialize_real_codex_broker(
 ) -> HarnessBroker {
     let mut broker = HarnessBroker::initialize(InitializeRequest {
         background: None,
-        backend_launch_by_provider: Default::default(),
+        provider_launch_by_provider: Default::default(),
         config_dir: None,
         data_root: data_root.to_string_lossy().into_owned(),
         permission_file: None,
         workspace: workspace.to_string_lossy().into_owned(),
         client_id: client_id.into(),
-        backend: BackendLaunch {
+        provider: ProviderLaunch {
             kind: "codex".into(),
             command: vec!["codex".into(), "app-server".into()],
         },

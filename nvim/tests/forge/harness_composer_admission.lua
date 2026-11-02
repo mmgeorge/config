@@ -57,7 +57,7 @@ assert(#warnings == 36)
 for _, warning in ipairs(warnings) do assert(warning == "Harness is still initializing") end
 
 -- Ownership, rather than the legacy ready marker, releases the same draft for one explicit submission.
-state.session = { id = "initialized-owner", backend = "mock" }
+state.session = { id = "initialized-owner", provider = "mock" }
 state.presentation = {
   capture_prompt = function()
     return { document = "composer", buffer = state.composer_buf, is_current = function() return true end }

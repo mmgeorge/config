@@ -83,7 +83,7 @@ end
 
 session.harness.session = {
   id = "provider-catalog-test",
-  backend = "codex",
+  provider = "codex",
   workspace = "D:/repo",
 }
 session.harness.capability = {

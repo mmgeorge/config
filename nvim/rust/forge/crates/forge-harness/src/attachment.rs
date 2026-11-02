@@ -299,8 +299,8 @@ pub(crate) async fn acp_input(
 pub(crate) fn copilot_input(
     text: &str,
     selected: &[InputAttachment],
-) -> Result<github_copilot_sdk::types::MessageOptions> {
-    use github_copilot_sdk::types::{Attachment as CopilotAttachment, MessageOptions};
+) -> Result<forge_provider_api::input::MessageInput> {
+    use forge_provider_api::input::{FileAttachment, MessageInput};
     let mut prompt = String::new();
     let mut attachments = Vec::new();
     for selected in selected {
@@ -310,18 +310,15 @@ pub(crate) fn copilot_input(
             escape(&selected.attachment.name),
             selected.closing()
         ));
-        attachments.push(CopilotAttachment::File {
+        attachments.push(FileAttachment {
             path: selected.attachment.path(&selected.root)?,
-            display_name: Some(format!("{} {}", selected.label, selected.attachment.name)),
-            line_range: None,
+            display_name: format!("{} {}", selected.label, selected.attachment.name),
         });
     }
     prompt.push_str(text);
-    let message = MessageOptions::new(prompt);
-    Ok(if attachments.is_empty() {
-        message
-    } else {
-        message.with_attachments(attachments)
+    Ok(MessageInput {
+        prompt,
+        attachments,
     })
 }
 
@@ -350,7 +347,7 @@ mod tests {
         );
         let message = copilot_input(&text, &[])?;
         assert_eq!(message.prompt, text);
-        assert!(message.attachments.is_none());
+        assert!(message.attachments.is_empty());
         Ok(())
     }
     #[tokio::test]
@@ -381,7 +378,7 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(image)
         );
         let message = copilot_input(prompt, &selected)?;
-        assert_eq!(message.attachments.unwrap().len(), 1);
+        assert_eq!(message.attachments.len(), 1);
         assert!(message.prompt.starts_with("<image name=[Image #1]"));
         assert!(message.prompt.ends_with(prompt));
         Ok(())

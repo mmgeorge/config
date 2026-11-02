@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{BackendModel, ServiceTier};
+use crate::provider::{ProviderModel, ServiceTier};
 use crate::session::HarnessSession;
 
 /// Overrides the planning model only for forked Plan Review answers.
@@ -21,7 +21,7 @@ impl AskModel {
     pub(crate) fn resolve(
         &self,
         source: &HarnessSession,
-        catalog: &[BackendModel],
+        catalog: &[ProviderModel],
     ) -> Result<Self> {
         let Some(model) = &self.model else {
             ensure!(

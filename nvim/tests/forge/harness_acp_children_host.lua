@@ -67,8 +67,8 @@ local function request(method, params)
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { backend = "claude", config_dir = data,
-    backends = { claude = { command = { "node", peer }, label = "Fixture ACP", selectable = true } } } })
+  require("forge").setup({ harness = { provider = "claude", config_dir = data,
+    providers = { claude = { command = { "node", peer }, label = "Fixture ACP", selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.ready and state.session end, 10))
   request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {}, windows_sandbox = "elevated" } })

@@ -17,7 +17,7 @@ fn repository_discovery_failure_returns_a_correlated_initialize_error() {
     let mut broker = BrokerProcess::start();
     broker.request(json!({"id": 41, "method": "session.initialize", "params": {
         "data_root": data.path(), "workspace": repository.path(), "client_id": "invalid-repository",
-        "backend": { "kind": "mock", "command": ["mock"] }
+        "provider": { "kind": "mock", "command": ["mock"] }
     }}));
     let response = broker.read_response(41);
     assert_eq!(
@@ -44,7 +44,7 @@ fn nested_workspace_initialization_preserves_the_canonical_repository_root() {
     let mut broker = BrokerProcess::start();
     broker.request(json!({"id": 42, "method": "session.initialize", "params": {
         "data_root": data.path(), "workspace": nested, "client_id": "nested-repository",
-        "backend": { "kind": "mock", "command": ["mock"] }
+        "provider": { "kind": "mock", "command": ["mock"] }
     }}));
     let response = broker.read_response(42);
     let workspace = response.last().unwrap()["result"]["session"]["workspace"]
@@ -419,7 +419,7 @@ fn chat_reports_provider_start_failure_without_stopping_host() {
         "id": 1, "method": "session.initialize", "params": {
             "data_root": data.path(), "workspace": repository.path(),
             "client_id": "chat-provider-stack-test",
-            "backend": { "kind": "codex", "command": ["forge-unavailable-provider-fixture"] },
+            "provider": { "kind": "codex", "command": ["forge-unavailable-provider-fixture"] },
             "model": "fixture", "effort": "medium"
         }
     }));
@@ -479,7 +479,7 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "planning-stack-test",
-            "backend": { "kind": "codex", "command": ["forge-unavailable-provider-fixture"] },
+            "provider": { "kind": "codex", "command": ["forge-unavailable-provider-fixture"] },
             "model": "fixture",
             "effort": "medium"
         }
@@ -503,7 +503,7 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if observed.iter().any(|message| {
-            (message["event"] == "backend_event"
+            (message["event"] == "provider_event"
                 && message["payload"]["kind"] == "error"
                 && message["payload"]["text"]
                     .as_str()
@@ -576,7 +576,7 @@ fn streams_plan_document_changes_after_command_admission() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "stdio-test",
-            "backend": { "kind": "mock", "command": ["mock"] },
+            "provider": { "kind": "mock", "command": ["mock"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -669,7 +669,7 @@ fn opens_a_fork_before_provider_preparation_and_queues_only_the_child_prompt() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "async-fork-test",
-            "backend": { "kind": "mock", "command": ["fork-blocking"] },
+            "provider": { "kind": "mock", "command": ["fork-blocking"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -759,7 +759,7 @@ fn creates_a_new_session_while_the_source_turn_continues() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "concurrent-new-test",
-            "backend": { "kind": "mock", "command": ["session-blocking"] },
+            "provider": { "kind": "mock", "command": ["session-blocking"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20,
@@ -810,7 +810,7 @@ fn creates_a_new_session_while_the_source_turn_continues() {
         created
             .last()
             .unwrap()
-            .pointer("/result/session/backend_session_id")
+            .pointer("/result/session/provider_session_id")
             .and_then(Value::as_str)
             .is_none()
     );
@@ -867,7 +867,7 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "cancel-test",
-            "backend": { "kind": "mock", "command": ["blocking"] },
+            "provider": { "kind": "mock", "command": ["blocking"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -938,7 +938,7 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
     broker.request(json!({
         "id":1,"method":"session.initialize","params":{
             "workspace":workspace.path(),"data_root":data.path(),"client_id":"shutdown-test",
-            "backend":{"kind":"mock","command":["visible-blocking"]}
+            "provider":{"kind":"mock","command":["visible-blocking"]}
         }
     }));
     let fixture_session_id = broker.capture_session(1);
@@ -1004,7 +1004,7 @@ fn restarts_a_running_turn_with_updated_permissions_without_creating_another_int
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "restart-test",
-            "backend": { "kind": "mock", "command": ["steering"] },
+            "provider": { "kind": "mock", "command": ["steering"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -1117,7 +1117,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "retract-test",
-            "backend": { "kind": "mock", "command": ["blocking"] },
+            "provider": { "kind": "mock", "command": ["blocking"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -1273,7 +1273,7 @@ fn visible_output_prevents_cancelled_turn_retraction() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "visible-cancel-test",
-            "backend": { "kind": "mock", "command": ["visible-blocking"] },
+            "provider": { "kind": "mock", "command": ["visible-blocking"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -1338,7 +1338,7 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "changed-cancel-test",
-            "backend": { "kind": "mock", "command": ["writing-blocking"] },
+            "provider": { "kind": "mock", "command": ["writing-blocking"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -1408,7 +1408,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "steer-test",
-            "backend": { "kind": "mock", "command": ["visible-blocking"] },
+            "provider": { "kind": "mock", "command": ["visible-blocking"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -1517,7 +1517,7 @@ fn reports_structured_lease_recovery_and_allows_a_new_session() {
                 "data_root": data.path(),
                 "workspace": repository.path(),
                 "client_id": client_id,
-                "backend": { "kind": "mock", "command": ["mock"] },
+                "provider": { "kind": "mock", "command": ["mock"] },
                 "model": "mock-model",
                 "effort": "low",
                 "goal_max_turns": 20,
@@ -1598,7 +1598,7 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "cancel-test",
-            "backend": { "kind": "mock", "command": ["blocking"] },
+            "provider": { "kind": "mock", "command": ["blocking"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20

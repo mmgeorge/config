@@ -1,18 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Defines the lifecycle of one concrete child-agent run.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentExecutionState {
-    Starting,
-    Running,
-    Waiting,
-    Completed,
-    Failed,
-    Interrupted,
-    Closed,
-}
+pub use forge_provider_api::agent::AgentExecutionState;
 
 /// Defines the lifecycle of a persistent provider-backed agent identity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -28,13 +17,6 @@ impl AgentState {
     /// Return whether the identity can own another exchange.
     pub fn is_open(self) -> bool {
         matches!(self, Self::Starting | Self::Ready)
-    }
-}
-
-impl AgentExecutionState {
-    /// Return whether the run can still accept input or interruption.
-    pub fn is_active(self) -> bool {
-        matches!(self, Self::Starting | Self::Running | Self::Waiting)
     }
 }
 

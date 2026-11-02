@@ -43,7 +43,7 @@ vim.notify = function(message, level)
   original_notify(message, level)
 end
 local unsubscribe = client.session_events_subscribe(function(event, payload)
-  if event == "backend_event" and payload.kind == "assistant_message" then received[#received + 1] = payload.text end
+  if event == "provider_event" and payload.kind == "assistant_message" then received[#received + 1] = payload.text end
 end)
 local function request(method, params)
   local deadline = vim.uv.now() + 20000
@@ -114,7 +114,7 @@ local identity, buffer
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
-    harness = { backend = "mock", backends = { mock = { command = { "lsp-tools" }, selectable = true } } } })
+    harness = { provider = "mock", providers = { mock = { command = { "lsp-tools" }, selectable = true } } } })
   vim.lsp.config("fixture-" .. language, { cmd = spec.cmd, root_dir = workspace,
     filetypes = { spec.filetype }, settings = spec.settings, init_options = spec.init_options })
   vim.lsp.enable("fixture-" .. language)

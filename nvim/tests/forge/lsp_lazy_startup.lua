@@ -1,13 +1,13 @@
 local startup = require("forge.lsp.startup")
 local source = require("forge.lsp.source")
 local directory = vim.fn.tempname()
-local frontend, backend, sibling = directory .. "/frontend", directory .. "/backend", directory .. "/sibling"
-for _, path in ipairs({ frontend, backend, sibling }) do vim.fn.mkdir(path, "p") end
+local frontend, provider, sibling = directory .. "/frontend", directory .. "/provider", directory .. "/sibling"
+for _, path in ipairs({ frontend, provider, sibling }) do vim.fn.mkdir(path, "p") end
 vim.fn.writefile({ "{}" }, frontend .. "/package.json")
 vim.fn.writefile({ "{}" }, sibling .. "/package.json")
 vim.fn.writefile({ "const ready = true" }, frontend .. "/main.ts")
 vim.fn.writefile({ "const other = true" }, sibling .. "/main.ts")
-vim.fn.writefile({ "[package]" }, backend .. "/Cargo.toml")
+vim.fn.writefile({ "[package]" }, provider .. "/Cargo.toml")
 local original = { configs = vim.lsp.get_configs, start = vim.lsp.start, client = vim.lsp.get_client_by_id,
   clients = vim.lsp.get_clients, attached = vim.lsp.buf_is_attached, scan = vim.uv.fs_scandir, now = vim.uv.now }
 local launched, scans, reads = {}, 0, 0
@@ -58,7 +58,7 @@ local success, failure = xpcall(function()
   for _, client in pairs(clients) do client.initialized = true end
   local roots = {}
   for _, launch in ipairs(launched) do roots[launch.name .. ":" .. launch.root] = true end
-  assert(roots["rust:" .. source.canonical(backend)] and roots["typescript:" .. source.canonical(sibling)])
+  assert(roots["rust:" .. source.canonical(provider)] and roots["typescript:" .. source.canonical(sibling)])
   await(frontend .. "/main.ts")
   await(sibling .. "/main.ts")
   await(nil)

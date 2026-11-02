@@ -47,7 +47,7 @@ local question_set = {
 local elicitation = { question_set = question_set, answer = {}, current_index = 0 }
 
 local ok, failure = pcall(function()
-  forge.setup({ walkthrough_inventory = "sem", harness = { backend = "mock" } })
+  forge.setup({ walkthrough_inventory = "sem", harness = { provider = "mock" } })
   local view = require("forge.views.harness.plan_question")
   local transcript_win = vim.api.nvim_get_current_win()
   local ask_params = nil

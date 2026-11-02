@@ -4,7 +4,6 @@
 pub mod agent;
 /// Typed file attachments captured independently of prompt text.
 pub mod attachment;
-pub mod backend;
 pub mod background;
 pub mod broker;
 pub mod buffer;
@@ -22,6 +21,7 @@ pub mod permissions;
 pub mod plan;
 pub(crate) mod process;
 pub mod protocol;
+pub mod provider;
 pub(crate) mod question;
 pub mod service;
 pub mod session;

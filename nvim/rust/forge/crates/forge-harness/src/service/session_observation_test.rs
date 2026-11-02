@@ -1,24 +1,27 @@
 use super::*;
-use crate::backend::{
-    Backend, BackendCapability, BackendDescriptor, BackendEvent, BackendEventSink, BackendKind,
-    BackendRequest, Compaction, CompactionResult, CompactionState, EventScope, ExecutionOwner,
-    ProviderDiagnostic,
+#[cfg(test)]
+use crate::provider::ProviderAdapter as _;
+use crate::provider::{
+    Compaction, CompactionResult, CompactionState, EventScope, ExecutionOwner, ProviderCapability,
+    ProviderDescriptor, ProviderDiagnostic, ProviderEvent, ProviderEventSink, ProviderKind,
+    ProviderRequest,
 };
 
 /// Supply a real bounded observation stream without starting a provider process.
-struct ObservationBackend {
+struct ObservationProvider {
     owner: ExecutionOwner,
-    stream: std::sync::Mutex<Option<crate::backend::events::BackendEventStream>>,
-    shutdown_delivery: std::sync::Mutex<Option<(BackendEventSink, Vec<BackendEvent>)>>,
+    stream: std::sync::Mutex<Option<crate::provider::events::ProviderEventStream>>,
+    shutdown_delivery: std::sync::Mutex<Option<(ProviderEventSink, Vec<ProviderEvent>)>>,
 }
 
 #[async_trait::async_trait]
-impl Backend for ObservationBackend {
+impl crate::provider::ProviderAdapter for ObservationProvider {
+    type Host = crate::provider::HarnessProviderHost;
     /// Transfer the fixture stream only to its owning session collector.
     async fn session_event_stream(
         &self,
         owner: ExecutionOwner,
-    ) -> Result<Option<crate::backend::events::BackendEventStream>> {
+    ) -> Result<Option<crate::provider::events::ProviderEventStream>> {
         assert_eq!(owner, self.owner);
         Ok(self.stream.lock().unwrap().take())
     }
@@ -55,20 +58,20 @@ impl Backend for ObservationBackend {
     }
 
     /// Describe the observation fixture without optional provider capabilities.
-    fn descriptor(&self) -> BackendDescriptor {
-        BackendDescriptor {
-            kind: BackendKind::Mock,
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor {
+            kind: ProviderKind::Mock,
             label: "session observation fixture".into(),
-            capability: BackendCapability::default(),
+            capability: ProviderCapability::default(),
         }
     }
 
     /// Reject accidental foreground execution from the observation collector.
     async fn prompt_stream(
         &self,
-        _: BackendRequest,
-        _: BackendEventSink,
-    ) -> Result<crate::backend::BackendCompletion, crate::backend::BackendError> {
+        _: ProviderRequest,
+        _: ProviderEventSink,
+    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
         panic!("session observations must not submit a foreground prompt")
     }
 }
@@ -79,7 +82,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let fixture = tempfile::tempdir()?;
     let broker = HarnessBroker::initialize(serde_json::from_value(json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
-        "client_id":"observation-fixture", "backend":{"kind":"mock","command":[]},
+        "client_id":"observation-fixture", "provider":{"kind":"mock","command":[]},
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
     let owner = ExecutionOwner::root(&session_id);
@@ -87,9 +90,9 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
         owner: owner.clone(),
         operation_id: "observation-fixture".into(),
     };
-    let (provider_sink, provider_stream) = crate::backend::events::channel(scope.clone());
+    let (provider_sink, provider_stream) = crate::provider::events::channel(scope.clone());
     let mut controller = SessionController::new(broker)?;
-    Arc::get_mut(&mut controller).unwrap().backend = Arc::new(ObservationBackend {
+    Arc::get_mut(&mut controller).unwrap().provider = Arc::new(ObservationProvider {
         owner,
         stream: std::sync::Mutex::new(Some(provider_stream)),
         shutdown_delivery: std::sync::Mutex::new(None),
@@ -100,7 +103,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let diagnostic_count = forge_protocol::MAX_PENDING_FRAMES + 1;
     let producer = tokio::spawn(async move {
         provider_sink
-            .send_wait(BackendEvent::Compaction {
+            .send_wait(ProviderEvent::Compaction {
                 scope: scope.clone(),
                 update: Box::new(Compaction {
                     id: "durable-observation".into(),
@@ -119,7 +122,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
             .await?;
         for sequence in 0..diagnostic_count {
             provider_sink
-                .send_wait(BackendEvent::Diagnostic {
+                .send_wait(ProviderEvent::Diagnostic {
                     scope: scope.clone(),
                     diagnostic: ProviderDiagnostic {
                         code: Some("observation-fixture".into()),
@@ -129,7 +132,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
                 })
                 .await?;
         }
-        Ok::<_, crate::backend::BackendError>(())
+        Ok::<_, crate::provider::ProviderError>(())
     });
     tokio::time::timeout(Duration::from_secs(2), producer)
         .await
@@ -149,7 +152,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
                 .await?
                 .context("session observation output closed")?;
             let event: Value = serde_json::from_slice(frame.bytes())?;
-            if event["event"] != "backend_event" {
+            if event["event"] != "provider_event" {
                 continue;
             }
             assert_eq!(event["session_id"], session_id);
@@ -185,20 +188,20 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
 /// Drain shutdown evidence through the real collector and store before releasing its lease.
 #[tokio::test]
 async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -> Result<()> {
-    use crate::backend::{
+    use crate::provider::{
         TextUpdate, ToolActivityKind, ToolAddress, ToolInvocation, ToolOutcome, ToolUpdate,
     };
 
     let fixture = tempfile::tempdir()?;
     let broker = HarnessBroker::initialize(serde_json::from_value(json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
-        "client_id":"shutdown-observation-fixture", "backend":{"kind":"mock","command":[]},
+        "client_id":"shutdown-observation-fixture", "provider":{"kind":"mock","command":[]},
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
     let owner = ExecutionOwner::root(&session_id);
-    let scope = crate::backend::InvocationScope::new(owner.clone(), "background-exchange");
+    let scope = crate::provider::InvocationScope::new(owner.clone(), "background-exchange");
     let address = ToolAddress {
-        turn: crate::backend::TurnAddress {
+        turn: crate::provider::TurnAddress {
             scope: scope.clone(),
             thread_id: "background-thread".into(),
             turn_id: "background-turn".into(),
@@ -230,20 +233,20 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
     let data_root = fixture.path().join("data");
     SqliteStore::open(&data_root)?.save_exchange(&exchange)?;
 
-    let (provider_sink, provider_stream) = crate::backend::events::channel(scope);
-    let backend = Arc::new(ObservationBackend {
+    let (provider_sink, provider_stream) = crate::provider::events::channel(scope);
+    let provider = Arc::new(ObservationProvider {
         owner,
         stream: std::sync::Mutex::new(Some(provider_stream)),
         shutdown_delivery: std::sync::Mutex::new(Some((
             provider_sink,
             vec![
-                BackendEvent::Tool {
+                ProviderEvent::Tool {
                     address: address.clone(),
                     update: ToolUpdate::Output {
                         update: TextUpdate::Append("STOPPED\n".into()),
                     },
                 },
-                BackendEvent::Tool {
+                ProviderEvent::Tool {
                     address,
                     update: ToolUpdate::Finished {
                         outcome: ToolOutcome::Interrupted,
@@ -253,13 +256,13 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
         ))),
     });
     let mut controller = SessionController::new(broker)?;
-    Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
+    Arc::get_mut(&mut controller).unwrap().provider = provider.clone();
     let (message_sink, _output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
     let broker_guard = controller.broker.lock().await;
     let shutdown_controller = controller.clone();
     let shutdown = tokio::spawn(async move {
-        backend.shutdown().await?;
+        provider.shutdown().await?;
         shutdown_controller.finish_session_events().await?;
         shutdown_controller.broker.lock().await.release_lease()?;
         Ok::<_, anyhow::Error>(())
@@ -308,16 +311,16 @@ async fn cancelled_session_observation_join_retains_collector_for_retry() -> Res
     let fixture = tempfile::tempdir()?;
     let broker = HarnessBroker::initialize(serde_json::from_value(json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
-        "client_id":"observation-retry-fixture", "backend":{"kind":"mock","command":[]},
+        "client_id":"observation-retry-fixture", "provider":{"kind":"mock","command":[]},
     }))?)?;
     let owner = ExecutionOwner::root(&broker.snapshot()?.session.id);
     let (provider_sink, provider_stream) =
-        crate::backend::events::channel(EventScope::SessionOperation {
+        crate::provider::events::channel(EventScope::SessionOperation {
             owner: owner.clone(),
             operation_id: "shutdown-retry".into(),
         });
     let mut controller = SessionController::new(broker)?;
-    Arc::get_mut(&mut controller).unwrap().backend = Arc::new(ObservationBackend {
+    Arc::get_mut(&mut controller).unwrap().provider = Arc::new(ObservationProvider {
         owner,
         stream: std::sync::Mutex::new(Some(provider_stream)),
         shutdown_delivery: std::sync::Mutex::new(None),

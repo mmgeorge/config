@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::usage::{TokenUsage, UsageUpdate};
+use crate::provider::usage::{TokenUsage, UsageUpdate};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -43,9 +43,9 @@ struct UsageCursor {
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 struct UsageSample {
-    scope: crate::backend::InvocationScope,
+    scope: crate::provider::InvocationScope,
     thread_id: String,
-    turn_id: Option<crate::backend::ProviderTurnId>,
+    turn_id: Option<crate::provider::ProviderTurnId>,
     id: String,
 }
 
@@ -135,7 +135,7 @@ impl ExchangeMetrics {
     /// Admit a new report once, excluding synthetic context adjustments and repeated snapshots.
     pub(crate) fn usage(
         &mut self,
-        address: &crate::backend::TurnAddress,
+        address: &crate::provider::TurnAddress,
         update: UsageUpdate,
     ) -> Option<TokenUsage> {
         let id = UsageSample {
@@ -217,10 +217,10 @@ impl Default for ExchangeMetrics {
 mod test {
     use super::*;
 
-    fn address(thread: &str, turn: &str) -> crate::backend::TurnAddress {
-        crate::backend::TurnAddress {
-            scope: crate::backend::InvocationScope {
-                owner: crate::backend::ExecutionOwner::root("session"),
+    fn address(thread: &str, turn: &str) -> crate::provider::TurnAddress {
+        crate::provider::TurnAddress {
+            scope: crate::provider::InvocationScope {
+                owner: crate::provider::ExecutionOwner::root("session"),
                 exchange_id: "exchange".into(),
                 invocation_id: "invocation".into(),
             },

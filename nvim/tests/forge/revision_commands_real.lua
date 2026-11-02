@@ -28,13 +28,13 @@ local ok, failure = xpcall(function()
   git({ "branch", "feature-é" })
   local plugin = dofile("nvim/lua/plugins/forge.lua")[1]
   vim.cmd.cd(vim.fn.fnameescape(root))
-  plugin.config(nil, { harness = { backend = "mock" }, harness_logging = false, diff_logging = false })
+  plugin.config(nil, { harness = { provider = "mock" }, harness_logging = false, diff_logging = false })
   builder._set_artifact_root_for_test(vim.fs.joinpath(root, "forge-sidecar"))
   builder.ensure = function(done) done({ ok = true, path = binary }) end
   vim.notify = function(message, level, options)
     notifications[#notifications + 1] = { message = tostring(message), level = level, options = options }
   end
-  package.loaded["forge.harness.backends.mock"] = { descriptor = function() error("completion initialized a provider") end }
+  package.loaded["forge.harness.providers.mock"] = { descriptor = function() error("completion initialized a provider") end }
   assert(#vim.fn.getcompletion("ForgeBranchDiff feature-", "cmdline") == 0)
   assert(vim.wait(10000, function()
     local values = vim.fn.getcompletion("ForgeBranchDiff feature-", "cmdline")
