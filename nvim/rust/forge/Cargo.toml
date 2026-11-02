@@ -1,44 +1,140 @@
 [package]
 name = "forge"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [workspace]
 resolver = "3"
 members = ["crates/forge-text", "crates/forge-buffer", "crates/forge-protocol", "crates/forge-harness", "crates/forge-git", "crates/forge-diff", "crates/forge-github", "crates/forge-review", "crates/forge-status"]
 exclude = ["vendor/gix-path", "vendor/tree-sitter-powershell"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+forge-buffer = { path = "crates/forge-buffer" }
+forge-diff = { path = "crates/forge-diff" }
+forge-git = { path = "crates/forge-git" }
+forge-github = { path = "crates/forge-github" }
+forge-harness = { path = "crates/forge-harness" }
+forge-protocol = { path = "crates/forge-protocol" }
+forge-review = { path = "crates/forge-review" }
+forge-status = { path = "crates/forge-status" }
+forge-text = { path = "crates/forge-text" }
+
+agent-client-protocol = "=3.3.0"
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22.1"
+cc = "1"
+clap = "4.5"
+dunce = "1.0.5"
+futures-util = "0.3"
+github-copilot-sdk = { version = "=1.0.7", default-features = false }
+gix = { version = "=0.87.1", default-features = false }
+hex = "0.4"
+home = "0.5"
+imara-diff = { package = "gix-imara-diff", version = "=0.2.5", default-features = false }
+jsonc-parser = "0.34"
+jsonschema = { version = "0.49", default-features = false }
+junction = { version = "=2.1.0", default-features = false }
+libc = "0.2.189"
+memchr = "2"
+proc-macro2 = "1.0"
+process-wrap = { version = "=10.0.1", default-features = false }
+pulldown-cmark = { version = "=0.13.4", default-features = false }
+quote = "1.0"
+redb = "=2.6.3"
+regex = "1"
+reqwest = { version = "0.12.28", default-features = false }
+roxmltree = "0.21"
+rusqlite = "0.40.1"
+schemars = "=1.2.2"
+semver = "1.0"
+serde = "1.0"
+serde_json = "1.0"
+serde_path_to_error = "0.1"
+serde_stacker = "=0.1.14"
+serde_yaml_ng = "=0.10.0"
+sha2 = "0.10"
+shlex = "2.0.1"
+similar = "3.1.1"
+spdx = "0.13.4"
+stacker = "=0.1.25"
+strip-ansi-escapes = "0.2.1"
+symspell_rs = "=7.0.1"
+syn = "2.0"
+tempfile = "3.23"
+thiserror = "2.0"
+tokio = "1.48"
+tokio-tungstenite = "0.28"
+tokio-util = "0.7"
+toml = "0.9"
+tree-sitter = "=0.27.0"
+tree-sitter-bash = "=0.25.1"
+tree-sitter-c = { git = "https://github.com/tree-sitter/tree-sitter-c", rev = "2a265d69a4caf57108a73ad2ed1e6922dd2f998c" }
+tree-sitter-c-sharp = { git = "https://github.com/tree-sitter/tree-sitter-c-sharp", rev = "b5eb5742f6a7e9438bee22ce8026d6b927be2cd7" }
+tree-sitter-cpp = { git = "https://github.com/tree-sitter/tree-sitter-cpp", rev = "e5cea0ec884c5c3d2d1e41a741a66ce13da4d945" }
+tree-sitter-css = "=0.23.2"
+tree-sitter-glsl = "=0.2.0"
+tree-sitter-html = "=0.23.2"
+tree-sitter-javascript = "=0.23.1"
+tree-sitter-json = "=0.24.8"
+tree-sitter-language = "=0.1.8"
+tree-sitter-lua = { git = "https://github.com/tree-sitter-grammars/tree-sitter-lua", rev = "db16e76558122e834ee214c8dc755b4a3edc82a9" }
+tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "413285231ce8fa8b11e7074bbe265b48aa7277f9" }
+tree-sitter-nu = { git = "https://github.com/nushell/tree-sitter-nu", rev = "4f577aaa735154f934594b598a69ed7b1b707cf6" }
+tree-sitter-powershell = "=0.26.4"
+tree-sitter-python = { git = "https://github.com/tree-sitter/tree-sitter-python", rev = "710796b8b877a970297106e5bbc8e2afa47f86ec" }
+tree-sitter-query = { git = "https://github.com/tree-sitter-grammars/tree-sitter-query", rev = "930202c2a80965a7a9ca018b5b2a08b25dfa7f12" }
+tree-sitter-rust = "=0.24.2"
+tree-sitter-slang = "=0.3.1"
+tree-sitter-toml-ng = "=0.7.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-vim = { git = "https://github.com/tree-sitter-grammars/tree-sitter-vim", rev = "11b688a1f0e97c0c4e3dbabf4a38016335f4d237" }
+tree-sitter-vimdoc = { git = "https://github.com/neovim/tree-sitter-vimdoc", rev = "2694c3d27e2ca98a0ccde72f33887394300d524e" }
+tree-sitter-yaml = "=0.7.0"
+tree-sitter-zsh = "=0.63.4"
+unicode-segmentation = "=1.12.0"
+unicode-width = "=0.2.2"
+uuid = "1.18"
+windows = "0.62.2"
+zip = { version = "=2.4.2", default-features = false }
+
 [patch.crates-io]
 gix-path = { path = "vendor/gix-path" }
 tree-sitter-powershell = { path = "vendor/tree-sitter-powershell" }
 
 [dependencies]
-anyhow = "1.0"
-base64 = "0.22.1"
-clap = { version = "4.5", features = ["derive"] }
-forge-text = { path = "crates/forge-text" }
-forge-harness = { path = "crates/forge-harness" }
-forge-git = { path = "crates/forge-git" }
-forge-github = { path = "crates/forge-github" }
-forge-diff = { path = "crates/forge-diff" }
-forge-protocol = { path = "crates/forge-protocol" }
-forge-review = { path = "crates/forge-review" }
-forge-buffer = { path = "crates/forge-buffer" }
-forge-status = { path = "crates/forge-status" }
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.48", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+forge-buffer = { workspace = true }
+forge-diff = { workspace = true }
+forge-git = { workspace = true }
+forge-github = { workspace = true }
+forge-harness = { workspace = true }
+forge-protocol = { workspace = true }
+forge-review = { workspace = true }
+forge-status = { workspace = true }
+forge-text = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-tempfile = "3.23"
-toml = "0.9"
+tempfile = { workspace = true }
+toml = { workspace = true }
 
 [profile.dev]
 opt-level = 0
-debug = 1
+debug = 0
 incremental = true
 lto = "off"
 

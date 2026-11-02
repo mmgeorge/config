@@ -190,7 +190,7 @@ impl RemoteQueue {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("GitHub operation identity exhausted"))?;
         self.input_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
                 bytes.checked_add(retained_bytes)
             })
             .map_err(|_| anyhow::anyhow!("GitHub mutation input accounting overflow"))?;

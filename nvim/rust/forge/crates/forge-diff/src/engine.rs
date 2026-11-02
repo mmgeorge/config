@@ -170,7 +170,7 @@ impl DiffEngine {
             if let Some(job) = state.job.get(&key) {
                 drop(source);
                 job.consumer
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |consumer| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |consumer| {
                         (consumer > 0 && consumer < MAX_ANALYSIS_CONSUMERS).then(|| consumer + 1)
                     })
                     .map_err(|consumer| {

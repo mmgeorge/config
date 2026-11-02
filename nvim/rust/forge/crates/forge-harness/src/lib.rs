@@ -1,3 +1,6 @@
+// Proving Send for the broker's nested async futures exceeds the default depth.
+#![recursion_limit = "256"]
+
 pub mod agent;
 /// Typed file attachments captured independently of prompt text.
 pub mod attachment;

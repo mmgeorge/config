@@ -1,26 +1,26 @@
 [package]
 name = "forge-git"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
-anyhow = "1.0"
-dunce = "1.0.5"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tempfile = "3.23"
-forge-diff = { path = "../forge-diff" }
-gix = { version = "=0.87.1", default-features = false, features = ["sha1", "sha256", "parallel", "attributes", "status", "revision"] }
-process-wrap = { version = "=10.0.1", default-features = false, features = ["tokio1", "job-object", "process-group", "kill-on-drop", "creation-flags"] }
-tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "sync", "time", "process", "io-util"] }
+anyhow = { workspace = true }
+dunce = { workspace = true }
+forge-diff = { workspace = true }
+gix = { workspace = true, features = ["sha1", "sha256", "parallel", "attributes", "status", "revision"] }
+process-wrap = { workspace = true, features = ["tokio1", "job-object", "process-group", "kill-on-drop", "creation-flags"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "process", "io-util"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.189"
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_System_Threading"] }
+windows = { workspace = true, features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

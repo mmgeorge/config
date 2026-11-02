@@ -30,7 +30,7 @@ impl EditBudget {
         let bytes = text.len();
         self.state
             .retained
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
                 retained.checked_add(bytes)
             })
             .map_err(|_| EditError::Capacity("edit text accounting overflow"))?;

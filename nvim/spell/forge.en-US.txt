@@ -26,3 +26,9 @@ llm
 cli
 
 md
+
+toml
+
+rustup
+
+lld

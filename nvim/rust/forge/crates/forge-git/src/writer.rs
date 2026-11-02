@@ -677,7 +677,7 @@ impl GitWriteIntent {
                 CommandStream::Stderr => &stderr,
             };
             chunk.sequence = counter
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
                     sequence.checked_add(1)
                 })
                 .map_err(|_| anyhow::anyhow!("operation progress sequence exhausted"))?;

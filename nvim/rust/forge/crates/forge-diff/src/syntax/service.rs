@@ -126,7 +126,7 @@ impl SyntaxEngine {
             }
             if let Some(job) = state.job.get(&key) {
                 job.consumer
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                         (count > 0).then(|| count + 1)
                     })
                     .map_err(|_| SyntaxError::Busy)?;

@@ -1,0 +1,5 @@
+[build]
+rustflags = ["-Zthreads=8"]
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+linker = "rust-lld"

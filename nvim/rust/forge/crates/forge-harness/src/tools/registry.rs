@@ -16,7 +16,7 @@ pub struct ControlToolDefinition {
 impl ControlToolDefinition {
     /// Convert the provider-neutral definition into the MCP tool-list shape.
     pub fn mcp_value(&self) -> Value {
-        serde_json::to_value(self).expect("tool definitions contain only serializable JSON fields")
+        serde_json::to_value(self).expect("tool definitions must serialize as JSON")
     }
 }
 

@@ -103,7 +103,7 @@ impl SectionCharge {
     ) -> Result<Arc<Self>> {
         use std::sync::atomic::Ordering;
         budget
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
             })
             .map_err(|_| anyhow::anyhow!("review section retained-byte accounting overflow"))?;

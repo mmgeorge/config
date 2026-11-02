@@ -146,7 +146,7 @@ impl RepositoryState {
         let mut revision = self.revision.lock().expect("repository revision lock");
         let previous = self
             .generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
                 generation.checked_add(1)
             })
             .ok()
